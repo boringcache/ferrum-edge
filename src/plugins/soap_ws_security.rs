@@ -1377,8 +1377,8 @@ impl SoapWsSecurity {
         Ok(())
     }
 
-    /// Retained replay-cache entry count. Test-only; not a production API.
-    #[cfg(test)]
+    /// Retained replay-cache entry count for the external unit-test crate.
+    #[allow(dead_code)]
     pub fn nonce_replay_entry_count(&self) -> usize {
         self.nonce_replay
             .lock()
@@ -1387,8 +1387,8 @@ impl SoapWsSecurity {
             .len()
     }
 
-    /// Retained replay-cache key bytes. Test-only; not a production API.
-    #[cfg(test)]
+    /// Retained replay-cache key bytes for the external unit-test crate.
+    #[allow(dead_code)]
     pub fn nonce_replay_retained_bytes(&self) -> usize {
         self.nonce_replay
             .lock()
