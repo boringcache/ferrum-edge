@@ -6310,14 +6310,8 @@ async fn empty_synthetic_response_runs_the_shared_final_body_validator() {
     let mut headers = json_headers();
     let mut body = Vec::new();
 
-    finalize_synthetic_response_for_test(
-        &plugins,
-        &mut ctx,
-        &mut status,
-        &mut headers,
-        &mut body,
-    )
-    .await;
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
 
     assert_eq!(status, 502);
     assert_eq!(
@@ -6352,14 +6346,8 @@ async fn empty_synthetic_response_honors_an_explicit_no_content_contract() {
     let mut headers = HashMap::new();
     let mut body = Vec::new();
 
-    finalize_synthetic_response_for_test(
-        &plugins,
-        &mut ctx,
-        &mut status,
-        &mut headers,
-        &mut body,
-    )
-    .await;
+    finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
+        .await;
 
     assert_eq!(status, 200);
     assert!(body.is_empty());

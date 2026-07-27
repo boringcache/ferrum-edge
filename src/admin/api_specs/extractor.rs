@@ -2163,10 +2163,7 @@ impl GeneratedOperationBudget {
     fn consume_key(&mut self, key: &str, location: &str) -> Result<(), ExtractError> {
         // Quoted key plus `:` / `,` structural bytes. The trailing comma is a
         // one-byte overestimate for the final entry and therefore fail-safe.
-        self.consume_bytes(
-            json_string_serialized_len(key).saturating_add(2),
-            location,
-        )
+        self.consume_bytes(json_string_serialized_len(key).saturating_add(2), location)
     }
 
     fn consume_map_entry(
