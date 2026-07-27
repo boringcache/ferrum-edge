@@ -2001,7 +2001,7 @@ fn h1_h2_h3_paths_reach_shared_body_transform_finalize() {
 
 use std::future::Future;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
