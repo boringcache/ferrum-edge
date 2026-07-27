@@ -1008,14 +1008,14 @@ async fn run_script(
                 H2Step::AwaitTestSignal => {
                     state.awaiting_test_signal.fetch_add(1, Ordering::SeqCst);
                     let mut rx = state.test_signal.clone();
-                    let wait_result = async {
+                    let wait_result: Result<(), String> = async {
                         loop {
                             if *rx.borrow_and_update() {
                                 return Ok(());
                             }
-                            rx.changed()
-                                .await
-                                .map_err(|_| "AwaitTestSignal: test signal channel closed".to_string())?;
+                            rx.changed().await.map_err(|_| {
+                                "AwaitTestSignal: test signal channel closed".to_string()
+                            })?;
                         }
                     }
                     .await;
