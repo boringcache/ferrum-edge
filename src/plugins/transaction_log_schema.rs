@@ -49,6 +49,8 @@ pub struct TransactionLogSchema {
     schemas: HashMap<String, Arc<SummarySchema>>,
 }
 
+type CompiledSchemaEntry = (String, Arc<Value>, Arc<SummarySchema>);
+
 impl TransactionLogSchema {
     /// Shape-only validation for admin/CP admission and the buffering screen.
     /// Compiles every schema entry without staging anything in the process-global
@@ -73,7 +75,7 @@ impl TransactionLogSchema {
 
     fn validate_and_compile_entries(
         config: &Value,
-    ) -> Result<Vec<(String, Arc<Value>, Arc<SummarySchema>)>, String> {
+    ) -> Result<Vec<CompiledSchemaEntry>, String> {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing 'schemas'".to_string()
         })?;
