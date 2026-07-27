@@ -252,13 +252,13 @@ impl UdpRateLimiting {
         let periodic = count > 0 && count.is_multiple_of(EVICTION_CHECK_INTERVAL) && len > 0;
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Keep strict admission active for every over-cap observation, even
-        // when this call wins cleanup and brings the map back to the cap. That
-        // prevents a spoofed new-IP stream from defeating the caller's O(1)
-        // rejection guard by alternating insertion with full-map eviction.
-        // Reuse the periodic timestamp as a once-per-second single-flight gate
-        // so attacker-controlled datagrams cannot trigger retain/eviction on
-        // every packet.
+        // Keep capacity pressure visible for every over-cap observation, even
+        // when this call wins cleanup and only reclaims idle keys. That
+        // preserves the caller's O(1) new-key rejection guard. Live budgets
+        // are never force-evicted; hard cardinality is enforced by atomic
+        // admission reservation. Reuse the periodic timestamp as a
+        // once-per-second single-flight gate so attacker-controlled datagrams
+        // cannot trigger retain on every packet.
         if over_capacity {
             let last_sweep = self.last_eviction_secs.load(Ordering::Relaxed);
             if now_secs.saturating_sub(last_sweep) >= EVICTION_COOLDOWN_SECS
@@ -282,8 +282,8 @@ impl UdpRateLimiting {
             {
                 // Periodic sweeps prune idle keys even while the map is
                 // below the hard cap. A later over-cap observation keeps the
-                // strict new-IP guard active and force-evicts at most once per
-                // second after pruning.
+                // new-key guard active and reclaims idle state at most once
+                // per second after pruning.
                 apply_rate_limit_cleanup(&self.limiter, max_entries, now, false);
             }
         }
@@ -335,6 +335,12 @@ impl Plugin for UdpRateLimiting {
             .await
         else {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+            warn!(
+                plugin = "udp_rate_limiting",
+                proxy_id = %ctx.proxy_id,
+                max_state_entries = MAX_STATE_ENTRIES,
+                "UDP rate-limit state capacity exceeded, dropping new client"
+            );
             return UdpDatagramVerdict::Drop;
         };
 

@@ -2172,6 +2172,16 @@ pub mod _test_support {
                 .seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_rate_limiting_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.rate_limiting
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_rate_limiting_periodic(&self) {
             self.rate_limiting.arm_periodic_eviction_for_test();
         }
@@ -2208,6 +2218,16 @@ pub mod _test_support {
             self.ai.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_ai_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ai
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_ai_periodic(&self) {
             self.ai.arm_periodic_eviction_for_test();
         }
@@ -2237,6 +2257,16 @@ pub mod _test_support {
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
             self.graphql.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn seed_graphql_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.graphql
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
         }
 
         pub fn arm_graphql_periodic(&self) {
@@ -2270,6 +2300,16 @@ pub mod _test_support {
             self.grpc.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_grpc_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.grpc
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_grpc_periodic(&self) {
             self.grpc.arm_periodic_eviction_for_test();
         }
@@ -2299,6 +2339,16 @@ pub mod _test_support {
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
             self.ws.seed_connection_at_for_test(connection_id, now);
+        }
+
+        pub fn seed_ws_with_cap(
+            &self,
+            connection_id: u64,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ws
+                .seed_connection_at_with_cap_for_test(connection_id, now, max_entries)
         }
 
         pub fn arm_ws_periodic(&self) {

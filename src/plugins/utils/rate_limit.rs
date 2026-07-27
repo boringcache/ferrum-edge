@@ -336,35 +336,19 @@ where
         });
     }
 
-    /// Enforce the hard entry cap after first pruning idle state.
+    /// Reclaim idle state under capacity pressure.
     ///
-    /// Idle entries are always evaluated — even when the map is already at or
-    /// below `max_entries` — so callers that route both periodic sweeps and
-    /// over-cap pressure through this helper reclaim stale keys. Only when
-    /// active state still exceeds the cap are live keys force-evicted.
+    /// Hard cardinality is enforced by atomic reservation on admission
+    /// ([`Self::check_at_with_capacity`] /
+    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]). This
+    /// helper only prunes idle entries — it never deletes still-active
+    /// budgets, which would reset consumed windows and weaken enforcement
+    /// (GHSA-3xxf-5m26-c8pv). `max_entries` is retained for call-site
+    /// compatibility with shared cleanup wrappers; admission already refuses
+    /// previously unseen local/fallback keys at the configured cap.
     pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
+        let _ = max_entries;
         self.prune_stale_at(now);
-
-        let len = self.tracked_keys_count();
-        if len <= max_entries {
-            return;
-        }
-
-        let remove_count = len.saturating_sub(max_entries);
-        // DashMap iteration order is intentionally arbitrary here. Rate-limit
-        // state is already window-bounded, so after stale entries are pruned
-        // any remaining key can be evicted to enforce the hard cap.
-        let keys: Vec<K> = self
-            .state
-            .iter()
-            .take(remove_count)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in keys {
-            if self.state.remove(&key).is_some() {
-                self.release_entry_slot();
-            }
-        }
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -899,7 +883,7 @@ where
 
     /// All-shard `DashMap::len()` call counter for hot-path regression tests.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+    pub fn all_shard_len_calls_for_test(&self) -> usize {
         match self {
             Self::Local(local) => local.all_shard_len_calls_for_test(),
             Self::Failover(failover) => failover.all_shard_len_calls_for_test(),
@@ -944,11 +928,13 @@ where
     }
 }
 
-/// Shared consumer cleanup branch: below-cap prune vs over-cap force eviction.
+/// Shared consumer cleanup branch: below-cap prune vs over-cap stale reclaim.
 ///
 /// Every rate-limit consumer wrapper routes through this helper so omitted or
 /// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
-/// failure mode rather than six divergent copies.
+/// failure mode rather than six divergent copies. Both arms only drop idle
+/// state — live budgets are never force-evicted. Hard cardinality is enforced
+/// by atomic admission reservation, not by deleting active keys.
 #[inline]
 pub fn apply_rate_limit_cleanup<K, A>(
     limiter: &RateLimitBackend<K, A>,
@@ -3266,7 +3252,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_enforce_capacity_removes_excess_entries() {
+    fn local_limiter_enforce_capacity_preserves_active_entries() {
         let limiter = LocalLimiter::new(
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
@@ -3274,15 +3260,31 @@ mod tests {
             crate::util::sharding::pool_shard_amount(0),
         );
         let op = TestOp;
+        let now = Instant::now();
 
         for idx in 0..5 {
             let key = format!("key:{idx}");
-            assert!(limiter.check(key, &op).allowed);
+            assert!(
+                limiter
+                    .check_at_with_capacity(key, &op, now, 5)
+                    .expect("admit within cap")
+                    .allowed
+            );
         }
         assert_eq!(limiter.tracked_keys_count(), 5);
+        assert!(
+            limiter
+                .check_at_with_capacity("key:new".to_string(), &op, now, 5)
+                .is_none(),
+            "previously unseen keys must deny at capacity"
+        );
 
-        limiter.enforce_capacity(3, Instant::now());
-        assert!(limiter.tracked_keys_count() <= 3);
+        // Cleanup must not delete still-active budgets to make room.
+        limiter.enforce_capacity(3, now);
+        assert_eq!(limiter.tracked_keys_count(), 5);
+        for idx in 0..5 {
+            assert!(limiter.contains_key(&format!("key:{idx}")));
+        }
     }
 
     #[test]
@@ -3699,7 +3701,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_entry_count_matches_map_under_concurrent_insert_prune_evict() {
+    fn local_limiter_entry_count_matches_map_under_concurrent_capped_insert_prune() {
         use std::sync::Arc;
         use std::thread;
 
@@ -3721,12 +3723,13 @@ mod tests {
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let key = format!("w{worker}:{i}");
-                    let _ = limiter.check(key, &op);
+                    let _ = limiter.check_at_with_capacity(key, &op, Instant::now(), max_entries);
                     i = i.wrapping_add(1);
                     if i.is_multiple_of(17) {
                         limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
                     }
                     if i.is_multiple_of(23) {
+                        // Over-cap cleanup must only prune idle state.
                         limiter.enforce_capacity(max_entries, Instant::now());
                     }
                 }
@@ -3739,8 +3742,6 @@ mod tests {
             handle.join().expect("worker joins");
         }
 
-        // Final cold-path enforcement must leave both the atomic count and the
-        // map at or below the hard cap with matching bookkeeping.
         limiter.enforce_capacity(max_entries, Instant::now());
         let tracked = limiter.tracked_keys_count();
         let map_len = limiter.map_len_for_test();
@@ -3750,7 +3751,7 @@ mod tests {
         );
         assert!(
             tracked <= max_entries,
-            "hard cap must hold after concurrent insert/prune/evict (tracked={tracked})"
+            "hard cap must hold via atomic admission reservation (tracked={tracked})"
         );
     }
 
