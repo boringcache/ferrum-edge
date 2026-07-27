@@ -738,13 +738,13 @@ pub fn needs_client_response_wire_sanitization(
                     != Some(&representation_len.to_string())
             }
         }
-        ClientResponseFraming::Streaming { status, is_head } => {
+        ClientResponseFraming::Streaming { status, .. } => {
             if status_forbids_response_body(status) {
-                headers.contains_key("content-length")
-            } else if is_head {
-                content_length_value_is_invalid(headers)
+                headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("content-length"))
             } else {
-                content_length_value_is_invalid(headers)
+                streaming_content_length_needs_repair(headers)
             }
         }
     }
@@ -755,13 +755,56 @@ fn status_forbids_response_body(status: u16) -> bool {
     matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
 }
 
-fn content_length_value_is_invalid(headers: &std::collections::HashMap<String, String>) -> bool {
-    match headers.get("content-length") {
-        None => false,
-        Some(value) => {
-            let trimmed = value.trim();
-            trimmed.is_empty() || trimmed.parse::<u64>().is_err()
+fn streaming_content_length_needs_repair(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut count = 0usize;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
         }
+        count += 1;
+        let trimmed = value.trim();
+        if count > 1
+            || name != "content-length"
+            || trimmed != value
+            || trimmed.is_empty()
+            || trimmed.parse::<u64>().is_err()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Preserve at most one valid streaming representation length and canonicalize
+/// its spelling. Multiple case variants are duplicate `Content-Length` fields
+/// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
+fn canonicalize_streaming_content_length(
+    headers: &mut std::collections::HashMap<String, String>,
+) {
+    let mut parsed = None;
+    let mut count = 0usize;
+    for (name, value) in headers.iter() {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        count += 1;
+        let value = value.trim().parse::<u64>().ok();
+        if count == 1 {
+            parsed = value;
+        } else {
+            parsed = None;
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    remove_content_length_header(headers);
+    if count == 1
+        && let Some(len) = parsed
+    {
+        headers.insert("content-length".to_string(), len.to_string());
     }
 }
 
@@ -827,14 +870,14 @@ pub fn sanitize_client_response_headers_for_wire(
                 set_content_length_header(headers, representation_len);
             }
         }
-        ClientResponseFraming::Streaming { status, is_head } => {
+        ClientResponseFraming::Streaming { status, .. } => {
             if status_forbids_response_body(status) {
                 remove_content_length_header(headers);
-            } else if content_length_value_is_invalid(headers) {
-                remove_content_length_header(headers);
-            } else if is_head {
-                // Preserve a valid backend representation length; nothing else
-                // to derive without the representation body.
+            } else {
+                // Preserve one valid backend representation length, including
+                // for HEAD, but canonicalize the key/value and remove
+                // duplicate case variants before HeaderMap construction.
+                canonicalize_streaming_content_length(headers);
             }
         }
     }
@@ -1798,5 +1841,40 @@ mod tests {
             },
         );
         assert_eq!(good.get("content-length").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn sanitize_streaming_canonicalizes_one_mixed_case_length_and_drops_duplicates() {
+        let mut mixed =
+            std::collections::HashMap::from([("Content-Length".to_string(), " 42 ".to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut mixed,
+            ClientResponseFraming::Streaming {
+                status: 200,
+                is_head: false,
+            },
+        );
+        assert_eq!(
+            mixed.get("content-length").map(String::as_str),
+            Some("42")
+        );
+        assert!(!mixed.contains_key("Content-Length"));
+
+        let mut duplicates = std::collections::HashMap::from([
+            ("content-length".to_string(), "42".to_string()),
+            ("Content-Length".to_string(), "42".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut duplicates,
+            ClientResponseFraming::Streaming {
+                status: 200,
+                is_head: false,
+            },
+        );
+        assert!(
+            !duplicates
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length"))
+        );
     }
 }
