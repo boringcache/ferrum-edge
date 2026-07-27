@@ -216,7 +216,11 @@ fn managed_tls_failed_create_update_delete_keep_prior_snapshot() {
         .expect_err("delete must fail under create fault");
     assert!(matches!(delete_err, ManagedTlsError::Write(_)));
     assert_eq!(
-        store.get("edge-ca").expect("still present").ca_bundle_pem.as_deref(),
+        store
+            .get("edge-ca")
+            .expect("still present")
+            .ca_bundle_pem
+            .as_deref(),
         Some("version-a")
     );
     assert_live_matches_reopened_managed(&store, dir.path(), "edge-ca");
@@ -297,8 +301,10 @@ fn acme_certificate_failed_create_update_delete_keep_prior_snapshot() {
     assert_eq!(material.bytes, key_a.as_bytes());
     assert_live_matches_reopened_acme_cert(&store, dir.path(), "edge-cert");
 
-    let delete_err = with_fault(PrivateFileFault::Rename, || store.delete_certificate("edge-cert"))
-        .expect_err("delete must fail");
+    let delete_err = with_fault(PrivateFileFault::Rename, || {
+        store.delete_certificate("edge-cert")
+    })
+    .expect_err("delete must fail");
     assert!(matches!(delete_err, AcmeError::Write(_)));
     assert!(store.get_certificate("edge-cert").is_ok());
     assert_live_matches_reopened_acme_cert(&store, dir.path(), "edge-cert");
@@ -337,8 +343,10 @@ fn acme_order_failed_create_update_delete_keep_prior_snapshot() {
     assert!(store.http01_key_authorization("tok_version_b").is_none());
     assert_live_matches_reopened_acme_order(&store, dir.path(), "edge-order");
 
-    let delete_err = with_fault(PrivateFileFault::Create, || store.delete_order("edge-order"))
-        .expect_err("delete must fail");
+    let delete_err = with_fault(PrivateFileFault::Create, || {
+        store.delete_order("edge-order")
+    })
+    .expect_err("delete must fail");
     assert!(matches!(delete_err, AcmeError::Write(_)));
     assert!(store.get_order("edge-order").is_ok());
     assert_live_matches_reopened_acme_order(&store, dir.path(), "edge-order");

@@ -55,7 +55,9 @@ fn injected_fault() -> PrivateFileFault {
 
 /// Arm a one-thread private-file fault until the returned guard drops.
 #[cfg(test)]
-pub(crate) fn inject_private_file_fault_for_tests(fault: PrivateFileFault) -> PrivateFileFaultGuard {
+pub(crate) fn inject_private_file_fault_for_tests(
+    fault: PrivateFileFault,
+) -> PrivateFileFaultGuard {
     INJECTED_FAULT.with(|cell| cell.set(fault));
     PrivateFileFaultGuard { active: true }
 }
@@ -473,7 +475,8 @@ mod tests {
         })
         .expect_err("dir sync fault must fail publish");
         assert!(
-            err.to_string().contains("injected fault: failed to fsync parent directory"),
+            err.to_string()
+                .contains("injected fault: failed to fsync parent directory"),
             "primary dir-sync error must be preserved: {err}"
         );
         assert!(
@@ -503,7 +506,8 @@ mod tests {
         })
         .expect_err("dir sync fault must fail create");
         assert!(
-            err.to_string().contains("injected fault: failed to fsync parent directory"),
+            err.to_string()
+                .contains("injected fault: failed to fsync parent directory"),
             "primary dir-sync error must be preserved: {err}"
         );
         assert!(
