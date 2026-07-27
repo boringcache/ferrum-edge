@@ -1279,6 +1279,14 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// incremental polls start from an authoritative snapshot boundary.
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
 
+    /// Return the store-wide durable config-change high-water mark.
+    ///
+    /// `config_changes.sequence` is allocated globally, not per namespace.
+    /// Control-plane mesh revision publication uses this value so a namespace
+    /// disappearing from the active scope cannot rewind the advertised
+    /// generation after a CP restart.
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
+
     /// Load only resources changed after `after_sequence`.
     async fn load_incremental_config(
         &self,

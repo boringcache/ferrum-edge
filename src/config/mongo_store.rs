@@ -5639,6 +5639,25 @@ mod inner {
             }
         }
 
+        async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+            let doc = self
+                .config_changes()
+                .find_one(doc! {})
+                .sort(doc! { "sequence": -1 })
+                .await?;
+            let Some(doc) = doc else {
+                return Ok(0);
+            };
+            match doc.get("sequence") {
+                Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
+                Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
+                other => anyhow::bail!(
+                    "MongoDB config_changes row has invalid sequence: {:?}",
+                    other
+                ),
+            }
+        }
+
         async fn load_incremental_config(
             &self,
             namespace: &str,

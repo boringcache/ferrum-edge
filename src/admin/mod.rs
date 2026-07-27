@@ -2781,6 +2781,26 @@ pub async fn handle_admin_request(
             handle_mesh_config_drift_get(&state, query.as_deref()).await
         }
 
+        // Issue #2473: operator escape hatch for the config-revision freshness
+        // gate. Clears the DP's last-accepted revision so the next slice from
+        // ANY authority is eligible again. This is the documented recovery for
+        // a config-store sequence rewind inside one authority (restore from
+        // backup without bumping `FERRUM_MESH_CONFIG_AUTHORITY_ID`) — the one
+        // case the gate never auto-adopts, because it is indistinguishable
+        // from the rollback the gate exists to prevent.
+        //
+        // JWT-authenticated (falls through the admin auth gate above) and
+        // Operator-role gated: it does not write configuration, but it lowers
+        // a fail-closed guard, so it is audited like any other privileged
+        // mutation. It installs nothing itself — the next slice still has to
+        // pass subscription binding and update validation.
+        (Method::POST, ["mesh", "config-revision", "reset"]) => {
+            if let Some(resp) = require_admin_role(&auth, AdminRole::Operator) {
+                return Ok(resp);
+            }
+            handle_mesh_config_revision_reset(&state, &auth).await
+        }
+
         // F7.2: remote-cluster discovery introspection. Read-only operator
         // view of the DP's multicluster east-west state — clusters it has
         // actually fetched endpoints from (with per-cluster workload/service
@@ -3084,6 +3104,47 @@ async fn handle_mesh_runtime_overlay_get(
     ))
 }
 
+/// `POST /mesh/config-revision/reset` — clear the accepted mesh config
+/// revision (issue #2473).
+///
+/// Returns the cleared revision so the operator can record what the gate was
+/// holding. Never logs or returns slice content.
+///
+/// The revision the gate hands back is already sanitized — the `authority` is
+/// control-plane-supplied, so `MeshRevisionGate::reset` strips control
+/// characters and truncates before the value can reach this audit log line or
+/// the JSON body. Do not swap this for a raw accessor.
+async fn handle_mesh_config_revision_reset(
+    state: &AdminState,
+    auth: &AuditActor,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let Some(mesh_runtime) = state.mesh_runtime_state.as_ref() else {
+        return Ok(json_response(
+            StatusCode::NOT_FOUND,
+            &json!({"error": "No active mesh runtime state"}),
+        ));
+    };
+
+    let cleared = mesh_runtime.reset_accepted_revision();
+    warn!(
+        actor = %auth.sub,
+        cleared_authority = cleared
+            .as_ref()
+            .map(|revision| revision.authority.as_str())
+            .unwrap_or("<none>"),
+        cleared_sequence = cleared.as_ref().map_or(0, |revision| revision.sequence),
+        "Mesh config-revision freshness gate reset by operator; the next accepted slice \
+         establishes a new ordering baseline"
+    );
+    Ok(json_response(
+        StatusCode::OK,
+        &json!({
+            "status": "reset",
+            "cleared_revision": cleared,
+        }),
+    ))
+}
+
 /// MESH-T6-C: per-DP config drift introspection.
 ///
 /// Returns a structured "where is this DP relative to the CP's last push?"
@@ -3144,6 +3205,8 @@ async fn handle_mesh_config_drift_get(
         include_overlay,
         // xDS-mode only; native mode leaves this `None` and the block is omitted.
         convergence: mesh_runtime.xds_convergence(),
+        // Issue #2473: accepted config revision + stale-fallback quarantine.
+        revision: mesh_runtime.revision_diagnostics(),
     });
 
     // `MeshConfigDriftResponse` is fully serde-derived; treat a serialize

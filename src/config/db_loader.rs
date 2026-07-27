@@ -4928,6 +4928,15 @@ impl DatabaseStore {
         Ok(max_sequence.max(0) as u64)
     }
 
+    pub async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes")
+                .fetch_one(&self.pool())
+                .await?;
+        let max_sequence: i64 = row.try_get("max_sequence")?;
+        Ok(max_sequence.max(0) as u64)
+    }
+
     /// Load only resources referenced by durable change records after `after_sequence`.
     pub async fn load_incremental_config(
         &self,
@@ -9097,6 +9106,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::latest_global_change_sequence(self).await
     }
 
     async fn load_incremental_config(

@@ -16,6 +16,7 @@ pub mod node_waypoint;
 pub mod outbound_enforcement;
 pub mod policy;
 pub mod policy_deny_log;
+pub mod revision;
 pub mod runtime;
 pub mod runtime_overlay_consumers;
 pub mod slice;
@@ -9179,6 +9180,11 @@ pub async fn run(
     );
 
     let mesh_state = MeshRuntimeState::new();
+    // Config-revision freshness policy (issue #2473). Installed before any
+    // consumer is spawned so the first slice is already gated.
+    mesh_state.set_revision_policy(crate::modes::mesh::revision::MeshRevisionPolicy {
+        foreign_authority_adopt_secs: env_config.mesh_config_revision_adopt_secs,
+    });
     let federation_activation = FederationActivation::from_env_config(&env_config);
 
     let mut background_handles = Vec::new();
@@ -10116,7 +10122,7 @@ async fn serve_mesh_runtime(
             // The scheme is authoritative for plaintext remotes: a `grpc://` /
             // `http://` control_plane_url must NOT get DP gRPC TLS material
             // attached just because TLS env vars are set, or
-            // `fetch_remote_slice_endpoints` would attempt a TLS handshake
+            // `fetch_remote_slice` would attempt a TLS handshake
             // against a plaintext port. (`build_dp_grpc_tls_config(.., &[], ..)`
             // returns `Some(tls)` whenever any TLS env is set, independent of
             // scheme — so force `None` here.) A `grpcs://` / `https://` remote
@@ -10127,6 +10133,7 @@ async fn serve_mesh_runtime(
             env_config.mesh_remote_discovery_poll_interval_seconds,
             env_config.mesh_remote_discovery_poll_timeout_seconds,
             env_config.mesh_remote_discovery_max_stale_seconds,
+            env_config.mesh_config_revision_adopt_secs,
             remote_grpc_secret,
             runtime.node_id.clone(),
             runtime.namespace.clone(),
@@ -13140,6 +13147,10 @@ async fn apply_mesh_slice_generation(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     dns_proxy: &Option<Arc<MeshDnsProxy>>,
 ) -> bool {
+    // Capture before any asynchronous preparation. An operator reset that
+    // lands while this generation is being built invalidates the token, so a
+    // late successful apply cannot resurrect the cleared freshness watermark.
+    let revision_apply_token = mesh_state.begin_revision_apply(base_slice);
     if has_termination_listener && !live_reload_enabled {
         let fixed_policy = proxy_state.mesh_inbound_tls_policy.load();
         if let Some((port, mode)) = newly_selectable_inbound_peer_auth_port_requires_reload(
@@ -13283,7 +13294,13 @@ async fn apply_mesh_slice_generation(
             if accepted && let Some((resolver, snapshot)) = staged_policy_scopes {
                 resolver.install_policy_scope_snapshot(snapshot);
             }
-            record_mesh_slice_apply_result(mesh_state, last_applied_slice, base_slice, accepted);
+            record_mesh_slice_apply_result(
+                mesh_state,
+                last_applied_slice,
+                base_slice,
+                accepted,
+                revision_apply_token,
+            );
             if accepted {
                 publish_gateway_active_trust_bundles(
                     proxy_state,
@@ -13395,11 +13412,13 @@ fn start_mesh_slice_apply_task(
                 let slice_unchanged =
                     mesh_slice_matches_last_applied(last_applied_slice.as_deref(), slice);
                 if slice_unchanged && !federation_changed && !remote_changed {
+                    let revision_apply_token = mesh_state.begin_revision_apply(slice);
                     record_mesh_slice_apply_result(
                         &mesh_state,
                         &mut last_applied_slice,
                         slice,
                         true,
+                        revision_apply_token,
                     );
                     debug!(
                         mesh_slice_version = %slice.version,
@@ -13429,6 +13448,19 @@ fn start_mesh_slice_apply_task(
                         &dns_proxy,
                     )
                     .await;
+                    // Issue #2473 lifecycle: the freshness gate advanced its
+                    // accepted watermark when this slice entered the received
+                    // slot, but the proxy runtime is a second, independent
+                    // gate. A candidate the runtime just refused never became
+                    // the serving generation, so its revision must not keep the
+                    // watermark — otherwise one runtime-invalid slice published
+                    // at a far-future sequence would quarantine every valid
+                    // revision beneath it and block recovery. Roll back to the
+                    // last APPLIED revision, keyed to this exact received
+                    // candidate so a newer one received mid-apply is untouched.
+                    if !received_accepted {
+                        mesh_state.record_rejected_slice(&snapshot);
+                    }
                     // Finding 3 (accepted-remote/federation update vs rejected
                     // received slice): the discovery + federation pollers are
                     // keyed to the ACCEPTED slice, so they can publish overlay
@@ -13517,9 +13549,10 @@ fn record_mesh_slice_apply_result(
     last_applied_slice: &mut Option<Arc<MeshSlice>>,
     slice: &MeshSlice,
     applied: bool,
+    revision_apply_token: Option<revision::MeshRevisionApplyToken>,
 ) {
     if applied {
-        mesh_state.record_applied_slice(slice);
+        mesh_state.record_applied_slice_with_token(slice, revision_apply_token);
         *last_applied_slice = Some(Arc::new(slice.clone()));
     }
 }
@@ -20533,6 +20566,7 @@ mod tests {
             labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
             labels_ambiguous: false,
             version: "test".to_string(),
+            revision: None,
             workloads: Vec::new(),
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
@@ -23441,7 +23475,13 @@ mod tests {
             labels: [("app".to_string(), "api".to_string())].into(),
             ..MeshSlice::default()
         };
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, false);
+        record_mesh_slice_apply_result(
+            &mesh_state,
+            &mut last_applied_slice,
+            &rejected,
+            false,
+            None,
+        );
         assert!(last_applied_slice.is_none());
         assert!(mesh_state.applied_snapshot().as_ref().is_none());
         assert!(!mesh_slice_matches_last_applied(
@@ -23453,7 +23493,7 @@ mod tests {
             }
         ));
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &rejected, true, None);
         assert!(mesh_state.applied_snapshot().as_ref().is_some());
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
@@ -23480,12 +23520,12 @@ mod tests {
             ..MeshSlice::default()
         };
 
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v1, true, None);
         assert!(mesh_slice_matches_last_applied(
             last_applied_slice.as_deref(),
             &v2
         ));
-        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true);
+        record_mesh_slice_apply_result(&mesh_state, &mut last_applied_slice, &v2, true, None);
 
         let applied = mesh_state.applied_snapshot();
         assert_eq!(
