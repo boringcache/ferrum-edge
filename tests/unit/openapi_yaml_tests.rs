@@ -6125,7 +6125,36 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         &json!({
             "status": "ok",
             "ready": true,
-            "mesh": {"egress_scope": health}
+            "mesh": {
+                "egress_scope": health,
+                "node_waypoint_observability": {
+                    "enabled": true,
+                    "hbone_handshakes": {
+                        "inbound_tls_success": 1,
+                        "inbound_tls_failure": 2,
+                        "inbound_connect_success": 3,
+                        "inbound_connect_failure": 4,
+                        "outbound_dial_success": 5,
+                        "outbound_dial_failure": 6
+                    },
+                    "asserted_identity": {
+                        "accepted": 1,
+                        "rejected_untrusted_assertor": 2,
+                        "rejected_trust_domain_mismatch": 0,
+                        "rejected_unauthenticated_hbone": 0,
+                        "rejected_malformed": 0,
+                        "rejected_stale_or_unknown": 0
+                    },
+                    "destination_policy_rejections": {
+                        "authz_deny": 1,
+                        "scope_missing": 0,
+                        "destination_scope_missing": 0,
+                        "relay_destination_denied": 0
+                    },
+                    "missing_destination_metadata": 1,
+                    "plaintext_fallback_attempts": 1
+                }
+            }
         }),
         true,
     );

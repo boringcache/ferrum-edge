@@ -92,7 +92,11 @@ CI today."
   production SPIRE, stale source-IP reuse, and inbound direct-pod enforcement
   are live-gated; the production identity profile now covers Workload API SVID
   issuance, plaintext/no-client-SVID HBONE rejection, forged assertor rejection,
-  and SPIRE Agent plus NodeWaypoint restart recovery;
+  SPIRE Agent plus NodeWaypoint restart recovery, and ADR observability
+  counter-movement assertions
+  (`node_waypoint.observability.hbone_handshake_inbound_tls_failure`,
+  `node_waypoint.observability.asserted_identity_rejected`,
+  `node_waypoint.observability.hbone_handshake_outbound_success`);
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies
@@ -176,9 +180,8 @@ ledger unless they change the support contract.
 | EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
 | Subset-scoped DestinationRule HTTP connection-pool policy (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`) | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `docs/mesh.md` DestinationRule deferred_fields / subset `connectionPool.http` |
 | Multicluster poller-driven partition / last-good-retention live gate | [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) | `docs/mesh_multicluster_federation_runbook.md` Harness |
-| NodeWaypoint observability contract + maturity promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | this matrix Experimental `NodeWaypoint` bullet |
 
-Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475).
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475); NodeWaypoint observability contract + maturity promotion gates (#3334 — ADR evidence table + Experimental→Beta/Beta→GA gates documented; maturity remains Experimental until promotion criteria close).
 
 ## How a feature graduates
 

@@ -2449,6 +2449,10 @@ impl MetricsRegistry {
             &mut output,
             &gateway_ns_label,
         );
+        crate::modes::mesh::node_waypoint_observability::render_prometheus(
+            &mut output,
+            &gateway_ns_label,
+        );
 
         if let Some(snapshot) = self.database_delta_poll_metrics_snapshot() {
             output.push_str(

@@ -654,23 +654,8 @@ impl HboneConnectionPool {
             effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
 
-        let fast_sender = with_hbone_pool_key(
-            dial_host,
-            app_port,
-            hbone_port,
-            proxy.dns_override.as_deref(),
-            fingerprint.as_ref(),
-            expected_peer,
-            sni_override,
-            expected_trust_domain,
-            &pool_config,
-            |key| self.try_cached_sender_read(key),
-        );
-
-        let sender = if let Some(sender) = fast_sender {
-            sender
-        } else {
-            let key = with_hbone_pool_key(
+        let dial_result = async {
+            let fast_sender = with_hbone_pool_key(
                 dial_host,
                 app_port,
                 hbone_port,
@@ -680,36 +665,70 @@ impl HboneConnectionPool {
                 sni_override,
                 expected_trust_domain,
                 &pool_config,
-                |key| key.to_string(),
+                |key| self.try_cached_sender_read(key),
             );
-            self.get_or_create_sender(
-                proxy,
-                dial_host,
-                app_host,
-                app_port,
-                app_policy_port,
-                hbone_port,
-                expected_peer,
-                expected_trust_domain,
-                sni_override,
-                &key,
-                &pool_config,
-                Some(connect_timeout),
+
+            let sender = if let Some(sender) = fast_sender {
+                sender
+            } else {
+                let key = with_hbone_pool_key(
+                    dial_host,
+                    app_port,
+                    hbone_port,
+                    proxy.dns_override.as_deref(),
+                    fingerprint.as_ref(),
+                    expected_peer,
+                    sni_override,
+                    expected_trust_domain,
+                    &pool_config,
+                    |key| key.to_string(),
+                );
+                self.get_or_create_sender(
+                    proxy,
+                    dial_host,
+                    app_host,
+                    app_port,
+                    app_policy_port,
+                    hbone_port,
+                    expected_peer,
+                    expected_trust_domain,
+                    sni_override,
+                    &key,
+                    &pool_config,
+                    Some(connect_timeout),
+                )
+                .await?
+            };
+            tokio::time::timeout(
+                connect_timeout,
+                self.open_connect_stream(sender, app_host, app_port, hbone_source_identity),
             )
-            .await?
-        };
-        tokio::time::timeout(
-            connect_timeout,
-            self.open_connect_stream(sender, app_host, app_port, hbone_source_identity),
-        )
-        .await
-        .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(app_host, app_port),
-            message: format!(
-                "timed out after {}ms waiting for HBONE CONNECT response",
-                effective_connect_timeout_ms
-            ),
-        })?
+            .await
+            .map_err(|_| HbonePoolError::ConnectStream {
+                authority: authority_for_host_port(app_host, app_port),
+                message: format!(
+                    "timed out after {}ms waiting for HBONE CONNECT response",
+                    effective_connect_timeout_ms
+                ),
+            })?
+        }
+        .await;
+
+        match &dial_result {
+            Ok(_) => {
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::OutboundDial,
+                    true,
+                );
+            }
+            Err(_) => {
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::OutboundDial,
+                    false,
+                );
+            }
+        }
+        dial_result
     }
 
     /// Open a **bare** HBONE CONNECT byte tunnel to a peer's HBONE listener over

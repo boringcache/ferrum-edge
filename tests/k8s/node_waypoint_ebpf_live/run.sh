@@ -90,6 +90,9 @@ if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
     node_waypoint.identity.unauthenticated_hbone_rejected
     node_waypoint.identity.forged_assertion_rejected
     node_waypoint.identity.spire_restart_recovery
+    node_waypoint.observability.hbone_handshake_inbound_tls_failure
+    node_waypoint.observability.asserted_identity_rejected
+    node_waypoint.observability.hbone_handshake_outbound_success
   )
 fi
 
@@ -2578,11 +2581,87 @@ run_hbone_listener_negative_check() {
     "hbone-negative"
 }
 
+collect_ambient_observability_metrics() {
+  local out_dir="$RESULTS_DIR/ambient-observability-metrics"
+  mkdir -p "$out_dir"
+  local -a pods
+  mapfile -t pods < <(ambient_pods)
+  local idx=0 pod port metrics_file pf_log pf_pid
+  for pod in "${pods[@]}"; do
+    port=$((19600 + idx))
+    idx=$((idx + 1))
+    metrics_file="$out_dir/$pod.prom"
+    pf_log="$out_dir/$pod-port-forward.log"
+    kubectl -n "$MESH_NS" port-forward "pod/$pod" "$port:$AMBIENT_ADMIN_PORT" >"$pf_log" 2>&1 &
+    pf_pid=$!
+    if wait_for_port_forward_ready "$pf_pid" "$pf_log" "$port"; then
+      curl -fsS "http://127.0.0.1:$port/metrics" >"$metrics_file" 2>/dev/null || true
+    fi
+    stop_port_forward "$pf_pid"
+  done
+}
+
+sum_ambient_metric_total() {
+  # Sum a Prometheus series across all ambient NodeWaypoint pods. Matches lines
+  # that begin with the exact metric selector prefix and ends with a numeric
+  # sample. Missing series count as zero so first-scrape baselines work.
+  local metric_selector="$1"
+  collect_ambient_observability_metrics
+  python3 - "$RESULTS_DIR/ambient-observability-metrics" "$metric_selector" <<'PY'
+import pathlib
+import sys
+
+out_dir = pathlib.Path(sys.argv[1])
+selector = sys.argv[2]
+total = 0
+for path in sorted(out_dir.glob("*.prom")):
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line:
+            continue
+        if not line.startswith(selector):
+            continue
+        # Allow optional gateway_namespace label suffix before the sample.
+        parts = line.rsplit(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            total += int(float(parts[1]))
+        except ValueError:
+            continue
+print(total)
+PY
+}
+
 run_plaintext_hbone_rejection_check() {
+  local before after
+  before="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}')"
   run_hbone_listener_negative_check \
     node_waypoint.identity.plaintext_hbone_rejected \
     plaintext \
     plaintext-to-hbone-listener-rejected
+  after="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}')"
+  if [[ "$after" -gt "$before" ]]; then
+    record_live_assertion \
+      node_waypoint.observability.hbone_handshake_inbound_tls_failure \
+      pass \
+      unmanaged-a \
+      dst-a \
+      "inbound_tls_failure_before=$before after=$after" \
+      "none" \
+      "$(spiffe_for_sa dst-a)" \
+      "hbone-negative,ambient-observability-metrics"
+  else
+    record_live_assertion \
+      node_waypoint.observability.hbone_handshake_inbound_tls_failure \
+      fail \
+      unmanaged-a \
+      dst-a \
+      "inbound_tls_failure_did_not_increase before=$before after=$after" \
+      "none" \
+      "$(spiffe_for_sa dst-a)" \
+      "hbone-negative,ambient-observability-metrics"
+    return 1
+  fi
 }
 
 run_unauthenticated_hbone_rejection_check() {
@@ -2736,7 +2815,7 @@ restore_default_hbone_assertors() {
 }
 
 run_forged_assertion_rejection_check() {
-  local bad_assertor blocked_ok=0 restored_ok=0 recovery_ok=0
+  local bad_assertor blocked_ok=0 restored_ok=0 recovery_ok=0 assert_after=0
   bad_assertor="spiffe://$TRUST_DOMAIN/ns/$MESH_NS/sa/not-a-node-waypoint"
   mkdir -p "$RESULTS_DIR/hbone-negative"
   log "checking authenticated HBONE baggage is rejected from an untrusted assertor"
@@ -2750,6 +2829,9 @@ run_forged_assertion_rejection_check() {
         "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
         4; then
         blocked_ok=0
+        # Capture before restore_default_hbone_assertors restarts ambient pods
+        # and resets process-static counters.
+        assert_after="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_asserted_identity_total{result="rejected",reason="untrusted_assertor"}')"
       else
         blocked_ok=$?
       fi
@@ -2786,6 +2868,28 @@ run_forged_assertion_rejection_check() {
       "authenticated-hbone-baggage-from-untrusted-assertor-fail-closed-and-recovers" \
       "$(spiffe_for_sa src-a)" \
       "$(spiffe_for_sa dst-a)"
+    if [[ "$assert_after" -gt 0 ]]; then
+      record_live_assertion \
+        node_waypoint.observability.asserted_identity_rejected \
+        pass \
+        src-a \
+        dst-a \
+        "asserted_identity_rejected_untrusted_assertor=$assert_after" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)" \
+        "ambient-observability-metrics"
+    else
+      record_live_assertion \
+        node_waypoint.observability.asserted_identity_rejected \
+        fail \
+        src-a \
+        dst-a \
+        "asserted_identity_rejected_untrusted_assertor_still_zero" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-a)" \
+        "ambient-observability-metrics"
+      return 1
+    fi
     return
   fi
 
@@ -2958,6 +3062,34 @@ run_traffic_checks() {
     "http://dst-b.$WORKLOAD_NS.svc.cluster.local:8080/" \
     "ok-b" \
     4
+
+  if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+    local outbound_success
+    outbound_success="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}')"
+    if [[ "$outbound_success" -gt 0 ]]; then
+      record_live_assertion \
+        node_waypoint.observability.hbone_handshake_outbound_success \
+        pass \
+        src-a \
+        dst-b \
+        "outbound_dial_success=$outbound_success" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-b)" \
+        "ambient-observability-metrics"
+    else
+      record_live_assertion \
+        node_waypoint.observability.hbone_handshake_outbound_success \
+        fail \
+        src-a \
+        dst-b \
+        "outbound_dial_success_still_zero_after_cross_node_allow" \
+        "$(spiffe_for_sa src-a)" \
+        "$(spiffe_for_sa dst-b)" \
+        "ambient-observability-metrics"
+      collect_traffic_failure_diagnostics
+      return 1
+    fi
+  fi
 
   recorded_expect_blocked \
     node_waypoint.ipv4.service_deny_same_node \
