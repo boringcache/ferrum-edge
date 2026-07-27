@@ -1,7 +1,6 @@
 use ferrum_edge::_test_support::{
-    SoapNonceReplayHarness, soap_count_wsu_id_occurrences_for_test,
-    soap_decode_xml_body_for_test, soap_exclusive_canonicalize_element_for_test,
-    soap_nonce_inconsistent_state_outcome_for_test,
+    SoapNonceReplayHarness, soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
+    soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -4674,10 +4673,7 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
     let err = harness
         .claim_at(&large_nonce, Duration::from_secs(1))
         .expect_err("bounded work cannot free 4096 bytes from 64 tiny entries");
-    assert_eq!(
-        err,
-        "WS-Security: replay protection state is at capacity"
-    );
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
     assert!(
         !err.contains(large_nonce.as_str()),
         "saturation diagnostic must never include the nonce"
@@ -4690,10 +4686,7 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
     assert_eq!(after.recomputed_key_bytes, 4_096);
     assert_eq!(after.shared_key_entries, ENTRY_COUNT);
     assert_eq!(after.last_expired_removals, 0);
-    assert_eq!(
-        after.last_forced_candidates,
-        after.max_maintenance_entries
-    );
+    assert_eq!(after.last_forced_candidates, after.max_maintenance_entries);
     assert_eq!(after.max_maintenance_entries, 64);
 }
 
@@ -4735,10 +4728,7 @@ fn test_nonce_inconsistent_age_index_fails_closed() {
         "reject_missing_security_header": false
     }))
     .expect("one-shot inconsistency probe");
-    assert_eq!(
-        err,
-        "WS-Security: replay protection state is at capacity"
-    );
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
 }
 
 // ── Concurrent nonce-cap invariants (GHSA-3ffh-5842-8m92 residual) ──────────
@@ -4812,10 +4802,7 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
                     "byte cap overshot under concurrency"
                 );
                 assert_eq!(snapshot.entry_count, snapshot.age_index_entry_count);
-                assert_eq!(
-                    snapshot.retained_key_bytes,
-                    snapshot.recomputed_key_bytes
-                );
+                assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
                 assert_eq!(snapshot.entry_count, snapshot.shared_key_entries);
             }
         }));
@@ -4883,13 +4870,11 @@ fn test_concurrent_nonce_admission_cannot_overshoot_entry_or_byte_caps() {
     }
     let snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(
-        snapshot.entry_count,
-        BYTE_CAP_ENTRIES,
+        snapshot.entry_count, BYTE_CAP_ENTRIES,
         "byte cap must pin the retained set once amortized headroom is refilled"
     );
     assert_eq!(
-        snapshot.retained_key_bytes,
-        MAX_BYTES,
+        snapshot.retained_key_bytes, MAX_BYTES,
         "byte cap must pin retained bytes once amortized headroom is refilled"
     );
 }
@@ -4950,9 +4935,6 @@ fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
         snapshot.retained_key_bytes,
         "same-key-concurrent-nonce!!".len()
     );
-    assert_eq!(
-        snapshot.retained_key_bytes,
-        snapshot.recomputed_key_bytes
-    );
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
     assert_eq!(snapshot.shared_key_entries, 1);
 }
