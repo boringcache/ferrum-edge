@@ -1127,7 +1127,7 @@ fn resolve_anthropic_tool_choice(
             .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
         if !tools
             .as_ref()
-            .is_some_and(|names| names.iter().any(|declared| *declared == name))
+            .is_some_and(|names| names.contains(&name))
         {
             return Err("named tool_choice does not match any declared tool".to_string());
         }
