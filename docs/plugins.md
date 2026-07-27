@@ -5722,6 +5722,8 @@ config:
 
 **Direction handling:** The plugin examines `ctx.direction` only implicitly — both directions update the same per-client window. This is intentional: the goal is to cap total UDP traffic per client IP, not just inbound. Plugins that need direction-specific behavior should branch on `ctx.direction` themselves.
 
+**Rejection diagnostics:** Count- and byte-limit drops still increment the existing per-rejection metrics/counters, but tracing warnings are bounded per plugin instance and process-wide. Each instance emits at most one summary per second (monotonic clock, relaxed atomics) carrying how many rejections were suppressed since its previous emit; a matching global limiter caps total `udp_rate_limiting` rejection warnings across all configured instances to one summary per second. Suppressed counts are monotonic between emits and may be slightly low under concurrent emit races; losing threads fold into the next summary instead of logging a spurious zero-suppressed line. Warnings identify only the configured `proxy_id` and a static `limit_kind` (`datagram_count` or `byte_count`) — never client addresses, payloads, or usage snapshots.
+
 
 ---
 

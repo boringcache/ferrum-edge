@@ -653,6 +653,177 @@ fn concurrent_insert_prune_and_cap_keep_exact_entry_count() {
     assert!(!h.seed_udp_with_cap("198.51.100.1", active, 32));
 }
 
+// ── Bounded rejection diagnostics (GHSA-x6v4-3gwg-3rw6) ───────────────
+
+fn reset_udp_rejection_warn_state(plugin: &ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting) {
+    ferrum_edge::_test_support::udp_rate_limiting_reset_rejection_warn_for_test(plugin);
+    ferrum_edge::_test_support::udp_rate_limiting_reset_global_rejection_warn_for_test();
+}
+
+#[test]
+fn rejection_warn_emits_once_per_window_under_identical_timestamp_flood() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    reset_udp_rejection_warn_state(&plugin);
+
+    let mut emissions = 0usize;
+    for _ in 0..10_000 {
+        if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin,
+            "datagram_count",
+            "proxy-1",
+            1_000,
+        ) {
+            emissions += 1;
+        }
+    }
+    assert_eq!(
+        emissions, 1,
+        "identical timestamps within one 1s window must emit at most once per instance"
+    );
+}
+
+#[test]
+fn rejection_warn_rolls_window_and_carries_suppressed_count() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    reset_udp_rejection_warn_state(&plugin);
+
+    assert!(
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin,
+            "datagram_count",
+            "proxy-1",
+            0,
+        )
+    );
+    for t in 1..=999 {
+        assert!(
+            !ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+                &plugin,
+                "datagram_count",
+                "proxy-1",
+                t,
+            )
+        );
+    }
+    assert!(
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin,
+            "datagram_count",
+            "proxy-1",
+            1_000,
+        ),
+        "window rollover must emit a summary"
+    );
+}
+
+#[tokio::test]
+async fn datagram_and_byte_limit_rejections_share_bounded_diagnostics() {
+    let count_plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    let byte_plugin = make_plugin(json!({"bytes_per_second": 100}));
+    reset_udp_rejection_warn_state(&count_plugin);
+    reset_udp_rejection_warn_state(&byte_plugin);
+
+    let mut ctx = make_ctx("10.0.0.1", 50);
+    assert_eq!(
+        count_plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Forward
+    );
+    ctx.direction = UdpDatagramDirection::BackendToClient;
+    assert_eq!(
+        count_plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+
+    let mut byte_ctx = make_ctx("10.0.0.2", 200);
+    assert_eq!(
+        byte_plugin.on_udp_datagram(&byte_ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+    byte_ctx.direction = UdpDatagramDirection::BackendToClient;
+    assert_eq!(
+        byte_plugin.on_udp_datagram(&byte_ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+
+    let mut count_emissions = 0usize;
+    let mut byte_emissions = 0usize;
+    for t in 0..5_000 {
+        if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &count_plugin,
+            "datagram_count",
+            "proxy-1",
+            t,
+        ) {
+            count_emissions += 1;
+        }
+        if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &byte_plugin,
+            "byte_count",
+            "proxy-1",
+            t,
+        ) {
+            byte_emissions += 1;
+        }
+    }
+    assert!(
+        count_emissions <= 6,
+        "count-limit diagnostics stayed bounded across flood: {count_emissions}"
+    );
+    assert!(
+        byte_emissions <= 6,
+        "byte-limit diagnostics stayed bounded across flood: {byte_emissions}"
+    );
+}
+
+#[test]
+fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
+    let plugin_a = make_plugin(json!({"datagrams_per_second": 1}));
+    let plugin_b = make_plugin(json!({"datagrams_per_second": 1}));
+    reset_udp_rejection_warn_state(&plugin_a);
+    reset_udp_rejection_warn_state(&plugin_b);
+
+    assert!(
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin_a,
+            "datagram_count",
+            "proxy-a",
+            0,
+        )
+    );
+    assert!(
+        ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin_b,
+            "datagram_count",
+            "proxy-b",
+            0,
+        )
+    );
+
+    let mut global_emissions = 0usize;
+    for t in 1..=10_000 {
+        if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin_a,
+            "datagram_count",
+            "proxy-a",
+            t,
+        ) {
+            global_emissions += 1;
+        }
+        if ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_for_test(
+            &plugin_b,
+            "datagram_count",
+            "proxy-b",
+            t,
+        ) {
+            global_emissions += 1;
+        }
+    }
+    assert!(
+        global_emissions <= 12,
+        "global + per-instance bounds must cap warnings across instances: {global_emissions}"
+    );
+}
+
 // ── Default Trait Methods ─────────────────────────────────────────────
 
 #[tokio::test]

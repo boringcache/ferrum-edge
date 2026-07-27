@@ -2430,6 +2430,25 @@ pub mod _test_support {
         plugin.epoch_base_for_test()
     }
 
+    pub fn udp_rate_limiting_record_rejection_warn_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> bool {
+        plugin.record_rate_limit_rejection_warn_for_test(limit_kind, proxy_id, now_ms)
+    }
+
+    pub fn udp_rate_limiting_reset_rejection_warn_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) {
+        plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    pub fn udp_rate_limiting_reset_global_rejection_warn_for_test() {
+        crate::plugins::udp_rate_limiting::reset_global_rate_limit_rejection_warn_for_test();
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two
