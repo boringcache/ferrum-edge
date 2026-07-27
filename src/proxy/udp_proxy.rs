@@ -1016,8 +1016,42 @@ fn stream_duration_ms_from_mono(start_ms: u64, end_ms: u64) -> f64 {
 
 /// Idle-expiry predicate on the shared coarse monotonic clock.
 #[inline]
-fn udp_idle_expired(now_mono_ms: u64, last_activity_ms: u64, idle_timeout_ms: u64) -> bool {
+pub(crate) fn udp_idle_expired(
+    now_mono_ms: u64,
+    last_activity_ms: u64,
+    idle_timeout_ms: u64,
+) -> bool {
     now_mono_ms.saturating_sub(last_activity_ms) > idle_timeout_ms
+}
+
+/// Whether a UDP/DTLS application-datagram outcome should refresh the shared
+/// idle watermark used by session cleanup / `dtls_shared_idle_watchdog`.
+///
+/// Policy-rejected receives (for example `udp_rate_limiting` Drop) and failed
+/// forwards must not extend session lifetime. Handshake/control traffic is
+/// handled by the DTLS stack before the application relay and is not gated by
+/// this predicate; admitted client→backend and successfully delivered
+/// backend→client application datagrams must refresh.
+#[inline]
+pub(crate) fn udp_idle_activity_should_refresh(
+    policy_admitted: bool,
+    forward_or_deliver_succeeded: bool,
+) -> bool {
+    policy_admitted && forward_or_deliver_succeeded
+}
+
+/// Advance the shared idle watermark to `now_ms` when
+/// [`udp_idle_activity_should_refresh`] is true.
+#[inline]
+pub(crate) fn maybe_touch_udp_idle_activity(
+    activity_ms: &AtomicU64,
+    now_ms: u64,
+    policy_admitted: bool,
+    forward_or_deliver_succeeded: bool,
+) {
+    if udp_idle_activity_should_refresh(policy_admitted, forward_or_deliver_succeeded) {
+        activity_ms.store(now_ms, Ordering::Relaxed);
+    }
 }
 
 /// Restore private correlation ownership after every plugin-writable metadata
@@ -3582,6 +3616,9 @@ async fn handle_dtls_client_inner(
     let shared_activity_ms = Arc::new(AtomicU64::new(coarse_epoch_millis()));
 
     // Client → Backend
+    // Idle activity advances only after policy admission + successful forward
+    // (parity with plain UDP). Decrypt/receive alone must not refresh the
+    // watchdog — otherwise rate-rejected application datagrams pin the session.
     let activity_fwd = Arc::clone(&shared_activity_ms);
     let client_to_backend = tokio::spawn(async move {
         loop {
@@ -3590,7 +3627,6 @@ async fn handle_dtls_client_inner(
                 Err(_) => break,
             };
             let len = data.len();
-            activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
 
             metrics_fwd.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_fwd
@@ -3619,6 +3655,8 @@ async fn handle_dtls_client_inner(
                     }
                 }
                 if dropped {
+                    // Rejected application datagram: leave shared idle watermark
+                    // untouched so the session can still expire.
                     continue; // Silent drop — standard UDP behavior
                 }
             }
@@ -3650,7 +3688,12 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_sent_fwd.fetch_add(len as u64, Ordering::Relaxed);
-            activity_fwd.store(coarse_epoch_millis(), Ordering::Relaxed);
+            maybe_touch_udp_idle_activity(
+                activity_fwd.as_ref(),
+                coarse_epoch_millis(),
+                true,
+                true,
+            );
         }
     });
 
@@ -3662,6 +3705,8 @@ async fn handle_dtls_client_inner(
     let amplification_factor_rev = proxy.udp_max_response_amplification_factor;
     let last_request_size_rev = Arc::clone(&last_request_size);
 
+    // Backend → Client (plain UDP or backend-DTLS): refresh idle only after
+    // amplification/plugin admission and successful client delivery.
     let activity_rev = Arc::clone(&shared_activity_ms);
     let backend_to_client = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
@@ -3680,7 +3725,6 @@ async fn handle_dtls_client_inner(
                 break;
             };
             let len = data.len();
-            activity_rev.store(coarse_epoch_millis(), Ordering::Relaxed);
 
             metrics_rev.datagrams_in.fetch_add(1, Ordering::Relaxed);
             metrics_rev
@@ -3735,7 +3779,12 @@ async fn handle_dtls_client_inner(
                 .bytes_out
                 .fetch_add(len as u64, Ordering::Relaxed);
             bytes_received_rev.fetch_add(len as u64, Ordering::Relaxed);
-            activity_rev.store(coarse_epoch_millis(), Ordering::Relaxed);
+            maybe_touch_udp_idle_activity(
+                activity_rev.as_ref(),
+                coarse_epoch_millis(),
+                true,
+                true,
+            );
         }
     });
 
