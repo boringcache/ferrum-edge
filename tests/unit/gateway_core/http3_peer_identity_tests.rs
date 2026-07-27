@@ -269,10 +269,7 @@ fn a_failed_handshake_cannot_clear_early_data_or_publish_identity() {
     let slot = H3ConnectionIdentity::pre_handshake();
 
     let handshake_succeeded = server_0rtt_handshake_succeeded(false, false);
-    slot.publish_handshake_result(
-        handshake_succeeded,
-        Some(vec![leaf(), intermediate()]),
-    );
+    slot.publish_handshake_result(handshake_succeeded, Some(vec![leaf(), intermediate()]));
 
     let snapshot = slot.snapshot();
     assert!(snapshot.is_early_data);

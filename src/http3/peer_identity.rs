@@ -89,10 +89,7 @@ pub fn quic_max_early_data_size(
 /// completed. Retaining a `true` acceptance result also handles a peer closing
 /// immediately after a successful 0-RTT handshake.
 #[inline]
-pub fn server_0rtt_handshake_succeeded(
-    zero_rtt_accepted: bool,
-    connection_is_open: bool,
-) -> bool {
+pub fn server_0rtt_handshake_succeeded(zero_rtt_accepted: bool, connection_is_open: bool) -> bool {
     zero_rtt_accepted || connection_is_open
 }
 
