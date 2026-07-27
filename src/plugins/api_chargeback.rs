@@ -258,6 +258,7 @@ pub struct InstanceScope {
     /// Instance namespace. Direct registry calls use this as the proxy namespace;
     /// production hooks pass the matched proxy's namespace explicitly so a
     /// gateway-wide global instance cannot conflate same-id tenant proxies.
+    #[allow(dead_code)] // Read by external registry tests; production passes matched namespaces.
     pub namespace: Arc<str>,
 }
 
@@ -1011,6 +1012,7 @@ impl ChargebackRegistry {
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
     /// WebSocket upgrade). Status code is the response status.
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
@@ -1076,6 +1078,7 @@ impl ChargebackRegistry {
     /// have no HTTP status code; entries are keyed by
     /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
     /// [`STREAM_STATUS_SENTINEL`].
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -1134,6 +1137,7 @@ impl ChargebackRegistry {
         );
     }
 
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
