@@ -35,8 +35,8 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "close_reason",
     // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
     "sync_mode",
-    "redis_url",
     "redis_tls",
+    "redis_url",
     "redis_key_prefix",
     "redis_pool_size",
     "redis_connect_timeout_seconds",
