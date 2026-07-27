@@ -26,6 +26,12 @@ pub struct AtomicLogRateLimiter {
     window_ms: u64,
 }
 
+impl Default for AtomicLogRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[inline]
 fn fetch_add_saturating(counter: &AtomicU64, delta: u64) {
     let mut current = counter.load(Ordering::Relaxed);
