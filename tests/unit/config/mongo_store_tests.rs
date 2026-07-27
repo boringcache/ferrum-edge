@@ -9,12 +9,14 @@
 //! detection without requiring a live DocumentDB backend.
 
 use ferrum_edge::_test_support::{
+    MongoReconnectTopology, MongoReconnectTransitionTestHooks,
     mongo_migration_lease_acquire_filter_classic, mongo_migration_lease_acquire_update_classic,
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
     mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
     mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
     mongo_store_acquire_connection_generation_pin_for_test, mongo_store_new_unconnected_for_test,
     mongo_store_published_database_name_for_test,
+    mongo_store_set_reconnect_transition_hooks_for_test,
     mongo_store_try_publish_reconnected_bundle_for_test, mtls_dns_policy_requires_consumer_load,
 };
 use ferrum_edge::config::db_backend::DatabaseBackend;
@@ -35,23 +37,6 @@ fn mongo_method(name: &str) -> &str {
     let start = MONGO_STORE_SOURCE.find(&marker).unwrap();
     let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
     let end = tail.find("\n        async fn ").unwrap_or(tail.len());
-    &MONGO_STORE_SOURCE[start..start + marker.len() + end]
-}
-
-fn mongo_sync_method(name: &str) -> &str {
-    // Mirror mongo_method: build the marker locally so the returned slice
-    // borrows MONGO_STORE_SOURCE ('static), not a temporary format string.
-    let marker = format!("        fn {name}");
-    let start = MONGO_STORE_SOURCE
-        .find(&marker)
-        .unwrap_or_else(|| panic!("missing method marker {marker}"));
-    let tail = &MONGO_STORE_SOURCE[start + marker.len()..];
-    let end = tail
-        .find("\n        fn ")
-        .into_iter()
-        .chain(tail.find("\n        async fn "))
-        .min()
-        .unwrap_or(tail.len());
     &MONGO_STORE_SOURCE[start..start + marker.len() + end]
 }
 
@@ -834,7 +819,9 @@ fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
 /// Issue #3001: Mongo failover must flip the write gate before publishing the
 /// connection (SQL `reconnect_for_topology` parity). Default-disabled admin
 /// writes must never observe a failover connection while `primary_active`
-/// still reads true. Deferred reconnects must not change topology.
+/// still reads true. Primary `mark_primary` must finalize under the same
+/// publication guards after ArcSwap. Deferred reconnects must not change
+/// topology.
 #[test]
 fn reconnect_failover_marks_topology_before_publishing_connection() {
     let reconnect_failover = mongo_fn_body("        async fn reconnect_failover(");
@@ -847,9 +834,10 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         "reconnect_failover must publish through the ordered helper"
     );
     assert!(
-        reconnect_failover.contains("Some(&crate::config::db_backend::redact_url(db_url))")
-            || reconnect_failover.contains("Some(&redact_url(db_url))"),
-        "reconnect_failover must pass the failover URL into publish so the gate flips before ArcSwap:\n{reconnect_failover}"
+        reconnect_failover.contains("MongoReconnectTopology::Failover")
+            && (reconnect_failover.contains("redact_url(db_url)")
+                || reconnect_failover.contains("crate::config::db_backend::redact_url(db_url)")),
+        "reconnect_failover must publish as Failover with a redacted URL:\n{reconnect_failover}"
     );
     // Must not reintroduce the old post-publish mark_failover call site.
     let after_publish = reconnect_failover
@@ -861,7 +849,7 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
         "mark_failover must not run after publication in reconnect_failover:\n{reconnect_failover}"
     );
 
-    let publish = mongo_sync_method("publish_reconnected_bundle(");
+    let publish = mongo_fn_body("        async fn publish_reconnected_bundle(");
     let publish_body = publish
         .split_once('{')
         .map(|(_, body)| body)
@@ -874,35 +862,37 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     let generation_try_write_at = publish_body
         .find("connection_generation.try_write()")
         .expect("publish_reconnected_bundle must fail-fast on the generation guard second");
-    let mark_at = publish_body
+    let mark_failover_at = publish_body
         .find("mark_failover(")
         .expect("publish_reconnected_bundle must mark failover under the guards");
     let swap_at = publish_body
         .find("connection.swap(")
         .expect("publish_reconnected_bundle must ArcSwap the connection");
+    let mark_primary_at = publish_body
+        .find("mark_primary(")
+        .expect("publish_reconnected_bundle must mark primary under the guards");
     assert!(
         admin_try_write_at < generation_try_write_at
-            && generation_try_write_at < mark_at
-            && mark_at < swap_at,
-        "admin try_write -> generation try_write -> mark_failover -> connection.swap is the fail-closed order:\n{publish_body}"
+            && generation_try_write_at < mark_failover_at
+            && mark_failover_at < swap_at
+            && swap_at < mark_primary_at,
+        "admin try_write -> generation try_write -> mark_failover -> swap -> mark_primary is the serialized order:\n{publish_body}"
     );
     assert!(
         !publish_body.contains(".write().await"),
         "Mongo publication must stay fail-fast (try_write), never unbounded write().await:\n{publish_body}"
     );
 
-    // Primary reconnect stays conservative: publish first, then mark_primary
-    // (temporary write blocking on a primary connection is acceptable).
+    // Primary reconnect must not finalize topology outside the publication
+    // critical section (the pre-fix fail-open race).
     let reconnect = mongo_fn_body("        async fn reconnect(");
-    let install_at = reconnect
-        .find("install_reconnected_bundle(")
-        .expect("reconnect must publish via install_reconnected_bundle");
-    let mark_primary_at = reconnect
-        .find("mark_primary(")
-        .expect("reconnect must mark primary after publish");
     assert!(
-        install_at < mark_primary_at,
-        "primary failback must mark_primary only after publication:\n{reconnect}"
+        reconnect.contains("install_reconnected_bundle("),
+        "reconnect must publish via install_reconnected_bundle:\n{reconnect}"
+    );
+    assert!(
+        !reconnect.contains("mark_primary("),
+        "reconnect must not call mark_primary after releasing publication guards:\n{reconnect}"
     );
 
     // SQL parity: failover topology flips before pool publication, and the
@@ -984,10 +974,11 @@ fn reconnect_failover_marks_topology_before_publishing_connection() {
     );
 
     // All Mongo publication paths funnel through publish_reconnected_bundle.
-    let install = mongo_sync_method("install_reconnected_bundle(");
+    let install = mongo_fn_body("        async fn install_reconnected_bundle(");
     assert!(
-        install.contains("publish_reconnected_bundle("),
-        "install_reconnected_bundle (primary reconnect / TLS reload) must publish via the shared helper"
+        install.contains("publish_reconnected_bundle(")
+            && install.contains("MongoReconnectTopology::Primary"),
+        "install_reconnected_bundle (primary reconnect) must publish via the shared helper as Primary"
     );
     assert!(
         reconnect_failover.contains("publish_reconnected_bundle("),
@@ -1040,8 +1031,10 @@ async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
     let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
         &store,
         "should_not_publish",
-        Some("mongodb://failover.example/test"),
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
     )
+    .await
     .expect_err("Admin write-topology pin must fail-fast defer publication");
     let blocked_msg = blocked.to_string();
     assert!(
@@ -1065,8 +1058,10 @@ async fn admin_permit_defers_publish_while_nested_admission_pin_succeeds() {
     mongo_store_try_publish_reconnected_bundle_for_test(
         &store,
         "after_admin_pin",
-        Some("mongodb://failover.example/test"),
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
     )
+    .await
     .expect("publish must succeed after Admin + admission pins drop");
     assert!(!store.failover_topology_status().primary_active);
     assert_eq!(
@@ -1085,8 +1080,10 @@ async fn admission_pin_defers_publish_without_topology_change() {
     let blocked = mongo_store_try_publish_reconnected_bundle_for_test(
         &store,
         "blocked_by_admission",
-        Some("mongodb://failover.example/test"),
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
     )
+    .await
     .expect_err("admission pin must fail-fast defer publication");
     assert!(
         blocked.to_string().contains("admission operation pins"),
@@ -1099,8 +1096,10 @@ async fn admission_pin_defers_publish_without_topology_change() {
     mongo_store_try_publish_reconnected_bundle_for_test(
         &store,
         "after_admission_pin",
-        Some("mongodb://failover.example/test"),
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
     )
+    .await
     .expect("publish after admission pin drops");
     assert!(!store.failover_topology_status().primary_active);
     assert_eq!(
@@ -1129,8 +1128,10 @@ async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
         let first = mongo_store_try_publish_reconnected_bundle_for_test(
             &publish_store,
             "raced_publish",
-            Some("mongodb://failover.example/test"),
-        );
+            MongoReconnectTopology::Failover,
+            "mongodb://failover.example/test",
+        )
+        .await;
         assert!(
             first.is_err(),
             "publish racing under Admin permit must fail-fast defer"
@@ -1140,8 +1141,10 @@ async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
         mongo_store_try_publish_reconnected_bundle_for_test(
             &publish_store,
             "after_race",
-            Some("mongodb://failover.example/test"),
+            MongoReconnectTopology::Failover,
+            "mongodb://failover.example/test",
         )
+        .await
     });
 
     let _ = outer_held_tx.send(());
@@ -1163,5 +1166,171 @@ async fn reconnect_between_admin_permit_and_admission_is_fail_fast() {
     assert_eq!(
         mongo_store_published_database_name_for_test(&store),
         "after_race"
+    );
+}
+
+/// Issue #3001: a primary publication that pauses after ArcSwap (before
+/// `mark_primary`) must not let a concurrent failover publish and then be
+/// overwritten only in metadata by a delayed `mark_primary` — that left the
+/// live bundle on failover while `primary_active=true` and made write gating
+/// fail open. Rendezvous via test seams; no sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_primary_publish_cannot_overwrite_later_failover_topology() {
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::Mutex as AsyncMutex;
+
+    let store = mongo_store_new_unconnected_for_test(vec![]).expect("lazy mongo store");
+    // Start on failover so primary failback is a real topology transition.
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "initial_failover",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("seed failover topology");
+    assert!(!store.failover_topology_status().primary_active);
+
+    let (primary_holding_tx, primary_holding_rx) = oneshot::channel::<()>();
+    let (primary_resume_tx, primary_resume_rx) = oneshot::channel::<()>();
+    let (failover_before_lock_tx, failover_before_lock_rx) = oneshot::channel::<()>();
+    let failover_holding = Arc::new(AtomicBool::new(false));
+
+    let primary_holding_tx = Arc::new(StdMutex::new(Some(primary_holding_tx)));
+    let primary_resume_rx = Arc::new(AsyncMutex::new(Some(primary_resume_rx)));
+    let failover_before_lock_tx = Arc::new(StdMutex::new(Some(failover_before_lock_tx)));
+
+    mongo_store_set_reconnect_transition_hooks_for_test(
+        &store,
+        Some(MongoReconnectTransitionTestHooks {
+            before_lock: Some(Arc::new({
+                let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                move |topology| {
+                    let failover_before_lock_tx = Arc::clone(&failover_before_lock_tx);
+                    Box::pin(async move {
+                        if topology != MongoReconnectTopology::Failover {
+                            return;
+                        }
+                        if let Some(tx) = failover_before_lock_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    })
+                }
+            })),
+            while_holding: Some(Arc::new({
+                let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                let primary_resume_rx = Arc::clone(&primary_resume_rx);
+                let failover_holding = Arc::clone(&failover_holding);
+                move |topology| {
+                    let primary_holding_tx = Arc::clone(&primary_holding_tx);
+                    let primary_resume_rx = Arc::clone(&primary_resume_rx);
+                    let failover_holding = Arc::clone(&failover_holding);
+                    Box::pin(async move {
+                        match topology {
+                            MongoReconnectTopology::Primary => {
+                                if let Some(tx) = primary_holding_tx.lock().unwrap().take() {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(rx) = primary_resume_rx.lock().await.take() {
+                                    let _ = rx.await;
+                                }
+                            }
+                            MongoReconnectTopology::Failover => {
+                                failover_holding.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    })
+                }
+            })),
+        }),
+    );
+
+    let primary_store = store.clone();
+    let primary_task = tokio::spawn(async move {
+        mongo_store_try_publish_reconnected_bundle_for_test(
+            &primary_store,
+            "primary_bundle",
+            MongoReconnectTopology::Primary,
+            "mongodb://primary.example/test",
+        )
+        .await
+    });
+
+    primary_holding_rx
+        .await
+        .expect("primary publish must enter while_holding under the publication guards");
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "primary must stay fail-closed until mark_primary after the deferred window"
+    );
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "primary_bundle",
+        "bundle must already be primary while mark_primary is still pending under the guards"
+    );
+
+    let failover_store = store.clone();
+    let failover_task = tokio::spawn(async move {
+        mongo_store_try_publish_reconnected_bundle_for_test(
+            &failover_store,
+            "later_failover",
+            MongoReconnectTopology::Failover,
+            "mongodb://failover.example/test",
+        )
+        .await
+    });
+
+    failover_before_lock_rx
+        .await
+        .expect("failover publish must reach before_lock while primary holds publication");
+    assert!(
+        !failover_holding.load(Ordering::SeqCst),
+        "failover must not enter while_holding while primary still holds publication"
+    );
+
+    // Fail-fast: concurrent failover cannot acquire the publication guards.
+    let deferred = failover_task.await.expect("join deferred failover");
+    let deferred_err = deferred.expect_err("failover racing under primary publication must fail-fast defer");
+    let deferred_msg = deferred_err.to_string();
+    assert!(
+        deferred_msg.contains("Admin write-topology permit")
+            || deferred_msg.contains("admission operation pins"),
+        "deferred failover must name a publication pin, got: {deferred_msg}"
+    );
+
+    primary_resume_tx.send(()).expect("resume primary");
+    primary_task
+        .await
+        .expect("join primary")
+        .expect("primary publish");
+    assert!(store.failover_topology_status().primary_active);
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "primary_bundle"
+    );
+
+    mongo_store_try_publish_reconnected_bundle_for_test(
+        &store,
+        "later_failover",
+        MongoReconnectTopology::Failover,
+        "mongodb://failover.example/test",
+    )
+    .await
+    .expect("failover must publish after primary releases");
+    assert!(
+        failover_holding.load(Ordering::SeqCst),
+        "failover must enter while_holding only after primary releases publication"
+    );
+
+    mongo_store_set_reconnect_transition_hooks_for_test(&store, None);
+
+    assert!(
+        !store.failover_topology_status().primary_active,
+        "later failover must own topology after the serialized primary transition"
+    );
+    assert_eq!(
+        mongo_store_published_database_name_for_test(&store),
+        "later_failover",
+        "active bundle must match the later failover publication"
     );
 }

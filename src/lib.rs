@@ -2325,6 +2325,9 @@ pub mod _test_support {
     }
 
     // ── config/mongo_store: Admin write-topology / publication test seams ────
+    pub use crate::config::mongo_store::{
+        MongoReconnectTopology, MongoReconnectTransitionHook, MongoReconnectTransitionTestHooks,
+    };
 
     /// Lazy Mongo store (no live MongoDB) for topology publication tests.
     pub fn mongo_store_new_unconnected_for_test(
@@ -2334,12 +2337,23 @@ pub mod _test_support {
     }
 
     /// Publish through Mongo's production Admin+admission fail-fast gates.
-    pub fn mongo_store_try_publish_reconnected_bundle_for_test(
+    pub async fn mongo_store_try_publish_reconnected_bundle_for_test(
         store: &crate::config::mongo_store::MongoStore,
         database_name: &str,
-        failover_url_redacted: Option<&str>,
+        topology: MongoReconnectTopology,
+        url_redacted: &str,
     ) -> Result<(), anyhow::Error> {
-        store.try_publish_reconnected_bundle_for_test(database_name, failover_url_redacted)
+        store
+            .try_publish_reconnected_bundle_for_test(database_name, topology, url_redacted)
+            .await
+    }
+
+    /// Install (or clear) Mongo reconnect publication test hooks.
+    pub fn mongo_store_set_reconnect_transition_hooks_for_test(
+        store: &crate::config::mongo_store::MongoStore,
+        hooks: Option<MongoReconnectTransitionTestHooks>,
+    ) {
+        store.set_reconnect_transition_hooks_for_test(hooks);
     }
 
     /// Simulate an in-flight admission generation pin without talking to Mongo.

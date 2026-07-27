@@ -687,6 +687,67 @@ async fn test_admit_write_pins_and_blocks_on_failover_without_opt_in() {
         panic!("admit_write must fail closed on failover without opt-in");
     };
     assert_eq!(err.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+
+    // Independent TLS/ACME stores must not inherit sticky DB failover policy.
+    state
+        .admit_non_config_db_write()
+        .expect("admit_non_config_db_write must ignore failover topology");
+}
+
+#[tokio::test]
+async fn test_admit_non_config_db_write_keeps_read_only_and_db_unavailable_gates() {
+    let config = TestConfig::default();
+    let db_flag = Arc::new(AtomicBool::new(false));
+    let read_only_state = AdminState {
+        db: None,
+        jwt_manager: create_test_jwt_manager(&config),
+        metrics_auth: Default::default(),
+        cached_config: None,
+        proxy_state: None,
+        mode: "database".to_string(),
+        read_only: true,
+        admin_audit_enabled: false,
+        admin_require_namespace_claim: false,
+        startup_ready: None,
+        serving_degraded: None,
+        serving_listener_failures: None,
+        db_available: Some(Arc::new(AtomicBool::new(true))),
+        config_rejected: None,
+        admin_restore_max_body_size_mib: 100,
+        admin_spec_max_body_size_mib: 25,
+        reserved_ports: std::collections::HashSet::new(),
+        stream_proxy_bind_address: "0.0.0.0".to_string(),
+        admin_allowed_cidrs: std::sync::Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::none(),
+        ),
+        cached_db_health: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None))),
+        db_health_refresh: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        dp_registry: None,
+        mesh_registry: None,
+        cp_connection_state: None,
+        admin_http_header_read_timeout_seconds: 10,
+        mesh_runtime_state: None,
+        admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
+        backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    };
+    let Err(read_only_err) = read_only_state.admit_non_config_db_write() else {
+        panic!("admit_non_config_db_write must honor read-only mode");
+    };
+    assert_eq!(read_only_err.status(), hyper::StatusCode::FORBIDDEN);
+
+    let unavailable_state = AdminState {
+        read_only: false,
+        db_available: Some(db_flag),
+        ..read_only_state
+    };
+    let Err(unavailable_err) = unavailable_state.admit_non_config_db_write() else {
+        panic!("admit_non_config_db_write must honor database-unavailable");
+    };
+    assert_eq!(
+        unavailable_err.status(),
+        hyper::StatusCode::SERVICE_UNAVAILABLE
+    );
 }
 
 #[tokio::test]
@@ -816,29 +877,42 @@ async fn test_admit_write_retains_pin_for_mutation_lifetime_on_primary() {
     assert!(!store.failover_topology_status().primary_active);
 }
 
-/// Every Admin API mutation path covered by the write gate must call
-/// `admit_write()` (topology pin). The sync `check_write_allowed()` remains
-/// observe-only for `/health` and policy tests.
+/// Config-database Admin mutation paths must call `admit_write()` (topology
+/// pin). Managed TLS/ACME handlers mutate independent stores and must call
+/// `admit_non_config_db_write()` instead. The sync `check_write_allowed()`
+/// remains observe-only for `/health` and policy tests.
 #[test]
 fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
-    let sources = [
-        include_str!("../../../src/admin/mod.rs"),
-        include_str!("../../../src/admin/crud.rs"),
-        include_str!("../../../src/admin/api_specs/handlers.rs"),
-        include_str!("../../../src/admin/tls_management.rs"),
+    let config_db_sources = [
+        ("mod.rs", include_str!("../../../src/admin/mod.rs")),
+        ("crud.rs", include_str!("../../../src/admin/crud.rs")),
+        (
+            "api_specs/handlers.rs",
+            include_str!("../../../src/admin/api_specs/handlers.rs"),
+        ),
     ];
-    let joined = sources.join("\n");
+    let tls_source = include_str!("../../../src/admin/tls_management.rs");
+
+    let joined = config_db_sources
+        .iter()
+        .map(|(_, src)| *src)
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         joined.contains("admit_write().await"),
-        "admin mutation handlers must call admit_write"
+        "config-database mutation handlers must call admit_write"
     );
-    // Handler call sites must not use the sync gate alone.
-    for (name, src) in [
-        ("mod.rs", sources[0]),
-        ("crud.rs", sources[1]),
-        ("api_specs/handlers.rs", sources[2]),
-        ("tls_management.rs", sources[3]),
-    ] {
+    assert!(
+        tls_source.contains("admit_non_config_db_write()"),
+        "managed TLS/ACME handlers must call admit_non_config_db_write"
+    );
+    assert!(
+        !tls_source.contains("admit_write().await"),
+        "managed TLS/ACME handlers must not pin sticky config-DB failover topology"
+    );
+
+    // Config-DB handler call sites must not use the sync gate alone.
+    for (name, src) in config_db_sources {
         for (idx, line) in src.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.contains("check_write_allowed()")
@@ -858,5 +932,15 @@ fn admin_mutation_handlers_use_admit_write_not_sync_gate_alone() {
                 );
             }
         }
+    }
+
+    // TLS/ACME must not regress to the sync observe-only gate either.
+    for (idx, line) in tls_source.lines().enumerate() {
+        let trimmed = line.trim();
+        assert!(
+            !trimmed.contains("state.check_write_allowed()"),
+            "tls_management.rs:{} must not call check_write_allowed; use admit_non_config_db_write:\n{trimmed}",
+            idx + 1
+        );
     }
 }

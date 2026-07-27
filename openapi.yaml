@@ -10191,11 +10191,14 @@ components:
         admin_writes_enabled:
           type: boolean
           description: |
-            `true` when the admin API will accept writes. `false` when the
-            admin API is in read-only mode, when the database is currently
-            unavailable, or when the active config-store pool is on a
-            `FERRUM_DB_FAILOVER_URLS` topology without
-            `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`. When `false` and
+            `true` when the admin API will accept **config-database** mutations
+            (proxies/upstreams/consumers/plugins/credentials/API specs/batch/
+            restore). `false` when the admin API is in read-only mode, when the
+            database is currently unavailable, or when the active config-store
+            pool is on a `FERRUM_DB_FAILOVER_URLS` topology without
+            `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`. This signal does **not** gate
+            managed TLS / ACME store mutations, which use independent stores and
+            only the read-only / database-unavailable gates. When `false` and
             read-only mode is not configured, `status` is forced to
             `degraded`.
         timestamp:
@@ -10959,13 +10962,14 @@ components:
       description: |
         Authenticated `/health` detail only. Present while the active config-store
         pool points at a `FERRUM_DB_FAILOVER_URLS` entry. URLs are always redacted
-        (no userinfo). When `allow_writes` is false (default), admin mutations
-        return 503 and `admin_writes_enabled` is false. When
-        `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, writes are permitted under the
-        operator's synchronously replicated multi-primary assertion; Ferrum
+        (no userinfo). When `allow_writes` is false (default), config-database
+        admin mutations return 503 and `admin_writes_enabled` is false. When
+        `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, those writes are permitted under
+        the operator's synchronously replicated multi-primary assertion; Ferrum
         allows automatic primary failback and emits one bounded process-local
         divergence-risk log for the window (not a durable fence; cleared by
-        restart). This object does not claim per-request mutation success.
+        restart). Managed TLS/ACME stores are independent and are not gated by
+        this topology. This object does not claim per-request mutation success.
       required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
       properties:
         primary_active:

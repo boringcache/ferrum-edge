@@ -256,10 +256,9 @@ pub(super) async fn handle_create_certificate(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCertificateRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -294,10 +293,9 @@ pub(super) async fn handle_update_certificate(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCertificateRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -336,10 +334,9 @@ pub(super) async fn handle_create_ca_bundle(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCaBundleRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -374,10 +371,9 @@ pub(super) async fn handle_update_ca_bundle(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCaBundleRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -415,10 +411,9 @@ pub(super) async fn handle_create_crl(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCrlRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -453,10 +448,9 @@ pub(super) async fn handle_update_crl(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedCrlRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -493,10 +487,9 @@ pub(super) async fn handle_create_ocsp_response(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedOcspResponseRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -531,10 +524,9 @@ pub(super) async fn handle_update_ocsp_response(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedOcspResponseRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -573,10 +565,9 @@ pub(super) async fn handle_create_jwks(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedJwksRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -610,10 +601,9 @@ pub(super) async fn handle_create_acme_certificate(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<AcmeCertificateRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -647,10 +637,9 @@ pub(super) async fn handle_create_acme_order(
     state: &AdminState,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     #[cfg(not(feature = "acme"))]
     {
         let _ = body_bytes;
@@ -696,10 +685,9 @@ pub(super) async fn handle_delete_acme_order(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let store = match acme_order_store_response() {
         Ok(store) => store,
         Err(response) => return Ok(*response),
@@ -718,10 +706,9 @@ pub(super) async fn handle_finalize_acme_order(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     #[cfg(not(feature = "acme"))]
     {
         let _ = (id, body_bytes);
@@ -881,10 +868,9 @@ pub(super) async fn handle_update_acme_certificate(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<AcmeCertificateRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -921,10 +907,9 @@ pub(super) async fn handle_delete_acme_certificate(
     state: &AdminState,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let usage = acme_certificate_usage(state, id);
     if !usage.is_empty() {
         return Ok(super::json_response(
@@ -957,10 +942,9 @@ pub(super) async fn handle_renew_acme_certificate(
     certificate_id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     #[cfg(not(feature = "acme"))]
     {
         let _ = (certificate_id, body_bytes);
@@ -1054,10 +1038,9 @@ pub(super) async fn handle_update_jwks(
     id: &str,
     body_bytes: &[u8],
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let request = match parse_json::<ManagedJwksRequest>(body_bytes) {
         Ok(request) => request,
         Err(response) => return Ok(*response),
@@ -1095,10 +1078,9 @@ pub(super) async fn handle_delete_managed(
     kind: ManagedTlsMaterialKind,
     id: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let _write_permit = match state.admit_write().await {
-        Ok(permit) => permit,
-        Err(response) => return Ok(response),
-    };
+    if let Err(response) = state.admit_non_config_db_write() {
+        return Ok(response);
+    }
     let usage = managed_record_usage(state, id);
     if !usage.is_empty() {
         return Ok(super::json_response(

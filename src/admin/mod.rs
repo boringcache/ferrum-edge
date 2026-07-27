@@ -456,6 +456,10 @@ impl AdminState {
     /// - If this pin wins first, reconnect publication waits (SQL) or
     ///   fail-fast defers (Mongo) until the permit drops, so the mutation
     ///   cannot silently land on a different topology.
+    ///
+    /// Use this for config-database mutations (CRUD, credentials, API specs,
+    /// batch, restore). Managed TLS / ACME handlers mutate independent stores
+    /// and must call [`Self::admit_non_config_db_write`] instead.
     pub async fn admit_write(
         &self,
     ) -> Result<crate::config::db_backend::DbWriteTopologyPermit, Response<Full<Bytes>>> {
@@ -476,6 +480,23 @@ impl AdminState {
             return Ok(permit);
         }
         Ok(crate::config::db_backend::DbWriteTopologyPermit::noop())
+    }
+
+    /// Admit a mutation that does **not** touch the sticky config-database
+    /// topology (managed TLS / ACME file stores).
+    ///
+    /// Applies the pre-existing non-topology Admin write gates (explicit
+    /// read-only mode and database-unavailable) only. Does **not** acquire a
+    /// config-DB write-topology pin and does **not** apply
+    /// `FERRUM_DB_FAILOVER_ALLOW_WRITES`, so slow ACME network work cannot
+    /// defer failover/failback and independent TLS stores are not gated by
+    /// sticky DB failover policy.
+    pub fn admit_non_config_db_write(&self) -> Result<(), Response<Full<Bytes>>> {
+        if let Some(response) = self.evaluate_non_topology_write_gate() {
+            Err(response)
+        } else {
+            Ok(())
+        }
     }
 
     fn evaluate_non_topology_write_gate(&self) -> Option<Response<Full<Bytes>>> {
@@ -1729,8 +1750,9 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Report whether admin writes are enabled (read_only flag + db_available
-        // + sticky failover write gate). Policy observation only.
+        // Report whether config-database admin writes are enabled (read_only
+        // flag + db_available + sticky failover write gate). Policy observation
+        // only; managed TLS/ACME stores use an independent non-topology gate.
         let writes_blocked = state.admin_writes_currently_blocked();
         health_status["admin_writes_enabled"] = json!(!writes_blocked);
         if writes_blocked && !state.read_only {

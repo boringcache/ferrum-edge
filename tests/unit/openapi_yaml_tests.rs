@@ -5987,6 +5987,12 @@ fn health_failover_topology_and_admin_writes_openapi_parity() {
             || admin_writes.contains("failover"),
         "admin_writes_enabled must document failover write blocking"
     );
+    assert!(
+        admin_writes.contains("config-database")
+            || admin_writes.contains("config-store")
+            || admin_writes.contains("managed TLS"),
+        "admin_writes_enabled must clarify it is the config-database mutation signal, not managed TLS/ACME"
+    );
 
     let topology_desc = spec["components"]["schemas"]["DatabaseFailoverTopology"]["description"]
         .as_str()
