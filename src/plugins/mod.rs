@@ -7908,10 +7908,13 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
-            config,
-            http_client.namespace(),
-        )?))),
+        "api_chargeback" => Ok(Some(Arc::new(
+            api_chargeback::ApiChargeback::new_with_shard_amount(
+                config,
+                http_client.namespace(),
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "api_chargeback_sink" => Ok(Some(Arc::new(
             api_chargeback_sink::ApiChargebackSink::new_with_config_id(
                 config,
