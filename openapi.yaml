@@ -16030,12 +16030,14 @@ components:
             bounded on three independent axes: per-nonce encoded length,
             retained entries, and retained key UTF-8 payload bytes counted once
             per shared immutable key allocation. An exact ordered age index
-            provides O(log n) expiry/oldest operations without a lookup-map
-            scan or stale queue. One request examines at most 64 indexed
-            entries; if that bounded work cannot make room the request fails
-            closed (HTTP 401) rather than accepting a nonce whose replay window
-            cannot be recorded. This is the only canonical shape; there is no
-            `nonce_replay_protection` alias.
+            provides O(log n) expiry operations without a lookup-map scan or
+            stale queue. Capacity maintenance reclaims only entries already
+            past cache_ttl_seconds and at most 64 of them per request; a nonce
+            inside its TTL is never evicted. If that bounded reclamation cannot
+            make room the request fails closed (HTTP 401) rather than accepting
+            a nonce whose replay window cannot be recorded or unprotecting one
+            that was already claimed. This is the only canonical shape; there
+            is no `nonce_replay_protection` alias.
           additionalProperties: false
           properties:
             cache_ttl_seconds:
@@ -16051,7 +16053,7 @@ components:
               default: 10000
               minimum: 1
               maximum: 1000000
-              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Expiry and exact-oldest eviction use an ordered age index and examine at most 64 entries per request.
+              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past cache_ttl_seconds. A nonce inside its TTL is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce.
             max_encoded_length:
               type: integer
               format: uint64
@@ -16065,7 +16067,7 @@ components:
               default: 8388608
               minimum: 4096
               maximum: 1073741824
-              description: Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length.
+              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside cache_ttl_seconds."
 
     CorsExactOrigin:
       oneOf:
