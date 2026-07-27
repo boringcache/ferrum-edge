@@ -223,9 +223,9 @@ impl RedisConfig {
     ) -> Result<Option<Self>, String> {
         // Value-redacted: config objects can carry redis_url / redis_password, so
         // diagnostics name the accepted shape without echoing the rejected value.
-        let object = config.as_object().ok_or_else(|| {
-            "redis rate limiter config must be a JSON object".to_string()
-        })?;
+        let object = config
+            .as_object()
+            .ok_or_else(|| "redis rate limiter config must be a JSON object".to_string())?;
 
         let sync_mode = parse_optional_string(object, "sync_mode")?
             .unwrap_or("local")
@@ -1916,6 +1916,17 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis compare-delete GET failed"
                 );
+                // WATCH already succeeded: attempt UNWATCH before failing closed.
+                // A failed UNWATCH is itself a failure; never retry on a new conn.
+                let unwatch: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                if let Err(unwatch_err) = unwatch {
+                    warn!(
+                        key = %key,
+                        error = %unwatch_err,
+                        "Redis UNWATCH failed"
+                    );
+                }
                 self.mark_unavailable();
                 return Err(());
             }
@@ -2020,6 +2031,17 @@ impl RedisRateLimitClient {
                     error = %e,
                     "Redis compare-and-set GET failed"
                 );
+                // WATCH already succeeded: attempt UNWATCH before failing closed.
+                // A failed UNWATCH is itself a failure; never retry on a new conn.
+                let unwatch: Result<(), redis::RedisError> =
+                    redis::cmd("UNWATCH").query_async(&mut conn).await;
+                if let Err(unwatch_err) = unwatch {
+                    warn!(
+                        key = %key,
+                        error = %unwatch_err,
+                        "Redis UNWATCH failed"
+                    );
+                }
                 self.mark_unavailable();
                 return Err(());
             }

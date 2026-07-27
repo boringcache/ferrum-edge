@@ -1109,6 +1109,11 @@ fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
             !impl_body.contains("ConnectionManager"),
             "{marker} implementation must not reference ConnectionManager"
         );
+        // Mismatch path + GET-error path must both attempt UNWATCH (fail closed).
+        assert!(
+            impl_body.matches("UNWATCH").count() >= 2,
+            "{marker} must UNWATCH on pre-MULTI mismatch and GET failure"
+        );
     }
 }
 
@@ -1275,6 +1280,25 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         assert!(
             !url_err.contains(secret),
             "redis_url diagnostic must not echo {secret:?}: {url_err}"
+        );
+    }
+
+    let parse_err = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": format!("not a url {USER}:{PASSWORD}?auth={TOKEN}"),
+        }),
+        "ferrum:test",
+    )
+    .expect_err("unparseable redis_url must be rejected");
+    assert!(
+        parse_err.contains("'redis_url'") && parse_err.contains("valid URL"),
+        "unexpected parse diagnostic: {parse_err}"
+    );
+    for secret in [PASSWORD, USER, TOKEN] {
+        assert!(
+            !parse_err.contains(secret),
+            "parse diagnostic must not echo {secret:?}: {parse_err}"
         );
     }
 }

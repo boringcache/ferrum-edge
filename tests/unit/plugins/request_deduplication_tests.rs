@@ -763,24 +763,43 @@ fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
     const PASSWORD: &str = "sentinel-dedup-redis-password-aa11";
     const USER: &str = "sentinel-dedup-redis-user-bb22";
 
-    let Err(error) = RequestDeduplication::new(
+    // No Redis-only keys: admission reaches RedisConfig sync_mode validation.
+    let Err(sync_error) = RequestDeduplication::new(
         &json!({
             "sync_mode": format!("redsi-{PASSWORD}"),
-            "redis_url": format!("redis://{USER}:{PASSWORD}@cache.internal:6379/0"),
-            "redis_password": PASSWORD,
         }),
         PluginHttpClient::default(),
     ) else {
         panic!("invalid sync_mode must be rejected");
     };
     assert!(
-        error.contains("'sync_mode'"),
-        "expected sync_mode diagnostic: {error}"
+        sync_error.contains("'sync_mode'") && sync_error.contains("'local' or 'redis'"),
+        "expected RedisConfig sync_mode diagnostic: {sync_error}"
     );
-    for secret in [PASSWORD, USER] {
+    assert!(
+        !sync_error.contains(PASSWORD),
+        "dedup sync_mode diagnostic must not echo sentinel: {sync_error}"
+    );
+
+    // Redis-only keys outside Redis mode: reject without echoing URL credentials.
+    let Err(mode_error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "local",
+            "redis_url": format!("redis://{USER}:{PASSWORD}@cache.internal:6379/0"),
+            "redis_password": PASSWORD,
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("Redis-only keys outside Redis mode must be rejected");
+    };
+    assert!(
+        mode_error.contains("require sync_mode='redis'"),
+        "expected redis-only-key diagnostic: {mode_error}"
+    );
+    for secret in [PASSWORD, USER, "cache.internal"] {
         assert!(
-            !error.contains(secret),
-            "dedup Redis diagnostic must not echo {secret:?}: {error}"
+            !mode_error.contains(secret),
+            "redis-only-key diagnostic must not echo {secret:?}: {mode_error}"
         );
     }
 
@@ -794,7 +813,7 @@ fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
         panic!("invalid redis_url scheme must be rejected");
     };
     assert!(
-        url_error.contains("'redis_url'"),
+        url_error.contains("'redis_url'") && url_error.contains("scheme"),
         "expected redis_url diagnostic: {url_error}"
     );
     for secret in [PASSWORD, USER, "http://", "cache.internal"] {
