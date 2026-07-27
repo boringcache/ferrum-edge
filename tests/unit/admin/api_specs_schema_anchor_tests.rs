@@ -518,10 +518,15 @@ fn inline_schema_ref_uses_its_own_id_as_base() {
         proxy = proxy_block()
     );
     let schema = first_request_schema(&spec);
-    assert_eq!(schema["$anchor"], "Target");
-    assert_eq!(schema["required"], json!(["scoped"]));
-    // `$ref` siblings are retained by the importer's existing merge contract.
+    // `$id` beside `$ref` stays on the referring Schema Object; the target is
+    // composed under `allOf` so adjacent identifiers cannot overwrite it.
     assert_eq!(schema["$id"], "https://example.com/scopes/wrapper.json");
+    assert_eq!(schema["allOf"][0]["$anchor"], "Target");
+    assert_eq!(schema["allOf"][0]["required"], json!(["scoped"]));
+    assert_eq!(
+        schema["allOf"][0]["$id"],
+        "https://example.com/scopes/target.json"
+    );
 }
 
 #[test]

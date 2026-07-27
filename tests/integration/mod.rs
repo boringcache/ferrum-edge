@@ -43,6 +43,7 @@ mod example_plugin_contract_tests;
 mod file_mode_admin_jwt_tests;
 mod file_mode_reload_observability_tests;
 mod frontend_tls_live_reload_tests;
+mod gateway_allowed_routes_selector_tests;
 mod gateway_hbone_pool_tests;
 mod gateway_svid_identity_tests;
 mod graceful_shutdown_tests;
@@ -91,6 +92,7 @@ mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;
 mod tcp_frontend_tls_order_tests;
+mod udp_hook_concurrency_tests;
 mod upstream_name_uniqueness_tests;
 mod vendor_integrity_tests;
 // websocket_gateway_test is a standalone binary (has fn main), not a test module
