@@ -221,9 +221,11 @@ impl RedisConfig {
         config: &serde_json::Value,
         default_prefix: &str,
     ) -> Result<Option<Self>, String> {
-        let object = config
-            .as_object()
-            .ok_or_else(|| format!("redis rate limiter config must be an object, got: {config}"))?;
+        // Value-redacted: config objects can carry redis_url / redis_password, so
+        // diagnostics name the accepted shape without echoing the rejected value.
+        let object = config.as_object().ok_or_else(|| {
+            "redis rate limiter config must be a JSON object".to_string()
+        })?;
 
         let sync_mode = parse_optional_string(object, "sync_mode")?
             .unwrap_or("local")
@@ -231,10 +233,11 @@ impl RedisConfig {
         let redis_enabled = match sync_mode.as_str() {
             "local" => false,
             "redis" => true,
-            other => {
-                return Err(format!(
-                    "redis rate limiter: 'sync_mode' must be 'local' or 'redis', got: {other:?}"
-                ));
+            _ => {
+                return Err(
+                    "redis rate limiter: 'sync_mode' must be exactly 'local' or 'redis'"
+                        .to_string(),
+                );
             }
         };
 
@@ -447,14 +450,19 @@ pub(crate) fn redact_url_userinfo(raw_url: &str) -> String {
 }
 
 fn validate_redis_url(raw_url: &str) -> Result<(), String> {
-    let parsed = Url::parse(raw_url)
-        .map_err(|e| format!("redis rate limiter: 'redis_url' must be a valid URL: {e}"))?;
+    // Never echo the rejected URL (or parse detail that might restate it): the
+    // field can carry userinfo credentials, query tokens, or fragments.
+    let parsed = Url::parse(raw_url).map_err(|_| {
+        "redis rate limiter: 'redis_url' must be a valid URL with scheme redis or rediss"
+            .to_string()
+    })?;
     match parsed.scheme() {
         "redis" | "rediss" => {}
-        scheme => {
-            return Err(format!(
-                "redis rate limiter: 'redis_url' scheme must be redis or rediss, got: {scheme}"
-            ));
+        _ => {
+            return Err(
+                "redis rate limiter: 'redis_url' scheme must be exactly 'redis' or 'rediss'"
+                    .to_string(),
+            );
         }
     }
     if !has_non_empty_authority(raw_url) || normalized_url_hostname(&parsed).is_none() {
@@ -842,10 +850,22 @@ impl RedisRateLimitClient {
         self.get_connection().await.is_some()
     }
 
-    /// Establish a dedicated ConnectionManager for tests.
+    /// Establish a dedicated non-reconnecting multiplexed connection for tests.
     #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_dedicated_for_test(&self) -> bool {
         self.get_dedicated_connection().await.is_some()
+    }
+
+    /// Type name of the concrete connection used by WATCH/MULTI/EXEC helpers.
+    ///
+    /// External tests assert this equals
+    /// `type_name::<redis::aio::MultiplexedConnection>()` and does not name
+    /// `ConnectionManager`. The production helper's return type is the
+    /// compile-time pin; changing it back to ConnectionManager fails either
+    /// this string check or the assignment in `get_dedicated_connection`.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn dedicated_watch_connection_type_name_for_test() -> &'static str {
+        std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
 
     /// Run one health-check-style multiplexed connect+PING for tests.
@@ -990,8 +1010,9 @@ impl RedisRateLimitClient {
 
     /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
     ///
-    /// Used by the health-check path (multiplexed connection, not ConnectionManager).
-    #[allow(dead_code)] // reachable only through public external-test support in binary builds
+    /// Used by the health-check path and by WATCH-transaction dedicated
+    /// connections (plain [`redis::aio::MultiplexedConnection`], never a
+    /// reconnecting [`redis::aio::ConnectionManager`]).
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
         redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
     }
@@ -1011,6 +1032,30 @@ impl RedisRateLimitClient {
         .await
         {
             Ok(Ok(manager)) => Ok(manager),
+            Ok(Err(error)) => Err(ConnectAttemptError::Redis(error)),
+            Err(_) => Err(ConnectAttemptError::Timeout),
+        }
+    }
+
+    /// Establish a non-reconnecting multiplexed connection with Ferrum's timeout
+    /// on both the inner redis-rs config and a defensive outer bound.
+    ///
+    /// Unlike [`Self::connect_manager`], this connection cannot transparently
+    /// replace its physical TCP session mid-sequence, so connection-local
+    /// `WATCH` state remains bound to the socket that observed it.
+    async fn connect_multiplexed(
+        &self,
+        client: redis::Client,
+    ) -> Result<redis::aio::MultiplexedConnection, ConnectAttemptError> {
+        let connect_timeout = self.connect_timeout();
+        let async_config = self.async_connection_config();
+        match tokio::time::timeout(
+            connect_timeout,
+            client.get_multiplexed_async_connection_with_config(&async_config),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => Ok(conn),
             Ok(Err(error)) => Err(ConnectAttemptError::Redis(error)),
             Err(_) => Err(ConnectAttemptError::Timeout),
         }
@@ -1117,13 +1162,27 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Create a one-off connection manager that is not stored in the shared hot-path cache.
+    /// Create a one-off non-reconnecting multiplexed connection that is not
+    /// stored in the shared hot-path cache.
     ///
-    /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/`EXEC`)
-    /// must not share the cached multiplexed managers with unrelated concurrent commands,
-    /// because another command sequence on that same manager can interleave `UNWATCH` or
-    /// `EXEC` and break the optimistic transaction boundary.
-    async fn get_dedicated_connection(&self) -> Option<redis::aio::ConnectionManager> {
+    /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/
+    /// `EXEC`) must:
+    /// 1. Not share a cached [`redis::aio::ConnectionManager`] with unrelated
+    ///    concurrent commands (another sequence on that manager can interleave
+    ///    `UNWATCH`/`EXEC` and break the optimistic transaction boundary).
+    /// 2. Not use [`redis::aio::ConnectionManager`] at all for the sequence —
+    ///    that type owns an `ArcSwap`-backed connection and can transparently
+    ///    reconnect (including after a RESP3 disconnect push). A reconnect
+    ///    between `WATCH` and `EXEC` yields a fresh physical socket with no
+    ///    watch state, so `EXEC` can become unconditional.
+    ///
+    /// This helper therefore returns a freshly dialed
+    /// [`redis::aio::MultiplexedConnection`] against the already
+    /// screened/redacted endpoint, using the same timeout/TLS/egress policy as
+    /// other connection creation. Callers must not clone or share it during the
+    /// transaction, and must fail closed on any I/O error rather than retrying
+    /// a partial transaction on a new connection.
+    async fn get_dedicated_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
             RedisEndpoint::EgressDenied => {
@@ -1155,10 +1214,10 @@ impl RedisRateLimitClient {
             }
         };
 
-        match self.connect_manager(client).await {
-            Ok(manager) => {
+        match self.connect_multiplexed(client).await {
+            Ok(conn) => {
                 self.available.store(true, Ordering::Relaxed);
-                Some(manager)
+                Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
@@ -1810,7 +1869,14 @@ impl RedisRateLimitClient {
     /// Uses optimistic transactions (`WATCH` + `MULTI`/`EXEC`) instead of Lua so
     /// RESP-compatible Redis backends that do not support scripting can still
     /// use ownership-token lock release.
+    ///
+    /// The transaction runs on a freshly dialed, non-reconnecting
+    /// [`redis::aio::MultiplexedConnection`] (never a
+    /// [`redis::aio::ConnectionManager`]) so connection-local `WATCH` state
+    /// cannot be silently dropped by a transparent reconnect. Any I/O failure
+    /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
+        // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
         let watch_result: Result<(), redis::RedisError> =
@@ -1830,8 +1896,17 @@ impl RedisRateLimitClient {
         match current {
             Ok(Some(current)) if current == expected => {}
             Ok(_) => {
-                let _: Result<(), redis::RedisError> =
+                let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
+                if let Err(e) = unwatch {
+                    warn!(
+                        key = %key,
+                        error = %e,
+                        "Redis UNWATCH failed"
+                    );
+                    self.mark_unavailable();
+                    return Err(());
+                }
                 self.available.store(true, Ordering::Relaxed);
                 return Ok(false);
             }
@@ -1880,10 +1955,10 @@ impl RedisRateLimitClient {
     /// This is the fencing primitive for ownership-token protocols: the caller
     /// writes an ownership record, performs work, and then publishes its result
     /// into the same key. Because the compare and the write happen inside one
-    /// `WATCH`/`MULTI`/`EXEC` transaction on a dedicated connection, an owner
-    /// whose record has since expired or been replaced by a successor can
-    /// neither overwrite the successor's value nor resurrect a key that Redis
-    /// already dropped:
+    /// `WATCH`/`MULTI`/`EXEC` transaction on a dedicated non-reconnecting
+    /// [`redis::aio::MultiplexedConnection`], an owner whose record has since
+    /// expired or been replaced by a successor can neither overwrite the
+    /// successor's value nor resurrect a key that Redis already dropped:
     ///
     /// - `Ok(true)` — the caller still owned the key and the new value is live.
     /// - `Ok(false)` — the key is missing, holds a different value, or was
@@ -1895,6 +1970,9 @@ impl RedisRateLimitClient {
     /// scripting still fence correctly (same rationale as
     /// [`Self::delete_if_value_matches`]). Only one key is touched, so the
     /// transaction is also slot-safe on sharded deployments.
+    ///
+    /// Any I/O failure at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed;
+    /// a partial transaction is never retried on a fresh connection.
     pub async fn set_bytes_with_expire_if_value_matches(
         &self,
         key: &str,
@@ -1902,6 +1980,7 @@ impl RedisRateLimitClient {
         value: &[u8],
         ttl_seconds: u64,
     ) -> Result<bool, ()> {
+        // Owned for the duration of the transaction; never cloned or shared.
         let mut conn = self.get_dedicated_connection().await.ok_or(())?;
 
         let watch_result: Result<(), redis::RedisError> =
@@ -1921,8 +2000,17 @@ impl RedisRateLimitClient {
         match current {
             Ok(Some(current)) if current == expected => {}
             Ok(_) => {
-                let _: Result<(), redis::RedisError> =
+                let unwatch: Result<(), redis::RedisError> =
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
+                if let Err(e) = unwatch {
+                    warn!(
+                        key = %key,
+                        error = %e,
+                        "Redis UNWATCH failed"
+                    );
+                    self.mark_unavailable();
+                    return Err(());
+                }
                 self.available.store(true, Ordering::Relaxed);
                 return Ok(false);
             }

@@ -730,17 +730,79 @@ fn redis_only_keys_outside_redis_mode_are_rejected() {
 
 #[test]
 fn on_redis_unavailable_requires_a_known_policy() {
+    const SENTINEL: &str = "sentinel-on-redis-unavailable-fallback-2d84";
     let Err(error) = RequestDeduplication::new(
         &json!({
             "sync_mode": "redis",
             "redis_url": "redis://host:6379",
-            "on_redis_unavailable": "fallback"
+            "on_redis_unavailable": SENTINEL
         }),
         PluginHttpClient::default(),
     ) else {
         panic!("unknown policy must be rejected");
     };
     assert!(error.contains("'on_redis_unavailable'"), "{error}");
+    assert!(
+        error.contains("'fail_closed'") && error.contains("'local_only'"),
+        "diagnostic must name accepted values: {error}"
+    );
+    assert!(
+        !error.contains(SENTINEL),
+        "diagnostic must not echo the rejected value: {error}"
+    );
+    assert!(
+        !error.contains("got:"),
+        "diagnostic must stay value-redacted: {error}"
+    );
+}
+
+/// request_deduplication's Redis admission path must not leak credential-bearing
+/// values through shared `RedisConfig` validation diagnostics.
+#[test]
+fn request_deduplication_redis_validation_diagnostics_are_value_redacted() {
+    const PASSWORD: &str = "sentinel-dedup-redis-password-aa11";
+    const USER: &str = "sentinel-dedup-redis-user-bb22";
+
+    let Err(error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": format!("redsi-{PASSWORD}"),
+            "redis_url": format!("redis://{USER}:{PASSWORD}@cache.internal:6379/0"),
+            "redis_password": PASSWORD,
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("invalid sync_mode must be rejected");
+    };
+    assert!(
+        error.contains("'sync_mode'"),
+        "expected sync_mode diagnostic: {error}"
+    );
+    for secret in [PASSWORD, USER] {
+        assert!(
+            !error.contains(secret),
+            "dedup Redis diagnostic must not echo {secret:?}: {error}"
+        );
+    }
+
+    let Err(url_error) = RequestDeduplication::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": format!("http://{USER}:{PASSWORD}@cache.internal:6379/0#{PASSWORD}"),
+        }),
+        PluginHttpClient::default(),
+    ) else {
+        panic!("invalid redis_url scheme must be rejected");
+    };
+    assert!(
+        url_error.contains("'redis_url'"),
+        "expected redis_url diagnostic: {url_error}"
+    );
+    for secret in [PASSWORD, USER, "http://", "cache.internal"] {
+        assert!(
+            !url_error.contains(secret),
+            "dedup redis_url diagnostic must not echo {secret:?}: {url_error}"
+        );
+    }
 }
 
 /// GHSA-f72h-jm2p-mc73: an unreachable coordination store must not silently

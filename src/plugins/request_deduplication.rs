@@ -889,11 +889,13 @@ impl RequestDeduplication {
             None => RedisUnavailablePolicy::FailClosed,
             Some("fail_closed") => RedisUnavailablePolicy::FailClosed,
             Some("local_only") => RedisUnavailablePolicy::LocalOnly,
-            Some(other) => {
-                return Err(format!(
-                    "request_deduplication: 'on_redis_unavailable' must be exactly 'fail_closed' \
-                     or 'local_only', got: {other:?}"
-                ));
+            Some(_) => {
+                // Value-redacted: the rejected string can be a mistyped secret.
+                return Err(
+                    "request_deduplication: 'on_redis_unavailable' must be exactly \
+                     'fail_closed' or 'local_only'"
+                        .to_string(),
+                );
             }
         };
         let shard_amount = http_client.pool_shard_amount();
