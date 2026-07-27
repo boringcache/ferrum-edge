@@ -713,3 +713,121 @@ fn health_check_fallback_propagates_construction_failure_without_panic() {
         "health-check fallback must not re-enable ambient proxies via Client::new()"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Redacted execution APIs — advisory GHSA-8594-2xhc-8g38
+//
+// Every HTTP-backed observability sink whose endpoint may embed a credential
+// funnels through one of these two helpers. The literal-IP egress denial, the
+// retry warning, and the slow-call warning are all emitted inside this client,
+// so proving redaction here proves it for every such caller at once.
+// ---------------------------------------------------------------------------
+
+/// The credential-bearing components a sink endpoint may legitimately hold.
+const URL_PATH_SENTINEL: &str = "shared-client-path-token-canary";
+const URL_QUERY_SENTINEL: &str = "shared-client-query-key-canary";
+
+fn sentinel_url(base: &str) -> String {
+    format!("{base}/receiver/{URL_PATH_SENTINEL}?apikey={URL_QUERY_SENTINEL}")
+}
+
+fn assert_url_sentinels_absent(logs: &str, context: &str) {
+    for sentinel in [URL_PATH_SENTINEL, URL_QUERY_SENTINEL] {
+        assert!(
+            !logs.contains(sentinel),
+            "{context} leaked {sentinel:?}: {logs}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execute_redacted_hides_literal_ip_egress_denial_url() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+
+    let url = sentinel_url("http://169.254.169.254");
+    let req = client.get().post(&url).body("batch");
+    let response = client
+        .execute_redacted(req, "sink_test", "http://169.254.169.254/redacted")
+        .await
+        .expect("a denied literal IP is surfaced as a 502, not an error");
+    assert_eq!(response.status(), 502);
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("denied literal-IP endpoint"),
+        "the denial diagnostic must have been emitted: {captured}"
+    );
+    assert!(captured.contains("http://169.254.169.254/redacted"));
+    assert_url_sentinels_absent(&captured, "egress denial diagnostic");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execute_with_redacted_url_hides_literal_ip_egress_denial_url() {
+    use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy};
+
+    // `api_chargeback_sink` uses this variant so it can classify the typed
+    // `reqwest::Error` itself; it must redact exactly like `execute_redacted`.
+    let (logs, guard) = super::plugin_utils::capture_logs();
+    let policy = BackendEgressPolicy::from_env(BackendAllowIps::Both, "", "", true).unwrap();
+    let client = PluginHttpClient::default_with_backend_allow_ips(policy);
+
+    let url = sentinel_url("http://169.254.169.254");
+    let req = client.get().post(&url).body("rows");
+    let response = client
+        .execute_with_redacted_url(req, "chargeback_test", "http://169.254.169.254/redacted")
+        .await
+        .expect("a denied literal IP is surfaced as a 502, not an error");
+    assert_eq!(response.status(), 502);
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("denied literal-IP endpoint"),
+        "the denial diagnostic must have been emitted: {captured}"
+    );
+    assert_url_sentinels_absent(&captured, "egress denial diagnostic");
+}
+
+/// Slow-call and retry warnings are emitted from the same code path for both
+/// redacted helpers; a dead port with `slow_threshold_ms = 0` triggers both.
+#[tokio::test(flavor = "current_thread")]
+async fn redacted_transport_failure_slow_and_retry_warnings_hide_the_url() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let client = PluginHttpClient::from_pool_config_with_settings(
+        &ferrum_edge::config::PoolConfig::default(),
+        0, // every call is "slow"
+        2, // retries enabled for GET
+        1,
+    );
+    let url = sentinel_url(&format!("http://{addr}"));
+    let redacted = format!("http://{addr}/redacted");
+
+    // GET so the retry path is eligible.
+    let req = client.get().get(&url);
+    let error = client
+        .execute_redacted(req, "sink_test", &redacted)
+        .await
+        .expect_err("a dead port must fail");
+    assert!(
+        !error.contains(URL_PATH_SENTINEL) && !error.contains(URL_QUERY_SENTINEL),
+        "the returned error must be sanitized: {error}"
+    );
+
+    drop(guard);
+    let captured = logs.contents();
+    assert!(
+        captured.contains("Retrying plugin HTTP call") || captured.contains("Slow plugin HTTP call"),
+        "retry and/or slow-call diagnostics must have been emitted: {captured}"
+    );
+    assert_url_sentinels_absent(&captured, "transport failure diagnostics");
+}

@@ -58,7 +58,8 @@ pub use byte_budget::{
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{
     BatchConfigDefaults, HttpBatchDrainOutcome, build_batch_config, drain_http_batch_response_body,
-    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    handle_http_batch_response, handle_http_batch_response_redacted, parse_custom_headers,
+    parse_http_endpoint, redacted_endpoint_url, redacted_endpoint_url_str, validate_batch_config,
 };
 pub use summary_log_budget::{
     QueuedSummaryPayload, admit_http_summary, admit_stream_summary, assemble_json_array,

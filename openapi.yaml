@@ -12341,7 +12341,16 @@ components:
       properties:
         endpoint_url:
           type: string
-          description: URL to POST transaction logs to
+          description: >-
+            URL to POST transaction logs to. Must be http:// or https:// with a
+            hostname or IP address; userinfo credentials
+            (https://user:pass@host) are rejected — authenticate with
+            custom_headers. Some collectors require a credential in the URL
+            (Sumo Logic path token, Mezmo apikey query parameter), so this value
+            is never rendered in operational output: egress-denial, DNS/TLS,
+            retry, slow-call, and batch-failure diagnostics show only a
+            structurally redacted scheme://host:port/redacted form, and the
+            admin audit projection redacts it the same way.
         custom_headers:
           type: object
           additionalProperties:
@@ -19999,7 +20008,7 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form, and the admin audit projection redacts it the same way."
             allow_insecure_loopback:
               type: boolean
               default: false
@@ -22515,6 +22524,17 @@ components:
                 `async_insert` is enabled and the wait setting is omitted, the
                 sink pins `wait_for_async_insert=1` rather than inheriting the
                 ClickHouse user/profile default.
+
+                Credential-bearing parameter names are rejected: the exact names
+                `user`, `password`, `access_token`, and `session_id`, plus any
+                name containing `apikey`, `api_key`, `credential`, `passwd`,
+                `secret`, or `token`. Authenticate with `username` and
+                `password_ref`, which are sent as an HTTP Basic header rather
+                than appended to the INSERT URL. Parameter values stay arbitrary
+                bounded strings, so the sink never renders the INSERT query
+                string in any diagnostic; failures report a structurally
+                redacted `scheme://host:port/redacted` endpoint. Admin audit
+                projections redact every value in this map.
             allow_lossy_async_insert:
               type: boolean
               default: false

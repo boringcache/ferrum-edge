@@ -238,6 +238,51 @@ pub fn validate_batch_config(
     admit_batch_fields(config, plugin_name, defaults).map(|_| ())
 }
 
+/// Placeholder host used when a diagnostic URL cannot name its own host.
+///
+/// Only reachable for a `Url` with no host component. Every caller here has
+/// already passed [`parse_http_endpoint`] (or an equivalent authority check),
+/// so this is a defensive constant rather than an expected rendering.
+const REDACTED_HOST_PLACEHOLDER: &str = "redacted-host";
+
+/// Structurally redacted rendering of a collector endpoint for diagnostics.
+///
+/// Keeps only scheme, host, and explicit port — the components an operator
+/// needs to identify *which* sink is failing — and replaces the entire
+/// path/query/fragment with a fixed `/redacted` segment. Userinfo is dropped
+/// outright.
+///
+/// This is **structural, not substring-based**: nothing from the configured
+/// path or query is copied into the result, so a credential anywhere in those
+/// components (a Sumo Logic path token, a Mezmo `apikey` query parameter, a
+/// ClickHouse setting) cannot survive into a log line, a tracing field, an
+/// error string, or retained diagnostic metadata. Callers keep the complete
+/// URL only for the actual network request.
+///
+/// `loki_logging::redacted_endpoint_url` and
+/// `otel_tracing::redacted_endpoint_url` delegate here so every HTTP-backed
+/// sink renders one identical form.
+pub fn redacted_endpoint_url(endpoint: &Url) -> String {
+    let host = endpoint.host_str().unwrap_or(REDACTED_HOST_PLACEHOLDER);
+    let port = endpoint
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{}{}/redacted", endpoint.scheme(), host, port)
+}
+
+/// [`redacted_endpoint_url`] for an endpoint still held as a string.
+///
+/// A value that does not parse yields a scheme-less fixed sentinel rather than
+/// any part of the input, so a malformed endpoint cannot smuggle its own text
+/// into diagnostics.
+pub fn redacted_endpoint_url_str(endpoint_url: &str) -> String {
+    match Url::parse(endpoint_url) {
+        Ok(parsed) => redacted_endpoint_url(&parsed),
+        Err(_) => format!("{REDACTED_HOST_PLACEHOLDER}/redacted"),
+    }
+}
+
 pub fn parse_http_endpoint(
     config: &Value,
     plugin_name: &'static str,
@@ -266,6 +311,25 @@ pub fn parse_http_endpoint(
     if !has_non_empty_authority(&endpoint_url) {
         return Err(format!(
             "{plugin_name}: 'endpoint_url' must include a hostname or IP address"
+        ));
+    }
+
+    // URL userinfo is a reusable credential with no redaction-safe rendering
+    // and no protocol need here: every supported collector authenticates with a
+    // header (`custom_headers`) or, where the vendor requires it, a path/query
+    // token that diagnostics render structurally redacted. Accepting userinfo
+    // would put a password in the configured value that operators reasonably
+    // expect to be echoable. Reject it at the boundary instead.
+    //
+    // Wording matches `loki_logging` / `otel_tracing` / `ws_logging`, which
+    // each already reject userinfo with their own message. Loki's check now
+    // runs after this one and is retained as defense in depth; keeping one
+    // phrase means an operator (and the settled tests) see the same rejection
+    // whichever boundary fires first.
+    if !parsed_url.username().is_empty() || parsed_url.password().is_some() {
+        return Err(format!(
+            "{plugin_name}: 'endpoint_url' must not contain user information; \
+             use custom_headers instead"
         ));
     }
 
@@ -412,10 +476,39 @@ fn has_non_empty_authority(endpoint_url: &str) -> bool {
 /// [`HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES`] and
 /// [`HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT`] so HTTP/1.1 keep-alive connections can
 /// be reused. Peer-controlled body bytes are never logged or retained.
+///
+/// Retained for sinks whose endpoint cannot carry a credential and for the
+/// shared drain/classification tests; the observability sinks covered by
+/// advisory GHSA-8594-2xhc-8g38 use
+/// [`handle_http_batch_response_redacted`] instead.
+#[allow(dead_code)] // No in-binary caller remains; used by tests/unit/plugins/
 pub async fn handle_http_batch_response(
     plugin_label: &str,
     entry_count: usize,
     result: Result<reqwest::Response, reqwest::Error>,
+) -> Result<(), String> {
+    match result {
+        Ok(response) => {
+            let status = response.status();
+            let drain = drain_http_batch_response_body(response).await;
+            classify_http_batch_response(plugin_label, entry_count, status, drain)
+        }
+        Err(error) => Err(format!("{plugin_label} batch failed: {error}")),
+    }
+}
+
+/// [`handle_http_batch_response`] for sinks whose endpoint may embed a
+/// credential in its path or query.
+///
+/// Takes the already-sanitized `Err` string produced by
+/// [`PluginHttpClient::execute_redacted`](super::PluginHttpClient::execute_redacted)
+/// — an error class plus a structurally redacted URL — instead of a
+/// `reqwest::Error`, whose `Display` prints the complete request URL. Success
+/// classification is byte-identical to the unredacted helper.
+pub async fn handle_http_batch_response_redacted(
+    plugin_label: &str,
+    entry_count: usize,
+    result: Result<reqwest::Response, String>,
 ) -> Result<(), String> {
     match result {
         Ok(response) => {

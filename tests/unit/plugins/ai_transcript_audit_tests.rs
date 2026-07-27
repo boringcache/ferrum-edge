@@ -9844,3 +9844,114 @@ async fn streamed_transaction_pays_one_request_capture() {
     assert!(records[0]["request_hash"].is_string());
     assert!(records[0]["response_hash"].is_string());
 }
+
+// ---------------------------------------------------------------------------
+// Sink endpoint credential redaction — advisory GHSA-8594-2xhc-8g38
+//
+// `sink.endpoint_url` may legitimately carry a reusable collector credential in
+// its path or query. It must never reach a diagnostic surface.
+// ---------------------------------------------------------------------------
+
+const SINK_PATH_SENTINEL: &str = "transcript-path-token-canary";
+const SINK_QUERY_SENTINEL: &str = "transcript-query-key-canary";
+
+fn sentinel_sink_endpoint(base: &str) -> String {
+    format!("{base}/audit/{SINK_PATH_SENTINEL}?apikey={SINK_QUERY_SENTINEL}")
+}
+
+fn assert_sink_sentinels_absent(logs: &str, context: &str) {
+    super::plugin_utils::assert_no_secrets(
+        logs,
+        context,
+        &[SINK_PATH_SENTINEL, SINK_QUERY_SENTINEL],
+    );
+}
+
+#[tokio::test]
+async fn sink_endpoint_url_rejects_userinfo_credentials() {
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url":
+                format!("https://audit:{SINK_PATH_SENTINEL}@collector.example.com/ingest"),
+        }
+    });
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .expect_err("userinfo credentials must be rejected at construction");
+
+    assert!(
+        err.contains("must not contain user information"),
+        "rejection must name the problem: {err}"
+    );
+    assert_sink_sentinels_absent(&err, "ai_transcript_audit userinfo rejection");
+}
+
+#[tokio::test]
+async fn malformed_sink_endpoint_rejection_does_not_echo_credentials() {
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": sentinel_sink_endpoint("ftp://collector.example.com"),
+        }
+    });
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .expect_err("non-HTTP scheme must be rejected");
+
+    assert!(err.contains("http:// or https://"), "got: {err}");
+    assert_sink_sentinels_absent(&err, "ai_transcript_audit scheme rejection");
+}
+
+/// Connect failure, retry, and slow-call diagnostics on a dead loopback port.
+///
+/// `slow_threshold_ms = 0` forces the slow-call warning and `max_retries = 2`
+/// forces the retry warning on the same failing request, so one fixture covers
+/// three of the advisory's failure classes at once.
+#[tokio::test(flavor = "current_thread")]
+async fn sink_delivery_failure_diagnostics_are_redacted() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let client = PluginHttpClient::from_pool_config_with_settings(
+        &PoolConfig::default(),
+        0, // every call is "slow"
+        2, // retries enabled
+        1,
+    );
+    let endpoint = sentinel_sink_endpoint(&format!("http://{addr}"));
+    let plugin = AiTranscriptAudit::new(&config_with_sink(&endpoint, json!({})), client)
+        .expect("sentinel endpoint is a valid configuration");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    for _ in 0..100 {
+        if logs.contents().contains("ai_transcript_audit") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(plugin);
+    drop(guard);
+
+    let captured = logs.contents();
+    assert!(
+        !captured.is_empty(),
+        "the failing flush must produce a diagnostic to inspect"
+    );
+    assert_sink_sentinels_absent(&captured, "ai_transcript_audit delivery failure");
+    assert!(
+        !captured.contains("/audit/"),
+        "no raw credential-bearing path may survive: {captured}"
+    );
+}
