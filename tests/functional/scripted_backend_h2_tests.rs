@@ -2629,6 +2629,18 @@ async fn pooled_h2_goaway_canceled_send_retries_buffered_unary() {
         backend.step_errors().await,
         harness.captured_combined().unwrap_or_default()
     );
+    let saw_grpc_retry = |logs: &str| logs.contains("Retrying gRPC backend request");
+    let logs = harness
+        .wait_for_log_contains(&saw_grpc_retry, Duration::from_secs(5))
+        .await;
+    assert!(
+        saw_grpc_retry(&logs),
+        "the second RPC must exercise the DispatchCanceled retry path, not merely \
+         succeed after a proactive pool redial; accepted={}\n\
+         --- captured gateway output ---\n{}",
+        backend.accepted_connections(),
+        logs
+    );
     assert!(
         backend.accepted_connections() >= 2,
         "retry must dial a fresh backend connection after DispatchCanceled; \
