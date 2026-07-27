@@ -1715,7 +1715,11 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
                 .expect("bounded streaming relay region")
         })
         .collect();
-    assert_eq!(relays.len(), 3, "three plain native/refined streaming relays");
+    assert_eq!(
+        relays.len(),
+        3,
+        "three plain native/refined streaming relays"
+    );
     for relay in &relays {
         let map_write = relay
             .find(r#".entry("content-type".to_string())"#)
