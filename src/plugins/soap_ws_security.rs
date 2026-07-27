@@ -629,6 +629,9 @@ impl NonceReplayState {
     }
 }
 
+// The binary target compiles this module without the library's `_test_support`
+// facade, so this external-test observation type is intentionally unused there.
+#[allow(dead_code)]
 pub(crate) struct NonceReplayObservationForTests {
     pub(crate) entry_count: usize,
     pub(crate) age_index_entry_count: usize,
@@ -1588,6 +1591,9 @@ impl SoapWsSecurity {
         Ok(state.has_capacity(incoming_bytes, max_entries, max_bytes))
     }
 
+    // These seams are consumed through `lib::_test_support`; the binary target
+    // compiles the shared plugin module without that facade.
+    #[allow(dead_code)]
     pub(crate) fn check_nonce_replay_at_for_tests(
         &self,
         nonce: &str,
@@ -1596,6 +1602,7 @@ impl SoapWsSecurity {
         self.check_nonce_replay_at(nonce, now)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn nonce_replay_observation_for_tests(
         &self,
     ) -> Result<NonceReplayObservationForTests, String> {
@@ -1638,6 +1645,7 @@ impl SoapWsSecurity {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn corrupt_nonce_age_index_for_tests(&self) -> Result<(), String> {
         let mut state = self
             .nonce_replay
