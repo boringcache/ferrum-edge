@@ -85,9 +85,25 @@ failures. They close the client side without dialing the backend or recording a
 backend circuit-breaker failure.
 
 The deliberate exception is operator-enabled HTTP/3 0-RTT early data
-(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled,
-Ferrum permits only configured replay-safe methods and forwards `Early-Data: 1`
-so backends can apply their own replay policy.
+(`FERRUM_TLS_EARLY_DATA_METHODS`), which is disabled by default. When enabled
+for HTTP/3 without frontend mTLS, Ferrum sets the QUIC TLS early-data size to
+`u32::MAX` (quinn/rustls require `0` or `2^32-1`; a finite TLS byte cap is not
+available on QUIC), permits only configured replay-safe methods, and forwards
+`Early-Data: 1` so backends can apply their own replay policy. HTTPS/H1/H2
+currently keep rustls 0-RTT disabled until per-request early-data state is
+available, so the method allowlist does not enable a TCP TLS early-data byte cap
+either.
+
+0-RTT and frontend mTLS are mutually exclusive on the HTTP/3 listener. When
+`FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` is set, the H3 listener sets QUIC
+rustls `max_early_data_size` to `0` and never takes quinn's 0.5-RTT accept path.
+Accepting the connection before the peer's `Certificate` flight would leave
+`peer_identity()` unknowable for the connection's lifetime, while accepting
+client early data only after the full handshake would lose the replay-state
+signal needed by the method gate. `FERRUM_TLS_EARLY_DATA_METHODS` is therefore
+inert for HTTP/3 on such a listener (a startup warning says so); ordinary 1-RTT
+H3 mTLS keeps working and `mtls_auth` / `spiffe_identity` receive the presented
+client certificate.
 
 ## Configuration Scenarios
 
@@ -600,7 +616,7 @@ The gateway supports fine-grained control over TLS protocol versions, cipher sui
 | `FERRUM_TLS_CIPHER_SUITES` | *(see defaults below)* | Comma-separated cipher suites (inbound + outbound) |
 | `FERRUM_TLS_KEY_EXCHANGE_GROUPS` | *(see defaults below)* | Comma-separated key exchange groups (inbound + outbound). `FERRUM_TLS_CURVES` is accepted as an alias |
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | `true` | Server cipher preference for TLS 1.2 (inbound only) |
-| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Session ID cache for TLS 1.2 resumption (inbound only) |
+| `FERRUM_TLS_SESSION_CACHE_SIZE` | `4096` | Inbound stateful session cache for TLS 1.2 session IDs and HTTP/3 server 0-RTT sessions |
 
 ### Protocol Version Examples
 
@@ -715,7 +731,7 @@ When using load balancers:
 ## Performance Considerations
 
 - **TLS Handshake Overhead**: Initial connections have higher latency
-- **Session Resumption**: Enabled by default. TLS 1.3 uses stateless session tickets (auto-rotating keys, unlimited capacity). TLS 1.2 falls back to a stateful session ID cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` (default 4096). Resumption saves 1 RTT on reconnections. 0-RTT early data is disabled for security (replay risk).
+- **Session Resumption**: Enabled by default. TLS 1.3 normally uses stateless auto-rotating tickets; HTTP/3 uses the bounded stateful cache sized by `FERRUM_TLS_SESSION_CACHE_SIZE` when server 0-RTT is explicitly enabled on a non-mTLS listener, because rustls requires stateful resumption for early data. TLS 1.2 uses the same bound for its stateful session ID cache. Resumption saves 1 RTT on reconnections. 0-RTT remains disabled by default because of replay risk.
 - **Hardware Acceleration**: Consider for high-throughput scenarios
 - **Certificate Size**: Smaller certificates improve performance
 
