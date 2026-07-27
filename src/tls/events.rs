@@ -19,6 +19,7 @@ use crate::tls::source::subscription::{MaterialFingerprintEntry, WatchedMaterial
 use crate::tls::source::{CertSource, MaterialKind, SourceScheme};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
+#[cfg(not(test))]
 const EVENT_LOG_FILE_NAME: &str = "tls-events.json";
 #[cfg(not(test))]
 const DEFAULT_EVENT_STORE_DIR: &str = "./ferrum-managed-tls";

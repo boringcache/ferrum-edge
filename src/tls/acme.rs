@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+#[cfg(feature = "acme")]
 use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;

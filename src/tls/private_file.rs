@@ -120,20 +120,20 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-fn write_private_file_inner(path: &Path, bytes: &[u8], file: &mut File) -> io::Result<()> {
+fn write_private_file_inner(_path: &Path, bytes: &[u8], file: &mut File) -> io::Result<()> {
     #[cfg(test)]
     match injected_fault() {
         PrivateFileFault::Write => {
             return Err(io::Error::other(format!(
                 "injected fault: failed to write private temp file '{}'",
-                path.display()
+                _path.display()
             )));
         }
         PrivateFileFault::Sync => {
             file.write_all(bytes)?;
             return Err(io::Error::other(format!(
                 "injected fault: failed to fsync private temp file '{}'",
-                path.display()
+                _path.display()
             )));
         }
         PrivateFileFault::None
