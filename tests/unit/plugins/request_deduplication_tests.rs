@@ -2401,49 +2401,120 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
 /// protection when the replay TTL is shorter than the in-flight lease.
 #[tokio::test]
 async fn oversized_external_operation_barrier_outlives_short_replay_ttl() {
+    for (label, config) in [
+        (
+            "entry",
+            json!({
+                "ttl_seconds": 1,
+                "inflight_ttl_seconds": 60,
+                "max_entry_size_bytes": 1,
+                "max_total_size_bytes": 8192
+            }),
+        ),
+        (
+            "total",
+            json!({
+                "ttl_seconds": 1,
+                "inflight_ttl_seconds": 60,
+                "max_entry_size_bytes": 8192,
+                "max_total_size_bytes": 1
+            }),
+        ),
+    ] {
+        let plugin = make_plugin(config);
+        let key = format!("long-lease-{label}");
+        let mut owner_ctx = new_ctx("POST", "/api");
+        let mut owner_headers =
+            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        assert!(matches!(
+            plugin
+                .before_proxy(&mut owner_ctx, &mut owner_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        owner_ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        assert!(matches!(
+            plugin
+                .on_final_response_body(&mut owner_ctx, 200, &HashMap::new(), b"executed")
+                .await,
+            PluginResult::Continue
+        ));
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+        let mut retry_ctx = new_ctx("POST", "/api");
+        let mut retry_headers = HashMap::from([("idempotency-key".to_string(), key)]);
+        assert!(
+            matches!(
+                plugin
+                    .before_proxy(&mut retry_ctx, &mut retry_headers)
+                    .await,
+                PluginResult::Reject {
+                    status_code: 409,
+                    ..
+                }
+            ),
+            "{label} size-skip barrier expired at ttl_seconds instead of inflight_ttl_seconds"
+        );
+    }
+}
+
+/// Total-capacity skip overflow must also retain the in-flight lease when replay
+/// TTL is shorter than `inflight_ttl_seconds`.
+#[tokio::test]
+async fn total_capacity_barrier_overflow_outlives_short_replay_ttl() {
     let plugin = make_plugin(json!({
+        "max_entries": 1,
         "ttl_seconds": 1,
         "inflight_ttl_seconds": 60,
-        "max_entry_size_bytes": 1,
-        "max_total_size_bytes": 8192
+        "max_entry_size_bytes": 8192,
+        "max_total_size_bytes": 1
     }));
-    let mut owner_ctx = new_ctx("POST", "/api");
-    let mut owner_headers =
-        HashMap::from([("idempotency-key".to_string(), "long-lease".to_string())]);
-    assert!(matches!(
-        plugin
-            .before_proxy(&mut owner_ctx, &mut owner_headers)
-            .await,
-        PluginResult::Continue
-    ));
-    owner_ctx.metadata.insert(
-        EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-    assert!(matches!(
-        plugin
-            .on_final_response_body(&mut owner_ctx, 200, &HashMap::new(), b"executed")
-            .await,
-        PluginResult::Continue
-    ));
+
+    for key in ["total-overflow-a", "total-overflow-b"] {
+        let mut owner_ctx = new_ctx("POST", "/api");
+        let mut owner_headers =
+            HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        assert!(matches!(
+            plugin
+                .before_proxy(&mut owner_ctx, &mut owner_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        owner_ctx.metadata.insert(
+            EXTERNAL_OPERATION_COMPLETED_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        assert!(matches!(
+            plugin
+                .on_final_response_body(&mut owner_ctx, 200, &HashMap::new(), b"executed")
+                .await,
+            PluginResult::Continue
+        ));
+    }
 
     tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
 
-    let mut retry_ctx = new_ctx("POST", "/api");
-    let mut retry_headers =
-        HashMap::from([("idempotency-key".to_string(), "long-lease".to_string())]);
-    assert!(
-        matches!(
-            plugin
-                .before_proxy(&mut retry_ctx, &mut retry_headers)
-                .await,
-            PluginResult::Reject {
-                status_code: 409,
-                ..
-            }
+    let mut blocked_ctx = new_ctx("POST", "/api");
+    let mut blocked_headers =
+        HashMap::from([("idempotency-key".to_string(), "total-overflow-c".to_string())]);
+    match plugin
+        .before_proxy(&mut blocked_ctx, &mut blocked_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 503);
+            assert!(body.contains("execution-barrier capacity"));
+        }
+        other => panic!(
+            "total-capacity barrier overflow must fail closed past ttl_seconds: {other:?}"
         ),
-        "the size-skip barrier expired at ttl_seconds instead of inflight_ttl_seconds"
-    );
+    }
 }
 
 /// Per-key execution barriers are hard-capped. Additional completed operations
