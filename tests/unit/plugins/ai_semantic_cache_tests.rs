@@ -739,10 +739,7 @@ async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets()
         .mount(&mock_server)
         .await;
 
-    let http_client = PluginHttpClient::from_pool_config_with_threshold(
-        &PoolConfig::default(),
-        50,
-    );
+    let http_client = PluginHttpClient::from_pool_config_with_threshold(&PoolConfig::default(), 50);
     let plugin = AiSemanticCache::new(
         &semantic_endpoint_config(format!(
             "{}/{path_secret}/embeddings?token={query_secret}",
@@ -764,7 +761,10 @@ async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets()
     drop(guard);
 
     let logs = writer.contents();
-    assert!(logs.contains("Slow plugin HTTP call"), "expected slow-call log: {logs}");
+    assert!(
+        logs.contains("Slow plugin HTTP call"),
+        "expected slow-call log: {logs}"
+    );
     for secret in [path_secret, query_secret] {
         assert!(
             !logs.contains(secret),
