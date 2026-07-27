@@ -1171,3 +1171,208 @@ fn virtual_service_fault_documentation_names_route_local_translation() {
     assert!(mesh.contains("Per-rule fault percentages are not RTDS-tunable"));
     assert!(!configuration.contains("fault` injection maps to proxy-scoped `fault_injection`"));
 }
+
+// ── Peer-departure cancellation (GHSA-484w-rxg2-7jg5) ────────────────
+//
+// These exercise the `RequestContext::peer_connection` boundary the HTTP/3
+// frontend stamps. They deliberately avoid the process-global shutdown token:
+// cancelling a one-shot global from a test would disarm every other
+// fault-delay assertion in this binary.
+
+mod peer_departure {
+    use super::*;
+    use ferrum_edge::plugins::{PeerConnectionSignal, PeerConnectionWatch};
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// Test double for a frontend transport watch. Mirrors the HTTP/3 QUIC
+    /// connection-close watch: observable without touching request bytes.
+    struct TestPeerWatch {
+        gone: CancellationToken,
+    }
+
+    impl PeerConnectionWatch for TestPeerWatch {
+        fn closed(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let gone = self.gone.clone();
+            Box::pin(async move { gone.cancelled().await })
+        }
+
+        fn is_closed(&self) -> bool {
+            self.gone.is_cancelled()
+        }
+    }
+
+    fn ctx_with_peer(gone: &CancellationToken) -> RequestContext {
+        let mut ctx = make_ctx();
+        ctx.peer_connection = Some(PeerConnectionSignal::new(Arc::new(TestPeerWatch {
+            gone: gone.clone(),
+        })));
+        ctx
+    }
+
+    /// The advisory's core amplifier: a client that reaches a long delay and
+    /// immediately disappears must not keep the request parked.
+    #[tokio::test]
+    async fn peer_departure_during_a_long_delay_abandons_the_request() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 60_000_u64, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let gone = CancellationToken::new();
+        let mut ctx = ctx_with_peer(&gone);
+
+        let closer = gone.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            closer.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let result = run_before_proxy(&plugin, &mut ctx).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the delay must end when the peer leaves, took {elapsed:?}"
+        );
+        match result {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 499, "client-closed-request convention");
+                assert!(body.is_empty(), "no body is owed to a departed client");
+            }
+            other => panic!("expected a 499 reject, got {other:?}"),
+        }
+        assert_eq!(ctx.metadata.get("fault_delay_outcome").unwrap(), "peer_gone");
+        assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
+        assert_eq!(ctx.metadata.get("fault_delay_ms").unwrap(), "60000");
+    }
+
+    /// An already-dead transport must not even consume a budget slot.
+    #[tokio::test]
+    async fn an_already_closed_peer_short_circuits_before_the_timer() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 60_000_u64, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let gone = CancellationToken::new();
+        gone.cancel();
+        let mut ctx = ctx_with_peer(&gone);
+
+        let start = std::time::Instant::now();
+        let result = run_before_proxy(&plugin, &mut ctx).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        assert!(matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 499,
+                ..
+            }
+        ));
+        assert_eq!(ctx.metadata.get("fault_delay_outcome").unwrap(), "peer_gone");
+    }
+
+    /// A departed peer preempts a co-triggered abort: the abort's status is a
+    /// response nobody can read, so the request is abandoned instead.
+    #[tokio::test]
+    async fn peer_departure_preempts_a_co_triggered_abort() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "abort": { "status_code": 503, "percentage": 100.0, "body": "injected" },
+            "delay": { "duration_ms": 60_000_u64, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let gone = CancellationToken::new();
+        gone.cancel();
+        let mut ctx = ctx_with_peer(&gone);
+
+        match run_before_proxy(&plugin, &mut ctx).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 499);
+                assert!(body.is_empty());
+            }
+            other => panic!("expected a 499 reject, got {other:?}"),
+        }
+        assert!(
+            ctx.metadata.get("fault_abort_status").is_none(),
+            "the abort must not also fire for a departed client"
+        );
+    }
+
+    /// A live peer must be entirely unaffected — no early exit, no new
+    /// metadata, and the ordinary delay/abort semantics preserved.
+    #[tokio::test]
+    async fn a_live_peer_still_gets_the_configured_delay() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 1, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let gone = CancellationToken::new();
+        let mut ctx = ctx_with_peer(&gone);
+
+        let start = std::time::Instant::now();
+        let result = run_before_proxy(&plugin, &mut ctx).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(start.elapsed().as_millis() >= 1);
+        assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
+        assert_eq!(ctx.metadata.get("fault_delay_ms").unwrap(), "1");
+        assert!(
+            ctx.metadata.get("fault_delay_outcome").is_none(),
+            "a completed delay must not add an outcome field"
+        );
+    }
+
+    /// A percentage miss must not consult the peer watch or park anything,
+    /// no matter how many times the same connection re-requests.
+    #[tokio::test]
+    async fn repeated_streams_that_miss_the_roll_never_park() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 60_000_u64, "percentage": 1e-300 }
+        }))
+        .unwrap();
+
+        let gone = CancellationToken::new();
+        let start = std::time::Instant::now();
+        for _ in 0..64 {
+            let mut ctx = ctx_with_peer(&gone);
+            let result = run_before_proxy(&plugin, &mut ctx).await;
+            assert!(matches!(result, PluginResult::Continue));
+            assert!(ctx.metadata.get("fault_delay_ms").is_none());
+            assert!(ctx.metadata.get("fault_delay_outcome").is_none());
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "misses must not wait"
+        );
+    }
+
+    /// Requests without a frontend watch (HTTP/1.1, HTTP/2) keep their
+    /// pre-existing behavior exactly.
+    #[tokio::test]
+    async fn a_context_without_a_peer_watch_is_unchanged() {
+        let plugin = FaultInjectionPlugin::new(&json!({
+            "delay": { "duration_ms": 1, "percentage": 100.0 }
+        }))
+        .unwrap();
+
+        let mut ctx = make_ctx();
+        assert!(ctx.peer_connection.is_none());
+
+        let result = run_before_proxy(&plugin, &mut ctx).await;
+
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(ctx.metadata.get("fault_type").unwrap(), "delay");
+        assert!(ctx.metadata.get("fault_delay_outcome").is_none());
+    }
+}
