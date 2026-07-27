@@ -1236,9 +1236,7 @@ fn is_ambiguous_legacy_numeric_ipv4_host(host: &str) -> bool {
         component
             .strip_prefix("0x")
             .or_else(|| component.strip_prefix("0X"))
-            .is_some_and(|hex| {
-                !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-            })
+            .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
     };
 
     if !host.contains('.') {
@@ -1330,9 +1328,7 @@ fn parse_acme_https_endpoint(raw: &str, label: &'static str) -> Result<url::Url,
     let raw_host = uri
         .host()
         .filter(|host| !host.is_empty())
-        .ok_or_else(|| {
-            AcmeError::BlockedDirectoryUrl(format!("{label} must include a host"))
-        })?;
+        .ok_or_else(|| AcmeError::BlockedDirectoryUrl(format!("{label} must include a host")))?;
     let parsed = url::Url::parse(raw).map_err(|_| {
         AcmeError::BlockedDirectoryUrl(format!("{label} must be a valid absolute URL"))
     })?;
@@ -3573,9 +3569,8 @@ mod tests {
             );
         }
 
-        let error =
-            validate_acme_directory_url_ssrf_policy("https://1.2.3.0x4/private-resource")
-                .expect_err("mixed-base host must be rejected");
+        let error = validate_acme_directory_url_ssrf_policy("https://1.2.3.0x4/private-resource")
+            .expect_err("mixed-base host must be rejected");
         assert!(
             !error.to_string().contains("1.2.3.0x4"),
             "rejection must not disclose the endpoint host"
