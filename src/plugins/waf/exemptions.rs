@@ -39,7 +39,12 @@ impl CompiledExemptions {
         let object = config
             .as_object()
             .ok_or_else(|| "waf: global_exemptions must be an object".to_string())?;
-        reject_unknown_keys(object, "config.global_exemptions", GLOBAL_EXEMPTION_KEYS, "waf: ")?;
+        reject_unknown_keys(
+            object,
+            "config.global_exemptions",
+            GLOBAL_EXEMPTION_KEYS,
+            "waf: ",
+        )?;
 
         let paths = optional_string_vec(object, "paths")?.unwrap_or_default();
         let path_set = if paths.is_empty() {

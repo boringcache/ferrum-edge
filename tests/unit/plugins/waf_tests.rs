@@ -1505,10 +1505,7 @@ fn unknown_keys_are_rejected_before_defaults_weaken_policy() {
             err.contains("unknown configuration key"),
             "{label}: expected unknown-key error, got {err}"
         );
-        assert!(
-            err.contains(path),
-            "{label}: expected path {path} in {err}"
-        );
+        assert!(err.contains(path), "{label}: expected path {path} in {err}");
         if let Some(hint) = suggestion {
             assert!(
                 err.contains(hint),

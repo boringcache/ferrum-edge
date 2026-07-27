@@ -1635,13 +1635,11 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
     }
 
     assert_eq!(
-        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["scoring"]
-            ["additionalProperties"],
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["scoring"]["additionalProperties"],
         json!(false)
     );
     assert_eq!(
-        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]
-            ["additionalProperties"],
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["additionalProperties"],
         json!(false)
     );
 
@@ -1659,8 +1657,8 @@ fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
         "rule_overrides must remain an open rule-id map of closed objects"
     );
     assert_eq!(
-        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
-            ["additionalProperties"]["additionalProperties"],
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]["additionalProperties"]
+            ["additionalProperties"],
         json!(false),
         "rule_overrides values must be closed"
     );
