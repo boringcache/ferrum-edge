@@ -249,6 +249,11 @@ impl ScriptedGrpcBackend {
         self.inner.handshakes_completed()
     }
 
+    /// Scripts currently blocked in `AcceptRpc` / `ExpectHeaders`.
+    pub fn acceptors_waiting(&self) -> u32 {
+        self.inner.acceptors_waiting()
+    }
+
     /// Every RPC observed by `AcceptRpc`, in arrival order.
     pub async fn received_streams(&self) -> Vec<ReceivedStream> {
         self.inner.received_streams().await

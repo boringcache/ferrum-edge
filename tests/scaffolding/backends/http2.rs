@@ -461,6 +461,13 @@ impl ScriptedH2Backend {
         self.state.handshakes.load(Ordering::SeqCst)
     }
 
+    /// Number of connection scripts currently blocked in `ExpectHeaders`
+    /// waiting for an inbound stream. Non-zero means the fixture has armed
+    /// at least that many acceptors after handshake.
+    pub fn acceptors_waiting(&self) -> u32 {
+        self.state.acceptors_waiting.load(Ordering::SeqCst)
+    }
+
     /// Request headers (and any drained body) for every stream the script
     /// accepted via `ExpectHeaders`. Streams are in arrival order.
     pub async fn received_streams(&self) -> Vec<ReceivedStream> {
@@ -541,6 +548,10 @@ impl Drop for ScriptedH2Backend {
 struct H2State {
     accepted: AtomicU32,
     handshakes: AtomicU32,
+    /// Scripts currently blocked in `ExpectHeaders` / `AcceptRpc` waiting for
+    /// the next inbound stream. Tests that must not race a cold pooled sender
+    /// against an unarmed acceptor poll this before sending traffic.
+    acceptors_waiting: AtomicU32,
     stream_count: AtomicU32,
     stream_resets: AtomicU32,
     matcher_mismatches: AtomicU32,
@@ -726,7 +737,13 @@ async fn run_script(
                     current_body_sender = None;
                     let _previous = current_stream.take();
 
+                    // Publish "acceptor armed" before parking on the channel so
+                    // tests can wait for a real AcceptRpc/ExpectHeaders barrier
+                    // instead of guessing after handshake or sleeping past a
+                    // teardown race on a dying pooled sender.
+                    state.acceptors_waiting.fetch_add(1, Ordering::SeqCst);
                     let pair = stream_rx.recv().await;
+                    state.acceptors_waiting.fetch_sub(1, Ordering::SeqCst);
                     match pair {
                         Some((req, send)) => {
                             let received = parse_request_head(&req);
