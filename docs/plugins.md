@@ -2687,8 +2687,8 @@ ring of aggregate count buckets (`SLIDING_WINDOW_BUCKET_COUNT = 64`) per key, so
 per-key memory stays O(1) in the request cap; the request-cap bound is an
 operational ceiling on budgets and Redis/header arithmetic, not a timestamp-log
 size limit. The `rate_limiting`, `graphql`, `grpc_method_router`, and
-`udp_rate_limiting` roots reject unknown keys. The `ai_rate_limiter` and
-`ws_rate_limiting` roots remain intentionally open for forward-compatible
+`udp_rate_limiting`, and `ws_rate_limiting` roots reject unknown keys. The
+`ai_rate_limiter` root remains intentionally open for forward-compatible
 fields, consistently in runtime admission and OpenAPI.
 
 At least one rate window must be configured in every rule. Do not combine the custom-window pair with preset `requests_per_*` fields in the same rule. When multiple preset windows are configured in a rule, each request must satisfy ALL windows. Consumer identities are matched against the effective identity used by the plugin: mapped Consumer username first, then external authenticated identity.
@@ -5597,7 +5597,7 @@ parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
 
 **Priority:** 2910
 

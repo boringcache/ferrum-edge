@@ -1825,6 +1825,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     use ferrum_edge::plugins::utils::rate_limit::{
         MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
     };
+    use ferrum_edge::plugins::ws_rate_limiting::WS_RATE_LIMITING_CONFIG_KEYS;
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1833,6 +1834,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
         ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
         ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("WsRateLimitingConfig", WS_RATE_LIMITING_CONFIG_KEYS),
     ] {
         let schema = spec
             .pointer(&format!("/components/schemas/{schema_name}"))
@@ -1855,20 +1857,18 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         );
     }
 
-    // The typo advisory's affected-component list is limited to ordinary HTTP,
-    // GraphQL, and gRPC-method limiter roots. AI and WebSocket remain
-    // intentionally open in runtime admission, so OpenAPI must not close them.
-    for schema_name in ["AiRateLimiterConfig", "WsRateLimitingConfig"] {
-        let schema = spec
-            .pointer(&format!("/components/schemas/{schema_name}"))
-            .unwrap_or_else(|| panic!("{schema_name} component exists"));
-        assert!(
-            schema
-                .get("additionalProperties")
-                .is_none_or(|value| value == &json!(true)),
-            "{schema_name} must remain open in parity with runtime admission"
-        );
-    }
+    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
+    // limiter roots. AI remains intentionally open in runtime admission, so
+    // OpenAPI must not close it.
+    let ai_schema = spec
+        .pointer("/components/schemas/AiRateLimiterConfig")
+        .expect("AiRateLimiterConfig component exists");
+    assert!(
+        ai_schema
+            .get("additionalProperties")
+            .is_none_or(|value| value == &json!(true)),
+        "AiRateLimiterConfig must remain open in parity with runtime admission"
+    );
 
     let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
     let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);
