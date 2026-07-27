@@ -9172,9 +9172,11 @@ components:
         bucket. Redis mode (`sync_mode: "redis"`) externalizes those
         per-connection counters under a per-plugin/gateway-instance key
         namespace; it does not coordinate a portable frame budget across
-        gateway instances, reconnects, or plugin rebuilds. Counter storage
-        supports only local memory and Redis; database-backed counters are
-        intentionally unsupported.
+        gateway instances, reconnects, or plugin rebuilds. Unknown top-level keys
+        are rejected by the runtime and by this schema. Counter storage supports
+        only local memory and Redis; database-backed counters are intentionally
+        unsupported.
+      additionalProperties: false
       properties:
         frames_per_second:
           type: integer
@@ -9239,10 +9241,12 @@ components:
           description: Redis password
         redis_connect_timeout_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Redis connection timeout in seconds
         redis_health_check_interval_seconds:
           type: integer
+          minimum: 1
           default: 5
           description: Health check ping interval when Redis is unavailable
 

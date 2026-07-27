@@ -1822,6 +1822,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
     use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
     use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
+    use ferrum_edge::plugins::ws_rate_limiting::WS_RATE_LIMITING_CONFIG_KEYS;
     use ferrum_edge::plugins::utils::rate_limit::{
         MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
     };
@@ -1833,6 +1834,7 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
         ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
         ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("WsRateLimitingConfig", WS_RATE_LIMITING_CONFIG_KEYS),
     ] {
         let schema = spec
             .pointer(&format!("/components/schemas/{schema_name}"))
@@ -1855,10 +1857,10 @@ fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
         );
     }
 
-    // The typo advisory's affected-component list is limited to ordinary HTTP,
-    // GraphQL, and gRPC-method limiter roots. AI and WebSocket remain
-    // intentionally open in runtime admission, so OpenAPI must not close them.
-    for schema_name in ["AiRateLimiterConfig", "WsRateLimitingConfig"] {
+    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
+    // limiter roots. AI remains intentionally open in runtime admission, so
+    // OpenAPI must not close it.
+    for schema_name in ["AiRateLimiterConfig"] {
         let schema = spec
             .pointer(&format!("/components/schemas/{schema_name}"))
             .unwrap_or_else(|| panic!("{schema_name} component exists"));
