@@ -477,6 +477,9 @@ impl AdminState {
                     }),
                 ));
             }
+            if !topology.primary_active {
+                db.note_failover_admin_write();
+            }
             return Ok(permit);
         }
         Ok(crate::config::db_backend::DbWriteTopologyPermit::noop())

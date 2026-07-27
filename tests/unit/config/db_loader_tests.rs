@@ -2374,10 +2374,9 @@ fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) 
 }
 
 #[tokio::test]
-async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
-    // Issue #3001 contract B: default fail-closed admin writes on failover;
-    // opt-in permits writes and allows automatic primary failback with a
-    // process-local divergence-risk marker (no durable fence).
+async fn failover_write_gate_fences_primary_after_opt_in_admission() {
+    // Issue #3001: default fail-closed Admin writes on failover; an admitted
+    // opt-in mutation fences automatic primary failback.
     use ferrum_edge::config::db_backend::DatabaseBackend;
 
     let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2436,29 +2435,33 @@ async fn failover_write_gate_allows_failback_with_opt_in_risk_marker() {
     .execute(&store.pool())
     .await
     .unwrap();
+    store.note_failover_admin_write();
 
-    // Primary is reachable: failback is allowed under contract B. The
-    // process-local opt-in risk marker is cleared on mark_primary; operators
-    // rely on the bounded failback log (and sync multi-primary assertion).
-    let active = store
+    // Even though primary is reachable, the store must retain the failover
+    // snapshot after a mutation admission there.
+    let error = store
         .try_failover_reconnect(&primary_rw_url)
         .await
-        .expect("primary failback must proceed under opt-in contract B");
-    assert_eq!(active, primary_rw_url);
+        .expect_err("primary failback must be refused after the admission");
     assert!(
-        store.failover_topology_status().primary_active,
-        "store must return to primary after successful failback"
+        error
+            .to_string()
+            .contains("Refusing primary database failback")
     );
     assert!(
-        !store
+        !store.failover_topology_status().primary_active,
+        "the stale primary must not replace the failover topology"
+    );
+    assert!(
+        store
             .failover_topology_status()
             .opt_in_writes_enabled_during_window,
-        "failback must clear the process-local window marker"
+        "the failover window remains active"
     );
     assert_eq!(
         store.list_namespaces().await.unwrap(),
-        vec!["primary-ns".to_string()],
-        "after failback the active topology is the primary snapshot"
+        vec!["failover-ns".to_string()],
+        "the failover-side write must remain visible"
     );
 }
 

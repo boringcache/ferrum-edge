@@ -707,7 +707,7 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
     assert!(!status.opt_in_writes_enabled_during_window);
     assert!(!status.allow_writes);
 
-    // Failback is always allowed under contract B (no write-admission fence).
+    // Failback remains allowed when no Admin mutation was admitted.
     state.mark_primary("sqlite:///tmp/primary.db");
     assert!(state.primary_active());
     assert!(!state.status().opt_in_writes_enabled_during_window);
@@ -732,11 +732,11 @@ fn failover_topology_state_transitions_and_opt_in_risk_marker() {
         Some("sqlite:///tmp/failover-2.db")
     );
 
-    // Failback clears the window and remains allowed even after opt-in.
-    state.mark_primary("postgres://***/***/ferrum");
-    assert!(state.primary_active());
-    assert!(!state.status().opt_in_writes_enabled_during_window);
-    assert!(state.status().failover_since_unix_ms.is_none());
+    // Opt-in alone does not fence failback, but an admitted mutation does.
+    assert!(state.ensure_primary_failback_allowed().is_ok());
+    state.note_admin_write();
+    assert!(state.ensure_primary_failback_allowed().is_err());
+    assert!(!state.primary_active());
 }
 
 #[test]
