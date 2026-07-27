@@ -705,6 +705,69 @@ fn cache_record_failed_attempt_is_scoped_to_its_namespace() {
 }
 
 #[test]
+fn mesh_tcp_egress_connection_accounting_uses_namespaced_balancer() {
+    let tenant_a_target = UpstreamTarget {
+        host: "10.0.0.1".into(),
+        port: 15008,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    let tenant_b_target = UpstreamTarget {
+        host: "10.0.0.2".into(),
+        port: 15008,
+        service_port_policy_key: None,
+        weight: 1,
+        tags: HashMap::new(),
+        locality: None,
+        path: None,
+    };
+    let mut tenant_a = make_upstream("shared", vec![tenant_a_target.clone()]);
+    tenant_a.namespace = "tenant-a".to_string();
+    tenant_a.algorithm = LoadBalancerAlgorithm::LeastConnections;
+    let mut tenant_b = make_upstream("shared", vec![tenant_b_target.clone()]);
+    tenant_b.namespace = "tenant-b".to_string();
+    tenant_b.algorithm = LoadBalancerAlgorithm::LeastConnections;
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![tenant_a, tenant_b],
+        ..Default::default()
+    });
+
+    assert_eq!(
+        ferrum_edge::_test_support::mesh_tcp_egress_connection_accounting_for_test(
+            &cache,
+            "tenant-a",
+            "shared",
+            &tenant_a_target,
+        ),
+        Some((1, 0)),
+        "tenant A's raw-TCP session must increment and release its own balancer"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::mesh_tcp_egress_connection_accounting_for_test(
+            &cache,
+            "tenant-b",
+            "shared",
+            &tenant_b_target,
+        ),
+        Some((1, 0)),
+        "tenant B's same-ID upstream must retain independent accounting"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::mesh_tcp_egress_connection_accounting_for_test(
+            &cache,
+            "tenant-c",
+            "shared",
+            &tenant_a_target,
+        ),
+        None,
+        "an absent namespace must fail closed instead of matching a bare upstream id"
+    );
+}
+
+#[test]
 fn test_least_latency_no_data_falls_back_to_round_robin() {
     // When latency_ewma has been initialized but no samples recorded (all UNSET),
     // warm-up round-robin should be used.

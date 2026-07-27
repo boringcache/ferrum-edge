@@ -47,6 +47,7 @@ pub mod http2_pool;
 mod mesh_egress_observability;
 pub mod mesh_mtls_pool;
 mod mesh_tcp_egress;
+pub(crate) use mesh_tcp_egress::connection_balancer as mesh_tcp_egress_connection_balancer;
 mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;

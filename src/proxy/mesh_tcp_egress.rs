@@ -51,7 +51,7 @@ use super::{
     tcp_proxy,
 };
 use crate::identity::SpiffeId;
-use crate::load_balancer::LoadBalancerCache;
+use crate::load_balancer::{LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner};
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpEgressEntry;
 
@@ -177,11 +177,11 @@ pub(crate) async fn handle_mesh_tcp_egress(
 
     // Least-connection accounting parity with the HTTP relay path. Held across
     // the transport-specific dial and the relay; dropped on any early return.
-    let balancer = epoch
-        .load_balancer
-        .balancers()
-        .get(&entry.upstream_id)
-        .cloned();
+    let balancer = connection_balancer(
+        &epoch.load_balancer,
+        &proxy.namespace,
+        &entry.upstream_id,
+    );
     let _lb_guard = LoadBalancerConnectionGuard::new(Some(Arc::clone(&target)), balancer);
 
     // Select the transport from the target's tag (mutually exclusive — the
@@ -441,6 +441,20 @@ pub(crate) async fn handle_mesh_tcp_egress(
             "Raw-TCP mesh egress relay completed"
         );
     }
+}
+
+/// Resolve the balancer that owns raw-TCP mesh egress connection accounting.
+///
+/// Balancer snapshots are keyed by `(namespace, upstream_id)`. Keeping this
+/// lookup behind the typed accessor prevents same-ID tenants from aliasing and
+/// avoids allocating a runtime key on the connection hot path.
+#[inline]
+pub(crate) fn connection_balancer(
+    snapshot: &LoadBalancerCacheInner,
+    namespace: &str,
+    upstream_id: &str,
+) -> Option<Arc<LoadBalancer>> {
+    snapshot.balancer(namespace, upstream_id).cloned()
 }
 
 fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {

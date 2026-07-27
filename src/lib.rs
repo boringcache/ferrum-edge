@@ -3660,6 +3660,34 @@ pub mod _test_support {
         crate::proxy::body::inspected_streaming_body(rx)
     }
 
+    pub fn mesh_tcp_egress_connection_accounting_for_test(
+        cache: &crate::load_balancer::LoadBalancerCache,
+        namespace: &str,
+        upstream_id: &str,
+        target: &crate::config::types::UpstreamTarget,
+    ) -> Option<(i64, i64)> {
+        let snapshot = cache.load_inner();
+        let balancer =
+            crate::proxy::mesh_tcp_egress_connection_balancer(&snapshot, namespace, upstream_id)?;
+        let target_key = crate::load_balancer::target_host_port_key(target);
+        let guard = crate::proxy::LoadBalancerConnectionGuard::new(
+            Some(Arc::new(target.clone())),
+            Some(Arc::clone(&balancer)),
+        );
+        let during = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        drop(guard);
+        let after = balancer
+            .active_connections
+            .get(&target_key)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        Some((during, after))
+    }
+
     pub fn h3_plugin_protocol_for_request_for_test(
         flavor: crate::config::types::HttpFlavor,
         grpc_web_request: bool,
