@@ -1488,7 +1488,7 @@ impl DtlsServer {
                                 verified_peer_cert = true;
                             }
                             peer_cert_chain_der = (chain.len() > 1)
-                                .then(|| Arc::new(chain[1..].iter().cloned().collect()));
+                                .then(|| Arc::new(chain[1..].to_vec()));
                         }
                         Output::ApplicationData(data)
                             if app_out_tx.send(data.to_vec()).await.is_err() =>
