@@ -4080,3 +4080,84 @@ async fn mirror_metrics_count_concurrency_drops() {
         "the saturated second attempt is a concurrency drop: {m:?}"
     );
 }
+
+#[test]
+fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() {
+    use ferrum_edge::plugins::{plugin_failure_policy, validate_plugin_config};
+    use ferrum_edge::plugins::request_mirror::REQUEST_MIRROR_CONFIG_KEYS;
+
+    assert_eq!(
+        plugin_failure_policy("request_mirror"),
+        Some(ferrum_edge::plugins::PluginFailurePolicy::KeepLastKnownGood)
+    );
+
+    for (typo, canonical) in [
+        ("mirror_request_bdy", "mirror_request_body"),
+        ("percetage", "percentage"),
+        ("mirror_protcol", "mirror_protocol"),
+    ] {
+        assert!(
+            REQUEST_MIRROR_CONFIG_KEYS.contains(&canonical),
+            "fixture must target a recognized key: {canonical}"
+        );
+        let mut config = json!({"mirror_host": "mirror.local"});
+        config
+            .as_object_mut()
+            .expect("object")
+            .insert(typo.to_string(), json!(false));
+        let err = RequestMirror::new(&config, PluginHttpClient::default())
+            .err()
+            .unwrap_or_else(|| panic!("expected unknown-key rejection for {typo}"));
+        assert!(
+            err.contains("unknown configuration key"),
+            "missing unknown-key wording: {err}"
+        );
+        assert!(err.contains(typo), "error must name the typo: {err}");
+        assert!(
+            err.contains("allowed keys"),
+            "error must list the allowed-key contract: {err}"
+        );
+        assert!(
+            err.contains("did you mean"),
+            "typo diagnostics should include a suggestion for {typo}: {err}"
+        );
+        assert!(
+            err.contains(canonical),
+            "suggestion should name the canonical key {canonical}: {err}"
+        );
+        for key in REQUEST_MIRROR_CONFIG_KEYS {
+            assert!(err.contains(key), "missing allowed key {key} in: {err}");
+        }
+
+        let shared = validate_plugin_config("request_mirror", &config)
+            .expect_err("shared admission must reject the same typo");
+        assert!(shared.contains(typo), "got: {shared}");
+    }
+
+    let arbitrary = json!({
+        "mirror_host": "mirror.local",
+        "zzz_arbitrary_unknown": true
+    });
+    let err = RequestMirror::new(&arbitrary, PluginHttpClient::default())
+        .err()
+        .expect("arbitrary unknown key must be rejected");
+    assert!(err.contains("zzz_arbitrary_unknown"), "got: {err}");
+    assert!(err.contains("allowed keys"), "got: {err}");
+}
+
+#[test]
+fn test_request_mirror_rejects_multiple_unknown_keys_sorted() {
+    let err = RequestMirror::new(
+        &json!({
+            "mirror_host": "mirror.local",
+            "zzz_extra": true,
+            "aaa_extra": false
+        }),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("multiple unknown keys must be rejected");
+    let aaa = err.find("aaa_extra").expect("aaa_extra");
+    let zzz = err.find("zzz_extra").expect("zzz_extra");
+    assert!(aaa < zzz, "unknown keys should be sorted: {err}");
+}

@@ -4988,6 +4988,72 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[test]
+fn request_mirror_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::request_mirror::{REQUEST_MIRROR_CONFIG_KEYS, RequestMirror};
+    use ferrum_edge::plugins::{PluginHttpClient, validate_plugin_config};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/RequestMirrorConfig")
+        .expect("RequestMirrorConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("RequestMirrorConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = REQUEST_MIRROR_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(documented, runtime, "request_mirror runtime/OpenAPI key drift");
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let mirror_docs = plugin_docs
+        .split("### `request_mirror`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("request_mirror docs section");
+    for key in REQUEST_MIRROR_CONFIG_KEYS {
+        assert!(
+            mirror_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md request_mirror section missing `{key}`"
+        );
+    }
+    assert!(mirror_docs.contains("KeepLastKnownGood"));
+    assert!(mirror_docs.contains("allowed-key"));
+
+    let valid = json!({
+        "mirror_host": "mirror.local",
+        "mirror_protocol": "https",
+        "percentage": 0,
+        "mirror_request_body": false
+    });
+    assert_component_validity(&spec, "RequestMirrorConfig", &valid, true);
+    assert!(
+        RequestMirror::new(&valid, PluginHttpClient::default()).is_ok(),
+        "valid request_mirror config must construct"
+    );
+    assert!(validate_plugin_config("request_mirror", &valid).is_ok());
+
+    let typo = json!({
+        "mirror_host": "mirror.local",
+        "mirror_protcol": "https",
+        "percentage": 0,
+        "mirror_request_body": false
+    });
+    assert_component_validity(&spec, "RequestMirrorConfig", &typo, false);
+    let err = RequestMirror::new(&typo, PluginHttpClient::default())
+        .expect_err("misspelled protocol key must fail admission");
+    assert!(err.contains("mirror_protcol"), "got: {err}");
+    assert!(err.contains("allowed keys"), "got: {err}");
+    validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
+}
+
 #[tokio::test]
 async fn load_testing_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
