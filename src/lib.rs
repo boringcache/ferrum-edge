@@ -1085,11 +1085,7 @@ pub mod _test_support {
             self.plugin.check_nonce_replay(nonce)
         }
 
-        pub fn claim_at(
-            &self,
-            nonce: &str,
-            elapsed: std::time::Duration,
-        ) -> Result<(), String> {
+        pub fn claim_at(&self, nonce: &str, elapsed: std::time::Duration) -> Result<(), String> {
             let now = self
                 .epoch
                 .checked_add(elapsed)

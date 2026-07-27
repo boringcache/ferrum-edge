@@ -580,12 +580,7 @@ impl NonceReplayState {
         }
     }
 
-    fn has_capacity(
-        &self,
-        incoming_bytes: usize,
-        max_entries: usize,
-        max_bytes: usize,
-    ) -> bool {
+    fn has_capacity(&self, incoming_bytes: usize, max_entries: usize, max_bytes: usize) -> bool {
         if self.cache.len() >= max_entries {
             return false;
         }
@@ -1608,9 +1603,10 @@ impl SoapWsSecurity {
             .nonce_replay
             .lock()
             .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
-        let recomputed_key_bytes = state.cache.keys().try_fold(0usize, |total, nonce| {
-            total.checked_add(nonce.len())
-        });
+        let recomputed_key_bytes = state
+            .cache
+            .keys()
+            .try_fold(0usize, |total, nonce| total.checked_add(nonce.len()));
         let Some(recomputed_key_bytes) = recomputed_key_bytes else {
             return Err(
                 "soap_ws_security: nonce replay observation accounting overflow".to_string(),
