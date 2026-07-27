@@ -1019,7 +1019,7 @@ impl StreamListenerManager {
     ///
     /// `build_config` is invoked once per active DTLS listener so the caller
     /// can rebuild a fresh `FrontendDtlsConfig` for each (cloning the
-    /// `DtlsCertificate` and verifier is cheap; the dimpl `Config` itself
+    /// `DtlsCertificateChain` and verifier is cheap; the dimpl `Config` itself
     /// can be re-used since the build is symmetric). Existing in-flight
     /// DTLS sessions keep the snapshot they handshake with until they end;
     /// new sessions pick up the swapped material on the next ClientHello.

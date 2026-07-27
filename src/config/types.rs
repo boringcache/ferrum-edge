@@ -3546,17 +3546,6 @@ impl GatewayConfig {
                         proxy.id, plugin.id
                     ));
                 }
-                if scheme.is_udp()
-                    && plugin
-                        .config
-                        .get("allowed_ca_fingerprints_sha256")
-                        .is_some()
-                {
-                    errors.push(format!(
-                        "Proxy '{}' cannot use allowed_ca_fingerprints_sha256 from mtls_auth PluginConfig '{}': UDP/DTLS does not expose the verified certificate chain; use allowed_issuers with a pinned ca_certificate_pem",
-                        proxy.id, plugin.id
-                    ));
-                }
             }
         }
 

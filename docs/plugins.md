@@ -1736,7 +1736,7 @@ Every `claim_headers` destination configured on `jwks_auth`, `oauth2_introspecti
 
 Authenticates requests using the client's TLS/DTLS certificate, matching a configurable certificate field against consumer credentials. It supports HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, terminated TCP+TLS, and UDP+DTLS. Stream proxies must set `frontend_tls: true` and `passthrough: false`; invalid combinations are rejected at configuration admission. On TCP stream proxies, it runs in `on_stream_connect` after the frontend TLS handshake. On UDP stream proxies, it runs after the frontend DTLS handshake completes. In both cases, the client certificate is mapped to a Consumer before later stream plugins run.
 
-For UDP+DTLS frontends, the underlying DTLS library exposes only the client leaf certificate to Ferrum. Chain-based plugin inputs such as `tls_client_cert_chain_der` are therefore unavailable on DTLS streams; configure the DTLS client CA bundle with any intermediate certificates needed for handshake validation.
+For UDP+DTLS frontends, Ferrum preserves the complete verified leaf-first client certificate chain. The leaf is available through `tls_client_cert_der`, while presented intermediates are available through `tls_client_cert_chain_der`, matching terminated TCP+TLS behavior.
 
 **Priority:** 950
 
@@ -1784,7 +1784,7 @@ config:
 **CA Fingerprint Filtering:**
 When `allowed_ca_fingerprints_sha256` is configured, at least one certificate in the client's TLS chain must match a configured SHA-256 fingerprint. When both `allowed_issuers` and `allowed_ca_fingerprints_sha256` are configured, both constraints must pass (AND logic).
 
-On UDP+DTLS streams, `allowed_ca_fingerprints_sha256` is not usable and is rejected during configuration admission. The filter hashes only verified intermediate/CA chain certificates (never the leaf), while the dimpl-backed DTLS path exposes only the client leaf. For DTLS, use `allowed_issuers` with the immediate issuing CA in `ca_certificate_pem`, so the configured pin can verify the leaf directly; a higher-level root pin needs the intermediate chain that DTLS does not expose. To pin one client certificate instead, use `cert_field: fingerprint_sha256` mapped to a consumer identity.
+UDP+DTLS applies `allowed_ca_fingerprints_sha256` to the same verified intermediate/CA chain surface as terminated TCP+TLS. The leaf is never treated as a CA fingerprint candidate. To pin one client certificate instead, use `cert_field: fingerprint_sha256` mapped to a consumer identity.
 
 Issuer-constraint rejection bodies are always emitted as valid JSON even when certificate subject fields contain quotes, newlines, or other control characters.
 
