@@ -897,9 +897,8 @@ async fn handle_h3_connection(
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
-                let remote = crate::util::client_identity::canonical_socket_addr(
-                    conn.remote_address(),
-                );
+                let remote =
+                    crate::util::client_identity::canonical_socket_addr(conn.remote_address());
                 debug!("HTTP/3 0-RTT connection accepted from {}", remote);
                 // Spawn a task that waits for the handshake to complete, then
                 // reports the outcome to the accept loop. The accept loop owns
