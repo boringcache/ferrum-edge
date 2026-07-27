@@ -3792,7 +3792,7 @@ jobs:
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
-          bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+          python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
 
       - name: Detect performance-sensitive changes
         id: perf_changes

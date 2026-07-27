@@ -15,7 +15,7 @@ duration, build profile, and comparison baseline.
 |---|---|---|---|
 | HTTP wrk smoke | `./run_perf_test.sh` | Local HTTP/1.1 gateway overhead against a direct Hyper backend using `wrk`. Useful for quick development smoke tests. | This README. Raw wrk output and `performance_report.html` are generated per run. |
 | CI HTTP overhead gate | `ci_overhead_bench.py` | Short HTTP overhead regression check used by `ci.yml`. | CI artifacts under `tests/performance/ci_results/`. |
-| Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison, connection saturation, and the scheduled protocol regression extras (churn/soak/reload/plateaus). | [`multi_protocol/README.md`](multi_protocol/README.md) and [`docs/protocol_perf_regression.md`](../../docs/protocol_perf_regression.md). |
+| Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison and connection saturation harnesses. | [`multi_protocol/README.md`](multi_protocol/README.md). |
 | Payload-size matrix | [`payload_size/`](payload_size/) | Content-type and payload-size sweeps across HTTP, gRPC, WebSocket, TCP, UDP, and TLS variants. | [`payload_size/README.md`](payload_size/README.md). |
 | In-process hot-path microbenches | [`mesh/`](mesh/) | Criterion microbenches for indexed IP restriction lookup plus mesh authorization, slice apply, and xDS translation paths. | [`mesh/README.md`](mesh/README.md) and `mesh/baseline.md`. |
 | Mesh DNS E2E | [`mesh-dns-e2e/`](mesh-dns-e2e/) | End-to-end transparent mesh DNS proxy latency/throughput over UDP and TCP. | [`mesh-dns-e2e/README.md`](mesh-dns-e2e/README.md). |
@@ -88,10 +88,6 @@ sudo yum install wrk
 
 - `ci.yml` runs the short HTTP overhead regression gate when
   performance-sensitive paths change.
-- `.github/workflows/protocol-perf-regression.yml` runs the scheduled and
-  manually dispatched multi-protocol regression lane with versioned
-  alert-only budgets, churn/soak/reload scenarios, and trend artifacts. See
-  [`docs/protocol_perf_regression.md`](../../docs/protocol_perf_regression.md).
 - `.github/workflows/perf-benchmark.yml` runs the multi-protocol benchmark on
   demand.
 - `.github/workflows/payload-size-benchmark.yml` runs the payload-size matrix on

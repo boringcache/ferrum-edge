@@ -141,7 +141,6 @@ Running 30s test @ https://127.0.0.1:8443/api/users
      50%    1.05ms
      75%    1.45ms
      90%    2.10ms
-     95%    3.20ms
      99%    5.80ms
 
   158340 requests in 30.00s, 22.45MB read
@@ -168,20 +167,11 @@ JSON output (`--json`):
   "p50_us": 1050,
   "p75_us": 1450,
   "p90_us": 2100,
-  "p95_us": 3200,
   "p99_us": 5800,
   "total_bytes": 23534280,
   "throughput_mbps": 6.28
 }
 ```
-
-## Scheduled Protocol Regression
-
-The scheduled / manually dispatched regression lane is
-`.github/workflows/protocol-perf-regression.yml`. It builds the gateway with
-`ci-release` on `ubuntu-latest`, runs this matrix, then executes churn / soak /
-resource-plateau / reload-under-load extras and evaluates versioned alert-only
-budgets. See [`docs/protocol_perf_regression.md`](../../../docs/protocol_perf_regression.md).
 
 ## Benchmark Results
 

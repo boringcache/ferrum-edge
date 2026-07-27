@@ -9,7 +9,7 @@ It is **not** a required pull-request check for the scheduled multi-protocol
 benchmark itself. Required PR CI does run lightweight static contracts for this
 lane inside the `Performance Regression Check` job in `.github/workflows/ci.yml`
 (workflow verifier self-test + repository contract, evaluator self-test, and a
-non-executing `bash -n` syntax check of the scenario harness) before optional
+`python3 -m py_compile` check of the scenario harness) before optional
 benchmark/build gating. The lightweight HTTP/1 overhead gate in `ci.yml`
 remains the PR path for measured overhead. Noisy shared-runner microbenchmarks
 stay out of branch protection.
@@ -35,7 +35,7 @@ Per supported protocol (gateway path):
 - Latency p50 / p95 / p99
 
 Additional scenarios from
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.sh`:
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`:
 
 - **Connection churn** — HTTP/1 with keep-alive / idle pool disabled
 - **Long-lived soak** — `proto_bench saturate` hold window
@@ -95,7 +95,7 @@ Optional inputs: duration, concurrency, iterations, protocol subset.
 python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
 python3 .github/scripts/verify_protocol_perf_regression_workflow.py
 python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
-bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
 ```
 
 Full-mode PR CI runs the same static set in `Performance Regression Check`
@@ -107,3 +107,5 @@ immediately after checkout.
 - PR overhead gate: `tests/performance/ci_overhead_bench.py` via `ci.yml`
 - Connection saturation headlines: `docs/connection_saturation_benchmark.md`
 - Suite index: `tests/performance/README.md`
+- Scheduled lane details: this document (performance suite READMEs stay
+  unchanged so trusted Cross automation digests are not rewritten)

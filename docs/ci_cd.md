@@ -306,8 +306,8 @@ diagnostics, mesh drift snapshots, pod-registry dumps, live assertions, and
 Runs on full-mode PRs, pushes to `main`, and manual dispatches. Immediately after
 checkout, the job always runs lightweight protocol-perf static validation (no
 benchmarks): workflow verifier `--self-test`, repository-contract verification,
-evaluator `--self-test`, and `bash -n` on
-`tests/performance/multi_protocol/run_protocol_regression_scenarios.sh`. PRs then
+evaluator `--self-test`, and `python3 -m py_compile` on
+`tests/performance/multi_protocol/run_protocol_regression_scenarios.py`. PRs then
 apply a performance-sensitive path filter; unrelated PRs skip the expensive
 benchmark and report success. The PR gate covers proxy and connection hot paths,
 the file-mode startup path used by this benchmark, performance fixtures, and

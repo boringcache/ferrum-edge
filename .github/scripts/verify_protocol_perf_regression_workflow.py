@@ -37,7 +37,7 @@ SCENARIOS_PATH = (
     / "tests"
     / "performance"
     / "multi_protocol"
-    / "run_protocol_regression_scenarios.sh"
+    / "run_protocol_regression_scenarios.py"
 )
 RUNBOOK_PATH = REPO_ROOT / "docs" / "protocol_perf_regression.md"
 CI_CD_PATH = REPO_ROOT / "docs" / "ci_cd.md"
@@ -57,13 +57,17 @@ APPROVED_SETUP = (
     "./.github/actions/setup-fast-linker",
 )
 
-# Bench JSON redirects that must not be silenced with `|| true`.
+# Bench JSON redirects that must not be silenced with `|| true` in shell form,
+# or with swallowed return codes when authored as Python subprocess helpers.
 BENCH_JSON_SWALLOWED = re.compile(
     r"--json\s*>\s*\"\$\{OUTPUT_DIR\}/(?:connection_churn|soak|reload_under_load)\.json\""
     r"[^\n]*\|\|\s*true",
 )
 WAIT_BENCH_SWALLOWED = re.compile(r"wait\s+\"\$\{BENCH_PID\}\"\s*\|\|\s*true")
-
+PY_BENCH_SWALLOWED = re.compile(
+    r"subprocess\.(?:run|Popen)\([^\n]*(?:connection_churn|soak|reload_under_load)"
+    r"[^\n]*\|\|\s*true"
+)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -99,7 +103,7 @@ def validate_workflow_text(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "run_protocol_regression_scenarios.sh" in text,
+        "run_protocol_regression_scenarios.py" in text,
         "workflow must run churn/soak/reload scenario harness",
         failures,
     )
@@ -224,6 +228,11 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
+        not PY_BENCH_SWALLOWED.search(text),
+        "scenarios harness must not swallow bench failures with || true",
+        failures,
+    )
+    require(
         "missing usable measurement sample" in text,
         "scenarios harness must validate usable measurement samples",
         failures,
@@ -234,8 +243,20 @@ def validate_scenarios_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "CHURN_RC" in text and "SOAK_RC" in text and "RELOAD_RC" in text,
+        ("churn_rc" in text and "soak_rc" in text and "reload_rc" in text)
+        or ("CHURN_RC" in text and "SOAK_RC" in text and "RELOAD_RC" in text),
         "scenarios harness must capture churn/soak/reload exit codes",
+        failures,
+    )
+    require(
+        "subprocess.run" in text or "subprocess.Popen" in text,
+        "scenarios harness must launch proto_bench via subprocess",
+        failures,
+    )
+    require(
+        '["./target/release/proto_bench"' in text
+        or "['./target/release/proto_bench'" in text,
+        "scenarios harness must use literal proto_bench argv lists",
         failures,
     )
 
@@ -264,7 +285,7 @@ def validate_pr_ci_contract(text: str, failures: list[str]) -> None:
         failures,
     )
     require(
-        "bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh"
+        "python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py"
         in text,
         "ci.yml must syntax-check the protocol regression scenario harness",
         failures,
@@ -412,7 +433,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
       - uses: ./.github/actions/setup-rust-ci
       - run: echo ci-release
-      - run: bash tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+      - run: python3 tests/performance/multi_protocol/run_protocol_regression_scenarios.py
       - run: python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py
       - run: echo protocol_perf_budgets.json alert trends runner_health
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -445,9 +466,13 @@ wait "${BENCH_PID}" || true
         failures.append("self-test expected || true swallow detection for scenario benches")
 
     good_scenarios = """
-CHURN_RC=0
-SOAK_RC=0
-RELOAD_RC=0
+churn_rc = 0
+soak_rc = 0
+reload_rc = 0
+subprocess.run(
+    ["./target/release/proto_bench", "http1", "--json"],
+    check=False,
+)
 # no || true after json redirects
 missing usable measurement sample
 resource_plateau insufficient rss_bytes sampling
@@ -469,7 +494,7 @@ resource_plateau insufficient rss_bytes sampling
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py --self-test
           python3 .github/scripts/verify_protocol_perf_regression_workflow.py
           python3 tests/performance/multi_protocol/evaluate_protocol_perf_budgets.py --self-test
-          bash -n tests/performance/multi_protocol/run_protocol_regression_scenarios.sh
+          python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_scenarios.py
       - name: Detect performance-sensitive changes
         run: echo detect
 """
