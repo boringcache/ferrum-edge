@@ -56,6 +56,47 @@ use crate::xds::XdsAdsServer;
 #[cfg(test)]
 use crate::config::incremental_apply::upsert_by_id;
 
+/// Narrow full-load source used by the CP snapshot/cursor orchestration.
+///
+/// Keeping this smaller than [`DatabaseBackend`] makes the ordering contract
+/// directly testable with a deterministic scripted source. Production stores
+/// receive the blanket implementation below.
+#[doc(hidden)]
+#[async_trait::async_trait]
+pub trait CpFullLoadSource: Send + Sync {
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error>;
+
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error>;
+}
+
+#[async_trait::async_trait]
+impl<T> CpFullLoadSource for T
+where
+    T: DatabaseBackend + ?Sized,
+{
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        DatabaseBackend::load_full_config_for_purpose(self, namespace, purpose).await
+    }
+
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        DatabaseBackend::latest_change_sequence(self, namespace).await
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        DatabaseBackend::latest_global_change_sequence(self).await
+    }
+}
+
 /// Stream of admitted CP gRPC connections handed to tonic's
 /// `serve_with_incoming_shutdown`.
 pub type CpGrpcIncomingStream =
@@ -623,8 +664,8 @@ struct IncrementalMultiLoad {
 /// failing namespace retains its last-known-good resources from `previous`,
 /// other namespaces continue to refresh, and `rejected_namespaces` names the
 /// failures for observability.
-async fn load_full_config_multi(
-    db: &dyn DatabaseBackend,
+async fn load_full_config_multi<B: CpFullLoadSource + ?Sized>(
+    db: &B,
     namespaces: &[String],
     previous: &GatewayConfig,
 ) -> Result<FullLoadMultiOutcome, anyhow::Error> {
@@ -873,9 +914,9 @@ fn append_namespace_resources_from(
 }
 
 /// Replace one namespace's resources in `config` with the last-known-good copy
-/// from `previous`. Used when a namespace loaded successfully but cannot be
-/// published (e.g. its change-sequence cursor is unreadable): broadcasting is
-/// skipped, so `config_arc` must not race ahead of what DPs still hold.
+/// from `previous`. Used when a namespace cannot be safely refreshed or
+/// published (e.g. its pre-load change boundary is unreadable), so its prior
+/// resources and cursor must remain intact.
 fn restore_namespace_last_known_good(
     config: &mut GatewayConfig,
     previous: &GatewayConfig,
@@ -886,49 +927,125 @@ fn restore_namespace_last_known_good(
 }
 
 async fn load_full_config_multi_with_sequence(
-    db: &dyn DatabaseBackend,
+    db: &(impl CpFullLoadSource + ?Sized),
     namespaces: &[String],
     previous: &GatewayConfig,
     scope: &CpScope,
     mesh_authority: Option<&str>,
     mesh_sequence_floor: u64,
 ) -> Result<(FullLoadMultiOutcome, HashMap<String, u64>), anyhow::Error> {
-    let mut outcome = load_full_config_multi(db, namespaces, previous).await?;
+    let boundary_namespaces = if namespaces.is_empty() {
+        vec!["ferrum".to_string()]
+    } else {
+        namespaces.to_vec()
+    };
+
+    // Capture every durable boundary BEFORE starting any corresponding
+    // resource load. SQL and replica-set Mongo loads end their snapshot
+    // transaction before this helper regains control; reading a cursor after
+    // that point could stamp an older snapshot with a concurrently committed
+    // change and then permanently skip its delta. A conservative pre-load
+    // boundary may cause a newer row already present in the snapshot to be
+    // harmlessly replayed by the next incremental poll, but it cannot skip a
+    // write the snapshot may not contain.
+    //
+    // All-scope's revision domain is store-global, so that watermark must be
+    // captured before even the per-namespace boundaries and resource loads.
+    let store_global_sequence = if mesh_authority.is_some() && matches!(scope, CpScope::All) {
+        db.latest_global_change_sequence().await?
+    } else {
+        0
+    };
+
     let mut sequences = HashMap::new();
-    if namespaces.is_empty() {
-        sequences.insert(
-            "ferrum".to_string(),
-            db.latest_change_sequence("ferrum").await?,
-        );
-    }
-    // Only advance cursors for namespaces that successfully refreshed. A
-    // cursor read that fails demotes just that namespace out of
-    // `refreshed_namespaces` (it keeps its old cursor and is not broadcast);
-    // it must not `?` and abort the reload for every other tenant (#2983).
-    // The freshly loaded resources are also reverted to last-known-good so
-    // `config_arc` / mesh full broadcasts cannot diverge from DPs that still
-    // hold the prior snapshot for that tenant.
-    let mut refreshed = Vec::with_capacity(outcome.refreshed_namespaces.len());
-    for ns in std::mem::take(&mut outcome.refreshed_namespaces) {
-        match db.latest_change_sequence(&ns).await {
+    let mut boundary_failed_namespaces = Vec::new();
+    for ns in &boundary_namespaces {
+        match db.latest_change_sequence(ns).await {
             Ok(sequence) => {
                 sequences.insert(ns.clone(), sequence);
-                refreshed.push(ns);
             }
             Err(error) => {
                 error!(
                     namespace = %ns,
                     error = %error,
-                    "CP could not read the change-sequence cursor for namespace after a full \
-                     reload; restoring last-known-good resources, leaving its cursor unchanged, \
-                     and skipping its broadcast"
+                    "CP could not capture the change-sequence boundary for namespace before a \
+                     full reload; retaining last-known-good resources, leaving its cursor \
+                     unchanged, and skipping its resource load and broadcast"
                 );
-                restore_namespace_last_known_good(&mut outcome.config, previous, &ns);
-                outcome.failed_namespaces.push(ns);
+                boundary_failed_namespaces.push(ns.clone());
             }
         }
     }
-    outcome.refreshed_namespaces = refreshed;
+
+    // All-scope's captured watermark covers every namespace in the store. If
+    // even one namespace cannot establish its pre-load boundary, retaining
+    // that namespace's older LKG content and stamping the combined config with
+    // the global watermark would overstate the snapshot. Keep the entire
+    // prior snapshot/cursor set instead. Explicit scopes have independent
+    // namespace boundaries and retain their per-tenant continuation below.
+    if matches!(scope, CpScope::All) && !boundary_failed_namespaces.is_empty() {
+        anyhow::bail!(
+            "CP All-scope full reload could not capture every namespace boundary; retaining the \
+             prior snapshot and cursors"
+        );
+    }
+
+    let load_namespaces: Vec<String> = boundary_namespaces
+        .iter()
+        .filter(|namespace| sequences.contains_key(*namespace))
+        .cloned()
+        .collect();
+    let mut outcome = if load_namespaces.is_empty() {
+        let mut config = previous.clone();
+        config.mesh = None;
+        FullLoadMultiOutcome {
+            config,
+            rejected_namespaces: Vec::new(),
+            refreshed_namespaces: Vec::new(),
+            failed_namespaces: Vec::new(),
+        }
+    } else {
+        load_full_config_multi(db, &load_namespaces, previous).await?
+    };
+
+    // The same whole-store rule applies after resource loading. A partial
+    // `All` snapshot may contain LKG resources older than the captured global
+    // watermark, so it must not be published or advance any cursor.
+    if matches!(scope, CpScope::All) {
+        if !outcome.failed_namespaces.is_empty() {
+            anyhow::bail!(
+                "CP All-scope full reload could not refresh every namespace; retaining the prior \
+                 snapshot and cursors"
+            );
+        }
+        if !outcome.rejected_namespaces.is_empty() {
+            let errors = outcome
+                .rejected_namespaces
+                .iter()
+                .map(|(namespace, message)| format!("namespace '{namespace}': {message}"))
+                .collect();
+            return Err(ConfigValidationRejection {
+                backend: "CP",
+                errors,
+            }
+            .into_anyhow());
+        }
+    }
+
+    // A boundary-read failure demotes only that namespace. It was deliberately
+    // excluded from the resource load, so restore its LKG partition when other
+    // namespaces refreshed successfully and leave its prior polling cursor
+    // untouched (#2983).
+    for namespace in boundary_failed_namespaces {
+        restore_namespace_last_known_good(&mut outcome.config, previous, &namespace);
+        if !outcome.failed_namespaces.contains(&namespace) {
+            outcome.failed_namespaces.push(namespace);
+        }
+    }
+
+    // A resource load/validation failure also keeps its prior cursor. Retain
+    // only boundaries whose corresponding snapshots actually refreshed.
+    sequences.retain(|namespace, _| outcome.refreshed_namespaces.contains(namespace));
 
     // Sequence domain is scope-dependent (issue #2473):
     // - Explicit Single/Set: max of the same per-namespace durable cursors
@@ -936,19 +1053,53 @@ async fn load_full_config_multi_with_sequence(
     //   a restarted replica jump ahead of its identical running peer.
     // - All: store-global high-water mark, so a namespace that disappears after
     //   its last resource is deleted cannot rewind a restarted CP.
-    // The in-process floor protects full reload while the process is alive.
+    // The in-process floor is applied only after those safe captures and acts
+    // solely as a monotonic lower bound while the process is alive.
     let mesh_sequence = if mesh_authority.is_some() {
-        let store_global_sequence = if matches!(scope, CpScope::All) {
-            db.latest_global_change_sequence().await?
-        } else {
-            0
-        };
         scope.mesh_full_load_sequence(&sequences, store_global_sequence, mesh_sequence_floor)
     } else {
         0
     };
     stamp_mesh_revision(&mut outcome.config, mesh_authority, mesh_sequence);
     Ok((outcome, sequences))
+}
+
+/// External-test view of CP full-load sequencing without exposing the
+/// credential-bearing internal outcome type.
+#[doc(hidden)]
+pub struct CpFullLoadSequenceOutcomeForTest {
+    pub config: GatewayConfig,
+    pub sequences: HashMap<String, u64>,
+    pub refreshed_namespaces: Vec<String>,
+    pub failed_namespaces: Vec<String>,
+}
+
+/// Exercise the production full-load boundary orchestration from external
+/// integration tests with a scripted [`CpFullLoadSource`].
+#[doc(hidden)]
+pub async fn load_full_config_multi_with_sequence_for_test(
+    db: &(impl CpFullLoadSource + ?Sized),
+    namespaces: &[String],
+    previous: &GatewayConfig,
+    scope: &CpScope,
+    mesh_authority: Option<&str>,
+    mesh_sequence_floor: u64,
+) -> Result<CpFullLoadSequenceOutcomeForTest, anyhow::Error> {
+    let (outcome, sequences) = load_full_config_multi_with_sequence(
+        db,
+        namespaces,
+        previous,
+        scope,
+        mesh_authority,
+        mesh_sequence_floor,
+    )
+    .await?;
+    Ok(CpFullLoadSequenceOutcomeForTest {
+        config: outcome.config,
+        sequences,
+        refreshed_namespaces: outcome.refreshed_namespaces,
+        failed_namespaces: outcome.failed_namespaces,
+    })
 }
 
 /// CAS-publish a DB-authored snapshot after re-merging the independently owned

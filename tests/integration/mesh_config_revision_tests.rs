@@ -7,7 +7,7 @@
 //! slice `version` cannot arbitrate that — it renders the serving CP's local
 //! wall clock.
 //!
-//! Five layers of coverage:
+//! Six layers of coverage:
 //!
 //! 1. The pure comparison contract (`MeshConfigRevision::compare`) and the
 //!    stateful gate (`MeshRevisionGate`), including the time-dependent
@@ -23,16 +23,20 @@
 //!    admission is provisional, so a candidate the runtime later refuses must
 //!    return the watermark to the last applied generation — without a late
 //!    rejection disturbing a newer candidate received meanwhile.
-//! 5. Bounding of the control-plane-supplied `authority` on every copy that
+//! 5. Full-load boundary ordering: namespace and store-global cursors are
+//!    captured before resources, and one failed namespace preserves its LKG
+//!    without blocking healthy explicit-scope namespaces.
+//! 6. Bounding of the control-plane-supplied `authority` on every copy that
 //!    leaves the gate (diagnostics, the operator reset, and the log lines built
 //!    from them), while ordering keeps the raw value.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
@@ -41,9 +45,15 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use ferrum_edge::config::db_backend::FullConfigLoadPurpose;
+use ferrum_edge::config::types::{Consumer, GatewayConfig};
+use ferrum_edge::grpc::cp_server::CpScope;
 use ferrum_edge::grpc::dp_client::GrpcJwtSecret;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
+use ferrum_edge::modes::control_plane::{
+    CpFullLoadSource, load_full_config_multi_with_sequence_for_test,
+};
 use ferrum_edge::modes::mesh::config_consumer::native_client::{
     NativeMeshClientConfig, NativeMeshConfigConsumer, start_native_mesh_client_with_shutdown,
 };
@@ -141,6 +151,352 @@ fn rendered_counter(series: &str) -> u64 {
         .find_map(|line| line.strip_prefix(series))
         .and_then(|rest| rest.trim().parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+// ── Full-snapshot boundary ordering ────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct SequenceAdvance {
+    namespace: u64,
+    global: u64,
+}
+
+struct ScriptedFullLoadSource {
+    snapshots: HashMap<String, GatewayConfig>,
+    namespace_sequences: Mutex<HashMap<String, u64>>,
+    sequence_failures: HashSet<String>,
+    global_sequence: AtomicU64,
+    advance_on_load: Mutex<HashMap<String, SequenceAdvance>>,
+    events: Mutex<Vec<String>>,
+}
+
+impl ScriptedFullLoadSource {
+    fn new(
+        snapshots: HashMap<String, GatewayConfig>,
+        namespace_sequences: HashMap<String, u64>,
+        global_sequence: u64,
+    ) -> Self {
+        Self {
+            snapshots,
+            namespace_sequences: Mutex::new(namespace_sequences),
+            sequence_failures: HashSet::new(),
+            global_sequence: AtomicU64::new(global_sequence),
+            advance_on_load: Mutex::new(HashMap::new()),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fail_sequence_for(mut self, namespace: &str) -> Self {
+        self.sequence_failures.insert(namespace.to_string());
+        self
+    }
+
+    fn advance_during_load(
+        self,
+        namespace: &str,
+        namespace_sequence: u64,
+        global_sequence: u64,
+    ) -> Self {
+        self.advance_on_load
+            .lock()
+            .expect("advance script lock")
+            .insert(
+                namespace.to_string(),
+                SequenceAdvance {
+                    namespace: namespace_sequence,
+                    global: global_sequence,
+                },
+            );
+        self
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().expect("events lock").clone()
+    }
+
+    fn namespace_sequence(&self, namespace: &str) -> u64 {
+        *self
+            .namespace_sequences
+            .lock()
+            .expect("namespace sequences lock")
+            .get(namespace)
+            .expect("scripted namespace sequence")
+    }
+}
+
+#[async_trait]
+impl CpFullLoadSource for ScriptedFullLoadSource {
+    async fn load_full_config_for_purpose(
+        &self,
+        namespace: &str,
+        purpose: FullConfigLoadPurpose,
+    ) -> Result<GatewayConfig, anyhow::Error> {
+        assert_eq!(purpose, FullConfigLoadPurpose::ControlPlane);
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(format!("load:{namespace}:snapshot"));
+        let snapshot = self
+            .snapshots
+            .get(namespace)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing scripted snapshot for {namespace}"))?;
+
+        // Deterministic race: the resource snapshot has already been selected,
+        // then an admin write commits before the full-load future completes.
+        // Returning `snapshot` models SQL / replica-set Mongo ending their
+        // snapshot transaction while the newer change is already durable.
+        if let Some(advance) = self
+            .advance_on_load
+            .lock()
+            .expect("advance script lock")
+            .remove(namespace)
+        {
+            self.namespace_sequences
+                .lock()
+                .expect("namespace sequences lock")
+                .insert(namespace.to_string(), advance.namespace);
+            self.global_sequence
+                .store(advance.global, Ordering::Release);
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(format!("write:{namespace}:{}", advance.namespace));
+        }
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(format!("load:{namespace}:complete"));
+        Ok(snapshot)
+    }
+
+    async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push(format!("boundary:{namespace}"));
+        if self.sequence_failures.contains(namespace) {
+            anyhow::bail!("scripted boundary failure for {namespace}");
+        }
+        Ok(self.namespace_sequence(namespace))
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        self.events
+            .lock()
+            .expect("events lock")
+            .push("boundary:global".to_string());
+        Ok(self.global_sequence.load(Ordering::Acquire))
+    }
+}
+
+fn full_load_consumer_config(namespace: &str, generation: &str, timestamp: i64) -> GatewayConfig {
+    GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        consumers: vec![Consumer {
+            id: format!("{namespace}-{generation}"),
+            username: format!("{namespace}-{generation}"),
+            namespace: namespace.to_string(),
+            custom_id: None,
+            credentials: HashMap::new(),
+            acl_groups: Vec::new(),
+            created_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+            updated_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+        }],
+        loaded_at: Utc.timestamp_opt(timestamp, 0).single().expect("timestamp"),
+        ..GatewayConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn explicit_full_load_captures_cursor_before_snapshot_can_complete() {
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([(
+            "alpha".to_string(),
+            full_load_consumer_config("alpha", "snapshot-41", 41),
+        )]),
+        HashMap::from([("alpha".to_string(), 41)]),
+        41,
+    )
+    .advance_during_load("alpha", 42, 42);
+
+    let outcome = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string()],
+        &GatewayConfig::default(),
+        &CpScope::Single("alpha".to_string()),
+        Some("db"),
+        0,
+    )
+    .await
+    .expect("full load");
+
+    assert_eq!(
+        outcome
+            .config
+            .mesh_revision
+            .as_ref()
+            .expect("mesh revision")
+            .sequence,
+        41,
+        "the older resource snapshot must not claim the concurrently committed sequence 42"
+    );
+    assert_eq!(outcome.sequences.get("alpha"), Some(&41));
+    assert_eq!(source.namespace_sequence("alpha"), 42);
+    assert_eq!(outcome.config.consumers[0].id, "alpha-snapshot-41");
+    assert_eq!(
+        source.events(),
+        vec![
+            "boundary:alpha",
+            "load:alpha:snapshot",
+            "write:alpha:42",
+            "load:alpha:complete",
+        ],
+        "the production orchestration must capture the incremental cursor before loading resources"
+    );
+}
+
+#[tokio::test]
+async fn all_scope_captures_global_watermark_before_any_resource_snapshot() {
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([(
+            "alpha".to_string(),
+            full_load_consumer_config("alpha", "snapshot-90", 90),
+        )]),
+        HashMap::from([("alpha".to_string(), 40)]),
+        90,
+    )
+    .advance_during_load("alpha", 41, 91);
+
+    let outcome = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string()],
+        &GatewayConfig::default(),
+        &CpScope::All,
+        Some("db"),
+        0,
+    )
+    .await
+    .expect("full load");
+
+    assert_eq!(
+        outcome
+            .config
+            .mesh_revision
+            .as_ref()
+            .expect("mesh revision")
+            .sequence,
+        90,
+        "All scope must publish the pre-load global watermark, not the concurrent write's 91"
+    );
+    assert_eq!(outcome.sequences.get("alpha"), Some(&40));
+    assert_eq!(
+        source.events(),
+        vec![
+            "boundary:global",
+            "boundary:alpha",
+            "load:alpha:snapshot",
+            "write:alpha:41",
+            "load:alpha:complete",
+        ],
+        "the store-global revision boundary must precede every namespace resource load"
+    );
+}
+
+#[tokio::test]
+async fn all_scope_boundary_failure_retains_the_whole_prior_snapshot() {
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "must-not-load", 20),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "must-not-load", 20),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 20), ("beta".to_string(), 30)]),
+        30,
+    )
+    .fail_sequence_for("beta");
+
+    let result = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string(), "beta".to_string()],
+        &full_load_consumer_config("alpha", "last-good", 10),
+        &CpScope::All,
+        Some("db"),
+        10,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "All scope must retain its entire prior snapshot when any namespace lacks a safe boundary"
+    );
+    assert_eq!(
+        source.events(),
+        vec!["boundary:global", "boundary:alpha", "boundary:beta"],
+        "no resource load may begin after an All-scope boundary failure"
+    );
+}
+
+#[tokio::test]
+async fn explicit_scope_boundary_failure_demotes_only_that_namespace() {
+    let previous = full_load_consumer_config("beta", "last-good", 10);
+    let source = ScriptedFullLoadSource::new(
+        HashMap::from([
+            (
+                "alpha".to_string(),
+                full_load_consumer_config("alpha", "fresh", 20),
+            ),
+            (
+                "beta".to_string(),
+                full_load_consumer_config("beta", "must-not-load", 20),
+            ),
+        ]),
+        HashMap::from([("alpha".to_string(), 20), ("beta".to_string(), 30)]),
+        30,
+    )
+    .fail_sequence_for("beta");
+    let scope = CpScope::Set(HashSet::from(["alpha".to_string(), "beta".to_string()]));
+
+    let outcome = load_full_config_multi_with_sequence_for_test(
+        &source,
+        &["alpha".to_string(), "beta".to_string()],
+        &previous,
+        &scope,
+        Some("db"),
+        0,
+    )
+    .await
+    .expect("healthy namespace must continue");
+
+    let consumer_ids: HashSet<&str> = outcome
+        .config
+        .consumers
+        .iter()
+        .map(|consumer| consumer.id.as_str())
+        .collect();
+    assert_eq!(
+        consumer_ids,
+        HashSet::from(["alpha-fresh", "beta-last-good"]),
+        "the failed namespace retains LKG while the healthy namespace refreshes"
+    );
+    assert_eq!(outcome.sequences, HashMap::from([("alpha".to_string(), 20)]));
+    assert_eq!(outcome.refreshed_namespaces, vec!["alpha"]);
+    assert_eq!(outcome.failed_namespaces, vec!["beta"]);
+    assert_eq!(
+        source.events(),
+        vec![
+            "boundary:alpha",
+            "boundary:beta",
+            "load:alpha:snapshot",
+            "load:alpha:complete",
+        ],
+        "a failed namespace boundary must prevent its resource load without aborting alpha"
+    );
 }
 
 // ── Comparison contract ────────────────────────────────────────────────────
