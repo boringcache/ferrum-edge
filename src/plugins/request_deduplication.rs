@@ -2040,12 +2040,11 @@ impl RequestDeduplication {
                 }
                 None
             };
-            let inflight_count =
-                if redis_candidate.is_some() || publish_execution_barrier_on_skip {
-                    self.inflight_count.load(Ordering::Relaxed)
-                } else {
-                    decrement_atomic(&self.inflight_count)
-                };
+            let inflight_count = if redis_candidate.is_some() || publish_execution_barrier_on_skip {
+                self.inflight_count.load(Ordering::Relaxed)
+            } else {
+                decrement_atomic(&self.inflight_count)
+            };
             return LocalCompletionAction::Skipped {
                 inflight_count,
                 reason: CompletionSkipReason::TotalCapacity {
@@ -2373,10 +2372,7 @@ impl RequestDeduplication {
                 // completion into the one bounded process-global refusal
                 // deadline rather than allocating another attacker-influenced
                 // map entry or reopening the operation.
-                self.extend_execution_barrier_overflow(
-                    barrier_inserted_at,
-                    barrier_retention,
-                );
+                self.extend_execution_barrier_overflow(barrier_inserted_at, barrier_retention);
                 entry.remove();
                 CompletedSequenceRemoval::Removed
             }

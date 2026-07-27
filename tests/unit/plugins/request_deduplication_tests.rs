@@ -2239,8 +2239,7 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
         let plugin = make_plugin(config);
         let key = format!("tiny-{label}-barrier");
         let mut owner_ctx = new_ctx("POST", "/api");
-        let mut owner_headers =
-            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        let mut owner_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
         assert!(matches!(
             plugin
                 .before_proxy(&mut owner_ctx, &mut owner_headers)
@@ -2271,12 +2270,7 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
             .metadata
             .remove(SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
         plugin
-            .on_response_committed(
-                &mut owner_ctx,
-                200,
-                &HashMap::new(),
-                b"externally-executed",
-            )
+            .on_response_committed(&mut owner_ctx, 200, &HashMap::new(), b"externally-executed")
             .await;
 
         assert_eq!(plugin.tracked_keys_count(), Some(1));
@@ -2291,8 +2285,7 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
         // the explicit completion barrier.
         request_deduplication_expire_inflight_entries_for_test(&plugin);
         let mut protected_ctx = new_ctx("POST", "/api");
-        let mut protected_headers =
-            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        let mut protected_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
         assert!(
             matches!(
                 plugin
@@ -2310,8 +2303,7 @@ async fn external_operation_barrier_survives_tiny_entry_and_total_byte_budgets()
         // max(ttl, inflight_ttl) deadline.
         request_deduplication_expire_execution_barriers_for_test(&plugin);
         let mut expired_ctx = new_ctx("POST", "/api");
-        let mut expired_headers =
-            HashMap::from([("idempotency-key".to_string(), key.clone())]);
+        let mut expired_headers = HashMap::from([("idempotency-key".to_string(), key.clone())]);
         assert!(
             matches!(
                 plugin
@@ -2338,8 +2330,7 @@ async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
 
     for key in ["barrier-cap-a", "barrier-cap-b"] {
         let mut ctx = new_ctx("POST", "/api");
-        let mut headers =
-            HashMap::from([("idempotency-key".to_string(), key.to_string())]);
+        let mut headers = HashMap::from([("idempotency-key".to_string(), key.to_string())]);
         assert!(matches!(
             plugin.before_proxy(&mut ctx, &mut headers).await,
             PluginResult::Continue
@@ -2358,10 +2349,8 @@ async fn execution_barrier_capacity_overflow_is_bounded_and_fail_closed() {
     // the durable fail-closed protection.
     request_deduplication_expire_inflight_entries_for_test(&plugin);
     let mut blocked_ctx = new_ctx("POST", "/api");
-    let mut blocked_headers = HashMap::from([(
-        "idempotency-key".to_string(),
-        "barrier-cap-c".to_string(),
-    )]);
+    let mut blocked_headers =
+        HashMap::from([("idempotency-key".to_string(), "barrier-cap-c".to_string())]);
     match plugin
         .before_proxy(&mut blocked_ctx, &mut blocked_headers)
         .await
