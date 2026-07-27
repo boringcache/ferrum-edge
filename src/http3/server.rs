@@ -6739,6 +6739,16 @@ async fn handle_h3_request(
             plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
         }
 
+        // `after_proxy` hooks only receive the initial response headers. Until
+        // trailers participate in that policy boundary too, do not let backend
+        // trailer fields bypass a configured response policy (for example a
+        // security_headers removal). This deliberately uses chain presence
+        // rather than observed header mutation: a removal can be a no-op on the
+        // initial map while still needing to suppress the same trailer name.
+        if !plugins.is_empty() {
+            response_trailers = None;
+        }
+
         // Sticky session cookie injection. The buffered variant also records the
         // cookie as gateway-owned so a committed-hook deadline cannot strip it.
         if !after_proxy_rejected {
@@ -6762,10 +6772,7 @@ async fn handle_h3_request(
 
         // Response-body plugins cannot inspect or transform trailers today, so
         // a chain that actually processes this response body must not forward
-        // backend-controlled trailer fields it never saw. The gate is the same
-        // two-tier response-body-buffering predicate that chose this path — NOT
-        // chain-emptiness: an auth/logging-only proxy never reads the body and
-        // keeps the backend's trailers (issue #2941). Body-mutating phases
+        // backend-controlled trailer fields it never saw. Body-mutating phases
         // below additionally clear the trailers when they replace the bytes.
         if crate::proxy::response_body_plugins_process_body(&plugins, &ctx) {
             response_trailers = None;
@@ -7034,10 +7041,8 @@ async fn handle_h3_request(
             bytes_received = response_body_bytes;
         }
 
-        // Backend trailers survive to here only when no response-body plugin
-        // phase processed this response (gate above) and no mutation / reject /
-        // normalize arm replaced the bytes. Auth/logging-only plugins must not
-        // wipe trailers merely because the plugin chain is nonempty (#2941).
+        // Backend trailers survive to here only when there was no plugin chain
+        // and no mutation / reject / normalize arm replaced the bytes.
 
         // Forward backend response trailers, if any (issue #1630). Strip
         // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with

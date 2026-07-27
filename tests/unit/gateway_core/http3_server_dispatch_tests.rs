@@ -1520,8 +1520,21 @@ fn plain_h3_streaming_body_and_trailer_faults_downgrade_capability() {
 }
 
 #[test]
-fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
+fn buffered_h3_trailers_cannot_bypass_after_proxy_policy() {
     let src = include_str!("../../../src/http3/server.rs");
+    let after_proxy = src
+        .split("        // after_proxy hooks")
+        .nth(1)
+        .expect("buffered after_proxy phase")
+        .split("// Sticky session cookie injection.")
+        .next()
+        .expect("bounded after_proxy trailer gate");
+    assert!(
+        after_proxy.contains("if !plugins.is_empty()")
+            && after_proxy.contains("response_trailers = None;"),
+        "buffered H3 must suppress backend trailers when after_proxy policies cannot inspect them"
+    );
+
     let gate = src
         .split("        let mut response_body_rejected = false;")
         .nth(1)
@@ -1532,23 +1545,16 @@ fn buffered_h3_trailers_drop_only_when_a_response_body_plugin_ran() {
     assert!(
         gate.contains("crate::proxy::response_body_plugins_process_body(&plugins, &ctx)")
             && gate.contains("response_trailers = None;"),
-        "buffered H3 must drop trailers exactly when a response-body plugin phase \
+        "buffered H3 must also drop trailers when a response-body plugin phase \
          processes this response"
-    );
-    assert!(
-        !gate.contains("if !plugins.is_empty()"),
-        "buffered H3 must not wipe trailers merely because the plugin chain is nonempty"
     );
 
     let send = src
-        .split("// Backend trailers survive to here only when no response-body plugin")
+        .split("// Backend trailers survive to here only when there was no plugin chain")
         .nth(1)
         .expect("buffered trailer retention comment")
         .split("// Forward backend response trailers, if any (issue #1630).")
         .next()
         .expect("bounded trailer forward comment");
-    assert!(
-        send.contains("Auth/logging-only plugins must not"),
-        "retention rationale for auth/logging-only plugins must remain documented"
-    );
+    assert!(send.contains("no mutation / reject / normalize arm"));
 }
