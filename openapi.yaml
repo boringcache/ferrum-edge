@@ -11358,9 +11358,10 @@ components:
         (no userinfo). When `allow_writes` is false (default), config-database
         admin mutations return 503 and `admin_writes_enabled` is false. When
         `FERRUM_DB_FAILOVER_ALLOW_WRITES=true`, those writes are permitted under
-        the operator's synchronously replicated multi-primary assertion; Ferrum
-        records each admitted failover-window mutation conservatively and fences
-        automatic primary failback until reconciliation or restart. Managed
+        the operator's synchronously replicated multi-primary assertion; this
+        opt-in divergence-risk contract records each admitted failover-window
+        mutation conservatively and fences automatic primary failback until
+        reconciliation or restart. Managed
         TLS/ACME stores are independent and are not gated by
         this topology. This object does not claim per-request mutation success.
       required: [primary_active, allow_writes, opt_in_writes_enabled_during_window]
