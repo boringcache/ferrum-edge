@@ -2080,14 +2080,15 @@ pub mod client {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use http::header::LOCATION;
-    use http::{Request, Uri};
+    use http::header::{CONTENT_LENGTH, LOCATION};
+    use http::{Request, Response, Uri};
+    use http_body_util::{LengthLimitError, Limited};
     use hyper_rustls::HttpsConnectorBuilder;
     use hyper_util::client::legacy::Client as HyperClient;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use instant_acme::{
-        Account, AccountCredentials, BodyWrapper, BytesResponse, ChallengeStatus, ChallengeType,
-        HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+        Account, AccountCredentials, BodyWrapper, BytesBody, BytesResponse, ChallengeStatus,
+        ChallengeType, HttpClient, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
     };
     use serde::Serialize;
     use thiserror::Error;
@@ -2166,20 +2167,35 @@ pub mod client {
         Client(String),
     }
 
+    /// One wall-clock budget for fresh DNS resolution plus every candidate dial.
     const ACME_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Maximum complete fresh A/AAAA answer accepted for one ACME connection.
+    ///
+    /// Ferrum still screens every returned address before applying this bound;
+    /// an oversized answer is rejected whole and is never truncated to a prefix.
+    const MAX_ACME_DNS_CANDIDATES: usize = 64;
+    /// Maximum wire bytes accepted from any ACME HTTP response, certificates included.
+    const MAX_ACME_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
+    const MAX_ACME_RESPONSE_BODY_BYTES_U64: u64 = MAX_ACME_RESPONSE_BODY_BYTES as u64;
 
     #[derive(Clone)]
     struct ScreenedAcmeConnector {
         dns_cache: DnsCache,
         egress_policy: BackendEgressPolicy,
+        connect_timeout: Duration,
     }
 
     impl ScreenedAcmeConnector {
         fn new(dns_cache: DnsCache) -> Self {
+            Self::with_connect_timeout(dns_cache, ACME_CONNECT_TIMEOUT)
+        }
+
+        fn with_connect_timeout(dns_cache: DnsCache, connect_timeout: Duration) -> Self {
             let egress_policy = super::acme_public_egress_policy();
             Self {
                 dns_cache: dns_cache.with_backend_egress_policy(egress_policy.clone()),
                 egress_policy,
+                connect_timeout,
             }
         }
 
@@ -2197,6 +2213,15 @@ pub mod client {
                     ));
                 }
             }
+            if candidates.len() > MAX_ACME_DNS_CANDIDATES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "ACME DNS resolution returned {} addresses, exceeding the limit of {MAX_ACME_DNS_CANDIDATES}",
+                        candidates.len()
+                    ),
+                ));
+            }
             Ok(candidates)
         }
 
@@ -2208,6 +2233,13 @@ pub mod client {
                 .map_err(|error| io::Error::other(error.to_string()))?;
             self.screen_candidates(candidates)
         }
+    }
+
+    fn acme_connection_deadline_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ACME fresh DNS resolution and TCP connection deadline exceeded",
+        )
     }
 
     impl Service<Uri> for ScreenedAcmeConnector {
@@ -2244,7 +2276,11 @@ pub mod client {
                 // resolver screens the complete A+AAAA answer atomically, so a
                 // mixed public/private answer cannot be laundered by an allowed
                 // first address.
-                let candidates = connector.resolve_candidates(&host).await?;
+                let deadline = tokio::time::Instant::now() + connector.connect_timeout;
+                let candidates =
+                    tokio::time::timeout_at(deadline, connector.resolve_candidates(&host))
+                        .await
+                        .map_err(|_| acme_connection_deadline_error())??;
 
                 let mut last_error = None;
                 for candidate in candidates {
@@ -2258,20 +2294,15 @@ pub mod client {
                         ));
                     }
                     let address = SocketAddr::new(candidate, port);
-                    match tokio::time::timeout(
-                        ACME_CONNECT_TIMEOUT,
+                    match tokio::time::timeout_at(
+                        deadline,
                         tokio::net::TcpStream::connect(address),
                     )
                     .await
                     {
                         Ok(Ok(stream)) => return Ok(TokioIo::new(stream)),
                         Ok(Err(error)) => last_error = Some(error),
-                        Err(_) => {
-                            last_error = Some(io::Error::new(
-                                io::ErrorKind::TimedOut,
-                                "ACME TCP connection timed out",
-                            ));
-                        }
+                        Err(_) => return Err(acme_connection_deadline_error()),
                     }
                 }
                 Err(last_error.unwrap_or_else(|| {
@@ -2286,6 +2317,54 @@ pub mod client {
 
     struct HyperAcmeHttpClient(AcmeHyperClient);
 
+    fn response_body_too_large_error() -> instant_acme::Error {
+        instant_acme::Error::Other(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "ACME response body exceeds the {MAX_ACME_RESPONSE_BODY_BYTES}-byte limit"
+            ),
+        )))
+    }
+
+    fn validate_declared_response_body_size(
+        headers: &http::HeaderMap,
+    ) -> Result<(), instant_acme::Error> {
+        let Some(content_length) = headers
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(());
+        };
+        if content_length > MAX_ACME_RESPONSE_BODY_BYTES_U64 {
+            return Err(response_body_too_large_error());
+        }
+        Ok(())
+    }
+
+    fn limit_hyper_response_body<B>(
+        response: Response<B>,
+    ) -> Result<Response<Limited<B>>, instant_acme::Error> {
+        validate_declared_response_body_size(response.headers())?;
+        Ok(response.map(|body| Limited::new(body, MAX_ACME_RESPONSE_BODY_BYTES)))
+    }
+
+    async fn collect_bounded_response_body(
+        mut body: Box<dyn BytesBody>,
+    ) -> Result<Bytes, instant_acme::Error> {
+        let bytes = match body.into_bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+                return Err(response_body_too_large_error());
+            }
+            Err(error) => return Err(instant_acme::Error::Other(error)),
+        };
+        if bytes.len() > MAX_ACME_RESPONSE_BODY_BYTES {
+            return Err(response_body_too_large_error());
+        }
+        Ok(bytes)
+    }
+
     impl HttpClient for HyperAcmeHttpClient {
         fn request(
             &self,
@@ -2294,10 +2373,10 @@ pub mod client {
         {
             let future = self.0.request(request);
             Box::pin(async move {
-                future
+                let response = future
                     .await
-                    .map(BytesResponse::from)
-                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))
+                    .map_err(|error| instant_acme::Error::Other(Box::new(error)))?;
+                Ok(BytesResponse::from(limit_hyper_response_body(response)?))
             })
         }
     }
@@ -2332,6 +2411,7 @@ pub mod client {
             let future = self.inner.request(request);
             Box::pin(async move {
                 let response = future.await?;
+                validate_declared_response_body_size(&response.parts.headers)?;
                 if response.parts.status.is_redirection() {
                     return Err(Self::reject(
                         "ACME redirects are disabled; redirect responses are rejected",
@@ -2346,8 +2426,8 @@ pub mod client {
                         .map_err(|error| Self::reject(error.to_string()))?;
                 }
 
-                let BytesResponse { parts, mut body } = response;
-                let bytes = body.into_bytes().await.map_err(instant_acme::Error::Other)?;
+                let BytesResponse { parts, body } = response;
+                let bytes = collect_bounded_response_body(body).await?;
                 validate_response_endpoint_fields(&endpoint_policy, &bytes, is_directory)
                     .map_err(|error| Self::reject(error.to_string()))?;
                 Ok(BytesResponse {
@@ -2497,11 +2577,41 @@ pub mod client {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn default_acme_dns_cache() -> DnsCache {
         DnsCache::new(DnsConfig {
             backend_allow_ips: super::acme_public_egress_policy(),
             ..DnsConfig::default()
         })
+    }
+
+    pub(crate) fn configured_acme_dns_cache() -> Result<DnsCache, AcmeClientError> {
+        let env_config = crate::config::EnvConfig::from_env().map_err(|_| {
+            AcmeClientError::Client(
+                "configured Ferrum DNS resolver could not be loaded".to_string(),
+            )
+        })?;
+        Ok(DnsCache::new(DnsConfig {
+            global_overrides: env_config.dns_overrides.clone(),
+            resolver_addresses: env_config.dns_resolver_address.clone(),
+            hosts_file_path: env_config.dns_resolver_hosts_file.clone(),
+            dns_order: env_config.dns_order.clone(),
+            ttl_override_seconds: env_config.dns_ttl_override,
+            min_ttl_seconds: env_config.dns_min_ttl,
+            stale_ttl_seconds: env_config.dns_stale_ttl,
+            error_ttl_seconds: env_config.dns_error_ttl,
+            max_cache_size: env_config.dns_cache_max_size,
+            refresh_threshold_percent: env_config.dns_refresh_threshold_percent,
+            slow_threshold_ms: env_config.dns_slow_threshold_ms,
+            warmup_concurrency: env_config.dns_warmup_concurrency,
+            failed_retry_interval_seconds: env_config.dns_failed_retry_interval,
+            try_tcp_on_error: env_config.dns_try_tcp_on_error,
+            num_concurrent_reqs: env_config.dns_num_concurrent_reqs,
+            max_active_requests: env_config.dns_max_active_requests,
+            max_concurrent_refreshes: env_config.dns_max_concurrent_refreshes,
+            backend_allow_ips: super::acme_public_egress_policy(),
+            shard_amount: env_config.pool_shard_amount,
+        }))
     }
 
     pub async fn prepare_http01_order(
@@ -2781,14 +2891,18 @@ pub mod client {
     mod tests {
         use super::*;
         use std::collections::HashMap;
+        use std::convert::Infallible;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use http::{Response, StatusCode};
+        use http_body::Frame;
+        use http_body_util::StreamBody;
 
         struct FakeHttpClient {
             status: StatusCode,
             location: Option<&'static str>,
+            content_length: Option<u64>,
             body: Bytes,
             requests: Arc<AtomicUsize>,
         }
@@ -2804,6 +2918,9 @@ pub mod client {
                 let mut builder = Response::builder().status(self.status);
                 if let Some(location) = self.location {
                     builder = builder.header(LOCATION, location);
+                }
+                if let Some(content_length) = self.content_length {
+                    builder = builder.header(CONTENT_LENGTH, content_length);
                 }
                 let response = builder
                     .body(self.body.clone())
@@ -2821,11 +2938,26 @@ pub mod client {
             status: StatusCode,
             location: Option<&'static str>,
         ) -> (PolicyAcmeHttpClient, Arc<AtomicUsize>) {
+            fake_boundary_bytes(
+                Bytes::from(serde_json::to_vec(&body).expect("serialize fake response")),
+                status,
+                location,
+                None,
+            )
+        }
+
+        fn fake_boundary_bytes(
+            body: Bytes,
+            status: StatusCode,
+            location: Option<&'static str>,
+            content_length: Option<u64>,
+        ) -> (PolicyAcmeHttpClient, Arc<AtomicUsize>) {
             let requests = Arc::new(AtomicUsize::new(0));
             let inner = FakeHttpClient {
                 status,
                 location,
-                body: Bytes::from(serde_json::to_vec(&body).expect("serialize fake response")),
+                content_length,
+                body,
                 requests: requests.clone(),
             };
             (
@@ -2926,6 +3058,46 @@ pub mod client {
             );
         }
 
+        #[tokio::test]
+        async fn shared_connection_deadline_covers_fresh_dns_resolution() {
+            let stalled_resolver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind stalled DNS responder");
+            let resolver_address = stalled_resolver
+                .local_addr()
+                .expect("stalled resolver address");
+            let _stalled_tcp_resolver = tokio::net::TcpListener::bind(resolver_address)
+                .await
+                .expect("bind stalled TCP DNS responder");
+            let dns_cache = DnsCache::new(DnsConfig {
+                resolver_addresses: Some(resolver_address.to_string()),
+                try_tcp_on_error: false,
+                num_concurrent_reqs: 1,
+                ..DnsConfig::default()
+            });
+            let mut connector =
+                ScreenedAcmeConnector::with_connect_timeout(dns_cache, Duration::from_millis(25));
+            let destination = "https://deadline.acme.test/directory"
+                .parse::<Uri>()
+                .expect("ACME destination");
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                connector.call(destination),
+            )
+            .await
+            .expect("connector must enforce its shorter shared deadline");
+            let error = result
+                .err()
+                .expect("stalled fresh DNS resolution must time out");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(
+                error
+                    .to_string()
+                    .contains("fresh DNS resolution and TCP connection deadline exceeded"),
+                "{error}"
+            );
+        }
+
         #[test]
         fn public_multi_address_answer_preserves_every_approved_candidate() {
             let connector = ScreenedAcmeConnector::new(default_acme_dns_cache());
@@ -2942,6 +3114,102 @@ pub mod client {
                 candidates,
                 "the connector must not first-answer-pin a multi-address result"
             );
+        }
+
+        #[test]
+        fn excessive_complete_dns_answer_is_rejected_without_truncation() {
+            let connector = ScreenedAcmeConnector::new(default_acme_dns_cache());
+            let candidates = (1..=MAX_ACME_DNS_CANDIDATES + 1)
+                .map(|suffix| IpAddr::from([11, 0, 0, suffix as u8]))
+                .collect::<Vec<_>>();
+            let error = connector
+                .screen_candidates(candidates)
+                .expect_err("excessive complete DNS answer must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("exceeding the limit of 64"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn excessive_dns_answer_is_fully_policy_screened_before_size_rejection() {
+            let connector = ScreenedAcmeConnector::new(default_acme_dns_cache());
+            let mut candidates = (1..=MAX_ACME_DNS_CANDIDATES + 1)
+                .map(|suffix| IpAddr::from([11, 0, 0, suffix as u8]))
+                .collect::<Vec<_>>();
+            candidates.push(IpAddr::from([127, 0, 0, 1]));
+            let error = connector
+                .screen_candidates(candidates)
+                .expect_err("denied address beyond the size bound must still be screened");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                error.to_string().contains("denied by egress policy"),
+                "{error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn declared_oversized_response_body_is_rejected_before_collection() {
+            let (client, requests) = fake_boundary_bytes(
+                Bytes::new(),
+                StatusCode::OK,
+                None,
+                Some(MAX_ACME_RESPONSE_BODY_BYTES_U64 + 1),
+            );
+            let error = boundary_request(&client, "https://acme.example/directory")
+                .await
+                .err()
+                .expect("oversized Content-Length must be rejected");
+            assert!(
+                error.to_string().contains("response body exceeds"),
+                "{error}"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn streamed_oversized_response_body_is_stopped_at_hyper_limit() {
+            let frames = vec![
+                Ok::<_, Infallible>(Frame::data(Bytes::from(vec![
+                    b'a';
+                    MAX_ACME_RESPONSE_BODY_BYTES
+                ]))),
+                Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"!"))),
+            ];
+            let response = Response::new(StreamBody::new(futures_util::stream::iter(frames)));
+            let response =
+                limit_hyper_response_body(response).expect("install streaming response limit");
+            let BytesResponse { body, .. } = BytesResponse::from(response);
+            let error = collect_bounded_response_body(body)
+                .await
+                .err()
+                .expect("streamed body over the cap must fail while collecting");
+            assert!(
+                error.to_string().contains("response body exceeds"),
+                "{error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_client_body_is_checked_again_after_collection() {
+            let (client, requests) = fake_boundary_bytes(
+                Bytes::from(vec![b'a'; MAX_ACME_RESPONSE_BODY_BYTES + 1]),
+                StatusCode::OK,
+                None,
+                None,
+            );
+            let error = boundary_request(&client, "https://acme.example/directory")
+                .await
+                .err()
+                .expect("custom client body over the cap must be rejected");
+            assert!(
+                error.to_string().contains("response body exceeds"),
+                "{error}"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]

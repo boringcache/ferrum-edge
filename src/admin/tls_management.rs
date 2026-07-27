@@ -765,6 +765,15 @@ pub(super) async fn handle_finalize_acme_order(
             ));
         };
 
+        let dns_cache = match acme_dns_cache(state) {
+            Ok(dns_cache) => dns_cache,
+            Err(error) => {
+                return Ok(super::json_response(
+                    StatusCode::BAD_GATEWAY,
+                    &json!({"error": error}),
+                ));
+            }
+        };
         let complete_config = crate::tls::acme::client::CompleteAcmeHttp01OrderConfig {
             directory_url: order.directory_url.clone(),
             account_credentials_json: crate::tls::source::SecretString::new(
@@ -774,7 +783,7 @@ pub(super) async fn handle_finalize_acme_order(
             poll_timeout: Duration::from_secs(
                 request.poll_timeout_seconds.unwrap_or(60).clamp(1, 600),
             ),
-            dns_cache: acme_dns_cache(state),
+            dns_cache,
         };
         let challenge_type = match acme_order_challenge_type(&order) {
             Ok(challenge_type) => challenge_type,
@@ -1897,12 +1906,11 @@ fn acme_certificate_record_from_request(
 }
 
 #[cfg(feature = "acme")]
-fn acme_dns_cache(state: &AdminState) -> crate::dns::DnsCache {
-    state
-        .proxy_state
-        .as_ref()
-        .map(|proxy| proxy.dns_cache.clone())
-        .unwrap_or_else(crate::tls::acme::client::default_acme_dns_cache)
+fn acme_dns_cache(state: &AdminState) -> Result<crate::dns::DnsCache, String> {
+    if let Some(proxy) = state.proxy_state.as_ref() {
+        return Ok(proxy.dns_cache.clone());
+    }
+    crate::tls::acme::client::configured_acme_dns_cache().map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "acme")]
@@ -1932,7 +1940,7 @@ async fn acme_order_record_from_request(
             existing_credentials_json: existing_account_credentials_json,
         },
         domains: domains.clone(),
-        dns_cache: acme_dns_cache(state),
+        dns_cache: acme_dns_cache(state)?,
     };
 
     let prepared = match challenge_type {

@@ -509,8 +509,11 @@ paths:
         Every ACME URL must be HTTPS and remain on the configured directory's
         normalized host and effective port. Ferrum rejects credential-directory
         drift, legacy embedded endpoint sets, redirects, and any fresh DNS answer
-        containing a non-public address. When Ferrum is built without the feature
-        this endpoint returns `501 Not Implemented`.
+        containing a non-public address or more than 64 addresses. Fresh DNS and
+        all TCP candidates share one 30-second wall-clock deadline. Every ACME
+        response, including certificate chains, is capped at 1 MiB while streaming.
+        When Ferrum is built without the feature this endpoint returns
+        `501 Not Implemented`.
       tags: [TLS]
       requestBody:
         required: true
@@ -574,8 +577,9 @@ paths:
         credentials from the latest order for the certificate when available,
         or uses credentials supplied in the request. Finalize the returned
         order after the selected challenge is reachable. The same HTTPS,
-        same-origin, fresh-DNS public-egress boundary used for initial issuance
-        applies to this renewal.
+        same-origin, shared 30-second fresh-DNS/TCP deadline, 64-address DNS limit,
+        public-egress checks, and 1 MiB streaming response cap used for initial
+        issuance apply to this renewal.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -655,7 +659,8 @@ paths:
         `acme` Cargo feature and returns `501 Not Implemented` without it.
         Persisted order and server-provided authorization, challenge, finalize,
         and certificate URLs remain subject to the directory's HTTPS same-origin
-        policy and fresh-DNS public-address connector.
+        policy, the shared 30-second fresh-DNS/TCP deadline, the complete-answer
+        public-address and 64-address checks, and the 1 MiB streaming response cap.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -5965,9 +5970,11 @@ components:
           type: string
           description: >-
             ACME directory URL. Must be an absolute `https` URL without userinfo or
-            a fragment. Every resolved A/AAAA candidate must be public, and all
-            server-provided resource URLs must retain this URL's normalized host
-            and effective port.
+            a fragment. The complete fresh A/AAAA answer must contain at most 64
+            candidates and every candidate must be public. Fresh DNS and all TCP
+            attempts share a 30-second deadline. All server-provided resource URLs
+            must retain this URL's normalized host and effective port, and every
+            ACME response body is capped at 1 MiB while streaming.
         contact:
           type: array
           items:
