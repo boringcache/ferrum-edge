@@ -937,18 +937,6 @@ async fn test_anthropic_tool_choice_required_and_named_preserve_semantics() {
         .expect("required must translate");
     assert_eq!(parsed["tool_choice"], json!({"type": "any"}));
 
-    let any_alias = json!({
-        "model": "claude-3-5-sonnet",
-        "stream": true,
-        "messages": [{"role": "user", "content": "weather?"}],
-        "tools": weather_tools(),
-        "tool_choice": "any"
-    });
-    let parsed = translate_anthropic_body(&any_alias)
-        .await
-        .expect("any must translate");
-    assert_eq!(parsed["tool_choice"], json!({"type": "any"}));
-
     let named = json!({
         "model": "claude-3-5-sonnet",
         "stream": true,
@@ -973,6 +961,7 @@ async fn test_anthropic_rejects_malformed_and_unsupported_tool_choice() {
     let plugin = build(openai_and_anthropic_config());
     let invalid = vec![
         json!("maybe"),
+        json!("any"),
         json!(42),
         json!(true),
         json!(["none"]),
@@ -984,6 +973,15 @@ async fn test_anthropic_rejects_malformed_and_unsupported_tool_choice() {
         json!({"type": "function", "function": {"name": "not valid!"}}),
         json!({"type": "function", "function": {}}),
         json!({"type": "function"}),
+        json!({
+            "type": "function",
+            "function": {"name": "get_weather"},
+            "extra": true
+        }),
+        json!({
+            "type": "function",
+            "function": {"name": "get_weather", "description": "nope"}
+        }),
     ];
 
     for tool_choice in invalid {
@@ -1059,7 +1057,7 @@ async fn test_anthropic_rejects_malformed_and_unsupported_tool_choice() {
 async fn test_anthropic_extended_thinking_tool_choice_combinations() {
     let plugin = build(openai_and_anthropic_config());
 
-    // Active thinking + none/auto are admitted and forwarded.
+    // Manual enabled thinking + none/auto are admitted and forwarded.
     for (tool_choice, expected) in [
         (json!("none"), json!({"type": "none"})),
         (json!("auto"), json!({"type": "auto"})),
@@ -1067,6 +1065,7 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
         let body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": weather_tools(),
             "tool_choice": tool_choice,
@@ -1080,6 +1079,7 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
             parsed["thinking"],
             json!({"type": "enabled", "budget_tokens": 1024})
         );
+        assert_eq!(parsed["max_tokens"], json!(4096));
     }
 
     let adaptive = json!({
@@ -1095,15 +1095,38 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
         .expect("adaptive thinking with auto must translate");
     assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
 
-    // Forced tool use with active thinking is rejected at admission.
+    // Adaptive thinking supports forced tool use (required / named).
+    for (tool_choice, expected) in [
+        (json!("required"), json!({"type": "any"})),
+        (
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            json!({"type": "tool", "name": "get_weather"}),
+        ),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools(),
+            "tool_choice": tool_choice,
+            "thinking": {"type": "adaptive"}
+        });
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("adaptive thinking with forced tool_choice must translate");
+        assert_eq!(parsed["tool_choice"], expected);
+        assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+    }
+
+    // Forced tool use with manual enabled thinking is rejected at admission.
     for tool_choice in [
         json!("required"),
-        json!("any"),
         json!({"type": "function", "function": {"name": "get_weather"}}),
     ] {
         let body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": "weather?"}],
             "tools": weather_tools(),
             "tool_choice": tool_choice,
@@ -1132,16 +1155,69 @@ async fn test_anthropic_extended_thinking_tool_choice_combinations() {
     assert_eq!(parsed["tool_choice"], json!({"type": "any"}));
     assert_eq!(parsed["thinking"], json!({"type": "disabled"}));
 
-    // Malformed thinking is rejected.
-    for thinking in [
-        json!("enabled"),
-        json!({"type": "enabled"}),
-        json!({"type": "enabled", "budget_tokens": 0}),
-        json!({"type": "mystery"}),
+    // Manual budget must be >= 1024 and strictly less than forwarded max_tokens.
+    let ok_budget = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let parsed = translate_anthropic_body(&ok_budget)
+        .await
+        .expect("budget_tokens 1024 with sufficient max_tokens must translate");
+    assert_eq!(
+        parsed["thinking"],
+        json!({"type": "enabled", "budget_tokens": 1024})
+    );
+
+    for (max_tokens, budget) in [
+        (4096u64, 0u64),
+        (4096, 1),
+        (4096, 1023),
+        (1024, 1024),
+        (2048, 2048),
+        (2048, 3000),
     ] {
         let body = json!({
             "model": "claude-3-5-sonnet",
             "stream": true,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": budget}
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            reject_status(&result),
+            Some(400),
+            "must reject invalid thinking budget without claiming the request"
+        );
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(
+                !body.contains(&budget.to_string()) && !body.contains(&max_tokens.to_string()),
+                "client error must not echo untrusted budget/max_tokens values: {body}"
+            );
+        }
+    }
+
+    // Malformed / open-ended thinking shapes are rejected.
+    for thinking in [
+        json!("enabled"),
+        json!({"type": "enabled"}),
+        json!({"type": "enabled", "budget_tokens": 0}),
+        json!({"type": "enabled", "budget_tokens": 1024, "effort": "high"}),
+        json!({"type": "adaptive", "budget_tokens": 1024}),
+        json!({"type": "disabled", "budget_tokens": 1}),
+        json!({"type": "mystery"}),
+        json!({"type": "enabled", "budget_tokens": 1024.5}),
+        json!({"type": "enabled", "budget_tokens": "1024"}),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": 4096,
             "messages": [{"role": "user", "content": "hi"}],
             "thinking": thinking
         });

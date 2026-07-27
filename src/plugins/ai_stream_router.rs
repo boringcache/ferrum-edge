@@ -34,9 +34,11 @@
 //!   matching `role: "tool"` results); Anthropic SSE events are normalized back
 //!   to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"` becomes
 //!   Anthropic `{"type":"none"}` with the tools list retained; unsupported
-//!   tool_choice values and forced tool use with active extended thinking are
-//!   rejected at admission. Provider `tool_use` under a none constraint fails
-//!   closed instead of becoming OpenAI `tool_calls`. Normalization requires
+//!   tool_choice values and forced tool use with manual extended thinking
+//!   (`thinking.type: "enabled"`) are rejected at admission. Adaptive thinking
+//!   may combine with OpenAI `required` / named choices. Provider `tool_use`
+//!   under a none constraint fails closed instead of becoming OpenAI
+//!   `tool_calls`. Normalization requires
 //!   Anthropic `message_stop` (or an explicit provider `error`) before emitting a
 //!   success-shaped terminal sequence; premature EOF / malformed events fail
 //!   closed with an upstream-error SSE frame. Requests that will be normalized
@@ -1025,7 +1027,7 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
 enum ToolChoiceKind {
     None,
     Auto,
-    /// OpenAI `required` / Anthropic `any`.
+    /// OpenAI `required` → Anthropic `{"type":"any"}`.
     ForcedAny,
     ForcedNamed,
 }
@@ -1056,6 +1058,15 @@ fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, 
     Ok(Some(names))
 }
 
+/// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
+/// else `max_completion_tokens`, else the translation default).
+fn anthropic_effective_max_tokens(openai_body: &Value) -> u64 {
+    openai_body["max_tokens"]
+        .as_u64()
+        .or_else(|| openai_body["max_completion_tokens"].as_u64())
+        .unwrap_or(4096)
+}
+
 /// Map supported OpenAI `tool_choice` values to Anthropic's object form.
 /// Unsupported, malformed, or ambiguous values fail closed — never silently
 /// dropped into the provider default (`auto` when tools are present).
@@ -1073,20 +1084,29 @@ fn resolve_anthropic_tool_choice(
         Value::String(value) => match value.as_str() {
             "none" => (ToolChoiceKind::None, json!({ "type": "none" })),
             "auto" => (ToolChoiceKind::Auto, json!({ "type": "auto" })),
-            // OpenAI `required` and the Anthropic-native string alias `any`.
-            "required" | "any" => (ToolChoiceKind::ForcedAny, json!({ "type": "any" })),
+            // OpenAI Chat Completions string form; Anthropic `any` is the
+            // translated object type, not an accepted OpenAI input string.
+            "required" => (ToolChoiceKind::ForcedAny, json!({ "type": "any" })),
             _ => {
                 return Err("unsupported or malformed tool_choice".to_string());
             }
         },
         Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) != Some("function") {
+            // Closed OpenAI shape: {type:"function", function:{name:...}}.
+            if object.len() != 2
+                || object.get("type").and_then(Value::as_str) != Some("function")
+            {
                 return Err("unsupported or malformed tool_choice".to_string());
             }
-            let name = object
+            let function = object
                 .get("function")
                 .and_then(Value::as_object)
-                .and_then(|function| function.get("name"))
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            if function.len() != 1 {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let name = function
+                .get("name")
                 .and_then(Value::as_str)
                 .filter(|value| valid_tool_name(value))
                 .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
@@ -1118,8 +1138,10 @@ fn resolve_anthropic_tool_choice(
     Ok(Some((kind, translated)))
 }
 
-/// Forward Anthropic extended-thinking when present, and reject combinations
-/// the provider documents as invalid (forced tool use with active thinking).
+/// Forward closed Anthropic thinking shapes when present. Manual extended
+/// thinking (`type: "enabled"`) cannot combine with forced tool use; adaptive
+/// thinking may. Budget must satisfy Anthropic's ordinary contract relative to
+/// the effective `max_tokens` this route forwards.
 fn resolve_anthropic_thinking(
     openai_body: &Value,
     tool_choice_kind: Option<ToolChoiceKind>,
@@ -1137,29 +1159,53 @@ fn resolve_anthropic_thinking(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
-    let active = match thinking_type {
+
+    let forwarded = match thinking_type {
         "enabled" => {
-            match object.get("budget_tokens").and_then(Value::as_u64) {
-                Some(budget) if budget > 0 => {}
-                _ => return Err("unsupported or malformed thinking".to_string()),
+            // Closed shape: exactly `type` and `budget_tokens`.
+            if object.len() != 2 || !object.contains_key("budget_tokens") {
+                return Err("unsupported or malformed thinking".to_string());
             }
-            true
+            let budget_value = object
+                .get("budget_tokens")
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            if !budget_value.is_u64() {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            let budget = budget_value
+                .as_u64()
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            let max_tokens = anthropic_effective_max_tokens(openai_body);
+            // Ordinary Anthropic contract: budget_tokens >= 1024 and strictly
+            // less than the forwarded max_tokens (this route does not opt into
+            // interleaved manual thinking via anthropic-beta).
+            if budget < 1024 || budget >= max_tokens {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            if matches!(
+                tool_choice_kind,
+                Some(ToolChoiceKind::ForcedAny | ToolChoiceKind::ForcedNamed)
+            ) {
+                return Err("forced tool_choice is incompatible with extended thinking".to_string());
+            }
+            json!({ "type": "enabled", "budget_tokens": budget })
         }
-        "adaptive" => true,
-        "disabled" => false,
+        "adaptive" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "adaptive" })
+        }
+        "disabled" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "disabled" })
+        }
         _ => return Err("unsupported or malformed thinking".to_string()),
     };
 
-    if active
-        && matches!(
-            tool_choice_kind,
-            Some(ToolChoiceKind::ForcedAny | ToolChoiceKind::ForcedNamed)
-        )
-    {
-        return Err("forced tool_choice is incompatible with extended thinking".to_string());
-    }
-
-    Ok(Some(thinking.clone()))
+    Ok(Some(forwarded))
 }
 
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
@@ -1254,10 +1300,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         message_index += 1;
     }
 
-    let max_tokens = openai_body["max_tokens"]
-        .as_u64()
-        .or_else(|| openai_body["max_completion_tokens"].as_u64())
-        .unwrap_or(4096);
+    let max_tokens = anthropic_effective_max_tokens(openai_body);
 
     let mut body = json!({
         "model": model,
