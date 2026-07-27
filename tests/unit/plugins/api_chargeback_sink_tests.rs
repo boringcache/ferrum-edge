@@ -5765,7 +5765,9 @@ async fn spool_replay_failure_does_not_leak_insert_url() {
 
     let temp = tempfile::tempdir().unwrap();
     let spool = test_spool(&temp);
-    spool.write_events(&[sample_event("evt-redaction")]).unwrap();
+    spool
+        .write_events(&[sample_event("evt-redaction")])
+        .unwrap();
 
     let outcome = replay_spool_once_for_tests(&spool, &insert_url).await;
     drop(guard);

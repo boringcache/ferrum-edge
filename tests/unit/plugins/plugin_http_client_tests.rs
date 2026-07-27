@@ -826,7 +826,8 @@ async fn redacted_transport_failure_slow_and_retry_warnings_hide_the_url() {
     drop(guard);
     let captured = logs.contents();
     assert!(
-        captured.contains("Retrying plugin HTTP call") || captured.contains("Slow plugin HTTP call"),
+        captured.contains("Retrying plugin HTTP call")
+            || captured.contains("Slow plugin HTTP call"),
         "retry and/or slow-call diagnostics must have been emitted: {captured}"
     );
     assert_url_sentinels_absent(&captured, "transport failure diagnostics");

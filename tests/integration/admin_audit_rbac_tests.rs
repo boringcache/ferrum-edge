@@ -1517,8 +1517,7 @@ async fn ai_transcript_audit_config_projections_redact_sink_endpoint_and_headers
     let path_secret = "transcript-path-canary";
     let query_secret = "transcript-query-canary";
     let header_secret = "transcript-header-canary";
-    let endpoint =
-        format!("https://audit.example.com/ingest/{path_secret}?apikey={query_secret}");
+    let endpoint = format!("https://audit.example.com/ingest/{path_secret}?apikey={query_secret}");
     let plugin = json!({
         "id": "transcript-redaction-config",
         "plugin_name": "ai_transcript_audit",
@@ -1550,8 +1549,12 @@ async fn ai_transcript_audit_config_projections_redact_sink_endpoint_and_headers
         &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
     assert_transcript_projection_redacted(audit_config);
 
-    let (status, projected) =
-        get_json(&base, "/plugins/config/transcript-redaction-config", &viewer).await;
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/transcript-redaction-config",
+        &viewer,
+    )
+    .await;
     assert_eq!(status, 200, "viewer read failed: {projected:?}");
     assert_transcript_projection_redacted(&projected["config"]);
 
@@ -1638,8 +1641,12 @@ async fn api_chargeback_sink_config_projections_redact_clickhouse_endpoint_and_p
         &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
     assert_chargeback_projection_redacted(audit_config);
 
-    let (status, projected) =
-        get_json(&base, "/plugins/config/chargeback-redaction-config", &viewer).await;
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/chargeback-redaction-config",
+        &viewer,
+    )
+    .await;
     assert_eq!(status, 200, "viewer read failed: {projected:?}");
     assert_chargeback_projection_redacted(&projected["config"]);
 
