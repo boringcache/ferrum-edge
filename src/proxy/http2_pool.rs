@@ -1111,6 +1111,11 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
     if hyper_err.is_timeout() {
         return Some(ErrorClass::ReadWriteTimeout);
     }
+    if hyper_err.is_canceled() {
+        // hyper contract: the request was never dispatched onto the wire.
+        // Treat as a stale pooled-sender / pool failure (pre-wire).
+        return Some(ErrorClass::ConnectionPoolError);
+    }
     if hyper_err.is_incomplete_message() {
         return Some(ErrorClass::ConnectionClosed);
     }
@@ -1120,6 +1125,51 @@ fn classify_hyper_error(hyper_err: &hyper::Error) -> Option<crate::retry::ErrorC
         return Some(ErrorClass::ProtocolError);
     }
     None
+}
+
+/// Classify a hyper error from `SendRequest::send_request` on an already-pooled
+/// HTTP/2 sender (direct-H2 dispatch).
+///
+/// `is_canceled` means the request was never dispatched (stale idle /
+/// GOAWAY race) and maps pre-wire. Other failures walk the hyper/io chain
+/// with `phase_is_connect = false` so mid-stream resets stay post-wire.
+/// Unknown errors default to [`ErrorClass::ProtocolError`] (post-wire
+/// conservative) rather than inventing a connect-class label.
+pub fn classify_pooled_h2_send_request_error(e: &hyper::Error) -> crate::retry::ErrorClass {
+    use crate::retry::ErrorClass;
+    if let Some(cls) = classify_hyper_error(e) {
+        return cls;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> =
+        std::error::Error::source(e as &dyn std::error::Error);
+    while let Some(node) = current {
+        if let Some(io_err) = node.downcast_ref::<std::io::Error>()
+            && let Some(cls) = classify_io_error(io_err, /* phase_is_connect */ false)
+        {
+            return normalize_pooled_h2_send_post_wire_class(cls);
+        }
+        current = node.source();
+    }
+    ErrorClass::ProtocolError
+}
+
+/// Keep source-chain classifications from turning an already-pooled H2 send
+/// into a connect failure.
+///
+/// `hyper::Error::is_canceled()` is handled before the source-chain walk and is
+/// the only proof that this dispatch never reached the wire. An inner
+/// `io::ErrorKind::ConnectionRefused` (or a platform port-exhaustion errno)
+/// cannot establish that boundary for an already-connected sender, so any
+/// connect-only class discovered below the hyper error must fail closed as a
+/// post-wire protocol error.
+pub(crate) fn normalize_pooled_h2_send_post_wire_class(
+    class: crate::retry::ErrorClass,
+) -> crate::retry::ErrorClass {
+    if crate::retry::request_reached_wire(class) {
+        class
+    } else {
+        crate::retry::ErrorClass::ProtocolError
+    }
 }
 
 /// Errors specific to HTTP/2 pool operations.
