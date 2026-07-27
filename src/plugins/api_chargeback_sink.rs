@@ -4304,6 +4304,38 @@ pub struct SpoolStats {
     pub bytes: u64,
 }
 
+/// One owned spool artifact with the size used for quota accounting.
+#[derive(Debug, Clone)]
+struct OwnedSpoolEntry {
+    path: PathBuf,
+    len: u64,
+}
+
+/// Single walk/sort/stat snapshot of owned spool usage.
+#[derive(Debug, Clone, Default)]
+struct OwnedSpoolInventory {
+    entries: Vec<OwnedSpoolEntry>,
+    stats: SpoolStats,
+}
+
+/// Deterministic report from one quota-eviction admission attempt.
+///
+/// External tests use this to prove multi-file reclaim is planned from a single
+/// inventory/sort rather than rescanning after every deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuotaEvictionReport {
+    /// How many times owned spool metadata was inventoried/sorted.
+    pub inventory_passes: u64,
+    /// Owned files present in that inventory snapshot.
+    pub files_inventoried: u64,
+    /// Owned bytes observed before deletions.
+    pub bytes_before: u64,
+    /// Files successfully unlinked during the pass.
+    pub files_deleted: u64,
+    /// Bytes freed according to the inventory snapshot sizes.
+    pub bytes_freed: u64,
+}
+
 /// Versioned durable ownership record for one managed chargeback spool namespace.
 ///
 /// Binds the whole namespace to the accepted plugin-config identity, the Ferrum
@@ -5180,6 +5212,23 @@ impl SpoolManager {
         self.list_owned_spool_files()
     }
 
+    /// Run quota eviction under the writer lock and return the planning report.
+    ///
+    /// External tests use this to assert multi-file reclaim is driven by one
+    /// inventory/sort pass rather than a per-deletion rescan.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn evict_until_can_admit_for_tests(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.evict_until_can_admit_with_report(incoming_len)
+    }
+
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_with_entry_limit_for_tests(
@@ -5513,16 +5562,29 @@ impl SpoolManager {
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
+        Ok(self.inventory_owned_spool_files()?.stats)
+    }
+
+    /// Collect owned `(path, size)` metadata once, sorted oldest-first.
+    ///
+    /// Quota eviction plans from this snapshot so reclaiming K files never
+    /// repeats a full directory walk/sort per deletion.
+    fn inventory_owned_spool_files(&self) -> Result<OwnedSpoolInventory, String> {
         let files = self.list_owned_spool_files()?;
-        let mut stats = SpoolStats::default();
+        let mut inventory = OwnedSpoolInventory {
+            entries: Vec::with_capacity(files.len()),
+            stats: SpoolStats::default(),
+        };
         for file in files {
             match fs::symlink_metadata(&file) {
                 Ok(meta) => {
                     if meta.file_type().is_symlink() {
                         continue;
                     }
-                    stats.files = stats.files.saturating_add(1);
-                    stats.bytes = stats.bytes.saturating_add(meta.len());
+                    let len = meta.len();
+                    inventory.stats.files = inventory.stats.files.saturating_add(1);
+                    inventory.stats.bytes = inventory.stats.bytes.saturating_add(len);
+                    inventory.entries.push(OwnedSpoolEntry { path: file, len });
                 }
                 Err(error) => {
                     return Err(format!(
@@ -5532,7 +5594,7 @@ impl SpoolManager {
                 }
             }
         }
-        Ok(stats)
+        Ok(inventory)
     }
 
     /// Drop oldest evictable owned spool files until
@@ -5546,61 +5608,98 @@ impl SpoolManager {
     /// destroy another owner's or another delivery's billing data. When only
     /// such files remain the write fails closed instead of over-admitting or
     /// stealing them.
+    ///
+    /// Planning inventories and sorts the owned set once, then deletes enough
+    /// eligible files from that snapshot in a single bounded pass.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
+        self.evict_until_can_admit_with_report(incoming_len)
+            .map(|_| ())
+    }
+
+    fn evict_until_can_admit_with_report(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
                 self.cfg.max_bytes
             ));
         }
-        loop {
-            let stats = self.scan_stats()?;
-            if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
-                return Ok(());
+        let inventory = self.inventory_owned_spool_files()?;
+        let mut report = QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: inventory.stats.files,
+            bytes_before: inventory.stats.bytes,
+            files_deleted: 0,
+            bytes_freed: 0,
+        };
+        let mut remaining_bytes = inventory.stats.bytes;
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+
+        let wall_clock = SystemTime::now();
+        let mut protected = 0u64;
+        let mut warned = false;
+        for entry in &inventory.entries {
+            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                return Ok(report);
             }
-            let owned = self.list_owned_spool_files()?;
-            let wall_clock = SystemTime::now();
-            let Some(oldest) = owned
-                .iter()
-                .find(|path| self.is_evictable_owned_file(path.as_path(), wall_clock))
-                .cloned()
-            else {
-                let protected = owned.len();
-                return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
-                    self.cfg.max_bytes
-                ));
-            };
-            self.assert_managed_path(&oldest)?;
-            match fs::remove_file(&oldest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
+                protected = protected.saturating_add(1);
+                continue;
+            }
+            self.assert_managed_path(&entry.path)?;
+            match fs::remove_file(&entry.path) {
+                Ok(()) => {
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.files_deleted = report.files_deleted.saturating_add(1);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                    self.metrics
+                        .spool_drops_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !warned {
+                        let now = unix_timestamp_seconds();
+                        let last = self.last_drop_warn_at.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
+                            && self
+                                .last_drop_warn_at
+                                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            warn!(
+                                plugin = PLUGIN_NAME,
+                                max_bytes = self.cfg.max_bytes,
+                                incoming_bytes = incoming_len,
+                                "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
+                            );
+                            warned = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone: credit the snapshot size so admission can
+                    // continue from this one inventory without rescanning.
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                }
                 Err(error) => {
                     return Err(format!(
                         "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
-                        oldest.display()
+                        entry.path.display()
                     ));
                 }
             }
-            self.metrics
-                .spool_drops_total
-                .fetch_add(1, Ordering::Relaxed);
-            let now = unix_timestamp_seconds();
-            let last = self.last_drop_warn_at.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
-                && self
-                    .last_drop_warn_at
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    max_bytes = self.cfg.max_bytes,
-                    incoming_bytes = incoming_len,
-                    "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
-                );
-            }
         }
+
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+        Err(format!(
+            "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
+            self.cfg.max_bytes
+        ))
     }
 
     /// Whether one owned file may be dropped to make room for a new batch.
