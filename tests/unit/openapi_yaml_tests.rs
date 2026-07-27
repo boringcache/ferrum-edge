@@ -5010,7 +5010,10 @@ fn request_mirror_schema_matches_strict_runtime_config_contract() {
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    assert_eq!(documented, runtime, "request_mirror runtime/OpenAPI key drift");
+    assert_eq!(
+        documented, runtime,
+        "request_mirror runtime/OpenAPI key drift"
+    );
 
     let plugin_docs = include_str!("../../docs/plugins.md");
     let mirror_docs = plugin_docs

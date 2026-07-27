@@ -4083,8 +4083,8 @@ async fn mirror_metrics_count_concurrency_drops() {
 
 #[test]
 fn test_request_mirror_rejects_unknown_keys_with_allowed_list_and_suggestions() {
-    use ferrum_edge::plugins::{plugin_failure_policy, validate_plugin_config};
     use ferrum_edge::plugins::request_mirror::REQUEST_MIRROR_CONFIG_KEYS;
+    use ferrum_edge::plugins::{plugin_failure_policy, validate_plugin_config};
 
     assert_eq!(
         plugin_failure_policy("request_mirror"),

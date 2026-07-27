@@ -2184,10 +2184,7 @@ async fn test_request_mirror_unknown_key_reload_keeps_last_known_good() {
     let error = cache
         .rebuild(&typo)
         .expect_err("unknown request_mirror key must reject cache publication");
-    assert!(
-        error.contains("mirror_protcol"),
-        "got: {error}"
-    );
+    assert!(error.contains("mirror_protcol"), "got: {error}");
 
     let after = cache.get_plugins("ferrum", "p1");
     assert_eq!(after.len(), 1);
