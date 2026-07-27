@@ -34,6 +34,8 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// drop idle keys without waiting for the next cool-down window. Live
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str =
+    r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
@@ -487,18 +489,13 @@ impl AiRateLimiter {
     }
 
     fn reject_capacity(&self) -> PluginResult {
-        warn!(
-            plugin = "ai_rate_limiter",
-            max_state_entries = MAX_STATE_ENTRIES,
-            "AI rate-limit state capacity exceeded, rejecting new key"
-        );
+        // The metric is deliberately the only operational signal here. A
+        // warning per attacker-selected new key would turn fail-closed
+        // admission into log amplification.
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
         PluginResult::Reject {
             status_code: 429,
-            body: format!(
-                r#"{{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max {} keys)"}}"#,
-                MAX_STATE_ENTRIES
-            ),
+            body: CAPACITY_REJECT_BODY.to_string(),
             headers: HashMap::new(),
         }
     }
@@ -1590,6 +1587,10 @@ impl Plugin for AiRateLimiter {
         //    how `ai_request_guard` treats compressed bodies (#1919) and is
         //    documented under `count_mode` / `on_unmetered_response` in
         //    docs/plugins.md.
+        // Advance sampled idle reclamation before admission so an exactly-full
+        // map of expired keys cannot remain pinned closed when only new
+        // identities arrive. Cleanup never removes live budgets.
+        self.evict_stale_entries();
         let Some(outcome) = (if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {
@@ -1604,11 +1605,6 @@ impl Plugin for AiRateLimiter {
         }) else {
             return self.reject_capacity();
         };
-        // Reclaim idle keys AFTER the check so cleanup never races the
-        // current request's admission. Live budgets are never force-evicted;
-        // hard cardinality is enforced by atomic reservation on insert.
-        // Mirrors `rate_limiting.rs::check_rate` ordering.
-        self.evict_stale_entries();
 
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();

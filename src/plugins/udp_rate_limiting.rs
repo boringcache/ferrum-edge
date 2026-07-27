@@ -335,12 +335,6 @@ impl Plugin for UdpRateLimiting {
             .await
         else {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(
-                plugin = "udp_rate_limiting",
-                proxy_id = %ctx.proxy_id,
-                max_state_entries = MAX_STATE_ENTRIES,
-                "UDP rate-limit state capacity exceeded, dropping new client"
-            );
             return UdpDatagramVerdict::Drop;
         };
 

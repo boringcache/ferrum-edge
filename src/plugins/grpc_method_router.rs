@@ -32,6 +32,7 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// drop idle keys without waiting for the next cool-down window. Live
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str = r#"{"error":"Rate limit state capacity exceeded"}"#;
 
 /// `grpc_method_router`-specific top-level config keys (excludes Redis fields).
 const GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS: &[&str] = &[
@@ -610,17 +611,10 @@ impl Plugin for GrpcMethodRouter {
             let key = self.rate_key(ctx, full_method);
             match self.check_rate(&key, spec).await {
                 None => {
-                    warn!(
-                        plugin = "grpc_method_router",
-                        max_state_entries = MAX_STATE_ENTRIES,
-                        "gRPC rate-limit state capacity exceeded, rejecting new key"
-                    );
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     return PluginResult::Reject {
                         status_code: 429,
-                        body: grpc_json_error_body(
-                            "Rate limit state capacity exceeded".to_string(),
-                        ),
+                        body: CAPACITY_REJECT_BODY.to_string(),
                         headers: grpc_content_type_header(),
                     };
                 }

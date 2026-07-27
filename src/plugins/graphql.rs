@@ -54,6 +54,8 @@ const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// drop idle keys without waiting for the next cool-down window. Live
 /// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str =
+    r#"{"errors":[{"message":"Rate limit state capacity exceeded"}]}"#;
 const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
     &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
@@ -1611,15 +1613,10 @@ impl Plugin for GraphqlPlugin {
             let key = self.rate_key(ctx, "type", op.op_type);
             match self.check_rate(&key, spec).await {
                 None => {
-                    warn!(
-                        plugin = "graphql",
-                        max_state_entries = MAX_STATE_ENTRIES,
-                        "GraphQL rate-limit state capacity exceeded, rejecting new key"
-                    );
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     return PluginResult::Reject {
                         status_code: 429,
-                        body: capacity_rate_limit_error_body(),
+                        body: CAPACITY_REJECT_BODY.to_string(),
                         headers: json_content_type_header(),
                     };
                 }
@@ -1656,15 +1653,10 @@ impl Plugin for GraphqlPlugin {
             let key = self.rate_key(ctx, "op", op_name);
             match self.check_rate(&key, spec).await {
                 None => {
-                    warn!(
-                        plugin = "graphql",
-                        max_state_entries = MAX_STATE_ENTRIES,
-                        "GraphQL rate-limit state capacity exceeded, rejecting new key"
-                    );
                     super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
                     return PluginResult::Reject {
                         status_code: 429,
-                        body: capacity_rate_limit_error_body(),
+                        body: CAPACITY_REJECT_BODY.to_string(),
                         headers: json_content_type_header(),
                     };
                 }
@@ -1751,10 +1743,6 @@ fn type_rate_limit_error_body(op_type: &str) -> String {
     message.push_str(op_type);
     message.push_str(" operations");
     graphql_error_body(&message)
-}
-
-fn capacity_rate_limit_error_body() -> String {
-    graphql_error_body("Rate limit state capacity exceeded")
 }
 
 fn operation_rate_limit_error_body(op_name: &str) -> String {

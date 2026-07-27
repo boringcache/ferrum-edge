@@ -302,12 +302,6 @@ impl Plugin for WsRateLimiting {
             .await
         else {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(
-                plugin = "ws_rate_limiting",
-                proxy_id = %proxy_id,
-                max_state_entries = MAX_STATE_ENTRIES,
-                "WebSocket rate-limit state capacity exceeded, closing new connection"
-            );
             return Some(Message::Close(Some(CloseFrame {
                 code: CloseCode::Policy,
                 reason: self.close_reason.clone().into(),

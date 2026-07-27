@@ -366,12 +366,9 @@ impl RateLimiting {
 
     fn reject_capacity(&self) -> PluginResult {
         // Capacity denial is fail-closed for previously unseen local/fallback
-        // keys. Do not reflect limiter identity back to the client.
-        warn!(
-            plugin = "rate_limiting",
-            max_state_entries = MAX_STATE_ENTRIES,
-            "Rate-limit state capacity exceeded, rejecting new key"
-        );
+        // keys. Do not reflect limiter identity back to the client or emit an
+        // attacker-rate warning for every new key; the counter is the bounded
+        // operational signal.
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
         PluginResult::Reject {
             status_code: 429,
@@ -386,6 +383,11 @@ impl RateLimiting {
         limit_op: &DynamicRateLimitOp,
         ctx: &mut RequestContext,
     ) -> PluginResult {
+        // Run sampled idle reclamation before admission. Capacity denial must
+        // still advance the cleanup schedule; otherwise an exactly-full map of
+        // expired keys could remain pinned closed when only new identities
+        // arrive. Cleanup never removes live budgets.
+        self.maybe_evict_stale_entries();
         let Some(outcome) = self
             .limiter
             .check_with_redis_key_and_local_capacity(
@@ -398,7 +400,6 @@ impl RateLimiting {
         else {
             return self.reject_capacity();
         };
-        self.maybe_evict_stale_entries();
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
@@ -410,6 +411,7 @@ impl RateLimiting {
     }
 
     async fn check_rate_stream(&self, key: String, limit_op: &DynamicRateLimitOp) -> PluginResult {
+        self.maybe_evict_stale_entries();
         let Some(outcome) = self
             .limiter
             .check_with_redis_key_and_local_capacity(
@@ -422,7 +424,6 @@ impl RateLimiting {
         else {
             return self.reject_capacity();
         };
-        self.maybe_evict_stale_entries();
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded (stream)");
