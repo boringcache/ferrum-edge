@@ -104,6 +104,39 @@ pub mod _test_support {
         crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
     }
 
+    /// Public mirror of the crate-private TCP SO_REUSEPORT accept-loop peer class.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TcpAcceptLoopClass {
+        Primary,
+        Extra { index: usize },
+    }
+
+    impl TcpAcceptLoopClass {
+        fn into_production(self) -> crate::proxy::tcp_proxy::TcpAcceptLoopClass {
+            match self {
+                Self::Primary => crate::proxy::tcp_proxy::TcpAcceptLoopClass::Primary,
+                Self::Extra { index } => {
+                    crate::proxy::tcp_proxy::TcpAcceptLoopClass::Extra { index }
+                }
+            }
+        }
+    }
+
+    /// Supervise TCP SO_REUSEPORT accept-loop peers the same way production does.
+    pub async fn supervise_tcp_accept_loop_peers_for_test(
+        peers: Vec<(
+            TcpAcceptLoopClass,
+            tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        )>,
+        cancel_siblings: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        let peers = peers
+            .into_iter()
+            .map(|(class, handle)| (class.into_production(), handle))
+            .collect();
+        crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -1604,6 +1637,102 @@ pub mod _test_support {
         plugin.staging_metadata_key_for_tests(suffix)
     }
 
+    pub fn ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        plugin.apply_redis_quarantine_delete_outcome_for_tests(cache_key, fingerprint, delete_ok);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_expire_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.expire_redis_quarantine_for_tests(cache_key);
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_len_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_len_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_delete_failures_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_delete_failures_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_suppressions_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.redis_quarantine_suppressions_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_cap_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.redis_quarantine_cap_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_ttl_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> std::time::Duration {
+        plugin.redis_quarantine_ttl_for_tests()
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_is_suppressed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) -> bool {
+        plugin.redis_quarantine_is_suppressed_for_tests(cache_key)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_matches_active_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+        fingerprint: &[u8; 32],
+    ) -> bool {
+        plugin.redis_quarantine_matches_active_for_tests(cache_key, fingerprint)
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_content_for_test(
+        data: &[u8],
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_content_for_tests(
+            data,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test(
+        length: usize,
+    ) -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_oversized_for_tests(
+            length,
+        )
+    }
+
+    pub fn ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test() -> [u8; 32] {
+        crate::plugins::ai_semantic_cache::AiSemanticCache::redis_quarantine_fingerprint_empty_for_tests(
+        )
+    }
+
+    pub fn ai_semantic_cache_clear_redis_quarantine_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        cache_key: &str,
+    ) {
+        plugin.clear_redis_quarantine_for_tests(cache_key);
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
@@ -2900,6 +3029,27 @@ pub mod _test_support {
             response_status,
             response_headers,
             response_body,
+        )
+        .await
+    }
+
+    /// Drive the complete shared H1/H2/H3 synthetic-response finalizer,
+    /// including the empty-body scheduling gate and rejection replacement.
+    pub async fn finalize_synthetic_response_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        response_status: &mut u16,
+        response_headers: &mut HashMap<String, String>,
+        response_body: &mut Vec<u8>,
+    ) {
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            response_status,
+            response_headers,
+            response_body,
+            false,
+            false,
         )
         .await
     }
