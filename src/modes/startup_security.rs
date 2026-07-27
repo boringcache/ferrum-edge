@@ -393,13 +393,12 @@ pub fn load_mesh_inbound_client_ca_bundle(
     path: &str,
 ) -> Result<(String, Arc<[u8]>), anyhow::Error> {
     let source = CertSource::parse(path, MaterialKind::CaBundle);
-    let material =
-        load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
-            format!(
-                "failed to load mesh frontend client CA bundle at {}",
-                source.redacted_source_id()
-            )
-        })?;
+    let material = load_material_blocking(&source, MaterialKind::CaBundle).with_context(|| {
+        format!(
+            "failed to load mesh frontend client CA bundle at {}",
+            source.redacted_source_id()
+        )
+    })?;
     let pem: Arc<[u8]> = material.bytes.expose_secret().to_vec().into();
     Ok((material.display_source_id, pem))
 }
@@ -422,10 +421,8 @@ pub fn mesh_inbound_server_identity_configured(
     if env_config.gateway_svid_cert_path.is_some() && env_config.gateway_svid_key_path.is_some() {
         return Ok(true);
     }
-    let ca_backend =
-        crate::identity::ca::CaBackend::from_str_lossy(&env_config.mesh_ca_backend).map_err(
-            |error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"),
-        )?;
+    let ca_backend = crate::identity::ca::CaBackend::from_str_lossy(&env_config.mesh_ca_backend)
+        .map_err(|error| anyhow::anyhow!("Invalid FERRUM_MESH_CA_BACKEND: {error}"))?;
     Ok(ca_backend != crate::identity::ca::CaBackend::None)
 }
 
@@ -476,9 +473,7 @@ pub fn validate_mesh_inbound_client_ca_if_applicable(
 /// unused at runtime; validate may therefore conservatively reject a
 /// configured CA that such a slice would not consume. It does **not** claim
 /// exact knowledge of the effective live mTLS mode.
-fn validate_mesh_inbound_client_ca_from_env(
-    env_config: &EnvConfig,
-) -> Result<(), anyhow::Error> {
+fn validate_mesh_inbound_client_ca_from_env(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
     let topology_raw =
         resolve_ferrum_var("FERRUM_MESH_TOPOLOGY").unwrap_or_else(|| "sidecar".to_string());
     let topology = MeshTopology::parse(&topology_raw).map_err(anyhow::Error::msg)?;

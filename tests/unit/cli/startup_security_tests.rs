@@ -8,8 +8,7 @@ use ferrum_edge::config::env_config::{EnvConfig, OperatingMode};
 use ferrum_edge::modes::startup_security::{
     StartupSecurityScope, load_startup_security, load_startup_security_with_scope,
     mesh_inbound_modes_need_client_ca, mesh_inbound_server_identity_configured,
-    try_load_frontend_tls, validate_dtls_material,
-    validate_mesh_inbound_client_ca_if_applicable,
+    try_load_frontend_tls, validate_dtls_material, validate_mesh_inbound_client_ca_if_applicable,
 };
 use ferrum_edge::tls::{TlsPolicy, load_crls};
 use rcgen::{CertificateParams, KeyPair};
@@ -419,8 +418,16 @@ fn mesh_malformed_client_ca_rejected_with_explicit_frontend_identity() {
     let env = EnvConfig {
         mode: OperatingMode::Mesh,
         admin_https_port: 0,
-        frontend_tls_cert_path: Some(write_pem(&dir, "frontend.crt", "unused-for-identity-gate\n")),
-        frontend_tls_key_path: Some(write_pem(&dir, "frontend.key", "unused-for-identity-gate\n")),
+        frontend_tls_cert_path: Some(write_pem(
+            &dir,
+            "frontend.crt",
+            "unused-for-identity-gate\n",
+        )),
+        frontend_tls_key_path: Some(write_pem(
+            &dir,
+            "frontend.key",
+            "unused-for-identity-gate\n",
+        )),
         frontend_tls_client_ca_bundle_path: Some(ca_path),
         ..EnvConfig::default()
     };
