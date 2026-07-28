@@ -210,6 +210,15 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   each secret is per-credential and bound CP-side. It requires at least 32
   bytes. Do not reuse one `HS*` secret across tenants — that reintroduces the
   original defect.
+- **In particular, never back a credential with `FERRUM_CP_DP_GRPC_JWT_SECRET`**
+  — not inline, not via `"secret_env": "FERRUM_CP_DP_GRPC_JWT_SECRET"`, and not
+  via a `secret_path` pointing at the same material. Every data plane in the
+  fleet already holds that value, so any of them could name that credential's
+  `kid` and reach its namespaces: the bundle would be structurally valid and
+  semantically identical to the pre-advisory posture. Startup cannot detect the
+  reuse (it never compares key bytes across sources); it only enforces that a
+  bundle exists. Generate one fresh secret per credential — or, better, use an
+  asymmetric key so the data plane cannot sign at all.
 - Startup refuses duplicate `kid`s (ambiguous key selection), unknown
   algorithms, algorithm/material mismatches, empty namespace lists, and
   unreadable material.

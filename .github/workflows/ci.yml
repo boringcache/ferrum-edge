@@ -3251,18 +3251,23 @@ jobs:
           # Multi-namespace production example declares
           # FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH and mounts this Secret. Supply a
           # real JSON bundle so fail-closed startup can load it (GHSA-3f2j).
-          # secret_env references the already-injected fleet JWT secret as the
-          # HS256 migration shape; kid selects the credential, namespaces are
-          # the server-derived ceiling. Do not embed secret bytes in the file.
+          # `kid` selects the credential; `namespaces` is the server-derived
+          # ceiling. The secret is generated here and masked, never written into
+          # this workflow: a credential MUST NOT be backed by the fleet-wide
+          # FERRUM_CP_DP_GRPC_JWT_SECRET (every data plane holds that value, so
+          # any of them could name this `kid` — the very forgery the advisory
+          # closes). Asymmetric material is the recommended production shape.
+          tenant_bundle_secret="$(openssl rand -hex 32)"
+          echo "::add-mask::${tenant_bundle_secret}"
           trust_bundle_dir="$(mktemp -d)"
-          cat > "${trust_bundle_dir}/cp-dp-trust-bundle.json" <<'EOF'
+          cat > "${trust_bundle_dir}/cp-dp-trust-bundle.json" <<EOF
           {
             "version": 1,
             "keys": [
               {
                 "kid": "ci-production-smoke",
                 "algorithm": "HS256",
-                "secret_env": "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "secret": "${tenant_bundle_secret}",
                 "namespaces": ["ferrum"]
               }
             ]
@@ -3291,7 +3296,9 @@ jobs:
           kubectl -n ferrum-prod get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/production-events.txt"
           kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 \
             > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log" 2>&1 || true
-          for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret"; do
+          # tenant_bundle_secret is trust-bundle key material: cp_trust.rs must
+          # never render it, not even in a bundle-load failure (GHSA-3f2j).
+          for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret" "$tenant_bundle_secret"; do
             if grep -Fq "$secret" "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"; then
               rm -f "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
               echo "::error title=Secret leaked to logs::production-style control-plane logs contained a secret value"
