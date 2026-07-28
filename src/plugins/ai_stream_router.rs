@@ -2753,21 +2753,38 @@ impl AnthropicSseNormalizer {
             self.events_seen = self.events_seen.saturating_add(1);
             self.clear_buffer();
 
-            if self.apply_frame_outcome(outcome, out) {
-                return true;
-            }
-            // Preserve prior EOF framing: a non-terminating trailing frame that
-            // is not pure whitespace is treated as malformed trailing data.
-            if !raw_is_ws {
-                self.emit_upstream_error(
-                    "upstream provider ended the Anthropic SSE stream with malformed trailing data",
-                    out,
-                );
-                self.finish(StreamTerminal::UpstreamFailure, out);
-                return true;
-            }
-            if self.normalized_output_exceeded(out) {
-                return true;
+            // Delimiter-less EOF remainder is trailing framing, not a complete
+            // event. Interpret Fail outcomes (incomplete JSON, bad UTF-8, etc.)
+            // with the stable trailing diagnostic rather than the complete-event
+            // malformed-JSON / malformed-SSE labels used by `drain_complete`.
+            match outcome {
+                FrameOutcome::Fail(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider ended the Anthropic SSE stream with malformed trailing data",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                outcome => {
+                    if self.apply_frame_outcome(outcome, out) {
+                        return true;
+                    }
+                    // Preserve prior EOF framing: a non-terminating trailing frame
+                    // that is not pure whitespace is treated as malformed trailing
+                    // data.
+                    if !raw_is_ws {
+                        self.emit_upstream_error(
+                            "upstream provider ended the Anthropic SSE stream with malformed trailing data",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
+                    if self.normalized_output_exceeded(out) {
+                        return true;
+                    }
+                }
             }
         }
         // Clean EOF without `message_stop` is premature truncation — never

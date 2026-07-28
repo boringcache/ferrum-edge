@@ -1972,20 +1972,6 @@ fn assert_bound_termination(text: &str, needle: &str) {
     assert!(!text.contains("aaaaaaaa"), "{text}");
 }
 
-fn large_text_delta_frame(text_bytes: usize) -> Vec<u8> {
-    let text = "a".repeat(text_bytes);
-    let payload = format!(
-        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#,
-        serde_json::to_string(&text).expect("text delta JSON")
-    );
-    let frame = format!("event: content_block_delta\ndata: {payload}\n\n").into_bytes();
-    assert!(
-        frame.len() <= MAX_SSE_EVENT_BYTES,
-        "delta frame {text_bytes} bytes must stay under the per-event cap"
-    );
-    frame
-}
-
 fn oversized_complete_event(event_bytes: usize) -> Vec<u8> {
     // `data: ` (6) + filler + `\n\n` (2) == event_bytes.
     assert!(event_bytes >= 8, "event frame too small");
@@ -2146,30 +2132,59 @@ async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
 #[tokio::test]
 async fn test_normalizer_rejects_excessive_normalized_output() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
-    let start = concat!(
-        "event: message_start\n",
-        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_out\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    // Text-dominated frames expand ~1:1 and trip the 8 MiB plaintext ceiling
+    // before the 16 MiB normalized-output ceiling. A long stream id is repeated
+    // in every OpenAI envelope, so tiny Anthropic text deltas expand enough to
+    // exercise the output bound while staying under the plaintext and
+    // event-count caps.
+    let stream_id = "m".repeat(256);
+    let start = format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
     );
     match inspector.on_chunk(start.as_bytes()).await {
         ResponseStreamAction::Forward(_) => {}
         other => panic!("message_start must forward: {other:?}"),
     }
 
-    const DELTA_TEXT_BYTES: usize = 512 * 1024;
-    let delta = large_text_delta_frame(DELTA_TEXT_BYTES);
-    let deltas_needed = MAX_SSE_NORMALIZED_OUTPUT_BYTES / DELTA_TEXT_BYTES + 2;
-    for index in 0..deltas_needed {
-        match inspector.on_chunk(&delta).await {
+    let delta = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    assert!(
+        delta.len() < 128,
+        "fixture delta must stay tiny so OpenAI envelope expansion dominates"
+    );
+    assert!(
+        MAX_SSE_NORMALIZED_OUTPUT_BYTES > MAX_SSE_NORMALIZED_BODY_BYTES,
+        "output ceiling must sit above the plaintext ceiling"
+    );
+
+    let batch_events = 512usize;
+    let mut batch = Vec::with_capacity(batch_events * delta.len());
+    for _ in 0..batch_events {
+        batch.extend_from_slice(delta);
+    }
+    // Long enough to exceed the 16 MiB output ceiling under envelope expansion
+    // (id repeated per OpenAI chunk), but still under the event-count hard cap.
+    let max_batches = MAX_SSE_EVENTS / batch_events;
+
+    for index in 0..max_batches {
+        match inspector.on_chunk(&batch).await {
             ResponseStreamAction::Forward(_) => {}
             ResponseStreamAction::Terminate(Some(bytes)) => {
                 let text = String::from_utf8(bytes.to_vec()).unwrap();
                 assert_bound_termination(&text, "cumulative normalized size limit");
+                // Distinguish from the plaintext body ceiling diagnostic.
+                assert!(
+                    !text.contains("exceeded the cumulative size limit"),
+                    "{text}"
+                );
+                assert!(!text.contains("event count limit"), "{text}");
+                assert!(!text.contains("oversized"), "{text}");
                 return;
             }
-            other => panic!("text delta {index} unexpected: {other:?}"),
+            other => panic!("text delta batch {index} unexpected: {other:?}"),
         }
     }
-    panic!("stream must terminate before {deltas_needed} text deltas exhaust the output cap");
+    panic!("stream must terminate before {max_batches} batches exhaust the output cap");
 }
 
 #[tokio::test]
@@ -2281,7 +2296,11 @@ async fn test_normalizer_trailing_incomplete_event_is_malformed() {
         ResponseStreamAction::Terminate(Some(bytes)) => {
             let text = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(text.contains("malformed trailing data"), "{text}");
+            // Delimiter-less EOF remainder must not use the complete-event
+            // malformed-JSON diagnostic.
+            assert!(!text.contains("malformed SSE JSON"), "{text}");
             assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+            assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
         }
         other => panic!("EOF must fail closed on incomplete trailing data: {other:?}"),
     }
