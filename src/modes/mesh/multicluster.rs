@@ -2115,7 +2115,7 @@ async fn fetch_remote_slice(
     tls_config: Option<&DpGrpcTlsConfig>,
     request_timeout: Duration,
 ) -> Result<crate::modes::mesh::slice::MeshSlice, String> {
-    use crate::grpc::dp_client::generate_dp_jwt_full;
+    use crate::grpc::dp_client::generate_dp_jwt_full_with_key_id;
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
@@ -2149,12 +2149,17 @@ async fn fetch_remote_slice(
         // issuer + expiry + signature cannot express "this token is for
         // cluster B", so a shared secret used by B and C made B's token valid
         // at C. The `aud` closes that (issue #2475).
-        let auth_token = generate_dp_jwt_full(
+        // The `kid` selects which of the PEER cluster's namespace-bound
+        // verification credentials must check this signature
+        // (advisory GHSA-3f2j-wwqw-grmg); the audience keeps the token
+        // non-transferable between peer clusters.
+        let auth_token = generate_dp_jwt_full_with_key_id(
             jwt_secret.as_str(),
             node_id,
             jwt_secret.issuer(),
             Some(namespace),
             Some(audience),
+            jwt_secret.key_id(),
         )
         .map_err(|e| format!("mint remote CP JWT: {e}"))?;
         let token: MetadataValue<_> = format!("Bearer {auth_token}")
@@ -4505,11 +4510,15 @@ mod tests {
                 } else {
                     GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
                 };
+                let verifier = crate::grpc::cp_trust::CpDpVerifier::SharedSecret(
+                    secret.as_str().to_string(),
+                );
                 verify_grpc_jwt_metadata_with_audience(
                     request.metadata(),
-                    secret.as_str(),
+                    &verifier,
                     secret.issuer(),
                     policy,
+                    request.extensions().get(),
                 )
                 .map_err(|(status, _)| status)?;
             }

@@ -26,10 +26,14 @@
 //!   `aud`, so any audience at all is refused, preserving `jsonwebtoken`'s
 //!   strict `validate_aud` posture.
 
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use jsonwebtoken::{Validation, decode, decode_header};
 use serde_json::Value;
 use std::collections::HashSet;
 use tonic::Status;
+
+use super::cp_trust::{
+    CpDpVerifier, CpGrpcConnectInfo, TenantAuthRejectReason, resolve_authorized_namespaces,
+};
 
 /// Reserved JWT `aud` prefix for cross-cluster mesh **remote-discovery**
 /// tokens. The prefix is what makes the token class self-describing: any
@@ -274,10 +278,10 @@ impl AllowedNamespaces {
 #[allow(clippy::result_large_err, dead_code)]
 pub(crate) fn verify_grpc_jwt_metadata(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
 ) -> Result<(), Status> {
-    verify_grpc_jwt_metadata_with_claims(metadata, jwt_secret, expected_issuer).map(|_| ())
+    verify_grpc_jwt_metadata_with_claims(metadata, verifier, expected_issuer, None).map(|_| ())
 }
 
 /// Verify the JWT and return any `ns` claim it carried. Use this variant
@@ -294,14 +298,16 @@ pub(crate) fn verify_grpc_jwt_metadata(
 #[allow(clippy::result_large_err)]
 pub(crate) fn verify_grpc_jwt_metadata_with_claims(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
+    peer: Option<&CpGrpcConnectInfo>,
 ) -> Result<AllowedNamespaces, Status> {
     verify_grpc_jwt_metadata_with_audience(
         metadata,
-        jwt_secret,
+        verifier,
         expected_issuer,
         GrpcAudiencePolicy::ReservedForbidden,
+        peer,
     )
     .map_err(|(status, _)| status)
 }
@@ -316,9 +322,10 @@ pub(crate) fn verify_grpc_jwt_metadata_with_claims(
 #[allow(clippy::result_large_err, clippy::type_complexity)]
 pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     metadata: &tonic::metadata::MetadataMap,
-    jwt_secret: &str,
+    verifier: &CpDpVerifier,
     expected_issuer: &str,
     audience_policy: GrpcAudiencePolicy<'_>,
+    peer: Option<&CpGrpcConnectInfo>,
 ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
     let token = metadata
         .get("authorization")
@@ -331,8 +338,20 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
             )
         })?;
 
-    let key = DecodingKey::from_secret(jwt_secret.as_bytes());
-    let mut validation = Validation::new(Algorithm::HS256);
+    // The JWS header selects WHICH credential must verify the signature. It is
+    // read before verification because it has to be — but it authorizes
+    // nothing: naming another tenant's `kid` without holding that key fails the
+    // signature check below, and the namespace ceiling comes from CP-side
+    // configuration attached to the selected key, never from the token.
+    let header = decode_header(token).map_err(|_| {
+        let reason = TenantAuthRejectReason::MalformedHeader;
+        (
+            Status::unauthenticated(reason.as_status_message()),
+            None::<AudienceRejectReason>,
+        )
+    })?;
+
+    let mut validation = Validation::new(header.alg);
     validation.validate_exp = true;
     validation.required_spec_claims = required_grpc_claims();
     validation.set_issuer(&[expected_issuer]);
@@ -341,7 +360,23 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     // closed instead of matching on any element.
     validation.validate_aud = false;
 
-    let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
+    let (decoded, bound_namespaces) = verifier
+        .with_decoding_key(header.kid.as_deref(), header.alg, |key, algorithm, bound| {
+            // `algorithm` is the credential's configured algorithm, which
+            // `with_decoding_key` already proved equal to the header's. Pin the
+            // validation to it rather than to the header so a future selection
+            // change cannot silently widen the accepted algorithm set.
+            validation.algorithms = vec![algorithm];
+            (decode::<Value>(token, key, &validation), bound.cloned())
+        })
+        .map_err(|reason| {
+            (
+                Status::unauthenticated(reason.as_status_message()),
+                None::<AudienceRejectReason>,
+            )
+        })?;
+
+    let token_data = decoded.map_err(|err| {
         (
             Status::unauthenticated(format!("Invalid token: {err}")),
             None,
@@ -355,7 +390,25 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
         ));
     }
 
-    extract_ns_claim(&token_data.claims).map_err(|status| (status, None))
+    let claim = extract_ns_claim(&token_data.claims).map_err(|status| (status, None))?;
+
+    // Server-derived binding. The claim can only narrow what the CP already
+    // decided this credential (and, when present, this authenticated peer) may
+    // reach — so a re-signed `ns` naming another tenant resolves to an empty
+    // set and is refused here, before any tenant configuration is serialized.
+    let effective = resolve_authorized_namespaces(
+        bound_namespaces.as_ref(),
+        peer.and_then(|info| info.peer_namespace_scope.as_ref()),
+        claim.0.as_ref(),
+    )
+    .map_err(|reason| {
+        (
+            Status::permission_denied(reason.as_status_message()),
+            None::<AudienceRejectReason>,
+        )
+    })?;
+
+    Ok(AllowedNamespaces(effective))
 }
 
 fn required_grpc_claims() -> HashSet<String> {

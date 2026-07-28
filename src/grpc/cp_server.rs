@@ -52,6 +52,7 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
@@ -418,7 +419,11 @@ pub const DEFAULT_CP_DP_JWT_ISSUER: &str = "ferrum-edge-cp-dp";
 /// CP gRPC server state.
 pub struct CpGrpcServer {
     config: Arc<ArcSwap<GatewayConfig>>,
-    jwt_secret: String,
+    /// How inbound tokens are verified and what namespaces each credential is
+    /// bound to. Shared with the mesh and xDS servers so all three
+    /// configuration surfaces enforce one authorization source
+    /// (advisory GHSA-3f2j-wwqw-grmg).
+    verifier: Arc<CpDpVerifier>,
     /// Expected `iss` claim on inbound DP tokens. Tokens whose `iss` does not
     /// exactly match this string are rejected with `unauthenticated`.
     expected_issuer: String,
@@ -536,10 +541,17 @@ impl CpGrpcServer {
     /// Fluent builder. Production code in `control_plane.rs` uses this to
     /// pass the full set of T2-A knobs (scope + require-claim) without
     /// growing yet another constructor overload.
+    /// Fluent builder seeded with the legacy fleet-wide shared secret.
+    ///
+    /// Production CP startup replaces the seeded verifier via
+    /// [`CpGrpcServerBuilder::verifier`] whenever a namespace-bound trust
+    /// bundle is configured; the shared-secret seed survives only for
+    /// single-namespace control planes and tests, where it is
+    /// security-equivalent.
     pub fn builder(config: Arc<ArcSwap<GatewayConfig>>, jwt_secret: String) -> CpGrpcServerBuilder {
         CpGrpcServerBuilder {
             config,
-            jwt_secret,
+            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
             channel_capacity: 128,
             registry: None,
             expected_issuer: DEFAULT_CP_DP_JWT_ISSUER.to_string(),
@@ -695,12 +707,26 @@ impl CpGrpcServer {
         }
     }
 
+    /// Verify a ConfigSync token and resolve the namespaces its bearer is
+    /// actually authorized for.
+    ///
+    /// `extensions` carries the per-connection [`CpGrpcConnectInfo`] the CP
+    /// gRPC listener attaches at handshake time. When that connection presented
+    /// an mTLS certificate encoding a SPIFFE namespace, the resolved set is
+    /// intersected with it — server-derived evidence that the bearer cannot
+    /// influence.
     #[allow(clippy::result_large_err)]
     fn verify_jwt_metadata(
         &self,
         metadata: &tonic::metadata::MetadataMap,
+        extensions: &tonic::Extensions,
     ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
+        verify_grpc_jwt_metadata_with_claims(
+            metadata,
+            &self.verifier,
+            &self.expected_issuer,
+            extensions.get::<CpGrpcConnectInfo>(),
+        )
     }
 
     pub fn into_service(self) -> ConfigSyncServer<Self> {
@@ -1479,7 +1505,7 @@ impl CpGrpcServer {
 /// setters in any order, then `.build()`.
 pub struct CpGrpcServerBuilder {
     config: Arc<ArcSwap<GatewayConfig>>,
-    jwt_secret: String,
+    verifier: Arc<CpDpVerifier>,
     channel_capacity: usize,
     registry: Option<Arc<DpNodeRegistry>>,
     expected_issuer: String,
@@ -1501,6 +1527,13 @@ impl CpGrpcServerBuilder {
 
     pub fn expected_issuer(mut self, issuer: String) -> Self {
         self.expected_issuer = issuer;
+        self
+    }
+
+    /// Replace the seeded shared-secret verifier with the CP's configured
+    /// namespace-bound trust bundle.
+    pub fn verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -1565,7 +1598,7 @@ impl CpGrpcServerBuilder {
         (
             CpGrpcServer {
                 config: self.config,
-                jwt_secret: self.jwt_secret,
+                verifier: self.verifier,
                 expected_issuer: self.expected_issuer,
                 broadcasts,
                 registry,
@@ -1587,7 +1620,7 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(allowed) => allowed,
             Err(status) => {
                 let req = request.get_ref();
@@ -1796,7 +1829,7 @@ impl ConfigSync for CpGrpcServer {
         &self,
         request: Request<FullConfigRequest>,
     ) -> Result<Response<FullConfigResponse>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(allowed) => allowed,
             Err(status) => {
                 let req = request.get_ref();
