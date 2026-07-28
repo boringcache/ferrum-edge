@@ -3408,8 +3408,9 @@ impl McpGateway {
     /// failure would leave a hidden session behind, and removing a
     /// newly minted session cannot restore one that its admission evicted. The
     /// supported contract is therefore that `initialize` is a singleton HTTP
-    /// request, and no batch may mutate the session store or stamp a session
-    /// response header.
+    /// request, and no batch may mint or evict a downstream session or stamp a
+    /// session response header. Ordinary batch members may still refresh an
+    /// existing session's idle lifetime, just like equivalent singletons.
     async fn handle_aggregate_jsonrpc_batch(
         &self,
         ctx: &mut RequestContext,
@@ -3471,9 +3472,9 @@ impl McpGateway {
             let is_notification = matches!(envelope.message_kind, McpMessageKind::Notification);
             let method = envelope.method.as_deref().unwrap_or_default();
 
-            // Reject session lifecycle before any dispatch so the session store
-            // is never mutated (or an existing live session evicted) by a batch
-            // that may still fail on a later member or on response admission.
+            // Reject session lifecycle before any dispatch so a batch initialize
+            // can never mint a session (or evict an existing live one) before a
+            // later member or response-admission failure.
             if method == "initialize" {
                 if is_notification {
                     blocked_lifecycle_notification = true;
