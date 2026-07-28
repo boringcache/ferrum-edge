@@ -17001,7 +17001,7 @@ pub(crate) fn framed_unary_reject_parts(
     reject: &NormalizedRejectResponse,
 ) -> Option<(&[u8], &HashMap<String, String>)> {
     (!reject.body.is_empty() && !reject.grpc_trailers.is_empty())
-        .then(|| (reject.body.as_slice(), &reject.grpc_trailers))
+        .then_some((reject.body.as_slice(), &reject.grpc_trailers))
 }
 
 pub(crate) fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
