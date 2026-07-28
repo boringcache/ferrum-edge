@@ -1,12 +1,13 @@
 //! Tests for loki_logging plugin
 
+use ferrum_edge::_test_support::loki_logging_with_ceiling_for_test;
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient,
     loki_logging::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
         LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LokiLogging,
     },
-    utils::byte_budget::process_retained_bytes,
+    utils::byte_budget::RetainedByteCeiling,
 };
 use serde_json::json;
 use std::io::{self, Read};
@@ -85,21 +86,24 @@ async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock
     panic!("Loki mock did not receive {expected} requests in time");
 }
 
-/// Poll until the process-wide retained-byte ceiling drops back to `baseline`.
+/// Poll until this test's isolated retained-byte ceiling is fully released.
 ///
 /// Mock request receipt is not a delivery-completion boundary: the reserved
 /// batch payload stays charged until the HTTP round-trip finishes.
-async fn wait_for_process_retained_bytes_at_most(baseline: usize, timeout: Duration) {
+async fn wait_for_retained_bytes_released(
+    ceiling: &'static RetainedByteCeiling,
+    timeout: Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if process_retained_bytes() <= baseline {
+        if ceiling.used() == 0 {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "process retained bytes did not drop to {baseline} within {:?}; still {}",
+                "isolated retained bytes did not release within {:?}; still {}",
                 timeout,
-                process_retained_bytes()
+                ceiling.used()
             );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -907,13 +911,14 @@ async fn test_loki_retained_content_budget_bounds_buffered_entries() {
 
 #[tokio::test]
 async fn test_loki_retained_content_budget_is_released_after_delivery() {
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(64 * 1024)));
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/loki/api/v1/push"))
         .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
         .mount(&server)
         .await;
-    let plugin = LokiLogging::new(
+    let plugin = loki_logging_with_ceiling_for_test(
         &json!({
             "endpoint_url": format!("{}/loki/api/v1/push", server.uri()),
             "batch_size": 1,
@@ -926,12 +931,12 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
             "gzip": false
         }),
         default_client(),
+        ceiling,
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
     plugin.commit_background_tasks();
-    let retained_baseline = process_retained_bytes();
     let large_path = "x".repeat(1800);
     let mut first = create_test_transaction_summary();
     first.request_path = format!("/first-budget-canary/{large_path}");
@@ -944,7 +949,7 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
 
     // The mock response is delayed; the reserved delivery payload stays charged
     // until the HTTP round-trip completes, not when the request is recorded.
-    wait_for_process_retained_bytes_at_most(retained_baseline, Duration::from_secs(2)).await;
+    wait_for_retained_bytes_released(ceiling, Duration::from_secs(2)).await;
     let mut admitted_after_release = first;
     admitted_after_release.request_path = format!("/released-budget-canary/{large_path}");
     plugin.log(&admitted_after_release).await;

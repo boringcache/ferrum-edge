@@ -1244,6 +1244,22 @@ pub mod _test_support {
     }
 
     // ── plugins/loki_logging ────────────────────────────────────────────────
+    /// Construct Loki logging against a test-owned retained-byte ceiling.
+    ///
+    /// This keeps ownership assertions isolated from concurrently running
+    /// observability tests that reserve against the process-global ceiling.
+    pub fn loki_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::loki_logging::LokiLogging, String> {
+        crate::plugins::loki_logging::LokiLogging::new_with_ceiling(
+            config,
+            http_client,
+            ceiling,
+        )
+    }
+
     /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
     /// wire body must be reserved against the retained-byte ceiling before it is
     /// materialized, stay charged alongside the queued entries, and release on

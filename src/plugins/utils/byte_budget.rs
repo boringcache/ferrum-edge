@@ -284,16 +284,6 @@ impl ByteBudget {
         self.used_bytes.load(Ordering::Acquire)
     }
 
-    /// Ceiling this budget reserves against. Batch materialization for the same
-    /// sink charges the same ceiling, so an end-to-end guarantee holds under a
-    /// test-owned ceiling exactly as it does under the process-global one.
-    // Read by external unit tests; the binary target compiles this shared
-    // module separately and cannot observe those callers.
-    #[allow(dead_code)]
-    pub fn ceiling(&self) -> &'static RetainedByteCeiling {
-        self.ceiling
-    }
-
     // Read by external unit tests; the binary target compiles this shared
     // module separately and cannot observe those callers.
     #[allow(dead_code)]
@@ -518,25 +508,6 @@ impl BoundedPayloadWriter {
             limit_exceeded: false,
         }
     }
-
-    /// Bytes written so far.
-    // Read by external unit tests; the binary target compiles this shared
-    // module separately and cannot observe those callers.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    /// Reserved upper bound this writer fails closed at.
-    #[allow(dead_code)]
-    pub fn max_bytes(&self) -> usize {
-        self.max_bytes
-    }
 }
 
 impl Write for BoundedPayloadWriter {
@@ -592,13 +563,6 @@ impl ReservedPayload {
 
     pub fn len(&self) -> usize {
         self.bytes.len()
-    }
-
-    // Read by external unit tests; the binary target compiles this shared
-    // module separately and cannot observe those callers.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
     }
 }
 
