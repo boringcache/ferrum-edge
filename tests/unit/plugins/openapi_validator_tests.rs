@@ -2778,6 +2778,7 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
     }))
     .unwrap();
     let headers = content_type_headers("multipart/form-data; boundary=abc");
+    const UNSUPPORTED_CHARSET_CANARY: &str = "HOSTILE-FILENAME-STAR-UNSUPPORTED-CHARSET-CANARY-r1";
     let cases: &[(&str, &str)] = &[
         (
             "ambiguous ordinary filename plus filename*",
@@ -2803,7 +2804,7 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
             "unsupported charset",
             concat!(
                 "--abc\r\n",
-                "Content-Disposition: form-data; name=\"file\"; filename*=ISO-8859-1''a.txt\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=HOSTILE-FILENAME-STAR-UNSUPPORTED-CHARSET-CANARY-r1''a.txt\r\n",
                 "Content-Type: text/plain\r\n\r\n",
                 "hello\r\n",
                 "--abc--\r\n"
@@ -2960,10 +2961,27 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
                 .await,
             Some(400),
         );
-        assert!(
-            request_error(&ctx).is_some(),
-            "{label}: expected request validation error"
-        );
+        if label == "unsupported charset" {
+            let error = request_error(&ctx)
+                .unwrap_or_else(|| panic!("{label}: expected request validation error"));
+            assert!(
+                !error.contains(UNSUPPORTED_CHARSET_CANARY),
+                "{label}: request error must not echo attacker-controlled charset: {error}"
+            );
+            assert!(
+                error.contains("unsupported filename* charset"),
+                "{label}: expected field-specific charset diagnostic: {error}"
+            );
+            assert!(
+                error.contains("only UTF-8 is supported"),
+                "{label}: expected UTF-8-only diagnostic: {error}"
+            );
+        } else {
+            assert!(
+                request_error(&ctx).is_some(),
+                "{label}: expected request validation error"
+            );
+        }
     }
 
     // Raw filename* param value exact bound (UTF-8'' + value-chars == 4 KiB).

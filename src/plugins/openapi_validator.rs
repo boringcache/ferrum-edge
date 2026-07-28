@@ -4677,9 +4677,10 @@ fn decode_rfc8187_filename_star(raw: &str) -> Result<String, String> {
         );
     };
     if !charset.eq_ignore_ascii_case("utf-8") {
-        return Err(format!(
-            "Malformed multipart part: unsupported filename* charset '{charset}' (only UTF-8 is supported)"
-        ));
+        return Err(
+            "Malformed multipart part: unsupported filename* charset (only UTF-8 is supported)"
+                .to_string(),
+        );
     }
     if !is_supported_rfc8187_language(language) {
         return Err("Malformed multipart part: invalid filename* language tag".to_string());
