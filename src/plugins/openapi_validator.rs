@@ -4476,7 +4476,12 @@ fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
     }
     let base = value.split(';').next().unwrap_or("").trim();
     let Some((type_, subtype)) = base.split_once('/') else {
-        return Err(format!("{ERROR_PREFIX}'{path}' must be a media type"));
+        // Malformed names (no type/subtype separator) share the concrete-media
+        // diagnostic with wildcards and non-token segments so admission, the
+        // importer, and the published schema describe one contract.
+        return Err(format!(
+            "{ERROR_PREFIX}'{path}' must be a concrete media type"
+        ));
     };
     if type_ == "*" || subtype == "*" || !is_mime_token(type_) || !is_mime_token(subtype) {
         return Err(format!(

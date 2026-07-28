@@ -18635,7 +18635,10 @@ components:
               minProperties: 1
               maxProperties: 1
               propertyNames:
-                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:;.*)?$"
+                # Concrete type/subtype only: each side is an RFC 9110 token that
+                # is not exactly `*` (so `*/*` and `application/*` fail closed,
+                # while `*` remains allowed inside a longer token).
+                pattern: "^(?:[!#$%&'+.^_`|~0-9A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*|\\*[!#$%&'*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&'+.^_`|~0-9A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*|\\*[!#$%&'*+.^_`|~0-9A-Za-z-]+)(?:;.*)?$"
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
               description: >
