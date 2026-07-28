@@ -16158,7 +16158,7 @@ components:
                 Where PasswordDigest replay claims live. REQUIRED when
                 username_token.enabled is true and password_type is
                 PasswordDigest; there is no default. "process" registers state
-                under a stable {namespace}:{plugin-config-id} scope so a reload
+                under a stable {namespace}|{plugin-config-id} scope so a reload
                 generation inherits the previous generation's claims instead of
                 starting from an empty cache — it is explicitly NOT cross-replica
                 protection, and selecting it asserts a single-replica deployment.
