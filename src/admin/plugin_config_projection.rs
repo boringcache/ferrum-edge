@@ -35,7 +35,9 @@
 //! legacy data — no built-in plugin accepts a scalar or array config — so it is
 //! replaced wholesale rather than walked. Likewise, when a schema rule expects a
 //! container (`headers.*`) and finds a scalar, the scalar is redacted rather
-//! than echoed.
+//! than echoed. Explicit JSON `null` leaf values on sensitive paths stay
+//! `null`: they disclose nothing, so projection must not invent a redaction
+//! marker for them.
 //!
 //! # Admin visibility
 //!
@@ -537,7 +539,9 @@ fn apply_sensitivity(value: &mut Value, sensitivity: FieldSensitivity) {
             Some(props) => {
                 for (key, prop) in props.iter_mut() {
                     if !is_safe_kafka_producer_property(key) {
-                        *prop = json!(REDACTED_PLACEHOLDER);
+                        // Explicit null discloses nothing; keep it so projection
+                        // does not invent a redaction marker for an unset property.
+                        apply_sensitivity(prop, FieldSensitivity::Secret);
                     }
                 }
             }
@@ -598,13 +602,14 @@ pub fn redact_endpoint_url(raw: &str) -> String {
 ///
 /// Custom plugins have no schema entry, and a built-in field can be added
 /// before its schema rule lands, so this layer still runs on every projection.
-/// It only ever *adds* redaction.
+/// It only ever *adds* redaction. Explicit JSON `null` values are left alone —
+/// they disclose nothing — matching [`apply_sensitivity`].
 pub fn redact_sensitive_plugin_config_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
                 if is_sensitive_plugin_config_key(key) {
-                    *child = json!(REDACTED_PLACEHOLDER);
+                    apply_sensitivity(child, FieldSensitivity::Secret);
                 } else if is_credential_bearing_url_config_key(key) {
                     apply_sensitivity(child, FieldSensitivity::RedisUrl);
                 } else {

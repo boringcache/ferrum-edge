@@ -3556,7 +3556,8 @@ paths:
         allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
         userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept.
+        scheme/host/port/database are kept. Explicit JSON `null` values on
+        sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
@@ -6772,7 +6773,9 @@ components:
             `redis_url` userinfo/query/fragment data is stripped while
             scheme/host/port/database are kept. Any remaining URL-shaped
             string carrying userinfo has that userinfo replaced. A plugin
-            config that is not an object is replaced wholesale.
+            config that is not an object (and not `null`) is replaced
+            wholesale. Explicit JSON `null` values on sensitive fields stay
+            `null`.
 
     AuditEventListResponse:
       type: object
