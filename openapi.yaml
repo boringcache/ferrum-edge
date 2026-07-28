@@ -13661,7 +13661,7 @@ components:
           type: string
           maxLength: 65536
           default: "${body}\n\n${fields}"
-          description: Plain-text body template. Adds `${fields}`, the notification's key/value rows rendered as `Name: value` lines.
+          description: "Plain-text body template. Adds `${fields}`, the notification's key/value rows rendered as `Name: value` lines."
         helo_name:
           type: string
           description: EHLO identity. Defaults to the domain of `from`.
