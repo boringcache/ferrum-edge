@@ -47,21 +47,8 @@ use crossbeam_utils::CachePadded;
 /// microseconds. Stable, low-cardinality contract shared by SRTT and
 /// SYN→ACK. Samples strictly greater than the last bound land in `+Inf`.
 pub const BPF_LATENCY_BUCKET_BOUNDS_US: [u64; 15] = [
-    100,
-    250,
-    500,
-    1_000,
-    2_500,
-    5_000,
-    10_000,
-    25_000,
-    50_000,
-    100_000,
-    250_000,
-    500_000,
-    1_000_000,
-    2_500_000,
-    5_000_000,
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000,
 ];
 
 /// Number of finite latency buckets (excludes the `+Inf` slot).
@@ -72,21 +59,8 @@ pub const BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT: usize = BPF_LATENCY_FINITE_BUCKET_
 
 /// Prometheus `le` label strings for [`BPF_LATENCY_BUCKET_BOUNDS_US`].
 pub const BPF_LATENCY_BUCKET_LE_LABELS: [&str; BPF_LATENCY_FINITE_BUCKET_COUNT] = [
-    "100",
-    "250",
-    "500",
-    "1000",
-    "2500",
-    "5000",
-    "10000",
-    "25000",
-    "50000",
-    "100000",
-    "250000",
-    "500000",
-    "1000000",
-    "2500000",
-    "5000000",
+    "100", "250", "500", "1000", "2500", "5000", "10000", "25000", "50000", "100000", "250000",
+    "500000", "1000000", "2500000", "5000000",
 ];
 
 /// Index into the exclusive-bucket array for a latency sample in microseconds.
