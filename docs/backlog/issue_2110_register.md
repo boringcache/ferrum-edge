@@ -30,7 +30,7 @@ Current mesh HBONE/DNS perf status lives in
 | Helm chart for core gateway modes | Shipped — [`charts/ferrum-gateway`](../../charts/ferrum-gateway/README.md), [`docs/kubernetes_deployment.md`](../kubernetes_deployment.md) |
 | Scheduled stress tests excluded from PR CI | [`.github/workflows/scaling-regression.yml`](../../.github/workflows/scaling-regression.yml) |
 | `WsDisconnectLogEntry` log schema | Implemented — [`docs/log_schema.md`](../log_schema.md) WebSocket disconnect family |
-| Mesh TLS-SNI L4 routing “on roadmap” | Supported `VirtualService.tls[]` SNI passthrough — [`docs/mesh_supported_matrix.md`](../mesh_supported_matrix.md), `tests/integration/mesh_l7_routing_tests.rs`; closed [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) / live capture [#2038](https://github.com/ferrum-edge/ferrum-edge/issues/2038) |
+| Mesh TLS-SNI L4 routing | Supported — VirtualService `tls[]` SNI passthrough (`sniHosts`); see [`docs/mesh_supported_matrix.md`](../mesh_supported_matrix.md) and `tests/integration/mesh_l7_routing_tests.rs` |
 | Remote-discovery JWT audience binding | Implemented — closed [#2475](https://github.com/ferrum-edge/ferrum-edge/issues/2475) |
 
 ## Live dedicated trackers (current backlog)
