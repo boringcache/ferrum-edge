@@ -305,6 +305,43 @@ Then start CP/DP modes normally. The database connection will use TLS.
 - **Admin API**: Limited by database query performance
 - **Proxy throughput**: DP performance scales with number of concurrent connections
 
+## Subprocess Harness Process Identity
+
+`tests/common/gateway_harness.rs` reserves the admin and proxy ports by
+binding `127.0.0.1:0` and dropping the listener, so between reservation
+and the child's own bind another gateway running in a parallel test can
+claim either port. Neither readiness nor a bare TCP accept can tell them
+apart — every gateway serves the same unauthenticated `/health` body.
+
+`TestGatewayBuilder::spawn` therefore mints per-spawn-attempt credentials
+(admin JWT secret/issuer plus `FERRUM_METRICS_BEARER_TOKEN`) and treats
+startup as complete only once the admin port answers `/health` in the
+**authenticated detail tier** for that instance's token *and* reports
+`ready: true`:
+
+- The detail tier requires the instance credential, so a foreign gateway
+  is rejected instead of impersonating the child.
+- `ready` flips only after every listener bind succeeded, including the
+  proxy HTTP listener, so an identified ready child is also proof that it
+  — not a squatter — owns the proxy port for its whole lifetime.
+
+`wait_for_proxy_port` re-proves that ownership before trusting a TCP
+accept, and the spawn wait polls the child so a process that dies after a
+partial bind fails fast instead of burning the health timeout against
+whatever claims the released port next.
+
+Tests that pin `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_METRICS_BEARER_TOKEN`
+(or open `FERRUM_METRICS_ALLOWED_CIDRS`) keep their explicit value; their
+identity is then only as unique as the value they chose. The contract is
+covered by `functional_shared_harness_smoke_test`.
+
+The same barrier is mandatory for suites that keep a bespoke spawner
+instead of `TestGatewayBuilder`. `functional_websocket_test.rs` reuses the
+exported `probe_gateway_identity` in `wait_for_owned_gateway`, because a
+bare TCP accept let an unrelated H2 fixture that had claimed the released
+proxy port answer the RFC 8441 Extended CONNECT handshake and reset it
+with `PROTOCOL_ERROR` (issue #3435).
+
 ## In-Process Test Harness
 
 The scripted-backend test harness (`tests/scaffolding/harness.rs`) ships
