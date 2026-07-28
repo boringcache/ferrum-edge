@@ -179,6 +179,13 @@ pub mod _test_support {
         ctx.mcp_trusted_tool_name_rewrite.is_none()
     }
 
+    /// Read-only view of the private aggregate-batch upstream-dispatch guard.
+    /// Intentionally has no setter: tests must prove the guard cannot be forged
+    /// from public metadata, so nothing outside `mcp_gateway` may set it.
+    pub fn mcp_batch_forbids_upstream_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.mcp_batch_forbids_upstream
+    }
+
     pub fn take_compression_response_buffer_permit_for_test(
         ctx: &mut crate::plugins::RequestContext,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {

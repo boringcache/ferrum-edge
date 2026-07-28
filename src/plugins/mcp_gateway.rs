@@ -37,9 +37,6 @@ const METADATA_RESPONSE_REWRITE_METHOD_KEY: &str = "mcp.response_rewrite.method"
 const METADATA_RESPONSE_REWRITE_SERVER_KEY: &str = "mcp.response_rewrite.server_id";
 const METADATA_RESPONSE_REWRITE_SESSION_KEY: &str = "mcp.response_rewrite.session";
 const METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY: &str = "mcp.response_rewrite.catalog_version";
-/// Set on aggregate JSON-RPC batch members so routed handlers validate policy
-/// without dialing upstream or returning `Continue` under weaker plugin policy.
-const METADATA_BATCH_FORBID_UPSTREAM: &str = "mcp.batch_forbid_upstream";
 const MAX_MCP_PAGINATION_PAGES: usize = 100;
 const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
 const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
@@ -54,9 +51,15 @@ const DEFAULT_MAX_JSONRPC_BATCH_RESPONSE_BYTES: usize = 1024 * 1024;
 /// JSON-RPC application error: aggregate batch member would require upstream
 /// routing that cannot preserve later plugin phases inside one HTTP exchange.
 const MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED: i64 = -32009;
-/// JSON-RPC application error: multiple initialize/session-mint outcomes in one
-/// batch cannot be represented by a single HTTP session response header.
+/// JSON-RPC application error: an MCP session-lifecycle operation was attempted
+/// inside a JSON-RPC batch. Session minting/eviction is not transactional across
+/// batch members and one HTTP response header cannot advertise more than one new
+/// session, so lifecycle members are rejected before any session-store mutation.
 const MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS: i64 = -32010;
+/// JSON-RPC application error: a batch notification member could not be
+/// processed. Notifications carry no per-item response element, so the failure
+/// is surfaced once at batch level instead of silently claiming success.
+const MCP_BATCH_NOTIFICATION_FAILED: i64 = -32011;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -742,6 +745,17 @@ impl McpGateway {
         })
     }
 
+    /// Whether the raw request body is shaped like a JSON-RPC batch, decided
+    /// from the first non-whitespace byte only. Used to apply
+    /// `validation.max_batch_bytes` before any JSON parsing, so an oversized
+    /// batch never funds a full `serde_json::Value` allocation. JSON permits
+    /// only these four whitespace bytes before a value.
+    fn body_is_jsonrpc_batch_shaped(body: &[u8]) -> bool {
+        body.iter()
+            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+            .is_some_and(|byte| *byte == b'[')
+    }
+
     fn request_body<'a>(&self, ctx: &'a RequestContext) -> Option<&'a [u8]> {
         ctx.request_body_bytes
             .as_ref()
@@ -826,6 +840,45 @@ impl McpGateway {
                 .insert("mcp.protocol_version".to_string(), version.to_string());
         }
         version
+    }
+
+    /// Post-initialize `MCP-Protocol-Version` gate.
+    ///
+    /// Shared by singleton dispatch and both batch paths so a JSON-RPC batch
+    /// can never forward (or execute) a protocol version that the equivalent
+    /// singleton request rejects. `initialize` is exempt because it negotiates
+    /// the version rather than asserting one.
+    fn unsupported_protocol_version_response(
+        &self,
+        ctx: &mut RequestContext,
+        envelope: &McpEnvelope,
+        protocol_version: Option<&str>,
+    ) -> Option<PluginResult> {
+        if envelope.method.as_deref() == Some("initialize") {
+            return None;
+        }
+        let version = protocol_version?;
+        if self
+            .supported_protocol_versions
+            .iter()
+            .any(|supported| supported.as_str() == version)
+        {
+            return None;
+        }
+        ctx.metadata
+            .insert("mcp.route_decision".to_string(), "deny".to_string());
+        Some(json_response(
+            400,
+            json!({
+                "jsonrpc": "2.0",
+                "id": envelope.id.clone().unwrap_or(Value::Null),
+                "error": {
+                    "code": -32600,
+                    "message": "Unsupported MCP protocol version"
+                }
+            }),
+            None,
+        ))
     }
 
     fn downstream_session_id_from_headers(
@@ -3260,7 +3313,26 @@ impl McpGateway {
                         envelopes.push(None);
                     } else {
                         self.emit_envelope_metadata(ctx, &envelope);
-                        let _ = self.mark_protocol_version(ctx, headers, Some(&envelope));
+                        let protocol_version =
+                            self.mark_protocol_version(ctx, headers, Some(&envelope));
+                        // Exact singleton parity: a post-initialize member on an
+                        // unsupported MCP-Protocol-Version is rejected here too,
+                        // so a batch cannot smuggle an unsupported version past
+                        // the gate the equivalent singleton enforces. Rejecting
+                        // the whole HTTP request is the only fail-closed option
+                        // — an HTTP batch body cannot be partially forwarded.
+                        if let Some(response) = self.unsupported_protocol_version_response(
+                            ctx,
+                            &envelope,
+                            protocol_version.as_deref(),
+                        ) {
+                            // Drop any staged per-item state, then restate the
+                            // deny decision so the rejection stays observable.
+                            self.clear_batch_item_routing_state(ctx);
+                            ctx.metadata
+                                .insert("mcp.route_decision".to_string(), "deny".to_string());
+                            return response;
+                        }
                         responses.push(Value::Null);
                         envelopes.push(Some(envelope));
                     }
@@ -3299,7 +3371,7 @@ impl McpGateway {
                 "mcp.route_decision".to_string(),
                 "synthetic_response".to_string(),
             );
-            return self.bounded_batch_json_response(responses, None);
+            return self.bounded_batch_json_response(responses);
         }
 
         // Every member is independently valid. Route once to the single
@@ -3329,6 +3401,15 @@ impl McpGateway {
     /// phases). Multi-upstream or mixed synthetic+upstream shapes cannot be
     /// represented by one HTTP exchange under full policy, so those members
     /// must be issued as singleton requests.
+    ///
+    /// Session-lifecycle members (`initialize`) are rejected *before* dispatch.
+    /// Session minting and the eviction it can trigger are not transactional
+    /// across batch members: a later ambiguity or a `max_batch_response_bytes`
+    /// failure would leave a hidden session behind, and removing a
+    /// newly minted session cannot restore one that its admission evicted. The
+    /// supported contract is therefore that `initialize` is a singleton HTTP
+    /// request, and no batch may mutate the session store or stamp a session
+    /// response header.
     async fn handle_aggregate_jsonrpc_batch(
         &self,
         ctx: &mut RequestContext,
@@ -3341,18 +3422,20 @@ impl McpGateway {
         // Tracking this incrementally avoids cloning and reserializing every
         // prior response for each new batch member.
         let mut response_bytes = 2usize;
-        let mut session_header: Option<(String, String)> = None;
         let mut saw_response_bearing = false;
         let mut blocked_upstream_notification = false;
-        let mut inbound_headers = headers.clone();
+        let mut blocked_lifecycle_notification = false;
+        let mut failed_notification = false;
+        let inbound_headers = headers.clone();
 
         for item in batch {
+            // Each member starts from the inbound request headers and a cleared
+            // per-item routing/rewrite state so no sibling's route override,
+            // trusted tool rewrite, response binding, or injected header can
+            // influence this member's dispatch decision.
             *headers = inbound_headers.clone();
             self.clear_batch_item_routing_state(ctx);
-            ctx.metadata.insert(
-                METADATA_BATCH_FORBID_UPSTREAM.to_string(),
-                "true".to_string(),
-            );
+            ctx.mcp_batch_forbids_upstream = true;
 
             let envelope = match self.validate_batch_member(item) {
                 Ok(envelope) => envelope,
@@ -3361,9 +3444,7 @@ impl McpGateway {
                     if let Err(response) =
                         self.push_bounded_batch_response(&mut responses, &mut response_bytes, error)
                     {
-                        self.clear_batch_item_routing_state(ctx);
-                        *headers = inbound_headers;
-                        return response;
+                        return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                     continue;
                 }
@@ -3382,10 +3463,44 @@ impl McpGateway {
                         "Invalid MCP JSON-RPC request",
                     ),
                 ) {
-                    self.clear_batch_item_routing_state(ctx);
-                    *headers = inbound_headers;
-                    return response;
+                    return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                 }
+                continue;
+            }
+
+            let is_notification = matches!(envelope.message_kind, McpMessageKind::Notification);
+            let method = envelope.method.as_deref().unwrap_or_default();
+
+            // Reject session lifecycle before any dispatch so the session store
+            // is never mutated (or an existing live session evicted) by a batch
+            // that may still fail on a later member or on response admission.
+            if method == "initialize" {
+                if is_notification {
+                    blocked_lifecycle_notification = true;
+                    continue;
+                }
+                saw_response_bearing = true;
+                if let Err(response) = self.push_bounded_batch_response(
+                    &mut responses,
+                    &mut response_bytes,
+                    json_rpc_error_value(
+                        envelope.id.clone(),
+                        MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
+                        "MCP initialize must be a singleton request, not a JSON-RPC batch member",
+                    ),
+                ) {
+                    return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
+                }
+                continue;
+            }
+
+            // Known routed notification forms (`tools/call`, `prompts/get`,
+            // `resources/read`) take a no-op 202 path inside singleton dispatch.
+            // Inside an aggregate batch they are upstream-bound and must obey the
+            // same singleton-routing restriction as their request forms, so mark
+            // them blocked here instead of letting the no-op claim success.
+            if is_notification && aggregate_notification_requires_upstream_routing(method) {
+                blocked_upstream_notification = true;
                 continue;
             }
 
@@ -3394,52 +3509,41 @@ impl McpGateway {
             match classify_batch_item_result(
                 result,
                 envelope.id.clone(),
-                matches!(envelope.message_kind, McpMessageKind::Notification),
+                is_notification,
                 &self.sessions.downstream_session_header,
             ) {
                 BatchItemOutcome::Notification => {}
+                BatchItemOutcome::FailedNotification => {
+                    failed_notification = true;
+                }
                 BatchItemOutcome::Response {
                     value,
                     session_header: item_session,
                 } => {
                     saw_response_bearing = true;
-                    if let Some((name, value)) = item_session {
-                        if let Some((existing_name, existing_value)) = session_header.as_ref() {
-                            if !existing_name.eq_ignore_ascii_case(&name)
-                                || existing_value != &value
-                            {
-                                // One HTTP response header cannot represent
-                                // multiple newly minted sessions.
-                                if let Err(response) = self.push_bounded_batch_response(
-                                    &mut responses,
-                                    &mut response_bytes,
-                                    json_rpc_error_value(
-                                        envelope.id.clone(),
-                                        MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
-                                        "Ambiguous MCP session lifecycle in JSON-RPC batch",
-                                    ),
-                                ) {
-                                    self.clear_batch_item_routing_state(ctx);
-                                    *headers = inbound_headers;
-                                    return response;
-                                }
-                                continue;
-                            }
-                        } else {
-                            // Propagate only gateway-minted downstream session
-                            // ids to later members; never trust client/upstream
-                            // forgeries beyond the configured header contract.
-                            remove_header(&mut inbound_headers, &name);
-                            inbound_headers.insert(name.to_ascii_lowercase(), value.clone());
-                            session_header = Some((name, value));
+                    if item_session.is_some() {
+                        // Lifecycle members are rejected above, so no member can
+                        // legitimately advertise a downstream session. Fail this
+                        // member closed rather than stamping a session header the
+                        // batch does not own — the response must never name a
+                        // session the store may not hold.
+                        if let Err(response) = self.push_bounded_batch_response(
+                            &mut responses,
+                            &mut response_bytes,
+                            json_rpc_error_value(
+                                envelope.id.clone(),
+                                MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
+                                "MCP session lifecycle is not supported inside a JSON-RPC batch",
+                            ),
+                        ) {
+                            return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                         }
+                        continue;
                     }
                     if let Err(response) =
                         self.push_bounded_batch_response(&mut responses, &mut response_bytes, value)
                     {
-                        self.clear_batch_item_routing_state(ctx);
-                        *headers = inbound_headers;
-                        return response;
+                        return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                     }
                 }
                 BatchItemOutcome::UpstreamBound {
@@ -3462,9 +3566,7 @@ impl McpGateway {
                                 "Aggregate JSON-RPC batch member requires singleton upstream routing",
                             ),
                         ) {
-                            self.clear_batch_item_routing_state(ctx);
-                            *headers = inbound_headers;
-                            return response;
+                            return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
                         }
                     }
                 }
@@ -3473,12 +3575,27 @@ impl McpGateway {
 
         self.clear_batch_item_routing_state(ctx);
         *headers = inbound_headers;
+        ctx.metadata.insert(
+            "mcp.route_decision".to_string(),
+            "synthetic_response".to_string(),
+        );
 
         if !saw_response_bearing {
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
+            // Notification-only batches carry no per-item response element, so
+            // any blocked or failed notification is reported once at batch
+            // level. Ordering is most-specific-first: a lifecycle restriction
+            // explains an upstream one, which explains a dispatch failure.
+            if blocked_lifecycle_notification {
+                return json_rpc_error(
+                    None,
+                    MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
+                    "MCP initialize must be a singleton request, not a JSON-RPC batch member",
+                    Some(
+                        "session lifecycle members are not dispatched inside JSON-RPC batches"
+                            .to_string(),
+                    ),
+                );
+            }
             if blocked_upstream_notification {
                 // Do not return empty 202: upstream-bound notifications were
                 // not executed, so claiming success would hide a fail-closed
@@ -3493,17 +3610,40 @@ impl McpGateway {
                     ),
                 );
             }
+            if failed_notification {
+                return json_rpc_error(
+                    None,
+                    MCP_BATCH_NOTIFICATION_FAILED,
+                    "JSON-RPC batch notification member could not be processed",
+                    None,
+                );
+            }
             return empty_response(202);
         }
 
+        // No batch may stamp a downstream session header: session lifecycle is
+        // singleton-only, so there is never a batch-owned live session to name.
+        self.bounded_batch_json_response(responses)
+    }
+
+    /// Restore request state before returning a batch-level fail-closed
+    /// response. Every early return from the aggregate loop must leave the
+    /// context with no per-item routing, rewrite, or dispatch-guard state, and
+    /// the headers back at their inbound values.
+    fn fail_batch_closed(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        inbound_headers: &HashMap<String, String>,
+        response: PluginResult,
+    ) -> PluginResult {
+        self.clear_batch_item_routing_state(ctx);
         ctx.metadata.insert(
             "mcp.route_decision".to_string(),
             "synthetic_response".to_string(),
         );
-        let session = session_header
-            .as_ref()
-            .map(|(name, value)| (name.as_str(), value.as_str()));
-        self.bounded_batch_json_response(responses, session)
+        *headers = inbound_headers.clone();
+        response
     }
 
     fn admit_jsonrpc_batch(&self, batch: &[Value], body_len: usize) -> Result<(), PluginResult> {
@@ -3604,11 +3744,11 @@ impl McpGateway {
         Ok(())
     }
 
-    fn bounded_batch_json_response(
-        &self,
-        responses: Vec<Value>,
-        session: Option<(&str, &str)>,
-    ) -> PluginResult {
+    /// Serialize a bounded batch response array. Batches never carry a session
+    /// response header: session lifecycle is singleton-only, so there is no
+    /// batch-owned session to advertise (and therefore no way to name a session
+    /// the store does not hold).
+    fn bounded_batch_json_response(&self, responses: Vec<Value>) -> PluginResult {
         let body = Value::Array(responses);
         match serde_json::to_vec(&body) {
             Ok(bytes) if bytes.len() > self.validation.max_batch_response_bytes => json_rpc_error(
@@ -3617,7 +3757,7 @@ impl McpGateway {
                 "Invalid Request",
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ),
-            Ok(_) => json_response(200, body, session),
+            Ok(_) => json_response(200, body, None),
             Err(_) => json_rpc_error(
                 None,
                 -32600,
@@ -3627,6 +3767,15 @@ impl McpGateway {
         }
     }
 
+    /// Drop every piece of per-item state a batch member can stage, so a
+    /// sibling's routing decision, private rewrite trust, response binding, or
+    /// item-scoped observability can never authorize or reroute another member.
+    /// Only request-level metadata survives a batch: `mcp.enabled`, `mcp.mode`,
+    /// `mcp.batch`, `mcp.batch_size`, `mcp.protocol_version` (a shared request
+    /// header), and the terminal `mcp.route_decision`. The request-start
+    /// baselines for `mcp.policy_decision` / `mcp.schema_validation` are
+    /// re-established afterwards so log schemas keep seeing those fields with
+    /// their neutral values rather than a sibling member's verdict.
     fn clear_batch_item_routing_state(&self, ctx: &mut RequestContext) {
         ctx.route_override_backend_scheme = None;
         ctx.route_override_backend_host = None;
@@ -3637,13 +3786,29 @@ impl McpGateway {
         ctx.route_override_authority = None;
         ctx.mcp_trusted_tool_name_rewrite = None;
         ctx.mcp_response_resource_binding = None;
+        ctx.mcp_batch_forbids_upstream = false;
         ctx.metadata.remove("mcp.server_id");
         ctx.metadata.remove("mcp.item_type");
+        ctx.metadata.remove("mcp.item_name");
         ctx.metadata.remove("mcp.tool_name");
+        ctx.metadata.remove("mcp.public_tool_name");
+        ctx.metadata.remove("mcp.upstream_tool_name");
         ctx.metadata.remove("mcp.prompt_name");
+        ctx.metadata.remove("mcp.upstream_prompt_name");
         ctx.metadata.remove("mcp.resource_uri");
         ctx.metadata.remove("mcp.upstream_resource_uri");
-        ctx.metadata.remove(METADATA_BATCH_FORBID_UPSTREAM);
+        ctx.metadata.remove("mcp.arguments");
+        ctx.metadata.remove("mcp.arguments_hash");
+        ctx.metadata.remove("mcp.input_schema_hash");
+        ctx.metadata.remove("mcp.schema_validation");
+        ctx.metadata.remove("mcp.policy_decision");
+        ctx.metadata.remove("mcp.catalog_hit");
+        ctx.metadata.remove("mcp.catalog_version");
+        ctx.metadata.remove("mcp.session.downstream");
+        ctx.metadata.remove("mcp.protocol_version_negotiated");
+        ctx.metadata.remove("mcp.message.kind");
+        ctx.metadata.remove("mcp.jsonrpc");
+        ctx.metadata.remove("mcp.method");
         ctx.metadata.remove(METADATA_REWRITE_KEY);
         ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY);
         ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY);
@@ -3655,12 +3820,18 @@ impl McpGateway {
         ctx.metadata.remove(METADATA_RESPONSE_REWRITE_SESSION_KEY);
         ctx.metadata
             .remove(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY);
+        // Restore the neutral request-start baselines the cleared keys had
+        // before any member ran. `entry().or_insert` leaves the terminal
+        // `mcp.route_decision` alone.
+        self.emit_base_metadata(ctx);
     }
 
+    /// Whether this dispatch is an aggregate JSON-RPC batch member and must not
+    /// reach the network. Reads the private `RequestContext` flag only: public
+    /// `metadata` is plugin scratch space that inbound request data and sibling
+    /// plugins can write, and a network-dispatch boundary must not be forgeable.
     fn batch_forbids_upstream(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata
-            .get(METADATA_BATCH_FORBID_UPSTREAM)
-            .is_some_and(|value| value == "true")
+        ctx.mcp_batch_forbids_upstream
     }
 
     async fn dispatch_post_envelope(
@@ -3701,27 +3872,10 @@ impl McpGateway {
             );
             return empty_response(202);
         }
-        if method != "initialize"
-            && let Some(version) = protocol_version.as_deref()
-            && !self
-                .supported_protocol_versions
-                .iter()
-                .any(|supported| supported.as_str() == version)
+        if let Some(response) =
+            self.unsupported_protocol_version_response(ctx, envelope, protocol_version.as_deref())
         {
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
-            return json_response(
-                400,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": envelope.id.clone().unwrap_or(Value::Null),
-                    "error": {
-                        "code": -32600,
-                        "message": "Unsupported MCP protocol version"
-                    }
-                }),
-                None,
-            );
+            return response;
         }
         if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
             if self.mode == McpGatewayMode::AggregateRouter
@@ -4147,6 +4301,22 @@ impl Plugin for McpGateway {
         let Some(body) = self.request_body(ctx) else {
             return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
         };
+        // Enforce the advertised aggregate batch byte cap on the raw body,
+        // before serde_json allocates a `Value` tree for it. A body whose first
+        // non-whitespace byte is `[` is array-shaped, so an oversized batch is
+        // refused without paying parse cost. Array-shaped bodies that are
+        // malformed still fail closed on the parse below, and singleton bodies
+        // are untouched by this cap.
+        if Self::body_is_jsonrpc_batch_shaped(body)
+            && body.len() > self.validation.max_batch_bytes
+        {
+            return json_rpc_error(
+                None,
+                -32600,
+                "Invalid Request",
+                Some("JSON-RPC batch exceeded max_batch_bytes".to_string()),
+            );
+        }
         let parsed: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
@@ -4971,8 +5141,21 @@ fn json_rpc_error_value(id: Option<Value>, code: i64, message: &str) -> Value {
     })
 }
 
+/// Methods whose aggregate handling routes to an upstream MCP server. Their
+/// notification forms are no-ops in singleton dispatch, but inside an aggregate
+/// batch they are upstream-bound and fall under the singleton-routing
+/// restriction like their request forms.
+fn aggregate_notification_requires_upstream_routing(method: &str) -> bool {
+    matches!(method, "tools/call" | "prompts/get" | "resources/read")
+}
+
 enum BatchItemOutcome {
     Notification,
+    /// A notification member whose dispatch did not succeed. A notification
+    /// never carries a per-item response element, so the batch reports the
+    /// failure once at batch level instead of silently claiming success or
+    /// answering a message that must not be answered.
+    FailedNotification,
     Response {
         value: Value,
         session_header: Option<(String, String)>,
@@ -5002,6 +5185,9 @@ fn classify_batch_item_result(
             body,
             ..
         } if body.is_empty() => BatchItemOutcome::Notification,
+        // An empty 202 is the only success shape for a notification. Any other
+        // terminal result is a failure that must not become a response element.
+        _ if is_notification => BatchItemOutcome::FailedNotification,
         PluginResult::Reject {
             status_code: 404,
             body,
