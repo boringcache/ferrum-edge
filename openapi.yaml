@@ -15594,7 +15594,9 @@ components:
                   a backend; takes precedence over `rewrite` and the route
                   override destination. A status-only redirect is valid and
                   preserves the original URL. A rule carrying a `redirect`
-                  does not require a `destination`.
+                  does not require a `destination`. `port` and `derive_port`
+                  are mutually exclusive (Istio oneof); scheme-default ports
+                  are omitted from Location.
                 properties:
                   uri:
                     type: [string, "null"]
@@ -15612,7 +15614,23 @@ components:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
-                    description: Replacement authority port; request host is preserved when authority is unset.
+                    description: |
+                      Replacement authority port (Istio `redirect.port`); request
+                      host is preserved when authority is unset. Mutually
+                      exclusive with `derive_port`. Scheme-default ports
+                      (`80`/`http`, `443`/`https`) are omitted from Location.
+                  derive_port:
+                    type: [string, "null"]
+                    enum: [FROM_PROTOCOL_DEFAULT, FROM_REQUEST_PORT, null]
+                    description: |
+                      Dynamically derive the Location authority port (Istio
+                      `redirect.derivePort`). `FROM_PROTOCOL_DEFAULT` uses 80 for
+                      http and 443 for https (including when `scheme` is set on
+                      the same redirect). `FROM_REQUEST_PORT` uses the trusted
+                      request port: original-destination port when capture
+                      rewrote the accept socket, otherwise the frontend listener
+                      port — never spoofable `X-Forwarded-Port` / `Forwarded`
+                      headers. Mutually exclusive with `port`.
                   scheme:
                     type: [string, "null"]
                     enum: [http, https, null]
