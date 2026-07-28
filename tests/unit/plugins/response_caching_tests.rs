@@ -4706,14 +4706,7 @@ async fn test_unsafe_invalidation_does_not_cross_authority_boundaries() {
     )
     .await;
 
-    unsafe_method_cycle(
-        &plugin,
-        "POST",
-        "/api/items",
-        Some("a.example.com"),
-        200,
-    )
-    .await;
+    unsafe_method_cycle(&plugin, "POST", "/api/items", Some("a.example.com"), 200).await;
 
     assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
     assert_cache_hit_for_host(&plugin, "/api/items", "b.example.com", b"tenant-b").await;
@@ -4766,9 +4759,7 @@ async fn test_unsafe_invalidation_uses_transformed_host_partition() {
     post_headers.insert("host".to_string(), "backend.internal".to_string());
     plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
     let mut post_resp = HashMap::new();
-    plugin
-        .after_proxy(&mut post_ctx, 204, &mut post_resp)
-        .await;
+    plugin.after_proxy(&mut post_ctx, 204, &mut post_resp).await;
 
     // Lookup with the rewritten Host must MISS.
     let mut miss_ctx = make_ctx("GET", "/api/items");
@@ -4803,14 +4794,7 @@ async fn test_failed_unsafe_mutation_does_not_invalidate() {
     .await;
 
     for status in [400u16, 401, 403, 404, 409, 500, 502, 503] {
-        unsafe_method_cycle(
-            &plugin,
-            "POST",
-            "/api/items",
-            Some("a.example.com"),
-            status,
-        )
-        .await;
+        unsafe_method_cycle(&plugin, "POST", "/api/items", Some("a.example.com"), status).await;
         assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"still-fresh").await;
     }
 }
@@ -4843,7 +4827,9 @@ async fn test_successful_unsafe_mutation_invalidates_after_non_error_response() 
         assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"cached").await;
 
         let mut resp_headers = HashMap::new();
-        plugin.after_proxy(&mut ctx, status, &mut resp_headers).await;
+        plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
         assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
     }
 }
@@ -4854,15 +4840,7 @@ async fn test_unknown_method_fail_closed_invalidates_after_success() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
 
-    cache_response(
-        &plugin,
-        "GET",
-        "/api/items",
-        200,
-        &HashMap::new(),
-        b"body",
-    )
-    .await;
+    cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
 
     // Error response for unknown method: no eviction.
     unsafe_method_cycle(&plugin, "CUSTOM", "/api/items", None, 405).await;
@@ -4919,14 +4897,7 @@ async fn test_path_descendant_invalidation_stays_authority_scoped() {
     )
     .await;
 
-    unsafe_method_cycle(
-        &plugin,
-        "DELETE",
-        "/api/items",
-        Some("a.example.com"),
-        204,
-    )
-    .await;
+    unsafe_method_cycle(&plugin, "DELETE", "/api/items", Some("a.example.com"), 204).await;
 
     assert_cache_miss_for_host(&plugin, "/api/items/42", "a.example.com").await;
     assert_cache_hit_for_host(&plugin, "/api/items/42", "b.example.com", b"b-child").await;
@@ -4975,24 +4946,10 @@ async fn test_concurrent_authority_scoped_invalidation() {
     let plugin_b = plugin.clone();
     let ((), ()) = tokio::join!(
         async move {
-            unsafe_method_cycle(
-                &plugin_a,
-                "POST",
-                "/api/items",
-                Some("a.example.com"),
-                200,
-            )
-            .await;
+            unsafe_method_cycle(&plugin_a, "POST", "/api/items", Some("a.example.com"), 200).await;
         },
         async move {
-            unsafe_method_cycle(
-                &plugin_b,
-                "PUT",
-                "/api/items",
-                Some("b.example.com"),
-                201,
-            )
-            .await;
+            unsafe_method_cycle(&plugin_b, "PUT", "/api/items", Some("b.example.com"), 201).await;
         },
     );
 
