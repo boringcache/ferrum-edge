@@ -658,7 +658,9 @@ pub fn is_cluster_topology_error(error: &redis::RedisError) -> bool {
     let Some(errors) = error.clone().into_server_errors() else {
         return false;
     };
-    errors.iter().any(|(_, err)| is_cluster_topology_code(Some(err.code())))
+    errors
+        .iter()
+        .any(|(_, err)| is_cluster_topology_code(Some(err.code())))
 }
 
 /// Read `cluster_enabled` out of an `INFO CLUSTER` reply.

@@ -2044,7 +2044,9 @@ fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
         "pooled establishment must return MultiplexedConnection"
     );
     assert!(
-        source.contains("async fn get_connection(&self) -> Option<redis::aio::MultiplexedConnection>"),
+        source.contains(
+            "async fn get_connection(&self) -> Option<redis::aio::MultiplexedConnection>"
+        ),
         "pooled accessor must return MultiplexedConnection"
     );
 

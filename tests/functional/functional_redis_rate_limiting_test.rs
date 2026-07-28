@@ -1062,8 +1062,11 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
             "ip:127.0.0.1",
             &[&current_index.saturating_sub(1).to_string()],
         );
-        let current_key =
-            redis_bucket_key(&unique_prefix, "ip:127.0.0.1", &[&current_index.to_string()]);
+        let current_key = redis_bucket_key(
+            &unique_prefix,
+            "ip:127.0.0.1",
+            &[&current_index.to_string()],
+        );
         set_redis_counter(&previous_key, 10, 3).await;
 
         let response = client
