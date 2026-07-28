@@ -2885,6 +2885,20 @@ impl Plugin for AiToolGovernor {
                     if !self.governs_buffered_json(ctx) {
                         return PluginResult::Continue;
                     }
+                    // Same duplicate-member screen the other decoded JSON paths
+                    // run, and BEFORE the skip hash is staged: an ambiguous body
+                    // governed from the `serde_json` last-wins view while the
+                    // client reads a first-wins view is uninspectable, and
+                    // recording its hash first would let the terminal re-check
+                    // hash-skip the very bytes that were never governable
+                    // (advisory `GHSA-c78j-5w9p-cpq6`).
+                    if ctx
+                        .json_scan_memo
+                        .ambiguity(strip_json_bom(&decoded))
+                        .is_some()
+                    {
+                        return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
+                    }
                     self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                     let Some(json) = parse_json_within_limit(&decoded) else {
                         return self.uninspectable_governed_response(
@@ -2990,14 +3004,11 @@ impl Plugin for AiToolGovernor {
                 if looks_like_sse(&decoded) {
                     return self.govern_buffered_sse(ctx, &decoded).await;
                 }
-                // Record the DECODED hash: the final re-check compares its
-                // own decode against this, so a compression-only final body
-                // is hash-skipped instead of re-governed (no duplicate
-                // approval webhook).
-                self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                 // Same duplicate-member screen on the DECODED bytes: a
                 // compressed governed body must not reach policy on a
-                // last-wins collapse either.
+                // last-wins collapse either. Screened BEFORE the hash is
+                // staged, so an ambiguous body never gets a skip hash the
+                // terminal re-check could honour.
                 if ctx
                     .json_scan_memo
                     .ambiguity(strip_json_bom(&decoded))
@@ -3005,6 +3016,11 @@ impl Plugin for AiToolGovernor {
                 {
                     return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
                 }
+                // Record the DECODED hash: the final re-check compares its
+                // own decode against this, so a compression-only final body
+                // is hash-skipped instead of re-governed (no duplicate
+                // approval webhook).
+                self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                 let Some(json) = parse_json_within_limit(&decoded) else {
                     return self.uninspectable_governed_response(
                         ctx,

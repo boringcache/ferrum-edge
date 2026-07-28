@@ -9778,6 +9778,93 @@ async fn buffered_sse_duplicate_member_frame_fails_closed() {
     );
 }
 
+/// A JSON-shaped body under an SSE label AND a `Content-Encoding` takes the
+/// decode-then-govern branch of `on_response_body`. The DECODED bytes must be
+/// screened for duplicate members before they are governed (and before their
+/// hash is staged for the terminal re-check): otherwise the plugin evaluates
+/// the `serde_json` last-wins view, forwards bytes a first-key-wins client
+/// reads as the denied call, and the terminal hook hash-skips them.
+#[tokio::test]
+async fn encoded_sse_labeled_json_with_duplicate_members_fails_closed() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    // The differential is real: serde only ever sees the ALLOWED name.
+    let parsed: Value = serde_json::from_str(ENCODED_SSE_AMBIGUOUS_JSON).expect("valid JSON");
+    assert_eq!(
+        parsed["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "safe"
+    );
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(ENCODED_SSE_AMBIGUOUS_JSON.as_bytes()),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Control: the same branch still governs normally — the unambiguous
+    // equivalent with the allowed call is forwarded, so the rejection above is
+    // the duplicate-member screen and not a blanket refusal of this route.
+    let clean = ENCODED_SSE_AMBIGUOUS_JSON.replace(r#""name":"danger","#, "");
+    let mut clean_ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut clean_ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(clean.as_bytes()),
+            )
+            .await,
+    );
+}
+
+/// Dry-run parity on the same encoded, SSE-labeled, JSON-shaped branch: observe
+/// without disrupting the response.
+#[tokio::test]
+async fn encoded_sse_labeled_json_with_duplicate_members_forwards_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(ENCODED_SSE_AMBIGUOUS_JSON.as_bytes()),
+            )
+            .await,
+    );
+}
+
+/// Chat Completions JSON carrying a duplicated `function.name`, mislabeled
+/// `text/event-stream` and compressed.
+const ENCODED_SSE_AMBIGUOUS_JSON: &str = concat!(
+    r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+    r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+    r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+);
+
+fn encoded_sse_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers
+}
+
 /// Streaming argument deltas reassemble into an ambiguous arguments document:
 /// the accumulated string is screened, so the batch is ungovernable and the
 /// stream is cut before the held frames are released.
