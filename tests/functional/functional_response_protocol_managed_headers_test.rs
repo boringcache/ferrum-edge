@@ -207,11 +207,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         .no_proxy()
         .build()
         .expect("h1 client");
-    let h1_resp = h1
-        .get(&echo_url)
-        .send()
-        .await
-        .expect("H1 ordinary");
+    let h1_resp = h1.get(&echo_url).send().await.expect("H1 ordinary");
     assert_eq!(h1_resp.status(), StatusCode::OK);
     assert_eq!(
         h1_resp
@@ -239,11 +235,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     assert_eq!(h1_resp.bytes().await.expect("body").as_ref(), b"hello");
 
     // --- Synthetic mock (H1) ---
-    let mock = h1
-        .get(&mocked_url)
-        .send()
-        .await
-        .expect("H1 mock");
+    let mock = h1.get(&mocked_url).send().await.expect("H1 mock");
     assert_eq!(mock.status(), StatusCode::OK);
     assert_eq!(
         mock.headers().get("x-mock").and_then(|v| v.to_str().ok()),
@@ -271,11 +263,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         .no_proxy()
         .build()
         .expect("h2 client");
-    let h2_resp = h2
-        .get(&echo_url)
-        .send()
-        .await
-        .expect("H2 ordinary");
+    let h2_resp = h2.get(&echo_url).send().await.expect("H2 ordinary");
     assert_eq!(h2_resp.version(), reqwest::Version::HTTP_2);
     assert_eq!(h2_resp.status(), StatusCode::OK);
     assert_no_protocol_managed(h2_resp.headers(), "H2 ordinary");
@@ -288,11 +276,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     );
     assert!(h2_resp.headers().get("x-request-id").is_some());
 
-    let h2_mock = h2
-        .get(&mocked_url)
-        .send()
-        .await
-        .expect("H2 mock");
+    let h2_mock = h2.get(&mocked_url).send().await.expect("H2 mock");
     assert_eq!(h2_mock.status(), StatusCode::OK);
     assert_no_protocol_managed(h2_mock.headers(), "H2 mock");
     assert_eq!(
