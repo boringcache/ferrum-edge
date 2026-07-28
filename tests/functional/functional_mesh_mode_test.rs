@@ -206,7 +206,9 @@ async fn start_static_mesh_cp_on(
     bind_addr: SocketAddr,
     advertised_ip: Option<std::net::IpAddr>,
 ) -> MeshCpHandle {
-    let listener = TcpListener::bind(bind_addr).await.expect("bind mesh CP");
+    let listener = bind_fixture_listener(bind_addr)
+        .await
+        .expect("bind mesh CP");
     let bound_addr = listener.local_addr().expect("mesh CP local addr");
     let addr = SocketAddr::new(advertised_ip.unwrap_or(bound_addr.ip()), bound_addr.port());
     let (request_tx, request_rx) = watch::channel(None);
@@ -264,7 +266,9 @@ async fn shutdown_grpc_server(
 }
 
 async fn start_xds_cp(config: GatewayConfig) -> XdsCpHandle {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind xDS CP");
+    let listener = bind_fixture_listener(loopback_ephemeral())
+        .await
+        .expect("bind xDS CP");
     let addr = listener.local_addr().expect("xDS CP local addr");
     let config = Arc::new(ArcSwap::from_pointee(config));
     let (update_tx, _) = broadcast::channel::<ConfigUpdate>(8);
@@ -380,12 +384,25 @@ struct MeshPorts {
 /// nondeterministically receive each other's fixture traffic.
 static USED_MESH_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
 
+fn used_mesh_ports() -> &'static Mutex<HashSet<u16>> {
+    USED_MESH_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// True when `port` has already been handed to a mesh gateway subprocess in this
+/// test process. Such a port belongs to that subprocess alone — see
+/// [`bind_fixture_listener`].
+fn mesh_port_is_reserved(port: u16) -> bool {
+    used_mesh_ports()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&port)
+}
+
 async fn reserve_unique_mesh_port() -> u16 {
     loop {
         let reservation = reserve_port().await.expect("reserve unique mesh port");
         let port = reservation.port;
-        let inserted = USED_MESH_PORTS
-            .get_or_init(|| Mutex::new(HashSet::new()))
+        let inserted = used_mesh_ports()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(port);
@@ -393,6 +410,69 @@ async fn reserve_unique_mesh_port() -> u16 {
             return reservation.drop_and_take_port();
         }
     }
+}
+
+/// Bind attempts [`bind_fixture_listener_where`] makes before giving up.
+const FIXTURE_BIND_ATTEMPTS: u32 = 32;
+
+fn loopback_ephemeral() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
+}
+
+/// Bind an ephemeral listener for a fixture-owned server (a control plane, an
+/// echo backend, …) on a port no mesh gateway subprocess has been given.
+///
+/// ## Why this is not a plain `TcpListener::bind(":0")` (issue #2132)
+///
+/// [`reserve_unique_mesh_port`] must RELEASE its listener before handing the
+/// port to a subprocess that binds it itself, so between the release and the
+/// gateway's own bind the port is free and the kernel can hand it straight back
+/// to the next `:0` bind in this process. The cross-cluster fixtures reserve all
+/// fifteen gateway ports first and only then bind their three control planes, so
+/// a control plane could land on a port already promised to a gateway. The
+/// gateway then failed startup with `Address already in use`, exited — and
+/// `wait_for_tcp_port` still succeeded, because the control plane was listening
+/// on that very port. `USED_MESH_PORTS` alone did not cover this: it only stops
+/// one mesh reservation reusing another.
+///
+/// Re-rolling here closes that window from the fixture side; the child-bound
+/// readiness gate ([`wait_for_gateway_listener`]) covers the cross-PROCESS case
+/// (another test binding our released port), which no in-process bookkeeping
+/// can see.
+async fn bind_fixture_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    bind_fixture_listener_where(addr, |port| !mesh_port_is_reserved(port)).await
+}
+
+/// [`bind_fixture_listener`] with an injectable acceptance predicate, so the
+/// re-roll itself is directly testable.
+///
+/// Rejected listeners are HELD until an acceptable port is found, so the kernel
+/// cannot hand the same rejected port back on the next attempt. A non-ephemeral
+/// (explicit, non-zero) bind address is returned as-is: the caller asked for
+/// that exact port.
+async fn bind_fixture_listener_where(
+    addr: SocketAddr,
+    acceptable: impl Fn(u16) -> bool,
+) -> std::io::Result<TcpListener> {
+    if addr.port() != 0 {
+        return TcpListener::bind(addr).await;
+    }
+    let mut rejected = Vec::new();
+    for _ in 0..FIXTURE_BIND_ATTEMPTS {
+        let listener = TcpListener::bind(addr).await?;
+        let port = listener.local_addr()?.port();
+        if acceptable(port) {
+            return Ok(listener);
+        }
+        rejected.push(listener);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        format!(
+            "no acceptable ephemeral port for a fixture listener after \
+             {FIXTURE_BIND_ATTEMPTS} attempts"
+        ),
+    ))
 }
 
 async fn reserve_mesh_ports() -> MeshPorts {
@@ -600,6 +680,301 @@ async fn wait_for_tcp_port(port: u16, timeout: Duration) -> bool {
             return false;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Outcome of waiting for a SPAWNED mesh gateway to bind one of its own
+/// listeners. See [`wait_for_gateway_listener`].
+#[derive(Debug)]
+enum GatewayListenerReadiness {
+    /// The port accepted a connection while the child was still running.
+    Ready,
+    /// The child exited before the port was proven ready. Whatever may be
+    /// listening on that port is NOT this gateway.
+    ChildExited(String),
+    /// The child is still running but never bound the port in time.
+    Timeout,
+}
+
+impl GatewayListenerReadiness {
+    fn is_ready(&self) -> bool {
+        matches!(self, GatewayListenerReadiness::Ready)
+    }
+
+    /// One-line diagnostic for a fixture's `last_failure` string.
+    fn describe(&self, label: &str, port: u16) -> String {
+        match self {
+            GatewayListenerReadiness::Ready => format!("{label} bound port {port}"),
+            GatewayListenerReadiness::ChildExited(status) => format!(
+                "{label} exited during startup ({status}) — port {port} is NOT owned by this \
+                 gateway (a competing listener can make a bare port probe succeed anyway)"
+            ),
+            GatewayListenerReadiness::Timeout => {
+                format!("{label} never bound port {port} within the startup timeout")
+            }
+        }
+    }
+}
+
+/// Non-blocking check for a spawned gateway that has already exited.
+fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
+    child.try_wait().expect("poll mesh gateway child")
+}
+
+/// The first labelled gateway in `children` that has already exited, rendered as
+/// a diagnostic. `None` means every gateway is still running.
+///
+/// A fixture whose gateway died mid-run is VOID: its ports were never owned by
+/// the process the driver believed it was talking to, so any observation made
+/// against them — success, failure, or fail-closed rejection — proves nothing.
+fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
+    for (label, child) in children.iter_mut() {
+        if let Some(status) = gateway_child_exited(child) {
+            return Some(format!("{label} exited during the run ({status})"));
+        }
+    }
+    None
+}
+
+/// Wait for a spawned mesh gateway to bind `port`, with readiness tied to THAT
+/// CHILD rather than to "something answers on this port" (issue #2132).
+///
+/// A bare [`wait_for_tcp_port`] probe asks only whether the port is reachable.
+/// When a gateway loses a startup bind race it logs `Address already in use` and
+/// exits, yet the probe still succeeds against whichever process actually holds
+/// the port — so the driver treats a foreign listener as gateway readiness and
+/// then reports that process's connection reset as a mesh datapath failure. That
+/// is precisely the failure captured in
+/// <https://github.com/ferrum-edge/ferrum-edge/actions/runs/30342386051>.
+///
+/// The child is polled BEFORE each probe and again after a successful one, so a
+/// child that dies at any point during the window is reported as
+/// [`GatewayListenerReadiness::ChildExited`] and the caller can consume its
+/// bounded attempt and retry with fresh ports, temp dirs, and control planes.
+async fn wait_for_gateway_listener(
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+) -> GatewayListenerReadiness {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = gateway_child_exited(child) {
+            return GatewayListenerReadiness::ChildExited(status.to_string());
+        }
+        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            // Re-check liveness: a gateway can fail a LATER listener's bind and
+            // exit after this one came up, which would leave the just-probed
+            // port owned by nobody (or by the competitor) moments later.
+            if let Some(status) = gateway_child_exited(child) {
+                return GatewayListenerReadiness::ChildExited(status.to_string());
+            }
+            return GatewayListenerReadiness::Ready;
+        }
+        if Instant::now() >= deadline {
+            return GatewayListenerReadiness::Timeout;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+// ── Harness contract guards for the mesh gateway port/readiness fix (#2132) ───
+
+/// This test file's own source, baked in at compile time so the check works from
+/// a relocated nextest archive with no cwd assumptions.
+const MESH_MODE_TEST_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/functional/functional_mesh_mode_test.rs"
+));
+
+/// Multi-gateway mesh fixtures that spawn gateway subprocesses under a bounded
+/// retry loop. Every one of them must gate readiness on the SPAWNED CHILD.
+const CHILD_BOUND_READINESS_FIXTURES: &[&str] = &[
+    "drive_egress_a_to_b",
+    "drive_grpc_egress_a_to_b",
+    "drive_websocket_egress_a_to_b",
+    "drive_cross_cluster_egress",
+    "drive_ambient_cross_cluster_egress",
+    "try_start_sidecar_cross_cluster_fixture",
+    "try_start_ambient_cross_cluster_fixture",
+];
+
+/// Drivers that must void an attempt whose gateway died mid-run.
+const DEAD_GATEWAY_VOIDING_DRIVERS: &[&str] = &[
+    "drive_egress_a_to_b",
+    "drive_grpc_egress_a_to_b",
+    "drive_websocket_egress_a_to_b",
+    "drive_cross_cluster_egress",
+    "drive_ambient_cross_cluster_egress",
+    "drive_cross_cluster_grpc_egress",
+    "drive_cross_cluster_ws_egress",
+    "drive_ambient_cross_cluster_ws_egress",
+    "drive_ambient_cross_cluster_ws_path_egress",
+];
+
+/// Extract one top-level `async fn <name>` body from [`MESH_MODE_TEST_SOURCE`].
+///
+/// Both boundaries are asserted: a missing `async fn` header and a missing
+/// closing `\n}\n` both panic rather than silently returning a slice. An
+/// over-captured body (a boundary that swallowed the rest of the file) makes the
+/// callers FAIL rather than pass, because the surrounding file still contains
+/// the very `wait_for_tcp_port(` calls they forbid.
+fn mesh_test_fn_body(name: &str) -> &'static str {
+    let header = format!("\nasync fn {name}(");
+    let start = MESH_MODE_TEST_SOURCE
+        .find(&header)
+        .unwrap_or_else(|| panic!("`async fn {name}(` not found in this test file's source"))
+        + 1;
+    let rest = &MESH_MODE_TEST_SOURCE[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("no top-level closing brace found for `async fn {name}`"));
+    let body = &rest[..end];
+    assert!(
+        body.len() > 200,
+        "extracted body for `async fn {name}` is implausibly short ({} bytes) — the \
+         extraction boundaries drifted",
+        body.len()
+    );
+    body
+}
+
+/// Readiness for a spawned mesh gateway must be tied to THAT CHILD, never to a
+/// bare "something accepts on this port" probe (issue #2132).
+///
+/// A bare [`wait_for_tcp_port`] succeeds against a competing listener that won a
+/// startup bind race on a dropped port reservation, so the driver then reports
+/// the competitor's connection reset as a mesh datapath failure. This guard
+/// fails the moment one of these fixtures reverts to that shape.
+#[test]
+fn multi_gateway_fixtures_gate_readiness_on_the_spawned_child() {
+    for name in CHILD_BOUND_READINESS_FIXTURES {
+        let body = mesh_test_fn_body(name);
+        assert!(
+            body.contains("spawn_mesh_gateway("),
+            "`{name}` no longer spawns a mesh gateway; update \
+             CHILD_BOUND_READINESS_FIXTURES to match the fixture it became"
+        );
+        assert!(
+            body.contains("wait_for_gateway_listener("),
+            "`{name}` must gate gateway readiness on `wait_for_gateway_listener` so a child \
+             that exits during startup consumes its bounded attempt (issue #2132)"
+        );
+        assert!(
+            !body.contains("wait_for_tcp_port("),
+            "`{name}` gates a spawned gateway on a bare `wait_for_tcp_port` probe again — that \
+             probe cannot tell this gateway's listener from a competing process that won the \
+             bind race on the same dropped reservation (issue #2132)"
+        );
+    }
+}
+
+/// Every multi-gateway driver must void an attempt whose gateway died mid-run,
+/// instead of reporting the resulting transport error as a datapath result.
+#[test]
+fn multi_gateway_drivers_void_attempts_whose_gateway_died() {
+    for name in DEAD_GATEWAY_VOIDING_DRIVERS {
+        let body = mesh_test_fn_body(name);
+        assert!(
+            body.contains("exited_gateway_diagnostic(") || body.contains("exited_gateway()"),
+            "`{name}` must void an attempt whose gateway exited during the run — its ports were \
+             never owned by the process it believed it was driving (issue #2132)"
+        );
+    }
+}
+
+/// The fixture-owned control planes and backends must not bind a port already
+/// promised to a mesh gateway subprocess (issue #2132).
+#[test]
+fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
+    for name in [
+        "start_static_mesh_cp_on",
+        "start_xds_cp",
+        "start_echo_backend",
+        "start_labeled_echo_backend",
+        "start_grpc_trailers_echo_backend",
+        "start_websocket_echo_backend",
+        "start_websocket_path_echo_backend",
+    ] {
+        let body = mesh_test_fn_body(name);
+        assert!(
+            body.contains("bind_fixture_listener("),
+            "`{name}` must bind through `bind_fixture_listener` so it can never take a port \
+             already handed to a mesh gateway subprocess (issue #2132)"
+        );
+    }
+}
+
+/// [`bind_fixture_listener_where`] must re-roll past a rejected port rather than
+/// returning it, and must not hand back the rejected port on a later attempt.
+#[tokio::test]
+async fn fixture_listener_bind_rerolls_past_a_rejected_port() {
+    let predicate_calls = AtomicUsize::new(0);
+    let rejected = Mutex::new(None);
+    let listener = bind_fixture_listener_where(loopback_ephemeral(), |port| {
+        if predicate_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            let mut rejected_slot = rejected
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *rejected_slot = Some(port);
+            false
+        } else {
+            true
+        }
+    })
+    .await
+    .expect("fixture listener bind");
+    let port = listener.local_addr().expect("fixture addr").port();
+    let rejected = rejected
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("predicate records its rejected first candidate");
+    assert_eq!(
+        predicate_calls.load(Ordering::Relaxed),
+        2,
+        "the test must exercise exactly one rejected bind and one accepted re-roll"
+    );
+    assert_ne!(
+        port, rejected,
+        "bind_fixture_listener_where returned the port its predicate rejected"
+    );
+}
+
+/// A port handed to a mesh gateway subprocess is registered, and fixture-owned
+/// listeners never bind one.
+#[tokio::test]
+async fn fixture_listeners_never_take_a_reserved_mesh_port() {
+    let ports = reserve_mesh_ports().await;
+    for (label, port) in [
+        ("inbound", ports.inbound),
+        ("outbound", ports.outbound),
+        ("hbone", ports.hbone),
+        ("egress", ports.egress),
+        ("east_west", ports.east_west),
+    ] {
+        assert!(
+            mesh_port_is_reserved(port),
+            "mesh {label} port {port} was handed to a gateway without being registered — the \
+             no-reuse protection would not cover it"
+        );
+    }
+
+    // Hold every listener for the duration so each bind draws a distinct port.
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        held.push(
+            bind_fixture_listener(loopback_ephemeral())
+                .await
+                .expect("fixture listener bind"),
+        );
+    }
+    for listener in &held {
+        let port = listener.local_addr().expect("fixture addr").port();
+        assert!(
+            !mesh_port_is_reserved(port),
+            "a fixture listener bound port {port}, which is already promised to a mesh gateway \
+             subprocess — the gateway would fail startup with EADDRINUSE while a bare port probe \
+             kept succeeding (issue #2132)"
+        );
     }
 }
 
@@ -2174,7 +2549,7 @@ async fn functional_mesh_mode_strict_inbound_requires_peer_svid() {
 /// capability-registry refresh probes the backend regardless of authz/warmup.)
 async fn start_echo_backend() -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind echo backend");
     let port = listener.local_addr().expect("echo backend addr").port();
@@ -2204,7 +2579,7 @@ async fn start_echo_backend() -> u16 {
 /// assertions can tell WHICH backend served the request.
 async fn start_labeled_echo_backend(label: &'static str) -> u16 {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind labeled echo backend");
     let port = listener.local_addr().expect("echo backend addr").port();
@@ -2972,9 +3347,12 @@ async fn drive_egress_a_to_b(
                 ],
             },
         );
-        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_transport_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B transport listener", b_transport_port),
                 captured_output(&temp_b)
             );
             kill_child(&mut child_b);
@@ -3027,9 +3405,12 @@ async fn drive_egress_a_to_b(
                 env_overrides: a_env,
             },
         );
-        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
                 captured_output(&temp_a)
             );
             kill_child(&mut child_a);
@@ -3064,6 +3445,32 @@ async fn drive_egress_a_to_b(
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so the observation above proves nothing about the mesh
+        // datapath — a competing listener on a dropped reservation can answer a
+        // bare port probe and then reset the connection (issue #2132). Void the
+        // attempt and retry with fresh ports, temp dirs, and control planes.
+        // Nothing here retries an observation from a HEALTHY fixture, so
+        // authoritative protocol responses and fail-closed security assertions
+        // are still made exactly once.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A", &mut child_a),
+            ("gateway B", &mut child_b),
+        ]);
+        if let Some(exited) = exited {
+            last_failure = format!(
+                "attempt {attempt}: {exited}\n--- gateway A ---\n{}\n--- gateway B ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -3179,7 +3586,7 @@ fn grpc_framed_payload(payload: &[u8]) -> Vec<u8> {
 /// header-encoded Trailers-Only shape, this exercises the full
 /// data-then-trailers relay the mesh-mTLS gRPC path must preserve end-to-end.
 async fn start_grpc_trailers_echo_backend() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind gRPC trailers echo backend");
     let port = listener.local_addr().expect("backend local addr").port();
@@ -3397,9 +3804,12 @@ async fn drive_grpc_egress_a_to_b(
                 ],
             },
         );
-        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_transport_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B transport listener", b_transport_port),
                 captured_output(&temp_b)
             );
             kill_child(&mut child_b);
@@ -3445,9 +3855,12 @@ async fn drive_grpc_egress_a_to_b(
                 env_overrides: a_env,
             },
         );
-        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
                 captured_output(&temp_a)
             );
             kill_child(&mut child_a);
@@ -3483,6 +3896,32 @@ async fn drive_grpc_egress_a_to_b(
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so the observation above proves nothing about the mesh
+        // datapath — a competing listener on a dropped reservation can answer a
+        // bare port probe and then reset the connection (issue #2132). Void the
+        // attempt and retry with fresh ports, temp dirs, and control planes.
+        // Nothing here retries an observation from a HEALTHY fixture, so
+        // authoritative protocol responses and fail-closed security assertions
+        // are still made exactly once.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A", &mut child_a),
+            ("gateway B", &mut child_b),
+        ]);
+        if let Some(exited) = exited {
+            last_failure = format!(
+                "attempt {attempt}: {exited}\n--- gateway A ---\n{}\n--- gateway B ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -4423,9 +4862,12 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
                 ],
             },
         );
-        if !wait_for_tcp_port(c_inbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_c, c_inbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway C inbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway C inbound listener", c_inbound_port),
                 captured_output(&temp_c)
             );
             kill_child(&mut child_c);
@@ -4463,9 +4905,12 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
                 ],
             },
         );
-        if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_east_west_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway B east-west listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B east-west listener", b_east_west_port),
                 captured_output(&temp_b)
             );
             kill_child(&mut child_b);
@@ -4529,9 +4974,12 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
                 ],
             },
         );
-        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
                 captured_output(&temp_a)
             );
             kill_child(&mut child_a);
@@ -4553,6 +5001,36 @@ async fn drive_cross_cluster_egress(client_trusted: bool) -> Result<(u16, String
         let last =
             wait_for_authoritative_cross_cluster_http(a_outbound_port, "cross-cluster egress")
                 .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so the observation above proves nothing about the mesh
+        // datapath — a competing listener on a dropped reservation can answer a
+        // bare port probe and then reset the connection (issue #2132). Void the
+        // attempt and retry with fresh ports, temp dirs, and control planes.
+        // Nothing here retries an observation from a HEALTHY fixture, so
+        // authoritative protocol responses and fail-closed security assertions
+        // are still made exactly once.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A (client)", &mut child_a),
+            ("gateway B (east-west)", &mut child_b),
+            ("gateway C (dest)", &mut child_c),
+        ]);
+        if let Some(exited) = exited {
+            last_failure = format!(
+                "attempt {attempt}: {exited}\n--- gateway A (client) ---\n{}\n\
+                 --- gateway B (east-west) ---\n{}\n--- gateway C (dest) ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b),
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            continue;
+        }
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -4669,6 +5147,19 @@ impl SidecarCrossClusterFixture {
             captured_output(&self.temp_b),
             captured_output(&self.temp_c),
         )
+    }
+
+    /// The first of this fixture's gateways that has already exited, if any.
+    ///
+    /// A dead gateway means its ports were never owned by the process the driver
+    /// believed it was driving (issue #2132), so the attempt is void — see
+    /// [`exited_gateway_diagnostic`].
+    fn exited_gateway(&mut self) -> Option<String> {
+        exited_gateway_diagnostic(&mut [
+            ("gateway A (client)", &mut self.child_a),
+            ("gateway B (east-west)", &mut self.child_b),
+            ("gateway C (dest)", &mut self.child_c),
+        ])
     }
 
     async fn shutdown(mut self) {
@@ -4799,7 +5290,10 @@ async fn try_start_sidecar_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(c_inbound_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_c, c_inbound_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_c);
         cp_a.shutdown().await;
         cp_b.shutdown().await;
@@ -4835,7 +5329,10 @@ async fn try_start_sidecar_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_b, b_east_west_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_b);
         kill_child(&mut child_c);
         cp_a.shutdown().await;
@@ -4892,7 +5389,10 @@ async fn try_start_sidecar_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_a);
         kill_child(&mut child_b);
         kill_child(&mut child_c);
@@ -4931,7 +5431,7 @@ async fn drive_cross_cluster_grpc_egress(
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
         let backend_port = start_grpc_trailers_echo_backend().await;
-        let Some(fixture) =
+        let Some(mut fixture) =
             try_start_sidecar_cross_cluster_fixture(attempt, client_trusted, backend_port).await
         else {
             last_failure = format!("attempt {attempt}: cross-cluster fixture never bound");
@@ -4945,6 +5445,18 @@ async fn drive_cross_cluster_grpc_egress(
         // authoritative-but-wrong response.
         let last =
             wait_for_authoritative_cross_cluster_grpc(fixture.a_outbound_port, &framed).await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so this observation proves nothing about the mesh datapath
+        // (issue #2132). Void the attempt and retry with fresh ports, temp dirs,
+        // and control planes. A HEALTHY fixture's observation is never retried,
+        // so authoritative protocol responses and fail-closed security
+        // assertions are still made exactly once.
+        if let Some(exited) = fixture.exited_gateway() {
+            last_failure = format!("attempt {attempt}: {exited}\n{}", fixture.logs());
+            fixture.shutdown().await;
+            continue;
+        }
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5042,7 +5554,7 @@ async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, 
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
         let backend_port = start_websocket_echo_backend().await;
-        let Some(fixture) =
+        let Some(mut fixture) =
             try_start_sidecar_cross_cluster_fixture(attempt, client_trusted, backend_port).await
         else {
             last_failure = format!("attempt {attempt}: cross-cluster fixture never bound");
@@ -5057,6 +5569,18 @@ async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, 
         let last =
             wait_for_authoritative_cross_cluster_ws(fixture.a_outbound_port, "mesh-xc-ws-hello")
                 .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so this observation proves nothing about the mesh datapath
+        // (issue #2132). Void the attempt and retry with fresh ports, temp dirs,
+        // and control planes. A HEALTHY fixture's observation is never retried,
+        // so authoritative protocol responses and fail-closed security
+        // assertions are still made exactly once.
+        if let Some(exited) = fixture.exited_gateway() {
+            last_failure = format!("attempt {attempt}: {exited}\n{}", fixture.logs());
+            fixture.shutdown().await;
+            continue;
+        }
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -5474,9 +5998,12 @@ async fn drive_ambient_cross_cluster_egress(
                 ],
             },
         );
-        if !wait_for_tcp_port(c_hbone_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_c, c_hbone_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway C HBONE listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway C HBONE listener", c_hbone_port),
                 captured_output(&temp_c)
             );
             kill_child(&mut child_c);
@@ -5514,9 +6041,12 @@ async fn drive_ambient_cross_cluster_egress(
                 ],
             },
         );
-        if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_east_west_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway B east-west listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B east-west listener", b_east_west_port),
                 captured_output(&temp_b)
             );
             kill_child(&mut child_b);
@@ -5584,9 +6114,12 @@ async fn drive_ambient_cross_cluster_egress(
                 ],
             },
         );
-        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
                 captured_output(&temp_a)
             );
             kill_child(&mut child_a);
@@ -5608,6 +6141,36 @@ async fn drive_ambient_cross_cluster_egress(
             "ambient cross-cluster egress",
         )
         .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so the observation above proves nothing about the mesh
+        // datapath — a competing listener on a dropped reservation can answer a
+        // bare port probe and then reset the connection (issue #2132). Void the
+        // attempt and retry with fresh ports, temp dirs, and control planes.
+        // Nothing here retries an observation from a HEALTHY fixture, so
+        // authoritative protocol responses and fail-closed security assertions
+        // are still made exactly once.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A (client)", &mut child_a),
+            ("gateway B (east-west)", &mut child_b),
+            ("gateway C (dest)", &mut child_c),
+        ]);
+        if let Some(exited) = exited {
+            last_failure = format!(
+                "attempt {attempt}: {exited}\n--- gateway A (client) ---\n{}\n\
+                 --- gateway B (east-west) ---\n{}\n--- gateway C (dest) ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b),
+                captured_output(&temp_c)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            kill_child(&mut child_c);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            cp_c.shutdown().await;
+            continue;
+        }
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);
@@ -5721,6 +6284,19 @@ impl AmbientCrossClusterFixture {
             captured_output(&self.temp_b),
             captured_output(&self.temp_c),
         )
+    }
+
+    /// The first of this fixture's gateways that has already exited, if any.
+    ///
+    /// A dead gateway means its ports were never owned by the process the driver
+    /// believed it was driving (issue #2132), so the attempt is void — see
+    /// [`exited_gateway_diagnostic`].
+    fn exited_gateway(&mut self) -> Option<String> {
+        exited_gateway_diagnostic(&mut [
+            ("gateway A (client)", &mut self.child_a),
+            ("gateway B (east-west)", &mut self.child_b),
+            ("gateway C (dest)", &mut self.child_c),
+        ])
     }
 
     async fn shutdown(mut self) {
@@ -5847,7 +6423,10 @@ async fn try_start_ambient_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(c_hbone_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_c, c_hbone_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_c);
         cp_a.shutdown().await;
         cp_b.shutdown().await;
@@ -5883,7 +6462,10 @@ async fn try_start_ambient_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_b, b_east_west_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_b);
         kill_child(&mut child_c);
         cp_a.shutdown().await;
@@ -5940,7 +6522,10 @@ async fn try_start_ambient_cross_cluster_fixture(
             ],
         },
     );
-    if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+    if !wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT)
+        .await
+        .is_ready()
+    {
         kill_child(&mut child_a);
         kill_child(&mut child_b);
         kill_child(&mut child_c);
@@ -5976,7 +6561,7 @@ async fn drive_ambient_cross_cluster_ws_egress(
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
         let backend_port = start_websocket_echo_backend().await;
-        let Some(fixture) =
+        let Some(mut fixture) =
             try_start_ambient_cross_cluster_fixture(attempt, client_trusted, backend_port).await
         else {
             last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
@@ -5992,6 +6577,18 @@ async fn drive_ambient_cross_cluster_ws_egress(
             "mesh-amb-xc-ws-hello",
         )
         .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so this observation proves nothing about the mesh datapath
+        // (issue #2132). Void the attempt and retry with fresh ports, temp dirs,
+        // and control planes. A HEALTHY fixture's observation is never retried,
+        // so authoritative protocol responses and fail-closed security
+        // assertions are still made exactly once.
+        if let Some(exited) = fixture.exited_gateway() {
+            last_failure = format!("attempt {attempt}: {exited}\n{}", fixture.logs());
+            fixture.shutdown().await;
+            continue;
+        }
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -6063,7 +6660,7 @@ async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String)
     let mut last_failure = String::new();
     for attempt in 1..=RETRY_ATTEMPTS {
         let backend_port = start_websocket_path_echo_backend().await;
-        let Some(fixture) =
+        let Some(mut fixture) =
             try_start_ambient_cross_cluster_fixture(attempt, true, backend_port).await
         else {
             last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
@@ -6079,6 +6676,18 @@ async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String)
             "mesh-amb-xc-ws-path-hello",
         )
         .await;
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so this observation proves nothing about the mesh datapath
+        // (issue #2132). Void the attempt and retry with fresh ports, temp dirs,
+        // and control planes. A HEALTHY fixture's observation is never retried,
+        // so authoritative protocol responses and fail-closed security
+        // assertions are still made exactly once.
+        if let Some(exited) = fixture.exited_gateway() {
+            last_failure = format!("attempt {attempt}: {exited}\n{}", fixture.logs());
+            fixture.shutdown().await;
+            continue;
+        }
 
         let logs = fixture.logs();
         fixture.shutdown().await;
@@ -6571,7 +7180,7 @@ async fn functional_mesh_sidecar_outbound_multi_port_without_orig_dst_fails_clos
 /// honors a Close.
 async fn start_websocket_echo_backend() -> u16 {
     use futures_util::{SinkExt, StreamExt};
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind websocket echo backend");
     let port = listener
@@ -6628,7 +7237,7 @@ async fn start_websocket_echo_backend() -> u16 {
 async fn start_websocket_path_echo_backend() -> u16 {
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_fixture_listener(loopback_ephemeral())
         .await
         .expect("bind websocket path-echo backend");
     let port = listener
@@ -6870,9 +7479,12 @@ async fn drive_websocket_egress_a_to_b(
                 ],
             },
         );
-        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_b, b_transport_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway B transport listener", b_transport_port),
                 captured_output(&temp_b)
             );
             kill_child(&mut child_b);
@@ -6918,9 +7530,12 @@ async fn drive_websocket_egress_a_to_b(
                 env_overrides: a_env,
             },
         );
-        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        let readiness =
+            wait_for_gateway_listener(&mut child_a, a_outbound_port, STARTUP_TIMEOUT).await;
+        if !readiness.is_ready() {
             last_failure = format!(
-                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                "attempt {attempt}: {}\n{}",
+                readiness.describe("gateway A outbound listener", a_outbound_port),
                 captured_output(&temp_a)
             );
             kill_child(&mut child_a);
@@ -6952,6 +7567,32 @@ async fn drive_websocket_egress_a_to_b(
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         };
+
+        // A gateway that exited during the run never owned the ports the driver
+        // just drove, so the observation above proves nothing about the mesh
+        // datapath — a competing listener on a dropped reservation can answer a
+        // bare port probe and then reset the connection (issue #2132). Void the
+        // attempt and retry with fresh ports, temp dirs, and control planes.
+        // Nothing here retries an observation from a HEALTHY fixture, so
+        // authoritative protocol responses and fail-closed security assertions
+        // are still made exactly once.
+        let exited = exited_gateway_diagnostic(&mut [
+            ("gateway A", &mut child_a),
+            ("gateway B", &mut child_b),
+        ]);
+        if let Some(exited) = exited {
+            last_failure = format!(
+                "attempt {attempt}: {exited}\n--- gateway A ---\n{}\n--- gateway B ---\n{}",
+                captured_output(&temp_a),
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
 
         let output_a = captured_output(&temp_a);
         let output_b = captured_output(&temp_b);

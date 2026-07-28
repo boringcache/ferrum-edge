@@ -2034,8 +2034,7 @@ fn parse_property_encoding(
                     {
                         return Err(format!("{media_path}.examples must be an object"));
                     }
-                    if media_object.contains_key("example")
-                        && media_object.contains_key("examples")
+                    if media_object.contains_key("example") && media_object.contains_key("examples")
                     {
                         return Err(format!(
                             "{media_path}.example and .examples are mutually exclusive"

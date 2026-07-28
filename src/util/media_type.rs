@@ -8,18 +8,12 @@
 pub fn is_concrete_http_media_type(value: &str) -> bool {
     let (base, parameters) = value
         .split_once(';')
-        .map_or((value, None), |(base, parameters)| {
-            (base, Some(parameters))
-        });
+        .map_or((value, None), |(base, parameters)| (base, Some(parameters)));
     let base = base.trim_end_matches(|character| matches!(character, ' ' | '\t'));
     let Some((type_, subtype)) = base.split_once('/') else {
         return false;
     };
-    if type_ == "*"
-        || subtype == "*"
-        || !is_http_token(type_)
-        || !is_http_token(subtype)
-    {
+    if type_ == "*" || subtype == "*" || !is_http_token(type_) || !is_http_token(subtype) {
         return false;
     }
     parameters.is_none_or(valid_media_type_parameters)
@@ -38,7 +32,10 @@ fn valid_media_type_parameters(parameters: &str) -> bool {
             continue;
         }
         let name_start = index;
-        while bytes.get(index).is_some_and(|byte| is_http_token_byte(*byte)) {
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_http_token_byte(*byte))
+        {
             index += 1;
         }
         if index == name_start {
@@ -55,7 +52,10 @@ fn valid_media_type_parameters(parameters: &str) -> bool {
             }
         } else {
             let value_start = index;
-            while bytes.get(index).is_some_and(|byte| is_http_token_byte(*byte)) {
+            while bytes
+                .get(index)
+                .is_some_and(|byte| is_http_token_byte(*byte))
+            {
                 index += 1;
             }
             if index == value_start {

@@ -75,6 +75,7 @@ shutdown guidance.
 
 ```
 on_ws_frame()  ── inspect/transform/close per WebSocket frame
+on_ws_reassembly_frames() ── charge physical fragments of a reassembled message
 ```
 
 ### TCP/UDP Stream Lifecycle
@@ -295,9 +296,12 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_response_stream_terminated(&mut ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up/account for streaming state and write aggregate transaction metadata before logging; does not receive body bytes |
 | `log(&summary)` | Logging | No | Hand transaction data to a bounded sink; timing depends on response ownership |
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
+| `on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)` | WebSocket physical fragments | Close** | Charge/observe the wire frames a fragmented message consumed before it reassembled |
 | `prepare_ws_frame_delivery(&message)` / `emit_ws_frame_delivery(...)` | After successful WS sink accept | — | Delivery-accurate observation (final post-guard message); default no-op |
 
 \*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame. The first terminal Close from a priority-ordered admission/mutating hook is preserved: later mutating plugins are skipped for that frame (so they cannot charge budget or overwrite the Close), while observational hooks that return `true` from `observes_ws_frame_decisions()` still see the final Close. Delivery-accurate loggers should emit from `prepare_ws_frame_delivery` / `emit_ws_frame_delivery` (after the control-frame guard and successful sink accept), not from `on_ws_frame`, so cancelled/failed writes are not presented as delivered frames.
+
+\*\*`on_ws_reassembly_frames` sees the frames `on_ws_frame` cannot: tungstenite reassembles Text/Binary continuations, so the initial non-final frame and every intermediate continuation — including zero-length ones, which trip no size ceiling — never surface as a message. The relay meters them and calls this hook (with `fragment_frames >= 1`) before the `on_ws_frame` chain for the read that surfaced them, and for an interleaved Ping/Pong; a peer `Close` is exempt, matching the existing rule that peer Closes bypass mutating admission. There is no message to mutate: only `Some(Message::Close(...))` is honored, everything else is ignored, and observe-only plugins are skipped. The completing frame is charged once through `on_ws_frame`, so a plugin implementing both hooks counts each wire frame exactly once. Set `requires_ws_frame_hooks()` to `true` to receive it.
 
 **Streaming inspectors:** A `ResponseStreamInspector` runs after response headers have been committed. It can forward, hold, or terminate the remaining body, but it cannot change the response status or retract bytes already sent.
 
@@ -385,7 +389,7 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Optional per-request native-H3 dispatch override when reqwest is operationally preferable; inspectors do not require it for transport coverage. |
 | `fn correlation_id_header_name(&self) -> Option<&str>` | `None` | Return the non-empty correlation header owned by this instance, or `None` when it owns no correlation header. Empty or whitespace-only claims fail admission with a capability-specific error. Core candidate admission and runtime cache construction defensively trim and compare valid claims ASCII-case-insensitively, rejecting the effective deployment-specific `FERRUM_REAL_IP_HEADER` and duplicate effective headers or priorities on one plugin chain, including custom-only chains. CP/DP deployments require every DP to advertise the same effective real-IP header as the CP before config distribution. Custom plugins must still trim, validate, and normalize the header names used by their own runtime writes. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
-| `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
+| `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()` or `on_ws_reassembly_frames()`. Pre-computed per proxy for zero overhead when unused. |
 | `fn observes_ws_frame_decisions(&self) -> bool` | `false` | Set to `true` for observe-only frame hooks. After an earlier admission plugin returns a terminal Close, the shared relay still invokes observational hooks with that Close while skipping later mutating plugins. The relay always ignores an observational hook's return value. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
 | `fn tracked_keys_count(&self) -> Option<usize>` | `None` | Number of tracked rate-limit keys (for admin API diagnostics). |
@@ -1545,7 +1549,8 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`
 - [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`
 - [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
-- [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()`
+- [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()` or `on_ws_reassembly_frames()`
+- [ ] Per-frame budget plugins implement `on_ws_reassembly_frames()` too, or a peer can fragment-flood past them
 - [ ] Mutating `on_ws_frame` hooks treat an inbound `Message::Close` as already-final (no budget charge / no replacement) unless they intentionally observe-only via `observes_ws_frame_decisions()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable
 - [ ] Slow `log()` I/O uses a bounded, lifecycle-owned handoff with explicit overflow and shutdown behavior

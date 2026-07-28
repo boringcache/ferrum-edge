@@ -1986,8 +1986,7 @@ fn normalize_request_body_encoding(
                             ),
                         });
                     }
-                    if media_object.contains_key("example")
-                        && media_object.contains_key("examples")
+                    if media_object.contains_key("example") && media_object.contains_key("examples")
                     {
                         return Err(ExtractError::MalformedExtension {
                             which: "requestBody.content.encoding",

@@ -423,6 +423,19 @@ fn gateway_binary_path() -> &'static str {
     }
 }
 
+/// Mint a per-spawn-attempt observability credential.
+///
+/// Nothing here is a real secret — it exists only so two gateways started by two
+/// parallel tests can never be mistaken for each other — but it is still handled
+/// like one: it is never printed, and identity failures report why the probe
+/// failed, never the credential. Mirrors `InstanceIdentity` in
+/// `tests/common/gateway_harness.rs` (issue #3428).
+fn mint_observability_token() -> String {
+    format!("ferrum-edge-ws-probe-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Spawn the gateway subprocess. Returns the child plus the admin HTTP port
+/// that [`wait_for_owned_gateway`] probes for process identity.
 fn start_gateway_with_extra_env(
     config_path: &str,
     http_port: u16,
@@ -430,18 +443,20 @@ fn start_gateway_with_extra_env(
     tls_cert_path: Option<&str>,
     tls_key_path: Option<&str>,
     extra_env: &[(&str, &str)],
-) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    observability_token: &str,
+) -> Result<(std::process::Child, u16), Box<dyn std::error::Error>> {
     // Use a fresh admin HTTP port and disable admin HTTPS so parallel gateways
     // in the same functional shard never contend on the default admin ports
     // (9000/9443). Admin-listener bind failure aborts startup (fatal), which
     // would otherwise surface here as a spurious "gateway did not start" when an
-    // unrelated parallel test holds the default port. These tests never use the
-    // admin API.
+    // unrelated parallel test holds the default port.
+    //
+    // The admin HTTP port must be a real port, never the `0` sentinel: `0`
+    // disables the plaintext admin listener, and this file's readiness barrier
+    // proves child identity through that listener.
     let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(0);
+        .and_then(|l| l.local_addr())
+        .map(|a| a.port())?;
     let mut cmd = std::process::Command::new(gateway_binary_path());
     cmd.env("FERRUM_MODE", "file")
         .env("FERRUM_FILE_CONFIG_PATH", config_path)
@@ -449,6 +464,13 @@ fn start_gateway_with_extra_env(
         .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
         .env("FERRUM_ADMIN_HTTPS_PORT", "0")
         .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Ownership proof for this exact child (issue #3428 pattern). Presenting
+        // this token unlocks the authenticated detail tier of `/health`, which
+        // no other gateway on the box can answer with. A leaked parent-shell
+        // CIDR allowlist would let a foreign gateway answer the detail tier
+        // without the token, so it is scrubbed from the child's environment.
+        .env("FERRUM_METRICS_BEARER_TOKEN", observability_token)
+        .env_remove("FERRUM_METRICS_ALLOWED_CIDRS")
         .env("RUST_LOG", "ferrum_edge=debug")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -468,7 +490,7 @@ fn start_gateway_with_extra_env(
         cmd.env(name, value);
     }
 
-    Ok(cmd.spawn()?)
+    Ok((cmd.spawn()?, admin_http_port))
 }
 
 /// Write a YAML config file with a WebSocket proxy pointing to the given backend port.
@@ -955,40 +977,115 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
-/// Wait for the gateway to become ready by probing the proxy port via TCP connect.
+/// Wait until `child` has proven it owns its admin port *and* the requested
+/// proxy port accepts a TCP connection.
+///
+/// Readiness is not identity (issue #3435). `free_port` releases its listener
+/// before the subprocess binds it, so between reservation and bind any parallel
+/// fixture in the shard — another gateway, a tonic backend, a scripted H2
+/// server — can claim the reserved proxy port. The gateway then dies with
+/// `Address already in use` while a bare TCP connect keeps succeeding against
+/// the squatter, and the test proceeds to speak WebSocket to a stranger. That is
+/// how `test_h2_websocket_extended_connect_echo` observed
+/// `Reset(StreamId(1), PROTOCOL_ERROR, Remote)`: the H2 peer that answered was
+/// an h2 server without RFC 8441 `SETTINGS_ENABLE_CONNECT_PROTOCOL`, so it reset
+/// the Extended CONNECT that a real Ferrum listener accepts.
+///
+/// The barrier is the same one `TestGateway` uses (issue #3428), applied to this
+/// file's bespoke spawner:
+///
+/// 1. `Child::try_wait` is polled around every probe, so a child that died after
+///    a partial bind consumes its retry attempt immediately instead of polling
+///    whatever claimed the released port.
+/// 2. The admin port must answer `/health` in the authenticated detail tier for
+///    this attempt's `FERRUM_METRICS_BEARER_TOKEN` *and* report `ready: true`.
+///    A foreign listener has a different token (or is not a gateway at all) and
+///    is rejected.
+/// 3. `ready` flips only after `wait_for_start_signals` observed every listener
+///    bind — HTTP, HTTPS, and HTTP/3 proxy listeners included — so an identified,
+///    ready child is proof that the child owns the port being probed. It holds
+///    that socket for its whole lifetime, so the proof stays valid.
 ///
 /// The deadline is generous (60s) because the TLS/HTTP3 gateway cold-start
 /// (jemalloc + rustls + config/cert load + QUIC socket setup + DNS/pool warmup)
 /// can exceed a tight budget on a loaded CI runner — the previous 15s caused
 /// intermittent "Gateway did not start" failures in the H3 WebSocket tests even
-/// across the 3 retry attempts. This does not slow the happy path: the loop
-/// returns as soon as the port accepts a TCP connection (polled every 300ms), so
-/// a fast start still finishes in a few seconds; the deadline only bounds a
-/// genuinely stuck start.
-async fn wait_for_gateway(gateway_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+/// across the 3 retry attempts. This does not slow the happy path: both stages
+/// return as soon as they are satisfied, and they share the one deadline so
+/// proving identity cannot double the caller's budget.
+async fn wait_for_owned_gateway(
+    child: &mut std::process::Child,
+    admin_port: u16,
+    observability_token: &str,
+    gateway_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     const STARTUP_TIMEOUT_SECS: u64 = 60;
-    let deadline = std::time::SystemTime::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    // Slice the ownership probe so `try_wait` is re-polled while it retries.
+    const PROBE_SLICE: Duration = Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     let addr = format!("127.0.0.1:{}", gateway_port);
 
+    let mut last_observation = String::from("no response yet");
     loop {
-        if std::time::SystemTime::now() >= deadline {
-            return Err(
-                format!("Gateway did not start within {STARTUP_TIMEOUT_SECS} seconds").into(),
-            );
+        if let Some(status) = child.try_wait()? {
+            return Err(format!(
+                "Gateway exited during startup with {status} \
+                 (last observation: {last_observation})"
+            )
+            .into());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "Gateway did not prove ownership of admin port {admin_port} within \
+                 {STARTUP_TIMEOUT_SECS} seconds (last observation: {last_observation})"
+            )
+            .into());
+        }
+        match crate::common::probe_gateway_identity(
+            admin_port,
+            observability_token,
+            remaining.min(PROBE_SLICE),
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(err) => last_observation = err.to_string(),
+        }
+    }
+
+    // Identity is proven, so this child bound every listener. The proxy socket
+    // can still need a moment to surface in the kernel's accept queue on a
+    // loaded runner, and a connect that fails now means the child died between
+    // the two stages — which `try_wait` reports distinctly.
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("Gateway exited after reporting ready with {status}").into());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Gateway port {gateway_port} did not accept TCP connections within \
+                 {STARTUP_TIMEOUT_SECS} seconds"
+            )
+            .into());
         }
         match tokio::net::TcpStream::connect(&addr).await {
-            Ok(_) => return Ok(()),
-            Err(_) => sleep(Duration::from_millis(300)).await,
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(_) => sleep(Duration::from_millis(25)).await,
         }
     }
 }
 
 /// Start the gateway with retry logic to handle ephemeral port races.
 ///
-/// Each attempt allocates a fresh gateway port, starts the gateway subprocess,
-/// and waits for it to become healthy. On failure the process is killed and a
-/// new attempt is made with a different port. Panics only after all attempts
-/// are exhausted.
+/// Each attempt allocates a fresh gateway port and a fresh instance credential,
+/// starts the gateway subprocess, and waits for that child to prove it owns its
+/// ports ([`wait_for_owned_gateway`]). An attempt whose child lost the port race
+/// is void: the process is killed and a new attempt is made with a different
+/// port. Panics only after all attempts are exhausted.
 async fn start_gateway_with_retry(
     config_path: &str,
     https_port: Option<u16>,
@@ -1010,6 +1107,7 @@ async fn start_gateway_with_retry_extra_env(
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
+        let observability_token = mint_observability_token();
         match start_gateway_with_extra_env(
             config_path,
             gateway_port,
@@ -1017,19 +1115,29 @@ async fn start_gateway_with_retry_extra_env(
             tls_cert_path,
             tls_key_path,
             extra_env,
+            &observability_token,
         ) {
-            Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => return (child, gateway_port),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed (port {}): {}",
-                        attempt, MAX_ATTEMPTS, gateway_port, last_err
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
+            Ok((mut child, admin_port)) => {
+                let owned = wait_for_owned_gateway(
+                    &mut child,
+                    admin_port,
+                    &observability_token,
+                    gateway_port,
+                )
+                .await;
+                match owned {
+                    Ok(()) => return (child, gateway_port),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        eprintln!(
+                            "Gateway startup attempt {}/{} failed (port {}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_port, last_err
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                 }
-            },
+            }
             Err(e) => {
                 last_err = e.to_string();
                 eprintln!(
@@ -1056,19 +1164,37 @@ async fn start_gateway_plain_with_retry_extra_env(
     let mut last_err = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_port = free_port().await;
-        match start_gateway_with_extra_env(config_path, gateway_port, None, None, None, extra_env) {
-            Ok(mut child) => match wait_for_gateway(gateway_port).await {
-                Ok(()) => return (child, gateway_port),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway startup attempt {}/{} failed (port {}): {}",
-                        attempt, MAX_ATTEMPTS, gateway_port, last_err
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
+        let observability_token = mint_observability_token();
+        match start_gateway_with_extra_env(
+            config_path,
+            gateway_port,
+            None,
+            None,
+            None,
+            extra_env,
+            &observability_token,
+        ) {
+            Ok((mut child, admin_port)) => {
+                let owned = wait_for_owned_gateway(
+                    &mut child,
+                    admin_port,
+                    &observability_token,
+                    gateway_port,
+                )
+                .await;
+                match owned {
+                    Ok(()) => return (child, gateway_port),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        eprintln!(
+                            "Gateway startup attempt {}/{} failed (port {}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_port, last_err
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                 }
-            },
+            }
             Err(e) => {
                 last_err = e.to_string();
                 eprintln!(
@@ -1109,6 +1235,7 @@ async fn start_gateway_tls_with_retry_extra_env(
     for attempt in 1..=MAX_ATTEMPTS {
         let gateway_http_port = free_port().await;
         let gateway_https_port = free_port().await;
+        let observability_token = mint_observability_token();
         match start_gateway_with_extra_env(
             config_path,
             gateway_http_port,
@@ -1116,19 +1243,29 @@ async fn start_gateway_tls_with_retry_extra_env(
             Some(tls_cert_path),
             Some(tls_key_path),
             extra_env,
+            &observability_token,
         ) {
-            Ok(mut child) => match wait_for_gateway(gateway_https_port).await {
-                Ok(()) => return (child, gateway_http_port, gateway_https_port),
-                Err(e) => {
-                    last_err = e.to_string();
-                    eprintln!(
-                        "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
-                        attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
-                    );
-                    let _ = child.kill();
-                    let _ = child.wait();
+            Ok((mut child, admin_port)) => {
+                let owned = wait_for_owned_gateway(
+                    &mut child,
+                    admin_port,
+                    &observability_token,
+                    gateway_https_port,
+                )
+                .await;
+                match owned {
+                    Ok(()) => return (child, gateway_http_port, gateway_https_port),
+                    Err(e) => {
+                        last_err = e.to_string();
+                        eprintln!(
+                            "Gateway TLS startup attempt {}/{} failed (ports {}/{}): {}",
+                            attempt, MAX_ATTEMPTS, gateway_http_port, gateway_https_port, last_err
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                 }
-            },
+            }
             Err(e) => {
                 last_err = e.to_string();
                 eprintln!(
@@ -1272,13 +1409,14 @@ async fn test_file_mode_rejects_non_object_correlation_id_config() {
     write_invalid_correlation_id_file_config(&config_path, free_port().await);
     build_gateway().expect("build gateway");
 
-    let mut gateway = start_gateway_with_extra_env(
+    let (mut gateway, _admin_port) = start_gateway_with_extra_env(
         config_path.to_str().unwrap(),
         free_port().await,
         None,
         None,
         None,
         &[],
+        &mint_observability_token(),
     )
     .expect("spawn gateway with invalid file config");
     let exit_status = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1953,6 +2091,71 @@ async fn test_h2_websocket_extended_connect_echo() {
     let _ = gateway.wait();
     echo_handle.abort();
     println!("test_h2_websocket_extended_connect_echo PASSED");
+}
+
+/// Regression for issue #3435: a bare TCP accept is not proof that the spawned
+/// gateway owns its proxy port.
+///
+/// A foreign listener holds the port the gateway is told to bind — exactly the
+/// state left behind when a parallel fixture wins the race after `free_port`
+/// released its reservation. The gateway then dies with `Address already in
+/// use`, and the old readiness check (connect to the proxy port, succeed) handed
+/// the test the squatter's socket. `test_h2_websocket_extended_connect_echo`
+/// observed that as `Reset(StreamId(1), PROTOCOL_ERROR, Remote)`, because the
+/// stranger's h2 server never advertised RFC 8441
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL`.
+///
+/// The barrier must reject the attempt (so the retry loop rerolls the port)
+/// rather than report a started gateway.
+#[ignore]
+#[tokio::test]
+async fn test_foreign_listener_on_proxy_port_is_not_gateway_readiness() {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, free_port().await);
+    build_gateway().expect("Failed to build gateway");
+
+    // Held for the whole test: this listener keeps accepting, so a bare TCP
+    // probe would report "ready" the entire time.
+    let squatter = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind foreign listener");
+    let contested_port = squatter.local_addr().unwrap().port();
+
+    let observability_token = mint_observability_token();
+    let (mut child, admin_port) = start_gateway_with_extra_env(
+        config_path.to_str().unwrap(),
+        contested_port,
+        None,
+        None,
+        None,
+        &[],
+        &observability_token,
+    )
+    .expect("spawn gateway onto the contested port");
+
+    let outcome =
+        wait_for_owned_gateway(&mut child, admin_port, &observability_token, contested_port).await;
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", contested_port))
+            .await
+            .is_ok(),
+        "the foreign listener must still accept connections, otherwise this test \
+         proves nothing about the old bare-TCP readiness check"
+    );
+    drop(squatter);
+
+    let err = outcome
+        .expect_err("readiness must not accept a foreign listener as the spawned gateway")
+        .to_string();
+    assert!(
+        err.contains("exited during startup") || err.contains("did not prove ownership"),
+        "readiness must fail on child death or on the unproven ownership probe, got: {err}"
+    );
+    println!("test_foreign_listener_on_proxy_port_is_not_gateway_readiness PASSED");
 }
 
 /// Global WebSocket connection admission should reject a second upgraded
