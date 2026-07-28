@@ -5124,6 +5124,19 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
         );
         return;
     }
+    // A partially-enrolled pod may already have had its inbound-redirect scope
+    // written (scope lands before the pod-IP flag), so the same after-the-IP
+    // clear the enrolled teardown does is needed here or those
+    // `(pod address, port)` pairs accumulate in the bounded scope map.
+    if let Err(e) = backend.clear_pod_inbound_ports(ip) {
+        warn!(
+            pod_uid,
+            %ip,
+            error = %e,
+            removal_reason,
+            "Failed to clear pre-enrollment inbound redirect scope after pod IP removal"
+        );
+    }
     forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
 }
 
@@ -5163,6 +5176,15 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
             &ip.to_string(),
         );
         return;
+    }
+    if let Err(e) = backend.clear_pod_inbound_ports6(ip) {
+        warn!(
+            pod_uid,
+            %ip,
+            error = %e,
+            removal_reason,
+            "Failed to clear pre-enrollment IPv6 inbound redirect scope after pod IP removal"
+        );
     }
     forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
 }

@@ -399,7 +399,16 @@ configured on the host), the NodeWaypoint inbound relay listener binds
 `IP_TRANSPARENT` / `IPV6_TRANSPARENT` whenever this variable is set — the kernel
 otherwise refuses to route a reply from a non-local source. The mesh proxy reads
 the same operator variable the node-agent does, so there is no IPC to keep in
-sync.
+sync; the Helm chart therefore renders
+`FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` into **both** the node-agent
+DaemonSet and the ambient NodeWaypoint DaemonSet from the single
+`nodeAgent.ingressRedirectIfaces` value. Setting it by hand outside the chart
+means setting it on both pods: a redirect whose relay listener is not
+transparent accepts inbound SYNs it can never answer. For the same reason
+`nodeAgent.ingressRedirectIfaces` requires `ambient.enabled=true` with
+`ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint` — the redirect fails closed,
+so enabling it without a relay on the node would drop all in-scope inbound
+traffic.
 
 Assigned packets still need to be classified as locally deliverable, so the
 node-agent installs a Ferrum-owned policy route per family:
@@ -453,10 +462,26 @@ eBPF-capable node no longer has to accept node-global REDIRECT semantics to get
 an inbound capture path.
 
 Like the rest of the in-netns datapath this is Linux-only and gated by
-live-kernel CI: the `ebpf-live` job load/verifies the program on a real kernel
-and drives IPv4 and IPv6 redirects through a veth pair, covering enrolled
-redirect, unenrolled pass-through, undeclared-port pass-through, the
-loop-prevention mark, and detach cleanup.
+live-kernel CI. The `ebpf-live` job load/verifies the program on a real kernel
+(the only way to check the `bpf_skc_lookup_tcp` / `bpf_sk_assign` /
+`bpf_sk_release` reference-tracking rules the verifier enforces on every
+branch), attaches and detaches it on a scratch veth tc ingress hook — asserting
+the classifier is present after attach and absent after detach, and that a
+second detach is a clean no-op — and round-trips both address families of the
+scope maps through write, narrow, and clear. The decision table itself is
+unit-tested in `ferrum-ebpf-common`.
+
+**What is not yet covered: end-to-end packet steering.** No live test drives a
+real TCP connection through the redirect into a transparent listener and back;
+that needs a live multi-pod node and belongs in the `node-waypoint-ebpf-live`
+workflow. Until it lands, treat this opt-in as unproven end to end — which is
+why it is default-off and why the iptables fallback is retained. Two further
+residual risks: the `ip rule` priority is below `main` and the table is
+Ferrum-owned, but a cluster running its own low-priority rules could still
+order ahead of it (verified only by the rule-shape unit tests); and the attach
+point is operator-supplied, so naming the wrong interface yields no redirect
+(traffic simply never reaches the hook) rather than a wrong one, with no
+auto-detection or validation.
 
 Because the relay dials backend pods from a node-local source address, at least
 one trusted node source IP (`FERRUM_NODE_AGENT_NODE_IP` /

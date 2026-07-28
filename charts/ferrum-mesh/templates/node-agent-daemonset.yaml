@@ -238,8 +238,17 @@ spec:
               value: {{ .Values.nodeAgent.trustedKubeletProbeSourceIps | quote }}
             {{- end }}
             {{- if .Values.nodeAgent.ingressRedirectIfaces }}
-            {{- if ne .Values.nodeAgent.proxyMode "node_waypoint" }}
+            {{- if ne $nodeAgentProxyMode "node_waypoint" }}
             {{- fail "nodeAgent.ingressRedirectIfaces requires nodeAgent.proxyMode=node_waypoint; only NodeWaypoint has an inbound HBONE relay to steer captured traffic into" }}
+            {{- end }}
+            {{- /* The redirect fails closed: an in-scope packet with no
+                   resolvable relay socket is dropped, never delivered. So the
+                   ambient NodeWaypoint relay must actually be deployed on this
+                   node, or enabling the redirect would black-hole inbound
+                   traffic for every enrolled workload. */ -}}
+            {{- $ambientTopology := replace "-" "_" (lower (trim (toString (index (default dict .Values.ambient.env) "FERRUM_MESH_TOPOLOGY")))) }}
+            {{- if or (not .Values.ambient.enabled) (ne $ambientTopology "node_waypoint") }}
+            {{- fail "nodeAgent.ingressRedirectIfaces requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint: the redirect steers inbound TCP into the node's NodeWaypoint relay and drops in-scope traffic when no relay listener exists" }}
             {{- end }}
             - name: FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES
               value: {{ .Values.nodeAgent.ingressRedirectIfaces | quote }}

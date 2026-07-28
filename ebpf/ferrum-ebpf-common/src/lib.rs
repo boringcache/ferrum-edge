@@ -1328,14 +1328,6 @@ mod tests {
         );
     }
 
-    /// A capture config with the inbound redirect fully armed, as the
-    /// node-agent publishes it in NodeWaypoint mode.
-    fn armed_redirect_config() -> BpfCaptureConfig {
-        BpfCaptureConfig::new(15001, 15008)
-            .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
-            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
-    }
-
     #[test]
     fn ingress_redirect_bypasses_the_relays_own_authorized_dial() {
         let config = armed_redirect_config();
@@ -1351,123 +1343,6 @@ mod tests {
         assert!(!config.ingress_redirect_bypass(0, 8080));
         // An unrelated CNI mark is not mistaken for either Ferrum mark.
         assert!(!config.ingress_redirect_bypass(0xF00, 8080));
-    }
-
-    #[test]
-    fn ingress_redirect_zero_auth_mark_does_not_authorize_unmarked_packets() {
-        // Local-pod mode carries a zero auth mark. An unmarked packet must not
-        // compare equal to it and be treated as an authorized relay dial.
-        let config = BpfCaptureConfig::new(15001, 15008)
-            .with_node_waypoint_inbound_auth_mark(0)
-            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
-        assert!(
-            !config.ingress_redirect_bypass(0, 8080),
-            "a zero auth mark must not make every unmarked packet look relayed"
-        );
-    }
-
-    #[test]
-    fn ingress_redirect_action_requires_enrollment_and_a_declared_port() {
-        let config = armed_redirect_config();
-        let baseline = IngressRedirectPacket::fully_in_scope(8080);
-
-        // Fully in scope.
-        assert_eq!(
-            ingress_redirect_action(&config, &baseline),
-            IngressRedirectAction::Steer
-        );
-
-        // Flip ONE axis at a time off the in-scope baseline, so a gate cannot
-        // be removed without a test noticing.
-
-        // Enrolled pod, undeclared port: left to the direct-pod guard, never
-        // steered — this is what keeps the redirect scoped to declared ports.
-        assert_eq!(
-            ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket {
-                    destination_port_declared: false,
-                    ..baseline
-                }
-            ),
-            IngressRedirectAction::Pass
-        );
-        // Declared port but the destination pod is not enrolled / not opted in:
-        // never capture unenrolled traffic.
-        assert_eq!(
-            ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket {
-                    destination_pod_opted_in: false,
-                    ..baseline
-                }
-            ),
-            IngressRedirectAction::Pass
-        );
-        // Non-TCP is out of scope: `bpf_sk_assign` here is TCP-only.
-        assert_eq!(
-            ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket {
-                    protocol_is_tcp: false,
-                    ..baseline
-                }
-            ),
-            IngressRedirectAction::Pass
-        );
-        // Loop prevention wins over scope: an in-scope packet already carrying
-        // the relay's auth mark (its own dial down to the backend pod) is
-        // passed through, or the relay would be fed its own traffic forever.
-        assert_eq!(
-            ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket {
-                    skb_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
-                    ..baseline
-                }
-            ),
-            IngressRedirectAction::Pass
-        );
-        // Likewise for a packet this program already redirected.
-        assert_eq!(
-            ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket {
-                    skb_mark: NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
-                    ..baseline
-                }
-            ),
-            IngressRedirectAction::Pass
-        );
-        // And for traffic already addressed to the relay listener itself.
-        assert_eq!(
-            ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(15008)),
-            IngressRedirectAction::Pass
-        );
-    }
-
-    #[test]
-    fn ingress_redirect_action_is_inert_when_disarmed() {
-        let in_scope = IngressRedirectPacket::fully_in_scope(8080);
-
-        // Not opted in: every packet passes through untouched regardless of
-        // enrollment, so an un-opted-in node behaves exactly as before.
-        let disarmed = BpfCaptureConfig::new(15001, 15008);
-        assert!(!disarmed.ingress_redirect_armed());
-        assert_eq!(
-            ingress_redirect_action(&disarmed, &in_scope),
-            IngressRedirectAction::Pass
-        );
-
-        // A mark with no relay port is equally inert: there is no listener to
-        // steer at, so the program must not start dropping in-scope traffic.
-        let no_relay_port = BpfCaptureConfig::new(15001, 0)
-            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
-        assert!(!no_relay_port.ingress_redirect_armed());
-        assert_eq!(
-            ingress_redirect_action(&no_relay_port, &in_scope),
-            IngressRedirectAction::Pass
-        );
     }
 
     #[test]

@@ -341,7 +341,14 @@ nodeAgent:
   # enrolled workloads a fully eBPF-owned inbound capture path instead of
   # node-global iptables REDIRECT semantics.
   #
-  # NodeWaypoint proxy mode only (a startup error in local_pod mode). Requires
+  # NodeWaypoint proxy mode only (a startup error in local_pod mode), and it
+  # requires ambient.enabled=true with ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint:
+  # the redirect fails closed, so without a relay listener on the node it would
+  # drop in-scope inbound traffic. The chart renders this value into BOTH the
+  # node-agent and the ambient DaemonSet, because the mesh proxy reads the same
+  # variable to decide whether its inbound relay listener binds IP_TRANSPARENT
+  # (the redirect preserves the original destination instead of NAT-ing it, so a
+  # non-transparent listener could never reply). Requires
   # iproute2 (`ip`) in the node-agent image and NET_ADMIN, which the existing tc
   # attachments already need — this adds no new privilege. Redirection is scoped
   # per packet to an enrolled, opted-in pod address on one of its declared
