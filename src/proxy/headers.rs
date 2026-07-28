@@ -720,7 +720,9 @@ pub fn needs_client_response_wire_sanitization(
             if status_forbids_response_body(status) {
                 headers.contains_key("content-length")
             } else {
-                headers.get("content-length").map(String::as_str) != Some(&len.to_string())
+                !headers
+                    .get("content-length")
+                    .is_some_and(|value| canonical_content_length_matches(value, len))
             }
         }
         ClientResponseFraming::Streaming { status } => {
@@ -733,6 +735,15 @@ pub fn needs_client_response_wire_sanitization(
             }
         }
     }
+}
+
+#[inline]
+fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && (bytes.len() == 1 || bytes[0] != b'0')
+        && bytes.iter().all(u8::is_ascii_digit)
+        && value.parse::<u64>() == Ok(expected)
 }
 
 #[inline]
@@ -1834,5 +1845,29 @@ mod tests {
                 .keys()
                 .any(|name| name.eq_ignore_ascii_case("content-length"))
         );
+    }
+
+    #[test]
+    fn exact_body_sanitization_predicate_accepts_only_canonical_matching_length() {
+        let framing = ClientResponseFraming::ExactBody {
+            status: 200,
+            len: 42,
+        };
+        let canonical =
+            std::collections::HashMap::from([("content-length".to_string(), "42".to_string())]);
+        assert!(!needs_client_response_wire_sanitization(
+            &canonical, framing
+        ));
+
+        for value in ["041", "042", "42 ", "+42", "41"] {
+            let headers = std::collections::HashMap::from([(
+                "content-length".to_string(),
+                value.to_string(),
+            )]);
+            assert!(
+                needs_client_response_wire_sanitization(&headers, framing),
+                "{value:?} must be repaired"
+            );
+        }
     }
 }

@@ -9657,16 +9657,26 @@ fn build_websocket_error_response(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
-    headers_mod::apply_response_headers(Response::builder().status(status), &response_headers)
-        .body(ProxyBody::from_string(body))
-        .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
+    // A failed handshake must not acquire transport-managed framing after the
+    // policy strip. Unknown body length prevents Hyper's H2 encoder from
+    // synthesizing Content-Length; HTTP/1.0 selects close-delimited H1 framing
+    // instead of Transfer-Encoding: chunked.
+    headers_mod::apply_response_headers(
+        Response::builder()
+            .status(status)
+            .version(hyper::Version::HTTP_10),
+        &response_headers,
+    )
+    .body(ProxyBody::bytes_without_advertised_length(body))
+    .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
 }
 
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
-    let mut response = Response::new(ProxyBody::from_string(
+    let mut response = Response::new(ProxyBody::bytes_without_advertised_length(
         r#"{"error":"Internal server error"}"#,
     ));
     *response.status_mut() = status;
+    *response.version_mut() = hyper::Version::HTTP_10;
     response
 }
 
