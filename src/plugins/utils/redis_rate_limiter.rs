@@ -1179,7 +1179,6 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
-        self.start_health_checker_if_needed();
     }
 
     /// Prove an unsupported Cluster topology the way a racing task would
@@ -1333,13 +1332,11 @@ impl RedisRateLimitClient {
         self.next_slot.fetch_add(1, Ordering::Relaxed) % len
     }
 
-    /// Resolve the Redis hostname via the gateway's DNS cache and build the
-    /// connection URL with the resolved IP (for non-TLS) or the original
-    /// hostname (for TLS, to preserve SNI).
-    /// Resolve the Redis endpoint URL through the DNS cache, returning `None`
-    /// when the host is blocked by the backend egress policy so the caller fails
-    /// CLOSED (in-memory limiter) instead of dialing a denied address. A generic
-    /// DNS failure still falls back to the hostname (the existing behavior).
+    /// Resolve the Redis endpoint through the gateway DNS cache.
+    ///
+    /// A usable endpoint carries a screened URL. Egress-policy denials and DNS
+    /// failures remain distinct unavailable outcomes so neither can fall back to
+    /// the Redis crate's unscreened resolver.
     async fn resolve_url(&self) -> RedisEndpoint {
         screen_redis_endpoint(&self.config, self.dns_cache.as_ref()).await
     }
@@ -1494,7 +1491,7 @@ impl RedisRateLimitClient {
                 // recovery checker — it would re-screen and stay denied every
                 // interval. The consumer's explicit failure policy applies
                 // until a config change rebuilds the client.
-                self.mark_unavailable();
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
@@ -1502,7 +1499,6 @@ impl RedisRateLimitClient {
                 // centralized Redis unavailable and let the recovery checker
                 // re-screen later; the consumer's failure policy applies.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1516,7 +1512,6 @@ impl RedisRateLimitClient {
                     "Failed to create Redis client for rate limiting"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1554,7 +1549,6 @@ impl RedisRateLimitClient {
                     "Failed to connect to Redis for rate limiting"
                 );
                 self.note_command_failure(&e);
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1565,7 +1559,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting to Redis for rate limiting"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1605,7 +1598,7 @@ impl RedisRateLimitClient {
                 // recovery checker — it would re-screen and stay denied every
                 // interval. The consumer's explicit failure policy applies
                 // until a config change rebuilds the client.
-                self.mark_unavailable();
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
@@ -1613,7 +1606,6 @@ impl RedisRateLimitClient {
                 // centralized Redis unavailable and let the recovery checker
                 // re-screen later; the consumer's failure policy applies.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1626,7 +1618,6 @@ impl RedisRateLimitClient {
                     "Failed to create dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1651,7 +1642,6 @@ impl RedisRateLimitClient {
                     "Failed to connect dedicated Redis client"
                 );
                 self.note_command_failure(&e);
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1661,7 +1651,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1679,8 +1668,24 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Mark Redis as unavailable and clear the connection for re-resolution.
+    /// Mark Redis unavailable, clear every cached connection, and ensure the
+    /// background recovery checker is running.
+    ///
+    /// Owning both halves here is a fail-closed lifecycle invariant. Pooled
+    /// connections normally start the checker when they are published, but the
+    /// dedicated `WATCH`/`MULTI` path does not. If a command on that path marks
+    /// the client unavailable without arming recovery, fail-closed consumers
+    /// remain unavailable until a configuration reload.
     fn mark_unavailable(&self) {
+        self.mark_unavailable_without_recovery();
+        self.start_health_checker_if_needed();
+    }
+
+    /// Mark Redis unavailable without starting a recovery checker.
+    ///
+    /// Reserved for an egress-policy denial. Re-screening an unchanged denied
+    /// endpoint cannot recover it; a configuration change rebuilds the client.
+    fn mark_unavailable_without_recovery(&self) {
         self.availability.mark_unreachable();
         self.clear_connection();
     }
@@ -1757,7 +1762,6 @@ impl RedisRateLimitClient {
                      will retry"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 false
             }
         }
@@ -1799,8 +1803,9 @@ impl RedisRateLimitClient {
                 // would otherwise let the background ping dial a denied address).
                 let url = match screen_redis_endpoint(&config, dns_cache.as_ref()).await {
                     RedisEndpoint::Url(url) => url,
-                    // Blocked by the egress policy or unresolvable — skip this ping
-                    // and re-check next interval (stay on the in-memory limiter).
+                    // Blocked by the egress policy or unresolvable — skip this
+                    // ping and re-check next interval while the consumer's
+                    // configured failure policy remains in force.
                     RedisEndpoint::EgressDenied | RedisEndpoint::ResolveFailed => continue,
                 };
 
@@ -2064,8 +2069,9 @@ impl RedisRateLimitClient {
     /// A failed compensating write is reported as `Err(())` (not `Ok(0)`): the
     /// key may be left negative on the server, and silently reporting success
     /// would let a recovered Redis read that negative counter as zero usage and
-    /// bypass enforcement. Returning the error makes the caller fall back to the
-    /// local limiter for that operation, which is the conservative choice.
+    /// bypass enforcement. Returning the error hands the decision to the
+    /// consumer's configured failure policy; the default refuses rather than
+    /// silently changing enforcement domains.
     ///
     /// This is the reconciliation-safe variant of [`incrby_with_expire`]. The
     /// AI token limiter applies reconciliation deltas (`actual - reserved`)
@@ -2106,10 +2112,10 @@ impl RedisRateLimitClient {
             // the key is left *negative* on the server. Do NOT report success:
             // a negative counter reads as zero usage once Redis recovers within
             // the key TTL, letting a consumer re-reserve the full budget —
-            // exactly the bypass the floor exists to prevent. `incrby_with_expire`
-            // already marked the client unavailable (triggering local failover);
-            // surface the failure to the caller and log the leaked-floor state so
-            // it is observable rather than silently undercounting.
+            // exactly the bypass the floor exists to prevent.
+            // `incrby_with_expire` already marked the client unavailable, so
+            // surface the failure for the caller's configured failure policy
+            // and log the leaked-floor state rather than silently undercounting.
             Err(()) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),

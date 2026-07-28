@@ -438,7 +438,7 @@ async fn connect_timeout_above_one_second_allows_delayed_redis_handshake() {
         "cached path must honor redis_connect_timeout_seconds > 1s"
     );
 
-    // Fresh client for dedicated path (cached manager is already warm).
+    // Fresh client for the dedicated path (the pooled connection is already warm).
     let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
     config.connect_timeout_seconds = 5;
     config.health_check_interval_seconds = 60;
@@ -1218,6 +1218,11 @@ async fn watch_cas_helpers_fail_closed_when_connection_drops_after_watch() {
     assert!(
         !client.is_available(),
         "I/O failure must mark Redis unavailable"
+    );
+    assert!(
+        client.health_checker_started_for_test(),
+        "a dedicated command failure must arm recovery instead of pinning fail-closed consumers \
+         unavailable until reload"
     );
 
     let _ = shutdown.send(());
