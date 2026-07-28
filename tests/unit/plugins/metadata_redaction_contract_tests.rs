@@ -21,7 +21,12 @@ const LEGACY_DEDUP_FIELDS: &[&str] = &[
     "_dedup_redis_lock_token",
     "_DEDUP_REDIS_LOCK_TOKEN",
     "_DeDuP_Local_Inflight_Token",
+    "_dedup-redis-lock-token",
+    "_DedupRedisLockToken",
 ];
+
+const NON_INTERNAL_DEDUP_CONTROLS: &[&str] =
+    &["dedup_key", "request_dedup_key", "_deduplication", "cache_key"];
 
 const API_CREDENTIAL_KEYS: &[&str] = &[
     "api_key",
@@ -86,7 +91,7 @@ fn assert_no_lifecycle_leak(json: &str, parsed: &Value) {
         assert!(
             parsed.pointer(&format!("/metadata/{key}")).is_none()
                 && parsed.get(key).is_none()
-                && parsed.get(&format!("meta_{key}")).is_none(),
+                && parsed.get(format!("meta_{key}")).is_none(),
             "lifecycle key {key} must be omitted from projection: {json}"
         );
     }
@@ -129,6 +134,7 @@ fn assert_counters_visible(md: &Map<String, Value>) {
 
 #[test]
 fn classifier_covers_api_key_spellings_and_non_secret_controls() {
+    assert_eq!(INTERNAL_ONLY_METADATA_KEY_PREFIX, "_dedup_");
     let extras = parse_extras_list("operator_canary");
     for key in API_CREDENTIAL_KEYS {
         assert!(
@@ -148,10 +154,15 @@ fn classifier_covers_api_key_spellings_and_non_secret_controls() {
     ));
     for key in LEGACY_DEDUP_FIELDS {
         assert!(
-            key.starts_with(INTERNAL_ONLY_METADATA_KEY_PREFIX)
-                && is_internal_only_metadata_key(key)
+            is_internal_only_metadata_key(key)
                 && is_sensitive_metadata_key_with_extras(key, &extras),
             "{key} must be internal-only and fail closed"
+        );
+    }
+    for key in NON_INTERNAL_DEDUP_CONTROLS {
+        assert!(
+            !is_internal_only_metadata_key(key),
+            "{key} must not be swept into the internal-only namespace"
         );
     }
 }
@@ -238,7 +249,7 @@ fn flattened_schema_view_redacts_and_omits_under_prefix() {
     assert!(parsed.get("metadata").is_none());
     for key in LEGACY_DEDUP_FIELDS {
         assert!(
-            parsed.get(&format!("meta_{key}")).is_none(),
+            parsed.get(format!("meta_{key}")).is_none(),
             "flattened lifecycle key meta_{key} must be omitted"
         );
     }
@@ -247,7 +258,7 @@ fn flattened_schema_view_redacts_and_omits_under_prefix() {
     }
     for (idx, key) in API_CREDENTIAL_KEYS.iter().enumerate() {
         assert_eq!(
-            parsed.get(&format!("meta_{key}")).and_then(Value::as_str),
+            parsed.get(format!("meta_{key}")).and_then(Value::as_str),
             Some(REDACTED_PLACEHOLDER),
             "flattened {key} must redact"
         );
@@ -256,7 +267,7 @@ fn flattened_schema_view_redacts_and_omits_under_prefix() {
     for (idx, key) in NON_SECRET_COUNTERS.iter().enumerate() {
         let expected = format!("counter-{idx}");
         assert_eq!(
-            parsed.get(&format!("meta_{key}")).and_then(Value::as_str),
+            parsed.get(format!("meta_{key}")).and_then(Value::as_str),
             Some(expected.as_str())
         );
     }

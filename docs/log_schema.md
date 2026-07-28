@@ -319,15 +319,19 @@ reload.
 
 ### Internal-only lifecycle metadata
 
-Keys whose names start case-insensitively with `_dedup_` are
-**internal-only**. They are stripped by `clone_log_metadata` and omitted by
-every native / schema serializer.
+Keys in the reserved `_dedup_*` lifecycle namespace are **internal-only**.
+Matching is fail-closed across ASCII case, delimiter (`-` / `.` / `_`), and
+camelCase spellings: a leading `_` whose first alphanumeric segment is `dedup`
+(for example `_dedup_key`, `_DEDUP_REDIS_LOCK_TOKEN`, `_dedup-redis-lock-token`,
+`_DedupRedisLockToken`). They are stripped by `clone_log_metadata` and omitted
+by every native / schema serializer. Names that merely contain `dedup`
+(`request_dedup_key`, `_deduplication`) stay observable.
 `request_deduplication` keeps ownership key, fingerprint, local inflight token,
 and Redis lock token in typed non-serializable request state instead of public
 metadata; the `_dedup_` filter is the shared fail-closed contract if any
 producer still writes the legacy names (`_dedup_key`, `_dedup_fingerprint`,
 `_dedup_local_inflight_token`, `_dedup_redis_lock_token`). Schema
-`static_fields` / rename targets that match this prefix are rejected at
+`static_fields` / rename targets that match this namespace are rejected at
 compile time.
 
 ## Per-Plugin Notes

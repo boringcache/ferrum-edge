@@ -24,10 +24,12 @@
 //! acronym camelCase (`APIKey`, `APIToken`) redact while usage metrics like
 //! `ai_total_tokens` stay visible.
 //!
-//! Request-private lifecycle keys under the `_dedup_` prefix are never emitted
-//! into transaction-log projections at all (omitted, not redacted). Typed
-//! request state is the primary home for that material; this filter is the
-//! shared fail-closed contract if any producer still writes the legacy keys.
+//! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
+//! and camelCase spellings under a leading `_` + first segment `dedup`) are
+//! never emitted into transaction-log projections at all (omitted, not
+//! redacted). Typed request state is the primary home for that material; this
+//! filter is the shared fail-closed contract if any producer still writes the
+//! legacy keys.
 
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -234,12 +236,39 @@ fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
 
 /// Returns true when the key is request-private lifecycle state that must be
 /// omitted from every transaction-log / audit projection.
+///
+/// Fail-closed across case, delimiter, and camelCase spellings of the reserved
+/// `_dedup_*` namespace: a leading `_` whose first alphanumeric segment is
+/// `dedup` (ASCII case-insensitive). Canonical producer names still use
+/// [`INTERNAL_ONLY_METADATA_KEY_PREFIX`]; this matcher is the shared
+/// observability contract if residual lifecycle keys appear under any of those
+/// spellings. Non-prefixed names (`dedup_key`, `request_dedup_*`) and longer
+/// first segments (`_deduplication`) stay observable.
 pub fn is_internal_only_metadata_key(key: &str) -> bool {
-    key.as_bytes()
+    if !key.as_bytes().first().is_some_and(|byte| *byte == b'_') {
+        return false;
+    }
+
+    // Fast path for the canonical / case-folded `_dedup_*` prefix.
+    if key
+        .as_bytes()
         .get(..INTERNAL_ONLY_METADATA_KEY_PREFIX.len())
         .is_some_and(|prefix| {
             prefix.eq_ignore_ascii_case(INTERNAL_ONLY_METADATA_KEY_PREFIX.as_bytes())
         })
+    {
+        return true;
+    }
+
+    // Normalized spellings (`_dedup-…`, `_DedupRedisLockToken`, …): leading `_`
+    // with first segment exactly `dedup`.
+    let mut first_segment: Option<&str> = None;
+    for_each_metadata_key_segment(key, |segment| {
+        if first_segment.is_none() {
+            first_segment = Some(segment);
+        }
+    });
+    first_segment.is_some_and(|segment| segment.eq_ignore_ascii_case("dedup"))
 }
 
 /// Strip every internal-only metadata key from a cloned observability map.
@@ -493,6 +522,10 @@ mod tests {
             "_dedup_fingerprint",
             "_dedup_local_inflight_token",
             "_dedup_redis_lock_token",
+            "_DEDUP_REDIS_LOCK_TOKEN",
+            "_DeDuP_Local_Inflight_Token",
+            "_dedup-redis-lock-token",
+            "_DedupRedisLockToken",
         ] {
             assert!(
                 is_internal_only_metadata_key(key),
@@ -501,6 +534,12 @@ mod tests {
             assert!(
                 is_sensitive_metadata_key_with_extras(key, &extras),
                 "{key} must fail closed for schema / static field checks"
+            );
+        }
+        for key in ["dedup_key", "request_dedup_key", "_deduplication", "cache_key"] {
+            assert!(
+                !is_internal_only_metadata_key(key),
+                "{key} must not be internal-only"
             );
         }
 
@@ -515,26 +554,45 @@ mod tests {
             "_dedup_redis_lock_token".to_string(),
             "redis-secret".to_string(),
         );
+        metadata.insert(
+            "_DEDUP_REDIS_LOCK_TOKEN".to_string(),
+            "upper-redis-secret".to_string(),
+        );
+        metadata.insert(
+            "_DedupRedisLockToken".to_string(),
+            "camel-redis-secret".to_string(),
+        );
         metadata.insert("trace_id".to_string(), "abc-123".to_string());
+        metadata.insert("request_dedup_key".to_string(), "visible-control".to_string());
 
         let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["trace_id"], "abc-123");
+        assert_eq!(parsed["request_dedup_key"], "visible-control");
         for key in [
             "_dedup_key",
             "_dedup_fingerprint",
             "_dedup_local_inflight_token",
             "_dedup_redis_lock_token",
+            "_DEDUP_REDIS_LOCK_TOKEN",
+            "_DedupRedisLockToken",
         ] {
             assert!(
                 parsed.get(key).is_none(),
                 "{key} must be omitted from log projection, got: {json}"
             );
         }
-        for leaked in ["idem-secret", "fp-secret", "local-secret", "redis-secret"] {
+        for leaked in [
+            "idem-secret",
+            "fp-secret",
+            "local-secret",
+            "redis-secret",
+            "upper-redis-secret",
+            "camel-redis-secret",
+        ] {
             assert!(
                 !json.contains(leaked),
-                "lifecycle value {leaked:?} leaked: {json}"
+                "lifecycle value leaked from projection"
             );
         }
     }
