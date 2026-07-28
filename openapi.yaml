@@ -13290,20 +13290,28 @@ components:
         buffering: a body is sampled only when the message declares an identity
         Content-Encoding, a Content-Length that fits inside the configured cap,
         and a capturable textual Content-Type (application/json, +json,
-        text/json, application/x-www-form-urlencoded, text/plain,
-        application/xml, text/xml, +xml, application/graphql). gRPC
-        (application/grpc*), SSE (text/event-stream), WebSocket upgrades,
-        multipart, text/html, binary media types, chunked/unknown-length, and
-        encoded messages keep streaming and are reported as omitted with a
-        stable reason. Request samples are taken after all request transforms
-        (backend-visible bytes) and response samples after all response
-        transforms (client-visible bytes). Samples are redacted before
-        rendering (JSON/form per field, unstructured text per line, plus
-        credential-shaped values anywhere), control and bidi characters are
-        escaped, non-UTF-8 bodies render as a fixed marker, and every capture
-        reports whether it was captured, truncated, binary, or omitted.
-        Captured bytes go only to the transaction_debug tracing target and are
-        never written into transaction-log metadata.
+        text/json, application/x-www-form-urlencoded, text/plain). gRPC
+        (application/grpc*), SSE (text/event-stream), WebSocket upgrades
+        (including H2/H3 Extended CONNECT, excluded by typed request
+        provenance rather than headers), XML, GraphQL, multipart, text/html,
+        binary media types, chunked/unknown-length, and encoded messages keep
+        streaming and are reported as omitted with a stable reason. XML and
+        GraphQL are excluded because Ferrum has no bounded structure-aware
+        redactor for them. Request samples are taken after all request
+        transforms (backend-visible bytes) and response samples after all
+        response transforms (client-visible bytes). Content-Length is only an
+        admission screen: both final body hooks re-check the actual body length
+        against the configured cap before any scan and fail closed with a
+        content-free over_capture_limit omission. Samples are redacted before
+        rendering (JSON/form per field, text/plain per line as a coarse
+        operator opt-in, plus credential-shaped values anywhere), a malformed
+        JSON body renders as a fixed content-free marker instead of a partial
+        rendering, control and bidi characters are escaped, non-UTF-8 bodies
+        (including an incomplete multibyte tail) render as a fixed marker, and
+        every capture reports whether it was captured, truncated, binary, or
+        omitted. When the transaction_debug DEBUG target is disabled no body is
+        buffered for capture. Captured bytes go only to the transaction_debug
+        tracing target and are never written into transaction-log metadata.
       properties:
         redacted_headers:
           type: array

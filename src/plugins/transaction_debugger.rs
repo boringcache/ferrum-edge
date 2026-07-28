@@ -18,22 +18,38 @@
 //!   [`MAX_BODY_CAPTURE_BYTES`] at construction. The rendered field is
 //!   additionally capped at [`MAX_RENDERED_BODY_BYTES`] after escaping, so
 //!   Unicode/control escaping cannot expand a capture without limit.
+//! * **Bounded by the actual body, not by a declared length.** `Content-Length`
+//!   is only an admission screen. Both final body hooks re-check the real
+//!   post-transform `body.len()` against the configured cap *before* any
+//!   full-body UTF-8 scan, parse, redaction, or allocation, and fail closed with
+//!   a content-free `over_capture_limit` omission when it does not fit. A stale
+//!   or lying header, or a transform that grows the body, therefore cannot make
+//!   the debugger walk an oversized payload.
 //! * **Never forces a stream to buffer.** Both buffering predicates return
 //!   `false` unless the message declares a `Content-Length` that fits inside the
 //!   configured cap, declares an identity `Content-Encoding`, and declares a
 //!   capturable textual `Content-Type`. gRPC, SSE (`text/event-stream`),
 //!   WebSocket upgrades, chunked/unknown-length, encoded, oversized, and binary
-//!   traffic keep streaming exactly as they do with capture disabled.
+//!   traffic keep streaming exactly as they do with capture disabled. They also
+//!   return `false` when the `transaction_debug` DEBUG target is not enabled,
+//!   because no capture record could be emitted for the buffered bytes.
 //! * **Captured after normalization/transformation.** The request sample is
 //!   taken in `on_final_request_body` (backend-visible bytes, after every
 //!   request transform) and the response sample in `on_final_response_body`
 //!   (client-visible bytes, after every response transform).
 //! * **Redacted before rendering.** JSON objects and form bodies are redacted
-//!   per field; unstructured text is redacted per line (any line holding a
-//!   sensitive marker is replaced wholesale); credential-shaped string values
-//!   (`Bearer …`, `Basic …`, JWT-shaped) are replaced anywhere they appear.
-//!   Non-UTF-8 payloads are never dumped — they render as
-//!   [`BODY_BINARY_MARKER`].
+//!   per field; credential-shaped string values (`Bearer …`, `Basic …`,
+//!   JWT-shaped) are replaced anywhere they appear. Structured families without
+//!   a sound structure-aware redactor (XML, GraphQL) are *not* capturable at
+//!   all, and a body that claims to be JSON but does not parse renders as
+//!   [`BODY_MALFORMED_MARKER`] rather than falling back to a partial rendering
+//!   that could split a key from its value across lines. `text/plain` is the one
+//!   deliberately coarse family: it has no field grammar, so it gets
+//!   operator-opt-in line-level redaction where any line holding a sensitive
+//!   marker is replaced wholesale. Payloads that are not valid UTF-8 — including
+//!   a valid prefix followed by an incomplete multibyte sequence, which at a
+//!   final body hook is malformed rather than truncated — are never dumped and
+//!   render as [`BODY_BINARY_MARKER`].
 //! * **Explicit provenance.** Every request/response emits exactly one capture
 //!   record whose `capture` field distinguishes `captured`, `truncated`,
 //!   `binary`, and `omitted` (with a stable `reason`), so an absent body sample
@@ -94,14 +110,17 @@ pub const DEFAULT_BODY_CAPTURE_BYTES: u64 = 1024;
 /// above this are rejected at construction rather than silently clamped.
 pub const MAX_BODY_CAPTURE_BYTES: u64 = 8192;
 
-/// Absolute ceiling for the rendered (redacted + escaped) body field. Escaping
-/// can expand one source byte into six output bytes; this bounds the emitted
-/// string regardless of the configured capture budget.
+/// Absolute ceiling for the rendered (redacted + escaped) body field.
+///
+/// The widest escape this renderer emits is `\u{XXXX}` (8 bytes) for a
+/// single-byte C0/C1 control character, so a maximal capture escapes to at most
+/// `8 * MAX_BODY_CAPTURE_BYTES`. The ceiling is dimensioned to exactly that
+/// worst case: escaping can touch it but — with the exact per-segment bound in
+/// `escape_for_diagnostics` — can never exceed it. The compile-time assertion
+/// below keeps the two constants from drifting apart.
 pub const MAX_RENDERED_BODY_BYTES: usize = 64 * 1024;
 
-/// Largest body that structured (JSON/form) redaction will parse. Above this a
-/// capture falls back to the coarser line-level text redaction.
-const REDACTION_PARSE_BUDGET_BYTES: usize = 32 * 1024;
+const _: () = assert!(MAX_RENDERED_BODY_BYTES == 8 * MAX_BODY_CAPTURE_BYTES as usize);
 
 /// Maximum number of lines retained by unstructured-text redaction.
 const MAX_TEXT_REDACTION_LINES: usize = 256;
@@ -112,6 +131,16 @@ const MAX_JSON_REDACTION_DEPTH: usize = 64;
 /// Rendered stand-in for a body that is not valid UTF-8. Binary payloads are
 /// never dumped, not even base64-encoded.
 pub const BODY_BINARY_MARKER: &str = "<non-utf8-body-omitted>";
+
+/// Rendered stand-in for a body that declared a structured media type but could
+/// not be parsed as that structure. Falling back to line-level text redaction
+/// would leak a value whose credential-bearing key sits on a different line, so
+/// a malformed structured body is never partially rendered.
+pub const BODY_MALFORMED_MARKER: &str = "<malformed-structured-body-omitted>";
+
+/// Rendered stand-in for a body whose actual length exceeds the effective
+/// capture ceiling. Content-free by construction.
+pub const BODY_OVER_LIMIT_MARKER: &str = "<over-capture-limit-body-omitted>";
 
 /// Rendered stand-in for a JSON subtree deeper than [`MAX_JSON_REDACTION_DEPTH`].
 const BODY_DEPTH_MARKER: &str = "***DEPTH-LIMIT***";
@@ -151,7 +180,10 @@ pub enum BodyKind {
     Json,
     /// `application/x-www-form-urlencoded`.
     Form,
-    /// Plain/structured text: `text/plain`, XML families, `application/graphql`.
+    /// `text/plain` only. Unstructured text has no field grammar, so this
+    /// family gets deliberately coarse line-level redaction and is an explicit
+    /// operator opt-in. Structured families that would need a structure-aware
+    /// redactor Ferrum does not implement (XML, GraphQL) are not capturable.
     Text,
 }
 
@@ -194,9 +226,11 @@ impl BodyCaptureDecision {
 /// A rendered, bounded, redacted body sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedBody {
-    /// `captured`, `truncated`, or `binary`.
+    /// `captured`, `truncated`, `binary`, or `omitted` (malformed structured
+    /// body, or a body past the effective capture ceiling — both content-free).
     pub state: &'static str,
-    /// Body family the sample was redacted as (`binary` for non-UTF-8).
+    /// Body family the sample was redacted as (`binary` for non-UTF-8,
+    /// `omitted` for a body past the effective capture ceiling).
     pub kind: &'static str,
     /// Byte length of the complete post-transform body.
     pub original_bytes: usize,
@@ -416,6 +450,16 @@ impl TransactionDebugger {
     /// response headers are known. Long-lived and streaming request flavors
     /// must never be pinned onto the buffered path by the debugger.
     fn request_shape_allows_response_capture(&self, ctx: &RequestContext) -> bool {
+        // Authoritative typed provenance first. The protocol flavor is stamped
+        // on the protocol entry path before any plugin runs, so it survives
+        // header mutation by an earlier plugin and it witnesses H2/H3 Extended
+        // CONNECT WebSockets, which carry no `Upgrade` header at all.
+        if ctx.is_native_grpc_request() || ctx.has_websocket_response_boundary() {
+            return false;
+        }
+        // Conservative header screen retained on top: it covers gRPC-Web and
+        // H1 `Upgrade` shapes that are not a distinct typed flavor, plus direct
+        // unit callers that construct a `RequestContext` without stamping one.
         if header_value(&ctx.headers, "upgrade").is_some() {
             return false;
         }
@@ -423,7 +467,7 @@ impl TransactionDebugger {
             return false;
         }
         if header_value(&ctx.headers, "accept")
-            .is_some_and(|accept| accept.to_ascii_lowercase().contains("text/event-stream"))
+            .is_some_and(|accept| contains_ignore_ascii_case(accept, "text/event-stream"))
         {
             return false;
         }
@@ -435,6 +479,13 @@ impl TransactionDebugger {
     /// Redaction runs over the complete post-transform body first and the
     /// byte cap is applied to the redacted rendering, so a truncated capture
     /// can never expose a secret that a full capture would have removed.
+    ///
+    /// The work this does is bounded before it starts: a body longer than the
+    /// effective ceiling (`max_bytes`, itself never allowed above
+    /// [`MAX_BODY_CAPTURE_BYTES`], so a direct caller cannot widen it) is never
+    /// scanned, parsed, redacted, or allocated from — it returns a content-free
+    /// omission. The final hooks apply the same rule and emit the ordinary
+    /// `over_capture_limit` omission record instead of calling this at all.
     pub fn render_captured_body(
         &self,
         body: &[u8],
@@ -442,7 +493,20 @@ impl TransactionDebugger {
         max_bytes: usize,
     ) -> CapturedBody {
         let original_bytes = body.len();
-        let Some(text) = utf8_prefix(body) else {
+        let effective_cap = max_bytes.min(MAX_BODY_CAPTURE_BYTES as usize);
+        if original_bytes > effective_cap {
+            return CapturedBody {
+                state: "omitted",
+                kind: "omitted",
+                original_bytes,
+                truncated: false,
+                rendered: BODY_OVER_LIMIT_MARKER.to_string(),
+            };
+        }
+        // A final body hook receives the complete byte slice, so an incomplete
+        // multibyte tail is malformed UTF-8 rather than a capture artifact.
+        // Every invalid body — prefix-valid or not — renders as the marker.
+        let Ok(text) = std::str::from_utf8(body) else {
             return CapturedBody {
                 state: "binary",
                 kind: "binary",
@@ -451,35 +515,32 @@ impl TransactionDebugger {
                 rendered: BODY_BINARY_MARKER.to_string(),
             };
         };
-        let non_utf8_tail = text.len() < original_bytes;
 
-        let (redacted, dropped_lines) = if original_bytes > REDACTION_PARSE_BUDGET_BYTES {
-            self.redact_text_lines(text)
-        } else {
-            match kind {
-                BodyKind::Json => match serde_json::from_str::<Value>(text) {
-                    Ok(mut value) => {
-                        self.redact_json_value(&mut value, 0);
-                        // Serialization of an already-parsed, redacted document
-                        // cannot fail; fall back to the text path defensively.
-                        match serde_json::to_string(&value) {
-                            Ok(rendered) => (rendered, false),
-                            Err(_) => self.redact_text_lines(text),
-                        }
+        let (redacted, dropped_lines) = match kind {
+            BodyKind::Json => match serde_json::from_str::<Value>(text) {
+                Ok(mut value) => {
+                    self.redact_json_value(&mut value, 0);
+                    match serde_json::to_string(&value) {
+                        Ok(rendered) => (rendered, false),
+                        // Serializing an already-parsed, redacted document
+                        // cannot fail; fail closed rather than degrade to a
+                        // weaker redactor if it somehow does.
+                        Err(_) => return malformed_structured_body(kind, original_bytes),
                     }
-                    // Unparseable JSON (malformed, or a body the operator
-                    // mislabelled) gets the conservative line-level treatment
-                    // rather than a raw dump.
-                    Err(_) => self.redact_text_lines(text),
-                },
-                BodyKind::Form => (self.redact_form_body(text), false),
-                BodyKind::Text => self.redact_text_lines(text),
-            }
+                }
+                // A body that claims JSON but does not parse has no structure to
+                // redact. Line-level fallback would redact a `"password":` line
+                // while logging the value on the next line, so fail closed to a
+                // fixed content-free marker instead.
+                Err(_) => return malformed_structured_body(kind, original_bytes),
+            },
+            BodyKind::Form => (self.redact_form_body(text), false),
+            BodyKind::Text => self.redact_text_lines(text),
         };
 
-        let (slice, byte_capped) = truncate_on_char_boundary(&redacted, max_bytes);
+        let (slice, byte_capped) = truncate_on_char_boundary(&redacted, effective_cap);
         let (rendered, render_capped) = escape_for_diagnostics(slice);
-        let truncated = byte_capped || render_capped || dropped_lines || non_utf8_tail;
+        let truncated = byte_capped || render_capped || dropped_lines;
         CapturedBody {
             state: if truncated { "truncated" } else { "captured" },
             kind: kind.as_str(),
@@ -589,8 +650,12 @@ impl TransactionDebugger {
 
     /// Line-level redaction for unstructured text. Returns the redacted text
     /// and whether lines beyond [`MAX_TEXT_REDACTION_LINES`] were dropped.
+    ///
+    /// Only reachable for `text/plain`, whose coarse, whole-line replacement is
+    /// documented as an operator opt-in. It is never used as a fallback for a
+    /// structured family.
     fn redact_text_lines(&self, text: &str) -> (String, bool) {
-        let mut out = String::with_capacity(text.len().min(REDACTION_PARSE_BUDGET_BYTES));
+        let mut out = String::with_capacity(text.len());
         let mut dropped = false;
         for (index, line) in text.lines().enumerate() {
             if index >= MAX_TEXT_REDACTION_LINES {
@@ -678,7 +743,7 @@ impl Plugin for TransactionDebugger {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.request_body_capture_decision(&ctx.headers).is_capture()
+        capture_output_enabled() && self.request_body_capture_decision(&ctx.headers).is_capture()
     }
 
     /// The capture reads the body from the `on_final_request_body` parameter,
@@ -693,7 +758,9 @@ impl Plugin for TransactionDebugger {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.log_response_body && self.request_shape_allows_response_capture(ctx)
+        self.log_response_body
+            && capture_output_enabled()
+            && self.request_shape_allows_response_capture(ctx)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -738,14 +805,24 @@ impl Plugin for TransactionDebugger {
         }
         let decision = self.request_body_capture_decision(headers);
         if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
+            let method = header_value(headers, ":method").unwrap_or("-");
+            let path = header_value(headers, ":path").unwrap_or("-");
+            // `Content-Length` admitted this message, but the backend-visible
+            // body is what actually gets walked. A stale/lying header or a
+            // transform that grew the body must not widen the capture ceiling,
+            // so fail closed before any UTF-8 scan, parse, or allocation.
+            if body.len() > max_bytes {
+                self.emit_body_capture(
+                    "request",
+                    method,
+                    path,
+                    BodyCaptureDecision::Skip("over_capture_limit"),
+                    None,
+                );
+                return PluginResult::Continue;
+            }
             let sample = self.render_captured_body(body, kind, max_bytes);
-            self.emit_body_capture(
-                "request",
-                header_value(headers, ":method").unwrap_or("-"),
-                header_value(headers, ":path").unwrap_or("-"),
-                decision,
-                Some(&sample),
-            );
+            self.emit_body_capture("request", method, path, decision, Some(&sample));
         }
         PluginResult::Continue
     }
@@ -790,6 +867,18 @@ impl Plugin for TransactionDebugger {
         }
         let decision = self.response_body_capture_decision(response_headers);
         if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
+            // Same fail-closed rule as the request side: the client-visible
+            // body, not the declared length, bounds the work done here.
+            if body.len() > max_bytes {
+                self.emit_body_capture(
+                    "response",
+                    &ctx.method,
+                    &ctx.path,
+                    BodyCaptureDecision::Skip("over_capture_limit"),
+                    None,
+                );
+                return PluginResult::Continue;
+            }
             let sample = self.render_captured_body(body, kind, max_bytes);
             self.emit_body_capture("response", &ctx.method, &ctx.path, decision, Some(&sample));
         }
@@ -958,12 +1047,45 @@ const fn stream_io_side_label(side: StreamIoSide) -> &'static str {
     }
 }
 
+/// Whether any capture record could actually be emitted right now.
+///
+/// Capture output exists only on the `transaction_debug` DEBUG target, so when
+/// that target is not enabled there is no record for a buffered body to end up
+/// in. The per-request buffering predicates consult this so eligible bodies are
+/// released to streaming instead of being buffered for nothing. The config-level
+/// `requires_*_body_buffering()` capability is deliberately left untouched: it
+/// must keep describing what the configuration can ask for, independent of the
+/// current log filter.
+///
+/// The admin log-level reloader can flip this between hooks. Both outcomes are
+/// benign and stateless — either a body is buffered and no record is emitted, or
+/// it streams and no record is emitted — so no cross-hook state is carried to
+/// make the two agree.
+fn capture_output_enabled() -> bool {
+    tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+}
+
 /// Case-insensitive header lookup that does not allocate.
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
     headers
         .iter()
         .find(|(key, _)| key.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+/// Allocation-free ASCII-case-insensitive substring test. Used on the hot path
+/// instead of lowercasing a whole header value to search inside it.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (haystack, needle) = (haystack.as_bytes(), needle.as_bytes());
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
@@ -1004,12 +1126,13 @@ fn capturable_body_kind(content_type: &str) -> Option<BodyKind> {
     if base.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
         return Some(BodyKind::Form);
     }
-    if base.eq_ignore_ascii_case("text/plain")
-        || base.eq_ignore_ascii_case("application/xml")
-        || base.eq_ignore_ascii_case("text/xml")
-        || base.eq_ignore_ascii_case("application/graphql")
-        || ends_with_ignore_ascii_case(base, "+xml")
-    {
+    // `text/plain` is the only unstructured family on the allow-list. XML and
+    // GraphQL are deliberately excluded: their secrets live in structural
+    // positions (element text, variable values) that line-level redaction
+    // cannot reach, and Ferrum has no bounded structure-aware redactor for
+    // either, so claiming a control here would be claiming one that cannot be
+    // enforced.
+    if base.eq_ignore_ascii_case("text/plain") {
         return Some(BodyKind::Text);
     }
     None
@@ -1051,15 +1174,15 @@ fn capture_decision(headers: &HashMap<String, String>, max_bytes: usize) -> Body
     BodyCaptureDecision::Capture { kind, max_bytes }
 }
 
-/// Longest valid UTF-8 prefix of `body`, or `None` when the body contains an
-/// actual invalid sequence (a binary payload) rather than a truncated tail.
-fn utf8_prefix(body: &[u8]) -> Option<&str> {
-    match std::str::from_utf8(body) {
-        Ok(text) => Some(text),
-        Err(err) if err.error_len().is_none() => {
-            std::str::from_utf8(&body[..err.valid_up_to()]).ok()
-        }
-        Err(_) => None,
+/// Content-free rendering for a structured body that could not be parsed as the
+/// structure it declared.
+fn malformed_structured_body(kind: BodyKind, original_bytes: usize) -> CapturedBody {
+    CapturedBody {
+        state: "omitted",
+        kind: kind.as_str(),
+        original_bytes,
+        truncated: false,
+        rendered: BODY_MALFORMED_MARKER.to_string(),
     }
 }
 
@@ -1086,27 +1209,34 @@ const fn is_spoofing_control(ch: char) -> bool {
 
 /// Escape control and bidi-spoofing characters and cap the rendered length.
 ///
-/// Escaping can expand one source character into six output bytes, so the
-/// output is additionally bounded by [`MAX_RENDERED_BODY_BYTES`]. Returns the
+/// One source character can expand into several output bytes, so the output is
+/// additionally bounded by [`MAX_RENDERED_BODY_BYTES`]. The bound is exact on
+/// every path: a segment is appended only when the *whole* encoded segment
+/// still fits, so the ceiling can be reached but never overshot. Returns the
 /// rendered string and whether the render ceiling truncated it.
 fn escape_for_diagnostics(text: &str) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
     let mut capped = false;
+    let mut char_buf = [0u8; 4];
+    let mut escape_buf = String::with_capacity(10);
     for ch in text.chars() {
-        if out.len() >= MAX_RENDERED_BODY_BYTES {
+        let segment: &str = match ch {
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            '\\' => "\\\\",
+            ch if ch.is_control() || is_spoofing_control(ch) => {
+                escape_buf.clear();
+                let _ = write!(escape_buf, "\\u{{{:04x}}}", ch as u32);
+                escape_buf.as_str()
+            }
+            ch => ch.encode_utf8(&mut char_buf),
+        };
+        if out.len() + segment.len() > MAX_RENDERED_BODY_BYTES {
             capped = true;
             break;
         }
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\\' => out.push_str("\\\\"),
-            ch if ch.is_control() || is_spoofing_control(ch) => {
-                let _ = write!(out, "\\u{{{:04x}}}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
+        out.push_str(segment);
     }
     (out, capped)
 }

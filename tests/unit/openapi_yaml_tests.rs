@@ -7694,10 +7694,22 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         "application/grpc",
         "redacted",
         "truncated",
+        // The capture allow-list, the actual-length recheck, and the
+        // fail-closed structured-body handling are security contracts, not
+        // prose: they must stay mirrored in the published schema.
+        "Content-Length is only an admission screen",
+        "over_capture_limit",
+        "XML and GraphQL are excluded",
     ] {
         assert!(
             description.contains(contract),
             "description missing `{contract}`"
+        );
+    }
+    for withdrawn in ["application/xml", "application/graphql,", "+xml"] {
+        assert!(
+            !description.contains(withdrawn),
+            "description still advertises withdrawn capturable media type `{withdrawn}`"
         );
     }
 
@@ -7708,7 +7720,14 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
             "docs/plugins.md transaction_debugger section missing `{key}`"
         );
     }
-    for contract in ["<non-utf8-body-omitted>", "over_capture_limit", "unknown_length"] {
+    for contract in [
+        "<non-utf8-body-omitted>",
+        "<malformed-structured-body-omitted>",
+        "<over-capture-limit-body-omitted>",
+        "over_capture_limit",
+        "unknown_length",
+        "typed request provenance",
+    ] {
         assert!(
             plugin_docs.contains(contract),
             "docs/plugins.md missing transaction_debugger contract `{contract}`"
