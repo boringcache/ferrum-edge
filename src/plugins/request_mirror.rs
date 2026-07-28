@@ -528,7 +528,7 @@ impl MirrorBodyBudget {
     /// declared. [`MirrorBodyLease::reconcile`] shrinks the lease to the
     /// observed length once the body exists.
     fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<MirrorBodyLease> {
-        if bytes > 0 && !self.try_add(bytes) {
+        if !self.try_add(bytes) {
             return None;
         }
         Some(MirrorBodyLease {
@@ -539,15 +539,28 @@ impl MirrorBodyBudget {
 
     /// Lock-free bounded add. Returns `false` without mutating when the budget
     /// cannot cover `bytes`.
+    ///
+    /// `max_bytes` is operator-configurable across the whole `u64` range, so the
+    /// candidate total is computed with `checked_add` and the *same* value is
+    /// both compared and published. A saturating comparison would let
+    /// `used + bytes` wrap past a `u64::MAX` ceiling (silently in release,
+    /// panicking in debug) and hand out capacity the budget does not have;
+    /// arithmetic overflow is itself an exhausted budget and fails closed.
     fn try_add(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
         let mut current = self.used.load(Ordering::Relaxed);
         loop {
-            if current.saturating_add(bytes) > self.max_bytes {
+            let Some(candidate) = current.checked_add(bytes) else {
+                return false;
+            };
+            if candidate > self.max_bytes {
                 return false;
             }
             match self.used.compare_exchange_weak(
                 current,
-                current + bytes,
+                candidate,
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             ) {
@@ -557,9 +570,20 @@ impl MirrorBodyBudget {
         }
     }
 
+    /// Return `bytes` to the budget.
+    ///
+    /// Leases release exactly what they hold exactly once, so this never
+    /// underflows in practice. It still saturates rather than wrapping: an
+    /// unsigned wrap would leave `used` near `u64::MAX` and wedge the instance's
+    /// mirroring closed for the rest of the plugin generation, which is a worse
+    /// failure than under-releasing.
     fn release(&self, bytes: u64) {
         if bytes > 0 {
-            self.used.fetch_sub(bytes, Ordering::SeqCst);
+            let _ = self
+                .used
+                .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(bytes))
+                });
         }
     }
 

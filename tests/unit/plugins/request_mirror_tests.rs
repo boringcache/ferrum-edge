@@ -4419,6 +4419,141 @@ async fn advisory_aggregate_budget_bounds_concurrent_unknown_length_uploads() {
 }
 
 #[tokio::test]
+async fn advisory_full_aggregate_budget_refuses_then_reuses_released_capacity() {
+    // Exactness at a saturated budget, independent of pointer width: one
+    // undeclared upload reserves the whole ceiling, the next positive
+    // reservation must be refused *without mutating* the aggregate, and the
+    // released capacity must become reusable.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 8,
+        "max_retained_request_body_bytes": 4096,
+        "max_mirrored_request_body_bytes": 4096
+    }));
+
+    let mut full = advisory_ctx(None);
+    plugin_utils::assert_continue(plugin.authorize(&mut full).await);
+    assert!(plugin.should_buffer_request_body(&full));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        4096
+    );
+
+    for declared in [None, Some(1), Some(4096)] {
+        let mut refused = advisory_ctx(declared);
+        plugin_utils::assert_continue(plugin.authorize(&mut refused).await);
+        assert!(
+            !plugin.should_buffer_request_body(&refused),
+            "a positive reservation against a full budget must be refused"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            4096,
+            "a refused reservation must not mutate the aggregate"
+        );
+    }
+
+    // A declared zero-length body reserves nothing, so it is still admitted.
+    let mut empty = advisory_ctx(Some(0));
+    plugin_utils::assert_continue(plugin.authorize(&mut empty).await);
+    assert!(plugin.should_buffer_request_body(&empty));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        4096
+    );
+
+    drop(full);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0,
+        "releasing the lease must return exactly what it reserved"
+    );
+
+    let mut reused = advisory_ctx(None);
+    plugin_utils::assert_continue(plugin.authorize(&mut reused).await);
+    assert!(
+        plugin.should_buffer_request_body(&reused),
+        "released capacity must be reusable"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        4096
+    );
+}
+
+// `max_mirrored_request_body_bytes` is bounded by `usize` at construction, so a
+// whole-`u64` ceiling is only expressible on 64-bit targets. Every CI target is
+// 64-bit; the gate keeps the file compiling on a hypothetical 32-bit host.
+#[cfg(target_pointer_width = "64")]
+#[tokio::test]
+async fn advisory_aggregate_budget_is_exact_at_the_u64_max_boundary() {
+    // `max_retained_request_body_bytes` is documented and validated across the
+    // whole `u64` range, so aggregate accounting must stay exact at the very
+    // top of it. Comparing a *saturating* candidate against the ceiling admits
+    // a second full-ceiling reservation here and then wraps `used` back through
+    // zero (silently in release, panicking in debug), handing out capacity the
+    // budget does not have — the exact fail-open the advisory bound exists to
+    // prevent.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 8,
+        "max_retained_request_body_bytes": u64::MAX,
+        "max_mirrored_request_body_bytes": u64::MAX
+    }));
+    assert_eq!(
+        request_mirror_max_retained_request_body_bytes_for_test(&plugin),
+        u64::MAX
+    );
+
+    // Undeclared framing reserves the whole plugin-local ceiling, which here is
+    // the entire aggregate budget.
+    let mut first = advisory_ctx(None);
+    plugin_utils::assert_continue(plugin.authorize(&mut first).await);
+    assert!(plugin.should_buffer_request_body(&first));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        u64::MAX
+    );
+
+    // Every positive reservation now overflows the ceiling and must fail closed
+    // without mutating the aggregate — including the smallest possible one.
+    for declared in [None, Some(1), Some(u64::MAX)] {
+        let mut refused = advisory_ctx(declared);
+        plugin_utils::assert_continue(plugin.authorize(&mut refused).await);
+        assert!(
+            !plugin.should_buffer_request_body(&refused),
+            "a positive reservation at the u64::MAX boundary must be refused"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            u64::MAX,
+            "an overflowing reservation must never wrap the aggregate"
+        );
+    }
+
+    // Releasing the full-ceiling lease returns the whole budget for reuse.
+    drop(first);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
+    let mut reused = advisory_ctx(None);
+    plugin_utils::assert_continue(plugin.authorize(&mut reused).await);
+    assert!(
+        plugin.should_buffer_request_body(&reused),
+        "released capacity must be reusable after a u64::MAX-sized lease"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        u64::MAX
+    );
+}
+
+#[tokio::test]
 async fn advisory_reservation_reconciles_to_the_observed_body_length() {
     let plugin = advisory_plugin(json!({
         "mirror_host": "127.0.0.1",
@@ -4763,10 +4898,16 @@ fn advisory_plugin_local_ceiling_survives_an_unlimited_global_limit() {
 }
 
 #[tokio::test]
-async fn advisory_admission_is_protocol_independent_across_h1_h2_h3_and_grpc() {
-    // The HTTP/1.1, HTTP/2, HTTP/3, and native-gRPC request paths all consult
-    // the same capability predicates and the same authorize hook, so the
-    // pre-buffer contract must hold for each shape of request context.
+async fn advisory_admission_ignores_content_type_and_declared_framing() {
+    // Scope: this is a *plugin-unit* assertion. It proves the admission hook
+    // itself is indifferent to content type and to whether the request declared
+    // a length — the shapes that differ between HTTP/1.1, HTTP/2, HTTP/3, and
+    // native gRPC — and that `request_mirror` claims all of them.
+    //
+    // It deliberately does NOT claim protocol coverage: it never traverses a
+    // real transport. Live H1/H2/H3 entry-path proof that admission precedes
+    // body collection lives in
+    // `tests/functional/functional_request_mirror_admission_test.rs`.
     assert_eq!(
         RequestMirror::new(
             &json!({ "mirror_host": "mirror.local" }),
@@ -4778,10 +4919,10 @@ async fn advisory_admission_is_protocol_independent_across_h1_h2_h3_and_grpc() {
     );
 
     for (label, content_type, content_length) in [
-        ("h1-declared", "application/json", Some(2048u64)),
-        ("h2-declared", "application/json", Some(2048)),
-        ("h3-undeclared", "application/json", None),
-        ("grpc", "application/grpc+proto", Some(2048)),
+        ("json-declared", "application/json", Some(2048u64)),
+        ("json-declared-repeat", "application/json", Some(2048)),
+        ("json-undeclared", "application/json", None),
+        ("grpc-declared", "application/grpc+proto", Some(2048)),
     ] {
         let zero = advisory_plugin(json!({
             "mirror_host": "mirror.local",
