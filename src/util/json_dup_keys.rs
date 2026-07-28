@@ -315,11 +315,11 @@ pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'s
         Ok(()) => None,
         Err(
             reject @ (JsonScanReject::DuplicateKey
-                | JsonScanReject::DepthExceeded
-                | JsonScanReject::TokenBudgetExceeded
-                | JsonScanReject::MemberBudgetExceeded
-                | JsonScanReject::KeyTooLong
-                | JsonScanReject::TooLarge),
+            | JsonScanReject::DepthExceeded
+            | JsonScanReject::TokenBudgetExceeded
+            | JsonScanReject::MemberBudgetExceeded
+            | JsonScanReject::KeyTooLong
+            | JsonScanReject::TooLarge),
         ) => Some(reject.reason()),
         Err(reject @ JsonScanReject::Malformed) => {
             // Confirmation parse, rejection path only. `SerdeJsonAccept` matches
