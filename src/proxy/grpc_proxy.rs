@@ -2001,15 +2001,21 @@ pub fn apply_buffered_grpc_initial_response_policy(
     response_headers: &mut HashMap<String, String>,
     authoritative_terminal_metadata: Option<&GrpcTerminalMetadataSnapshot>,
 ) {
-    let content_length = response_headers.remove_entry("content-length");
+    let content_length = response_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.clone());
+    // Drop every case variant before the policy overlay so a mixed-case leftover
+    // cannot co-exist with the restored transform-owned length.
+    crate::proxy::headers::remove_content_length_header(response_headers);
     strip_grpc_terminal_metadata_from_initial(response_headers);
 
     if let Some(policy_state) = policy_state {
         policy_state.apply_to_initial_headers(response_headers);
     }
-    response_headers.remove("content-length");
-    if let Some((name, value)) = content_length {
-        response_headers.insert(name, value);
+    crate::proxy::headers::remove_content_length_header(response_headers);
+    if let Some(value) = content_length {
+        response_headers.insert("content-length".to_string(), value);
     }
     strip_grpc_terminal_metadata_from_initial(response_headers);
 

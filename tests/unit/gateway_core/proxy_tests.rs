@@ -2152,6 +2152,17 @@ fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit(
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut deadline_headers, true);
     assert!(!deadline_headers.contains_key("content-length"));
 
+    // Mixed-case must also drop: Streaming sanitization would otherwise
+    // canonicalize a surviving variant onto the wire.
+    let mut mixed_case =
+        HashMap::from([("Content-Length".to_string(), "128".to_string())]);
+    strip_content_length_for_streaming_grpc_deadline_for_test(&mut mixed_case, true);
+    assert!(
+        !mixed_case
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length"))
+    );
+
     let mut unbounded_headers = HashMap::from([("content-length".to_string(), "128".to_string())]);
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut unbounded_headers, false);
     assert_eq!(

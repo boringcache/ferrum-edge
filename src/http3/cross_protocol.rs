@@ -3137,9 +3137,11 @@ where
         None
     };
     // Strip Content-Length when inspecting — the inspector transforms the body, so
-    // the backend's declared length no longer matches what we send.
+    // the backend's declared length no longer matches what we send. Case-insensitive
+    // omit must run before `send_response_headers` Streaming sanitization, which
+    // would otherwise re-canonicalize a mixed-case plugin spelling onto the wire.
     if response_inspector.is_some() {
-        response_headers.remove("content-length");
+        crate::proxy::headers::remove_content_length_header(&mut response_headers);
     }
 
     // Send response headers, then stream the body.
@@ -3666,7 +3668,9 @@ where
         )
     });
     if grpc_web_initial_terminal_metadata.is_some() {
-        streaming.headers.remove("content-length");
+        // Omit before Streaming sanitization so a mixed-case plugin spelling
+        // cannot be re-canonicalized onto the wire.
+        crate::proxy::headers::remove_content_length_header(&mut streaming.headers);
     }
 
     // The body relay may replace an empty backend stream with terminal

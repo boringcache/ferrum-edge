@@ -886,8 +886,34 @@ fn canonicalize_streaming_content_length(headers: &mut std::collections::HashMap
     }
 }
 
-fn remove_content_length_header(headers: &mut std::collections::HashMap<String, String>) {
+/// Remove every `Content-Length` case variant from a plugin/backend string map.
+///
+/// Call this *before* [`sanitize_client_response_headers_for_wire`] with
+/// [`ClientResponseFraming::Streaming`] on paths that must omit length
+/// (native H3 gRPC streaming, gRPC-Web translation, stream inspectors, deadline
+/// replacement). Streaming framing otherwise canonicalizes a single mixed-case
+/// plugin-authored value onto the wire.
+#[inline]
+pub fn remove_content_length_header(headers: &mut std::collections::HashMap<String, String>) {
     headers.retain(|name, _| !name.eq_ignore_ascii_case("content-length"));
+}
+
+/// First parseable `Content-Length` value under any case spelling.
+///
+/// Used when a path must capture a backend-declared length for internal
+/// accounting before an intentional wire omit. Multiple conflicting variants
+/// are not reconciled here — the wire boundary fails closed separately.
+#[inline]
+pub fn content_length_header_value(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<u64> {
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse().ok()
+        } else {
+            None
+        }
+    })
 }
 
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
@@ -1930,6 +1956,31 @@ mod tests {
                 .keys()
                 .any(|name| name.eq_ignore_ascii_case("content-length"))
         );
+    }
+
+    #[test]
+    fn intentional_content_length_omit_before_streaming_sanitize_drops_mixed_case() {
+        // Paths that must omit length (H3 gRPC streaming, gRPC-Web translation,
+        // inspectors, deadline replacement) strip first, then Streaming-sanitize.
+        // The strip must be case-insensitive or Streaming re-publishes the value.
+        let mut headers = std::collections::HashMap::from([
+            ("Content-Length".to_string(), "999".to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(content_length_header_value(&headers), Some(999));
+        remove_content_length_header(&mut headers);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Streaming { status: 200 },
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "mixed-case Content-Length must not survive omit-then-Streaming sanitize"
+        );
+        assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
+        assert_eq!(content_length_header_value(&headers), None);
     }
 
     #[test]

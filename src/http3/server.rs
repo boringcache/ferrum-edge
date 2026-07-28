@@ -47,9 +47,10 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     ClientResponseFraming, RejectBodyDisposition, apply_response_headers,
-    is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, sanitize_client_response_headers_for_wire,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    content_length_header_value, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map, remove_content_length_header,
+    sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -5365,11 +5366,12 @@ async fn handle_h3_request(
         // client — the graceful-close recovery below still needs it to tell a
         // complete body from a truncated one (an inspected response strips
         // Content-Length because the inspector transforms the body).
-        let declared_content_length: Option<u64> = response_headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok());
+        let declared_content_length: Option<u64> =
+            content_length_header_value(&response_headers);
         if response_inspector.is_some() {
-            response_headers.remove("content-length");
+            // Omit before Streaming sanitization so a mixed-case plugin
+            // spelling cannot be re-canonicalized onto the wire.
+            remove_content_length_header(&mut response_headers);
         }
 
         // Final protocol-aware strip after after_proxy: plugins must not
@@ -9549,10 +9551,10 @@ async fn dispatch_grpc_native_h3(
     // would treat that truncated body as malformed before surfacing the gRPC
     // status, so strip it from the client-facing headers (captured first for the
     // internal graceful-close completeness check in the relay loop below).
-    let declared_content_length: Option<u64> = response_headers
-        .get("content-length")
-        .and_then(|v| v.parse::<u64>().ok());
-    response_headers.remove("content-length");
+    let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
+    // Omit before Streaming sanitization so a mixed-case plugin/backend
+    // spelling cannot be re-canonicalized onto the wire.
+    remove_content_length_header(&mut response_headers);
 
     // gRPC carries its terminal status in the TRAILERS frame; the initial HEADERS
     // must NOT also carry `grpc-status` / `grpc-message` for a non-empty response

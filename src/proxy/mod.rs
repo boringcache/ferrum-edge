@@ -17723,7 +17723,9 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) {
     if grpc_deadline_at.is_some() {
-        response_headers.remove("content-length");
+        // Case-insensitive: Streaming sanitization would otherwise canonicalize
+        // a single mixed-case plugin/backend spelling back onto the wire.
+        headers_mod::remove_content_length_header(response_headers);
     }
 }
 
@@ -23851,11 +23853,11 @@ async fn handle_proxy_request_inner(
                 if grpc_web_streaming_content_type.is_some() {
                     // Incremental translation changes the representation size
                     // and carries terminal metadata in a final DATA frame.
-                    response_headers.remove("content-length");
+                    // Omit before Streaming sanitization so a mixed-case
+                    // plugin spelling cannot be re-canonicalized onto the wire.
+                    headers_mod::remove_content_length_header(&mut response_headers);
                 }
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                let cl = headers_mod::content_length_header_value(&response_headers);
 
                 // Final protocol-aware boundary before the H2 gRPC streaming
                 // builder. Trailer frames are filtered separately by
@@ -26455,7 +26457,9 @@ async fn handle_proxy_request_inner(
         None
     };
     if response_inspector.is_some() {
-        response_headers.remove("content-length");
+        // Inspector transforms the body; omit before Streaming sanitization so
+        // a mixed-case plugin spelling cannot be re-canonicalized onto the wire.
+        headers_mod::remove_content_length_header(&mut response_headers);
     }
     // Capture this before `method` is moved into the optional transaction
     // summary below. Response framing still needs the request-method semantic,
@@ -26571,7 +26575,9 @@ async fn handle_proxy_request_inner(
             already_ended,
             pristine_streaming_grpc_web_terminal_names.as_ref(),
         );
-        response_headers.remove("content-length");
+        // Omit before Streaming sanitization so a mixed-case plugin spelling
+        // cannot be re-canonicalized onto the wire.
+        headers_mod::remove_content_length_header(&mut response_headers);
         Some((content_type.to_string(), terminal))
     } else {
         None
