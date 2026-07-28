@@ -5600,6 +5600,37 @@ async fn aggregate_batch_oversized_item_count_is_rejected() {
 }
 
 #[tokio::test]
+async fn aggregate_batch_oversized_member_is_rejected_without_dropping_valid_sibling() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = json!({
+        "max_batch_items": 4,
+        "max_batch_bytes": 4096,
+        "max_batch_item_bytes": 128
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "too-large",
+            "method": "ping",
+            "params": { "padding": "x".repeat(512) }
+        },
+        { "jsonrpc": "2.0", "id": "valid", "method": "ping", "params": {} }
+    ]));
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body
+        .as_array()
+        .expect("per-item admission must preserve valid siblings");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "too-large");
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(responses[1].get("result").is_some());
+}
+
+#[tokio::test]
 async fn aggregate_batch_nested_array_is_per_item_invalid() {
     let plugin = create_plugin(
         "mcp_gateway",
