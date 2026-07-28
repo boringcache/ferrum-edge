@@ -1908,6 +1908,14 @@ pub struct RequestContext {
     /// metadata so sibling/custom plugins cannot clear or forge the signal
     /// consumed by fail-closed response negotiation.
     response_cache_hit: bool,
+    /// Genuine HTTP status from the origin/backend response, recorded once by
+    /// proxy core at the start of `run_after_proxy_hooks` before any
+    /// `after_proxy` hook can reject and replace the client-visible response.
+    /// `None` when no origin response was received (pre-dispatch rejects,
+    /// transport failures that never yield headers, gateway-only synthetics).
+    /// Kept private so request metadata cannot forge origin success for
+    /// invalidation or similar origin-success boundaries.
+    origin_http_response_status: Option<u16>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -2523,6 +2531,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             response_cache_hit: false,
+            origin_http_response_status: None,
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -2952,6 +2961,23 @@ impl RequestContext {
         self.response_cache_hit
     }
 
+    /// Record the genuine origin/backend HTTP status exactly once.
+    ///
+    /// Proxy core calls this at the start of `run_after_proxy_hooks` before any
+    /// response hook can replace the downstream status. Subsequent calls are
+    /// ignored so an earlier rejection or plugin cannot overwrite provenance.
+    pub(crate) fn record_origin_http_response_status(&mut self, status: u16) {
+        if self.origin_http_response_status.is_none() {
+            self.origin_http_response_status = Some(status);
+        }
+    }
+
+    /// Genuine origin/backend HTTP status when one was received for this
+    /// request, otherwise `None`.
+    pub(crate) fn origin_http_response_status(&self) -> Option<u16> {
+        self.origin_http_response_status
+    }
+
     pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
         self.authorized_backend_path = Some(path);
     }
@@ -3305,6 +3331,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             response_cache_hit: self.response_cache_hit,
+            origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -6875,6 +6902,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Observe the genuine origin/backend HTTP status exactly once, before any
+    /// `after_proxy` hook can reject and replace the downstream response.
+    ///
+    /// Proxy core records the status on [`RequestContext`] as private typed
+    /// provenance and then invokes this hook for every plugin in configured
+    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// must not depend on later hooks presenting the origin status to the
+    /// client (for example cache invalidation) override this.
+    fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
+
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted
     /// response.
@@ -7573,6 +7610,42 @@ pub trait Plugin: Send + Sync {
         _connection_id: u64,
         _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        None
+    }
+
+    /// Called for the physical WebSocket frames a peer spent on message
+    /// reassembly that [`Plugin::on_ws_frame`] can never see.
+    ///
+    /// Tungstenite yields only reassembled messages, so the initial non-final
+    /// Text/Binary frame and every intermediate Continuation frame — including
+    /// zero-length ones — are invisible to `on_ws_frame`. Without this hook a
+    /// peer could drive unbounded framing work while paying for a single
+    /// logical message (GHSA-qq94-2gv2-phh6).
+    ///
+    /// `fragment_frames` is always `>= 1` and counts only frames that produced
+    /// no message. The completing frame is charged exactly once through the
+    /// ordinary [`Plugin::on_ws_frame`] call for the reassembled message, so a
+    /// plugin implementing both hooks charges each wire frame exactly once.
+    ///
+    /// The relay invokes this before the message chain for the read that
+    /// surfaced them, and also for an interleaved Ping/Pong that arrives
+    /// mid-reassembly. A peer `Close` is the exception: it bypasses mutating
+    /// admission entirely so no plugin can replace the peer's code/reason, and
+    /// the session is ending anyway. There is no message to mutate: only
+    /// `Some(Message::Close(..))` is honored, which closes the connection in
+    /// both directions; every other return value is ignored. Observational
+    /// plugins ([`Plugin::observes_ws_frame_decisions`]) are skipped entirely.
+    ///
+    /// The count/duration ceilings that stop a message which never completes
+    /// live in the parser (see `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+    /// / `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), not here.
+    async fn on_ws_reassembly_frames(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _fragment_frames: u64,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
     }

@@ -85,7 +85,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{FragmentMeter, Message, WebSocketConfig};
 use tokio_tungstenite::{
     WebSocketStream, client_async_tls_with_config, client_async_with_config,
     tungstenite::handshake::derive_accept_key,
@@ -10656,6 +10656,7 @@ async fn handle_websocket_request_authenticated(
     let ws_tunnel = state.websocket_tunnel_mode;
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
+    let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -10764,6 +10765,7 @@ async fn handle_websocket_request_authenticated(
                             // RFC 9220 §5 compliance.
                             false,
                             ws_idle_tracker,
+                            ws_fragment_policy,
                             &adaptive_buf,
                         )
                         .await
@@ -10786,6 +10788,7 @@ async fn handle_websocket_request_authenticated(
                             ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
+                            ws_fragment_policy,
                             &adaptive_buf,
                         )
                         .await
@@ -12204,6 +12207,103 @@ struct WsSizeLimitRule {
     close_reason: Arc<str>,
 }
 
+/// Parser-level bounds on a WebSocket message that is still being reassembled.
+///
+/// Tungstenite yields only complete messages, so the initial non-final frame
+/// and every intermediate continuation frame are invisible to the relay and to
+/// `on_ws_frame`. Byte ceilings (`max_message_size`) do not bound them either:
+/// a zero-length continuation carries no payload but still costs a frame parse.
+/// These two bounds are therefore independent of `ws_message_size_limiting` and
+/// of each other — one on physical frame count, one on wall-clock duration —
+/// and fail the connection closed while the message is still incomplete
+/// (GHSA-qq94-2gv2-phh6).
+///
+/// `0` on either env var disables that bound.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WsFragmentPolicy {
+    max_incomplete_message_frames: Option<usize>,
+    max_incomplete_message_duration: Option<Duration>,
+}
+
+impl WsFragmentPolicy {
+    pub(crate) fn from_env(env_config: &EnvConfig) -> Self {
+        let max_frames = env_config.websocket_max_incomplete_message_frames;
+        let max_seconds = env_config.websocket_max_incomplete_message_seconds;
+        Self {
+            max_incomplete_message_frames: (max_frames > 0).then_some(max_frames),
+            max_incomplete_message_duration: (max_seconds > 0)
+                .then(|| Duration::from_secs(max_seconds)),
+        }
+    }
+
+    /// `(max_frames, max_duration)` as installed into both framers.
+    pub(crate) fn bounds(&self) -> (Option<usize>, Option<Duration>) {
+        (
+            self.max_incomplete_message_frames,
+            self.max_incomplete_message_duration,
+        )
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1008 for an incomplete-message bound.
+///
+/// The reason is a fixed literal: it never echoes peer-controlled bytes and
+/// stays well inside the 123-byte control-frame budget.
+pub(crate) fn ws_fragment_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Policy,
+        reason: "fragmented message limit".into(),
+    }
+}
+
+/// Map a parser fragment-bound failure to its policy Close and log label.
+pub(crate) fn ws_fragment_policy_close_for_error(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> Option<(CloseFrame, &'static str)> {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let limit_kind = match error {
+        Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded) => "fragment_frames",
+        Error::Protocol(ProtocolError::IncompleteMessageTimeout) => "fragment_duration",
+        _ => return None,
+    };
+    Some((ws_fragment_policy_close_frame(), limit_kind))
+}
+
+/// Charge the physical fragments a peer spent on message reassembly.
+///
+/// Returns `Some(close)` when a plugin refuses the batch, in which case the
+/// caller must publish that Close and tear the session down without running
+/// the ordinary message chain — the fragments have already been charged, and
+/// the completing message must not be admitted on an exhausted budget.
+///
+/// Only `Message::Close` is honored: there is no message to mutate here.
+/// Observational plugins are skipped so they cannot see a partial decision.
+pub(crate) async fn apply_ws_fragment_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    fragment_frames: u64,
+) -> Option<Option<CloseFrame>> {
+    if plugins.is_empty() || fragment_frames == 0 {
+        return None;
+    }
+    for plugin in plugins {
+        if plugin.observes_ws_frame_decisions() {
+            continue;
+        }
+        if let Some(Message::Close(close)) = plugin
+            .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
+            .await
+        {
+            return Some(close);
+        }
+    }
+    None
+}
+
 pub(crate) type WebSocketRelayPluginLists = (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>);
 
 pub(crate) struct EffectiveWsSizeLimits {
@@ -12799,7 +12899,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     mut client_io: C,
-    backend_ws_stream: WebSocketStream<B>,
+    mut backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
     ws_framing_plugins: Vec<Arc<dyn Plugin>>,
@@ -12813,6 +12913,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -13012,12 +13113,37 @@ where
     // the wrap applied beneath the backend stream at connect time: read
     // progress on a partially received (fragmented/large) client message
     // refreshes the shared watermark before a complete `Message` is yielded.
-    let ws_stream = WebSocketStream::from_raw_socket(
+    let mut ws_stream = WebSocketStream::from_raw_socket(
         WsActivityIo::new(client_io, ws_idle_tracker.clone()),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
     .await;
+
+    // Physical-fragment accounting, installed on BOTH framers before any read
+    // and before `split()` hides the codec behind a `SplitStream`.
+    //
+    // Each meter counts the initial non-final frame and every intermediate
+    // continuation frame of a fragmented message — the frames that produce no
+    // `Message` and are therefore invisible to `on_ws_frame`. The relay drains
+    // its own direction's meter after each successful read and charges the
+    // batch through `on_ws_reassembly_frames`; the completing message is then
+    // charged exactly once by the ordinary frame chain, so no wire frame is
+    // counted twice. The independent count/duration bounds fail the connection
+    // closed for a message that never completes (GHSA-qq94-2gv2-phh6).
+    let client_fragment_meter = Arc::new(FragmentMeter::new());
+    let backend_fragment_meter = Arc::new(FragmentMeter::new());
+    let (max_frames, max_duration) = fragment_policy.bounds();
+    ws_stream.set_fragment_accounting(
+        Some(Arc::clone(&client_fragment_meter)),
+        max_frames,
+        max_duration,
+    );
+    backend_ws_stream.set_fragment_accounting(
+        Some(Arc::clone(&backend_fragment_meter)),
+        max_frames,
+        max_duration,
+    );
 
     // Split streams for bidirectional communication
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -13134,6 +13260,31 @@ where
                             break;
                         }
                     };
+                    // Charge the physical fragments this read consumed before
+                    // the reassembled message (or an interleaved control frame)
+                    // is admitted. Skipped on the error path (already tearing
+                    // down) and on a peer Close, which bypasses mutating
+                    // admission hooks so no plugin can replace the peer's
+                    // code/reason.
+                    if !matches!(msg, Err(_) | Ok(Message::Close(_)))
+                        && let Some(close_frame) = apply_ws_fragment_plugins(
+                            &ctb_plugins,
+                            &proxy_id_ctb,
+                            connection_id,
+                            WebSocketFrameDirection::ClientToBackend,
+                            client_fragment_meter.take_reassembly_frames(),
+                        )
+                        .await
+                    {
+                        debug!("Fragment budget rejected client->backend reassembly frames");
+                        let close = publish_ws_policy_close(
+                            &policy_close_ctb,
+                            &cancel_ctb,
+                            close_frame,
+                        );
+                        send_bounded_ws_close(&mut backend_sink, close).await;
+                        break;
+                    }
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -13317,6 +13468,23 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind)) =
+                                ws_fragment_policy_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -13397,6 +13565,27 @@ where
                             break;
                         }
                     };
+                    // Mirror of the client->backend half: a hostile backend can
+                    // fragment-flood the gateway just as a hostile client can.
+                    if !matches!(msg, Err(_) | Ok(Message::Close(_)))
+                        && let Some(close_frame) = apply_ws_fragment_plugins(
+                            &btc_plugins,
+                            &proxy_id_btc,
+                            connection_id,
+                            WebSocketFrameDirection::BackendToClient,
+                            backend_fragment_meter.take_reassembly_frames(),
+                        )
+                        .await
+                    {
+                        debug!("Fragment budget rejected backend->client reassembly frames");
+                        let close = publish_ws_policy_close(
+                            &policy_close_btc,
+                            &cancel_btc,
+                            close_frame,
+                        );
+                        send_bounded_ws_close(&mut ws_sink, close).await;
+                        break;
+                    }
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -13561,6 +13750,23 @@ where
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind)) =
+                                ws_fragment_policy_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from backend: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -16394,6 +16600,16 @@ pub(crate) async fn run_after_proxy_hooks(
     // request on non-AI proxies. When no reservation exists the keep/release
     // decision is moot anyway (`should_release_gateway_rejection` requires a
     // non-zero reservation), so the status is only useful when the marker is set.
+    //
+    // Independently, record the same genuine status as private typed provenance
+    // on `RequestContext` and notify every plugin once. That path is
+    // non-spoofable by public metadata and lets origin-success side effects
+    // (notably `response_caching` invalidation) run even when an earlier
+    // `after_proxy` hook replaces the client-visible response.
+    ctx.record_origin_http_response_status(response_status);
+    for plugin in plugins {
+        plugin.observe_origin_http_response_status(ctx, response_status);
+    }
     if ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
         ctx.metadata.insert(
             BACKEND_STATUS_METADATA_KEY.to_string(),
@@ -22336,6 +22552,7 @@ async fn handle_proxy_request_inner(
                 grpc_method,
                 grpc_headers,
                 grpc_req_body.clone(),
+                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
                 &state.grpc_pool,
@@ -22594,6 +22811,7 @@ async fn handle_proxy_request_inner(
                             grpc_method,
                             grpc_headers,
                             grpc_req_body.clone(),
+                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
                             &state.grpc_pool,
@@ -23048,6 +23266,8 @@ async fn handle_proxy_request_inner(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
                     grpc_body_bytes.clone(),
+                    // A retry replays the complete request, trailers included.
+                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
                     &state.grpc_pool,

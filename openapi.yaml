@@ -18212,7 +18212,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. XML conversion honors OpenAPI XML Object fields
+        binary media types. Multipart Content-Disposition accepts ordinary
+        `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
+        unquoted ext-value) and rejects continuations, quoted `filename*`,
+        bare/non-token parameter segments, conflicts, and hostile extended
+        values.
+        XML conversion honors OpenAPI XML Object fields
         `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
@@ -19305,7 +19310,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -19381,7 +19386,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on unsafe methods (POST, PUT, PATCH, DELETE, and extension methods, which are conservatively treated as unsafe). Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating"
+          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
 
     GraphqlConfig:
       type: object
@@ -20773,7 +20778,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:
