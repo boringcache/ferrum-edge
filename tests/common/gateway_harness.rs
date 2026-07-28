@@ -1081,9 +1081,15 @@ async fn build_env(
         GatewayMode::Database(db) => {
             env.insert("FERRUM_MODE".into(), "database".into());
             if !b.omit_admin_jwt_secret {
-                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), identity.jwt_secret.clone());
+                env.insert(
+                    "FERRUM_ADMIN_JWT_SECRET".into(),
+                    identity.jwt_secret.clone(),
+                );
             }
-            env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), identity.jwt_issuer.clone());
+            env.insert(
+                "FERRUM_ADMIN_JWT_ISSUER".into(),
+                identity.jwt_issuer.clone(),
+            );
             env.insert(
                 "FERRUM_DB_POLL_INTERVAL".into(),
                 b.db_poll_interval_seconds.to_string(),
@@ -1098,9 +1104,15 @@ async fn build_env(
             // File mode generates its own admin JWT secret internally (read-only
             // API), but setting a secret makes admin tokens testable.
             if !b.omit_admin_jwt_secret {
-                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), identity.jwt_secret.clone());
+                env.insert(
+                    "FERRUM_ADMIN_JWT_SECRET".into(),
+                    identity.jwt_secret.clone(),
+                );
             }
-            env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), identity.jwt_issuer.clone());
+            env.insert(
+                "FERRUM_ADMIN_JWT_ISSUER".into(),
+                identity.jwt_issuer.clone(),
+            );
             let path = temp.path().join("ferrum.yaml");
             std::fs::write(&path, config_yaml)?;
             env.insert(
@@ -1115,9 +1127,15 @@ async fn build_env(
         } => {
             env.insert("FERRUM_MODE".into(), "cp".into());
             if !b.omit_admin_jwt_secret {
-                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), identity.jwt_secret.clone());
+                env.insert(
+                    "FERRUM_ADMIN_JWT_SECRET".into(),
+                    identity.jwt_secret.clone(),
+                );
             }
-            env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), identity.jwt_issuer.clone());
+            env.insert(
+                "FERRUM_ADMIN_JWT_ISSUER".into(),
+                identity.jwt_issuer.clone(),
+            );
             env.insert(
                 "FERRUM_DB_POLL_INTERVAL".into(),
                 b.db_poll_interval_seconds.to_string(),
@@ -1144,9 +1162,15 @@ async fn build_env(
         GatewayMode::DataPlane { cp_grpc_urls } => {
             env.insert("FERRUM_MODE".into(), "dp".into());
             if !b.omit_admin_jwt_secret {
-                env.insert("FERRUM_ADMIN_JWT_SECRET".into(), identity.jwt_secret.clone());
+                env.insert(
+                    "FERRUM_ADMIN_JWT_SECRET".into(),
+                    identity.jwt_secret.clone(),
+                );
             }
-            env.insert("FERRUM_ADMIN_JWT_ISSUER".into(), identity.jwt_issuer.clone());
+            env.insert(
+                "FERRUM_ADMIN_JWT_ISSUER".into(),
+                identity.jwt_issuer.clone(),
+            );
             env.insert(
                 "FERRUM_CP_DP_GRPC_JWT_SECRET".into(),
                 "ferrum-edge-shared-harness-grpc-secret00".into(),
@@ -1230,7 +1254,9 @@ async fn probe_gateway_identity_once(
         return Err(format!("HTTP {status}"));
     }
     if value.get("ready").and_then(serde_json::Value::as_bool) != Some(true) {
-        return Err(format!("HTTP {status}: identified gateway is not ready yet"));
+        return Err(format!(
+            "HTTP {status}: identified gateway is not ready yet"
+        ));
     }
     Ok(())
 }
