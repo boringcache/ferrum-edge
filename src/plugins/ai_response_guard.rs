@@ -21,7 +21,7 @@
 //! inspected opportunistically and never forced onto the buffered path.
 
 use async_trait::async_trait;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use prost::Message as _;
 use prost_reflect::{
@@ -2087,27 +2087,29 @@ fn decompress_grpc_gzip(
     payload: &[u8],
     max_message_bytes: usize,
 ) -> Result<Vec<u8>, GrpcFramingError> {
-    let mut input: &[u8] = payload;
+    // Use `bufread::GzDecoder` (not `read::GzDecoder`): the read variant wraps
+    // a `BufReader` and may pull past the first member's trailer into its
+    // internal buffer, which would make a leftover-slice check miss trailing
+    // garbage or a second concatenated member.
+    let mut decoder = GzDecoder::new(payload);
     let mut decompressed = Vec::with_capacity(payload.len().min(max_message_bytes));
-    {
-        let mut decoder = GzDecoder::new(&mut input);
-        let mut buffer = [0u8; 8192];
-        loop {
-            let read = decoder
-                .read(&mut buffer)
-                .map_err(|_| GrpcFramingError::Malformed)?;
-            if read == 0 {
-                break;
-            }
-            if decompressed.len().saturating_add(read) > max_message_bytes {
-                return Err(GrpcFramingError::MessageTooLarge);
-            }
-            decompressed.extend_from_slice(&buffer[..read]);
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = decoder
+            .read(&mut buffer)
+            .map_err(|_| GrpcFramingError::Malformed)?;
+        if read == 0 {
+            break;
         }
+        if decompressed.len().saturating_add(read) > max_message_bytes {
+            return Err(GrpcFramingError::MessageTooLarge);
+        }
+        decompressed.extend_from_slice(&buffer[..read]);
     }
-    // `GzDecoder` stops after the first member; any unread input is trailing
-    // garbage or another concatenated member and must not be silently ignored.
-    if !input.is_empty() {
+    // First member (header + deflate + trailer/CRC) was fully validated.
+    // Recover the exact unconsumed input; any remainder is trailing garbage
+    // or another concatenated member and must not be silently ignored.
+    if !decoder.into_inner().is_empty() {
         return Err(GrpcFramingError::Malformed);
     }
     Ok(decompressed)
