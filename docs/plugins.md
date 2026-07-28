@@ -1190,6 +1190,46 @@ current reservation depth. Alert on
 aggregate reject counter when diagnosing budget exhaustion: the aggregate also
 counts closed-admission and no-runtime rejects that occur normally at shutdown.
 
+### Process-wide retained-byte ceiling
+
+The task budget above bounds *pending delivery tasks*. A second, independent
+budget bounds *retained bytes*. Every observability sink instance —
+`http_logging`, `tcp_logging`, `udp_logging`, `statsd_logging`, `loki_logging`,
+`ws_logging`, `kafka_logging`, the OpenTelemetry/Zipkin/Datadog trace
+exporters, and `api_chargeback_sink` — already reserves against its own
+per-instance `buffer_max_bytes` budget before it clones, serializes, or
+compresses an attacker-shaped record. Each of those reservations now also takes
+a matching reservation against one process-wide ceiling,
+`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` (default 256 MiB).
+
+The process reservation is taken *first*, so a refused aggregate reservation
+never leaves per-instance bytes held, and the record is refused before any
+clone, serialization, or compression work happens. Reservations shrink to the
+exact retained size once the record is measured and release on drop, so
+delivery, drops, rejected channel handoffs, and cancellation all recover
+capacity without waiting for shutdown.
+
+This is what stops configuration from multiplying the bound: ten sink instances
+each configured at the 256 MiB per-instance hard maximum retain at most the one
+configured process total between them, not 2.5 GiB.
+
+Telemetry uses fixed labels only — no attacker-controlled label values:
+
+- `ferrum_observability_retained_bytes` — current process-wide retention
+- `ferrum_observability_retained_bytes_high_water` — peak since startup
+- `ferrum_observability_max_retained_bytes` — the configured ceiling
+- `ferrum_observability_process_ceiling_rejections_total` — admissions refused
+  by the ceiling specifically, rather than by a per-instance budget
+
+Per-instance refusals stay on each sink's own drop accounting, so the two
+counters together tell an operator whether to raise one sink's
+`buffer_max_bytes` or the process ceiling.
+
+The process-global stdout access-log sink is deliberately excluded: it is a
+single sink bounded by `FERRUM_LOG_BUFFER_CAPACITY` /
+`FERRUM_LOG_BUFFER_BYTES` / `FERRUM_LOG_MAX_RECORD_BYTES`, and it does not
+multiply with plugin instance count.
+
 A completed drain is terminal for that delivery lifecycle *generation*: its
 task and worker admission stay closed and its drain report stays cached, so
 late producers on a shutting-down process cannot reopen delivery work behind

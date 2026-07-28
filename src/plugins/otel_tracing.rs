@@ -34,6 +34,7 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
+use super::utils::byte_budget::ProcessByteReservation;
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
@@ -326,7 +327,7 @@ impl SpanData {
             response_streamed: summary.response_streamed,
             client_disconnected: summary.client_disconnected,
             otlp_error,
-            mesh_attributes: mesh_trace_attributes(&summary.metadata),
+            mesh_attributes: bounded_mesh_attributes(&summary.metadata, max_attribute_bytes),
             stream_protocol: None,
             stream_listen_port: None,
             stream_bytes_sent: None,
@@ -428,7 +429,7 @@ impl SpanData {
                 Some(DisconnectCause::RecvError)
             ),
             otlp_error,
-            mesh_attributes: mesh_trace_attributes(&summary.metadata),
+            mesh_attributes: bounded_mesh_attributes(&summary.metadata, max_attribute_bytes),
             stream_protocol: Some(summary.protocol.clone()),
             stream_listen_port: Some(summary.listen_port),
             stream_bytes_sent: Some(summary.bytes_sent),
@@ -511,7 +512,7 @@ impl SpanData {
             response_streamed: false,
             client_disconnected: websocket_client_disconnected(ctx),
             otlp_error,
-            mesh_attributes: mesh_trace_attributes(&ctx.metadata),
+            mesh_attributes: bounded_mesh_attributes(&ctx.metadata, max_attribute_bytes),
             stream_protocol: Some("websocket".to_string()),
             stream_listen_port: Some(ctx.listen_port),
             stream_bytes_sent: Some(ctx.bytes_client_to_backend),
@@ -1129,6 +1130,11 @@ struct TraceHttpExporterConfig {
 struct QueuedSpan {
     span: SpanData,
     bytes: usize,
+    /// Matching reservation against the process-wide observability ceiling.
+    /// Held for exactly as long as the span is retained (queue plus the
+    /// worker's in-flight batch), so multiple exporters cannot multiply past
+    /// the process total.
+    process: ProcessByteReservation,
 }
 
 struct BufferedTraceExporter {
@@ -1225,14 +1231,24 @@ impl BufferedTraceExporter {
         }
     }
 
-    fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<(), String> {
+    /// Reserve `bytes` against the process ceiling first, then this exporter's
+    /// own queued-byte budget. Returning the process reservation to the caller
+    /// keeps release tied to the span's actual retention lifetime; a failed
+    /// per-instance reservation drops it here so nothing leaks.
+    fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<ProcessByteReservation, String> {
+        let process = ProcessByteReservation::try_acquire(bytes).ok_or_else(|| {
+            format!(
+                "process-wide observability retained-byte ceiling exceeded (+{bytes} > {})",
+                crate::plugins::utils::byte_budget::process_max_retained_bytes()
+            )
+        })?;
         self.queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(bytes)
                     .filter(|next| *next <= self.buffer_max_bytes)
             })
-            .map(|_| ())
+            .map(|_| process)
             .map_err(|current| {
                 format!(
                     "queued byte budget exceeded ({current}+{bytes} > {})",
@@ -1272,13 +1288,22 @@ impl TraceExporter for BufferedTraceExporter {
         };
         self.queued_spans.fetch_add(1, Ordering::Relaxed);
         let bytes = span.approx_queued_bytes();
-        if let Err(error) = self.try_reserve_queued_bytes(bytes) {
-            decrement_queued_spans(&self.queued_spans, 1);
-            return Err(error);
-        }
-        match self.sender.try_send(QueuedSpan { span, bytes }) {
+        let process = match self.try_reserve_queued_bytes(bytes) {
+            Ok(process) => process,
+            Err(error) => {
+                decrement_queued_spans(&self.queued_spans, 1);
+                return Err(error);
+            }
+        };
+        match self.sender.try_send(QueuedSpan {
+            span,
+            bytes,
+            process,
+        }) {
             Ok(()) => Ok(()),
             Err(error) => {
+                // The rejected `QueuedSpan` carries the process reservation and
+                // releases it on drop; only the per-instance charge is manual.
                 self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                 decrement_queued_spans(&self.queued_spans, 1);
                 Err(error.to_string())
@@ -1572,6 +1597,10 @@ async fn trace_export_flush_loop(
     mut close_rx: watch::Receiver<bool>,
 ) {
     let mut buffer: Vec<SpanData> = Vec::with_capacity(cfg.batch_size);
+    // Process-ceiling reservations for the spans currently in `buffer`. They
+    // are held for the whole retention window (queue plus in-flight batch) and
+    // released together with the per-exporter charge after each send.
+    let mut reservations: Vec<ProcessByteReservation> = Vec::with_capacity(cfg.batch_size);
     let mut buffered_bytes = 0usize;
     let mut timer = tokio::time::interval(cfg.flush_interval);
     let mut closing = *close_rx.borrow();
@@ -1596,12 +1625,14 @@ async fn trace_export_flush_loop(
                     Some(queued) => {
                         buffered_bytes = buffered_bytes.saturating_add(queued.bytes);
                         buffer.push(queued.span);
+                        reservations.push(queued.process);
                         if buffer.len() >= cfg.batch_size {
                             let span_count = buffer.len();
                             send_trace_batch(&cfg, &buffer).await;
                             queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                             decrement_queued_spans(&queued_spans, span_count);
                             buffer.clear();
+                            reservations.clear();
                             buffered_bytes = 0;
                         }
                     }
@@ -1611,6 +1642,7 @@ async fn trace_export_flush_loop(
                             send_trace_batch(&cfg, &buffer).await;
                             queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                             decrement_queued_spans(&queued_spans, span_count);
+                            reservations.clear();
                         }
                         break;
                     }
@@ -1624,6 +1656,7 @@ async fn trace_export_flush_loop(
                     queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
                     decrement_queued_spans(&queued_spans, span_count);
                     buffer.clear();
+                    reservations.clear();
                     buffered_bytes = 0;
                 }
             }
@@ -2892,6 +2925,26 @@ fn sample_ratio(ratio: f64) -> bool {
     }
     let random = Uuid::new_v4().as_u128() as f64 / (u128::MAX as f64);
     random < ratio
+}
+
+/// Mesh trace attributes with every value bounded by `max_attribute_bytes`.
+///
+/// Attribute *names* are already bounded (gateway-set `mesh.*` keys, plus at
+/// most 32 operator-named custom keys of <= 128 bytes). Their values come from
+/// request metadata and can be attacker-shaped, so they get the same
+/// per-attribute ceiling and `...` truncation marker as every other span
+/// string field.
+fn bounded_mesh_attributes(
+    metadata: &HashMap<String, String>,
+    max_attribute_bytes: usize,
+) -> Vec<(String, String)> {
+    mesh_trace_attributes(metadata)
+        .into_iter()
+        .map(|(key, value)| {
+            let bounded = truncate_attr(&value, max_attribute_bytes);
+            (key, bounded)
+        })
+        .collect()
 }
 
 fn truncate_attr(value: &str, max_bytes: usize) -> String {

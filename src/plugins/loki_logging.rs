@@ -33,6 +33,7 @@ use tracing::warn;
 
 use crate::config::types::MAX_ID_LENGTH;
 
+use super::utils::byte_budget::ProcessByteReservation;
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome,
@@ -120,6 +121,9 @@ struct LokiFlushConfig {
 struct LokiByteLease {
     used_bytes: Arc<AtomicUsize>,
     bytes: usize,
+    /// Matching reservation against the process-wide observability ceiling, so
+    /// multiple Loki instances cannot multiply past the process total.
+    _process: ProcessByteReservation,
 }
 
 impl Drop for LokiByteLease {
@@ -144,6 +148,12 @@ impl LokiByteBudget {
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<Arc<LokiByteLease>> {
+        // Process ceiling first: a failed aggregate reservation must never
+        // leave per-instance bytes held.
+        let Some(process) = ProcessByteReservation::try_acquire(bytes) else {
+            self.record_drop("process-wide retained-byte ceiling exhausted");
+            return None;
+        };
         let reserved = self
             .used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -151,6 +161,7 @@ impl LokiByteBudget {
                     .filter(|next| *next <= self.max_bytes)
             });
         if reserved.is_err() {
+            drop(process);
             self.record_drop("retained-content byte budget exhausted");
             return None;
         }
@@ -158,6 +169,7 @@ impl LokiByteBudget {
         Some(Arc::new(LokiByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
             bytes,
+            _process: process,
         }))
     }
 

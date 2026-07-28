@@ -1104,6 +1104,11 @@ pub fn render_prometheus() -> String {
     let admitted_tasks = lifecycle.admitted_tasks.load(Ordering::Acquire);
     let max_tasks = lifecycle.max_tasks;
     let capacity_rejections = lifecycle.capacity_rejection_count();
+    let retained_bytes = crate::plugins::utils::byte_budget::process_retained_bytes();
+    let max_retained_bytes = crate::plugins::utils::byte_budget::process_max_retained_bytes();
+    let retained_high_water =
+        crate::plugins::utils::byte_budget::process_retained_bytes_high_water();
+    let ceiling_rejections = crate::plugins::utils::byte_budget::process_ceiling_rejections();
     let active_workers = match lifecycle.workers.lock() {
         Ok(workers) => workers
             .values()
@@ -1145,7 +1150,19 @@ pub fn render_prometheus() -> String {
          ferrum_observability_delivery_lost_worker_records_total {}\n\
          # HELP ferrum_observability_delivery_drain_timeouts_total Observability shutdown drains that exhausted their shared deadline.\n\
          # TYPE ferrum_observability_delivery_drain_timeouts_total counter\n\
-         ferrum_observability_delivery_drain_timeouts_total {}\n",
+         ferrum_observability_delivery_drain_timeouts_total {}\n\
+         # HELP ferrum_observability_retained_bytes Bytes currently retained across every observability sink instance in this process.\n\
+         # TYPE ferrum_observability_retained_bytes gauge\n\
+         ferrum_observability_retained_bytes {retained_bytes}\n\
+         # HELP ferrum_observability_max_retained_bytes Configured process-wide retained-byte ceiling shared by all observability sink instances.\n\
+         # TYPE ferrum_observability_max_retained_bytes gauge\n\
+         ferrum_observability_max_retained_bytes {max_retained_bytes}\n\
+         # HELP ferrum_observability_retained_bytes_high_water Peak process-wide observability retention observed since startup.\n\
+         # TYPE ferrum_observability_retained_bytes_high_water gauge\n\
+         ferrum_observability_retained_bytes_high_water {retained_high_water}\n\
+         # HELP ferrum_observability_process_ceiling_rejections_total Sink admissions refused specifically by the process-wide retained-byte ceiling rather than a per-instance budget.\n\
+         # TYPE ferrum_observability_process_ceiling_rejections_total counter\n\
+         ferrum_observability_process_ceiling_rejections_total {ceiling_rejections}\n",
         report.rejected_tasks,
         report.cancelled_tasks,
         report.lost_worker_records,

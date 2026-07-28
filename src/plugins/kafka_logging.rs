@@ -48,6 +48,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
+use super::utils::byte_budget::ProcessByteReservation;
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
@@ -817,6 +818,10 @@ impl ProducerContext for KafkaDeliveryContext {
 struct KafkaByteLease {
     used_bytes: Arc<AtomicUsize>,
     bytes: AtomicUsize,
+    /// Matching reservation against the process-wide observability ceiling, so
+    /// multiple `kafka_logging` instances cannot multiply past the process
+    /// total.
+    process: ProcessByteReservation,
 }
 
 impl KafkaByteLease {
@@ -832,6 +837,7 @@ impl KafkaByteLease {
                 Ok(_) => {
                     self.used_bytes
                         .fetch_sub(current - new_bytes, Ordering::AcqRel);
+                    self.process.shrink_to(new_bytes);
                     return;
                 }
                 Err(actual) => current = actual,
@@ -867,6 +873,9 @@ impl KafkaByteBudget {
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<Arc<KafkaByteLease>> {
+        // Process ceiling first: a failed aggregate reservation must never
+        // leave per-instance bytes held.
+        let process = ProcessByteReservation::try_acquire(bytes)?;
         let reserved = self
             .used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -879,6 +888,7 @@ impl KafkaByteBudget {
         Some(Arc::new(KafkaByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
             bytes: AtomicUsize::new(bytes),
+            process,
         }))
     }
 }
