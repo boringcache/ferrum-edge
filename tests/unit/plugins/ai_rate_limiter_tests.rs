@@ -4264,8 +4264,15 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
 /// provider had reported usage.
 #[tokio::test]
 async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
+    // `observed_usage` reads `ai_ratelimit_usage` from metadata, which
+    // `store_metadata` only writes when headers are exposed.
     let plugin = AiRateLimiter::new(
-        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
         PluginHttpClient::default(),
     )
     .unwrap();
@@ -4294,7 +4301,15 @@ async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
         !ctx.metadata.contains_key("ai_ratelimit_actual_tokens"),
         "a framed gRPC-Web body must never be reconciled as provider-reported usage"
     );
-    // Default `charge_estimate` keeps the reservation rather than charging 0.
+    assert_eq!(
+        ctx.metadata
+            .get("ai_ratelimit_unmetered_action")
+            .map(String::as_str),
+        Some("charge_estimate"),
+        "framed gRPC-Web must take the unmetered policy path, not JSON usage extract"
+    );
+    // Default `charge_estimate` keeps the reservation rather than charging 0
+    // or the embedded OpenAI usage total (700).
     assert_eq!(observed_usage(&plugin).await, reserved);
 }
 
