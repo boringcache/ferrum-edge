@@ -332,6 +332,24 @@ fn incomplete_message_frame_bound_fails_closed() {
     assert!(close.reason.as_str().len() <= 123);
 }
 
+/// Zero duration arms the timer on the initial non-final frame without failing.
+#[test]
+fn incomplete_message_duration_zero_arms_on_initial_frame() {
+    let bytes = vec![0x01, 0x00];
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(bytes),
+        Role::Client,
+        None,
+    );
+    socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+    let error = socket.read().expect_err("peer must reset without completing");
+    assert!(matches!(
+        error,
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    ));
+}
+
 /// The duration bound is independent of the frame-count bound.
 #[test]
 fn incomplete_message_duration_bound_fails_closed() {

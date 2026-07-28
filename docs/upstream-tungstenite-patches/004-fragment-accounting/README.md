@@ -85,6 +85,7 @@ dependency-policy SLA.
   `fragment_meter_ignores_unfragmented_messages`,
   `incomplete_message_frame_limit_fails_closed`,
   `incomplete_message_duration_limit_fails_closed`,
+  `incomplete_message_duration_zero_arms_on_initial_frame`,
   `incomplete_message_duration_rejects_final_continuation_bypass`,
   `incomplete_message_duration_rejects_interleaved_ping_pong`,
   `incomplete_message_close_bypasses_duration_bound`,

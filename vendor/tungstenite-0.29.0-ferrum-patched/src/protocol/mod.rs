@@ -611,14 +611,15 @@ impl WebSocketContext {
 
     /// Enforce the incomplete-message duration bound whenever a message is
     /// still in flight. Called for every subsequent non-Close frame without
-    /// incrementing the frame counter.
+    /// incrementing the frame counter. The deadline is inclusive: at or after
+    /// `max_duration` since the initial non-final frame arms the timer.
     fn enforce_incomplete_message_duration(&self) -> Result<()> {
         if self.incomplete.is_none() {
             return Ok(());
         }
         if let Some(max_duration) = self.config.max_incomplete_message_duration {
             if let Some(started) = self.incomplete_started_at {
-                if started.elapsed() > max_duration {
+                if started.elapsed() >= max_duration {
                     return Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout));
                 }
             }
@@ -639,8 +640,11 @@ impl WebSocketContext {
             }
         }
         if self.config.max_incomplete_message_duration.is_some() {
-            self.incomplete_started_at.get_or_insert_with(Instant::now);
-            self.enforce_incomplete_message_duration()?;
+            if self.incomplete_started_at.is_some() {
+                self.enforce_incomplete_message_duration()?;
+            } else {
+                self.incomplete_started_at = Some(Instant::now());
+            }
         }
         Ok(())
     }
@@ -1264,6 +1268,26 @@ mod tests {
             socket.read(),
             Err(Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded))
         ));
+    }
+
+    /// Zero duration arms the timer on the initial non-final frame without
+    /// failing; only subsequent fragments while the message stays incomplete
+    /// trip the bound.
+    #[test]
+    fn incomplete_message_duration_zero_arms_on_initial_frame() {
+        let incoming = vec![0x01, 0x00];
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+        let err = socket.read().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+            ),
+            "initial non-final frame must arm the timer, not time out: {err:?}"
+        );
     }
 
     /// The duration bound is independent of the frame-count bound: a slow
