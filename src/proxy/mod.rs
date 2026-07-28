@@ -2606,7 +2606,7 @@ fn http2_pool_sender_error_response(
     error!(proxy_id = %proxy.id, error = %msg, "HTTP/2 pool connection failed");
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(error_body.into_bytes()),
+        body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         // Derive connection_error from the class so a gateway-side egress denial
         // (DispatchPolicyRejected — a hostname/dns_override that resolves or
@@ -2652,7 +2652,7 @@ pub(crate) fn direct_h2_send_request_error_response_for_class(
 ) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -2670,7 +2670,7 @@ fn backend_tls_sni_requires_direct_h2_response(
     );
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
         headers,
         // reqwest cannot apply per-request backend SNI. Mark this terminal
         // gateway policy response as non-retryable so a 502 retry policy
@@ -4215,7 +4215,9 @@ pub(crate) async fn run_final_request_body_hooks_with_provenance(
 
 pub(crate) struct RejectedResponseParts {
     pub status_code: u16,
-    pub body: Vec<u8>,
+    /// Immutable response bytes. Cached synthetic producers retain `Bytes` and
+    /// this boundary must not force a per-hit `to_vec()` copy.
+    pub body: Bytes,
     pub headers: HashMap<String, String>,
 }
 
@@ -4229,7 +4231,7 @@ pub(crate) fn plugin_result_into_reject_parts(
             headers,
         } => Some(RejectedResponseParts {
             status_code,
-            body: body.into_bytes(),
+            body: Bytes::from(body),
             headers,
         }),
         PluginResult::RejectBinary {
@@ -4238,7 +4240,7 @@ pub(crate) fn plugin_result_into_reject_parts(
             headers,
         } => Some(RejectedResponseParts {
             status_code,
-            body: body.to_vec(),
+            body,
             headers,
         }),
         PluginResult::Continue => None,
@@ -4253,7 +4255,7 @@ fn reject_result_to_backend_response(
         .expect("continue result cannot be converted to a reject");
     retry::BackendResponse {
         status_code: reject.status_code,
-        body: ResponseBody::Buffered(reject.body),
+        body: ResponseBody::buffered(reject.body),
         headers: reject.headers,
         connection_error: false,
         backend_resolved_ip,
@@ -15340,12 +15342,13 @@ async fn log_rejected_request_with_path_and_backend_state(
 fn replace_rejection_with_gateway_deadline(
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: Option<&mut Vec<u8>>,
+    response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
     *status_code = StatusCode::OK.as_u16();
     if let Some(body) = response_body {
-        body.clear();
+        // Drop any retained shared capacity; do not clear-in-place.
+        *body = Bytes::new();
     }
     ctx.retain_deadline_response_gateway_headers(response_headers);
     grpc_proxy::finalize_grpc_error_response_headers(
@@ -15362,7 +15365,7 @@ const DETACHED_REJECTION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 struct OwnedRejectionHookResult {
     ctx: RequestContext,
     status_code: u16,
-    response_body: Option<Vec<u8>>,
+    response_body: Option<Bytes>,
     response_headers: HashMap<String, String>,
     result: PluginResult,
 }
@@ -15374,7 +15377,7 @@ fn owned_rejection_hook_future(
     plugin: Arc<dyn Plugin>,
     mut ctx: RequestContext,
     status_code: u16,
-    response_body: Option<Vec<u8>>,
+    response_body: Option<Bytes>,
     mut response_headers: HashMap<String, String>,
 ) -> OwnedRejectionHookFuture {
     Box::pin(async move {
@@ -15407,7 +15410,7 @@ fn adopt_owned_rejection_hook_result(
     outcome: OwnedRejectionHookResult,
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: &mut Option<&mut Vec<u8>>,
+    response_body: &mut Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) -> PluginResult {
     *ctx = outcome.ctx;
@@ -15493,7 +15496,7 @@ async fn run_after_proxy_hooks_on_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    mut response_body: Option<&mut Vec<u8>>,
+    mut response_body: Option<&mut Bytes>,
     response_headers: &mut HashMap<String, String>,
 ) {
     ctx.begin_rejection_deadline_response_header_provenance(response_headers);
@@ -15758,7 +15761,7 @@ pub(crate) async fn apply_replaceable_after_proxy_hooks_to_rejection(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status_code: &mut u16,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     response_headers: &mut HashMap<String, String>,
 ) {
     run_after_proxy_hooks_on_rejection(
@@ -15791,7 +15794,7 @@ fn rebuild_plugin_rejection_response_headers(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
-) -> Vec<u8> {
+) -> Bytes {
     *response_status = reject.status_code;
     response_headers.clear();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -15807,7 +15810,7 @@ pub(crate) async fn apply_plugin_rejection_response(
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
     reject: RejectedResponseParts,
-) -> Vec<u8> {
+) -> Bytes {
     let mut body =
         rebuild_plugin_rejection_response_headers(response_status, response_headers, reject);
     apply_replaceable_after_proxy_hooks_to_rejection(
@@ -15929,7 +15932,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
 ) {
     // Mark the context for the duration of this body-hook phase so that storing
     // plugins (e.g. `request_deduplication`) can tell this body is a synthetic
@@ -16047,7 +16050,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             if let Some(transformed) = transformed {
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
-                *response_body = transformed;
+                *response_body = Bytes::from(transformed);
                 crate::plugins::finalize_response_body_transformation(
                     plugin.as_ref(),
                     ctx,
@@ -16078,7 +16081,7 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
                 response_headers,
                 RejectedResponseParts {
                     status_code: 502,
-                    body: br#"{"error":"response redaction failed"}"#.to_vec(),
+                    body: Bytes::from_static(br#"{"error":"response redaction failed"}"#),
                     headers: HashMap::new(),
                 },
             );
@@ -16178,7 +16181,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
     ctx: &mut RequestContext,
     status: &mut u16,
     headers: &mut HashMap<String, String>,
-    body: &mut Vec<u8>,
+    body: &mut Bytes,
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) {
@@ -16270,7 +16273,8 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        let normalized =
+            normalize_reject_response(status_code, body.clone(), headers, is_grpc_request);
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -16297,7 +16301,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 plugins[index + 1..].to_vec(),
                 *status,
                 Arc::new(headers.clone()),
-                Arc::new(body.clone()),
+                body.clone(),
             );
             break;
         }
@@ -16325,13 +16329,15 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         headers,
         body.len(),
     ) {
-        *body = Vec::new();
+        // Drop the shared reference (and any uniquely owned allocation) rather
+        // than clearing in place and retaining capacity.
+        *body = Bytes::new();
     }
 }
 
 pub(crate) struct AfterProxyReject {
     pub status_code: u16,
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub headers: HashMap<String, String>,
 }
 
@@ -16470,7 +16476,7 @@ pub(crate) async fn run_after_proxy_hooks(
 pub(crate) struct NormalizedRejectResponse {
     pub(crate) http_status: StatusCode,
     pub(crate) headers: HashMap<String, String>,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
 }
@@ -16593,10 +16599,11 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
 
 pub(crate) fn normalize_reject_response(
     status: StatusCode,
-    body: &[u8],
+    body: impl Into<Bytes>,
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
+    let body = body.into();
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
     if !is_grpc_request || grpc_web_accept_rejected {
@@ -16611,7 +16618,7 @@ pub(crate) fn normalize_reject_response(
         return NormalizedRejectResponse {
             http_status: status,
             headers: normalized_headers,
-            body: body.to_vec(),
+            body,
             grpc_status: None,
             grpc_message: None,
         };
@@ -16624,7 +16631,7 @@ pub(crate) fn normalize_reject_response(
     let grpc_message = headers
         .get("grpc-message")
         .cloned()
-        .or_else(|| extract_grpc_reject_message(body))
+        .or_else(|| extract_grpc_reject_message(body.as_ref()))
         .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
     let grpc_message = sanitize_grpc_message(&grpc_message);
 
@@ -16647,7 +16654,7 @@ pub(crate) fn normalize_reject_response(
     NormalizedRejectResponse {
         http_status: StatusCode::OK,
         headers: normalized_headers,
-        body: Vec::new(),
+        body: Bytes::new(),
         grpc_status: Some(grpc_status),
         grpc_message: Some(grpc_message),
     }
@@ -16656,7 +16663,7 @@ pub(crate) fn normalize_reject_response(
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
     normalize_reject_response(
         StatusCode::OK,
-        &[],
+        Bytes::new(),
         &HashMap::from([
             ("content-type".to_string(), "application/grpc".to_string()),
             (
@@ -16707,7 +16714,7 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
         plugins,
         ctx,
         status,
-        &reject.body,
+        reject.body,
         reject.headers,
         true,
         invoke_response_committed,
@@ -16730,7 +16737,7 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
         // empty Full bodies; 204/304 are already special-cased upstream).
         ProxyBody::empty_for_response_status(reject.http_status.as_u16())
     } else {
-        ProxyBody::full(Bytes::from(reject.body))
+        ProxyBody::full(reject.body)
     };
 
     builder.body(body).unwrap_or_else(|_| {
@@ -16941,7 +16948,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
     ctx: &mut RequestContext,
     grpc_web_response_content_type: Option<&str>,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     ctx.mark_gateway_deadline_response_selected();
@@ -16959,7 +16966,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
             None,
         );
         *response_headers = response.headers;
-        *response_body = response.body;
+        *response_body = Bytes::from(response.body);
     } else {
         grpc_proxy::finalize_grpc_error_response_headers(
             response_headers,
@@ -16967,7 +16974,7 @@ pub(crate) fn replace_buffered_grpc_response_with_deadline(
             GATEWAY_DEADLINE_EXCEEDED_MESSAGE,
             initial_response_header_policy_plugins,
         );
-        response_body.clear();
+        *response_body = Bytes::new();
     }
     ctx.sync_deadline_response_terminal_headers(response_headers);
     insert_grpc_error_metadata(
@@ -17093,7 +17100,7 @@ async fn replace_buffered_response_with_representation_error(
     grpc_web_response_content_type: Option<&str>,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     rejection: crate::plugins::response_representation::RepresentationRejection,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
@@ -17139,7 +17146,7 @@ async fn replace_buffered_response_with_representation_error(
             None,
         );
         *response_headers = response.headers;
-        *response_body = response.body;
+        *response_body = Bytes::from(response.body);
         *response_status = StatusCode::OK.as_u16();
         ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
@@ -17162,7 +17169,7 @@ async fn replace_buffered_response_with_representation_error(
             REPRESENTATION_UNINSPECTABLE_MESSAGE,
             &[],
         );
-        response_body.clear();
+        *response_body = Bytes::new();
         *response_status = StatusCode::OK.as_u16();
         ctx.sync_deadline_response_terminal_headers(response_headers);
         insert_grpc_error_metadata(
@@ -17181,8 +17188,9 @@ async fn replace_buffered_response_with_representation_error(
             response_headers,
             RejectedResponseParts {
                 status_code: 502,
-                body: format!(r#"{{"error":"{REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#)
-                    .into_bytes(),
+                body: Bytes::from(format!(
+                    r#"{{"error":"{REPRESENTATION_UNINSPECTABLE_MESSAGE}"}}"#
+                )),
                 headers: HashMap::new(),
             },
         );
@@ -17216,7 +17224,7 @@ pub(crate) async fn admit_buffered_response_body_transforms(
     origin: crate::plugins::response_representation::RepresentationOrigin,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_source: InitialResponseHeaderPolicySource<'_>,
     apply_reject_after_proxy_hooks: bool,
@@ -17317,7 +17325,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
     origin: crate::plugins::response_representation::RepresentationOrigin,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     grpc_web_response_content_type: Option<&str>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> (bool, bool) {
@@ -17382,7 +17390,7 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
         };
         if let Some(transformed) = transformed {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
-            *response_body = transformed;
+            *response_body = Bytes::from(transformed);
             crate::plugins::finalize_response_body_transformation(
                 plugin.as_ref(),
                 ctx,
@@ -17424,7 +17432,7 @@ fn owned_response_committed_hook_future(
     mut ctx: RequestContext,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
-    response_body: Arc<Vec<u8>>,
+    response_body: Bytes,
 ) -> OwnedResponseCommittedHookFuture {
     Box::pin(async move {
         plugin
@@ -17463,7 +17471,7 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         ctx.clone(),
         response_status,
         Arc::new(response_headers.clone()),
-        Arc::new(response_body.to_vec()),
+        Bytes::copy_from_slice(response_body),
     );
     if terminal_gateway_deadline {
         let completed = futures_util::future::poll_fn(|cx| {
@@ -17499,7 +17507,7 @@ pub(crate) fn spawn_detached_response_committed_hooks(
     remaining_plugins: Vec<Arc<dyn Plugin>>,
     response_status: u16,
     response_headers: Arc<HashMap<String, String>>,
-    response_body: Arc<Vec<u8>>,
+    response_body: Bytes,
 ) {
     std::mem::drop(tokio::spawn(async move {
         let cleanup = async move {
@@ -17540,7 +17548,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
     let terminal_at_entry = ctx.gateway_deadline_response_selected();
@@ -17589,7 +17597,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             plugins[index + 1..].to_vec(),
             *response_status,
             Arc::new(response_headers.clone()),
-            Arc::new(response_body.clone()),
+            response_body.clone(),
         );
         return true;
     }
@@ -17703,7 +17711,7 @@ async fn build_grpc_web_reject_response(
                 plugins[index + 1..].to_vec(),
                 StatusCode::OK.as_u16(),
                 Arc::new(translated.headers.clone()),
-                Arc::new(translated.body.clone()),
+                Bytes::from(translated.body.clone()),
             );
             break;
         }
@@ -17798,7 +17806,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: impl Into<Bytes>,
     headers: HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
@@ -17818,13 +17826,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: &[u8],
+    body: impl Into<Bytes>,
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
-    let mut response_body = body.to_vec();
+    let mut response_body = body.into();
     let hook_start = Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
@@ -17849,7 +17857,7 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+    normalize_reject_response(status, response_body, &headers, is_grpc_request)
 }
 
 /// Finalize a terminal request-body read failure before any external operation
@@ -25164,7 +25172,7 @@ async fn handle_proxy_request_inner(
                 );
                 result = retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
                             .to_vec(),
                     ),
@@ -25704,7 +25712,7 @@ async fn handle_proxy_request_inner(
             response_headers
                 .entry("content-type".to_string())
                 .or_insert_with(|| "application/json".to_string());
-            response_body = ResponseBody::Buffered(reject.body);
+            response_body = ResponseBody::buffered(reject.body);
             after_proxy_rejected = true;
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -25838,7 +25846,7 @@ async fn handle_proxy_request_inner(
                 reject,
             )
             .await;
-            response_body = ResponseBody::Buffered(body);
+            response_body = ResponseBody::buffered(body);
             let _ = ctx.take_buffered_initial_response_header_policy();
             mesh_grpc_web_trailer_reconcile = None;
             response_body_rejected = true;
@@ -25894,13 +25902,17 @@ async fn handle_proxy_request_inner(
                 .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                 .and_then(|value| value.parse::<u16>().ok());
             let content_type = response_headers.get("content-type").map(String::as_str);
-            if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                data,
+            let mut owned_body = ResponseBody::take_buffered_vec(data);
+            let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                &mut owned_body,
                 content_type,
                 &trailers,
                 http_status,
-            ) {
-                response_headers.insert("content-length".to_string(), data.len().to_string());
+            );
+            let synced_len = owned_body.len();
+            ResponseBody::store_buffered_vec(data, owned_body);
+            if synced {
+                response_headers.insert("content-length".to_string(), synced_len.to_string());
                 // Mirror H1/H2/H3: after body-framing trailers, retire
                 // trailer-only application metadata from initial headers while
                 // preserving shadowed collisions and reserved terminal keys.
@@ -25960,7 +25972,7 @@ async fn handle_proxy_request_inner(
                 reject,
             )
             .await;
-            response_body = ResponseBody::Buffered(body);
+            response_body = ResponseBody::buffered(body);
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
@@ -26715,7 +26727,7 @@ async fn handle_proxy_request_inner(
             // Buffered response: body is fully consumed, drop the guard
             // immediately so record_connection_end fires now.
             drop(lb_connection_guard);
-            ProxyBody::full(Bytes::from(data))
+            ProxyBody::full(data)
         }
     };
     let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
@@ -27385,7 +27397,7 @@ pub(crate) async fn proxy_to_backend_retry(
             error!("Failed to get client from pool for retry: {}", e);
             return retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     format!(r#"{{"error":"Backend unavailable: {}"}}"#, e).into_bytes(),
                 ),
                 headers: HashMap::new(),
@@ -27402,7 +27414,7 @@ pub(crate) async fn proxy_to_backend_retry(
             warn!("Invalid HTTP method on retry: {}", method);
             return retry::BackendResponse {
                 status_code: 405,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -27573,7 +27585,7 @@ pub(crate) async fn proxy_to_backend_retry(
             // shed.
             return retry::BackendResponse {
                 status_code: 503,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Upstream pending request queue full"}"#
                         .as_bytes()
                         .to_vec(),
@@ -27651,7 +27663,7 @@ pub(crate) async fn proxy_to_backend_retry(
                 );
                 return retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend response body exceeds maximum size"}"#
                             .as_bytes()
                             .to_vec(),
@@ -27737,7 +27749,7 @@ pub(crate) async fn proxy_to_backend_retry(
                     match collected {
                         Ok((resp_body, _)) => retry::BackendResponse {
                             status_code: status,
-                            body: ResponseBody::Buffered(resp_body),
+                            body: ResponseBody::buffered(resp_body),
                             headers: resp_headers,
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -27745,7 +27757,7 @@ pub(crate) async fn proxy_to_backend_retry(
                         },
                         Err(err_body) => retry::BackendResponse {
                             status_code: 502,
-                            body: ResponseBody::Buffered(err_body),
+                            body: ResponseBody::buffered(err_body),
                             headers: HashMap::new(),
                             connection_error: false,
                             backend_resolved_ip: resolved_ip.clone(),
@@ -27799,7 +27811,7 @@ pub(crate) async fn proxy_to_backend_retry(
             let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
@@ -27948,7 +27960,7 @@ fn buffered_backend_response_from_body_read(
     match result {
         Ok(b) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::Buffered(b.to_vec()),
+            body: ResponseBody::buffered(b.to_vec()),
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
@@ -27964,7 +27976,7 @@ fn buffered_backend_response_from_body_read(
             );
             retry::BackendResponse {
                 status_code,
-                body: ResponseBody::Buffered(eager_buffer_body_read_error_body(status_code)),
+                body: ResponseBody::buffered(eager_buffer_body_read_error_body(status_code)),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -28107,7 +28119,7 @@ pub(crate) fn denied_literal_backend_or_dns_override_canonical(
 fn backend_egress_denied_response(host: &str) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
         ),
         headers: HashMap::new(),
@@ -28142,7 +28154,7 @@ fn oversized_request_body_dispatch_reject(
         return Some(backend_dispatch_response(
             retry::BackendResponse {
                 status_code: 413,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -28700,7 +28712,7 @@ async fn proxy_to_backend(
                         return backend_dispatch_response(
                             retry::BackendResponse {
                                 status_code: 500,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Request buffering invariant violated"}"#
                                         .as_bytes()
                                         .to_vec(),
@@ -28825,7 +28837,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
+                    body: ResponseBody::buffered(r#"{"error":"Bad Gateway"}"#.as_bytes().to_vec()),
                     headers: HashMap::new(),
                     connection_error: true,
                     backend_resolved_ip: resolved_ip.clone(),
@@ -28844,7 +28856,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -28980,7 +28992,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 413,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -29109,7 +29121,7 @@ async fn proxy_to_backend(
                                 retry::BackendResponse {
                                     status_code: 413,
                                     body:
-                                        ResponseBody::Buffered(
+                                        ResponseBody::buffered(
                                             r#"{"error":"Request body exceeds maximum size"}"#
                                                 .as_bytes()
                                                 .to_vec(),
@@ -29157,7 +29169,7 @@ async fn proxy_to_backend(
                             return backend_dispatch_response(
                                 retry::BackendResponse {
                                     status_code: 499,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                     ),
                                     headers: HashMap::new(),
@@ -29302,7 +29314,7 @@ async fn proxy_to_backend(
             return backend_dispatch_response(
                 retry::BackendResponse {
                     status_code: 503,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Upstream pending request queue full"}"#
                             .as_bytes()
                             .to_vec(),
@@ -29402,7 +29414,7 @@ async fn proxy_to_backend(
                 return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -29452,7 +29464,7 @@ async fn proxy_to_backend(
                     return backend_dispatch_response(
                         retry::BackendResponse {
                             status_code: 502,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Backend response body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -29568,7 +29580,7 @@ async fn proxy_to_backend(
                 match collected {
                     Ok((resp_body, _)) => retry::BackendResponse {
                         status_code: status,
-                        body: ResponseBody::Buffered(resp_body),
+                        body: ResponseBody::buffered(resp_body),
                         headers: resp_headers,
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
@@ -29576,7 +29588,7 @@ async fn proxy_to_backend(
                     },
                     Err(err_body) => retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(err_body),
+                        body: ResponseBody::buffered(err_body),
                         headers: HashMap::new(),
                         connection_error: false,
                         backend_resolved_ip: resolved_ip.clone(),
@@ -29676,7 +29688,7 @@ async fn proxy_to_backend(
                 return backend_dispatch_response(
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -29713,7 +29725,7 @@ async fn proxy_to_backend(
             let error_body = r#"{"error":"Backend unavailable"}"#;
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+                body: ResponseBody::buffered(error_body.as_bytes().to_vec()),
                 headers: HashMap::new(),
                 connection_error: !retry::request_reached_wire(error_class),
                 backend_resolved_ip: resolved_ip.clone(),
@@ -30391,7 +30403,7 @@ fn build_request_body_too_large_response(
 fn request_body_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: StatusCode::REQUEST_TIMEOUT.as_u16(),
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Request body read timed out"}"#.as_bytes().to_vec(),
         ),
         headers: HashMap::new(),
@@ -30439,7 +30451,7 @@ fn hbone_pool_error_response(
     );
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(error_body.into_bytes()),
+        body: ResponseBody::buffered(error_body.into_bytes()),
         headers: HashMap::new(),
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -30455,7 +30467,7 @@ fn hbone_hyper_error_response(
     error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
+        body: ResponseBody::buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30549,7 +30561,7 @@ fn hbone_response_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Backend response body exceeds maximum size"}"#
                 .as_bytes()
                 .to_vec(),
@@ -30582,7 +30594,7 @@ fn hbone_request_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 413,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
         ),
         headers: HashMap::new(),
@@ -30629,7 +30641,7 @@ fn mesh_grpc_unavailable_response(
     headers.insert("grpc-message".to_string(), message.to_string());
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: !retry::request_reached_wire(error_class),
         backend_resolved_ip: resolved_ip,
@@ -30659,7 +30671,7 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
     );
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30711,7 +30723,7 @@ pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
     );
     retry::BackendResponse {
         status_code: StatusCode::OK.as_u16(),
-        body: ResponseBody::Buffered(translated.body),
+        body: ResponseBody::buffered(translated.body),
         headers: translated.headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30765,7 +30777,7 @@ fn mesh_grpc_response_body_too_large_response(
     );
     retry::BackendResponse {
         status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30799,7 +30811,7 @@ fn mesh_grpc_response_buffering_refusal_response(
         } else {
             200 // gRPC errors ride HTTP 200 + grpc-status
         },
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -30859,7 +30871,7 @@ async fn proxy_to_backend_hbone(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HBONE target missing"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -30885,7 +30897,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 500,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"HBONE request buffering invariant violated"}"#
                             .as_bytes()
                             .to_vec(),
@@ -30989,7 +31001,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster HBONE target missing SNI"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31013,7 +31025,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster HBONE target missing trust domain"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31158,7 +31170,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -31202,7 +31214,7 @@ async fn proxy_to_backend_hbone(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -31368,7 +31380,7 @@ async fn proxy_to_backend_hbone(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -31490,7 +31502,7 @@ async fn proxy_to_backend_hbone(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -31506,7 +31518,7 @@ async fn proxy_to_backend_hbone(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -31561,7 +31573,7 @@ async fn proxy_to_backend_mesh_mtls(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Sidecar mTLS target missing"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -31633,7 +31645,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31657,7 +31669,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31700,7 +31712,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 500,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"mesh mTLS request buffering invariant violated"}"#
                             .as_bytes()
                             .to_vec(),
@@ -31968,7 +31980,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 504,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32021,7 +32033,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32095,7 +32107,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend authority"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32135,7 +32147,7 @@ async fn proxy_to_backend_mesh_mtls(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32313,7 +32325,7 @@ async fn proxy_to_backend_mesh_mtls(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -32570,7 +32582,7 @@ async fn proxy_to_backend_mesh_mtls(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -32627,7 +32639,7 @@ async fn proxy_to_backend_mesh_mtls(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -32701,7 +32713,7 @@ async fn proxy_to_backend_http2(
             return (
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Invalid backend URL"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32766,7 +32778,7 @@ async fn proxy_to_backend_http2(
             return (
                 retry::BackendResponse {
                     status_code: 405,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Method Not Allowed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -32908,7 +32920,7 @@ async fn proxy_to_backend_http2(
         (
             retry::BackendResponse {
                 status_code: 413,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -32934,7 +32946,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 413,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Request body exceeds maximum size"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33000,7 +33012,7 @@ async fn proxy_to_backend_http2(
                         return (
                             retry::BackendResponse {
                                 status_code: 504,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                                 ),
                                 headers: HashMap::new(),
@@ -33109,7 +33121,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33143,7 +33155,7 @@ async fn proxy_to_backend_http2(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Backend response body exceeds maximum size"}"#
                         .as_bytes()
                         .to_vec(),
@@ -33211,7 +33223,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend response body exceeds maximum size"}"#
                                 .as_bytes()
                                 .to_vec(),
@@ -33229,7 +33241,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Failed to read backend response"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33249,7 +33261,7 @@ async fn proxy_to_backend_http2(
                 return (
                     retry::BackendResponse {
                         status_code: 504,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"Backend timeout"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -33264,7 +33276,7 @@ async fn proxy_to_backend_http2(
         (
             retry::BackendResponse {
                 status_code: status,
-                body: ResponseBody::Buffered(body_bytes),
+                body: ResponseBody::buffered(body_bytes),
                 headers: resp_headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -33450,7 +33462,7 @@ async fn proxy_to_backend_http3(
         return (
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -33488,7 +33500,7 @@ async fn proxy_to_backend_http3(
                     return (
                         retry::BackendResponse {
                             status_code: 413,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Request body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -33606,7 +33618,7 @@ async fn proxy_to_backend_http3(
                                 retry::BackendResponse {
                                     status_code: 413,
                                     body:
-                                        ResponseBody::Buffered(
+                                        ResponseBody::buffered(
                                             r#"{"error":"Request body exceeds maximum size"}"#
                                                 .as_bytes()
                                                 .to_vec(),
@@ -33631,7 +33643,7 @@ async fn proxy_to_backend_http3(
                             (
                                 retry::BackendResponse {
                                     status_code: 499,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                     ),
                                     headers: HashMap::new(),
@@ -33689,7 +33701,7 @@ async fn proxy_to_backend_http3(
                             (
                                 retry::BackendResponse {
                                     status_code: 502,
-                                    body: ResponseBody::Buffered(
+                                    body: ResponseBody::buffered(
                                         r#"{"error":"HTTP/3 backend request failed"}"#
                                             .as_bytes()
                                             .to_vec(),
@@ -33723,7 +33735,7 @@ async fn proxy_to_backend_http3(
                     return (
                         retry::BackendResponse {
                             status_code: 413,
-                            body: ResponseBody::Buffered(
+                            body: ResponseBody::buffered(
                                 r#"{"error":"Request body exceeds maximum size"}"#
                                     .as_bytes()
                                     .to_vec(),
@@ -33749,7 +33761,7 @@ async fn proxy_to_backend_http3(
                         return (
                             retry::BackendResponse {
                                 status_code: 413,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Request body exceeds maximum size"}"#
                                         .as_bytes()
                                         .to_vec(),
@@ -33796,7 +33808,7 @@ async fn proxy_to_backend_http3(
                         return (
                             retry::BackendResponse {
                                 status_code: 499,
-                                body: ResponseBody::Buffered(
+                                body: ResponseBody::buffered(
                                     r#"{"error":"Client disconnected"}"#.as_bytes().to_vec(),
                                 ),
                                 headers: HashMap::new(),
@@ -33967,7 +33979,7 @@ async fn proxy_to_backend_http3(
                 (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -34097,7 +34109,7 @@ async fn proxy_to_backend_http3(
                 (
                     retry::BackendResponse {
                         status_code: 502,
-                        body: ResponseBody::Buffered(
+                        body: ResponseBody::buffered(
                             r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                         ),
                         headers: HashMap::new(),
@@ -34211,7 +34223,7 @@ async fn drain_h3_streaming_response_to_buffered(
     {
         Ok((body, _trailers)) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::Buffered(body),
+            body: ResponseBody::buffered(body),
             headers: response_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
@@ -34226,7 +34238,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"Backend response body exceeds maximum size"}"#
                         .as_bytes()
                         .to_vec(),
@@ -34264,7 +34276,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -34289,7 +34301,7 @@ async fn drain_h3_streaming_response_to_buffered(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend response truncated"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -34426,7 +34438,7 @@ fn h3_response_body_too_large_response(
     }
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(
+        body: ResponseBody::buffered(
             r#"{"error":"Backend response body exceeds maximum size"}"#
                 .as_bytes()
                 .to_vec(),
@@ -34468,7 +34480,7 @@ fn declared_response_length_exceeds_limit(
 fn h3_read_timeout_backend_response(resolved_ip: Option<String>) -> retry::BackendResponse {
     retry::BackendResponse {
         status_code: 504,
-        body: ResponseBody::Buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Backend timeout"}"#.as_bytes().to_vec()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -34678,7 +34690,7 @@ async fn proxy_to_backend_http3_retry(
                 );
                 retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                     ),
                     headers: HashMap::new(),
@@ -34743,7 +34755,7 @@ async fn proxy_to_backend_http3_retry(
                 );
                 return retry::BackendResponse {
                     status_code: 502,
-                    body: ResponseBody::Buffered(
+                    body: ResponseBody::buffered(
                         r#"{"error":"Backend response body exceeds maximum size"}"#
                             .as_bytes()
                             .to_vec(),
@@ -34760,7 +34772,7 @@ async fn proxy_to_backend_http3_retry(
             // frame machinery that is out of scope for issue #1630.
             retry::BackendResponse {
                 status_code: response.status,
-                body: ResponseBody::Buffered(response.body),
+                body: ResponseBody::buffered(response.body),
                 headers: response.headers,
                 connection_error: false,
                 backend_resolved_ip: resolved_ip,
@@ -34800,7 +34812,7 @@ async fn proxy_to_backend_http3_retry(
             );
             retry::BackendResponse {
                 status_code: 502,
-                body: ResponseBody::Buffered(
+                body: ResponseBody::buffered(
                     r#"{"error":"HTTP/3 backend request failed"}"#.as_bytes().to_vec(),
                 ),
                 headers: HashMap::new(),
@@ -36488,7 +36500,7 @@ mod tests {
             HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
         let reject = RejectedResponseParts {
             status_code: 502,
-            body: br#"{"error":"blocked"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"blocked"}"#),
             headers: HashMap::new(),
         };
 
@@ -36549,7 +36561,7 @@ mod tests {
             ("vary".to_string(), "accept-encoding, Origin".to_string()),
             ("warning".to_string(), "110 stale".to_string()),
         ]);
-        let mut body = b"synthetic success".to_vec();
+        let mut body = Bytes::from_static(b"synthetic success");
 
         apply_reject_after_proxy_and_synthetic_body_hooks(
             &plugins,
@@ -36723,7 +36735,7 @@ mod tests {
         let mut status = 200;
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let mut body = br#"{"secret":"must be inspected"}"#.to_vec();
+        let mut body = Bytes::from_static(br#"{"secret":"must be inspected"}"#);
 
         apply_reject_after_proxy_and_synthetic_body_hooks(
             &plugins,
@@ -37472,7 +37484,7 @@ mod tests {
         let mut response_headers = HashMap::new();
         let reject = RejectedResponseParts {
             status_code: 403,
-            body: br#"{"error":"blocked"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"blocked"}"#),
             headers: HashMap::new(),
         };
 
@@ -37510,7 +37522,7 @@ mod tests {
         );
         let reject = RejectedResponseParts {
             status_code: 403,
-            body: br#"{"error":"Forbidden"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"Forbidden"}"#),
             headers: HashMap::new(),
         };
 
@@ -40821,7 +40833,7 @@ mod tests {
         let mk = |connection_error: bool, error_class: Option<retry::ErrorClass>| {
             retry::BackendResponse {
                 status_code: 502,
-                body: retry::ResponseBody::Buffered(Vec::new()),
+                body: retry::ResponseBody::buffered(Vec::new()),
                 headers: HashMap::new(),
                 connection_error,
                 backend_resolved_ip: None,

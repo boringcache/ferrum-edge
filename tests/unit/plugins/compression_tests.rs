@@ -3229,7 +3229,7 @@ async fn test_buffered_normalizer_noop_preserves_existing_views_without_content_
     ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"preexisting byte view"));
     let original_bytes_ptr = ctx.request_body_bytes.as_ref().unwrap().as_ptr();
     let mut headers = HashMap::new();
-    let mut body = b"ordinary uncompressed request".to_vec();
+    let mut body = bytes::Bytes::from_static(b"ordinary uncompressed request");
 
     let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
         &plugins,
@@ -4212,7 +4212,7 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
     );
     assert_integrity_digests_present(&headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4288,7 +4288,7 @@ async fn test_brotli_compression_transform_strips_stale_integrity_digests() {
         Some("br")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4336,7 +4336,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[Arc::clone(&plugin)],
             &mut ctx,
@@ -4376,7 +4376,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[Arc::clone(&plugin)],
             &mut ctx,
@@ -4414,7 +4414,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[plugin],
             &mut ctx,
@@ -4447,7 +4447,7 @@ async fn test_compression_noop_transform_preserves_integrity_digests() {
     insert_stale_integrity_digests(&mut headers);
 
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4489,7 +4489,7 @@ async fn test_synthetic_compression_transform_strips_stale_integrity_digests() {
         Some("gzip")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     apply_synthetic_response_body_hooks_for_test(
         &[plugin],
         &mut ctx,
@@ -4530,7 +4530,7 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
         PluginResult::Continue
     ));
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4685,7 +4685,7 @@ async fn test_multi_instance_response_single_coding_layer() {
         Some("gzip")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4741,7 +4741,7 @@ async fn test_multi_instance_response_order_selects_brotli_first() {
         Some("br")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4795,7 +4795,7 @@ async fn test_multi_instance_identity_then_later_instance_may_compress() {
         "identity-only earlier instance must not block a later compress"
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4982,7 +4982,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
         run_after_proxy_chain(&compression, &mut ctx, status, &mut resp_headers).await,
         PluginResult::Continue
     ));
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &compression,
         &mut ctx,
@@ -5268,7 +5268,7 @@ async fn test_content_encoding_identity_only_strips_without_body_rewrite() {
     let mut ctx = make_request_ctx_with_body("identity", b"plain");
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "identity".to_string());
-    let mut body = b"plain".to_vec();
+    let mut body = bytes::Bytes::from_static(b"plain");
     let result = plugin
         .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
         .await;

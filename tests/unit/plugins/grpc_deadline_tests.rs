@@ -1040,7 +1040,7 @@ async fn committed_deadline_replacement_runs_remaining_hooks_exactly_once() {
         ("content-type".to_string(), "application/grpc".to_string()),
         ("x-backend".to_string(), "present".to_string()),
     ]);
-    let mut body = b"backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"backend response");
 
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
@@ -1103,7 +1103,7 @@ async fn response_transform_deadline_replaces_native_and_grpc_web_responses() {
             ("content-type".to_string(), "application/grpc".to_string()),
             ("content-length".to_string(), "16".to_string()),
         ]);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
 
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
@@ -1244,7 +1244,7 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
             );
             set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
             let mut status = 200;
-            let mut body = b"discarded backend response".to_vec();
+            let mut body = bytes::Bytes::from_static(b"discarded backend response");
 
             assert!(
                 transform_buffered_response_body_with_deadline_and_policy_for_test(
@@ -1547,7 +1547,7 @@ async fn deadline_replacement_preserves_injected_sticky_cookie_and_strips_backen
     // A committed-response hook then exhausts the RPC deadline.
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -1612,7 +1612,7 @@ async fn deadline_replacement_preserves_workload_metrics_traceparent_on_exact_ba
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         transform_buffered_response_body_with_deadline_for_test(
             &transform_plugins,
@@ -1700,7 +1700,7 @@ async fn deadline_replacement_keeps_owned_set_cookie_write_followed_by_append() 
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         transform_buffered_response_body_with_deadline_for_test(
             &transform_plugins,
@@ -1778,7 +1778,7 @@ async fn deadline_replacement_keeps_later_append_matching_overwritten_backend_co
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -1855,7 +1855,7 @@ async fn deadline_replacement_preserves_rate_limiting_telemetry_on_exact_backend
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         transform_buffered_response_body_with_deadline_for_test(
             &transform_plugins,
@@ -1943,7 +1943,7 @@ async fn deadline_replacement_keeps_configured_grpc_web_expose_headers_on_exact_
 
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
-        let mut body = b"discarded backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"discarded backend response");
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
                 &transform_plugins,
@@ -2020,7 +2020,7 @@ async fn deadline_replacement_keeps_base_grpc_web_expose_list_under_partial_gate
 
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
-        let mut body = b"discarded backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"discarded backend response");
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
                 &transform_plugins,
@@ -2220,7 +2220,7 @@ async fn deadline_replacement_keeps_exact_value_response_transformer_writes() {
 
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
-        let mut body = b"discarded backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"discarded backend response");
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
                 &transform_plugins,
@@ -2383,7 +2383,7 @@ async fn buffered_deadline_strips_gateway_authored_cache_and_representation_head
 
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
-        let mut body = b"discarded backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"discarded backend response");
         assert!(
             transform_buffered_response_body_with_deadline_for_test(
                 &transform_plugins,
@@ -2507,7 +2507,7 @@ async fn buffered_deadline_uses_private_state_for_multiple_correlation_instances
         );
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
         let mut status = 200;
-        let mut body = b"discarded backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"discarded backend response");
         let transform_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledResponseTransformer)];
 
         assert!(
@@ -2582,7 +2582,7 @@ async fn response_normalizer_deadline_replaces_buffered_grpc_response() {
         "correlation decoration must not reject the backend response"
     );
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
-    let mut body = b"backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"backend response");
 
     let normalized = normalize_response_body_for_inspection(
         &plugins,
@@ -2660,7 +2660,7 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
             "trusted response decoration must not reject"
         );
         set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
 
         assert!(
             normalize_response_body_for_inspection(
@@ -3700,7 +3700,7 @@ async fn deadline_replacement_keeps_gateway_set_cookie_identical_to_a_backend_li
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -3754,7 +3754,7 @@ async fn deadline_replacement_strips_every_duplicate_backend_set_cookie_line() {
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -3906,7 +3906,7 @@ async fn deadline_replacement_preserves_response_transformer_rename_destination(
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4029,7 +4029,7 @@ async fn deadline_rebuild_keeps_a_rejection_cookie_matching_a_backend_cookie() {
     );
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
-    let mut body = b"rejection body".to_vec();
+    let mut body = bytes::Bytes::from_static(b"rejection body");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4087,7 +4087,7 @@ async fn deadline_rebuild_never_crosses_a_backend_only_cookie_through_a_rejectio
             .expect("the after_proxy hook must reject the backend response");
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
-    let mut body = b"rejection body".to_vec();
+    let mut body = bytes::Bytes::from_static(b"rejection body");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4149,7 +4149,7 @@ async fn rejection_adoption_preserves_prior_cookie_decoration_without_backend_li
             .expect("the later after_proxy hook must reject the backend response");
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
-    let mut body = b"rejection body".to_vec();
+    let mut body = bytes::Bytes::from_static(b"rejection body");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4222,7 +4222,7 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_update_matching_a_backend_li
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4295,7 +4295,7 @@ async fn deadline_rebuild_keeps_an_owned_set_cookie_rename_destination() {
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4364,7 +4364,7 @@ async fn deadline_rebuild_drops_backend_cookies_replaced_by_an_owned_set_cookie_
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4448,7 +4448,7 @@ async fn deadline_rebuild_credits_only_the_appended_portion_of_a_route_added_hea
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4527,7 +4527,7 @@ async fn deadline_rebuild_keeps_a_whole_owned_update_list_sharing_a_backend_elem
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4611,7 +4611,7 @@ async fn deadline_rebuild_keeps_a_static_add_that_reinstated_a_removed_header() 
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4693,7 +4693,7 @@ async fn deadline_rebuild_keeps_a_route_override_add_that_reinstated_a_removed_h
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,
@@ -4782,7 +4782,7 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,

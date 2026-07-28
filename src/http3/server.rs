@@ -194,7 +194,7 @@ async fn finalize_h3_terminal_body_read_rejection(
     );
     let mut response_status = status.as_u16();
     let mut headers = HashMap::new();
-    let mut body = body.to_vec();
+    let mut body = Bytes::copy_from_slice(body);
     let rejection_hook_start = std::time::Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
@@ -3717,9 +3717,9 @@ async fn handle_h3_request(
             Err(()) => {
                 let phase_start = std::time::Instant::now();
                 let mut reject_status = 503;
-                let mut reject_body =
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
-                        .to_vec();
+                let mut reject_body = Bytes::from_static(
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                );
                 let mut rej_headers = HashMap::new();
                 crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                     &plugins,
@@ -6420,7 +6420,7 @@ async fn handle_h3_request(
                         result.request_on_wire,
                         result.error_class,
                     ),
-                    body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                    body: crate::retry::ResponseBody::buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
                     error_class: result.error_class,
@@ -6717,7 +6717,7 @@ async fn handle_h3_request(
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-        let mut response_body = response_body;
+        let mut response_body = Bytes::from(response_body);
 
         // Capture original response invariants before `after_proxy` runs on this
         // buffered native-H3 path. Unlike the streamed paths, the body here IS
@@ -6837,7 +6837,7 @@ async fn handle_h3_request(
                             response_headers.clear();
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
-                            response_body = b"Internal Server Error".to_vec();
+                            response_body = Bytes::from_static(b"Internal Server Error");
                             // Synthesized error body — backend trailers no
                             // longer apply (issue #1630).
                             response_trailers = None;
@@ -6929,7 +6929,7 @@ async fn handle_h3_request(
                             response_headers.clear();
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
-                            response_body = b"Internal Server Error".to_vec();
+                            response_body = Bytes::from_static(b"Internal Server Error");
                             // Synthesized error body — backend trailers no
                             // longer apply (issue #1630).
                             response_trailers = None;
@@ -7997,7 +7997,7 @@ async fn run_h3_streaming_after_proxy_hooks(
             reject.body.len(),
         )
     {
-        reject.body = Vec::new();
+        reject.body = Bytes::new();
     }
     *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     reject
@@ -8120,7 +8120,7 @@ async fn proxy_to_backend_h3_refined_response(
             method,
             &crate::retry::BackendResponse {
                 status_code: response_status,
-                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                body: crate::retry::ResponseBody::buffered(Vec::new()),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: None,
@@ -12062,7 +12062,7 @@ pub(crate) fn replace_buffered_h3_response_with_grpc_deadline(
     ctx: &mut RequestContext,
     grpc_web_response_content_type: Option<&str>,
     headers: &mut HashMap<String, String>,
-    body: &mut Vec<u8>,
+    body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     crate::proxy::replace_buffered_grpc_response_with_deadline(
@@ -12270,7 +12270,7 @@ mod h3_request_body_timeout_tests {
             ("content-type".to_string(), "application/json".to_string()),
             ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
-        let mut body = b"backend response".to_vec();
+        let mut body = Bytes::from_static(b"backend response");
         ctx.mark_gateway_deadline_response_selected();
         ctx.begin_rejection_deadline_response_header_provenance(&headers);
 

@@ -186,7 +186,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
@@ -538,9 +538,9 @@ pub mod _test_support {
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
         status_code: u16,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
         headers: HashMap<String, String>,
-    ) -> (u16, Vec<u8>, HashMap<String, String>) {
+    ) -> (u16, bytes::Bytes, HashMap<String, String>) {
         let mut response_status = status_code;
         let mut response_headers = headers.clone();
         let response_body = crate::proxy::apply_plugin_rejection_response(
@@ -550,7 +550,7 @@ pub mod _test_support {
             &mut response_headers,
             crate::proxy::RejectedResponseParts {
                 status_code,
-                body,
+                body: body.into(),
                 headers,
             },
         )
@@ -1085,7 +1085,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -1112,7 +1112,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -3227,7 +3227,7 @@ pub mod _test_support {
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,
-        pub body: Vec<u8>,
+        pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
     }
@@ -3300,7 +3300,7 @@ pub mod _test_support {
         ctx.begin_buffered_deadline_response_header_provenance(&headers);
         headers.insert("x-correlation-id".to_string(), "request-123".to_string());
         ctx.record_deadline_response_header_mutations(&headers);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
             grpc_web_response_content_type,
@@ -3324,8 +3324,9 @@ pub mod _test_support {
         grpc_web_response_content_type: Option<&str>,
         mut backend_headers: HashMap<String, String>,
         gateway_headers: HashMap<String, String>,
-        mut body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
     ) -> NormalizedRejectResponse {
+        let mut body = body.into();
         let mut ctx = crate::plugins::RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
@@ -3359,7 +3360,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
             plugins,
@@ -3386,7 +3387,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         response_body_rejected: bool,
     ) -> (bool, bool) {
@@ -3465,7 +3466,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_synthetic_response_body_hooks(
             plugins,
@@ -3484,7 +3485,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
             plugins,
@@ -3656,7 +3657,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
         transform_buffered_response_body_with_deadline_and_policy_for_test(
@@ -3676,7 +3677,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ) -> bool {

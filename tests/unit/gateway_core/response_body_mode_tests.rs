@@ -198,7 +198,7 @@ fn test_plugin_can_require_buffering() {
 fn test_response_body_buffered() {
     use ferrum_edge::retry::ResponseBody;
 
-    let body = ResponseBody::Buffered(b"hello".to_vec());
+    let body = ResponseBody::buffered(b"hello".to_vec());
     match body {
         ResponseBody::Buffered(data) => assert_eq!(data, b"hello"),
         _ => panic!("Expected Buffered variant"),

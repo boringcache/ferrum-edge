@@ -7,6 +7,7 @@ mod backend_reqwest_no_proxy_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
 mod client_ip_tests;
+mod cached_synthetic_bytes_share_tests;
 mod config_delta_namespace_prune_tests;
 mod config_delta_tests;
 mod configsync_lifecycle_tests;

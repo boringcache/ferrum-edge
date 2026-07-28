@@ -6308,7 +6308,7 @@ async fn empty_synthetic_response_runs_the_shared_final_body_validator() {
     let mut ctx = post_ctx("/items");
     let mut status = 200;
     let mut headers = json_headers();
-    let mut body = Vec::new();
+    let mut body = bytes::Bytes::new();
 
     finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
         .await;
@@ -6344,7 +6344,7 @@ async fn empty_synthetic_response_honors_an_explicit_no_content_contract() {
     let mut ctx = post_ctx("/items");
     let mut status = 200;
     let mut headers = HashMap::new();
-    let mut body = Vec::new();
+    let mut body = bytes::Bytes::new();
 
     finalize_synthetic_response_for_test(&plugins, &mut ctx, &mut status, &mut headers, &mut body)
         .await;

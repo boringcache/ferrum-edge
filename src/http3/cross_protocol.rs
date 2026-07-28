@@ -890,7 +890,7 @@ fn reqwest_error_response_for_cross_protocol(
     };
     crate::retry::BackendResponse {
         status_code: 502,
-        body: crate::retry::ResponseBody::Buffered(error_body.as_bytes().to_vec()),
+        body: crate::retry::ResponseBody::buffered(error_body.as_bytes().to_vec()),
         headers: HashMap::new(),
         // Funnel through `request_reached_wire` instead of
         // `e.is_connect() || e.is_timeout()` — the predicate-pair misses
@@ -1766,7 +1766,7 @@ where
                         Ok(response) => {
                             let attempt_result = crate::retry::BackendResponse {
                                 status_code: response.status().as_u16(),
-                                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                                body: crate::retry::ResponseBody::buffered(Vec::new()),
                                 headers: HashMap::new(),
                                 connection_error: false,
                                 backend_resolved_ip: None,
@@ -2692,7 +2692,7 @@ where
         )
         .await
         {
-            Ok(Ok(body)) => body,
+            Ok(Ok(body)) => bytes::Bytes::from(body),
             Ok(Err((error_body, error_class))) => {
                 record_backend_outcome(
                     state,
@@ -3552,7 +3552,7 @@ where
             ctx,
             PluginResult::RejectBinary {
                 status_code: reject.status_code,
-                body: Bytes::from(reject.body),
+                body: reject.body,
                 headers: reject.headers,
             },
             backend_start,
@@ -4674,7 +4674,7 @@ where
                     ctx,
                     PluginResult::RejectBinary {
                         status_code: reject.status_code,
-                        body: Bytes::from(reject.body),
+                        body: reject.body,
                         headers: reject.headers,
                     },
                     response_committed_plugins,
@@ -4757,7 +4757,7 @@ where
             // trailer-only backend `set-cookie` cannot divert it into the wire
             // trailers.
             let mut response_status = resp.status;
-            let mut response_body = resp.body;
+            let mut response_body = bytes::Bytes::from(resp.body);
             let mut response_trailers = resp.trailers;
             if normalize_response_body_for_inspection(
                 plugins,
@@ -5947,7 +5947,7 @@ async fn apply_buffered_plain_plugin_reject(
     reject: PluginResult,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
 ) {
     let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
         warn!("buffered plain reject helper received a non-reject plugin result");
@@ -5979,7 +5979,7 @@ async fn apply_buffered_grpc_plugin_reject(
     reject: PluginResult,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     response_trailers: &mut HashMap<String, String>,
 ) {
     let Some(mut reject) = crate::proxy::plugin_result_into_reject_parts(reject) else {
@@ -6029,7 +6029,7 @@ fn replace_buffered_grpc_response_with_deadline(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     response_trailers: &mut HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) {
@@ -7886,7 +7886,7 @@ mod tests {
         let mut status = 503;
         let mut headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
         let mut trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         replace_buffered_grpc_response_with_deadline(
@@ -8059,7 +8059,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
         let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         apply_buffered_grpc_plugin_reject(
@@ -8127,7 +8127,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
         let mut response_trailers = HashMap::from([("grpc-status".to_string(), "0".to_string())]);
 
         apply_buffered_grpc_plugin_reject(
@@ -8179,7 +8179,7 @@ mod tests {
         let mut response_status = 200;
         let mut response_headers =
             HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
-        let mut response_body = b"backend-body".to_vec();
+        let mut response_body = bytes::Bytes::from_static(b"backend-body");
 
         apply_buffered_plain_plugin_reject(
             &plugins,

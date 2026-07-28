@@ -1768,7 +1768,7 @@ async fn synthetic_lifecycle_strips_stale_validators_on_rewrite() {
     headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_representation_headers(&mut headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     apply_synthetic_response_body_hooks_for_test(
         &[plugin],
         &mut ctx,
