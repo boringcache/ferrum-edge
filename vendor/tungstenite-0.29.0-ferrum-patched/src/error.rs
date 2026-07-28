@@ -251,6 +251,21 @@ pub enum ProtocolError {
     /// Received data while waiting for more fragments.
     #[error("While waiting for more fragments received: {0}")]
     ExpectedFragment(Data),
+    /// Ferrum local extension: a single fragmented message consumed more
+    /// physical data frames than
+    /// [`WebSocketConfig::max_incomplete_message_frames`] allows. Unlike
+    /// [`CapacityError::MessageTooLong`] this fires on frame count, so a flood
+    /// of zero-length continuation frames cannot evade it.
+    ///
+    /// [`WebSocketConfig::max_incomplete_message_frames`]: crate::protocol::WebSocketConfig::max_incomplete_message_frames
+    #[error("Fragmented message exceeded the incomplete-message frame limit")]
+    IncompleteMessageFrameLimitExceeded,
+    /// Ferrum local extension: a message stayed incomplete for longer than
+    /// [`WebSocketConfig::max_incomplete_message_duration`].
+    ///
+    /// [`WebSocketConfig::max_incomplete_message_duration`]: crate::protocol::WebSocketConfig::max_incomplete_message_duration
+    #[error("Fragmented message exceeded the incomplete-message duration limit")]
+    IncompleteMessageTimeout,
     /// Connection closed without performing the closing handshake.
     #[error("Connection reset without closing handshake")]
     ResetWithoutClosingHandshake,

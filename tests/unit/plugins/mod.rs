@@ -36,6 +36,7 @@ mod custom_plugin_guide_tests;
 mod dpop_tests;
 mod example_audit_plugin_tests;
 mod example_plugin_tests;
+mod fault_delay_tests;
 mod fault_injection_tests;
 mod geo_restriction_tests;
 mod graphql_tests;

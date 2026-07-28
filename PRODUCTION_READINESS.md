@@ -93,7 +93,7 @@ issue body alone.
 | `ai_stream_router` `google_gemini` adapter | #3299 | Config accepted; construction fails closed until implemented |
 | AI semantic-firewall token windows | #3302 | `streaming.window: tokens` rejected |
 | Native-gRPC transcript capture | #3304 | HTTP-only today |
-| Pre-first-byte stream-router fallback | #3328 | Implement or explicitly reject |
+| Pre-first-byte stream-router fallback | #3328 | Resolved by explicit rejection: the `fallback` block now fails admission. Implementing it needs a per-attempt request-preparation boundary in proxy dispatch, not a plugin change |
 | Native SMTP/email notification channel | #3329 | |
 | MongoDB replica-set change-stream wakeups | #3330 | Polling remains authoritative backstop |
 | Multicluster poller partition / last-good live gate | #3331 | File-config fixture does not exercise pollers |

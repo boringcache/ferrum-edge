@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
@@ -3071,23 +3071,199 @@ impl Drop for HeldClickHouseExport {
     }
 }
 
+/// Deterministic BeforeWrite parking gate bound to the spool-write hook.
+///
+/// Readiness is published only after the writer has incremented `parked` and is
+/// committed to blocking on `release` while still holding the release mutex.
+/// Waiting on a looser "entered hook" flag published before that increment lets
+/// observers race ahead and see `parked == 0` under scheduler pressure (the
+/// hosted flake at issue #3433).
+struct SpoolBeforeWriteGate {
+    release: Mutex<bool>,
+    release_cv: Condvar,
+    parked: Mutex<usize>,
+    parked_cv: Condvar,
+    finished: Mutex<bool>,
+    finished_cv: Condvar,
+}
+
+impl SpoolBeforeWriteGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            release: Mutex::new(false),
+            release_cv: Condvar::new(),
+            parked: Mutex::new(0),
+            parked_cv: Condvar::new(),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        })
+    }
+
+    fn on_before_write(&self) {
+        // Acquire release first so publishing parked commits us to waiting
+        // before any observer can proceed from wait_until_parked.
+        let mut release = self.release.lock().expect("release gate lock");
+        {
+            let mut parked = self.parked.lock().expect("parked gate lock");
+            *parked = parked.saturating_add(1);
+            self.parked_cv.notify_all();
+        }
+        while !*release {
+            release = self.release_cv.wait(release).expect("release gate wait");
+        }
+        let mut parked = self.parked.lock().expect("parked gate lock");
+        *parked = parked.saturating_sub(1);
+    }
+
+    fn on_after_write(&self) {
+        let mut finished = self.finished.lock().expect("finished gate lock");
+        *finished = true;
+        self.finished_cv.notify_all();
+    }
+
+    fn parked_count(&self) -> usize {
+        *self.parked.lock().expect("parked gate lock")
+    }
+
+    fn is_finished(&self) -> bool {
+        *self.finished.lock().expect("finished gate lock")
+    }
+
+    fn is_released(&self) -> bool {
+        *self.release.lock().expect("release gate lock")
+    }
+
+    fn diagnostic_snapshot(&self) -> String {
+        format!(
+            "parked={} finished={} released={}",
+            self.parked_count(),
+            self.is_finished(),
+            self.is_released()
+        )
+    }
+
+    /// Block until at least `min_parked` writers are inside BeforeWrite.
+    ///
+    /// Returns a bounded diagnostic when the gate is never reached instead of
+    /// racing on a later parked-count assertion.
+    fn wait_until_parked(&self, min_parked: usize, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut parked = self.parked.lock().expect("parked gate lock");
+        while *parked < min_parked {
+            let now = Instant::now();
+            if now >= deadline {
+                let parked_now = *parked;
+                // Drop parked before reading sibling gate locks so we never
+                // invert the release->parked order used by on_before_write.
+                drop(parked);
+                return Err(format!(
+                    "spool BeforeWrite gate did not reach parked>={min_parked} within {timeout:?}; parked={parked_now} finished={} released={}",
+                    self.is_finished(),
+                    self.is_released()
+                ));
+            }
+            let (next, wait_result) = self
+                .parked_cv
+                .wait_timeout(parked, deadline.saturating_duration_since(now))
+                .expect("parked gate wait");
+            parked = next;
+            if wait_result.timed_out() && *parked < min_parked {
+                let parked_now = *parked;
+                drop(parked);
+                return Err(format!(
+                    "spool BeforeWrite gate did not reach parked>={min_parked} within {timeout:?}; parked={parked_now} finished={} released={}",
+                    self.is_finished(),
+                    self.is_released()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_until_finished(&self) {
+        let mut finished = self.finished.lock().expect("finished gate lock");
+        while !*finished {
+            finished = self.finished_cv.wait(finished).expect("finished gate wait");
+        }
+    }
+
+    fn release_all(&self) {
+        let mut release = self.release.lock().expect("release gate lock");
+        *release = true;
+        self.release_cv.notify_all();
+    }
+}
+
 /// Clears the process-global spool write hook and opens any held release gate
 /// even if the test panics mid-block.
 struct ClearSpoolWriteHookOnDrop {
-    release: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<SpoolBeforeWriteGate>,
 }
 
 impl Drop for ClearSpoolWriteHookOnDrop {
     fn drop(&mut self) {
-        {
-            let (lock, cv) = &*self.release;
-            if let Ok(mut guard) = lock.lock() {
-                *guard = true;
-                cv.notify_all();
-            }
-        }
+        self.gate.release_all();
         set_spool_write_hook_for_tests(None);
     }
+}
+
+#[test]
+fn spool_before_write_gate_publishes_parked_before_waiters_return() {
+    // Regression for #3433: readiness must not be observable while parked==0.
+    let gate = SpoolBeforeWriteGate::new();
+    let writer_gate = Arc::clone(&gate);
+    let started = Arc::new(Barrier::new(2));
+    let writer_started = Arc::clone(&started);
+
+    let writer = thread::spawn(move || {
+        writer_started.wait();
+        writer_gate.on_before_write();
+        writer_gate.on_after_write();
+    });
+
+    started.wait();
+    gate.wait_until_parked(1, Duration::from_secs(5))
+        .expect("writer must publish parked before waiters observe readiness");
+    assert_eq!(
+        gate.parked_count(),
+        1,
+        "wait_until_parked must not return while parked==0; {}",
+        gate.diagnostic_snapshot()
+    );
+    assert!(
+        !gate.is_finished(),
+        "writer must remain inside BeforeWrite until release; {}",
+        gate.diagnostic_snapshot()
+    );
+
+    gate.release_all();
+    writer.join().expect("gated writer thread");
+    assert_eq!(gate.parked_count(), 0);
+    assert!(gate.is_finished());
+}
+
+#[test]
+fn spool_before_write_gate_timeout_names_unreachable_gate_state() {
+    let gate = SpoolBeforeWriteGate::new();
+    let error = gate
+        .wait_until_parked(1, Duration::from_millis(20))
+        .expect_err("an unreachable BeforeWrite gate must fail closed");
+    assert!(
+        error.contains("did not reach parked>=1"),
+        "timeout must name the missed parked threshold: {error}"
+    );
+    assert!(
+        error.contains("parked=0"),
+        "timeout must report parked count: {error}"
+    );
+    assert!(
+        error.contains("finished=false"),
+        "timeout must report finished state: {error}"
+    );
+    assert!(
+        error.contains("released=false"),
+        "timeout must report release state: {error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3114,49 +3290,15 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     config["spool"]["delivery_queue_capacity"] = json!(8);
     config["spool"]["replay_interval_secs"] = json!(3600);
 
-    let entered = Arc::new((Mutex::new(false), Condvar::new()));
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let finished = Arc::new((Mutex::new(false), Condvar::new()));
-    // Count writers currently parked inside BeforeWrite so the assertion below
-    // proves the gated write is still blocked, not merely that AfterWrite has
-    // not yet been observed on some other unpaired completion.
-    let parked_before_write = Arc::new(AtomicUsize::new(0));
+    let gate = SpoolBeforeWriteGate::new();
     let _clear_hook = ClearSpoolWriteHookOnDrop {
-        release: Arc::clone(&release),
+        gate: Arc::clone(&gate),
     };
 
-    let entered_for_hook = Arc::clone(&entered);
-    let release_for_hook = Arc::clone(&release);
-    let finished_for_hook = Arc::clone(&finished);
-    let parked_for_hook = Arc::clone(&parked_before_write);
+    let hook_gate = Arc::clone(&gate);
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => {
-            // Hold the release lock before publishing `entered` so the test
-            // cannot race past this point until we are on the condvar wait.
-            // Every write that arrives while the gate is closed parks here, so
-            // a peer SpoolManager cannot publish AfterWrite early.
-            let (lock, cv) = &*release_for_hook;
-            let mut guard = lock.lock().expect("release gate lock");
-            {
-                let (entered_lock, entered_cv) = &*entered_for_hook;
-                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
-                if !*entered_guard {
-                    *entered_guard = true;
-                    entered_cv.notify_all();
-                }
-            }
-            parked_for_hook.fetch_add(1, Ordering::SeqCst);
-            while !*guard {
-                guard = cv.wait(guard).expect("release gate wait");
-            }
-            parked_for_hook.fetch_sub(1, Ordering::SeqCst);
-        }
-        SpoolWriteHookPoint::AfterWrite => {
-            let (lock, cv) = &*finished_for_hook;
-            let mut guard = lock.lock().expect("finished gate lock");
-            *guard = true;
-            cv.notify_all();
-        }
+        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
@@ -3177,7 +3319,16 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     // to the bounded spool delivery worker, which blocks in write_events.
     plugin.log(&billable_summary("overflow-blocked")).await;
 
-    wait_condvar_flag(Arc::clone(&entered)).await;
+    // Wait on the parked count itself (not a looser "entered" flag) so readiness
+    // is bound to the actual BeforeWrite gate under the release mutex.
+    let wait_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || {
+        wait_gate
+            .wait_until_parked(1, Duration::from_secs(5))
+            .expect("overflow spool write must park in BeforeWrite")
+    })
+    .await
+    .expect("parked gate wait task");
 
     let (enqueued_while_blocked, written_while_blocked, lost_while_blocked) =
         spool_delivery_totals();
@@ -3221,24 +3372,24 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
         "bounded overflow enqueue must not drop while the delivery queue has capacity"
     );
     assert!(
-        parked_before_write.load(Ordering::SeqCst) > 0,
-        "gated spool write must still be parked in BeforeWrite before release"
+        gate.parked_count() > 0,
+        "gated spool write must still be parked in BeforeWrite before release; {}",
+        gate.diagnostic_snapshot()
     );
     assert!(
-        !*finished.0.lock().expect("finished gate lock"),
-        "blocked spool write must not finish before release"
+        !gate.is_finished(),
+        "blocked spool write must not finish before release; {}",
+        gate.diagnostic_snapshot()
     );
 
     let enqueued_during_gate = enqueued_after_hook - enqueued_baseline;
 
-    {
-        let (lock, cv) = &*release;
-        let mut guard = lock.lock().expect("release gate lock");
-        *guard = true;
-        cv.notify_all();
-    }
+    gate.release_all();
 
-    wait_condvar_flag(Arc::clone(&finished)).await;
+    let finished_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || finished_gate.wait_until_finished())
+        .await
+        .expect("finished gate wait task");
 
     // AfterWrite runs inside write_events; the delivery worker publishes
     // jobs_written only after spawn_blocking joins. Yield until our gated
@@ -5659,4 +5810,129 @@ fn snapshot_exports_at_limit_identity_verbatim() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].consumer_id, consumer);
+}
+
+// ---------------------------------------------------------------------------
+// ClickHouse endpoint credential handling — advisory GHSA-8594-2xhc-8g38
+// ---------------------------------------------------------------------------
+
+/// Sentinel planted in an `insert_query_params` value. Parameter *values* stay
+/// arbitrary (ClickHouse settings are operator tuning), so the guarantee is
+/// that the INSERT query string never reaches a diagnostic.
+const CH_VALUE_SENTINEL: &str = "clickhouse-setting-value-canary";
+
+#[test]
+fn insert_query_params_reject_credential_bearing_names() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    for name in [
+        "user",
+        "password",
+        "access_token",
+        "session_id",
+        "USER",
+        "Password",
+        "x_api_key",
+        "myapikey",
+        "vendor_secret",
+        "svc_credential",
+        "db_passwd",
+        "refresh_token",
+    ] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["insert_query_params"] = json!({ name: CH_VALUE_SENTINEL });
+        let err = validate_plugin_config("api_chargeback_sink", &config)
+            .expect_err("credential-bearing parameter names must be rejected");
+        assert!(
+            err.contains("names a credential"),
+            "rejection must explain the contract for {name}: {err}"
+        );
+        assert!(
+            err.contains("password_ref"),
+            "rejection must point at the supported channel for {name}: {err}"
+        );
+        assert!(
+            !err.contains(CH_VALUE_SENTINEL),
+            "rejection must not echo the value for {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn insert_query_params_still_accept_ordinary_clickhouse_settings() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "1",
+        "max_insert_threads": "4",
+        "date_time_input_format": "best_effort",
+    });
+    validate_plugin_config("api_chargeback_sink", &config)
+        .expect("ordinary ClickHouse settings must remain admitted");
+}
+
+/// The INSERT URL carries every configured parameter (so the export works),
+/// while the diagnostic rendering keeps only scheme/host/port.
+#[test]
+fn insert_url_carries_params_but_redacted_form_does_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://clickhouse.example.com:8443/base-path");
+    config["clickhouse"]["insert_query_params"] = json!({ "async_insert": CH_VALUE_SENTINEL });
+    let parsed: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+
+    let insert_url = clickhouse_insert_url_for_tests(&parsed).unwrap();
+    assert!(
+        insert_url.contains(CH_VALUE_SENTINEL),
+        "the real request must still carry the configured parameter: {insert_url}"
+    );
+
+    let redacted = ferrum_edge::plugins::utils::redacted_endpoint_url_str(&insert_url);
+    assert_eq!(redacted, "https://clickhouse.example.com:8443/redacted");
+    assert!(!redacted.contains(CH_VALUE_SENTINEL));
+    assert!(
+        !redacted.contains("base-path"),
+        "redaction is structural: the path is dropped, not substring-replaced"
+    );
+    assert!(!redacted.contains("INSERT"));
+}
+
+/// The custom-TLS (`Dedicated`) client path classifies its transport failure
+/// rather than rendering the `reqwest::Error`, so the INSERT URL cannot reach a
+/// log line or the returned replay error.
+#[tokio::test(flavor = "current_thread")]
+async fn spool_replay_failure_does_not_leak_insert_url() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let insert_url =
+        format!("http://{addr}/?database=ferrum&query=INSERT&password={CH_VALUE_SENTINEL}");
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    spool
+        .write_events(&[sample_event("evt-redaction")])
+        .unwrap();
+
+    let outcome = replay_spool_once_for_tests(&spool, &insert_url).await;
+    drop(guard);
+
+    if let Err(error) = &outcome {
+        assert!(
+            !error.contains(CH_VALUE_SENTINEL),
+            "replay error leaked the INSERT credential: {error}"
+        );
+    }
+    let captured = logs.contents();
+    super::plugin_utils::assert_no_secrets(
+        &captured,
+        "chargeback spool replay",
+        &[CH_VALUE_SENTINEL],
+    );
 }

@@ -12,6 +12,7 @@
 use super::conf_file::ConfFile;
 use super::db_backend::redact_url;
 use crate::ebpf::NodeAgentProxyMode;
+use crate::plugins::utils::fault_delay::DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
 use crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS;
 use crate::util::cidr::CidrSet;
 use std::collections::{HashMap, HashSet};
@@ -1677,6 +1678,18 @@ pub struct EnvConfig {
     /// `FERRUM_HTTP3_IDLE_TIMEOUT` when isolated H3 WebSockets need a longer
     /// idle window.
     pub websocket_idle_timeout_seconds: u64,
+    /// Maximum physical WebSocket frames a single fragmented message may consume
+    /// before the connection is closed with RFC 6455 code `1008`. Counts the
+    /// initial non-final Text/Binary frame plus every continuation frame that
+    /// does not finish the message, regardless of payload length. `0` disables
+    /// the bound. Default: 1024.
+    pub websocket_max_incomplete_message_frames: usize,
+    /// Maximum wall-clock seconds a WebSocket message may stay incomplete,
+    /// measured from its first fragment and checked on every subsequent
+    /// non-Close frame while the message is still incomplete — including the
+    /// completing continuation and interleaved Ping/Pong. Independent of the
+    /// frame-count bound. `0` disables the bound. Default: 60.
+    pub websocket_max_incomplete_message_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -2204,6 +2217,15 @@ pub struct EnvConfig {
     /// Removes entries where the active request count has dropped to zero.
     /// Only relevant when `max_concurrent_requests_per_ip > 0`. Default: 60.
     pub per_ip_cleanup_interval_seconds: u64,
+    /// Process-wide ceiling on requests/connections concurrently parked on an
+    /// injected `fault_injection` (or `mesh_route_dispatch` route-local) delay.
+    ///
+    /// Shared by every plugin instance in the process, so aggregate exposure is
+    /// bounded no matter how many proxies attach a fault. Unlike the optional
+    /// per-IP request cap, `0` here does not mean "unlimited": it disables
+    /// injected delays entirely. Exceeding the budget skips the delay rather
+    /// than queueing it. Default: 256.
+    pub max_concurrent_fault_delays: usize,
     /// Maximum entries in the circuit breaker cache. Entries are keyed by
     /// proxy_id::host:port. Stale entries from removed upstream targets are
     /// pruned during config reload. This cap prevents unbounded growth from
@@ -2584,6 +2606,8 @@ impl Default for EnvConfig {
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
             websocket_idle_timeout_seconds: 300,
+            websocket_max_incomplete_message_frames: 1_024,
+            websocket_max_incomplete_message_seconds: 60,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -2701,6 +2725,7 @@ impl Default for EnvConfig {
             max_requests: 0,
             max_concurrent_requests_per_ip: 0,
             per_ip_cleanup_interval_seconds: 60,
+            max_concurrent_fault_delays: DEFAULT_MAX_CONCURRENT_FAULT_DELAYS,
             circuit_breaker_cache_max_entries: 10_000,
             pool_shard_amount: 0,
             status_counts_max_entries: 200,
@@ -3026,6 +3051,8 @@ impl EnvConfig {
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
+            websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
+            websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;
@@ -3158,6 +3185,7 @@ impl EnvConfig {
             max_requests: usize = "FERRUM_MAX_REQUESTS" => 0usize;
             max_concurrent_requests_per_ip: u64 = "FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP" => 0u64;
             per_ip_cleanup_interval_seconds: u64 = "FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS" => 60u64;
+            max_concurrent_fault_delays: usize = "FERRUM_MAX_CONCURRENT_FAULT_DELAYS" => DEFAULT_MAX_CONCURRENT_FAULT_DELAYS;
             circuit_breaker_cache_max_entries: usize = "FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES" => 10_000usize;
             pool_shard_amount: usize = "FERRUM_POOL_SHARD_AMOUNT" => 0usize;
             status_counts_max_entries: usize = "FERRUM_STATUS_COUNTS_MAX_ENTRIES" => 200usize;
@@ -3678,6 +3706,8 @@ impl EnvConfig {
             websocket_write_buffer_size,
             websocket_tunnel_mode,
             websocket_idle_timeout_seconds,
+            websocket_max_incomplete_message_frames,
+            websocket_max_incomplete_message_seconds,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
@@ -3794,6 +3824,7 @@ impl EnvConfig {
             max_requests,
             max_concurrent_requests_per_ip,
             per_ip_cleanup_interval_seconds,
+            max_concurrent_fault_delays,
             circuit_breaker_cache_max_entries,
             pool_shard_amount,
             status_counts_max_entries,
