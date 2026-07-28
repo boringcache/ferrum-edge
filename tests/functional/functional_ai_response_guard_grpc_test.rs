@@ -347,7 +347,7 @@ fn assert_ok_trailer_grpc_status(call: &GrpcCall, context: &str) {
         call.headers.get("grpc-status"),
     );
     assert!(
-        call.headers.get("grpc-status").is_none(),
+        !call.headers.contains_key("grpc-status"),
         "{context}: message-carrying responses must not expose grpc-status in \
          initial HEADERS (got {:?})",
         call.headers.get("grpc-status"),
