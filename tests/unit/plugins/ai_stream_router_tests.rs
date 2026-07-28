@@ -5,7 +5,7 @@ use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
 use ferrum_edge::plugins::ai_stream_router::{
     AiStreamRouter, MAX_SSE_EVENT_BYTES, MAX_SSE_EVENT_JSON_DEPTH, MAX_SSE_EVENTS,
-    MAX_SSE_NORMALIZED_BODY_BYTES,
+    MAX_SSE_NORMALIZED_BODY_BYTES, MAX_SSE_NORMALIZED_OUTPUT_BYTES,
 };
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
@@ -1972,6 +1972,20 @@ fn assert_bound_termination(text: &str, needle: &str) {
     assert!(!text.contains("aaaaaaaa"), "{text}");
 }
 
+fn large_text_delta_frame(text_bytes: usize) -> Vec<u8> {
+    let text = "a".repeat(text_bytes);
+    let payload = format!(
+        r#"{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{}}}}}"#,
+        serde_json::to_string(&text).expect("text delta JSON")
+    );
+    let frame = format!("event: content_block_delta\ndata: {payload}\n\n").into_bytes();
+    assert!(
+        frame.len() <= MAX_SSE_EVENT_BYTES,
+        "delta frame {text_bytes} bytes must stay under the per-event cap"
+    );
+    frame
+}
+
 fn oversized_complete_event(event_bytes: usize) -> Vec<u8> {
     // `data: ` (6) + filler + `\n\n` (2) == event_bytes.
     assert!(event_bytes >= 8, "event frame too small");
@@ -2127,6 +2141,35 @@ async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
     // Structural companion: library-inline `sse_buffer_tests` asserts cursor
     // compaction keeps capacity O(partial). Here we only prove the public
     // streaming path stays healthy under a many-event burst.
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_excessive_normalized_output() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let start = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_out\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+    );
+    match inspector.on_chunk(start.as_bytes()).await {
+        ResponseStreamAction::Forward(_) => {}
+        other => panic!("message_start must forward: {other:?}"),
+    }
+
+    const DELTA_TEXT_BYTES: usize = 512 * 1024;
+    let delta = large_text_delta_frame(DELTA_TEXT_BYTES);
+    let deltas_needed = MAX_SSE_NORMALIZED_OUTPUT_BYTES / DELTA_TEXT_BYTES + 2;
+    for index in 0..deltas_needed {
+        match inspector.on_chunk(&delta).await {
+            ResponseStreamAction::Forward(_) => {}
+            ResponseStreamAction::Terminate(Some(bytes)) => {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert_bound_termination(&text, "cumulative normalized size limit");
+                return;
+            }
+            other => panic!("text delta {index} unexpected: {other:?}"),
+        }
+    }
+    panic!("stream must terminate before {deltas_needed} text deltas exhaust the output cap");
 }
 
 #[tokio::test]
