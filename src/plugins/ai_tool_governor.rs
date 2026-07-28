@@ -225,8 +225,7 @@ const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
 const AMBIGUOUS_REQUEST_JSON: &str =
     "request body contains duplicate JSON object member names and cannot be governed unambiguously";
 /// Response-side counterpart of [`AMBIGUOUS_REQUEST_JSON`].
-const AMBIGUOUS_RESPONSE_JSON: &str =
-    "response body contains duplicate JSON object member names and cannot be governed unambiguously";
+const AMBIGUOUS_RESPONSE_JSON: &str = "response body contains duplicate JSON object member names and cannot be governed unambiguously";
 /// A governed tool call whose `arguments` JSON STRING carries duplicate member
 /// names. The enclosing document scan cannot see inside a JSON string, so the
 /// string content gets its own screen and an ambiguous one makes the call
@@ -2999,7 +2998,11 @@ impl Plugin for AiToolGovernor {
                 // Same duplicate-member screen on the DECODED bytes: a
                 // compressed governed body must not reach policy on a
                 // last-wins collapse either.
-                if ctx.json_scan_memo.ambiguity(strip_json_bom(&decoded)).is_some() {
+                if ctx
+                    .json_scan_memo
+                    .ambiguity(strip_json_bom(&decoded))
+                    .is_some()
+                {
                     return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
                 }
                 let Some(json) = parse_json_within_limit(&decoded) else {
@@ -3461,7 +3464,11 @@ impl Plugin for AiToolGovernor {
                 return PluginResult::Continue;
             }
             // Duplicate-member screen on the DECODED client-visible bytes.
-            if ctx.json_scan_memo.ambiguity(strip_json_bom(&decoded)).is_some() {
+            if ctx
+                .json_scan_memo
+                .ambiguity(strip_json_bom(&decoded))
+                .is_some()
+            {
                 return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
             }
             let Some(json) = parse_json_within_limit(&decoded) else {

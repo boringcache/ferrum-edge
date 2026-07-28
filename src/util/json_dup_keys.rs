@@ -460,7 +460,8 @@ fn read_string<'a>(bytes: &'a [u8], index: &mut usize) -> Result<(&'a str, bool)
             _ => position += 1,
         }
     }
-    let raw = std::str::from_utf8(&bytes[start..position]).map_err(|_| JsonScanReject::Malformed)?;
+    let raw =
+        std::str::from_utf8(&bytes[start..position]).map_err(|_| JsonScanReject::Malformed)?;
     *index = position + 1;
     Ok((raw, has_escape))
 }

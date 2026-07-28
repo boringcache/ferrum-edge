@@ -9501,9 +9501,7 @@ async fn mcp_duplicate_tool_name_is_observed_in_dry_run() {
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_ne!(
-        ctx.metadata
-            .get(AMBIGUITY_METADATA_KEY)
-            .map(String::as_str),
+        ctx.metadata.get(AMBIGUITY_METADATA_KEY).map(String::as_str),
         Some("deny"),
         "dry-run must not record an enforcement decision"
     );
@@ -9528,7 +9526,10 @@ async fn mcp_duplicate_rejection_detail_echoes_no_body_bytes() {
         body.contains("duplicate JSON object member names"),
         "detail should name the cause: {body}"
     );
-    assert!(!body.contains("SHIBBOLETH"), "detail leaked body bytes: {body}");
+    assert!(
+        !body.contains("SHIBBOLETH"),
+        "detail leaked body bytes: {body}"
+    );
     // The plugin's own metadata must not echo the body either. `request_body`
     // is the proxy's own buffered copy, not something this plugin wrote.
     for (key, value) in &ctx.metadata {

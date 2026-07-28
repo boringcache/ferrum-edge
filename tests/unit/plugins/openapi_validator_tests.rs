@@ -6878,7 +6878,10 @@ async fn log_only_mode_observes_duplicate_members_without_claiming_enforcement()
     );
     let detail = request_error(&ctx).expect("request error recorded");
     assert!(detail.contains("duplicate object member names"), "{detail}");
-    assert!(!detail.contains("admin"), "detail echoed body bytes: {detail}");
+    assert!(
+        !detail.contains("admin"),
+        "detail echoed body bytes: {detail}"
+    );
 }
 
 /// The response direction is the mirror image: the CLIENT is the first-key-wins

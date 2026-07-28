@@ -5189,7 +5189,10 @@ async fn duplicate_member_rejection_detail_echoes_no_body_bytes() {
         body.contains("duplicate object member names"),
         "detail should name the duplicate-member cause: {body}"
     );
-    assert!(!body.contains("SECRET"), "detail leaked a member name: {body}");
+    assert!(
+        !body.contains("SECRET"),
+        "detail leaked a member name: {body}"
+    );
     assert!(!body.contains("VALUE"), "detail leaked a value: {body}");
     assert!(!body.contains("admin"), "detail leaked a value: {body}");
 }
@@ -5223,10 +5226,7 @@ async fn duplicate_member_nested_inside_arrays_and_objects_is_rejected() {
     ] {
         let mut ctx = make_json_ctx(body);
         let mut headers = make_json_headers();
-        assert_reject(
-            plugin.before_proxy(&mut ctx, &mut headers).await,
-            Some(400),
-        );
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
     }
 }
 
@@ -5277,7 +5277,12 @@ async fn duplicate_member_in_response_body_is_rejected() {
 
     let mut ctx = make_response_ctx();
     let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, br#"{"role":"admin","role":"safe"}"#)
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &headers,
+            br#"{"role":"admin","role":"safe"}"#,
+        )
         .await;
     assert_reject(result, Some(502));
 
