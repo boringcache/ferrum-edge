@@ -3385,7 +3385,9 @@ struct IngestStep {
 /// text to inspect when a sentence/paragraph boundary (or the byte cap) is
 /// crossed — with a rolling overlap so a violation split across a boundary is
 /// caught. After a clean verdict the caller takes the released raw bytes via
-/// [`release`](Self::release); on a violation it calls [`discard_pending`](Self::discard_pending).
+/// [`release`](Self::release); on a violation or cut it calls
+/// [`discard_held`](Self::discard_held) (which clears the pending window via
+/// [`discard_pending`](Self::discard_pending) and frees held raw bytes + carry).
 ///
 /// Block-mode contract: raw bytes are held until the text they produced has been
 /// inspected and cleared, so no un-inspected bytes reach the client. Async
@@ -3770,7 +3772,7 @@ impl StreamWindowEngine {
     /// cut so un-inspected content is freed at the cut, not at inspector drop —
     /// no held window survives the cancellation that ended the response.
     fn discard_held(&mut self) {
-        self.pending_clears_to = None;
+        self.discard_pending();
         self.held.clear();
         self.held.shrink_to_fit();
         self.carry.clear();
@@ -6143,6 +6145,8 @@ mod stream_window_tests {
             overlap_bytes,
             max_inspections: 64,
             cut_with_error_event: true,
+            max_hold: None,
+            hold_timeout: HoldTimeoutPolicy::FollowOnError,
         }
     }
 
