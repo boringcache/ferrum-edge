@@ -123,7 +123,9 @@ use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv6Addr};
+use std::future::Future;
+use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1465,10 +1467,14 @@ impl CorrelationIdState {
 }
 
 impl CanonicalClientIpCache {
+    /// Ingress already folded IPv4-mapped IPv6 identities to native IPv4
+    /// (GHSA-vjwj-657f-5w9g). The shared helper is applied once more here so a
+    /// context built outside the gateway accept paths — a custom plugin, an
+    /// external test — still resolves one principal per host.
     fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
         *self
             .value
-            .get_or_init(|| parse_canonical_client_ip(client_ip))
+            .get_or_init(|| crate::util::client_identity::parse_canonical_client_ip(client_ip))
     }
 
     /// Whether a policy has already resolved the typed address.
@@ -1497,30 +1503,6 @@ impl CanonicalClientIpCache {
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         self.correlation_ids.project_correlation_ids(metadata);
     }
-}
-
-fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
-    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
-}
-
-/// Parse the legacy client/rule literal forms without allocation.
-///
-/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
-/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
-/// established policy grammar.
-fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Ok(ipv4) = client_ip.parse() {
-        return Some(IpAddr::V4(ipv4));
-    }
-
-    let unbracketed = client_ip
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(client_ip);
-    let without_zone = unbracketed
-        .find('%')
-        .map_or(unbracketed, |index| &unbracketed[..index]);
-    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
 /// AI usage that was produced by a built-in accounting path.
@@ -1734,6 +1716,51 @@ pub enum ResponsePresentationPolicy {
     Dynamic,
 }
 
+/// Frontend-supplied watch on the client transport carrying a request.
+///
+/// Implementations must be observable **without** reading or polling the
+/// request body: the request stream stays owned by the proxy path, and no
+/// detached watcher may race it for bytes. A QUIC connection-close watch
+/// qualifies; draining a socket to "check liveness" does not.
+pub trait PeerConnectionWatch: Send + Sync {
+    /// Resolve once the client transport is known to be gone.
+    ///
+    /// Must be cancel-safe: callers place it in a `select!` and drop it when
+    /// another branch wins.
+    fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Non-blocking check for an already-closed transport.
+    fn is_closed(&self) -> bool;
+}
+
+/// Cloneable handle to a [`PeerConnectionWatch`].
+#[derive(Clone)]
+pub struct PeerConnectionSignal(Arc<dyn PeerConnectionWatch>);
+
+impl PeerConnectionSignal {
+    pub fn new(watch: Arc<dyn PeerConnectionWatch>) -> Self {
+        Self(watch)
+    }
+
+    /// See [`PeerConnectionWatch::closed`].
+    pub fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.0.closed()
+    }
+
+    /// See [`PeerConnectionWatch::is_closed`].
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+impl std::fmt::Debug for PeerConnectionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque on purpose: the underlying handle carries transport state
+        // that has no business in a `RequestContext` debug dump.
+        f.write_str("PeerConnectionSignal")
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1881,6 +1908,14 @@ pub struct RequestContext {
     /// metadata so sibling/custom plugins cannot clear or forge the signal
     /// consumed by fail-closed response negotiation.
     response_cache_hit: bool,
+    /// Genuine HTTP status from the origin/backend response, recorded once by
+    /// proxy core at the start of `run_after_proxy_hooks` before any
+    /// `after_proxy` hook can reject and replace the client-visible response.
+    /// `None` when no origin response was received (pre-dispatch rejects,
+    /// transport failures that never yield headers, gateway-only synthetics).
+    /// Kept private so request metadata cannot forge origin success for
+    /// invalidation or similar origin-success boundaries.
+    origin_http_response_status: Option<u16>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -2286,6 +2321,19 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Optional watch on the *client transport* carrying this request.
+    ///
+    /// Stamped by frontends that can observe peer departure without polling
+    /// (and therefore without competing for ownership of) the request body.
+    /// Today that is the HTTP/3 frontend, which watches QUIC connection close.
+    /// `None` on HTTP/1.1 and HTTP/2, where hyper owns the connection state and
+    /// no such side-channel exists.
+    ///
+    /// Only deliberately parked work consults this — currently injected fault
+    /// delays. It is not a general request-cancellation channel and must not
+    /// become one without a hot-path review: awaiting it costs a boxed future.
+    #[doc(hidden)]
+    pub peer_connection: Option<PeerConnectionSignal>,
     /// Aggregate fail-closed decision staged by cache-managed
     /// `mesh_route_dispatch` instances. The cache inserts a finalizer directly
     /// after the last instance so disjoint rules can all participate before a
@@ -2483,6 +2531,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             response_cache_hit: false,
+            origin_http_response_status: None,
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -2555,6 +2604,7 @@ impl RequestContext {
             max_response_body_size_bytes: 0,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            peer_connection: None,
             mesh_route_dispatch_reject_unmatched: false,
             mesh_route_dispatch_matched: false,
             route_override_upstream_id: None,
@@ -2911,6 +2961,23 @@ impl RequestContext {
         self.response_cache_hit
     }
 
+    /// Record the genuine origin/backend HTTP status exactly once.
+    ///
+    /// Proxy core calls this at the start of `run_after_proxy_hooks` before any
+    /// response hook can replace the downstream status. Subsequent calls are
+    /// ignored so an earlier rejection or plugin cannot overwrite provenance.
+    pub(crate) fn record_origin_http_response_status(&mut self, status: u16) {
+        if self.origin_http_response_status.is_none() {
+            self.origin_http_response_status = Some(status);
+        }
+    }
+
+    /// Genuine origin/backend HTTP status when one was received for this
+    /// request, otherwise `None`.
+    pub(crate) fn origin_http_response_status(&self) -> Option<u16> {
+        self.origin_http_response_status
+    }
+
     pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
         self.authorized_backend_path = Some(path);
     }
@@ -3264,6 +3331,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             response_cache_hit: self.response_cache_hit,
+            origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -3380,6 +3448,7 @@ impl RequestContext {
             max_response_body_size_bytes: self.max_response_body_size_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
+            peer_connection: self.peer_connection.clone(),
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
             mesh_route_dispatch_matched: self.mesh_route_dispatch_matched,
             route_override_upstream_id: self.route_override_upstream_id.clone(),
@@ -6832,6 +6901,16 @@ pub trait Plugin: Send + Sync {
     fn applies_after_proxy_on_reject(&self) -> bool {
         false
     }
+
+    /// Observe the genuine origin/backend HTTP status exactly once, before any
+    /// `after_proxy` hook can reject and replace the downstream response.
+    ///
+    /// Proxy core records the status on [`RequestContext`] as private typed
+    /// provenance and then invokes this hook for every plugin in configured
+    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// must not depend on later hooks presenting the origin status to the
+    /// client (for example cache invalidation) override this.
+    fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
 
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted

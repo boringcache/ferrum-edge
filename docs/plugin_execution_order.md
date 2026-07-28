@@ -1027,7 +1027,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
 | `security_headers` | ✓ | ✓ | ✓ | | | HTTP-family response security headers and fingerprint stripping |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
-| `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
+| `ai_rate_limiter` | ✓ | | | | | HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
 | `statsd_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
