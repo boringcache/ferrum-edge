@@ -1109,7 +1109,8 @@ pub fn render_prometheus() -> String {
     let retained_high_water =
         crate::plugins::utils::byte_budget::process_retained_bytes_high_water();
     let ceiling_rejections = crate::plugins::utils::byte_budget::process_ceiling_rejections();
-    let batch_lost_records = crate::plugins::utils::byte_budget::batch_materialization_lost_records();
+    let batch_lost_records =
+        crate::plugins::utils::byte_budget::batch_materialization_lost_records();
     let batch_loss_events = crate::plugins::utils::byte_budget::batch_materialization_loss_events();
     let batch_fallbacks = crate::plugins::utils::byte_budget::batch_materialization_fallbacks();
     let active_workers = match lifecycle.workers.lock() {

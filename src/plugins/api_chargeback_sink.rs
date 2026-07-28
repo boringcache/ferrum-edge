@@ -7590,12 +7590,14 @@ fn decode_spool_artifact(
 
     let mut line_count = 0usize;
     for_each_spool_line(&text, |_, _| line_count = line_count.saturating_add(1));
-    let index_bytes = line_count.checked_mul(SPOOL_INDEX_ENTRY_BYTES).ok_or_else(|| {
-        SpoolDecodeError::Unreadable(format!(
-            "{PLUGIN_NAME}: spool file '{}' line index byte bound overflowed",
-            path.display()
-        ))
-    })?;
+    let index_bytes = line_count
+        .checked_mul(SPOOL_INDEX_ENTRY_BYTES)
+        .ok_or_else(|| {
+            SpoolDecodeError::Unreadable(format!(
+                "{PLUGIN_NAME}: spool file '{}' line index byte bound overflowed",
+                path.display()
+            ))
+        })?;
     let index_reservation = ceiling.try_acquire(index_bytes).ok_or_else(|| {
         SpoolDecodeError::CeilingExhausted(format!(
             "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
@@ -9239,7 +9241,10 @@ impl SnapshotAccumulator {
     /// covers the per-event fields that come from configuration rather than from
     /// the accumulator key.
     fn delta_projection_bound(&self, per_event_extra: usize) -> Option<usize> {
-        let identities = self.entries.len().checked_add(self.overflow_pending_len())?;
+        let identities = self
+            .entries
+            .len()
+            .checked_add(self.overflow_pending_len())?;
         self.retained_bytes()
             .checked_mul(SNAPSHOT_PROJECTION_COPIES)?
             .checked_add(identities.checked_mul(per_event_extra)?)

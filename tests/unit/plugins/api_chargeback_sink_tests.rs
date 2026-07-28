@@ -6332,7 +6332,11 @@ fn snapshot_accumulators_share_one_process_ceiling_across_instances() {
     drop(second);
     assert_eq!(ceiling.used(), 0, "drop releases the remaining charge");
     drop(first);
-    assert_eq!(ceiling.used(), 0, "a cleared accumulator cannot double-release");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a cleared accumulator cannot double-release"
+    );
 }
 
 #[test]
@@ -6348,7 +6352,10 @@ fn snapshot_accumulator_releases_its_process_charge_when_overflow_is_drained() {
         );
     }
     let staged = accumulator.process_retained_bytes_for_tests();
-    assert!(staged > 0, "staged overflow must charge the process ceiling");
+    assert!(
+        staged > 0,
+        "staged overflow must charge the process ceiling"
+    );
     assert_eq!(staged, ceiling.used());
 
     accumulator.clear_for_compaction_for_tests();
@@ -6425,7 +6432,10 @@ fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clam
     fs::write(&bomb_path, &bomb).unwrap();
     let err = decode_spool_file_for_tests(&bomb_path)
         .expect_err("the ratio clamp must still bound a header-less high-ratio archive");
-    assert!(err.contains("decompression bound"), "unexpected error: {err}");
+    assert!(
+        err.contains("decompression bound"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -1201,11 +1201,7 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
             // this path fires once per batch, so it must not warn once per
             // batch. The record-scale counter is separate from the ceiling's
             // reservation-rejection counter.
-            record_batch_materialization_loss(
-                LOKI_PLUGIN_NAME,
-                entry_count as u64,
-                error.reason(),
-            );
+            record_batch_materialization_loss(LOKI_PLUGIN_NAME, entry_count as u64, error.reason());
             return Ok(());
         }
     };

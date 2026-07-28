@@ -189,7 +189,9 @@ static BATCH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 /// never anything derived from payload content.
 pub fn record_batch_materialization_loss(sink: &'static str, records: u64, reason: &'static str) {
     BATCH_LOST_RECORDS.fetch_add(records, Ordering::Relaxed);
-    let events = BATCH_LOSS_EVENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let events = BATCH_LOSS_EVENTS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     if events == 1 || events.is_multiple_of(BATCH_DIAGNOSTIC_WARN_EVERY) {
         warn!(
             plugin = sink,
@@ -207,7 +209,9 @@ pub fn record_batch_materialization_loss(sink: &'static str, records: u64, reaso
 /// Account a degraded-but-complete delivery by `sink` and emit a sampled,
 /// fixed-label warning. No records are lost on this path.
 pub fn record_batch_materialization_fallback(sink: &'static str, reason: &'static str) {
-    let events = BATCH_FALLBACKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    let events = BATCH_FALLBACKS
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     if events == 1 || events.is_multiple_of(BATCH_DIAGNOSTIC_WARN_EVERY) {
         warn!(
             plugin = sink,
