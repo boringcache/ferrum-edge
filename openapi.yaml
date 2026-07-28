@@ -19080,8 +19080,10 @@ components:
             even when the global FERRUM_MAX_REQUEST_BODY_SIZE_BYTES is set to 0
             (unlimited). Combined with the global limit by the proxy; the
             strictest positive value wins, and it applies only to requests this
-            instance admitted for mirroring. Must not exceed
-            max_retained_request_body_bytes (rejected at construction otherwise).
+            instance admitted for mirroring. An explicit value above
+            max_retained_request_body_bytes is rejected at construction; when
+            the key is omitted the default clamps down to
+            max_retained_request_body_bytes instead of failing.
             Default is 10 MiB, matching the global default.
         mirror_timeout_ms:
           type: integer

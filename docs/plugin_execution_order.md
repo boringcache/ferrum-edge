@@ -233,7 +233,10 @@ allocates a mirror body. Because the hook runs at the end of the authorization
 phase, authentication and every real authorization plugin still reject first,
 and the sampler is never advanced for a request they refuse. Instances with
 `mirror_request_body: false` or a zero-quantized `percentage` declare no body
-capability at all and stay out of the authorize list.
+capability at all and stay out of the authorize list. The staged decision is
+left behind as a consumed marker after `before_proxy` takes the lease, so the
+buffering predicate answers consistently for the whole request.
+
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
 the external call. After each deferred pass, the gateway removes every case

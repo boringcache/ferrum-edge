@@ -4824,6 +4824,143 @@ fn advisory_max_mirrored_request_body_bytes_validation() {
 }
 
 #[test]
+fn advisory_default_ceiling_clamps_to_a_smaller_aggregate_budget() {
+    use ferrum_edge::_test_support::request_mirror_max_mirrored_request_body_bytes_for_test;
+
+    // Lowering only the aggregate budget must keep constructing: the per-request
+    // ceiling is defaulted, not operator-declared, so it clamps down instead of
+    // failing an instance the operator never mis-configured.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "max_retained_request_body_bytes": 4096
+    }));
+    assert_eq!(
+        request_mirror_max_mirrored_request_body_bytes_for_test(&plugin),
+        4096,
+        "the default ceiling must clamp to the configured aggregate budget"
+    );
+    assert_eq!(
+        plugin
+            .request_body_buffer_limit()
+            .expect("a body-mirroring instance publishes a positive ceiling"),
+        4096
+    );
+
+    // A larger aggregate budget leaves the default ceiling untouched.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "max_retained_request_body_bytes": ADVISORY_DEFAULT_MIRROR_BODY_CEILING * 4
+    }));
+    assert_eq!(
+        request_mirror_max_mirrored_request_body_bytes_for_test(&plugin),
+        ADVISORY_DEFAULT_MIRROR_BODY_CEILING
+    );
+}
+
+#[tokio::test]
+async fn advisory_buffering_decision_stays_stable_after_before_proxy_consumes_it() {
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "127.0.0.1",
+        "mirror_port": 9,
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 1,
+        "max_retained_request_body_bytes": 65536,
+        "max_mirrored_request_body_bytes": 65536,
+        "mirror_timeout_ms": 1
+    }));
+
+    let mut ctx = advisory_ctx(Some(128));
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(plugin.should_buffer_request_body(&ctx));
+
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 128]));
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        1
+    );
+
+    // The proxy re-evaluates `should_buffer_request_body` AFTER `before_proxy`
+    // (`final_request_body_requirements` on a header-transformed request). A
+    // flip to `false` there would re-derive `requires_request_body_buffering`
+    // — and downstream transport choices — from a body already collected.
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "the buffering predicate must stay stable once the body was collected"
+    );
+
+    // A second `before_proxy` must not re-sample, re-acquire, or dispatch.
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let metrics = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(metrics.dispatched, 1, "no duplicate shadow request");
+    assert_eq!(
+        metrics.concurrency_drops, 0,
+        "a consumed admission must not re-enter the permit path"
+    );
+    assert_eq!(
+        ctx.collect_mirror_results().await.len(),
+        1,
+        "exactly one mirror outcome is published for one admitted request"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while request_mirror_retained_request_body_bytes_for_test(&plugin) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached task must release the reservation exactly once");
+}
+
+#[tokio::test]
+async fn advisory_declared_length_is_read_from_the_raw_wire_headers() {
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_mirrored_request_body_bytes": 1024
+    }));
+
+    // Real proxy paths always carry raw headers; admission must read the wire
+    // framing from them rather than the folded map.
+    let mut ctx = make_ctx_with_proxy();
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("1048576"),
+    );
+    ctx.set_raw_headers(raw);
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "a wire Content-Length above the ceiling must keep the request streaming"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
+
+    // A malformed wire value is unknown length, not zero: fail closed by
+    // reserving the whole ceiling.
+    let mut ctx = make_ctx_with_proxy();
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("not-a-number"),
+    );
+    ctx.set_raw_headers(raw);
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        1024,
+        "an unparseable declared length must reserve the full ceiling"
+    );
+}
+
+#[test]
 fn advisory_max_mirrored_request_body_bytes_is_documented_everywhere() {
     let source = include_str!("../../../src/plugins/request_mirror.rs");
     let guide = include_str!("../../../docs/plugins.md");
