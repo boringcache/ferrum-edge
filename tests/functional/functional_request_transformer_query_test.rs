@@ -77,7 +77,7 @@ async fn request_transformer_query_survives_retry_on_h1() {
     assert_eq!(
         targets.len(),
         3,
-        "expected 1 original + 2 retries: {targets:?}"
+        "expected 1 original + 2 retries on /resource: {targets:?}"
     );
     for (idx, target) in targets.iter().enumerate() {
         assert!(
@@ -307,7 +307,14 @@ impl TransformerRetryHarness {
     async fn wait_for_attempts(&self, count: usize, timeout: Duration) -> Option<Vec<String>> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let targets = self.backend.targets();
+            // Ignore unrelated backend health/probe traffic (for example "*")
+            // so the retry count only covers the /resource requests under test.
+            let targets: Vec<String> = self
+                .backend
+                .targets()
+                .into_iter()
+                .filter(|target| target.starts_with("/resource"))
+                .collect();
             if targets.len() >= count {
                 return Some(targets);
             }
