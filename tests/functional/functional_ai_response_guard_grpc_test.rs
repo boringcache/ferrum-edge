@@ -236,7 +236,10 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
         let mut child = match start_gateway(config_path, gateway_port, admin_port) {
             Ok(child) => child,
             Err(e) => {
-                eprintln!("Gateway spawn attempt {}/{} failed: {}", attempt, MAX_ATTEMPTS, e);
+                eprintln!(
+                    "Gateway spawn attempt {}/{} failed: {}",
+                    attempt, MAX_ATTEMPTS, e
+                );
                 if attempt < MAX_ATTEMPTS {
                     sleep(Duration::from_secs(1)).await;
                 }
@@ -424,7 +427,10 @@ async fn grpc_guard_passes_clean_unary_response() {
 
     assert_eq!(call.status, 200);
     assert_eq!(call.grpc_status(), "0");
-    assert_eq!(call.body, body, "a clean response must be forwarded verbatim");
+    assert_eq!(
+        call.body, body,
+        "a clean response must be forwarded verbatim"
+    );
     harness.shutdown();
 }
 
@@ -551,7 +557,9 @@ async fn grpc_guard_fails_closed_on_malformed_framing() {
 #[ignore]
 async fn grpc_guard_fails_closed_on_oversized_messages() {
     let harness = Harness::start("reject", "        max_message_bytes: 8\n").await;
-    let body = grpc_frame(&encode_hello_response("a message that is definitely longer"));
+    let body = grpc_frame(&encode_hello_response(
+        "a message that is definitely longer",
+    ));
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &body, &[])
         .await
         .expect("gRPC call");
