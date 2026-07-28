@@ -577,8 +577,14 @@ impl TransactionDebugger {
             .any(|marker| lowered.contains(marker));
         matches_marker
             || SENSITIVE_HEADERS.iter().any(|name| lowered.contains(name))
-            || self.extra_redacted_headers.iter().any(|n| lowered.contains(n))
-            || self.redacted_body_fields.iter().any(|n| lowered.contains(n))
+            || self
+                .extra_redacted_headers
+                .iter()
+                .any(|n| lowered.contains(n))
+            || self
+                .redacted_body_fields
+                .iter()
+                .any(|n| lowered.contains(n))
             || is_sensitive_metadata_key(&lowered)
             || lowered.contains("bearer ")
             || lowered.contains("basic ")
@@ -743,7 +749,10 @@ impl Plugin for TransactionDebugger {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        capture_output_enabled() && self.request_body_capture_decision(&ctx.headers).is_capture()
+        capture_output_enabled()
+            && self
+                .request_body_capture_decision(&ctx.headers)
+                .is_capture()
     }
 
     /// The capture reads the body from the `on_final_request_body` parameter,
@@ -771,7 +780,9 @@ impl Plugin for TransactionDebugger {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && self.response_body_capture_decision(response_headers).is_capture()
+            && self
+                .response_body_capture_decision(response_headers)
+                .is_capture()
     }
 
     async fn before_proxy(
@@ -1160,8 +1171,8 @@ fn capture_decision(headers: &HashMap<String, String>, max_bytes: usize) -> Body
     {
         return BodyCaptureDecision::Skip("content_encoding");
     }
-    let Some(declared_length) = header_value(headers, "content-length")
-        .and_then(|value| value.trim().parse::<u64>().ok())
+    let Some(declared_length) =
+        header_value(headers, "content-length").and_then(|value| value.trim().parse::<u64>().ok())
     else {
         return BodyCaptureDecision::Skip("unknown_length");
     };

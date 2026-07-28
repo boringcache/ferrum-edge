@@ -959,7 +959,9 @@ async fn test_body_capture_disabled_by_default_is_zero_cost() {
     assert!(!plugin.should_buffer_response_body(&ctx));
     assert!(!plugin.needs_request_body_text());
     assert_eq!(
-        plugin.request_body_capture_decision(&ctx.headers).skip_reason(),
+        plugin
+            .request_body_capture_decision(&ctx.headers)
+            .skip_reason(),
         Some("disabled")
     );
 
@@ -970,7 +972,10 @@ async fn test_body_capture_disabled_by_default_is_zero_cost() {
             .await;
     })
     .await;
-    assert!(logs.is_empty(), "disabled capture must emit nothing: {logs}");
+    assert!(
+        logs.is_empty(),
+        "disabled capture must emit nothing: {logs}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1073,7 +1078,9 @@ fn test_capture_decision_exact_cap_and_cap_plus_one() {
     assert!(plugin.request_body_capture_decision(&at_cap).is_capture());
     let over_cap = body_headers("application/json", 65);
     assert_eq!(
-        plugin.request_body_capture_decision(&over_cap).skip_reason(),
+        plugin
+            .request_body_capture_decision(&over_cap)
+            .skip_reason(),
         Some("over_capture_limit")
     );
     let empty = body_headers("application/json", 0);
@@ -1354,7 +1361,9 @@ fn test_structured_families_without_a_structure_aware_redactor_are_not_capturabl
             "content_type={content_type}"
         );
         assert_eq!(
-            plugin.response_body_capture_decision(&headers).skip_reason(),
+            plugin
+                .response_body_capture_decision(&headers)
+                .skip_reason(),
             Some("content_type_excluded"),
             "content_type={content_type}"
         );
@@ -1408,7 +1417,10 @@ fn test_render_ceiling_is_exact_under_control_and_bidi_expansion() {
         "the render ceiling must be reached exactly, never overshot"
     );
     assert!(!sample.rendered.contains('\u{0007}'));
-    assert!(!sample.truncated, "an exactly-fitting capture is not truncated");
+    assert!(
+        !sample.truncated,
+        "an exactly-fitting capture is not truncated"
+    );
 
     // Bidi-spoofing characters expand 3 source bytes into 8 output bytes and
     // stay inside the same ceiling.
@@ -1461,7 +1473,9 @@ async fn test_final_request_hook_fails_closed_when_the_actual_body_exceeds_the_c
     assert!(plugin.request_body_capture_decision(&headers).is_capture());
 
     let logs = capture_debug_logs(|| async {
-        let _ = plugin.on_final_request_body(&headers, body.as_bytes()).await;
+        let _ = plugin
+            .on_final_request_body(&headers, body.as_bytes())
+            .await;
     })
     .await;
 
@@ -1470,7 +1484,10 @@ async fn test_final_request_hook_fails_closed_when_the_actual_body_exceeds_the_c
     assert!(logs.contains("direction=request"), "got: {logs}");
     assert!(!logs.contains("hunter2"), "secret leaked: {logs}");
     assert!(!logs.contains("qqqq"), "body content leaked: {logs}");
-    assert!(!logs.contains("body_bytes"), "length metadata leaked: {logs}");
+    assert!(
+        !logs.contains("body_bytes"),
+        "length metadata leaked: {logs}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1486,7 +1503,10 @@ async fn test_final_response_hook_fails_closed_on_transformation_length_drift() 
     // transform (templating, envelope wrapping, decompression) grew the
     // client-visible body past the configured cap.
     let headers = body_headers("application/json", 96);
-    let body = format!(r#"{{"api_key":"resp-secret","detail":"{}"}}"#, "z".repeat(2048));
+    let body = format!(
+        r#"{{"api_key":"resp-secret","detail":"{}"}}"#,
+        "z".repeat(2048)
+    );
     assert!(plugin.response_body_capture_decision(&headers).is_capture());
 
     let logs = capture_debug_logs(|| async {
