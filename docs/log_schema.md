@@ -252,10 +252,12 @@ schema raises.)
     `overwrite` (metadata entry replaces — implemented as a duplicate
     key, which most JSON parsers resolve as "last wins").
 
-Sensitive keys (`authorization`, `cookie`, credential tokens, etc.) are
-**always** redacted, on every path — `nested`, `flatten`, even when the
+Sensitive keys (`authorization`, `cookie`, credential tokens, API keys, etc.)
+are **always** redacted, on every path — `nested`, `flatten`, even when the
 operator renames the outer `metadata` field via `rename:`. There is no
-way to bypass redaction through the schema.
+way to bypass redaction through the schema. Request-private lifecycle keys
+under the `_dedup_` prefix are **omitted entirely** (not redacted) from every
+summary projection.
 
 ### Sensitive substrings
 
@@ -292,10 +294,21 @@ logs.
 Workaround: rename the field to drop the substring (e.g.
 `secret_count` → `total_credentials` or `credential_count`).
 
-Singular `token` keys go through a narrower per-segment classifier
-(`is_sensitive_token_metadata_key`) so usage metrics like
-`ai_total_tokens` / `prompt_tokens` stay visible; see
-`src/plugins/utils/metadata_redaction.rs` for the exact rules.
+### Per-segment credential classifiers
+
+Singular `token` keys and API-key spellings go through narrower per-segment
+classifiers in `src/plugins/utils/metadata_redaction.rs` so the same decision
+applies to native serialization, nested/flattened schema metadata, renamed
+outer metadata fields, and explicitly selected `static_fields`:
+
+| Concept | Sensitive examples | Not sensitive (controls) |
+|---------|--------------------|--------------------------|
+| Token | `token`, `access_token`, `refreshToken`, `id-token`, `APIToken`, `session_token` | `ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `prompt_tokens` |
+| API key | `api_key`, `api-key`, `apikey`, `APIKey`, `x-api-key`, `openai_api_key` | `cache_key`, `routing_key`, `api_response_count`, `ai_total_tokens` |
+
+Segmentation splits on non-alphanumeric delimiters, camelCase boundaries, and
+acronym→word boundaries (`APIKey` → `API` + `Key`, `APIToken` → `API` +
+`Token`). Concatenated `apikey` is recognized as its own segment.
 
 Operator-supplied extras may be added via the
 `FERRUM_LOG_REDACT_METADATA_KEYS` env var (comma-separated, also
@@ -303,6 +316,18 @@ substring-matched). Those apply to the redaction path only — schema
 compile-time rejection runs against the env-extras too, so adding a
 substring there will start rejecting matching schema names on the next
 reload.
+
+### Internal-only lifecycle metadata
+
+Keys whose names start with `_dedup_` are **internal-only**. They are stripped
+by `clone_log_metadata` and omitted by every native / schema serializer.
+`request_deduplication` keeps ownership key, fingerprint, local inflight token,
+and Redis lock token in typed non-serializable request state instead of public
+metadata; the `_dedup_` filter is the shared fail-closed contract if any
+producer still writes the legacy names (`_dedup_key`, `_dedup_fingerprint`,
+`_dedup_local_inflight_token`, `_dedup_redis_lock_token`). Schema
+`static_fields` / rename targets that match this prefix are rejected at
+compile time.
 
 ## Per-Plugin Notes
 

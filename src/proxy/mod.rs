@@ -3218,6 +3218,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // Fail-closed shared contract: request-deduplication lifecycle keys under
+    // `_dedup_*` never enter any transaction-log projection. Ownership lives in
+    // typed request state; this strips any residual public-metadata copies.
+    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {

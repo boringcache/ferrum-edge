@@ -182,6 +182,72 @@ async fn request_context_debug_redacts_request_deduplication_state() {
     }
 }
 
+#[tokio::test]
+async fn dedup_lifecycle_state_never_reaches_transaction_log_metadata() {
+    use ferrum_edge::_test_support::clone_log_metadata;
+
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":100}"#);
+    let mut upstream_headers = keyed_headers("log-projection-key", "api.example.test", 14);
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut upstream_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &ctx).is_some());
+
+    // Defense-in-depth: even if a hostile/custom producer reintroduces the
+    // legacy public-metadata names, the shared fail-closed filter omits them.
+    for (idx, key) in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ctx.metadata
+            .insert(key.to_string(), format!("planted-dedup-sentinel-{idx}"));
+    }
+
+    let logged = clone_log_metadata(&ctx);
+    for key in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ] {
+        assert!(
+            !logged.contains_key(key),
+            "{key} must never enter transaction-log metadata"
+        );
+    }
+    for idx in 0..4 {
+        let sentinel = format!("planted-dedup-sentinel-{idx}");
+        assert!(
+            !logged.values().any(|value| value.contains(&sentinel)),
+            "dedup lifecycle value leaked into log metadata"
+        );
+    }
+
+    // Incomplete stream termination retains typed ownership until TTL without
+    // copying it into public metadata.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert!(request_identity(&plugin, &ctx).is_some());
+    let after_incomplete = clone_log_metadata(&ctx);
+    for key in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ] {
+        assert!(!after_incomplete.contains_key(key));
+    }
+}
+
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), key.to_string());
