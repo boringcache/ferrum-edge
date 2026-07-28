@@ -25,7 +25,7 @@ use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsage
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
@@ -627,9 +627,13 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
     proxy.dispatch_kind = DispatchKind::from(BackendScheme::Http);
     proxy.backend_host = "multi-address-h2c.test".to_string();
     proxy.backend_port = port;
+    // Two candidates share this budget, so the first address is abandoned by
+    // `connect_candidates` after 1500 ms even if nothing rejects it.
     proxy.backend_connect_timeout_ms = 3_000;
 
+    let started = Instant::now();
     let sender = pool.get_sender(&proxy).await;
+    let elapsed = started.elapsed();
     assert!(
         sender.is_ok(),
         "healthy second address should complete the h2c handshake: {:?}",
@@ -644,6 +648,15 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
         healthy_attempts.load(Ordering::Relaxed),
         1,
         "the pool must reject the stalled non-H2 peer and dial the healthy candidate"
+    );
+    // Failover must come from observing the peer's non-H2 reply at ~100 ms,
+    // not from the first candidate exhausting its 1500 ms share of the connect
+    // budget. Without that distinction a readiness wait that simply never
+    // completes would still let this test pass.
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "failover must be driven by the h2c protocol rejection, not by the \
+         candidate connect budget expiring (took {elapsed:?})"
     );
 }
 

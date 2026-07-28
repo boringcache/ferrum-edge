@@ -814,9 +814,9 @@ impl GrpcPoolManager {
 
         // The candidate attempt includes TCP socket setup, negotiated ALPN h2
         // when TLS is configured, and the Hyper H2 handshake. Cleartext h2c
-        // additionally observes the spawned driver for an immediate protocol
-        // rejection. A peer that accepts TCP but cannot establish the requested
-        // protocol must not pin this pool to that DNS address.
+        // additionally waits for the peer's initial SETTINGS, since it has no
+        // ALPN proof. A peer that accepts TCP but cannot establish the
+        // requested protocol must not pin this pool to that DNS address.
         let result = if use_tls {
             let tls_config = self.get_tls_config(proxy, svid_generation)?;
             let connector = tokio_rustls::TlsConnector::from(tls_config);
@@ -921,7 +921,16 @@ impl GrpcPoolManager {
     }
 
     /// Build an HTTP/2 client builder with keepalive and flow-control settings.
-    fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
+    ///
+    /// `settings_readiness_sentinel` is set only for h2c, where there is no
+    /// ALPN proof and `create_h2c_connection` needs a value that cannot be
+    /// confused with a peer-supplied one. ALPN-proven TLS keeps the previous
+    /// pre-SETTINGS outbound bound so its first request is never gated on the
+    /// peer's SETTINGS arriving.
+    fn build_h2_builder(
+        pool_config: &PoolConfig,
+        settings_readiness_sentinel: bool,
+    ) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
         // Timer is required for keep_alive_interval and keep_alive_timeout to work
@@ -947,12 +956,21 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Cap server-initiated streams (push).
+            // Advertised to the peer as our own inbound stream cap.
             builder.max_concurrent_streams(max_streams);
         }
-        // Zero is a pre-SETTINGS sentinel only. The peer's initial SETTINGS
-        // replaces it, including the RFC default when the parameter is absent.
-        builder.initial_max_send_streams(0);
+
+        if settings_readiness_sentinel {
+            // Zero is a pre-SETTINGS sentinel only. h2 replaces it when the
+            // peer's *initial* SETTINGS is applied, using the advertised value
+            // or `usize::MAX` when the parameter is absent, so any non-zero
+            // reading proves the peer completed its half of the preface.
+            builder.initial_max_send_streams(0);
+        } else if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            // Preserve the configured initial outbound bound until the peer's
+            // SETTINGS frame replaces it.
+            builder.initial_max_send_streams(max_streams as usize);
+        }
 
         builder
     }
@@ -964,7 +982,7 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
-        let builder = Self::build_h2_builder(pool_config);
+        let builder = Self::build_h2_builder(pool_config, true);
 
         let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
@@ -974,34 +992,13 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // handshake() resolves after writing the client preface. Poll the
-        // driver until peer SETTINGS replace the zero-stream sentinel before
-        // accepting this DNS candidate.
-        std::future::poll_fn(|cx| {
-            if conn.current_max_send_streams() > 0 {
-                return std::task::Poll::Ready(Ok(()));
-            }
-            match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
-                std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
-                    "h2c connection closed before peer SETTINGS".to_string(),
-                )),
-                std::task::Poll::Ready(Err(error)) => {
-                    std::task::Poll::Ready(Err(format!("h2c handshake failed: {error}")))
-                }
-                std::task::Poll::Pending if conn.current_max_send_streams() > 0 => {
-                    std::task::Poll::Ready(Ok(()))
-                }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        })
-        .await
-        .map_err(|message| {
-            GrpcProxyError::backend_unavailable_with_source(
+        if let Err(message) = Self::await_h2c_peer_settings(&mut conn).await {
+            return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            )
-        })?;
+            ));
+        }
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -1010,6 +1007,53 @@ impl GrpcPoolManager {
         });
 
         Ok(sender)
+    }
+
+    /// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
+    ///
+    /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
+    /// accepts TCP must not pin this pool to its DNS address. `handshake()`
+    /// resolves once the *client* preface is written; readiness is the peer's
+    /// initial SETTINGS having been applied, which lifts the zero-stream
+    /// sentinel installed by `build_h2_builder`.
+    ///
+    /// `conn` is hyper's request dispatcher, not the h2 connection driver —
+    /// `handshake()` already spawned the driver on the executor. Awaiting the
+    /// dispatcher therefore surfaces a protocol error or a close from a
+    /// non-H2 peer, but it is never woken by SETTINGS arriving, so the
+    /// sentinel is re-read on a bounded backoff between those awaits instead
+    /// of being waited on directly.
+    ///
+    /// There is no timeout here by design: the caller runs inside
+    /// `dns::connect_candidates`, whose per-candidate share of
+    /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
+    /// address. A peer whose initial SETTINGS explicitly advertises
+    /// `MAX_CONCURRENT_STREAMS: 0` is indistinguishable from one that has sent
+    /// nothing and is rejected the same way — it could not carry a stream
+    /// either.
+    async fn await_h2c_peer_settings(
+        conn: &mut http2::Connection<TokioIo<TcpStream>, GrpcBody, TokioExecutor>,
+    ) -> Result<(), String> {
+        // First re-read delay; the common case resolves on the first or second
+        // pass over a loopback or same-datacenter RTT.
+        const FIRST_RECHECK: Duration = Duration::from_millis(1);
+        // Ceiling for the doubling backoff, so a peer that accepts TCP and
+        // then stalls costs a bounded number of timer wakeups per candidate.
+        const MAX_RECHECK: Duration = Duration::from_millis(20);
+
+        let mut recheck = FIRST_RECHECK;
+        loop {
+            if conn.current_max_send_streams() > 0 {
+                return Ok(());
+            }
+            match tokio::time::timeout(recheck, &mut *conn).await {
+                Ok(Ok(())) => {
+                    return Err("h2c connection closed before peer SETTINGS".to_string());
+                }
+                Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
+                Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
+            }
+        }
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -1037,7 +1081,7 @@ impl GrpcPoolManager {
         }
 
         let io = TokioIo::new(tls_stream);
-        let builder = Self::build_h2_builder(pool_config);
+        let builder = Self::build_h2_builder(pool_config, false);
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2Handshake,
