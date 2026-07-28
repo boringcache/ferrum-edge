@@ -3536,7 +3536,12 @@ impl McpGateway {
                                 "MCP session lifecycle is not supported inside a JSON-RPC batch",
                             ),
                         ) {
-                            return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
+                            return self.fail_batch_closed(
+                                ctx,
+                                headers,
+                                &inbound_headers,
+                                response,
+                            );
                         }
                         continue;
                     }
@@ -4307,9 +4312,7 @@ impl Plugin for McpGateway {
         // refused without paying parse cost. Array-shaped bodies that are
         // malformed still fail closed on the parse below, and singleton bodies
         // are untouched by this cap.
-        if Self::body_is_jsonrpc_batch_shaped(body)
-            && body.len() > self.validation.max_batch_bytes
-        {
+        if Self::body_is_jsonrpc_batch_shaped(body) && body.len() > self.validation.max_batch_bytes {
             return json_rpc_error(
                 None,
                 -32600,

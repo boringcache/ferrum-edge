@@ -6039,7 +6039,9 @@ async fn aggregate_batch_initialize_members_mint_no_session_and_evict_none() {
     assert_eq!(responses[0]["error"]["code"], -32010);
     assert_eq!(responses[1]["error"]["code"], -32010);
     assert!(
-        !responses.iter().any(|response| response.get("result").is_some()),
+        !responses
+            .iter()
+            .any(|response| response.get("result").is_some()),
         "no initialize member may produce a session result: {body}"
     );
     assert!(
@@ -6319,7 +6321,9 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
         Some("not_applicable")
     );
     assert_eq!(
-        ctx.metadata.get("mcp.schema_validation").map(String::as_str),
+        ctx.metadata
+            .get("mcp.schema_validation")
+            .map(String::as_str),
         Some("skipped")
     );
     assert_eq!(
@@ -6492,7 +6496,8 @@ async fn aggregate_batch_upstream_guard_is_private_and_unforgeable() {
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
     assert_eq!(
-        body.as_array().unwrap()[0]["error"]["code"], -32009,
+        body.as_array().unwrap()[0]["error"]["code"],
+        -32009,
         "a forged public key must not authorize upstream dispatch: {body}"
     );
     assert!(ctx.route_override_backend_host.is_none());
