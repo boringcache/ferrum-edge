@@ -506,10 +506,7 @@ mod tests {
 
         let mut metadata = HashMap::new();
         metadata.insert("_dedup_key".to_string(), "idem-secret".to_string());
-        metadata.insert(
-            "_dedup_fingerprint".to_string(),
-            "fp-secret".to_string(),
-        );
+        metadata.insert("_dedup_fingerprint".to_string(), "fp-secret".to_string());
         metadata.insert(
             "_dedup_local_inflight_token".to_string(),
             "local-secret".to_string(),

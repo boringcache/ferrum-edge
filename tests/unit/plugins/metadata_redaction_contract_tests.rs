@@ -5,9 +5,7 @@
 //! counter controls. All projections must share one sensitivity decision.
 
 use ferrum_edge::_test_support::clone_log_metadata;
-use ferrum_edge::plugins::utils::log_schema::{
-    SchemaCapabilities, SchemaView, SummarySchema,
-};
+use ferrum_edge::plugins::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema};
 use ferrum_edge::plugins::utils::metadata_redaction::{
     INTERNAL_ONLY_METADATA_KEY_PREFIX, REDACTED_PLACEHOLDER, is_internal_only_metadata_key,
     is_sensitive_metadata_key_with_extras, parse_extras_list, strip_internal_only_metadata,
@@ -245,9 +243,7 @@ fn flattened_schema_view_redacts_and_omits_under_prefix() {
     }
     for (idx, key) in API_CREDENTIAL_KEYS.iter().enumerate() {
         assert_eq!(
-            parsed
-                .get(&format!("meta_{key}"))
-                .and_then(Value::as_str),
+            parsed.get(&format!("meta_{key}")).and_then(Value::as_str),
             Some(REDACTED_PLACEHOLDER),
             "flattened {key} must redact"
         );
@@ -256,9 +252,7 @@ fn flattened_schema_view_redacts_and_omits_under_prefix() {
     for (idx, key) in NON_SECRET_COUNTERS.iter().enumerate() {
         let expected = format!("counter-{idx}");
         assert_eq!(
-            parsed
-                .get(&format!("meta_{key}"))
-                .and_then(Value::as_str),
+            parsed.get(&format!("meta_{key}")).and_then(Value::as_str),
             Some(expected.as_str())
         );
     }
