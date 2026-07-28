@@ -18212,7 +18212,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. XML conversion honors OpenAPI XML Object fields
+        binary media types. Multipart Content-Disposition accepts ordinary
+        `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
+        unquoted ext-value) and rejects continuations, quoted `filename*`,
+        bare/non-token parameter segments, conflicts, and hostile extended
+        values.
+        XML conversion honors OpenAPI XML Object fields
         `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
@@ -20784,7 +20789,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:

@@ -3864,7 +3864,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
 | `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation. Case-equivalent duplicate keys are rejected at construction. |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Required request bodies are buffered even when Content-Type is missing so presence checks cannot be skipped. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata (including bounded RFC 5987/8187 `filename*`), supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Required request bodies are buffered even when Content-Type is missing so presence checks cannot be skipped. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 Config admission is closed: unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, and `request_body` are rejected at construction with a spelling suggestion; explicit `null` cannot stand in for an omitted non-null field; and free-form media/status map keys are shape-validated. (`null` values in `bypass.header_present` intentionally mean “match any value.”) Response selection is status-first — an exact status precludes wildcard-range and `default` fallback, media selection happens only inside the selected response object, and an empty backend or gateway-generated synthetic body is parsed against the selected schema except for HEAD / 1xx / 204 / 205 / 304. Response validation errors are redacted to a fixed generic message plus the operator/schema-controlled schema location so backend response content (including JSON property names in instance paths) never reaches the client or the transaction log.
 
@@ -4055,9 +4055,51 @@ declared. Every five-byte header and declared payload must be present, later
 frame flags are checked, and the buffer must be consumed exactly. Empty bodies,
 truncated frames, trailing bytes, unsupported flags, and compressed frames
 without a usable encoding fail closed with a gRPC-Web-shaped client error.
-Request-side body trailer frames (`0x80`/`0x81`) are unsupported and rejected:
-Ferrum does not translate them into native HTTP/2 request trailers, so they are
-never forwarded to the backend as message bytes.
+**Request trailer frames.** A gRPC-Web client cannot emit HTTP/2 trailers, so it
+encodes end-of-stream metadata as a final `0x80` frame in the request body.
+Ferrum splits that frame off the message frames, validates it, and re-emits it
+as a real HTTP/2 TRAILERS block after the backend-bound DATA, in both binary and
+text mode. The trailer bytes never reach the backend as message bytes, and they
+are never folded into the initial header block: metadata that arrives at end of
+stream is not interchangeable with metadata the gateway already authenticated,
+authorized, and forwarded.
+
+Validation is fail-closed and produces a field-specific 400 (surfaced to the
+client as a gRPC-Web terminal frame) before any backend dispatch:
+
+- `0x81` (`Compressed-Flag` set on a trailer frame) is not defined by the wire
+  format and is refused rather than guessed at.
+- The trailer frame must be the **last** frame. A second trailer frame, or any
+  DATA after one, is refused — the parse must land exactly on the end of the
+  buffer.
+- A trailer frame must follow at least one message frame, and its block must
+  carry at least one entry.
+- Each line must be `name: value` and CRLF-terminated. Bare CR/LF, a missing
+  colon, whitespace around the name, and a leading `:` (pseudo-header) are
+  refused.
+- Names are lowercased and must match the gRPC Custom-Metadata charset; values
+  must be printable ASCII, and a `-bin` value must be base64 (padded or not).
+- Forbidden at end of stream: pseudo-headers, connection/framing fields
+  (`connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
+  `content-length`, `content-type`, `content-encoding`, `host`, …),
+  initial-only gRPC call parameters (`grpc-timeout`, `grpc-encoding`,
+  `grpc-accept-encoding`, `grpc-message-type`, `user-agent`), response terminal
+  metadata (`grpc-status`, `grpc-message`, `grpc-status-details-bin`),
+  credentials and gateway-authoritative assertions (`authorization`, `cookie`,
+  `x-api-key`, `x-geo-country`, `x-consumer-*`, `x-ferrum-*`), Ferrum-owned
+  forwarding identity (`x-forwarded-for`, `x-forwarded-proto`,
+  `x-forwarded-host`, and RFC 7239 `forwarded` — rejected unconditionally even
+  when primary `Forwarded` generation is disabled), and Ferrum's internal
+  gRPC-Web bridge headers.
+- The block is bounded at 8 KiB and 64 entries (names 128 bytes, values 4096
+  bytes) inside the existing gRPC receive ceiling. The block does not stay body
+  bytes — it becomes a header block the backend holds decoded — so it may not
+  consume the whole body budget.
+
+Duplicate names are preserved as repeated trailer entries. Retries replay the
+same complete request, trailers included. Request streaming is unchanged: only
+the already-buffered gRPC-Web envelope is inspected, and native gRPC requests
+keep their streaming fast path and backpressure.
 
 On the response path, `grpc_web` streams backend DATA as it arrives and embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, `grpc-status-details-bin`, and valid ASCII custom trailing metadata such as `request-id` — as exactly one final length-prefixed trailer frame (flag byte `0x80`) in the response body. Binary mode forwards each bounded DATA chunk without an additional translation copy; text mode base64-encodes each runtime flush independently, including protocol-permitted padding at flush boundaries, so neither mode waits for backend EOF before publishing server-streaming messages. Backpressure, cancellation, resets, absolute deadlines, response-size enforcement, load-balancer/admission guards, and deferred logging remain attached to the live body pipeline. The configured response-size ceiling applies to native backend DATA before text expansion; client-visible byte accounting records the encoded bytes and terminal frame.
 
@@ -4070,7 +4112,7 @@ likewise take precedence over response streaming.
 
 The plugin rewrites `content-type` to the **negotiated** gRPC-Web variant and removes an upstream `Content-Length`, because streaming text expansion and the terminal frame change the final representation length. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and ordinary initial response headers are not copied into the terminal block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name. A backend error propagates as a stream error and does not gain a fabricated clean terminal status; a clean EOF without valid trailers receives the documented HTTP-to-gRPC synthesized status.
 
-Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
+Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope — including its trailer frame — before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
 
@@ -5179,6 +5221,10 @@ config:
 Rate-limits consumers by LLM token consumption instead of request count. The limiter reserves an estimated token cost before proxying JSON `POST` requests, using the largest configured output cap — the OpenAI-style `max_tokens` / `max_completion_tokens` / `max_output_tokens` fields plus provider-native caps (Gemini/Vertex `generationConfig.maxOutputTokens`, AWS Bedrock Converse `inferenceConfig.maxTokens`, Amazon Titan `textGenerationConfig.maxTokenCount`, TGI/HuggingFace `parameters.max_new_tokens`) — plus an estimated prompt-token count according to `count_mode`. The reservation is reconciled after the response: actual usage replaces the estimate when available; otherwise the `on_unmetered_response` policy decides whether to keep the estimate, reject the response, or release the estimate with a warning.
 
 Supports both regular JSON and SSE streaming responses — when `ai_token_metrics` is active, reads tokens from metadata; when used standalone, parses response bodies directly including SSE `data:` lines.
+
+**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Advertising gRPC previously meant an operator could deploy an apparently supported token limiter on a native gRPC AI route where every unary or streaming call re-checked an empty window and passed unbudgeted. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view.
+
+**gRPC-Web is also unsupported.** gRPC-Web rides the HTTP (and composed H3 gRPC-Web) view, so the plugin can still observe it, and it explicitly stays out of the way: framed `application/grpc-web*` bodies — including the `+json` variants that otherwise satisfy the JSON content-type screen — are never buffered, never classified as a JSON AI request, and never parsed as a JSON usage document on the response side. Such traffic is left as ordinary non-AI traffic rather than being charged zero tokens against a budget or turned into a 502 by `on_unmetered_response`. Ordinary HTTP JSON and SSE AI traffic is unaffected.
 
 **Priority:** 4200
 
