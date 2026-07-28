@@ -1729,8 +1729,12 @@ impl KafkaLogging {
         let metrics_for_hooks = Arc::clone(&metrics);
         let hooks = LoggerHooks {
             on_failed_batch: None,
+            // Intentional overflow shedding: Ferrum records the drop and accepts
+            // ownership of the shed decision so high-water / full-buffer paths
+            // report DiversionAccepted rather than leaving the item unowned.
             on_overflow: Some(Arc::new(move |_item, reason| {
                 metrics_for_hooks.record_ferrum_drop(reason);
+                true
             })),
             on_high_water: None,
             high_watermark_percent: 80,
@@ -2085,6 +2089,26 @@ struct AdmittedProducerConfig {
     extra_props: Vec<(String, String)>,
 }
 
+/// True when a `producer_config` value carries an inline PEM private key.
+///
+/// Matches the PEM opening line for any private-key label (`PRIVATE KEY`,
+/// `RSA PRIVATE KEY`, `EC PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, …) rather than
+/// one exact banner, and is case-insensitive so a re-cased banner cannot slip
+/// through. Certificates and public keys are intentionally not matched: they
+/// are not credentials.
+pub(crate) fn contains_inline_private_key(value: &str) -> bool {
+    const BANNER: &str = "-----BEGIN";
+    let normalized = value.to_ascii_uppercase();
+    normalized.match_indices(BANNER).any(|(start, _)| {
+        let after = &normalized[start + BANNER.len()..];
+        let label = match after.find("-----") {
+            Some(end) => &after[..end],
+            None => after,
+        };
+        label.contains("PRIVATE KEY")
+    })
+}
+
 /// Admit `producer_config` overrides (budgets, forbidden keys, CRL conflict)
 /// without constructing a Kafka producer.
 fn admit_producer_config(
@@ -2120,6 +2144,20 @@ fn admit_producer_config(
         if prop.trim().is_empty() {
             return Err(format!(
                 "kafka_logging: 'producer_config.{key}' must not be empty"
+            ));
+        }
+        // `producer_config` is an open escape hatch forwarded verbatim to
+        // librdkafka. Named private-key properties (`ssl.key.pem`) are already
+        // refused below, but librdkafka grows new ones and an operator can
+        // reach a future/aliased property under a name this list does not know.
+        // Refuse inline private-key material by *shape* so raw PEM can never be
+        // persisted here at all — it must go through `ssl_key_location` or an
+        // external secret reference. The error deliberately names only the
+        // property, never the rejected material.
+        if contains_inline_private_key(prop) {
+            return Err(format!(
+                "kafka_logging: 'producer_config.{key}' contains inline private-key material; \
+                 use top-level 'ssl_key_location' (or an external secret reference) instead"
             ));
         }
         if normalized == "bootstrap.servers" || normalized == "metadata.broker.list" {

@@ -75,10 +75,15 @@ paths:
 
 - Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.
 - Port allocation must retry. Bind-drop-rebind races with parallel tests.
+- Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
+- `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
 - Backend/echo server should hold its listener. Do not drop+rebind; pass pre-bound `TcpListener` to `start_echo_server_on()`.
 - `wait_for_health` returns `bool` or `Result`; it must not panic.
+- **Readiness for a spawned gateway must be bound to THAT CHILD, not to "some process accepts this port"** (issue #2132). A reservation has to be released before the subprocess binds it, so a competing listener can take that port; the child then dies with `Address already in use` while a bare port probe keeps succeeding, and the driver reports the competitor's connection reset as a datapath failure. `functional_mesh_mode_test.rs` is the reference implementation: `wait_for_gateway_listener` polls `Child::try_wait()` before and after each probe, and a `ChildExited` outcome consumes the bounded attempt.
+- **A fixture-owned server (control plane, echo backend) must not bind an ephemeral port already promised to a gateway subprocess.** Bind through a mesh-port-aware helper (`bind_fixture_listener`) that re-rolls, holding rejected listeners so the kernel cannot re-offer them. A `USED_MESH_PORTS`-style set alone only stops one reservation reusing another.
+- **An attempt whose gateway died mid-run is VOID**: retry with fresh ports/dirs/control planes instead of returning the resulting transport error. Never retry an observation from a healthy fixture — authoritative protocol responses and fail-closed security assertions must be made exactly once.
 - `FERRUM_POOL_WARMUP_ENABLED=true` makes the gateway issue `HEAD /` to each backend at startup and shifts backend-hit assertions by one.
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.

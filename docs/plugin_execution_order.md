@@ -826,7 +826,7 @@ guardrails on the same client-visible representation across H1/H2 and every
 buffered H3 path without changing `ai_stream_router`'s request-side priority
 (which must remain after `ai_semantic_cache`).
 
-Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its final request-body hook and immediately continues, so the two plugins compose cleanly on the same proxy. Fallback across providers after the first downstream byte is out of scope — once bytes have streamed the provider cannot be switched (`ai_stream_router.fallback_attempts` is always `0`).
+Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its final request-body hook and immediately continues, so the two plugins compose cleanly on the same proxy. `ai_stream_router` does not implement provider fallback in any form, and a `fallback` config block is rejected at admission rather than stored inert (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body in `before_proxy`, and the dispatch retry loop replays exactly those prepared bytes and headers against the same effective proxy. No `ai_stream_router.fallback_attempts` metadata is emitted.
 
 ### Transforms after auth (3000+)
 
@@ -1055,7 +1055,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
 | `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
-| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks |
+| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks |
 | `transaction_log_schema` | — | — | — | — | — | Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999) |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
