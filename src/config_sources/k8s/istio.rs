@@ -9258,10 +9258,7 @@ extensionProviders:
             .iter()
             .find_map(|r| r.get("redirect"))
             .expect("redirect action present");
-        assert_eq!(
-            redirect["derive_port"].as_str(),
-            Some("FROM_REQUEST_PORT")
-        );
+        assert_eq!(redirect["derive_port"].as_str(), Some("FROM_REQUEST_PORT"));
         assert_eq!(redirect["scheme"].as_str(), Some("https"));
         assert!(redirect.get("port").is_none());
         use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
@@ -9412,10 +9409,7 @@ extensionProviders:
             .iter()
             .find_map(|r| r.get("redirect").cloned())
             .expect("redirect present after update");
-        assert_eq!(
-            redirect["derive_port"].as_str(),
-            Some("FROM_REQUEST_PORT")
-        );
+        assert_eq!(redirect["derive_port"].as_str(), Some("FROM_REQUEST_PORT"));
         assert!(redirect.get("port").is_none());
 
         let deleted = translate_k8s_objects(&[], options()).expect("delete VirtualService");

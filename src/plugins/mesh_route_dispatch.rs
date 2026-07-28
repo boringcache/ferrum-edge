@@ -2041,12 +2041,13 @@ fn build_redirect_response(
             .or_else(|| headers.get(":authority"))
             .map(String::as_str)
     });
-    let authority = authority.map(|authority| {
-        match resolve_redirect_authority_port(ctx, redirect, scheme) {
-            Some(port) => authority_with_redirect_port(authority, port, scheme),
-            None => authority.to_string(),
-        }
-    });
+    let authority =
+        authority.map(
+            |authority| match resolve_redirect_authority_port(ctx, redirect, scheme) {
+                Some(port) => authority_with_redirect_port(authority, port, scheme),
+                None => authority.to_string(),
+            },
+        );
     let path = redirect
         .uri
         .as_deref()
@@ -2101,9 +2102,7 @@ fn resolve_redirect_authority_port(
         return Some(port);
     }
     match redirect.derive_port {
-        Some(RedirectDerivePort::FromProtocolDefault) => {
-            Some(scheme_default_redirect_port(scheme))
-        }
+        Some(RedirectDerivePort::FromProtocolDefault) => Some(scheme_default_redirect_port(scheme)),
         Some(RedirectDerivePort::FromRequestPort) => trusted_request_port(ctx),
         None => None,
     }
@@ -5896,7 +5895,8 @@ mod tests {
         ctx.metadata
             .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
         ctx.frontend_listen_port = Some(80);
-        let mut headers = HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
+        let mut headers =
+            HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
         match plugin.before_proxy(&mut ctx, &mut headers).await {
             PluginResult::Reject { headers, .. } => {
                 assert_eq!(

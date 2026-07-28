@@ -2547,10 +2547,9 @@ async fn mesh_tier3_redirect_port_and_derive_port_live_data_path() {
         .iter()
         .find(|p| p.listen_path.as_deref() == Some("/old"))
         .expect("redirect proxy");
-    let dispatch = MeshRouteDispatch::new(
-        &dispatch_plugin_for_proxy(&with_request_port.config, proxy).config,
-    )
-    .expect("plugin config");
+    let dispatch =
+        MeshRouteDispatch::new(&dispatch_plugin_for_proxy(&with_request_port.config, proxy).config)
+            .expect("plugin config");
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
         "GET".to_string(),
