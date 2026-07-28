@@ -1014,14 +1014,12 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, protobuf);
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "grpc_status": 0,
-                "grpc_message": "ok",
-                "message_base64": message_base64,
-                "trailers": { "x-function": "terminate" }
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grpc_status": 0,
+            "grpc_message": "ok",
+            "message_base64": message_base64,
+            "trailers": { "x-function": "terminate" }
+        })))
         .mount(&server)
         .await;
 
@@ -1068,7 +1066,10 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
                 .unwrap();
             assert_eq!(body, framed);
         }
-        other => panic!("Expected RejectBinary framed gRPC response, got {:?}", other),
+        other => panic!(
+            "Expected RejectBinary framed gRPC response, got {:?}",
+            other
+        ),
     }
 }
 

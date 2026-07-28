@@ -2245,9 +2245,8 @@ fn build_native_grpc_terminate_response(
     }
 
     let framed_body = match message_bytes {
-        Some(message) => frame_uncompressed_unary_grpc_message(&message).map_err(|detail| {
-            InvocationFailure::new("invalid_grpc_terminate_response", detail)
-        })?,
+        Some(message) => frame_uncompressed_unary_grpc_message(&message)
+            .map_err(|detail| InvocationFailure::new("invalid_grpc_terminate_response", detail))?,
         None => Bytes::new(),
     };
     if framed_body.len() > max_response_body_bytes {
@@ -2321,7 +2320,7 @@ pub mod test_helpers {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(String::from),
-            };
+        };
         aws_sigv4::sign_request(
             &config,
             "lambda",
@@ -2436,8 +2435,8 @@ impl Plugin for ServerlessFunction {
             };
         }
 
-        let native_grpc_terminate =
-            self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(headers, ctx);
+        let native_grpc_terminate = self.mode == InvocationMode::Terminate
+            && is_native_grpc_terminate_request(headers, ctx);
 
         let payload = match self.build_invocation_payload(ctx, headers) {
             Ok(payload) => payload,

@@ -12057,8 +12057,7 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     // Serverless native-gRPC terminate (and any other plugin that already
     // authored an uncompressed unary DATA frame with grpc-status) must preserve
     // the body. Ordinary rejects remain trailers-only.
-    let normalized =
-        crate::proxy::normalize_reject_response(http_status, http_body, headers, true);
+    let normalized = crate::proxy::normalize_reject_response(http_status, http_body, headers, true);
     if !normalized.body.is_empty() && !normalized.grpc_trailers.is_empty() {
         let mut builder = Response::builder().status(StatusCode::OK);
         for (k, v) in &normalized.headers {

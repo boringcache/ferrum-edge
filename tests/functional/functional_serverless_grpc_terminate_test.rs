@@ -214,7 +214,9 @@ async fn send_h2_grpc(
 
 async fn spawn_counting_grpc_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
     let hits = Arc::new(AtomicUsize::new(0));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind backend");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind backend");
     let port = listener.local_addr().expect("backend addr").port();
     let hits_clone = Arc::clone(&hits);
     let task = tokio::spawn(async move {
@@ -239,7 +241,9 @@ async fn spawn_counting_grpc_backend() -> (u16, Arc<AtomicUsize>, JoinHandle<()>
                         )
                     }
                 });
-                let _ = Http1ServerBuilder::new().serve_connection(io, service).await;
+                let _ = Http1ServerBuilder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     });
@@ -280,7 +284,9 @@ async fn spawn_grpc_terminate_function() -> (u16, Arc<AtomicUsize>, JoinHandle<(
                         )
                     }
                 });
-                let _ = Http1ServerBuilder::new().serve_connection(io, service).await;
+                let _ = Http1ServerBuilder::new()
+                    .serve_connection(io, service)
+                    .await;
             });
         }
     });
