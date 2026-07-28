@@ -46,11 +46,11 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    PrePolicyResponseHeaders, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
-    apply_response_headers, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, reconcile_backend_trailers_with_response_policy,
-    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
-    strip_response_hop_by_hop_trailers,
+    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
+    ResponseTrailerPolicyWitness, apply_response_headers, is_backend_request_strip_header,
+    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
+    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
+    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -572,7 +572,7 @@ where
                 trailer_policy.final_headers,
                 trailer_policy.pre_policy,
                 trailer_policy.governance,
-                &[],
+                GatewayOwnedResponseHeaders::default(),
             );
             if removed > 0 {
                 debug!(
@@ -7196,7 +7196,7 @@ async fn handle_h3_request(
                 &trailer_policy_witness,
                 plugin_cache_view.response_trailer_policy_names(),
                 plugin_cache_view.response_trailer_policy_prefixes(),
-                &[],
+                GatewayOwnedResponseHeaders::default(),
                 unbounded_trailer_policy,
             );
             if removed > 0 {

@@ -724,7 +724,7 @@ fn streaming_h2_gateway_owned_idempotent_write_binds_each_builder_field() {
     // Exact-value pre-seeding: the backend already sent the identical string the
     // gateway builder will write. Folding into `final_headers` alone leaves the
     // mutation witness with before == after; only the per-response
-    // `gateway_owned_names` declaration closes the trailer channel — the same
+    // `gateway_owned_headers` declaration closes the trailer channel — the same
     // idempotent-write shape plugin declarations handle.
     use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test as govern_owned;
 
@@ -1016,7 +1016,7 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     );
 
     // The seal folds in the gateway-authored fields written straight onto the
-    // response builder AND records each write in `gateway_owned_names`, so an
+    // response builder AND records each write in `gateway_owned_headers`, so an
     // exact-value pre-seed cannot hide the ownership from the mutation witness.
     // `connection: close` is deliberately absent: it is hop-by-hop and never
     // survives to the reconciliation.
@@ -1036,7 +1036,7 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         );
     }
     assert!(
-        seal.contains("gateway_owned_names.push("),
+        seal.contains("gateway_owned_headers.insert("),
         "the seal must declare per-response gateway ownership for each builder write"
     );
     assert!(

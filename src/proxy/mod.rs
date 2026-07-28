@@ -26413,7 +26413,7 @@ async fn handle_proxy_request_inner(
     // an exact-value pre-seed (backend already sent the identical string) is
     // invisible to the mutation witness, the same idempotent-write shape
     // plugin declarations close. Each field the gateway actually writes on
-    // THIS response is therefore also recorded in `gateway_owned_names` so
+    // THIS response is therefore also recorded in `gateway_owned_headers` so
     // the trailer channel stays governed even when before == after. Fields
     // the gateway did not write stay off that list and remain ungoverned.
     //
@@ -26434,35 +26434,40 @@ async fn handle_proxy_request_inner(
     let mut h2_streaming_trailer_governor = None;
     if let Some((pre_policy, unbounded)) = h2_streaming_trailer_policy {
         let mut final_headers = response_headers.clone();
-        let mut gateway_owned_names = Vec::new();
+        let mut gateway_owned_headers =
+            headers_mod::GatewayOwnedResponseHeaders::default();
         if backend_resp.connection_error {
             final_headers.insert("x-gateway-error".into(), "connection_failure".into());
-            gateway_owned_names.push("x-gateway-error".into());
+            gateway_owned_headers
+                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         } else if response_status == 504 {
             final_headers.insert("x-gateway-error".into(), "backend_timeout".into());
-            gateway_owned_names.push("x-gateway-error".into());
+            gateway_owned_headers
+                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         } else if response_status >= 500 {
             final_headers.insert("x-gateway-error".into(), "backend_error".into());
-            gateway_owned_names.push("x-gateway-error".into());
+            gateway_owned_headers
+                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         }
         if upstream_is_fallback {
             final_headers.insert("x-gateway-upstream-status".into(), "degraded".into());
-            gateway_owned_names.push("x-gateway-upstream-status".into());
+            gateway_owned_headers
+                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayUpstreamStatus);
         }
         if let Some(alt_svc) = state.alt_svc_header.as_ref() {
             final_headers.insert("alt-svc".into(), alt_svc.to_string());
-            gateway_owned_names.push("alt-svc".into());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::AltSvc);
         }
         if let Some(via) = resp_via {
             final_headers.insert("via".into(), via.clone());
-            gateway_owned_names.push("via".into());
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::Via);
         }
         h2_streaming_trailer_governor = Some(headers_mod::StreamingResponseTrailerGovernor::new(
             final_headers,
             pre_policy,
             plugin_cache_view.response_trailer_policy_names_shared(),
             plugin_cache_view.response_trailer_policy_prefixes_shared(),
-            gateway_owned_names,
+            gateway_owned_headers,
             unbounded,
         ));
     }

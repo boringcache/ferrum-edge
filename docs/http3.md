@@ -391,10 +391,11 @@ streaming path](response_body_streaming.md#backend-trailers-on-the-direct-http2-
 Its only structural difference is ownership: the body is handed to hyper and the
 handler returns, so the boundary travels with the body as an owned
 `StreamingResponseTrailerGovernor` instead of borrowing the handler's locals.
-That owned form also carries a per-response `gateway_owned_names` list for the
-end-to-end builder writes (`via`, `alt-svc`, `X-Gateway-*`) so an exact-value
-pre-seed cannot bypass them. Native gRPC (mesh-mTLS) and translated gRPC-Web on
-that arm are excluded exactly as `dispatch_grpc_native_h3` is excluded here.
+That owned form also carries an allocation-free per-response
+`gateway_owned_headers` bitset for the end-to-end builder writes (`via`,
+`alt-svc`, `X-Gateway-*`) so an exact-value pre-seed cannot bypass them. Native
+gRPC (mesh-mTLS) and translated gRPC-Web on that arm are excluded exactly as
+`dispatch_grpc_native_h3` is excluded here.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

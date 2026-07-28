@@ -3211,7 +3211,7 @@ pub mod _test_support {
             &witness,
             policy_names,
             policy_prefixes,
-            gateway_owned_names,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
             unbounded_policy,
         );
         surviving_trailer_lines_for_test(&map)
@@ -3274,7 +3274,7 @@ pub mod _test_support {
             final_headers,
             &pre_policy,
             governance,
-            gateway_owned_names,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
         );
         surviving_trailer_lines_for_test(&map)
     }
@@ -3335,7 +3335,7 @@ pub mod _test_support {
             pre_policy,
             std::sync::Arc::new(policy_names.to_vec()),
             std::sync::Arc::new(policy_prefixes.to_vec()),
-            gateway_owned_names.to_vec(),
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
             unbounded_policy,
         );
         crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);

@@ -820,6 +820,60 @@ pub(crate) struct ResponseTrailerGovernance<'a> {
     pub(crate) unbounded: bool,
 }
 
+/// Allocation-free per-response ownership for the small, fixed set of
+/// end-to-end fields written directly onto the plain streaming-HTTP/2 response
+/// builder.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GatewayOwnedResponseHeaders(u8);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GatewayOwnedResponseHeader {
+    Via = 1 << 0,
+    AltSvc = 1 << 1,
+    GatewayError = 1 << 2,
+    GatewayUpstreamStatus = 1 << 3,
+}
+
+impl GatewayOwnedResponseHeaders {
+    pub(crate) fn insert(&mut self, header: GatewayOwnedResponseHeader) {
+        self.0 |= header as u8;
+    }
+
+    fn owns(self, field: &str) -> bool {
+        let bit = match field {
+            "via" => GatewayOwnedResponseHeader::Via as u8,
+            "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,
+            "x-gateway-error" => GatewayOwnedResponseHeader::GatewayError as u8,
+            "x-gateway-upstream-status" => {
+                GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8
+            }
+            _ => return false,
+        };
+        self.0 & bit != 0
+    }
+
+    pub(crate) fn from_names(names: &[String]) -> Self {
+        let mut owned = Self::default();
+        for name in names {
+            let header = if name.eq_ignore_ascii_case("via") {
+                Some(GatewayOwnedResponseHeader::Via)
+            } else if name.eq_ignore_ascii_case("alt-svc") {
+                Some(GatewayOwnedResponseHeader::AltSvc)
+            } else if name.eq_ignore_ascii_case("x-gateway-error") {
+                Some(GatewayOwnedResponseHeader::GatewayError)
+            } else if name.eq_ignore_ascii_case("x-gateway-upstream-status") {
+                Some(GatewayOwnedResponseHeader::GatewayUpstreamStatus)
+            } else {
+                None
+            };
+            if let Some(header) = header {
+                owned.insert(header);
+            }
+        }
+        owned
+    }
+}
+
 /// The backend's response headers as a STREAMING relay saw them before its
 /// response-header phases ran.
 ///
@@ -892,7 +946,7 @@ impl PrePolicyResponseHeaders {
 ///
 /// Construction is once per governed streaming RESPONSE (one header-map clone
 /// for `final_headers`, one for the pre-policy snapshot, one `Arc` bump each for
-/// the precomputed policy names and prefixes, plus a small owned list of
+/// the precomputed policy names and prefixes, plus an allocation-free bitset of
 /// builder fields this response actually wrote). Never per body frame: the body
 /// wrapper only touches this on the single TRAILERS frame, and the
 /// reconciliation itself is bounded by the trailer count exactly as on the
@@ -916,7 +970,7 @@ pub(crate) struct StreamingResponseTrailerGovernor {
     /// gateway did not write on this response stays ungoverned. Empty when
     /// none of those builder writes fired. Never includes hop-by-hop
     /// `connection`.
-    gateway_owned_names: Vec<String>,
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
     unbounded: bool,
 }
@@ -927,7 +981,7 @@ impl StreamingResponseTrailerGovernor {
         pre_policy: PrePolicyResponseHeaders,
         policy_names: std::sync::Arc<Vec<String>>,
         policy_prefixes: std::sync::Arc<Vec<String>>,
-        gateway_owned_names: Vec<String>,
+        gateway_owned_headers: GatewayOwnedResponseHeaders,
         unbounded: bool,
     ) -> Self {
         Self {
@@ -935,7 +989,7 @@ impl StreamingResponseTrailerGovernor {
             pre_policy,
             policy_names,
             policy_prefixes,
-            gateway_owned_names,
+            gateway_owned_headers,
             unbounded,
         }
     }
@@ -953,7 +1007,7 @@ impl StreamingResponseTrailerGovernor {
                 policy_prefixes: self.policy_prefixes.as_slice(),
                 unbounded: self.unbounded,
             },
-            &self.gateway_owned_names,
+            self.gateway_owned_headers,
         )
     }
 }
@@ -966,7 +1020,7 @@ impl StreamingResponseTrailerGovernor {
 /// every response-header mutation for the path and immediately before
 /// `send_trailers`.
 ///
-/// `gateway_owned_names` is the plain streaming-HTTP/2 builder-ownership list
+/// `gateway_owned_headers` is the plain streaming-HTTP/2 builder-ownership bitset
 /// (empty on the native-H3 relays, which fold gateway writes into the shared
 /// header map before reconciling).
 pub(crate) fn reconcile_streaming_backend_trailers(
@@ -974,7 +1028,7 @@ pub(crate) fn reconcile_streaming_backend_trailers(
     response_headers: &std::collections::HashMap<String, String>,
     pre_policy: &PrePolicyResponseHeaders,
     governance: ResponseTrailerGovernance<'_>,
-    gateway_owned_names: &[String],
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
 ) -> usize {
     let witness = pre_policy.witness(trailers);
     reconcile_backend_trailers_with_response_policy(
@@ -983,7 +1037,7 @@ pub(crate) fn reconcile_streaming_backend_trailers(
         &witness,
         governance.policy_names,
         governance.policy_prefixes,
-        gateway_owned_names,
+        gateway_owned_headers,
         governance.unbounded,
     )
 }
@@ -1012,7 +1066,7 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// * `policy_prefixes` — the config-time union of open-ended ASCII prefixes
 ///   (CORS `access-control-`). Catches trailer-only extension names a finite
 ///   write list never enumerates.
-/// * `gateway_owned_names` — per-response end-to-end fields the plain streaming
+/// * `gateway_owned_headers` — per-response end-to-end fields the plain streaming
 ///   HTTP/2 builder actually wrote. Same idempotent-write shape as a plugin
 ///   declaration: folding the value into `final_headers` alone misses an
 ///   exact-value pre-seed.
@@ -1038,7 +1092,7 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
     witness: &ResponseTrailerPolicyWitness,
     policy_names: &[String],
     policy_prefixes: &[String],
-    gateway_owned_names: &[String],
+    gateway_owned_headers: GatewayOwnedResponseHeaders,
     unbounded_policy: bool,
 ) -> usize {
     let mut to_remove: Vec<http::HeaderName> = Vec::new();
@@ -1051,9 +1105,7 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
             field.len() >= prefix.len()
                 && field.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
         });
-        let gateway_owned = gateway_owned_names
-            .iter()
-            .any(|owned| owned.eq_ignore_ascii_case(field));
+        let gateway_owned = gateway_owned_headers.owns(field);
         let governed = explicitly_named
             || prefix_owned
             || gateway_owned
