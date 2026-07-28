@@ -1053,12 +1053,11 @@ impl GrpcPoolManager {
     /// initial SETTINGS having been applied, which lifts the zero-stream
     /// sentinel installed by `build_h2_builder`.
     ///
-    /// `conn` is hyper's request dispatcher, not the h2 connection driver —
-    /// `handshake()` already spawned the driver on the executor. Awaiting the
-    /// dispatcher therefore surfaces a protocol error or a close from a
-    /// non-H2 peer, but it is never woken by SETTINGS arriving, so the
-    /// sentinel is re-read on a bounded backoff between those awaits instead
-    /// of being waited on directly.
+    /// `conn` is hyper's connection-driver future. Polling it drives the peer's
+    /// preface and SETTINGS processing and surfaces a protocol error or close,
+    /// but the future does not resolve merely because SETTINGS arrived. The
+    /// short timeout therefore supplies a bounded recheck cadence for the
+    /// sentinel while also continuing to drive the connection.
     ///
     /// There is no timeout here by design: the caller runs inside
     /// `dns::connect_candidates`, whose per-candidate share of
