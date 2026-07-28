@@ -4687,14 +4687,14 @@ impl EnvConfig {
                     );
                 }
             }
-            OperatingMode::DataPlane => {
-                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() {
-                    return Err(
-                        "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
-                                FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
-                            .into(),
-                    );
-                }
+            OperatingMode::DataPlane
+                if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() =>
+            {
+                return Err(
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
+                            FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
+                        .into(),
+                );
             }
             _ => {}
         }
