@@ -94,7 +94,8 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 /// Request-metadata namespace prefix. Each plugin instance appends its
 /// process-unique [`ResponseCaching::instance_id`] so multiple
 /// `response_caching` configs on one proxy cannot overwrite one another's
-/// staged base key, status, predictor key, timing, or header snapshot.
+/// staged base key, status, predictor key, timing, header snapshot, or
+/// pending unsafe-method invalidation host partition.
 const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
 const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
 const CACHE_STATUS_SUFFIX: &str = "cache_status";
@@ -108,6 +109,10 @@ const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str = "cache_request_starte
 /// and the bug it fixes. The full metadata key is
 /// `response_caching.<instance_id>.cache_request_headers_snapshot`.
 const CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX: &str = "cache_request_headers_snapshot";
+/// Normalized Host/authority partition (`h-<sha256>` or empty) stashed when an
+/// unsafe method may require RFC 9111 §4.4 invalidation after a non-error
+/// response. Must match [`cache_key_host_part`] used by lookup/storage.
+const CACHE_PENDING_INVALIDATE_HOST_SUFFIX: &str = "cache_pending_invalidate_host";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -989,6 +994,8 @@ pub struct ResponseCaching {
     meta_request_started: String,
     /// Precomputed `response_caching.<id>.cache_request_headers_snapshot`.
     meta_headers_snapshot: String,
+    /// Precomputed `response_caching.<id>.cache_pending_invalidate_host`.
+    meta_pending_invalidate_host: String,
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
@@ -1049,6 +1056,10 @@ impl ResponseCaching {
             meta_headers_snapshot: staging_metadata_key(
                 instance_id,
                 CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX,
+            ),
+            meta_pending_invalidate_host: staging_metadata_key(
+                instance_id,
+                CACHE_PENDING_INVALIDATE_HOST_SUFFIX,
             ),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1326,11 +1337,20 @@ impl ResponseCaching {
     /// RFC 9110 §9.2.1 safe methods (GET/HEAD/OPTIONS/TRACE) never invalidate
     /// cached entries, even when absent from `cacheable_methods` — being
     /// ineligible for storage is not the same as changing server state. Every
-    /// other method (POST/PUT/PATCH/DELETE, and any extension method, which is
-    /// conservatively treated as unsafe because its semantics are unknown to
-    /// the gateway) triggers `invalidate_on_unsafe_methods`.
+    /// other method (POST/PUT/PATCH/DELETE, and any extension/custom method)
+    /// is treated as unsafe. Unknown methods fail closed: their semantics are
+    /// unknown to the gateway, so `invalidate_on_unsafe_methods` applies after
+    /// a non-error response (RFC 9111 §4.4).
     fn is_unsafe_method(method: &str) -> bool {
         !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+
+    /// RFC 9110 / RFC 9111: final status codes below 400 are non-error.
+    ///
+    /// Mandatory cache invalidation for unsafe methods is tied to receiving a
+    /// non-error response, not merely forwarding the request.
+    fn is_non_error_status(status: u16) -> bool {
+        status < 400
     }
 
     fn cache_lookup_vary_headers(&self, base_key: &str) -> Vec<String> {
@@ -1640,19 +1660,26 @@ impl ResponseCaching {
         }
     }
 
-    /// Invalidate cache entries matching a path pattern.
-    /// Called when an unsafe method (POST/PUT/PATCH/DELETE, or an extension
-    /// method conservatively treated as unsafe — see
-    /// [`Self::is_unsafe_method`]) hits a path.
-    fn invalidate_path(&self, ctx: &RequestContext) {
+    /// Invalidate cache entries matching a path under one authority partition.
+    ///
+    /// Called only after a non-error response to an unsafe method (see
+    /// [`Self::is_unsafe_method`] and RFC 9111 §4.4). `host_part` must be the
+    /// same normalized Host partition that [`Self::build_base_cache_key`]
+    /// embeds (including the empty partition when Host is absent), so a
+    /// mutation on authority A cannot evict authority B on a shared proxy.
+    fn invalidate_path(&self, ctx: &RequestContext, host_part: &str) {
         let _guard = self.accounting_guard();
         let proxy_id = ctx
             .matched_proxy
             .as_ref()
             .map(|p| p.id.as_str())
             .unwrap_or("_");
-        let mut prefix = String::with_capacity(proxy_id.len() + 1);
+        // Prefix is `proxy_id:host_part:` — identical authority isolation to
+        // lookup/storage. Avoids scanning other Host partitions on the proxy.
+        let mut prefix = String::with_capacity(proxy_id.len() + 1 + host_part.len() + 1);
         prefix.push_str(proxy_id);
+        prefix.push(':');
+        prefix.push_str(host_part);
         prefix.push(':');
         let path = &ctx.path;
         let mut removed_size = 0usize;
@@ -1678,6 +1705,33 @@ impl ResponseCaching {
         // (every principal/variant of the invalidated path); reclaim them now
         // rather than waiting for the next store.
         self.prune_vary_index_locked();
+    }
+
+    /// Stage RFC 9111 §4.4 invalidation for an unsafe method using the same
+    /// transformed Host view that cache lookup would use. Actual eviction runs
+    /// in [`Self::after_proxy`] only after a non-error response.
+    fn stage_pending_invalidation(
+        &self,
+        ctx: &mut RequestContext,
+        request_headers: &HashMap<String, String>,
+    ) {
+        let host_part = request_headers
+            .get("host")
+            .map(|h| cache_key_host_part(h))
+            .unwrap_or_default();
+        ctx.metadata
+            .insert(self.meta_pending_invalidate_host.clone(), host_part);
+    }
+
+    /// Apply a previously staged unsafe-method invalidation when the backend
+    /// (or gateway) produced a non-error final status.
+    fn maybe_apply_pending_invalidation(&self, ctx: &mut RequestContext, response_status: u16) {
+        let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
+            return;
+        };
+        if Self::is_non_error_status(response_status) {
+            self.invalidate_path(ctx, &host_part);
+        }
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
@@ -2068,15 +2122,18 @@ impl Plugin for ResponseCaching {
         // One ArcSwap load, memoized on the context for sibling instances.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
         if !self.is_cacheable_method(&ctx.method) {
-            // Only genuinely unsafe methods evict: a safe method that is
-            // merely ineligible for storage (OPTIONS with the default
-            // cacheable set, HEAD with a GET-only set) must bypass without
-            // flushing hot entries.
+            // Only genuinely unsafe methods may evict, and only after a
+            // non-error response (staged here, applied in `after_proxy`). A
+            // safe method that is merely ineligible for storage (OPTIONS with
+            // the default cacheable set, HEAD with a GET-only set) must bypass
+            // without flushing hot entries. Use the `headers` parameter so a
+            // rewritten Host partitions invalidation identically to lookup.
             if self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method) {
-                self.invalidate_path(ctx);
+                self.stage_pending_invalidation(ctx, headers);
             }
             // Clear only this instance's staging so a sibling cache keeps
-            // its independently staged base/snapshot/status.
+            // its independently staged base/snapshot/status. Pending
+            // invalidation host is intentionally retained until after_proxy.
             self.clear_lookup_staging(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
@@ -2218,9 +2275,16 @@ impl Plugin for ResponseCaching {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // RFC 9111 §4.4: mandatory invalidation for unsafe methods runs only
+        // after a non-error response establishes that the mutation succeeded
+        // at the origin (or gateway). Failed/unauthorized mutations and
+        // transport failures that surface as 4xx/5xx leave other authorities'
+        // cache entries intact.
+        self.maybe_apply_pending_invalidation(ctx, response_status);
+
         let Some(status) = self.cache_status(ctx) else {
             // A preceding sibling may already have short-circuited with a HIT
             // before this instance reached `before_proxy`. Do not invent MISS
@@ -3000,6 +3064,15 @@ mod tests {
             .insert("host".to_string(), "example.com".to_string());
         let mut post_headers = post_ctx.headers.clone();
         plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+        assert_eq!(
+            plugin.cache.len(),
+            1,
+            "unsafe method must not invalidate before a non-error response"
+        );
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+            .await;
 
         assert!(
             plugin.cache.is_empty(),
@@ -3030,6 +3103,10 @@ mod tests {
             .insert("host".to_string(), "example.com".to_string());
         let mut post_headers = post_ctx.headers.clone();
         plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+            .await;
 
         assert_eq!(
             plugin.cache.len(),
@@ -3163,6 +3240,10 @@ mod tests {
                 .insert("host".to_string(), host.to_string());
             let mut post_headers = post_ctx.headers.clone();
             plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+            let mut resp_headers = HashMap::new();
+            plugin
+                .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+                .await;
 
             assert!(
                 plugin.cache.is_empty(),
