@@ -2961,7 +2961,7 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
                 .await,
             Some(400),
         );
-        if label == "unsupported charset" {
+        if *label == "unsupported charset" {
             let error = request_error(&ctx)
                 .unwrap_or_else(|| panic!("{label}: expected request validation error"));
             assert!(
