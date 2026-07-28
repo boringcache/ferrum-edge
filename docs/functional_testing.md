@@ -335,6 +335,13 @@ Tests that pin `FERRUM_ADMIN_JWT_SECRET` or `FERRUM_METRICS_BEARER_TOKEN`
 identity is then only as unique as the value they chose. The contract is
 covered by `functional_shared_harness_smoke_test`.
 
+The same barrier is mandatory for suites that keep a bespoke spawner
+instead of `TestGatewayBuilder`. `functional_websocket_test.rs` reuses the
+exported `probe_gateway_identity` in `wait_for_owned_gateway`, because a
+bare TCP accept let an unrelated H2 fixture that had claimed the released
+proxy port answer the RFC 8441 Extended CONNECT handshake and reset it
+with `PROTOCOL_ERROR` (issue #3435).
+
 ## In-Process Test Harness
 
 The scripted-backend test harness (`tests/scaffolding/harness.rs`) ships

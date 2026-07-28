@@ -1236,6 +1236,21 @@ async fn strict_route_response_limit_rejects_unknown_length_json_despite_sse_acc
 // delivery is proven by requiring status + headers + the first event well
 // before the backend's mid-stream pause elapses — a buffered response cannot
 // yield any client bytes until the backend closes the stream.
+//
+// Fixture note (#3431): these two tests used to drive a raw `ScriptedTcpBackend`
+// with `ReadUntil("\r\n\r\n")` followed by a fixed `ReadExact(body.len())`, and
+// ran against a binary-mode gateway. Binary-mode startup performs a backend
+// capability refresh whose h2c prior-knowledge probe opens a second connection
+// to every plaintext HTTP backend; the HTTP/2 client preface
+// (`PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`) satisfies the `\r\n\r\n` needle, so the
+// script then sat in `ReadExact` on the probe's SETTINGS bytes and short-read
+// when the probe hung up ("short read: expected 98, got 62"). Whether that
+// close landed before `assert_no_step_errors()` was pure timing, which is what
+// made the failure intermittent. Both tests now use the request-aware
+// `ScriptedHttp1Backend` (it decodes the real request framing and captures the
+// body) on an in-process harness, which keeps the backend cold — matching the
+// sibling SSE streaming tests above — and assert a single backend connection so
+// a reintroduced stray dial fails loudly instead of corrupting the script.
 
 fn a2a_retry_file_config(backend_port: u16, plugin_config: serde_json::Value) -> String {
     let config = json!({
@@ -1293,23 +1308,37 @@ async fn a2a_retry_configured_unexpected_sse_streams_incrementally() {
 
     let reservation = reserve_port().await.expect("reserve backend port");
     let backend_port = reservation.port;
-    let response_head =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
-    let backend = ScriptedTcpBackend::builder(reservation.into_listener())
-        .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-        .step(TcpStep::ReadExact(request_body.len()))
-        .step(TcpStep::Write(
-            format!("{response_head}{EVENT_ONE}").into_bytes(),
-        ))
-        .step(TcpStep::Sleep(MID_STREAM_PAUSE))
-        .step(TcpStep::Write(EVENT_TWO.as_bytes().to_vec()))
-        .step(TcpStep::Drop)
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST", "/a2a",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "text/event-stream".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()))
+        .step(HttpStep::Sleep(MID_STREAM_PAUSE))
+        .step(HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()))
+        .step(HttpStep::RespondBodyEnd)
         .spawn()
         .expect("spawn backend");
 
     let yaml = a2a_retry_file_config(backend_port, json!({}));
     let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: binary-mode startup performs an
+        // independent h2c capability probe that opens a second backend
+        // connection (see the fixture note above).
+        .mode_in_process()
         .file_config(yaml)
+        .pool_warmup_enabled(false)
         .spawn()
         .await
         .expect("spawn gateway");
@@ -1376,6 +1405,38 @@ async fn a2a_retry_configured_unexpected_sse_streams_incrementally() {
         body.contains("\"final\":true"),
         "terminal SSE event should arrive after the pause, got: {body:?}"
     );
+
+    // The fixture parsed real HTTP framing, so the forwarded request itself is
+    // now assertable: exactly one backend connection carrying exactly one
+    // `POST /a2a` whose body is the untouched JSON-RPC envelope. A stray
+    // connection (the old flake) or a mangled body now fails here rather than
+    // corrupting the script.
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "a released SSE response must not trigger another backend attempt: {requests:?}"
+    );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "the a2a SSE flow must use exactly one backend connection"
+    );
+    let forwarded = &requests[0];
+    assert_eq!(forwarded.method, "POST");
+    assert_eq!(forwarded.path, "/a2a");
+    assert!(
+        !forwarded.body_truncated,
+        "the fixture could not capture the forwarded body losslessly; \
+         partial capture was {:?}",
+        String::from_utf8_lossy(&forwarded.body)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&forwarded.body),
+        request_body,
+        "the JSON-RPC request body must reach the backend byte-for-byte"
+    );
+    backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }
 
@@ -1395,15 +1456,29 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
 
     let reservation = reserve_port().await.expect("reserve backend port");
     let backend_port = reservation.port;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        card_body.len(),
-        card_body
-    );
-    let backend = ScriptedTcpBackend::builder(reservation.into_listener())
-        .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
-        .step(TcpStep::Write(response.into_bytes()))
-        .step(TcpStep::Drop)
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "GET",
+            "/a2a/.well-known/agent-card.json",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Type".into(),
+            value: "application/json".into(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".into(),
+            value: card_body.len().to_string(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Connection".into(),
+            value: "close".into(),
+        })
+        .step(HttpStep::RespondBodyChunk(card_body.as_bytes().to_vec()))
+        .step(HttpStep::RespondBodyEnd)
         .spawn()
         .expect("spawn backend");
 
@@ -1414,7 +1489,11 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
         }),
     );
     let harness = GatewayHarness::builder()
+        // Same reason as the SSE sibling: keep the scripted backend cold so
+        // the startup h2c capability probe cannot consume the script.
+        .mode_in_process()
         .file_config(yaml)
+        .pool_warmup_enabled(false)
         .spawn()
         .await
         .expect("spawn gateway");
@@ -1432,5 +1511,18 @@ async fn a2a_retry_configured_json_agent_card_is_still_rewritten() {
         "agent card URL must be rewritten — the buffered JSON path must not \
          be released under retries"
     );
+
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "the agent-card fetch must reach the backend exactly once: {requests:?}"
+    );
+    assert_eq!(
+        backend.accepted_connections(),
+        1,
+        "the agent-card flow must use exactly one backend connection"
+    );
+    backend.assert_no_matcher_mismatches().await;
     backend.assert_no_step_errors().await;
 }

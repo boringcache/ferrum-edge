@@ -9,6 +9,7 @@ pub mod jwt_auth;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
 pub mod metrics;
+pub mod plugin_config_projection;
 pub mod spec_codec;
 mod tls_management;
 
