@@ -1338,6 +1338,179 @@ fn test_normalize_reject_provenance_is_byte_exact() {
         "a body that is not the authored frame must not be preserved"
     );
     assert!(normalized.grpc_trailers.is_empty());
+
+    // Dropping the body is not enough. The authored reject headers still carry
+    // the contract's `grpc-status: 0`, so an unguarded fallback would emit an
+    // empty Trailers-Only SUCCESS and silently turn a successful unary response
+    // into "the RPC returned nothing". Invalidated authorization fails closed.
+    assert_eq!(
+        normalized.grpc_status,
+        Some(13),
+        "an invalidated framed terminate authorization must fail closed, not report OK"
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("13")
+    );
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated")
+    );
+}
+
+/// A response-body policy rejection replaces the authorized representation and
+/// selects its own status. Failing closed must not flatten that into a generic
+/// INTERNAL — the client has to see the rejection's real gRPC error even though
+/// the stale contract `grpc-status: 0` is still sitting in the header map.
+#[test]
+fn test_normalize_reject_invalidated_by_body_policy_keeps_rejection_status() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let authored = frame_terminate_message(b"hello");
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &authored,
+        framed_grpc_terminate_trailers(),
+    );
+
+    // What `rebuild_plugin_rejection_response_headers` leaves behind when a
+    // body guardrail replaces the synthetic response: a new HTTP status over a
+    // header map that may still carry the contract's terminal metadata.
+    let headers = framed_grpc_terminate_reject_headers();
+    let normalized = normalize_reject_response_with_context(
+        &ctx,
+        StatusCode::FORBIDDEN,
+        br#"{"error":"blocked"}"#,
+        &headers,
+        true,
+    );
+    assert!(normalized.body.is_empty());
+    assert!(normalized.grpc_trailers.is_empty());
+    assert_eq!(
+        normalized.grpc_status,
+        Some(7),
+        "a body-policy rejection must normalize to PERMISSION_DENIED, not OK and not INTERNAL"
+    );
+}
+
+/// Stale provenance must not be inheritable. A later, unrelated rejection that
+/// happens to carry the same bytes still selects its own HTTP status, and the
+/// authorization is bound to the status the contract authored as well as to the
+/// frame — so the original successful trailers can never ride out on it.
+#[test]
+fn test_normalize_reject_stale_provenance_is_not_inherited() {
+    use ferrum_edge::_test_support::{
+        framed_unary_reject_trailers, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let authored = frame_terminate_message(b"hello");
+    let headers = framed_grpc_terminate_reject_headers();
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &authored,
+        framed_grpc_terminate_trailers(),
+    );
+
+    let normalized = normalize_reject_response_with_context(
+        &ctx,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &authored,
+        &headers,
+        true,
+    );
+    assert!(
+        normalized.body.is_empty(),
+        "byte equality alone must not re-authorize a rejection the contract did not author"
+    );
+    assert!(framed_unary_reject_trailers(&normalized).is_none());
+    assert_eq!(normalized.grpc_status, Some(13));
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Shared response-body policy lifecycle over the framed terminate contract.
+//
+// The framed native-gRPC terminate representation is the only gRPC
+// short-circuit that puts real bytes on the wire, so it is the only one the
+// shared body lifecycle (`on_response_body`, representation admission,
+// transforms, `on_final_response_body`) can govern. These assert the PRODUCTION
+// gate, so a regression that silently skips configured gRPC response validators
+// cannot pass.
+// ---------------------------------------------------------------------------
+
+fn response_body_buffering_plugin() -> Vec<std::sync::Arc<dyn Plugin>> {
+    vec![std::sync::Arc::new(
+        ferrum_edge::plugins::ai_token_metrics::AiTokenMetrics::new(&json!({})).unwrap(),
+    )]
+}
+
+fn grpc_terminate_context_with_frame(frame: &[u8]) -> ferrum_edge::plugins::RequestContext {
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut ctx, true);
+    if !frame.is_empty() {
+        ferrum_edge::_test_support::set_serverless_grpc_terminate_frame_for_test(
+            &mut ctx,
+            frame,
+            framed_grpc_terminate_trailers(),
+        );
+    }
+    ctx
+}
+
+#[test]
+fn test_authorized_grpc_terminate_frame_runs_response_body_lifecycle() {
+    use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
+
+    let framed = frame_terminate_message(b"hello");
+    let ctx = grpc_terminate_context_with_frame(&framed);
+    let plugins = response_body_buffering_plugin();
+
+    assert!(
+        synthetic_response_body_hooks_apply_for_test(200, true, &framed, &plugins, &ctx),
+        "the validated native-gRPC terminate representation must run the shared response-body \
+         policy lifecycle; skipping it bypasses configured gRPC response validators/limits"
+    );
+}
+
+#[test]
+fn test_ordinary_grpc_reject_still_skips_response_body_lifecycle() {
+    use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
+
+    let framed = frame_terminate_message(b"hello");
+    let plugins = response_body_buffering_plugin();
+
+    // No terminate provenance at all: an ordinary gRPC reject is trailers-only,
+    // so there is nothing for a body validator to inspect.
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    assert!(!synthetic_response_body_hooks_apply_for_test(200, true, &framed, &plugins, &ctx));
+
+    // Terminate provenance present, but these are not the authored bytes — the
+    // carve-out is provenance, never shape.
+    let ctx = grpc_terminate_context_with_frame(&framed);
+    let other = frame_terminate_message(b"tampered");
+    assert!(!synthetic_response_body_hooks_apply_for_test(200, true, &other, &plugins, &ctx));
+
+    // Same bytes, but not the status the contract authored.
+    assert!(!synthetic_response_body_hooks_apply_for_test(500, true, &framed, &plugins, &ctx));
 }
 
 /// The authorization is native-gRPC only. A non-gRPC request keeps the ordinary

@@ -1772,8 +1772,16 @@ impl std::fmt::Debug for PeerConnectionSignal {
 /// headers a decorator added — CORS, header policy, internal bridge fields —
 /// stay in the initial HEADERS block and can never surface as client-visible
 /// custom trailers.
+///
+/// `http_status` is the HTTP status the plugin authored alongside the frame
+/// (always 200 for a native gRPC terminate). Authorization checks it as well as
+/// the frame bytes so a *later, unrelated* rejection on the same request cannot
+/// inherit the original successful trailers just because its body happens to
+/// match: a replacement rejection carries its own status, and a rejection that
+/// matched on bytes alone would otherwise present as the original success.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerlessGrpcTerminateFrame {
+    pub(crate) http_status: u16,
     pub(crate) frame: bytes::Bytes,
     pub(crate) trailers: HashMap<String, String>,
 }

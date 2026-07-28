@@ -2599,6 +2599,7 @@ impl Plugin for ServerlessFunction {
                                     .collect();
                                 let authored =
                                     crate::plugins::ServerlessGrpcTerminateFrame {
+                                        http_status: status_code,
                                         frame: framed_body.clone(),
                                         trailers,
                                     };

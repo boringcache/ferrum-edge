@@ -6001,19 +6001,22 @@ async fn apply_buffered_grpc_plugin_reject(
         &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
-    // A trailers-only rejection replaces the backend response wholesale, so the
-    // backend's trailers must not survive. A framed unary rejection instead
-    // carries its own sanitized terminal metadata, and clearing it would emit
-    // DATA with no terminal trailers at all.
-    let framed_unary_trailers = crate::proxy::framed_unary_reject_parts(&normalized)
-        .map(|(_, trailers)| trailers.clone());
+    // A rejection here replaces the backend response wholesale, so the backend's
+    // trailers must not survive.
+    //
+    // This helper is the response-BODY reject path: it runs only after a backend
+    // response was received, whereas `serverless_function` terminate
+    // short-circuits in `before_proxy` before any backend dispatch. A framed
+    // unary terminate representation can therefore never arrive here, and
+    // `normalize_h3_grpc_reject` deliberately carries no framed provenance — so
+    // the normalized rejection is always trailers-only and the clear is
+    // unconditional. Every caller immediately follows with
+    // `select_buffered_grpc_terminal_response`, which clears again from the
+    // gateway-authored header view.
     *response_status = normalized.http_status.as_u16();
     *response_headers = normalized.headers;
     *response_body = normalized.body;
-    match framed_unary_trailers {
-        Some(trailers) => *response_trailers = trailers,
-        None => response_trailers.clear(),
-    }
+    response_trailers.clear();
 }
 
 fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {

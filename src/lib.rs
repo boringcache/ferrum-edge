@@ -3956,16 +3956,51 @@ pub mod _test_support {
     /// Stamp the request-scoped provenance that `serverless_function` sets when
     /// a validated native-gRPC terminate contract produced `frame` plus
     /// `trailers`.
+    ///
+    /// The authored HTTP status is 200, exactly as the production plugin stamps
+    /// it — authorization is checked against that status as well as the bytes.
     pub fn set_serverless_grpc_terminate_frame_for_test(
         ctx: &mut crate::plugins::RequestContext,
         frame: &[u8],
         trailers: HashMap<String, String>,
     ) {
         let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+            http_status: 200,
             frame: bytes::Bytes::copy_from_slice(frame),
             trailers,
         };
         ctx.serverless_grpc_terminate_frame = Some(Arc::new(authored));
+    }
+
+    /// Mark the request as carrying a `serverless_function` terminate response,
+    /// the same flag the plugin sets before returning its `RejectBinary`.
+    pub fn set_serverless_terminate_response_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        value: bool,
+    ) {
+        ctx.serverless_terminate_response = value;
+    }
+
+    /// The production gate that decides whether a plugin short-circuit runs the
+    /// shared response-body policy lifecycle (`on_response_body`,
+    /// representation admission, transforms, `on_final_response_body`).
+    ///
+    /// Exposed so the native-gRPC terminate carve-out is asserted against the
+    /// real predicate rather than a test-local restatement of it.
+    pub fn synthetic_response_body_hooks_apply_for_test(
+        status_code: u16,
+        is_grpc_request: bool,
+        response_body: &[u8],
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::should_apply_synthetic_response_body_hooks(
+            status_code,
+            is_grpc_request,
+            response_body,
+            plugins,
+            ctx,
+        )
     }
 
     /// Read back the request-scoped framed native-gRPC terminate provenance:

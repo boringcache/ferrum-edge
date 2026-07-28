@@ -19139,7 +19139,12 @@ components:
         ceiling, measured after sanitization and after base64 re-encoding.
         gRPC-Web terminate is rejected with 500. Streaming and compression
         contract shapes fail closed. Malformed or oversized function output
-        fails closed without reflecting untrusted bodies. Cloud credential
+        fails closed without reflecting untrusted bodies. The validated
+        framed response enters the shared response-body policy lifecycle, so
+        configured gRPC response validators and limits still apply; if a body
+        policy or transform invalidates that authorized representation, the
+        response fails closed to a nonzero gRPC error rather than degrading to
+        an empty successful trailers-only reply. Cloud credential
         fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie

@@ -12114,6 +12114,22 @@ async fn send_h3_reject_flavor_aware_with_header_state(
 
     // Derive signalling from the sanitized response metadata.
     let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
+    // This writer derives its own signal rather than reusing `normalized`, so it
+    // needs the same fail-closed correction the normalizer applies: reaching
+    // here while still HOLDING framed-terminate authorization means the authored
+    // representation was invalidated, and the contract's `grpc-status: 0` must
+    // not be emitted as an empty Trailers-Only success.
+    let h3_mapped_status =
+        crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
+    let fail_closed = crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
+        framed_unary_provenance,
+        grpc_status,
+        h3_mapped_status,
+    );
+    let (grpc_status, grpc_message) = match fail_closed {
+        Some((status, message)) => (status, std::borrow::Cow::Borrowed(message)),
+        None => (grpc_status, grpc_message),
+    };
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the

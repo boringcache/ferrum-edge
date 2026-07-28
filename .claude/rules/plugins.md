@@ -100,7 +100,13 @@ authorizes exactly that byte-identical frame to be emitted as HEADERS + one unco
 unary DATA frame + plugin-authored terminal trailers. Reject body shape and reject
 `content-type`/`grpc-status` headers are never provenance, and the terminate contract is
 entered only for the request-scoped native-gRPC flavor the frontend stamps at intake —
-never for a mutable effective `content-type`.
+never for a mutable effective `content-type`. Authorization binds the authored HTTP status
+as well as the frame bytes, and that authorized representation — and only it — runs the
+shared synthetic response-body policy lifecycle so configured gRPC response validators are
+not bypassed. Invalidated authorization (rewritten frame, replaced response, changed
+status) FAILS CLOSED: the body is dropped and a residual `grpc-status: 0` is replaced by
+the rejection's own status, or `INTERNAL` — never emitted as an empty Trailers-Only
+success.
 
 ## Request Context And Body Rules
 
