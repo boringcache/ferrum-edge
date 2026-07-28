@@ -385,8 +385,73 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     );
 }
 
+/// Issue #3328: a `fallback` block must fail admission outright instead of
+/// being parsed into a policy the runtime never honors. Every JSON shape is
+/// refused — an object, a well-formed policy, an empty object, `null`, and a
+/// scalar — so no operator can persist inert failover configuration.
 #[test]
-fn test_config_rejects_unknown_provider_and_fallback_keys() {
+fn test_config_rejects_fallback_block_in_every_shape() {
+    for fallback in [
+        json!({"enabled": true, "on_connect_error": true, "on_5xx_before_first_byte": true, "max_attempts": 3}),
+        json!({"enabled": false}),
+        json!({}),
+        Value::Null,
+        json!(true),
+        json!(2),
+        json!("enabled"),
+    ] {
+        let cfg = json!({
+            "providers": [valid_provider()],
+            "fallback": fallback.clone(),
+        });
+        let err = AiStreamRouter::new(&cfg, http_client())
+            .err()
+            .unwrap_or_else(|| panic!("fallback {fallback} must be rejected"));
+        assert!(
+            err.contains("unsupported field 'fallback'"),
+            "fallback {fallback}: {err}"
+        );
+        assert!(
+            err.contains("provider fallback is not implemented"),
+            "rejection must explain the missing capability, not read as a typo: {err}"
+        );
+        // The same fail-closed verdict must reach Admin API / file validate /
+        // CP-DP publication through the shared admission entrypoint.
+        assert!(
+            validate_plugin_config("ai_stream_router", &cfg).is_err(),
+            "shared admission must reject fallback {fallback}"
+        );
+    }
+}
+
+/// A `fallback` block is refused with its own diagnostic rather than being
+/// reported as an unknown-key typo, so the operator learns the capability does
+/// not exist.
+#[test]
+fn test_fallback_rejection_is_specific_not_a_typo_suggestion() {
+    let cfg = json!({
+        "providers": [valid_provider()],
+        "fallback": {"on_connect_error": true},
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(!err.contains("did you mean"), "{err}");
+    assert!(!err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("Remove the 'fallback' block"), "{err}");
+}
+
+/// Omitting `fallback` preserves the plugin's existing behavior exactly: the
+/// router still constructs and still routes a claimed streaming request.
+#[test]
+fn test_omitted_fallback_preserves_construction() {
+    let cfg = json!({
+        "providers": [valid_provider()]
+    });
+    assert!(AiStreamRouter::new(&cfg, http_client()).is_ok());
+    assert!(validate_plugin_config("ai_stream_router", &cfg).is_ok());
+}
+
+#[test]
+fn test_config_rejects_unknown_provider_keys() {
     let cfg = json!({
         "providers": [{
             "name": "p",
@@ -410,23 +475,6 @@ fn test_config_rejects_unknown_provider_and_fallback_keys() {
     assert!(
         err.contains("did you mean 'allow_plaintext'")
             || err.contains("did you mean 'inherit_backend_tls'"),
-        "{err}"
-    );
-
-    let cfg = json!({
-        "providers": [valid_provider()],
-        "fallback": {
-            "enabled": true,
-            "on_connect_erro": false,
-            "max_attemps": 3
-        }
-    });
-    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("'config.fallback.on_connect_erro'"), "{err}");
-    assert!(err.contains("'config.fallback.max_attemps'"), "{err}");
-    assert!(
-        err.contains("did you mean 'on_connect_error'")
-            || err.contains("did you mean 'max_attempts'"),
         "{err}"
     );
 }
@@ -665,11 +713,13 @@ async fn test_route_override_and_metadata_set_for_openai() {
             .map(String::as_str),
         Some("false")
     );
-    assert_eq!(
-        ctx.metadata
-            .get("ai_stream_router.fallback_attempts")
-            .map(String::as_str),
-        Some("0")
+    // Issue #3328: no permanently-zero fallback counter is published — the
+    // plugin never attempts a second provider, so the key would only advertise
+    // a capability that does not exist.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_stream_router.fallback_attempts"),
+        "claimed requests must not stamp an inert fallback_attempts counter"
     );
 }
 

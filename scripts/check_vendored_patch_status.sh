@@ -23,7 +23,9 @@ PATCHES=(
   "tungstenite lossless raw takeover|tungstenite|0.29.0|snapview/tungstenite-rs|556|NONE|docs/upstream-tungstenite-patches/"
   "tungstenite distinct frame-limit origin|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/"
   "tungstenite optional auto_pong|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/003-optional-auto-pong/"
+  "tungstenite fragment accounting and incomplete-message bounds|tungstenite|0.29.0|snapview/tungstenite-rs|NONE|NONE|docs/upstream-tungstenite-patches/004-fragment-accounting/"
   "tokio-tungstenite lossless raw takeover|tokio-tungstenite|0.29.0|snapview/tokio-tungstenite|380|NONE|docs/upstream-tungstenite-patches/"
+  "tokio-tungstenite fragment accounting delegator|tokio-tungstenite|0.29.0|snapview/tokio-tungstenite|NONE|NONE|docs/upstream-tungstenite-patches/004-fragment-accounting/"
   "dimpl certificate chains and key zeroization|dimpl|0.6.1|algesten/dimpl|NONE|NONE|docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/"
 )
 

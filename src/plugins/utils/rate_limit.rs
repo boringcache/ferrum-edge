@@ -2071,8 +2071,36 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
     }
 }
 
+/// One `ws_rate_limiting` admission decision covering `frames` physical
+/// WebSocket frames.
+///
+/// A reassembled message can cost many wire frames: the shared relay charges
+/// the completing message as one frame and charges the initial non-final frame
+/// plus every intermediate continuation frame in a single batched op. Batching
+/// keeps the Redis path at one round trip per read instead of one per fragment
+/// (GHSA-qq94-2gv2-phh6).
 #[derive(Debug, Clone, Copy)]
-pub struct WsRateLimitOp;
+pub struct WsRateLimitOp {
+    frames: u64,
+}
+
+impl WsRateLimitOp {
+    /// A single-frame charge (one unfragmented message or control frame).
+    pub const ONE: Self = Self { frames: 1 };
+
+    /// A batched charge. Zero is normalized to one so an accidental empty
+    /// batch can never be a free admission.
+    pub fn frames(frames: u64) -> Self {
+        Self {
+            frames: frames.max(1),
+        }
+    }
+
+    /// Frames this op charges; always at least one.
+    pub fn frame_count(&self) -> u64 {
+        self.frames.max(1)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WsFrameRateAlgorithm {
@@ -2203,10 +2231,15 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
     fn check_local(
         &self,
         state: &mut Self::State,
-        _op: &Self::Op,
+        op: &Self::Op,
         now: Instant,
     ) -> RateLimitOutcome {
-        let outcome = if state.check_and_consume(now, 1) {
+        // All-or-nothing: a batch larger than the remaining budget consumes
+        // nothing and is denied, which is terminal for the connection. A batch
+        // larger than `burst_size` can never be admitted — that is the intended
+        // fail-closed answer for a message built from more wire frames than the
+        // configured burst.
+        let outcome = if state.check_and_consume(now, op.frame_count()) {
             RateLimitOutcome::allow()
         } else {
             RateLimitOutcome::deny()
@@ -2220,7 +2253,7 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         &self,
         redis: &RedisRateLimitClient,
         key: &str,
-        _op: &Self::Op,
+        op: &Self::Op,
     ) -> Result<RateLimitOutcome, ()> {
         // Approximate the local TokenBucket via a sliding two-window check
         // over the bucket's full-refill period. See `redis_window_derivation`
@@ -2239,8 +2272,12 @@ impl RateLimitAlgorithm for WsFrameRateAlgorithm {
         let prev_key = redis.make_key(&[key, &prev_idx.to_string()]);
         let ttl = two_window_ttl_seconds(window_seconds);
 
+        // Charge the whole batch in one round trip. `frame_count()` is bounded
+        // by the relay's incomplete-message frame ceiling, so the INCRBY amount
+        // cannot be driven arbitrarily high by a peer (GHSA-qq94-2gv2-phh6).
+        let charge = i64::try_from(op.frame_count()).unwrap_or(i64::MAX);
         let (prev_count, curr_count) = redis
-            .sliding_window_increment(&prev_key, &curr_key, ttl)
+            .sliding_window_increment_by(&prev_key, &curr_key, charge, ttl)
             .await?;
         let weighted = prev_count as f64 * (1.0 - elapsed_fraction) + curr_count as f64;
         let allowed = weighted <= limit as f64;

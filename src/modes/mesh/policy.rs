@@ -734,13 +734,7 @@ fn canonicalize_cidr_network_for_match(
 /// CIDR comparisons treat both representations identically.
 #[inline]
 fn canonicalize_ip_for_match(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    }
+    crate::util::client_identity::canonical_ip(ip)
 }
 
 #[inline]
