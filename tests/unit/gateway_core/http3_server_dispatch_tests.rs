@@ -1811,9 +1811,11 @@ fn the_trailer_reconciliation_exempts_no_field_name() {
         .expect("bounded reconciliation function");
 
     // A name-based exemption here is a bypass, not a protocol accommodation:
-    // every reconciled path is a PLAIN-flavor H3 relay (`use_native_h3_pool` and
-    // the buffered send path both require `HttpFlavor::Plain`), and native gRPC
-    // finishes its own trailers in `dispatch_grpc_native_h3`. So a non-gRPC
+    // every reconciled path carries a PLAIN-flavor response — the H3 relays
+    // require `HttpFlavor::Plain` (`use_native_h3_pool` and the buffered send
+    // path alike) and native gRPC finishes its own trailers in
+    // `dispatch_grpc_native_h3`, while the direct-H2 arm excludes native gRPC
+    // and translated gRPC-Web from the governor entirely. So a non-gRPC
     // backend could otherwise smuggle a governed field past an observed or
     // unbounded policy by naming its trailer `grpc-status`.
     assert!(

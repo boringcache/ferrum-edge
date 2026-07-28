@@ -5,10 +5,10 @@
 //! `after_proxy` and every later response-header phase see only the INITIAL
 //! header map, so a backend trailer repeating a governed field name lands on
 //! the wire after the policy boundary. The reconciliation here is the boundary
-//! that closes that gap on the buffered native-HTTP/3 send path AND on the
-//! plain native/refined HTTP/3 streaming relays, without punishing chains that
-//! apply no response-header policy at all (issue #2941 — auth/logging-only
-//! plugins keep their trailers).
+//! that closes that gap on the buffered native-HTTP/3 send path, on the plain
+//! native/refined HTTP/3 streaming relays, AND on the plain direct-HTTP/2
+//! streaming relay, without punishing chains that apply no response-header
+//! policy at all (issue #2941 — auth/logging-only plugins keep their trailers).
 //!
 //! The streaming relays commit their initial HEADERS frame before the backend's
 //! trailers exist, so they retain the pre-policy header map instead of
@@ -264,9 +264,10 @@ fn unbounded_policy_drops_trailer_only_representation_metadata() {
 
 #[test]
 fn a_grpc_named_trailer_gets_no_exemption_from_the_unbounded_arm() {
-    // Every path that reaches this reconciliation is a PLAIN-flavor HTTP/3 relay
-    // — native gRPC finishes its own trailers in `dispatch_grpc_native_h3` and is
-    // never reconciled. So a `grpc-*` trailer here is an ordinary backend field,
+    // Every path that reaches this reconciliation carries a PLAIN-flavor
+    // response — native gRPC finishes its own trailers in
+    // `dispatch_grpc_native_h3` on H3 and is excluded from the governor on the
+    // direct-H2 arm. So a `grpc-*` trailer here is an ordinary backend field,
     // and exempting it by NAME would hand any non-gRPC backend a one-word bypass
     // of a fail-closed response-header policy.
     let backend = headers(&[("content-type", "text/plain")]);
@@ -817,4 +818,82 @@ fn native_grpc_and_grpc_web_h2_dispatches_are_never_reconciled() {
         gate.contains("PrePolicyResponseHeaders::capture_for_streaming("),
         "the plain streaming H2 relay must capture the pristine backend header view"
     );
+}
+
+#[test]
+fn streaming_h2_capture_precedes_the_first_response_header_phase() {
+    // Evidence is only evidence if it predates every mutation it must witness.
+    // The capture sits above `run_after_proxy_hooks`, which is the first
+    // response-header phase on this path; the governor is sealed only after the
+    // response BUILDER has taken its gateway-authored writes.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let capture_at = src
+        .find("let h2_streaming_trailer_policy = ")
+        .expect("streaming H2 trailer policy capture");
+    let seal_at = src
+        .find("let mut h2_streaming_trailer_governor = None;")
+        .expect("streaming H2 trailer governor seal");
+    assert!(
+        capture_at < seal_at,
+        "the pre-policy capture must precede the governor seal"
+    );
+    let first_phase = "run_after_proxy_hooks(&plugins, &mut ctx, response_status,";
+    assert!(
+        src[capture_at..seal_at].contains(first_phase),
+        "the pre-policy capture must precede the first response-header phase"
+    );
+    let builder_at = src
+        .find("apply_response_headers(resp_builder, &response_headers)")
+        .expect("response builder header application");
+    assert!(
+        builder_at < seal_at,
+        "the governor must be sealed after the response builder took its writes"
+    );
+}
+
+#[test]
+fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
+    // `body.rs` proving each constructor forwards the governor is only half the
+    // contract: `handle_proxy_request_inner` must actually hand one to EVERY
+    // mutually-exclusive constructor it picks on the plain streaming-H2 arm. A
+    // new branch added without `.take()` would silently drop the boundary.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let after_seal = src
+        .split("let mut h2_streaming_trailer_governor = None;")
+        .nth(1)
+        .expect("streaming H2 trailer governor seal");
+    let region = after_seal
+        .split("let mut body = if let Some(inspector) = response_inspector {")
+        .next()
+        .expect("bounded streaming H2 body-construction region");
+    let constructors = region.matches("_h2_body_strip_hop_by_hop_trailers(").count();
+    let governed = region.matches("h2_streaming_trailer_governor.take()").count();
+    assert_eq!(
+        constructors, 4,
+        "the plain streaming H2 arm should build exactly four body variants"
+    );
+    assert_eq!(
+        governed, constructors,
+        "every plain streaming H2 body constructor must receive the sealed trailer governor"
+    );
+
+    // The seal folds in the gateway-authored fields written straight onto the
+    // response builder, so a backend trailer of one of those names cannot
+    // reconcile as absent->absent. `connection: close` is deliberately absent:
+    // it is hop-by-hop and never survives to the reconciliation.
+    let seal = region
+        .split("// Build response body:")
+        .next()
+        .expect("bounded seal region");
+    for field in [
+        "\"x-gateway-error\"",
+        "\"x-gateway-upstream-status\"",
+        "\"alt-svc\"",
+        "\"via\"",
+    ] {
+        assert!(
+            seal.contains(field),
+            "the governor's final-header view must fold in the builder-only field {field}"
+        );
+    }
 }

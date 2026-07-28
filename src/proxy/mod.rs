@@ -26402,10 +26402,18 @@ async fn handle_proxy_request_inner(
     // response-header phases ran. The reconciliation compares the backend's
     // pre-policy values against the headers the client ACTUALLY received, so
     // the view handed to the body is `response_headers` plus the four
-    // gateway-authored fields the builder above wrote directly. A
+    // end-to-end gateway-authored fields the builder above wrote directly
+    // (`X-Gateway-Error`, `X-Gateway-Upstream-Status`, `alt-svc`, `via`). A
     // builder-only field left out of the view would reconcile as
     // absent->absent and let a backend trailer of the same name land on the
     // wire contradicting the gateway's own header.
+    //
+    // The drain/overload `connection: close` write above is the one deliberate
+    // omission, and needs no fold: `connection` is response-direction
+    // hop-by-hop, so `strip_response_hop_by_hop_trailers` has already removed
+    // it from the trailer section before the governor ever runs. It is left out
+    // of the capture gate for the same reason — a name that can never reach the
+    // reconciliation cannot decide whether evidence is needed.
     //
     // Ownership: the body outlives this handler, so the governor owns every
     // input (one final-header clone, the pre-policy snapshot, an `Arc` bump of

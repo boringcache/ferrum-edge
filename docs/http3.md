@@ -315,14 +315,16 @@ them against the response-header policy actually in force for the request:
   | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
   | `ai_stream_router` | Anthropic SSE normalization removes `content-encoding` / `content-length`, invalidates every content-bound validator/digest/signature plus the open-ended `x-amz-checksum-*` / `x-checksum-*` families, and rewrites `vary` — prefix-derived names cannot be listed as finite exact names |
 
-**No field name is exempt, `grpc-*` included.** Every reconciled path is a
-plain-flavor H3 relay — the native H3 pool branches require
-`HttpFlavor::Plain`, and a native gRPC dispatch inlines its own trailer finish in
-`dispatch_grpc_native_h3` and is never reconciled here (see
-[gRPC trailers over H3](#grpc-trailers-over-h3)). A `grpc-status` trailer on a
-reconciled path is therefore an ordinary backend-supplied field, and exempting it
-by name would let any non-gRPC backend bypass an observed or fail-closed
-response-header policy with a single well-chosen trailer name.
+**No field name is exempt, `grpc-*` included.** Every reconciled path carries a
+plain-flavor response. On H3 that is structural: the native H3 pool branches
+require `HttpFlavor::Plain`, and a native gRPC dispatch inlines its own trailer
+finish in `dispatch_grpc_native_h3` and is never reconciled here (see
+[gRPC trailers over H3](#grpc-trailers-over-h3)). The
+[direct-H2 streaming relay](#direct-http2-streaming) draws the same line by
+excluding native gRPC and translated gRPC-Web from the boundary. A `grpc-status`
+trailer on a reconciled path is therefore an ordinary backend-supplied field, and
+exempting it by name would let any non-gRPC backend bypass an observed or
+fail-closed response-header policy with a single well-chosen trailer name.
 
 An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, or a rate
 limiter with response-header exposure disabled — declares no names and mutates

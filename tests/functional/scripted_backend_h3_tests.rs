@@ -4341,8 +4341,8 @@ async fn h3_streaming_unbounded_response_policy_drops_backend_trailers() {
     assert_eq!(resp.trailer("x-powered-by"), None);
 }
 
-// A `grpc-*` trailer NAME earns no exemption on a reconciled path. Every path
-// that reaches the reconciliation is plain-flavor H3 — a native gRPC dispatch
+// A `grpc-*` trailer NAME earns no exemption on a reconciled path. Every H3 path
+// that reaches the reconciliation is plain-flavor — a native gRPC dispatch
 // finishes its own trailers in `dispatch_grpc_native_h3` and is never
 // reconciled — so this backend is an ordinary HTTP backend that merely happens
 // to name its trailer `grpc-status`. Without the fix that one word would carry

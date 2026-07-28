@@ -648,16 +648,27 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
 // Deliberately NO name-based exemption for gRPC control trailers
 // (`grpc-status` / `grpc-message` / `grpc-status-details-bin`).
 //
-// Every path that reaches this reconciliation is a PLAIN-flavor HTTP/3 relay:
-// `use_native_h3_pool` and the buffered native-H3 send path both require
-// `backend_http_flavor == HttpFlavor::Plain`, and a native gRPC dispatch goes to
-// `dispatch_grpc_native_h3`, which inlines its own trailer finish and is never
-// reconciled. No reconciled path therefore carries protocol-required native gRPC
-// status, and a name-only exemption would instead let ANY non-gRPC backend
-// smuggle a governed field past an observed or unbounded response-header policy
-// simply by naming its trailer `grpc-status`. Native gRPC status correctness is
-// preserved where it actually lives — in `dispatch_grpc_native_h3` and the H2
-// cross-protocol gRPC bridge, neither of which calls this function.
+// Every path that reaches this reconciliation carries PLAIN-flavor responses,
+// on both protocols that reach it:
+//
+// * HTTP/3 — `use_native_h3_pool` and the buffered native-H3 send path both
+//   require `backend_http_flavor == HttpFlavor::Plain`, and a native gRPC
+//   dispatch goes to `dispatch_grpc_native_h3`, which inlines its own trailer
+//   finish and is never reconciled.
+// * Direct HTTP/2 streaming (`ResponseBody::StreamingH2`, reconciled through
+//   `StreamingResponseTrailerGovernor` inside `proxy::body::StripHopByHopTrailers`)
+//   — `handle_proxy_request_inner` installs the governor only when the response
+//   is neither native gRPC (`streaming_h2_native_grpc`, the mesh-mTLS relay) nor
+//   translated gRPC-Web (`grpc_request_is_web_translated`); both pass `None` and
+//   keep the wrapper a pure hop-by-hop filter.
+//
+// No reconciled path therefore carries protocol-required native gRPC status, and
+// a name-only exemption would instead let ANY non-gRPC backend smuggle a
+// governed field past an observed or unbounded response-header policy simply by
+// naming its trailer `grpc-status`. Native gRPC status correctness is preserved
+// where it actually lives — in `dispatch_grpc_native_h3`, the mesh-mTLS
+// streaming-H2 relay, and the H2 cross-protocol gRPC bridge, none of which call
+// this function.
 
 /// Outcome of a case-insensitive lookup into a plugin-facing header map.
 ///
@@ -954,10 +965,13 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// `after_proxy` and every later response-header phase see only the INITIAL
 /// header map. A backend trailer carrying a governed field name arrives after
 /// that boundary, so without this reconciliation it reintroduces exactly what
-/// the policy removed — or contradicts what the policy set — on the wire. Both
-/// the buffered native-HTTP/3 send path and the plain native/refined HTTP/3
-/// STREAMING relays cross that boundary; the streaming relays reach this
-/// function through [`reconcile_streaming_backend_trailers`].
+/// the policy removed — or contradicts what the policy set — on the wire. Three
+/// families of path cross that boundary: the buffered native-HTTP/3 send path,
+/// the plain native/refined HTTP/3 STREAMING relays, and the plain direct-HTTP/2
+/// streaming relay. Both streaming families reach this function through
+/// [`reconcile_streaming_backend_trailers`] — the H3 relays inline, the H2 relay
+/// through the owned [`StreamingResponseTrailerGovernor`] its response body
+/// carries.
 ///
 /// Two independent signals decide "governed", because neither alone is
 /// sufficient:
@@ -975,10 +989,10 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// treated as governed.
 ///
 /// There is NO field-name exemption of any kind, gRPC control trailers included.
-/// Every reconciled path is plain-flavor HTTP/3 (see the module-level note above
-/// this function), so a `grpc-*` trailer here is an ordinary backend-supplied
-/// field, and exempting it by name would hand any backend a one-word bypass of
-/// the response-header policy.
+/// Every reconciled path carries plain-flavor responses on both protocols that
+/// reach it (see the module-level note above this function), so a `grpc-*`
+/// trailer here is an ordinary backend-supplied field, and exempting it by name
+/// would hand any backend a one-word bypass of the response-header policy.
 ///
 /// Removal is loop-until-absent so a trailer name repeated across several field
 /// lines cannot leave a surviving duplicate behind.
