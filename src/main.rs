@@ -739,6 +739,13 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         }
     };
 
+    // Apply the delayed-work admission budget before any listener can accept
+    // traffic, so a fault-injection delay is never admitted against the
+    // compiled-in default when the operator configured a smaller bound.
+    crate::plugins::utils::fault_delay::init_fault_delay_admission(
+        env_config.max_concurrent_fault_delays,
+    );
+
     // Initialize DTLS buffer config from resolved EnvConfig before any DTLS sessions.
     crate::dtls::init_dtls_buf_config(
         env_config.dtls_max_plaintext_bytes,
