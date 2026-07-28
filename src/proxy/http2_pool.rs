@@ -57,10 +57,18 @@ pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
 
 /// Terminal protocol outcome for one DNS candidate.
 ///
-/// Negotiated HTTP/1.1 is a usable backend capability result, not a failed
-/// address attempt: the dispatcher can route it through reqwest. Keeping it in
-/// the successful candidate channel prevents a later transport or handshake
+/// For a route that can fall back to reqwest, negotiated HTTP/1.1 is a usable
+/// backend capability result, not a failed address attempt. Keeping it in the
+/// successful candidate channel prevents a later transport or handshake
 /// failure from overwriting the downgrade signal.
+///
+/// Routes carrying a backend TLS SNI override are the exception and never
+/// reach this variant: reqwest cannot apply a per-request SNI override, so
+/// HTTP/1.1 is a candidate *failure* there and is returned through the error
+/// channel so `connect_candidates` keeps scanning. Exhausting every candidate
+/// that way still surfaces `Http2PoolError::BackendSelectedHttp1` (the last
+/// failure is propagated verbatim), so the dispatcher's fail-closed SNI
+/// handling is unchanged.
 enum Http2CandidateOutcome {
     Established(Http2Sender),
     BackendSelectedHttp1 { pool_key: String },
