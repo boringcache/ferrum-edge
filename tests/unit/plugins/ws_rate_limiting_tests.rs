@@ -1105,7 +1105,9 @@ async fn fail_closed_policy_closes_both_frame_charging_paths_while_redis_is_unav
     let direction = WebSocketFrameDirection::ClientToBackend;
 
     let message = plugin.on_ws_frame("proxy", 1, direction, &msg).await;
-    let fragment = plugin.on_ws_reassembly_frames("proxy", 2, direction, 3).await;
+    let fragment = plugin
+        .on_ws_reassembly_frames("proxy", 2, direction, 3)
+        .await;
 
     assert!(
         is_policy_close(&message),
@@ -1132,7 +1134,9 @@ async fn local_fallback_policy_admits_both_frame_charging_paths_while_redis_is_u
     let direction = WebSocketFrameDirection::ClientToBackend;
 
     let message = plugin.on_ws_frame("proxy", 1, direction, &msg).await;
-    let fragment = plugin.on_ws_reassembly_frames("proxy", 2, direction, 3).await;
+    let fragment = plugin
+        .on_ws_reassembly_frames("proxy", 2, direction, 3)
+        .await;
 
     assert!(
         message.is_none(),
@@ -1156,7 +1160,9 @@ async fn empty_fragment_batch_is_not_charged_under_the_fail_closed_default() {
     .unwrap();
     let direction = WebSocketFrameDirection::ClientToBackend;
 
-    let result = plugin.on_ws_reassembly_frames("proxy", 3, direction, 0).await;
+    let result = plugin
+        .on_ws_reassembly_frames("proxy", 3, direction, 0)
+        .await;
 
     assert!(
         result.is_none(),
