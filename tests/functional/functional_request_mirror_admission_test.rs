@@ -280,7 +280,11 @@ impl CaptureBackend {
     }
 
     fn first(&self) -> Option<Captured> {
-        self.requests.lock().expect("requests lock").first().cloned()
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .first()
+            .cloned()
     }
 
     async fn wait_for_request(&self) -> Option<Captured> {
