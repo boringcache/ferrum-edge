@@ -16394,6 +16394,16 @@ pub(crate) async fn run_after_proxy_hooks(
     // request on non-AI proxies. When no reservation exists the keep/release
     // decision is moot anyway (`should_release_gateway_rejection` requires a
     // non-zero reservation), so the status is only useful when the marker is set.
+    //
+    // Independently, record the same genuine status as private typed provenance
+    // on `RequestContext` and notify every plugin once. That path is
+    // non-spoofable by public metadata and lets origin-success side effects
+    // (notably `response_caching` invalidation) run even when an earlier
+    // `after_proxy` hook replaces the client-visible response.
+    ctx.record_origin_http_response_status(response_status);
+    for plugin in plugins {
+        plugin.observe_origin_http_response_status(ctx, response_status);
+    }
     if ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
         ctx.metadata.insert(
             BACKEND_STATUS_METADATA_KEY.to_string(),
@@ -22336,6 +22346,7 @@ async fn handle_proxy_request_inner(
                 grpc_method,
                 grpc_headers,
                 grpc_req_body.clone(),
+                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
                 &state.grpc_pool,
@@ -22594,6 +22605,7 @@ async fn handle_proxy_request_inner(
                             grpc_method,
                             grpc_headers,
                             grpc_req_body.clone(),
+                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
                             &state.grpc_pool,
@@ -23048,6 +23060,8 @@ async fn handle_proxy_request_inner(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
                     grpc_body_bytes.clone(),
+                    // A retry replays the complete request, trailers included.
+                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
                     &state.grpc_pool,
