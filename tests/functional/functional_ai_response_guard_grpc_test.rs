@@ -16,8 +16,8 @@
 
 use crate::scaffolding::ports::reserve_port;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http2::Builder as Http2ServerBuilder;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -28,7 +28,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_stream::wrappers::ReceiverStream;
 
 // ============================================================================
 // Protobuf fixtures
@@ -126,6 +128,11 @@ async fn free_port() -> u16 {
 /// Echo backend: returns the request body as the gRPC response body, and
 /// mirrors `x-set-grpc-encoding` into the response `grpc-encoding` so the test
 /// can drive the compressed-frame path.
+///
+/// Terminal `grpc-status: 0` is emitted as an HTTP/2 TRAILERS frame after the
+/// DATA frame(s). Placing it in the initial HEADERS block is protocol-invalid
+/// for ordinary message-carrying responses; the gateway treats that field as
+/// transport-managed and will not forward it as a success signal.
 async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
     let reservation = reserve_port().await.expect("reserve backend port");
     let port = reservation.port;
@@ -155,14 +162,25 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
                         .map(|collected| collected.to_bytes())
                         .unwrap_or_default();
 
+                    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+                    let _ = tx.send(Ok(Frame::data(body_bytes))).await;
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert(
+                        "grpc-status",
+                        hyper::header::HeaderValue::from_static("0"),
+                    );
+                    let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    drop(tx);
+
                     let mut builder = Response::builder()
                         .status(200)
-                        .header("content-type", "application/grpc")
-                        .header("grpc-status", "0");
+                        .header("content-type", "application/grpc");
                     if let Some(encoding) = encoding {
                         builder = builder.header("grpc-encoding", encoding);
                     }
-                    let response = builder.body(Full::new(body_bytes)).unwrap();
+                    let response = builder
+                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .unwrap();
                     Ok::<_, hyper::Error>(response)
                 });
                 if let Err(e) = builder.serve_connection(io, service).await
@@ -266,19 +284,76 @@ async fn start_gateway_with_retry(config_path: &str) -> (std::process::Child, u1
 
 struct GrpcCall {
     status: u16,
-    /// Response headers merged with trailers; a trailers-only gRPC error puts
-    /// `grpc-status` in the header block, an ordinary response in the trailers.
-    metadata: HashMap<String, String>,
+    /// Initial response HEADERS (excluding trailers).
+    headers: HashMap<String, String>,
+    /// Terminal TRAILERS frame values, when present.
+    trailers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
 impl GrpcCall {
+    /// Terminal `grpc-status`: prefer the TRAILERS frame (ordinary responses),
+    /// then fall back to initial HEADERS for the gRPC Trailers-Only error shape.
     fn grpc_status(&self) -> &str {
-        self.metadata
+        self.trailers
             .get("grpc-status")
+            .or_else(|| self.headers.get("grpc-status"))
             .map(String::as_str)
             .unwrap_or("")
     }
+
+    /// `grpc-status` from the TRAILERS frame only — never from initial HEADERS.
+    fn trailer_grpc_status(&self) -> Option<&str> {
+        self.trailers.get("grpc-status").map(String::as_str)
+    }
+}
+
+/// Assert a protocol-correct non-OK gRPC termination: a present, parseable,
+/// nonempty, nonzero terminal status. An empty/missing status must fail —
+/// `assert_ne!(status, "0")` alone is insufficient because `"" != "0"`.
+fn assert_nonzero_terminal_grpc_status(call: &GrpcCall, context: &str) {
+    let raw = call.grpc_status();
+    assert!(
+        !raw.is_empty(),
+        "{context}: expected a present terminal grpc-status, got empty/missing \
+         (headers={:?}, trailers={:?})",
+        call.headers.get("grpc-status"),
+        call.trailers.get("grpc-status"),
+    );
+    let code: u32 = raw.parse().unwrap_or_else(|_| {
+        panic!(
+            "{context}: grpc-status {raw:?} is not a parseable u32 \
+             (headers={:?}, trailers={:?})",
+            call.headers.get("grpc-status"),
+            call.trailers.get("grpc-status"),
+        )
+    });
+    assert_ne!(
+        code, 0,
+        "{context}: expected nonzero terminal grpc-status, got {code} \
+         (headers={:?}, trailers={:?})",
+        call.headers.get("grpc-status"),
+        call.trailers.get("grpc-status"),
+    );
+}
+
+/// Assert a successful message-carrying gRPC response: `grpc-status: 0` must
+/// arrive in terminal trailers. An initial-header-only value is not accepted.
+fn assert_ok_trailer_grpc_status(call: &GrpcCall, context: &str) {
+    assert_eq!(
+        call.trailer_grpc_status(),
+        Some("0"),
+        "{context}: expected grpc-status: 0 in terminal trailers, got \
+         trailer={:?} header={:?}",
+        call.trailer_grpc_status(),
+        call.headers.get("grpc-status"),
+    );
+    assert!(
+        call.headers.get("grpc-status").is_none(),
+        "{context}: message-carrying responses must not expose grpc-status in \
+         initial HEADERS (got {:?})",
+        call.headers.get("grpc-status"),
+    );
 }
 
 async fn send_grpc_request(
@@ -313,24 +388,26 @@ async fn send_grpc_request(
     let response = sender.send_request(req).await?;
 
     let status = response.status().as_u16();
-    let mut metadata = HashMap::new();
+    let mut headers = HashMap::new();
     for (key, value) in response.headers() {
         if let Ok(text) = value.to_str() {
-            metadata.insert(key.as_str().to_string(), text.to_string());
+            headers.insert(key.as_str().to_string(), text.to_string());
         }
     }
     let collected = response.into_body().collect().await?;
-    if let Some(trailers) = collected.trailers() {
-        for (key, value) in trailers {
+    let mut trailers = HashMap::new();
+    if let Some(trailer_map) = collected.trailers() {
+        for (key, value) in trailer_map {
             if let Ok(text) = value.to_str() {
-                metadata.insert(key.as_str().to_string(), text.to_string());
+                trailers.insert(key.as_str().to_string(), text.to_string());
             }
         }
     }
 
     Ok(GrpcCall {
         status,
-        metadata,
+        headers,
+        trailers,
         body: collected.to_bytes().to_vec(),
     })
 }
@@ -426,7 +503,7 @@ async fn grpc_guard_passes_clean_unary_response() {
         .expect("gRPC call");
 
     assert_eq!(call.status, 200);
-    assert_eq!(call.grpc_status(), "0");
+    assert_ok_trailer_grpc_status(&call, "clean unary");
     assert_eq!(
         call.body, body,
         "a clean response must be forwarded verbatim"
@@ -443,10 +520,9 @@ async fn grpc_guard_rejects_unary_response_with_pii() {
         .await
         .expect("gRPC call");
 
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "a guarded gRPC violation must terminate with a non-OK gRPC status"
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "a guarded gRPC violation must terminate with a non-OK gRPC status",
     );
     assert!(
         call.body.is_empty(),
@@ -465,7 +541,7 @@ async fn grpc_guard_never_inspects_unenrolled_methods() {
         .expect("gRPC call");
 
     assert_eq!(call.status, 200);
-    assert_eq!(call.grpc_status(), "0");
+    assert_ok_trailer_grpc_status(&call, "unenrolled method");
     assert_eq!(
         call.body, body,
         "an un-enrolled method must be forwarded untouched"
@@ -483,7 +559,7 @@ async fn grpc_guard_inspects_every_streaming_frame() {
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &clean, &[])
         .await
         .expect("gRPC call");
-    assert_eq!(call.grpc_status(), "0");
+    assert_ok_trailer_grpc_status(&call, "clean streaming");
     assert_eq!(call.body, clean);
 
     let mut dirty = grpc_frame(&encode_hello_response("first"));
@@ -492,10 +568,9 @@ async fn grpc_guard_inspects_every_streaming_frame() {
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &dirty, &[])
         .await
         .expect("gRPC call");
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "a violation in a later stream frame must still terminate the call"
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "a violation in a later stream frame must still terminate the call",
     );
     harness.shutdown();
 }
@@ -514,10 +589,9 @@ async fn grpc_guard_decodes_compressed_frames_and_refuses_unknown_encodings() {
     )
     .await
     .expect("gRPC call");
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "a gzip-compressed violation must be decoded and rejected"
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "a gzip-compressed violation must be decoded and rejected",
     );
 
     let call = send_grpc_request(
@@ -528,10 +602,9 @@ async fn grpc_guard_decodes_compressed_frames_and_refuses_unknown_encodings() {
     )
     .await
     .expect("gRPC call");
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "an encoding the guard cannot inflate must fail closed"
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "an encoding the guard cannot inflate must fail closed",
     );
     harness.shutdown();
 }
@@ -545,11 +618,7 @@ async fn grpc_guard_fails_closed_on_malformed_framing() {
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &truncated, &[])
         .await
         .expect("gRPC call");
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "truncated gRPC framing must fail closed"
-    );
+    assert_nonzero_terminal_grpc_status(&call, "truncated gRPC framing must fail closed");
     harness.shutdown();
 }
 
@@ -563,10 +632,9 @@ async fn grpc_guard_fails_closed_on_oversized_messages() {
     let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &body, &[])
         .await
         .expect("gRPC call");
-    assert_ne!(
-        call.grpc_status(),
-        "0",
-        "a message above max_message_bytes must fail closed"
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "a message above max_message_bytes must fail closed",
     );
     harness.shutdown();
 }
@@ -581,7 +649,7 @@ async fn grpc_guard_redacts_and_reencodes_the_protobuf_response() {
         .expect("gRPC call");
 
     assert_eq!(call.status, 200);
-    assert_eq!(call.grpc_status(), "0");
+    assert_ok_trailer_grpc_status(&call, "redacted unary");
     let payloads = frame_payloads(&call.body);
     assert_eq!(payloads.len(), 1, "expected one re-encoded response frame");
     let message = decode_hello_message(&payloads[0]);
