@@ -91,6 +91,7 @@ mod functional_retry_test;
 mod functional_router_cache_test;
 mod functional_scale_perf_test;
 mod functional_secrets_test;
+mod functional_serverless_grpc_terminate_test;
 mod functional_serverless_mirror_test;
 mod functional_service_discovery_test;
 mod functional_shared_harness_smoke_test;

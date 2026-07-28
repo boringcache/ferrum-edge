@@ -16497,6 +16497,11 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Vec<u8>,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// When non-empty together with a non-empty `body`, these are emitted as
+    /// HTTP trailers after the unary DATA frame (serverless native-gRPC
+    /// terminate). Ordinary trailers-only rejects leave this empty and keep
+    /// terminal metadata in `headers`.
+    pub(crate) grpc_trailers: HashMap<String, String>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16638,7 +16643,15 @@ pub(crate) fn normalize_reject_response(
             body: body.to_vec(),
             grpc_status: None,
             grpc_message: None,
+            grpc_trailers: HashMap::new(),
         };
+    }
+
+    // Preserve plugin-authored uncompressed unary DATA + terminal metadata
+    // (serverless_function terminate). Ordinary rejects fall through to
+    // trailers-only so untrusted bodies are never reflected onto the wire.
+    if let Some(framed) = try_normalize_framed_grpc_unary_reject(body, headers) {
+        return framed;
     }
 
     let grpc_status = headers
@@ -16674,7 +16687,86 @@ pub(crate) fn normalize_reject_response(
         body: Vec::new(),
         grpc_status: Some(grpc_status),
         grpc_message: Some(grpc_message),
+        grpc_trailers: HashMap::new(),
     }
+}
+
+/// Accept a plugin reject that already carries an uncompressed unary native
+/// gRPC DATA frame plus `grpc-status` signalling. Used by serverless terminate
+/// so the framed protobuf message is not discarded by trailers-only
+/// normalization.
+fn try_normalize_framed_grpc_unary_reject(
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<NormalizedRejectResponse> {
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers.get("content-type")?;
+    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return None;
+    }
+    let grpc_status = headers.get("grpc-status")?.parse::<u32>().ok()?;
+    if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+
+    let grpc_message = headers
+        .get("grpc-message")
+        .map(|message| sanitize_grpc_message(message))
+        .filter(|message| !message.is_empty());
+
+    let mut initial_headers = HashMap::with_capacity(1);
+    initial_headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let mut trailers = HashMap::with_capacity(headers.len());
+    trailers.insert("grpc-status".to_string(), grpc_status.to_string());
+    if let Some(ref message) = grpc_message {
+        trailers.insert("grpc-message".to_string(), message.clone());
+    }
+
+    for (key, value) in headers {
+        if key.eq_ignore_ascii_case("content-type")
+            || key.eq_ignore_ascii_case("grpc-status")
+            || key.eq_ignore_ascii_case("grpc-message")
+        {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("connection")
+            || key.eq_ignore_ascii_case("keep-alive")
+            || key.eq_ignore_ascii_case("proxy-connection")
+            || key.eq_ignore_ascii_case("transfer-encoding")
+            || key.eq_ignore_ascii_case("te")
+            || key.eq_ignore_ascii_case("trailer")
+            || key.eq_ignore_ascii_case("upgrade")
+            || key.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        trailers.insert(key.clone(), value.clone());
+    }
+
+    Some(NormalizedRejectResponse {
+        http_status: StatusCode::OK,
+        headers: initial_headers,
+        body: body.to_vec(),
+        grpc_status: Some(grpc_status),
+        grpc_message,
+        grpc_trailers: trailers,
+    })
+}
+
+fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
+    if body.len() < 5 {
+        return false;
+    }
+    // Compression is unsupported on the serverless terminate contract; only
+    // flag byte 0 (uncompressed DATA) is accepted.
+    if body[0] != 0 {
+        return false;
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    body.len() == 5 + msg_len
 }
 
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
@@ -16748,7 +16840,10 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
         &reject.headers,
     );
 
-    let body = if reject.body.is_empty() {
+    let body = if !reject.body.is_empty() && !reject.grpc_trailers.is_empty() {
+        let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
+        ProxyBody::buffered_grpc_with_trailers(Bytes::from(reject.body), trailers)
+    } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).

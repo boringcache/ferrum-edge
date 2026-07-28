@@ -7355,7 +7355,8 @@ where
 }
 
 /// Send-only core of [`write_normalized_grpc_reject`]: writes the trailers-only
-/// gRPC reject and FINs the send half WITHOUT touching the recv half. Bounded
+/// gRPC reject (or a framed unary DATA + trailers response for serverless
+/// terminate) and FINs the send half WITHOUT touching the recv half. Bounded
 /// `S: SendStream<Bytes>` so it accepts both the full `RequestStream` and a
 /// `split()` send half.
 async fn write_normalized_grpc_reject_send<S>(
@@ -7367,9 +7368,10 @@ async fn write_normalized_grpc_reject_send<S>(
 where
     S: SendStream<Bytes>,
 {
+    let framed_unary = !reject.body.is_empty() && !reject.grpc_trailers.is_empty();
     debug_assert!(
-        reject.body.is_empty(),
-        "normalized gRPC rejects should be trailers-only"
+        framed_unary || reject.body.is_empty(),
+        "normalized gRPC rejects should be trailers-only or framed unary with trailers"
     );
     let mut headers = reject.headers.clone();
     strip_client_response_hop_by_hop_headers(&mut headers);
@@ -7396,11 +7398,20 @@ where
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
+    let mut bytes_streamed = 0u64;
+    if framed_unary {
+        let data = Bytes::copy_from_slice(&reject.body);
+        bytes_streamed = data.len() as u64;
+        stream.send_data(data).await?;
+        let trailers =
+            crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
+        stream.send_trailers(trailers).await?;
+    }
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
         response_streamed: false,
-        bytes_streamed: 0,
+        bytes_streamed,
         bytes_sent,
         backend_target: None,
         backend_resolved_ip: None,

@@ -102,6 +102,22 @@ const ALLOWED_CONFIG_FIELDS: &[&str] = &[
 
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 
+/// Maximum custom trailer entries accepted from a gRPC terminate function
+/// response. Protocol-owned `grpc-status` / `grpc-message` /
+/// `grpc-status-details-bin` are counted separately via dedicated fields.
+const MAX_GRPC_TERMINATE_CUSTOM_TRAILERS: usize = 32;
+/// Per-trailer value byte cap (decoded). Prevents a function from forcing
+/// oversized HEADER/TRAILER blocks onto the client stream.
+const MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES: usize = 8 * 1024;
+/// Allowed top-level keys in the terminate-mode native-gRPC JSON contract.
+const GRPC_TERMINATE_RESPONSE_FIELDS: &[&str] = &[
+    "grpc_status",
+    "grpc_message",
+    "message_base64",
+    "status_details_base64",
+    "trailers",
+];
+
 #[derive(Debug)]
 struct InvocationFailure {
     code: &'static str,
@@ -1916,11 +1932,332 @@ fn has_non_empty_authority(url: &str) -> bool {
     authority_end > 0
 }
 
-fn starts_with_grpc_content_type(value: &str) -> bool {
-    value
-        .as_bytes()
-        .get(..b"application/grpc".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"application/grpc"))
+fn request_content_type<'a>(
+    headers: &'a HashMap<String, String>,
+    ctx: &'a RequestContext,
+) -> Option<&'a str> {
+    headers
+        .get("content-type")
+        .map(String::as_str)
+        .or_else(|| ctx.headers.get("content-type").map(String::as_str))
+}
+
+fn is_native_grpc_terminate_request(
+    headers: &HashMap<String, String>,
+    ctx: &RequestContext,
+) -> bool {
+    if ctx.is_native_grpc_request() {
+        return true;
+    }
+    request_content_type(headers, ctx).is_some_and(|ct| {
+        crate::proxy::backend_dispatch::is_native_grpc_content_type(ct.as_bytes())
+    })
+}
+
+fn is_grpc_web_terminate_request(headers: &HashMap<String, String>, ctx: &RequestContext) -> bool {
+    request_content_type(headers, ctx)
+        .is_some_and(crate::plugins::grpc_web::is_grpc_web_content_type)
+}
+
+fn sanitize_grpc_terminate_message(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Frame one uncompressed unary gRPC DATA message: flag(0) + BE length + bytes.
+fn frame_uncompressed_unary_grpc_message(message: &[u8]) -> Result<Bytes, String> {
+    let len = u32::try_from(message.len()).map_err(|_| {
+        "serverless_function: gRPC terminate message exceeds u32 length".to_string()
+    })?;
+    let mut framed = Vec::with_capacity(5 + message.len());
+    framed.push(0);
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(message);
+    Ok(Bytes::from(framed))
+}
+
+fn decode_bounded_base64_field(
+    value: &str,
+    field: &str,
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    // Reject standard/base64url alphabet waste that would decode far beyond the
+    // configured message ceiling before allocating the decoded buffer.
+    let approx_decoded = value.len().saturating_mul(3) / 4;
+    if approx_decoded > max_decoded_bytes.saturating_add(3) {
+        return Err(format!(
+            "serverless_function: gRPC terminate '{field}' exceeds max_response_body_bytes"
+        ));
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.as_bytes())
+        .map_err(|_| {
+            format!("serverless_function: gRPC terminate '{field}' must be standard base64")
+        })?;
+    if decoded.len() > max_decoded_bytes {
+        return Err(format!(
+            "serverless_function: gRPC terminate '{field}' exceeds max_response_body_bytes"
+        ));
+    }
+    Ok(decoded)
+}
+
+fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
+    crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(name)
+        || name.eq_ignore_ascii_case("content-type")
+        || name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("grpc-encoding")
+        || name.eq_ignore_ascii_case("grpc-accept-encoding")
+}
+
+/// Parse the terminate-mode native-gRPC JSON contract and build the client
+/// RejectBinary parts (HTTP 200 + `application/grpc` + framed unary body /
+/// trailers-only signalling).
+///
+/// Contract (fail-closed, unknown fields rejected):
+/// ```json
+/// {
+///   "grpc_status": 0,
+///   "grpc_message": "optional",
+///   "message_base64": "optional raw protobuf bytes",
+///   "status_details_base64": "optional grpc-status-details-bin",
+///   "trailers": { "x-custom": "value" }
+/// }
+/// ```
+///
+/// The gateway owns framing and reserved terminal metadata. Compression and
+/// streaming forms are rejected explicitly.
+fn build_native_grpc_terminate_response(
+    function_http_status: u16,
+    body: &[u8],
+    max_response_body_bytes: usize,
+) -> Result<(u16, Bytes, HashMap<String, String>), InvocationFailure> {
+    if !(200..=299).contains(&function_http_status) {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_status",
+            format!(
+                "gRPC terminate requires a 2xx function HTTP status, got {function_http_status}"
+            ),
+        ));
+    }
+
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| {
+        InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            "gRPC terminate function response must be a JSON object",
+        )
+    })?;
+    let object = parsed.as_object().ok_or_else(|| {
+        InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            "gRPC terminate function response must be a JSON object",
+        )
+    })?;
+
+    // Reject unsupported streaming / compression contract shapes explicitly
+    // before the generic unknown-field diagnostic so operators get a precise
+    // reason rather than a field-list error.
+    if object.contains_key("streaming")
+        || object.contains_key("messages")
+        || object.contains_key("grpc_encoding")
+        || object.contains_key("message_compressed")
+        || object.contains_key("compression")
+    {
+        return Err(InvocationFailure::new(
+            "unsupported_grpc_terminate_encoding",
+            "gRPC terminate supports only uncompressed unary responses",
+        ));
+    }
+
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !GRPC_TERMINATE_RESPONSE_FIELDS.contains(key))
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            format!(
+                "unknown gRPC terminate response field(s): {}",
+                unknown.join(", ")
+            ),
+        ));
+    }
+
+    let grpc_status = object
+        .get("grpc_status")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                "gRPC terminate response requires integer 'grpc_status'",
+            )
+        })?;
+    if grpc_status > u64::from(u32::MAX) {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            "gRPC terminate 'grpc_status' is out of range",
+        ));
+    }
+    let grpc_status = grpc_status as u32;
+
+    let grpc_message = match object.get("grpc_message") {
+        None => None,
+        Some(Value::String(message)) => {
+            let sanitized = sanitize_grpc_terminate_message(message);
+            (!sanitized.is_empty()).then_some(sanitized)
+        }
+        Some(_) => {
+            return Err(InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                "gRPC terminate 'grpc_message' must be a string",
+            ));
+        }
+    };
+
+    // Message bytes are raw protobuf (not length-prefixed). Frame overhead is 5
+    // bytes; keep the framed unary payload within max_response_body_bytes.
+    let max_message_bytes = max_response_body_bytes.saturating_sub(5);
+    let message_bytes = match object.get("message_base64") {
+        None => None,
+        Some(Value::String(encoded)) => {
+            if encoded.is_empty() {
+                Some(Vec::new())
+            } else {
+                Some(
+                    decode_bounded_base64_field(encoded, "message_base64", max_message_bytes)
+                        .map_err(|detail| {
+                            InvocationFailure::new("invalid_grpc_terminate_response", detail)
+                        })?,
+                )
+            }
+        }
+        Some(_) => {
+            return Err(InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                "gRPC terminate 'message_base64' must be a string",
+            ));
+        }
+    };
+
+    let status_details = match object.get("status_details_base64") {
+        None => None,
+        Some(Value::String(encoded)) => {
+            if encoded.is_empty() {
+                None
+            } else {
+                let decoded = decode_bounded_base64_field(
+                    encoded,
+                    "status_details_base64",
+                    MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES,
+                )
+                .map_err(|detail| {
+                    InvocationFailure::new("invalid_grpc_terminate_response", detail)
+                })?;
+                // grpc-status-details-bin is a binary trailer; re-encode the
+                // validated bytes so only well-formed base64 reaches the wire.
+                Some(base64::engine::general_purpose::STANDARD.encode(decoded))
+            }
+        }
+        Some(_) => {
+            return Err(InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                "gRPC terminate 'status_details_base64' must be a string",
+            ));
+        }
+    };
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    response_headers.insert("grpc-status".to_string(), grpc_status.to_string());
+    if let Some(message) = grpc_message {
+        response_headers.insert("grpc-message".to_string(), message);
+    }
+    if let Some(details) = status_details {
+        response_headers.insert("grpc-status-details-bin".to_string(), details);
+    }
+
+    if let Some(trailers_value) = object.get("trailers") {
+        let trailers = trailers_value.as_object().ok_or_else(|| {
+            InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                "gRPC terminate 'trailers' must be an object of string values",
+            )
+        })?;
+        if trailers.len() > MAX_GRPC_TERMINATE_CUSTOM_TRAILERS {
+            return Err(InvocationFailure::new(
+                "invalid_grpc_terminate_response",
+                format!(
+                    "gRPC terminate 'trailers' exceeds {MAX_GRPC_TERMINATE_CUSTOM_TRAILERS} entries"
+                ),
+            ));
+        }
+        for (name, value) in trailers {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!("gRPC terminate trailer name '{name}' is not a valid HTTP field name"),
+                )
+            })?;
+            let lower = header_name.as_str();
+            if is_reserved_grpc_terminate_trailer_name(lower) {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!(
+                        "gRPC terminate trailer '{lower}' is protocol-owned; use the dedicated contract fields"
+                    ),
+                ));
+            }
+            let value = value.as_str().ok_or_else(|| {
+                InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!("gRPC terminate trailer '{lower}' must be a string"),
+                )
+            })?;
+            if value.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!(
+                        "gRPC terminate trailer '{lower}' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                    ),
+                ));
+            }
+            if HeaderValue::from_str(value).is_err() {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!("gRPC terminate trailer '{lower}' is not a valid HTTP field value"),
+                ));
+            }
+            response_headers.insert(lower.to_string(), value.to_string());
+        }
+    }
+
+    let framed_body = match message_bytes {
+        Some(message) => frame_uncompressed_unary_grpc_message(&message).map_err(|detail| {
+            InvocationFailure::new("invalid_grpc_terminate_response", detail)
+        })?,
+        None => Bytes::new(),
+    };
+    if framed_body.len() > max_response_body_bytes {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            "framed gRPC terminate response exceeds max_response_body_bytes",
+        ));
+    }
+
+    Ok((200, framed_body, response_headers))
 }
 
 // ---------------------------------------------------------------------------
@@ -1984,7 +2321,7 @@ pub mod test_helpers {
                 .as_str()
                 .filter(|s| !s.is_empty())
                 .map(String::from),
-        };
+            };
         aws_sigv4::sign_request(
             &config,
             "lambda",
@@ -1994,6 +2331,19 @@ pub mod test_helpers {
             payload,
             now,
         )
+    }
+
+    pub fn frame_uncompressed_unary_grpc_message_test(message: &[u8]) -> Result<Bytes, String> {
+        frame_uncompressed_unary_grpc_message(message)
+    }
+
+    pub fn build_native_grpc_terminate_response_test(
+        function_http_status: u16,
+        body: &[u8],
+        max_response_body_bytes: usize,
+    ) -> Result<(u16, Bytes, HashMap<String, String>), String> {
+        build_native_grpc_terminate_response(function_http_status, body, max_response_body_bytes)
+            .map_err(|failure| failure.operator_detail)
     }
 }
 
@@ -2068,27 +2418,26 @@ impl Plugin for ServerlessFunction {
             return PluginResult::Continue;
         }
 
-        // Terminate mode is incompatible with gRPC: the gateway normalizes
-        // RejectBinary into trailers-only gRPC errors, dropping the body.
-        // Fail clearly rather than silently losing the function response.
-        if self.mode == InvocationMode::Terminate {
-            let is_grpc = headers
-                .get("content-type")
-                .is_some_and(|ct| starts_with_grpc_content_type(ct));
-            if is_grpc {
-                warn!(
-                    "serverless_function: terminate mode is not supported for gRPC requests — \
-                     the gateway normalizes plugin rejects into trailers-only gRPC errors"
-                );
-                ctx.serverless_pre_invocation_rejection_owners
-                    .extend(ctx.request_deduplication_states.keys().copied());
-                return PluginResult::Reject {
-                    status_code: 500,
-                    body: r#"{"error":"serverless_function terminate mode is not supported for gRPC"}"#.to_string(),
-                    headers: HashMap::new(),
-                };
-            }
+        // Terminate + gRPC-Web is unsupported: gRPC-Web framing/trailer encoding
+        // is owned by the grpc_web plugin, and RejectBinary normalization cannot
+        // synthesize a correct browser-facing response from the unary contract.
+        if self.mode == InvocationMode::Terminate && is_grpc_web_terminate_request(headers, ctx) {
+            warn!(
+                "serverless_function: terminate mode does not support gRPC-Web requests — \
+                 use native application/grpc or HTTP terminate"
+            );
+            ctx.serverless_pre_invocation_rejection_owners
+                .extend(ctx.request_deduplication_states.keys().copied());
+            return PluginResult::Reject {
+                status_code: 500,
+                body: r#"{"error":"serverless_function terminate mode does not support gRPC-Web"}"#
+                    .to_string(),
+                headers: HashMap::new(),
+            };
         }
+
+        let native_grpc_terminate =
+            self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(headers, ctx);
 
         let payload = match self.build_invocation_payload(ctx, headers) {
             Ok(payload) => payload,
@@ -2125,6 +2474,33 @@ impl Plugin for ServerlessFunction {
 
         match self.mode {
             InvocationMode::Terminate => {
+                if native_grpc_terminate {
+                    match build_native_grpc_terminate_response(
+                        status,
+                        &body,
+                        self.max_response_body_bytes,
+                    ) {
+                        Ok((status_code, framed_body, grpc_headers)) => {
+                            debug!(
+                                "serverless_function: terminate mode — returning framed unary gRPC response"
+                            );
+                            ctx.serverless_terminate_response = true;
+                            return PluginResult::RejectBinary {
+                                status_code,
+                                body: framed_body,
+                                headers: grpc_headers,
+                            };
+                        }
+                        Err(mut failure) => {
+                            // Malformed/oversized/unsupported function output is
+                            // not a faithful client representation; never continue
+                            // to the backend with on_error=continue.
+                            failure.must_reject = true;
+                            return self.failure_result(ctx, failure);
+                        }
+                    }
+                }
+
                 if !(200..=599).contains(&status) {
                     return self.failure_result(
                         ctx,

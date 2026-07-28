@@ -19128,9 +19128,15 @@ components:
         Google Cloud Functions as middleware in the proxy pipeline. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
-        response is returned directly to the client (HTTP only — gRPC
-        rejection normalization would drop the body, so terminate mode on
-        gRPC requests is rejected with 500). Cloud credential fields fall
+        response is returned directly to the client. Native gRPC terminate
+        requires a JSON contract with `grpc_status` plus optional
+        `message_base64` (raw protobuf bytes), `grpc_message`,
+        `status_details_base64`, and custom `trailers`; the gateway frames an
+        uncompressed unary DATA message and owns reserved terminal metadata.
+        gRPC-Web terminate is rejected with 500. Streaming and compression
+        contract shapes fail closed. Malformed or oversized function output
+        fails closed without reflecting untrusted bodies. Cloud credential
+        fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
@@ -19180,7 +19186,8 @@ components:
         and enforcing
         redaction-dependent plugins reject governed content when those bytes
         cannot be safely rewritten.
-        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        Proven pre-invocation payload-validation, unsupported-gRPC-Web,
+        DNS-policy,
         and literal-IP-policy rejections release every acquired deduplication
         owner after commit. Real remote 502 responses remain application
         responses; uncertain post-invocation failures retain their protection.
@@ -19216,7 +19223,8 @@ components:
           default: pre_proxy
           description: |
             pre_proxy: invoke and inject headers/metadata, then continue.
-            terminate: invoke and return response to client (HTTP only).
+            terminate: invoke and return response to client (HTTP body
+            passthrough, or native-gRPC JSON unary contract).
         function_url:
           type: string
           format: uri

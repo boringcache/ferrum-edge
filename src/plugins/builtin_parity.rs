@@ -456,7 +456,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 3025,
         active_phases: "before_proxy",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions)",
+        protocol_rationale: "Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions); terminate supports HTTP and native unary gRPC",
     },
     BuiltinPluginParityMeta {
         name: "response_mock",

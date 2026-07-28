@@ -12054,6 +12054,39 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
     let headers = &sanitized_headers;
 
+    // Serverless native-gRPC terminate (and any other plugin that already
+    // authored an uncompressed unary DATA frame with grpc-status) must preserve
+    // the body. Ordinary rejects remain trailers-only.
+    let normalized =
+        crate::proxy::normalize_reject_response(http_status, http_body, headers, true);
+    if !normalized.body.is_empty() && !normalized.grpc_trailers.is_empty() {
+        let mut builder = Response::builder().status(StatusCode::OK);
+        for (k, v) in &normalized.headers {
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                hyper::header::HeaderValue::from_str(v),
+            ) {
+                builder = builder.header(name, val);
+            }
+        }
+        let resp = builder
+            .body(())
+            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
+        stream.send_response(resp).await?;
+        stream
+            .send_data(Bytes::copy_from_slice(&normalized.body))
+            .await?;
+        let trailers = crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(
+            &normalized.grpc_trailers,
+        );
+        stream.send_trailers(trailers).await?;
+        stream.finish().await?;
+        if halt_recv {
+            crate::http3::stream_util::halt_request_body(stream);
+        }
+        return Ok(());
+    }
+
     // Derive signalling from the sanitized response metadata.
     let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
 

@@ -3256,6 +3256,7 @@ pub mod _test_support {
         pub body: Vec<u8>,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+        pub grpc_trailers: HashMap<String, String>,
     }
 
     pub struct DeadlineBackendResponse {
@@ -3343,6 +3344,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            grpc_trailers: HashMap::new(),
         }
     }
 
@@ -3377,6 +3379,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            grpc_trailers: HashMap::new(),
         }
     }
 
@@ -3942,6 +3945,7 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            grpc_trailers: normalized.grpc_trailers,
         }
     }
 

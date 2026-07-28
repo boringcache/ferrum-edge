@@ -966,11 +966,11 @@ async fn test_before_proxy_error_continue_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// Terminate mode + gRPC incompatibility
+// Terminate mode + native gRPC unary contract
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_terminate_mode_rejects_grpc_requests() {
+async fn test_terminate_mode_rejects_grpc_web_requests() {
     let plugin = ServerlessFunction::new(
         &json!({
             "provider": "azure_functions",
@@ -982,10 +982,15 @@ async fn test_terminate_mode_rejects_grpc_requests() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    ctx.headers
-        .insert("content-type".to_string(), "application/grpc".to_string());
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     match result {
@@ -993,10 +998,179 @@ async fn test_terminate_mode_rejects_grpc_requests() {
             status_code, body, ..
         } => {
             assert_eq!(status_code, 500);
-            assert!(body.contains("not supported for gRPC"));
+            assert!(body.contains("does not support gRPC-Web"));
         }
-        other => panic!("Expected Reject for gRPC terminate, got {:?}", other),
+        other => panic!("Expected Reject for gRPC-Web terminate, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_terminate_mode_frames_native_grpc_unary_response() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let protobuf = b"\x08\x01";
+    let message_base64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, protobuf);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({
+                "grpc_status": 0,
+                "grpc_message": "ok",
+                "message_base64": message_base64,
+                "trailers": { "x-function": "terminate" }
+            })),
+        )
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc")
+            );
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
+            assert_eq!(headers.get("grpc-message").map(String::as_str), Some("ok"));
+            assert_eq!(
+                headers.get("x-function").map(String::as_str),
+                Some("terminate")
+            );
+            let framed =
+                ferrum_edge::plugins::serverless_function::test_helpers::frame_uncompressed_unary_grpc_message_test(
+                    protobuf,
+                )
+                .unwrap();
+            assert_eq!(body, framed);
+        }
+        other => panic!("Expected RejectBinary framed gRPC response, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_terminate_mode_native_grpc_malformed_contract_fails_closed() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("invalid_grpc_terminate_response"));
+        }
+        other => panic!("Expected fail-closed Reject, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_native_grpc_terminate_contract_rejects_streaming_and_reserved_trailers() {
+    let streaming_err =
+        ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test(
+            200,
+            br#"{"grpc_status":0,"streaming":true}"#,
+            1024,
+        )
+        .unwrap_err();
+    assert!(streaming_err.contains("uncompressed unary"));
+
+    let reserved_err =
+        ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test(
+            200,
+            br#"{"grpc_status":0,"trailers":{"grpc-status":"9"}}"#,
+            1024,
+        )
+        .unwrap_err();
+    assert!(reserved_err.contains("protocol-owned"));
+}
+
+#[test]
+fn test_normalize_reject_preserves_framed_unary_grpc_body() {
+    use ferrum_edge::_test_support::normalize_reject_response;
+    use http::StatusCode;
+
+    let protobuf = b"hello";
+    let framed =
+        ferrum_edge::plugins::serverless_function::test_helpers::frame_uncompressed_unary_grpc_message_test(
+            protobuf,
+        )
+        .unwrap();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("x-custom".to_string(), "trail".to_string());
+
+    let normalized = normalize_reject_response(StatusCode::OK, &framed, &headers, true);
+    assert_eq!(normalized.http_status, StatusCode::OK);
+    assert_eq!(normalized.body, framed.as_ref());
+    assert_eq!(normalized.grpc_status, Some(0));
+    assert_eq!(
+        normalized.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    assert!(!normalized.headers.contains_key("grpc-status"));
+    assert_eq!(
+        normalized
+            .grpc_trailers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        normalized.grpc_trailers.get("x-custom").map(String::as_str),
+        Some("trail")
+    );
 }
 
 #[tokio::test]
