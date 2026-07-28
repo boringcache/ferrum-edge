@@ -10164,21 +10164,42 @@ fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() 
     assert!(cache.requires_request_body_buffering("ferrum", "p1"));
     assert!(cache.requires_response_body_buffering("ferrum", "p1"));
 
-    // An out-of-range budget fails closed and retains the live generation.
+    // An out-of-range budget is rejected outright by plugin-config validation,
+    // so admin admission and file-mode startup never accept it.
+    let invalid_config = json!({"log_request_body": true, "max_request_body_bytes": 1_000_000});
+    let validation =
+        ferrum_edge::plugins::validate_plugin_config("transaction_debugger", &invalid_config);
+    let error = validation.expect_err("an out-of-range capture budget must fail validation");
+    assert!(error.contains("max_request_body_bytes"), "got: {error}");
+
+    // `transaction_debugger` is an optional observability plugin
+    // (`PluginFailurePolicy::OptionalFailOpen`), so a generation that still
+    // carries the rejected config omits the instance rather than publishing a
+    // capture with an unvalidated budget: the reload succeeds and the proxy
+    // stops claiming body buffering.
     let invalid = make_config(
         vec![make_proxy("p1", "/api", vec![])],
         vec![make_plugin_config_with_json(
             "debug-1",
             "transaction_debugger",
-            json!({"log_request_body": true, "max_request_body_bytes": 1_000_000}),
+            invalid_config.clone(),
             PluginScope::Global,
             None,
         )],
     );
-    let error = cache
+    cache
         .rebuild(&invalid)
-        .expect_err("an out-of-range capture budget must reject cache publication");
-    assert!(error.contains("max_request_body_bytes"), "got: {error}");
+        .expect("an omitted optional plugin still publishes a generation");
+    assert!(
+        !cache.requires_request_body_buffering("ferrum", "p1"),
+        "a fail-open omission must never leave buffering claimed"
+    );
+    assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+
+    // Re-enable so the disable step below is a real transition.
+    cache
+        .rebuild(&enabled)
+        .expect("re-enabling bounded body capture must reload");
     assert!(cache.requires_request_body_buffering("ferrum", "p1"));
 
     cache

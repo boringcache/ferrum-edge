@@ -157,6 +157,11 @@ pub const BODY_OVER_LIMIT_MARKER: &str = "<over-capture-limit-body-omitted>";
 /// Rendered stand-in for a JSON subtree deeper than [`MAX_JSON_REDACTION_DEPTH`].
 const BODY_DEPTH_MARKER: &str = "***DEPTH-LIMIT***";
 
+/// `capture` field value for a record that carries no sample. Kept as a
+/// constant so the omission record renders the field exactly like the captured
+/// record's `CapturedBody::state` instead of quoting only one of the two.
+const BODY_CAPTURE_OMITTED: &str = "omitted";
+
 /// Substrings that make a body field name (or an unstructured text line)
 /// credential-bearing. Matched case-insensitively against the lowercased name.
 const SENSITIVE_BODY_KEY_SUBSTRINGS: &[&str] = &[
@@ -574,8 +579,8 @@ impl TransactionDebugger {
         matches_marker
             || SENSITIVE_BODY_KEY_EXACT.iter().any(|name| lowered == *name)
             || SENSITIVE_HEADERS.iter().any(|name| lowered == *name)
-            || self.extra_redacted_headers.iter().any(|n| lowered == *n)
-            || self.redacted_body_fields.iter().any(|n| lowered == *n)
+            || self.extra_redacted_headers.contains(&lowered)
+            || self.redacted_body_fields.contains(&lowered)
             || is_sensitive_metadata_key(&lowered)
     }
 
@@ -623,10 +628,8 @@ impl TransactionDebugger {
                     self.redact_json_value(entry, depth + 1);
                 }
             }
-            Value::String(text) => {
-                if looks_like_credential(text) {
-                    *text = REDACTED.to_string();
-                }
+            Value::String(text) if looks_like_credential(text) => {
+                *text = REDACTED.to_string();
             }
             _ => {}
         }
@@ -769,7 +772,7 @@ impl TransactionDebugger {
                 tracing::debug!(
                     target: "transaction_debug",
                     direction = %direction,
-                    capture = "omitted",
+                    capture = %BODY_CAPTURE_OMITTED,
                     reason = %reason,
                     method = %method,
                     path = %path,

@@ -53,6 +53,8 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {backend_port}
     strip_listen_path: false
+    plugins:
+      - plugin_config_id: "debug-body-capture"
 
 consumers: []
 plugin_configs:
@@ -125,9 +127,17 @@ impl DebugBodyHarness {
         Ok(harness)
     }
 
-    fn captured(&self) -> String {
+    /// Poll the captured gateway output until `predicate` matches. The gateway
+    /// logs through an async non-blocking sink, so a record it has already
+    /// emitted may not have reached the capture file yet; polling can only turn
+    /// a flush race into a hit, never a hit into a miss.
+    async fn wait_for_logs<F>(&self, predicate: F) -> String
+    where
+        F: Fn(&str) -> bool,
+    {
         self.gateway
-            .read_combined_captured_output()
+            .wait_for_captured_output(predicate, Duration::from_secs(10))
+            .await
             .unwrap_or_else(|error| format!("<failed to read output: {error}>"))
     }
 }
@@ -190,18 +200,25 @@ async fn functional_transaction_debugger_captures_bounded_redacted_bodies_h1_h2(
     assert_eq!(response.version(), reqwest::Version::HTTP_2);
     let _ = response.bytes().await;
 
-    // Give the non-blocking tracing writer a moment to flush.
-    tokio::time::sleep(Duration::from_millis(750)).await;
-    let logs = harness.captured();
+    // The gateway logs JSON through a non-blocking writer, so assertions match
+    // serialized fields (`"direction":"request"`), and the snapshot is polled
+    // rather than slept on: a line already emitted may not have reached the
+    // capture file yet.
+    let logs = harness
+        .wait_for_logs(|output| {
+            output.contains(r#""reason":"content_type_excluded""#) && output.contains("bob")
+        })
+        .await;
 
     assert!(
         logs.contains("Bounded body capture"),
         "no body capture record emitted:\n{logs}"
     );
     // Request and response samples both appear, with credentials redacted.
-    assert!(logs.contains("direction=request"), "logs:\n{logs}");
-    assert!(logs.contains("direction=response"), "logs:\n{logs}");
-    assert!(logs.contains("body_kind=json"), "logs:\n{logs}");
+    assert!(logs.contains(r#""capture":"captured""#), "logs:\n{logs}");
+    assert!(logs.contains(r#""direction":"request""#), "logs:\n{logs}");
+    assert!(logs.contains(r#""direction":"response""#), "logs:\n{logs}");
+    assert!(logs.contains(r#""body_kind":"json""#), "logs:\n{logs}");
     assert!(logs.contains("alice"), "logs:\n{logs}");
     assert!(
         !logs.contains("req-secret-value"),
@@ -219,11 +236,11 @@ async fn functional_transaction_debugger_captures_bounded_redacted_bodies_h1_h2(
 
     // Excluded shapes are explicit omissions, not silent gaps.
     assert!(
-        logs.contains("reason=over_capture_limit"),
+        logs.contains(r#""reason":"over_capture_limit""#),
         "oversized body omission missing:\n{logs}"
     );
     assert!(
-        logs.contains("reason=content_type_excluded"),
+        logs.contains(r#""reason":"content_type_excluded""#),
         "non-textual body omission missing:\n{logs}"
     );
 }
@@ -252,10 +269,10 @@ async fn functional_transaction_debugger_leaves_unknown_length_requests_streamin
     assert_eq!(response.status(), 200);
     let _ = response.bytes().await;
 
-    tokio::time::sleep(Duration::from_millis(750)).await;
-    let logs = harness.captured();
+    let unknown_length = r#""reason":"unknown_length""#;
+    let logs = harness.wait_for_logs(|output| output.contains(unknown_length)).await;
     assert!(
-        logs.contains("reason=unknown_length"),
+        logs.contains(unknown_length),
         "chunked request must report an unknown_length omission:\n{logs}"
     );
     assert!(

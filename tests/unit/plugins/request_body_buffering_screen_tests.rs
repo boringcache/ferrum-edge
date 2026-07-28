@@ -121,6 +121,10 @@ fn conditional_buffering_matrix() -> Vec<Row> {
     let body_rules = json!({"rules": [body_rule]});
     let no_body_forward = json!({"forward_body": false});
     let no_body_inspection = json!({"request_body_inspection": false});
+    // Bounded body capture (#3316) is the debugger's only buffering input; the
+    // per-request predicates narrow it further, but the config-level capability
+    // this screen asks about follows `log_request_body` alone.
+    let capture_request_bodies = json!({"log_request_body": true});
 
     vec![
         base("a2a_gateway", ParityOnly),
@@ -162,6 +166,8 @@ fn conditional_buffering_matrix() -> Vec<Row> {
         base("serverless_function", ParityOnly),
         row("serverless_function", no_body_forward, ParityOnly),
         base("soap_ws_security", Exactly(Buffers)),
+        base("transaction_debugger", Exactly(Streams)),
+        row("transaction_debugger", capture_request_bodies, Exactly(Buffers)),
         base("waf", ParityOnly),
         row("waf", no_body_inspection, Exactly(Streams)),
     ]
