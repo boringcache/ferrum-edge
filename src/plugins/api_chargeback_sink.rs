@@ -48,7 +48,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, wait_until_committed, wait_until_committed_or_closed,
+    RetryPolicy, TrySendOutcome, redacted_endpoint_url, redacted_endpoint_url_str,
+    wait_until_committed, wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -1832,7 +1833,16 @@ struct SinkMetrics {
     events_exported_total: AtomicU64,
     failures_total: AtomicU64,
     failure_reasons: FailureReasonCounters,
+    /// Observed queue depth at/above the high-water mark (telemetry only).
     queue_high_water_hits_total: AtomicU64,
+    /// High-water events whose durable spool-delivery handoff actually accepted
+    /// the job. Saturation/closure of the delivery queue is counted by spool
+    /// loss metrics instead.
+    queue_high_water_diversions_total: AtomicU64,
+    /// Events lost because the bounded in-memory channel was actually full and
+    /// no durable overflow path accepted ownership. Never incremented for
+    /// shutdown/unavailable admission.
+    queue_full_drops_total: AtomicU64,
     queue_byte_budget_exhausted_total: AtomicU64,
     spool_drops_total: AtomicU64,
     spool_available: AtomicBool,
@@ -1866,6 +1876,8 @@ impl Default for SinkMetrics {
             failures_total: AtomicU64::new(0),
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
+            queue_high_water_diversions_total: AtomicU64::new(0),
+            queue_full_drops_total: AtomicU64::new(0),
             queue_byte_budget_exhausted_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
             spool_available: AtomicBool::new(false),
@@ -2024,7 +2036,15 @@ impl LatencyHistogram {
 #[derive(Clone)]
 struct ClickHouseFlushConfig {
     http: ClickHouseHttpClient,
+    /// Complete INSERT URL, including the `database`/`query` parameters and
+    /// every operator `insert_query_params` pair. Used **only** to build the
+    /// outbound request.
     insert_url: String,
+    /// Structurally redacted rendering of [`Self::insert_url`] for every
+    /// diagnostic surface. Credential-bearing `insert_query_params` names are
+    /// already rejected at validation, but arbitrary values remain admitted, so
+    /// no diagnostic ever renders the query string.
+    redacted_insert_url: String,
     username: Option<String>,
     password: Option<String>,
     timeout: Duration,
@@ -2038,12 +2058,25 @@ enum ClickHouseHttpClient {
 }
 
 impl ClickHouseHttpClient {
+    /// Send the INSERT while keeping the complete URL out of diagnostics.
+    ///
+    /// The shared-client arm routes through `execute_with_redacted_url` so the
+    /// literal-IP egress denial, retry, and slow-call warnings emitted inside
+    /// `PluginHttpClient` record `redacted_url` instead of the INSERT URL. The
+    /// dedicated custom-TLS arm emits no diagnostics of its own; its
+    /// `reqwest::Error` is reduced to a fixed [`FailureReason`] by the caller
+    /// and never rendered, so the URL cannot reach a log line there either.
     async fn execute(
         &self,
         request: reqwest::RequestBuilder,
+        redacted_url: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         match self {
-            ClickHouseHttpClient::Shared(client) => client.execute(request, PLUGIN_NAME).await,
+            ClickHouseHttpClient::Shared(client) => {
+                client
+                    .execute_with_redacted_url(request, PLUGIN_NAME, redacted_url)
+                    .await
+            }
             ClickHouseHttpClient::Dedicated(_) => request.send().await,
         }
     }
@@ -2140,6 +2173,9 @@ impl ApiChargebackSink {
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
+        // Structural, not substring: nothing from the INSERT query string is
+        // copied into the diagnostic rendering.
+        let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
         // Build the spool-replay client before staging so a TLS/file failure
@@ -2183,6 +2219,7 @@ impl ApiChargebackSink {
         let flush_config = ClickHouseFlushConfig {
             http,
             insert_url: insert_url.clone(),
+            redacted_insert_url: redacted_insert_url.clone(),
             username: self.config.clickhouse.username.clone(),
             password,
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -2190,7 +2227,7 @@ impl ApiChargebackSink {
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
-        let overflow_metrics = Arc::clone(&metrics);
+        let high_water_metrics = Arc::clone(&metrics);
         let (commit_tx, commit_rx) = watch::channel(false);
         let spool_enqueue = spool.as_ref().map(|spool_manager| {
             start_spool_delivery(
@@ -2201,7 +2238,31 @@ impl ApiChargebackSink {
             )
         });
         let failed_enqueue = spool_enqueue.clone();
-        let overflow_enqueue = spool_enqueue.clone();
+        // Install diversion only when a durable owner exists. Without spool,
+        // high water is telemetry-only and the bounded channel remains usable
+        // until it is actually full (issue #3038).
+        let on_overflow: Option<
+            Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>,
+        > = spool_enqueue.as_ref().map(|overflow_enqueue| {
+            let overflow_metrics = Arc::clone(&metrics);
+            let overflow_enqueue = Arc::clone(overflow_enqueue);
+            Arc::new(move |queued: QueuedChargeEvent, reason: &'static str| {
+                if snapshot_events_are_pre_spooled {
+                    // Snapshot charges are already durably owned; acknowledge
+                    // ownership without counting a fresh high-water diversion.
+                    invalidate_status_cache();
+                    return true;
+                }
+                let accepted = overflow_enqueue.try_enqueue(vec![queued], reason);
+                if accepted && reason == "queue high water" {
+                    overflow_metrics
+                        .queue_high_water_diversions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                invalidate_status_cache();
+                accepted
+            }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
+        });
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
                 if snapshot_events_are_pre_spooled {
@@ -2217,26 +2278,11 @@ impl ApiChargebackSink {
                     );
                 }
             })),
-            on_overflow: Some(Arc::new(move |queued: QueuedChargeEvent, reason| {
-                overflow_metrics
+            on_overflow,
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_metrics
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
-                if snapshot_events_are_pre_spooled {
-                    invalidate_status_cache();
-                    return;
-                }
-                if let Some(enqueue) = overflow_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(vec![queued], reason);
-                } else {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        overflow_reason = reason,
-                        "Chargeback sink queue overflowed and spool is disabled; event was lost"
-                    );
-                }
-                invalidate_status_cache();
-            })),
-            on_high_water: Some(Arc::new(|_, _| {
                 invalidate_status_cache();
             })),
             high_watermark_percent: 80,
@@ -2314,6 +2360,7 @@ impl ApiChargebackSink {
                 ClickHouseFlushConfig {
                     http: replay_http,
                     insert_url,
+                    redacted_insert_url,
                     username: self.config.clickhouse.username.clone(),
                     password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -2932,7 +2979,7 @@ fn disabled_status_snapshot() -> Value {
         "snapshot_finalizations_oldest_age_secs": oldest_age,
         "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
+            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0, "high_water_diversions_total": 0, "full_drops_total": 0},
             "spool": {
                 "files": 0,
                 "bytes": 0,
@@ -2963,6 +3010,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut queue_depth = 0u64;
     let mut queue_capacity = 0u64;
     let mut high_water = 0u64;
+    let mut high_water_diversions = 0u64;
+    let mut full_drops = 0u64;
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
     let mut spool_drops = 0u64;
@@ -2982,6 +3031,18 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             runtime
                 .metrics
                 .queue_high_water_hits_total
+                .load(Ordering::Relaxed),
+        );
+        high_water_diversions = high_water_diversions.saturating_add(
+            runtime
+                .metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        full_drops = full_drops.saturating_add(
+            runtime
+                .metrics
+                .queue_full_drops_total
                 .load(Ordering::Relaxed),
         );
         events_enqueued = events_enqueued.saturating_add(
@@ -3036,7 +3097,9 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             "queue": {
                 "depth": queue_depth,
                 "capacity": queue_capacity,
-                "high_water_hits_total": high_water
+                "high_water_hits_total": high_water,
+                "high_water_diversions_total": high_water_diversions,
+                "full_drops_total": full_drops
             },
             "spool": {
                 "files": spool_files,
@@ -3097,6 +3160,11 @@ impl SinkRuntime {
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
+                "high_water_diversions_total": self
+                    .metrics
+                    .queue_high_water_diversions_total
+                    .load(Ordering::Relaxed),
+                "full_drops_total": self.metrics.queue_full_drops_total.load(Ordering::Relaxed),
                 "retained_bytes": self.byte_budget.used(),
                 "buffer_max_bytes": self.byte_budget.max_bytes(),
                 "byte_budget_exhausted_total": self
@@ -3227,6 +3295,9 @@ fn render_prometheus_for_sinks(
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
     let mut queue_byte_budget_exhausted = 0u64;
+    let mut queue_high_water_hits = 0u64;
+    let mut queue_high_water_diversions = 0u64;
+    let mut queue_full_drops = 0u64;
     let mut snapshot_emits = 0u64;
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
@@ -3280,6 +3351,15 @@ fn render_prometheus_for_sinks(
                 .queue_byte_budget_exhausted_total
                 .load(Ordering::Relaxed),
         );
+        queue_high_water_hits = queue_high_water_hits
+            .saturating_add(metrics.queue_high_water_hits_total.load(Ordering::Relaxed));
+        queue_high_water_diversions = queue_high_water_diversions.saturating_add(
+            metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        queue_full_drops =
+            queue_full_drops.saturating_add(metrics.queue_full_drops_total.load(Ordering::Relaxed));
         let spool_stats = runtime
             .spool
             .as_ref()
@@ -3328,7 +3408,7 @@ fn render_prometheus_for_sinks(
         latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
     }
 
-    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events accepted by the exporter.\n");
+    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.\n");
     output.push_str("# TYPE chargeback_sink_events_enqueued_total counter\n");
     output.push_str(&format!(
         "chargeback_sink_events_enqueued_total {}\n",
@@ -3358,6 +3438,30 @@ fn render_prometheus_for_sinks(
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_hits_total Chargeback sink enqueue attempts observed at or above the queue high-water mark (telemetry only).\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_hits_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_hits_total {}\n",
+        queue_high_water_hits
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_diversions_total Chargeback sink events whose high-water durable spool-delivery handoff was accepted. Spool delivery saturation/closure is counted by spool loss metrics, not this counter.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_diversions_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_diversions_total {}\n",
+        queue_high_water_diversions
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_full_drops_total Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path accepted ownership. Shutdown/unavailable admission is not counted here.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_full_drops_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_full_drops_total {}\n",
+        queue_full_drops
+    ));
     output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending Snapshot generations retaining unspooled terminal deltas after admission closed.\n");
     output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending gauge\n");
     output.push_str(&format!(
@@ -3620,7 +3724,7 @@ async fn post_json_each_row(
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
-    let result = cfg.http.execute(request).await;
+    let result = cfg.http.execute(request, &cfg.redacted_insert_url).await;
     match result {
         Ok(response) => {
             let status = response.status();
@@ -4101,11 +4205,58 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
     Ok(())
 }
 
+/// ClickHouse parameter names that carry a reusable credential.
+///
+/// ClickHouse accepts `user`/`password`/`access_token` as HTTP query
+/// parameters, so an operator could authenticate that way. Ferrum does not
+/// support it: `clickhouse.username` and `clickhouse.password_ref` are the
+/// dedicated channel and send the credential as an HTTP Basic header, which is
+/// never rendered in diagnostics and never appended to a URL. Admitting the
+/// query form would put a reusable database credential into the configured
+/// `insert_query_params` map — a value that admin projections and config
+/// exports treat as ordinary tuning.
+///
+/// This list is exact-match and lowercase; it is deliberately bounded rather
+/// than a substring screen so that legitimate ClickHouse settings are never
+/// refused by accident.
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &["access_token", "password", "session_id", "user"];
+
+/// Substrings that mark an operator-invented credential-bearing parameter name.
+///
+/// ClickHouse has no settings containing these tokens, so a name that does is
+/// far more likely to be a hand-rolled secret than a tuning knob. Kept short
+/// and explicit for the same reason as [`CREDENTIAL_QUERY_PARAM_NAMES`].
+const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
+    "apikey",
+    "api_key",
+    "credential",
+    "passwd",
+    "secret",
+    "token",
+];
+
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
             return Err(format!(
                 "{PLUGIN_NAME}: clickhouse.insert_query_params contains invalid key"
+            ));
+        }
+        // Reject credential-bearing *names* outright. Values stay arbitrary
+        // (bounded length, no control characters) and are protected instead by
+        // never rendering the INSERT query string in any diagnostic — see
+        // `ClickHouseFlushConfig::redacted_insert_url`.
+        let lowered = key.to_ascii_lowercase();
+        if CREDENTIAL_QUERY_PARAM_NAMES.contains(&lowered.as_str())
+            || CREDENTIAL_QUERY_PARAM_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: clickhouse.insert_query_params['{key}'] names a credential; \
+                 ClickHouse credentials belong in clickhouse.username and \
+                 clickhouse.password_ref, which are sent as an HTTP Basic header rather than \
+                 appended to the INSERT URL"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
@@ -7064,6 +7215,7 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
+        redacted_insert_url: redacted_endpoint_url_str(insert_url),
         username: None,
         password: None,
         timeout: Duration::from_secs(5),
@@ -7115,6 +7267,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     let cfg = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: "http://127.0.0.1/".to_string(),
+        redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
         password: None,
         timeout: Duration::from_secs(1),
@@ -9149,11 +9302,29 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    runtime
-        .metrics
-        .events_enqueued_total
-        .fetch_add(1, Ordering::Relaxed);
-    runtime.logger.try_send(QueuedChargeEvent { event, lease });
+    match runtime
+        .logger
+        .try_send_outcome(QueuedChargeEvent { event, lease })
+    {
+        TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
+            runtime
+                .metrics
+                .events_enqueued_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::BufferFull => {
+            // Genuine full in-memory channel with no accepted durable ownership.
+            runtime
+                .metrics
+                .queue_full_drops_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::DiversionRejected | TrySendOutcome::WorkerUnavailable => {
+            // DiversionRejected: spool delivery saturation/closure already
+            // recorded spool job/event loss. WorkerUnavailable: shutdown must
+            // not masquerade as a full-buffer drop.
+        }
+    }
     invalidate_status_cache();
 }
 

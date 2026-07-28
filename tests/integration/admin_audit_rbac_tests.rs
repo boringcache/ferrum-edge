@@ -895,7 +895,10 @@ async fn loki_config_projection_redacts_endpoint_and_all_header_credentials() {
 }
 
 fn assert_loki_config_projection_redacted(config: &Value) {
-    assert_eq!(config["endpoint_url"], "https://logs.example.com/redacted");
+    assert_eq!(
+        config["endpoint_url"],
+        "https://logs.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
     assert_eq!(config["authorization_header"], "[REDACTED]");
     assert_eq!(config["custom_headers"]["X-Scope-OrgID"], "[REDACTED]");
     assert_eq!(config["custom_headers"]["X-Arbitrary"], "[REDACTED]");
@@ -979,7 +982,10 @@ async fn otel_tracing_config_projections_redact_endpoint_auth_and_headers() {
 }
 
 fn assert_otel_config_projection_redacted(config: &Value) {
-    assert_eq!(config["endpoint"], "https://collector.example.com/redacted");
+    assert_eq!(
+        config["endpoint"],
+        "https://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
     assert_eq!(config["authorization"], "[REDACTED]");
     assert_eq!(config["headers"]["x-honeycomb-team"], "[REDACTED]");
 }
@@ -993,13 +999,22 @@ async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections(
     let viewer = token("view-only", Some("viewer"));
     let operator = token("mesh-operator", Some("operator"));
 
-    for (shape, raw_config) in [
-        ("scalar", json!("loki-disabled-scalar-secret-canary")),
+    // A `null` config carries nothing to disclose and projects as `null`; every
+    // other non-object shape is replaced wholesale because its interior cannot
+    // be classified against the plugin schema. This is now uniform across all
+    // plugins rather than a loki-only special case.
+    for (shape, raw_config, expected) in [
+        (
+            "scalar",
+            json!("loki-disabled-scalar-secret-canary"),
+            json!("[REDACTED]"),
+        ),
         (
             "array",
             json!(["loki-disabled-array-secret-canary", {"nested": "credential"}]),
+            json!("[REDACTED]"),
         ),
-        ("null", Value::Null),
+        ("null", Value::Null, Value::Null),
     ] {
         let id = format!("loki-disabled-{shape}");
         let plugin = json!({
@@ -1026,7 +1041,7 @@ async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections(
         .await;
         let audit_config =
             &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
-        assert_eq!(audit_config, &json!("[REDACTED]"));
+        assert_eq!(audit_config, &expected);
 
         for bearer in [&viewer, &operator] {
             let (status, projected) =
@@ -1035,7 +1050,7 @@ async fn disabled_non_object_loki_configs_are_fully_redacted_across_projections(
                 status, 200,
                 "projected disabled {shape} Loki config read failed: {projected:?}"
             );
-            assert_eq!(projected["config"], "[REDACTED]");
+            assert_eq!(projected["config"], expected);
         }
 
         let (status, raw) = get_json(&base, &format!("/plugins/config/{id}"), &admin).await;
@@ -1412,5 +1427,612 @@ async fn rejected_batch_mutation_writes_no_audit_event() {
     assert_eq!(
         audit_body["total"], 0,
         "a fully rejected batch must not write a batch_create audit event: {audit_body:?}"
+    );
+}
+
+/// GHSA-4988-2wph-67g2: an HTTP log sink's endpoint may carry collector
+/// credentials in its path/query (documented in `docs/plugins.md`), and its
+/// `custom_headers` map accepts arbitrary vendor authentication header names
+/// that match no substring pattern. Neither may reach a non-admin read, an
+/// audit diff, or a list projection.
+#[tokio::test]
+async fn http_logging_endpoint_and_custom_header_credentials_are_projected() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let path_secret = "httplog-path-canary";
+    let query_secret = "httplog-query-canary";
+    let vendor_secret = "httplog-honeycomb-canary";
+    let tenant_secret = "httplog-tenant-canary";
+    let endpoint =
+        format!("https://collector.example.com/{path_secret}/ingest?api_key={query_secret}");
+    let plugin = json!({
+        "id": "http-logging-redaction",
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "config": {
+            "endpoint_url": endpoint,
+            "custom_headers": {
+                "x-honeycomb-team": vendor_secret,
+                "X-Tenant": tenant_secret
+            },
+            "batch_size": 50
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "http_logging create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=http-logging-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_http_logging_projection_redacted(audit_config);
+
+    let mut projections = vec![audit_config.clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/http-logging-redaction", bearer).await;
+        assert_eq!(status, 200, "projected read failed: {projected:?}");
+        assert_http_logging_projection_redacted(&projected["config"]);
+        projections.push(projected["config"].clone());
+
+        let (status, list) = get_json(&base, "/plugins/config", bearer).await;
+        assert_eq!(status, 200, "projected list failed: {list:?}");
+        let listed = list["data"]
+            .as_array()
+            .expect("plugin list data")
+            .iter()
+            .find(|item| item["id"] == "http-logging-redaction")
+            .expect("listed http_logging config")
+            .clone();
+        assert_http_logging_projection_redacted(&listed["config"]);
+        projections.push(listed["config"].clone());
+    }
+
+    // Admin reads stay raw so rotation by read-modify-write keeps working.
+    let (status, raw) = get_json(&base, "/plugins/config/http-logging-redaction", &admin).await;
+    assert_eq!(status, 200, "admin read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint_url"], endpoint);
+    assert_eq!(
+        raw["config"]["custom_headers"]["x-honeycomb-team"],
+        vendor_secret
+    );
+
+    for projection in &projections {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, vendor_secret, tenant_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "http_logging projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_http_logging_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["endpoint_url"],
+        "https://collector.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(config["custom_headers"]["x-honeycomb-team"], "[REDACTED]");
+    assert_eq!(config["custom_headers"]["X-Tenant"], "[REDACTED]");
+    // Safe-value control: non-credential tuning stays readable for operators.
+    assert_eq!(config["batch_size"], 50);
+    // Header names remain visible; only the values are secret.
+    assert!(
+        config["custom_headers"]
+            .as_object()
+            .expect("custom_headers object")
+            .contains_key("x-honeycomb-team")
+    );
+}
+
+/// GHSA-4988-2wph-67g2: `proxy_alerts` generic webhook channels take a
+/// credential-bearing `url` (a key with no sensitive substring), arbitrary
+/// vendor header names, and an operator-authored `body_template` that is the
+/// documented place to inline a routing key.
+#[tokio::test]
+async fn proxy_alerts_generic_webhook_credentials_are_projected() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let url_path_secret = "alerts-url-path-canary";
+    let url_query_secret = "alerts-url-query-canary";
+    let header_secret = "alerts-header-canary";
+    let template_secret = "alerts-template-canary";
+    let slack_secret = "alerts-slack-canary";
+    let webhook_url =
+        format!("https://hooks.example.com/{url_path_secret}?routing_key={url_query_secret}");
+    let plugin = json!({
+        "id": "proxy-alerts-redaction",
+        "plugin_name": "proxy_alerts",
+        "scope": "global",
+        // Stored without plugin construction so the projection contract is
+        // exercised independently of channel-dispatch prerequisites.
+        "enabled": false,
+        "config": {
+            "channels": {
+                "generic": {
+                    "type": "webhook",
+                    "url": webhook_url,
+                    "method": "POST",
+                    "headers": {"x-routing-key": header_secret},
+                    "body_template": format!("{{\"key\":\"{template_secret}\"}}")
+                },
+                "ops-slack": {
+                    "type": "slack",
+                    "webhook_url": format!("https://hooks.slack.com/services/T0/B0/{slack_secret}")
+                }
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "proxy_alerts create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=proxy-alerts-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_proxy_alerts_projection_redacted(audit_config);
+
+    let mut projections = vec![audit_config.clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/proxy-alerts-redaction", bearer).await;
+        assert_eq!(status, 200, "projected read failed: {projected:?}");
+        assert_proxy_alerts_projection_redacted(&projected["config"]);
+        projections.push(projected["config"].clone());
+    }
+
+    let (status, raw) = get_json(&base, "/plugins/config/proxy-alerts-redaction", &admin).await;
+    assert_eq!(status, 200, "admin read failed: {raw:?}");
+    assert_eq!(raw["config"]["channels"]["generic"]["url"], webhook_url);
+
+    for projection in &projections {
+        let serialized = projection.to_string();
+        for secret in [
+            url_path_secret,
+            url_query_secret,
+            header_secret,
+            template_secret,
+            slack_secret,
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "proxy_alerts projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_proxy_alerts_projection_redacted(config: &Value) {
+    let generic = &config["channels"]["generic"];
+    assert_eq!(
+        generic["url"],
+        "https://hooks.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(generic["headers"]["x-routing-key"], "[REDACTED]");
+    assert_eq!(generic["body_template"], "[REDACTED]");
+    // Safe-value controls: channel wiring stays legible.
+    assert_eq!(generic["type"], "webhook");
+    assert_eq!(generic["method"], "POST");
+    // `webhook_url` is caught wholesale by the name heuristic; the schema must
+    // not weaken that to a structural projection.
+    assert_eq!(config["channels"]["ops-slack"]["webhook_url"], "[REDACTED]");
+}
+
+/// GHSA-4988-2wph-67g2: `kafka_logging.producer_config` is an arbitrary
+/// librdkafka property map. Everything outside the safe-tuning allow-list is
+/// redacted, so a newly sensitive upstream property is covered by default.
+#[tokio::test]
+async fn kafka_producer_config_properties_are_projected_by_allow_list() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let keypw_secret = "kafka-keypw-canary";
+    let oauth_secret = "kafka-keytab-canary";
+    let plugin = json!({
+        "id": "kafka-producer-redaction",
+        "plugin_name": "kafka_logging",
+        "scope": "global",
+        // Stored without producer construction; the projection is what is under
+        // test here, and inline PEM rejection is covered by the plugin's own
+        // admission tests.
+        "enabled": false,
+        "config": {
+            "broker_list": "broker.example.com:9093",
+            "topic": "ferrum-logs",
+            "security_protocol": "sasl_ssl",
+            "producer_config": {
+                "ssl.key.password": keypw_secret,
+                "sasl.kerberos.keytab": oauth_secret,
+                "linger.ms": "20",
+                "compression.type": "lz4"
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "kafka_logging create failed: {body:?}");
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=kafka-producer-redaction",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_kafka_projection_redacted(audit_config);
+
+    let mut projections = vec![audit_config.clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) =
+            get_json(&base, "/plugins/config/kafka-producer-redaction", bearer).await;
+        assert_eq!(status, 200, "projected read failed: {projected:?}");
+        assert_kafka_projection_redacted(&projected["config"]);
+        projections.push(projected["config"].clone());
+    }
+
+    let (status, raw) = get_json(&base, "/plugins/config/kafka-producer-redaction", &admin).await;
+    assert_eq!(status, 200, "admin read failed: {raw:?}");
+    assert_eq!(
+        raw["config"]["producer_config"]["sasl.kerberos.keytab"],
+        oauth_secret
+    );
+
+    for projection in &projections {
+        let serialized = projection.to_string();
+        for secret in [keypw_secret, oauth_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "kafka projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_kafka_projection_redacted(config: &Value) {
+    let props = &config["producer_config"];
+    assert_eq!(props["ssl.key.password"], "[REDACTED]");
+    // No name heuristic matches this property; only the allow-list saves it.
+    assert_eq!(props["sasl.kerberos.keytab"], "[REDACTED]");
+    // Safe-value controls: allow-listed tuning knobs stay visible.
+    assert_eq!(props["linger.ms"], "20");
+    assert_eq!(props["compression.type"], "lz4");
+    assert_eq!(config["topic"], "ferrum-logs");
+}
+
+/// `GET /backup` intentionally exports raw configuration so backups stay
+/// restorable, which is only safe while it remains Admin-only. Pin that gate
+/// alongside the projection tests so a future role change cannot quietly turn
+/// the backup route into the disclosure path the projection closes.
+#[tokio::test]
+async fn backup_export_is_admin_only_and_stays_raw_for_admin() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let vendor_secret = "backup-honeycomb-canary";
+    let plugin = json!({
+        "id": "backup-projection-probe",
+        "plugin_name": "otel_tracing",
+        "scope": "global",
+        "config": {
+            "endpoint": "https://collector.example.com/v1/traces",
+            "headers": {"x-honeycomb-team": vendor_secret}
+        }
+    });
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "otel plugin create failed: {body:?}");
+
+    for (role, bearer) in [("viewer", &viewer), ("operator", &operator)] {
+        let (status, denied) = get_json(&base, "/backup", bearer).await;
+        assert_eq!(status, 403, "{role} must not reach /backup: {denied:?}");
+        assert!(
+            !denied.to_string().contains(vendor_secret),
+            "{role} backup denial leaked config: {denied:?}"
+        );
+    }
+
+    let (status, backup) = get_json(&base, "/backup", &admin).await;
+    assert_eq!(status, 200, "admin backup failed: {backup:?}");
+    let stored = backup["plugin_configs"]
+        .as_array()
+        .expect("backup plugin_configs")
+        .iter()
+        .find(|item| item["id"] == "backup-projection-probe")
+        .expect("backed-up plugin config");
+    assert_eq!(
+        stored["config"]["headers"]["x-honeycomb-team"], vendor_secret,
+        "admin backups must stay restorable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Remaining observability sinks — advisory GHSA-8594-2xhc-8g38
+//
+// `http_logging`, `ai_transcript_audit`, and `api_chargeback_sink` accept
+// endpoints whose path/query can carry a reusable credential. Non-admin reads
+// and every audit projection must render only the structurally redacted form.
+// These vendor-shaped cases now route through the one schema-aware projection
+// (GHSA-4988-2wph-67g2), so they assert its structural markers rather than the
+// per-plugin `/redacted` rendering they were written against.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_logging_vendor_collector_endpoint_credentials_are_projected() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let path_secret = "http-logging-sumo-path-canary";
+    let query_secret = "http-logging-mezmo-query-canary";
+    let header_secret = "http-logging-header-canary";
+    let endpoint = format!(
+        "https://endpoint1.collection.us1.sumologic.com/receiver/v1/http/{path_secret}?apikey={query_secret}"
+    );
+    let plugin = json!({
+        "id": "http-logging-redaction-config",
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "config": {
+            "endpoint_url": endpoint,
+            "custom_headers": { "X-Sumo-Category": header_secret }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "http_logging plugin create failed: {body:?}");
+    assert_eq!(body["config"]["endpoint_url"], endpoint);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=http-logging-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_vendor_http_logging_projection_redacted(audit_config);
+
+    let mut projections = vec![audit_config.clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(
+            &base,
+            "/plugins/config/http-logging-redaction-config",
+            bearer,
+        )
+        .await;
+        assert_eq!(status, 200, "projected read failed: {projected:?}");
+        assert_vendor_http_logging_projection_redacted(&projected["config"]);
+        projections.push(projected["config"].clone());
+    }
+
+    // The admin (raw) read is deliberately unredacted — an operator with the
+    // admin role must still be able to read back what they configured.
+    let (status, raw) = get_json(
+        &base,
+        "/plugins/config/http-logging-redaction-config",
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "admin raw read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint_url"], endpoint);
+
+    for projection in &projections {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, header_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "http_logging projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_vendor_http_logging_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["endpoint_url"],
+        "https://endpoint1.collection.us1.sumologic.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(config["custom_headers"]["X-Sumo-Category"], "[REDACTED]");
+}
+
+#[tokio::test]
+async fn ai_transcript_audit_config_projections_redact_sink_endpoint_and_headers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let path_secret = "transcript-path-canary";
+    let query_secret = "transcript-query-canary";
+    let header_secret = "transcript-header-canary";
+    let endpoint = format!("https://audit.example.com/ingest/{path_secret}?apikey={query_secret}");
+    let plugin = json!({
+        "id": "transcript-redaction-config",
+        "plugin_name": "ai_transcript_audit",
+        "scope": "global",
+        "config": {
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "custom_headers": { "X-Audit-Token": header_secret }
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(
+        status, 201,
+        "ai_transcript_audit plugin create failed: {body:?}"
+    );
+    assert_eq!(body["config"]["sink"]["endpoint_url"], endpoint);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=transcript-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_transcript_projection_redacted(audit_config);
+
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/transcript-redaction-config",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer read failed: {projected:?}");
+    assert_transcript_projection_redacted(&projected["config"]);
+
+    for projection in [audit_config, &projected["config"]] {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, header_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "ai_transcript_audit projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_transcript_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["sink"]["endpoint_url"],
+        "https://audit.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        config["sink"]["custom_headers"]["X-Audit-Token"],
+        "[REDACTED]"
+    );
+}
+
+#[tokio::test]
+async fn api_chargeback_sink_config_projections_redact_clickhouse_endpoint_and_params() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let path_secret = "chargeback-path-canary";
+    let param_secret = "chargeback-param-value-canary";
+    let spool_dir = tmp.path().join("chargeback-spool");
+    std::fs::create_dir_all(&spool_dir).unwrap();
+    let clickhouse_url = format!("https://clickhouse.example.com:8443/{path_secret}");
+    let plugin = json!({
+        "id": "chargeback-redaction-config",
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "config": {
+            "mode": "per_event",
+            "clickhouse": {
+                "url": clickhouse_url,
+                "database": "ferrum",
+                "table": "charges_raw",
+                "timeout_ms": 1000,
+                "insert_query_params": { "async_insert": param_secret }
+            },
+            "batch": {"size": 2, "flush_interval_ms": 60000, "buffer_capacity": 10},
+            "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+            "spool": {
+                "enabled": true,
+                "dir": spool_dir.to_string_lossy(),
+                "max_bytes": 1048576,
+                "replay_interval_secs": 3600,
+                "compression": "none"
+            },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+            "bandwidth_pricing": {"price_per_byte_sent": 0.000001, "price_per_byte_received": 0.000002},
+            "stream_connection_pricing": {"price_per_connection": 0.1},
+            "pricing_version": "test-v1",
+            "currency": "USD"
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(
+        status, 201,
+        "api_chargeback_sink plugin create failed: {body:?}"
+    );
+    assert_eq!(body["config"]["clickhouse"]["url"], clickhouse_url);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=chargeback-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_chargeback_projection_redacted(audit_config);
+
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/chargeback-redaction-config",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer read failed: {projected:?}");
+    assert_chargeback_projection_redacted(&projected["config"]);
+
+    for projection in [audit_config, &projected["config"]] {
+        let serialized = projection.to_string();
+        for secret in [path_secret, param_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "api_chargeback_sink projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_chargeback_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["clickhouse"]["url"],
+        "https://clickhouse.example.com:8443/[REDACTED_PATH]"
+    );
+    assert_eq!(
+        config["clickhouse"]["insert_query_params"]["async_insert"],
+        "[REDACTED]"
     );
 }

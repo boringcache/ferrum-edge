@@ -372,3 +372,109 @@ async fn test_tcp_connection_throttle_allows_same_identity_on_different_proxies(
         PluginResult::Continue
     ));
 }
+
+/// Admission and release must use the SAME canonical key across
+/// representations (advisory GHSA-vjwj-657f-5w9g). A release keyed on the
+/// mapped text while admission keyed on the native text would leak the slot
+/// permanently; the reverse would let one host hold two budgets.
+#[tokio::test]
+async fn disconnect_release_returns_the_slot_to_the_canonical_identity() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    // Admit as the mapped form, release, then re-admit as the native form.
+    let mut mapped = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut mapped).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+    mapped.release_admission_permits();
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "releasing a mapped-form admission must remove the canonical entry"
+    );
+
+    let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut native).await,
+            PluginResult::Continue
+        ),
+        "the released slot must be available to the same principal's native form"
+    );
+
+    // ...and the budget is still one slot for that principal, not two.
+    let mut again = make_ctx("tcp-proxy", "::ffff:192.0.2.10", None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut again).await,
+        PluginResult::Reject { .. }
+    ));
+    native.release_admission_permits();
+    assert_eq!(plugin.tracked_keys_count(), Some(0));
+}
+
+/// A genuine IPv6 client keeps a separate budget from the IPv4 address its
+/// low-order bits encode.
+#[tokio::test]
+async fn true_ipv6_client_keeps_its_own_connection_budget() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let mut native = make_ctx("tcp-proxy", "192.0.2.10", None);
+    let mut compatible = make_ctx("tcp-proxy", "::192.0.2.10", None);
+    let mut distinct = make_ctx("tcp-proxy", "2001:db8::10", None);
+
+    assert!(matches!(
+        plugin.on_stream_connect(&mut native).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut compatible).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        plugin.on_stream_connect(&mut distinct).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(3));
+}
+
+/// PROXY-protocol-forwarded sources are folded at the same boundary, so an L4
+/// load balancer that reports the client in `AF_INET6` form does not hand that
+/// client a second connection budget.
+#[tokio::test]
+async fn proxy_protocol_forwarded_source_shares_the_native_budget() {
+    let plugin = make_plugin(&json!({"max_connections_per_key": 1})).unwrap();
+
+    let lb_peer = "10.0.0.7:5000".parse().unwrap();
+    let mapped_src = "[::ffff:192.0.2.10]:33000".parse().unwrap();
+    let native_src = "192.0.2.10:33001".parse().unwrap();
+
+    let (from_mapped, _) = apply_proxy_result(
+        ProxyProtocolResult::Forwarded {
+            src: mapped_src,
+            dst: lb_peer,
+        },
+        &lb_peer,
+    );
+    let (from_native, _) = apply_proxy_result(
+        ProxyProtocolResult::Forwarded {
+            src: native_src,
+            dst: lb_peer,
+        },
+        &lb_peer,
+    );
+    assert_eq!(from_mapped, from_native);
+
+    let mut first = make_ctx("tcp-proxy", &from_mapped, None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut first).await,
+        PluginResult::Continue
+    ));
+    let mut second = make_ctx("tcp-proxy", &from_native, None);
+    assert!(matches!(
+        plugin.on_stream_connect(&mut second).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(plugin.tracked_keys_count(), Some(1));
+}
