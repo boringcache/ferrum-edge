@@ -893,13 +893,11 @@ where
     let gateway_api_route_conflicts =
         gateway_api::route_conflicts(&included_objects, &acc.options, Some(&acc));
     for conflict in &gateway_api_route_conflicts {
-        let skipped_reason = if conflict.loser.kind == "GRPCRoute"
-            && conflict.key.match_signature == "{}"
-        {
-            "Ferrum cannot yet dispatch GRPCRoute method/header matches within a shared path, so this conflicting match was skipped"
-        } else {
-            "the conflicting match was skipped"
-        };
+        // GRPCRoute method / header predicates now carry their own conflict
+        // signature (see `gateway_api::grpc_route_match_signature`), so two
+        // gRPC routes only collide when they claim the *same* predicate on the
+        // same parent, hostname, and listen path — exactly like HTTPRoute.
+        let skipped_reason = "the conflicting match was skipped";
         acc.warnings.push(format!(
             "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",
             conflict.loser.kind,

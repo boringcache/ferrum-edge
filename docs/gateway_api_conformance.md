@@ -78,9 +78,61 @@ Follow-up validation on branch `codex/gateway-api-data-plane-conformance` reache
 | Selectorless/headless Services | Yes | With pod discovery enabled, backends resolve ready EndpointSlice addresses directly; a named Service `targetPort` resolves against EndpointSlice port names, but the `backendRef.port` itself is numeric-only — see [backendRef port and zero-weight semantics](#backendref-port-and-zero-weight-semantics) |
 | Backend failure | Yes | Traffic to unavailable generated backends must return an error response rather than falling through |
 | Route update and deletion | Yes | Reconciliation regenerates live proxy/upstream/plugin config; deletion removes the route from live config |
-| `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and partially translated through HTTP/gRPC routing, but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
+| `GRPCRoute` | Not claimed by the `GATEWAY-HTTP` gate | Watched and translated — see [GRPCRoute predicate translation](#grpcroute-predicate-translation) — but not advertised as a passing upstream `GATEWAY-GRPC` profile until request traffic conformance is added |
 | `TLSRoute` and `TCPRoute` | Not claimed | Watched/translated for L4 experiments, but not advertised as supported Gateway API conformance profiles |
 | `UDPRoute`, `BackendTLSPolicy`, `ListenerSet`, `BackendLBPolicy` | No | Not claimed as effective Gateway API conformance features |
+
+## GRPCRoute predicate translation
+
+`GRPCRoute.spec.rules[].matches[]` is translated on its own terms; a gRPC
+predicate is never rewritten into an invented HTTP catch-all path, and it is
+never dropped for being pathless.
+
+| `matches[]` shape | Materialized as |
+|---|---|
+| `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}`; no request-time predicate |
+| `method.type: Exact` with `service` only | Listen path prefix `/{service}/` — a gRPC `:path` always carries a trailing method segment, so this selects exactly that service |
+| `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` |
+| `method.type: RegularExpression` | `/` listener plus a `mesh_route_dispatch` URI regex `/(?:{service})/(?:{method})`; an omitted component becomes the single-segment wildcard `[^/]+`, and each operand is wrapped in its own non-capturing group so a top-level alternation cannot escape its segment |
+| Header-only match (no `method`) | `/` listener plus the "any gRPC call" URI regex `/[^/]+/[^/]+` and the exact header predicates |
+| Rule with `matches` omitted or empty | `/` listener plus the "any gRPC call" URI regex — the Gateway API defines this as every **gRPC** call on the route's hostnames, not every HTTP request |
+
+Every predicate that has to materialize on the `/` listener additionally
+carries a `content-type` prefix predicate of `application/grpc`, so a pathless
+gRPC rule can never capture ordinary HTTP traffic sharing the same hostname. A
+route-authored `content-type` header match replaces that gate (it is the more
+specific operator intent). The generated `mesh_route_dispatch` instance sets
+`reject_unmatched: true` unless a coexisting route contributes an
+unconditional match for the same `(hostname, listen path)` — for example an
+HTTPRoute catch-all on the same host, in which case plain HTTP still falls
+through to the HTTPRoute's default backend while gRPC calls keep matching
+their predicates.
+
+Rule and match ordering is preserved: gRPC predicates sharing a listen path
+collapse into one ordered dispatch-rule list (method-bearing before
+header-count before route `creationTimestamp`, then namespace/name, rule
+index, and match index), so fall-through between a specific rule and a later
+broader rule behaves as written. Two GRPCRoutes only conflict when they claim
+the *same* predicate on the same parent, hostname, and listen path; distinct
+methods on the shared `/` listener are distinct routes, not a collision.
+
+Shapes Ferrum still cannot represent exactly are **dropped fail closed** with a
+field-specific translator warning (`GRPCRoute {ns}/{name}
+rules[i].matches[j] dropped fail-closed: …`) rather than widened:
+
+- `method.type` other than `Exact` / `RegularExpression`.
+- A `method` block with neither `service` nor `method`.
+- An `Exact` `service` / `method` literal that is empty, longer than 512
+  characters, or contains anything outside ASCII alphanumerics, `.`, `_`, `-`.
+- A `RegularExpression` operand that is empty, longer than 512 characters,
+  contains `/` (a service or method name is a single path segment), or does not
+  compile.
+- `headers[].type: RegularExpression`, or a header match missing `name` or
+  `value` — only `Exact` header matches are translated, matching the HTTPRoute
+  translator.
+
+A rule whose every match is dropped materializes no route, so its parent status
+is not reported as programmed.
 
 ## backendRef port and zero-weight semantics
 

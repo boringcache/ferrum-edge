@@ -145,17 +145,14 @@ pub(super) fn translate(
             }
             Ok(true)
         }
-        "HTTPRoute" => {
+        // GRPCRoute shares HTTPRoute's materialization path: gRPC predicates
+        // that cannot be a listen path land on the `/` listener as ordered
+        // `mesh_route_dispatch` rules, so the same-(hosts, listen_path)
+        // collapse is what preserves rule ordering and fall-through between
+        // gRPC rules — and between a GRPCRoute and a coexisting HTTPRoute.
+        "HTTPRoute" | "GRPCRoute" => {
             let (proxies, plugins) = http_route_resources(object, acc)?;
             upsert_http_route_resources(acc, proxies, plugins);
-            Ok(true)
-        }
-        "GRPCRoute" => {
-            let (proxies, plugins) = http_route_resources(object, acc)?;
-            for proxy in proxies {
-                acc.upsert_proxy(proxy, SourceKind::GatewayApi);
-            }
-            acc.config.plugin_configs.extend(plugins);
             Ok(true)
         }
         "TCPRoute" => {
@@ -1337,13 +1334,13 @@ fn route_match_entry_descriptors(
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
         return vec![RouteMatchEntryDescriptor {
             match_index: 0,
-            descriptor: default_route_match_descriptor(),
+            descriptor: default_route_match_descriptor(object),
         }];
     };
     if matches.is_empty() {
         return vec![RouteMatchEntryDescriptor {
             match_index: 0,
-            descriptor: default_route_match_descriptor(),
+            descriptor: default_route_match_descriptor(object),
         }];
     }
 
@@ -1372,7 +1369,17 @@ fn dedup_route_match_descriptors(
     descriptors
 }
 
-fn default_route_match_descriptor() -> RouteMatchDescriptor {
+fn default_route_match_descriptor(object: &K8sObject) -> RouteMatchDescriptor {
+    if object.kind == "GRPCRoute" {
+        // A GRPCRoute rule with no `matches` matches every gRPC call on the
+        // route's hostnames. It still must not swallow plain HTTP sharing the
+        // same host, so it materializes on `/` behind the gRPC-shape
+        // predicate rather than as an unguarded catch-all.
+        return RouteMatchDescriptor {
+            listen_path: "/".to_string(),
+            match_signature: grpc_route_match_signature(&grpc_any_call_match()),
+        };
+    }
     RouteMatchDescriptor {
         listen_path: "/".to_string(),
         match_signature: "{}".to_string(),
@@ -1384,14 +1391,19 @@ fn route_match_descriptor_for_entry(
     entry: &Value,
 ) -> Option<RouteMatchDescriptor> {
     if object.kind == "GRPCRoute" {
-        // GRPCRoute method-only/header-only matches (no explicit path) must NOT
-        // default to "/" — that creates a catch-all proxy that routes ALL traffic
-        // to the backend, bypassing method-specificity. Drop pathless matches
-        // until per-method dispatch is implemented.
-        let listen_path = entry.get("path").and_then(http_path_match)?;
+        // gRPC predicates are represented independently from HTTP paths: a
+        // fully-qualified `service`+`method` becomes an exact listen path, a
+        // service-only match becomes a `/{service}/` prefix, and everything
+        // else (method-only, regex, header-only, empty) materializes on `/`
+        // behind a `mesh_route_dispatch` URI + content-type predicate. Nothing
+        // is dropped for being pathless, and nothing widens into a catch-all.
+        let parsed = grpc_route_match(entry).ok()?;
         return Some(RouteMatchDescriptor {
-            listen_path,
-            match_signature: "{}".to_string(),
+            listen_path: match &parsed.plan {
+                GrpcRouteMatchPlan::PathOnly { listen_path } => listen_path.clone(),
+                GrpcRouteMatchPlan::UriRegex { .. } => "/".to_string(),
+            },
+            match_signature: grpc_route_match_signature(&parsed),
         });
     }
 
@@ -1474,6 +1486,289 @@ fn http_route_match_signature(entry: &Value) -> String {
 
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Regex fragment matching exactly one gRPC path segment (a service or a
+/// method name). A gRPC `:path` is always `/{service}/{method}`, and neither
+/// component may contain `/`, so a wildcard segment never crosses a separator.
+const GRPC_PATH_SEGMENT_PATTERN: &str = "[^/]+";
+
+/// Content-type prefix every gRPC request carries (`application/grpc`,
+/// `application/grpc+proto`, `application/grpc-web`, …). Pathless GRPCRoute
+/// predicates have to materialize on the `/` listener, so this gate is what
+/// keeps them from capturing ordinary HTTP traffic on the same hostname.
+const GRPC_CONTENT_TYPE_PREFIX: &str = "application/grpc";
+
+/// Upper bound on a GRPCRoute `method.service` / `method.method` operand
+/// (exact literal or regex source). gRPC service and method names are short
+/// identifiers; anything longer is a malformed or hostile predicate and is
+/// refused rather than compiled into a request-path matcher.
+const MAX_GRPC_METHOD_OPERAND_LENGTH: usize = 512;
+
+/// How one GRPCRoute `matches[]` entry projects onto Ferrum routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GrpcRouteMatchPlan {
+    /// The gRPC method predicate is expressed losslessly by the proxy's
+    /// `listen_path` — an exact `={service}/{method}` path for a fully
+    /// qualified method, or a `/{service}/` prefix for a service-only match.
+    /// No request-time URI evaluation is needed.
+    PathOnly { listen_path: String },
+    /// The predicate cannot be expressed as a listen path (method-only,
+    /// `RegularExpression`, header-only, or an empty match). The route
+    /// materializes on the `/` listener and the predicate rides a
+    /// `mesh_route_dispatch` URI regex plus the gRPC content-type gate, with
+    /// `reject_unmatched` keeping unrelated traffic off the backend.
+    UriRegex { pattern: String },
+}
+
+/// A single GRPCRoute `matches[]` entry after fail-closed parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrpcRouteMatch {
+    plan: GrpcRouteMatchPlan,
+    /// Translated exact header predicates as `(lowercased name, value)` in
+    /// first-occurrence order, mirroring the HTTPRoute translator's
+    /// first-duplicate-wins rule.
+    headers: Vec<(String, String)>,
+}
+
+fn grpc_any_call_pattern() -> String {
+    format!("/{GRPC_PATH_SEGMENT_PATTERN}/{GRPC_PATH_SEGMENT_PATTERN}")
+}
+
+/// The predicate for "any gRPC call" — used for a GRPCRoute rule with no
+/// `matches` (or an empty match entry), which the Gateway API defines as
+/// matching every gRPC request on the route's hostnames.
+fn grpc_any_call_match() -> GrpcRouteMatch {
+    GrpcRouteMatch {
+        plan: GrpcRouteMatchPlan::UriRegex {
+            pattern: grpc_any_call_pattern(),
+        },
+        headers: Vec::new(),
+    }
+}
+
+/// Parse one GRPCRoute `matches[]` entry. `Err` means Ferrum cannot represent
+/// the predicate exactly; the caller drops that match fail-closed (with a
+/// field-specific warning) rather than widening it into something broader.
+fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
+    if entry.as_object().is_none() {
+        return Err("matches[] entry must be an object".to_string());
+    }
+
+    let plan = match entry.get("method").filter(|method| !method.is_null()) {
+        Some(method) => grpc_route_method_plan(method)?,
+        // `path` is not a GRPCRoute CRD field; it is retained as a Ferrum
+        // extension for hand-authored specs that pin an HTTP listen path
+        // directly. A CRD-shaped route reaches the gRPC-shape branch below.
+        None => match entry.get("path").and_then(http_path_match) {
+            Some(listen_path) => GrpcRouteMatchPlan::PathOnly { listen_path },
+            None => GrpcRouteMatchPlan::UriRegex {
+                pattern: grpc_any_call_pattern(),
+            },
+        },
+    };
+
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if let Some(headers_array) = entry.get("headers").filter(|value| !value.is_null()) {
+        let headers_array = headers_array
+            .as_array()
+            .ok_or_else(|| "matches[].headers must be an array".to_string())?;
+        for header in headers_array {
+            if !gateway_match_type_is_exact(header) {
+                return Err(format!(
+                    "matches[].headers[].type '{}' is not supported; only Exact header matches \
+                     are translated",
+                    string_field(header, "type").unwrap_or("<missing>")
+                ));
+            }
+            let name = string_field(header, "name")
+                .ok_or_else(|| "matches[].headers[].name is required".to_string())?;
+            let value = string_field(header, "value")
+                .ok_or_else(|| "matches[].headers[].value is required".to_string())?;
+            let name = name.to_ascii_lowercase();
+            if !headers.iter().any(|(existing, _)| existing == &name) {
+                headers.push((name, value.to_string()));
+            }
+        }
+    }
+
+    Ok(GrpcRouteMatch { plan, headers })
+}
+
+fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> {
+    if method.as_object().is_none() {
+        return Err("matches[].method must be an object".to_string());
+    }
+    let service = string_field(method, "service");
+    let name = string_field(method, "method");
+    if service.is_none() && name.is_none() {
+        return Err("matches[].method requires at least one of service / method".to_string());
+    }
+
+    match string_field(method, "type").unwrap_or("Exact") {
+        "Exact" => {
+            let service = service
+                .map(|service| validate_grpc_method_literal("service", service))
+                .transpose()?;
+            let name = name
+                .map(|name| validate_grpc_method_literal("method", name))
+                .transpose()?;
+            match (service, name) {
+                (Some(service), Some(name)) => Ok(GrpcRouteMatchPlan::PathOnly {
+                    listen_path: exact_path_listen_path(&format!("/{service}/{name}")),
+                }),
+                // gRPC paths always carry a trailing method segment, so the
+                // `/{service}/` prefix selects exactly this service and can
+                // never reach a longer service name (`/pkg.SvcExtra/…` does
+                // not start with `/pkg.Svc/`).
+                (Some(service), None) => Ok(GrpcRouteMatchPlan::PathOnly {
+                    listen_path: format!("/{service}/"),
+                }),
+                // A method-only match has no path prefix: the service segment
+                // is a wildcard, so it can only be a URI predicate.
+                (None, Some(name)) => Ok(GrpcRouteMatchPlan::UriRegex {
+                    pattern: format!("/{GRPC_PATH_SEGMENT_PATTERN}/{}", regex::escape(name)),
+                }),
+                // Already rejected above; re-checked rather than panicking so
+                // the production path has no unreachable assertion.
+                (None, None) => Err(
+                    "matches[].method requires at least one of service / method".to_string(),
+                ),
+            }
+        }
+        "RegularExpression" => {
+            let service = service
+                .map(|service| validate_grpc_method_regex("service", service))
+                .transpose()?
+                .unwrap_or(GRPC_PATH_SEGMENT_PATTERN);
+            let name = name
+                .map(|name| validate_grpc_method_regex("method", name))
+                .transpose()?
+                .unwrap_or(GRPC_PATH_SEGMENT_PATTERN);
+            // Each operand is wrapped in its own non-capturing group so a
+            // top-level alternation in the operator's pattern cannot escape
+            // its path segment and swallow the rest of the expression.
+            let pattern = format!("/(?:{service})/(?:{name})");
+            compile_grpc_uri_regex(&pattern).map_err(|error| {
+                format!("matches[].method regex is not usable as a URI predicate: {error}")
+            })?;
+            Ok(GrpcRouteMatchPlan::UriRegex { pattern })
+        }
+        other => Err(format!(
+            "matches[].method.type '{other}' is not supported; expected Exact or \
+             RegularExpression"
+        )),
+    }
+}
+
+/// Validate an `Exact` gRPC service / method literal before it becomes part of
+/// a listen path or a request-path regex. gRPC identifiers are dotted ASCII
+/// names, so anything outside that alphabet (path separators, query/fragment
+/// delimiters, percent escapes, whitespace, control bytes) is refused instead
+/// of being smuggled into routing state.
+fn validate_grpc_method_literal<'a>(field: &str, value: &'a str) -> Result<&'a str, String> {
+    if value.is_empty() {
+        return Err(format!("matches[].method.{field} must not be empty"));
+    }
+    if value.len() > MAX_GRPC_METHOD_OPERAND_LENGTH {
+        return Err(format!(
+            "matches[].method.{field} must not exceed {MAX_GRPC_METHOD_OPERAND_LENGTH} characters"
+        ));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+    {
+        return Err(format!(
+            "matches[].method.{field} must contain only ASCII alphanumerics, '.', '_' or '-'"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_grpc_method_regex<'a>(field: &str, value: &'a str) -> Result<&'a str, String> {
+    if value.is_empty() {
+        return Err(format!("matches[].method.{field} regex must not be empty"));
+    }
+    if value.len() > MAX_GRPC_METHOD_OPERAND_LENGTH {
+        return Err(format!(
+            "matches[].method.{field} regex must not exceed \
+             {MAX_GRPC_METHOD_OPERAND_LENGTH} characters"
+        ));
+    }
+    if value.contains('/') {
+        return Err(format!(
+            "matches[].method.{field} regex must not contain '/'; a gRPC service or method name \
+             is a single path segment"
+        ));
+    }
+    regex::Regex::new(value)
+        .map_err(|error| format!("matches[].method.{field} regex is invalid: {error}"))?;
+    Ok(value)
+}
+
+/// Compile a candidate URI regex exactly the way `mesh_route_dispatch` will at
+/// plugin-construction time (`\A(?:…)\z`), so an unusable pattern is refused
+/// during translation instead of failing the plugin build on the data plane.
+fn compile_grpc_uri_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!(r"\A(?:{pattern})\z"))
+}
+
+/// Stable identity for a parsed gRPC match, used both for descriptor dedup and
+/// as the route-conflict signature so two distinct gRPC predicates sharing the
+/// `/` listener are not treated as the same route.
+fn grpc_route_match_signature(parsed: &GrpcRouteMatch) -> String {
+    let mut parts = Vec::new();
+    if let GrpcRouteMatchPlan::UriRegex { pattern } = &parsed.plan {
+        parts.push(format!("grpc_uri={}", json_string(pattern)));
+    }
+    let mut headers: Vec<String> = parsed
+        .headers
+        .iter()
+        .map(|(name, value)| format!("header:{name}={}", json_string(value)))
+        .collect();
+    headers.sort();
+    parts.extend(headers);
+
+    if parts.is_empty() {
+        "{}".to_string()
+    } else {
+        parts.join("|")
+    }
+}
+
+/// Build the `mesh_route_dispatch` match criteria for one GRPCRoute entry.
+/// Returns `None` for a match Ferrum cannot represent (same fail-closed
+/// decision `route_match_descriptor_for_entry` made, so the two never diverge).
+fn grpc_dispatch_match_criteria(entry: &Value) -> Option<serde_json::Map<String, Value>> {
+    let parsed = grpc_route_match(entry).ok()?;
+    Some(grpc_dispatch_match_criteria_for(&parsed))
+}
+
+fn grpc_dispatch_match_criteria_for(parsed: &GrpcRouteMatch) -> serde_json::Map<String, Value> {
+    let mut criteria = serde_json::Map::new();
+    let mut headers = serde_json::Map::new();
+
+    if let GrpcRouteMatchPlan::UriRegex { pattern } = &parsed.plan {
+        criteria.insert("uri".to_string(), serde_json::json!({ "regex": pattern }));
+        // The URI shape alone would still admit a plain HTTP request whose
+        // path happens to have two segments. Gate on the gRPC content type so
+        // a pathless gRPC predicate can only ever match a gRPC call.
+        headers.insert(
+            "content-type".to_string(),
+            serde_json::json!({ "prefix": GRPC_CONTENT_TYPE_PREFIX }),
+        );
+    }
+    // A route-authored `content-type` predicate is more specific than the
+    // gate, so it deliberately replaces it.
+    for (name, value) in &parsed.headers {
+        headers.insert(name.clone(), Value::String(value.clone()));
+    }
+    if !headers.is_empty() {
+        criteria.insert("headers".to_string(), Value::Object(headers));
+    }
+
+    criteria
 }
 
 fn route_hostnames(object: &K8sObject) -> Vec<String> {
@@ -2282,6 +2577,40 @@ fn route_scoped_suffix(
     }
 }
 
+/// Emit one field-specific warning per GRPCRoute match Ferrum refuses to
+/// represent. The match itself is dropped fail-closed by
+/// `route_match_descriptor_for_entry`; this makes the drop visible to
+/// operators instead of leaving a rule silently inert.
+fn warn_unrepresentable_grpc_route_matches(object: &K8sObject, acc: &mut K8sAccumulator) {
+    if object.kind != "GRPCRoute" {
+        return;
+    }
+    for (rule_index, rule) in object
+        .spec
+        .get("rules")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (match_index, entry) in rule
+            .get("matches")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if let Err(reason) = grpc_route_match(entry) {
+                acc.warnings.push(format!(
+                    "GRPCRoute {}/{} rules[{rule_index}].matches[{match_index}] dropped \
+                     fail-closed: {reason}",
+                    object.metadata.namespace, object.metadata.name
+                ));
+            }
+        }
+    }
+}
+
 type HttpRouteResources = (Vec<Proxy>, Vec<PluginConfig>);
 
 fn http_route_resources(
@@ -2302,6 +2631,7 @@ fn http_route_resources(
         .flat_map(|conflicts| conflicts.iter().map(|conflict| conflict.key.clone()))
         .collect();
     let route_kind = object.kind.to_ascii_lowercase();
+    warn_unrepresentable_grpc_route_matches(object, acc);
     let mut proxies = Vec::new();
     let mut plugins = Vec::new();
 
@@ -2508,7 +2838,7 @@ fn http_route_resources(
                         backend_read_timeout_ms: None,
                     });
 
-                    if object.kind == "HTTPRoute" {
+                    if matches!(object.kind.as_str(), "HTTPRoute" | "GRPCRoute") {
                         let skipped_descriptors = skipped_descriptors_for_host(
                             &host_scope.parent_refs,
                             &route_family,
@@ -2713,46 +3043,21 @@ fn http_route_dispatch_rules_for_proxy(
     fault: Option<&Value>,
 ) -> (Vec<Value>, bool) {
     let has_route_actions = !request_transform.is_empty() || redirect.is_some() || fault.is_some();
-    let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
-        if has_route_actions {
-            let default_match = gateway_api_default_path_prefix_match();
-            return (
-                vec![gateway_api_dispatch_route_rule(
-                    object,
-                    default_match.clone(),
-                    rule_index,
-                    0,
-                    route_destination,
-                    request_transform,
-                    redirect,
-                    fault,
-                    &default_match,
-                )],
-                true,
-            );
-        }
-        return (Vec::new(), true);
+    let matches = rule
+        .get("matches")
+        .and_then(Value::as_array)
+        .filter(|matches| !matches.is_empty());
+    let Some(matches) = matches else {
+        return route_default_match_dispatch_rules(
+            object,
+            rule_index,
+            route_destination,
+            request_transform,
+            redirect,
+            fault,
+            has_route_actions,
+        );
     };
-    if matches.is_empty() {
-        if has_route_actions {
-            let default_match = gateway_api_default_path_prefix_match();
-            return (
-                vec![gateway_api_dispatch_route_rule(
-                    object,
-                    default_match.clone(),
-                    rule_index,
-                    0,
-                    route_destination,
-                    request_transform,
-                    redirect,
-                    fault,
-                    &default_match,
-                )],
-                true,
-            );
-        }
-        return (Vec::new(), true);
-    }
 
     let mut rules = Vec::new();
     let mut has_path_only_match = false;
@@ -2772,54 +3077,17 @@ fn http_route_dispatch_rules_for_proxy(
             continue;
         }
 
-        let mut match_criteria = serde_json::Map::new();
-        if let Some(method) = string_field(entry, "method") {
-            match_criteria.insert("methods".to_string(), serde_json::json!([method]));
-        }
-
-        if let Some(headers_array) = entry.get("headers").and_then(Value::as_array) {
-            let mut headers = serde_json::Map::new();
-            for header in headers_array {
-                if !gateway_match_type_is_exact(header) {
-                    continue;
-                }
-                let Some(name) = string_field(header, "name") else {
-                    continue;
-                };
-                let Some(value) = string_field(header, "value") else {
-                    continue;
-                };
-                let name = name.to_ascii_lowercase();
-                if !headers.contains_key(&name) {
-                    headers.insert(name, Value::String(value.to_string()));
-                }
-            }
-            if !headers.is_empty() {
-                match_criteria.insert("headers".to_string(), Value::Object(headers));
-            }
-        }
-
-        if let Some(params_array) = entry.get("queryParams").and_then(Value::as_array) {
-            let mut params = serde_json::Map::new();
-            for param in params_array {
-                if !gateway_match_type_is_exact(param) {
-                    continue;
-                }
-                let Some(name) = string_field(param, "name") else {
-                    continue;
-                };
-                let Some(value) = string_field(param, "value") else {
-                    continue;
-                };
-                let name = name.to_string();
-                if !params.contains_key(&name) {
-                    params.insert(name, Value::String(value.to_string()));
-                }
-            }
-            if !params.is_empty() {
-                match_criteria.insert("query_params".to_string(), Value::Object(params));
-            }
-        }
+        let match_criteria = if object.kind == "GRPCRoute" {
+            // Fail closed on a gRPC predicate Ferrum cannot represent — the
+            // descriptor pass already dropped it, so emitting an unguarded
+            // rule here would resurrect it as a widened match.
+            let Some(criteria) = grpc_dispatch_match_criteria(entry) else {
+                continue;
+            };
+            criteria
+        } else {
+            http_route_dispatch_match_criteria(entry)
+        };
 
         if match_criteria.is_empty() {
             has_path_only_match = true;
@@ -2853,6 +3121,121 @@ fn http_route_dispatch_rules_for_proxy(
     }
 
     (rules, has_path_only_match)
+}
+
+fn http_route_dispatch_match_criteria(entry: &Value) -> serde_json::Map<String, Value> {
+    let mut match_criteria = serde_json::Map::new();
+    if let Some(method) = string_field(entry, "method") {
+        match_criteria.insert("methods".to_string(), serde_json::json!([method]));
+    }
+
+    if let Some(headers_array) = entry.get("headers").and_then(Value::as_array) {
+        let mut headers = serde_json::Map::new();
+        for header in headers_array {
+            if !gateway_match_type_is_exact(header) {
+                continue;
+            }
+            let Some(name) = string_field(header, "name") else {
+                continue;
+            };
+            let Some(value) = string_field(header, "value") else {
+                continue;
+            };
+            let name = name.to_ascii_lowercase();
+            if !headers.contains_key(&name) {
+                headers.insert(name, Value::String(value.to_string()));
+            }
+        }
+        if !headers.is_empty() {
+            match_criteria.insert("headers".to_string(), Value::Object(headers));
+        }
+    }
+
+    if let Some(params_array) = entry.get("queryParams").and_then(Value::as_array) {
+        let mut params = serde_json::Map::new();
+        for param in params_array {
+            if !gateway_match_type_is_exact(param) {
+                continue;
+            }
+            let Some(name) = string_field(param, "name") else {
+                continue;
+            };
+            let Some(value) = string_field(param, "value") else {
+                continue;
+            };
+            let name = name.to_string();
+            if !params.contains_key(&name) {
+                params.insert(name, Value::String(value.to_string()));
+            }
+        }
+        if !params.is_empty() {
+            match_criteria.insert("query_params".to_string(), Value::Object(params));
+        }
+    }
+
+    match_criteria
+}
+
+/// Dispatch rules for a rule whose `matches` is omitted or empty.
+///
+/// For an HTTPRoute that is an unconditional `/` catch-all, so a rule is only
+/// emitted when it carries route-local actions and the caller keeps
+/// `has_path_only_match = true` (unmatched requests fall through to the
+/// proxy's default backend).
+///
+/// For a GRPCRoute the Gateway API defines it as "every gRPC call on the
+/// route's hostnames" — which is NOT the same as every HTTP request. It
+/// therefore always emits a rule carrying the gRPC-shape URI predicate plus
+/// the content-type gate, and reports `has_path_only_match = false` so
+/// `reject_unmatched` keeps non-gRPC traffic off the backend.
+#[allow(clippy::too_many_arguments)]
+fn route_default_match_dispatch_rules(
+    object: &K8sObject,
+    rule_index: usize,
+    route_destination: MeshRouteDispatchDestination<'_>,
+    request_transform: &[Value],
+    redirect: Option<&Value>,
+    fault: Option<&Value>,
+    has_route_actions: bool,
+) -> (Vec<Value>, bool) {
+    if object.kind == "GRPCRoute" {
+        let entry = Value::Object(serde_json::Map::new());
+        let criteria = grpc_dispatch_match_criteria_for(&grpc_any_call_match());
+        return (
+            vec![gateway_api_dispatch_route_rule(
+                object,
+                Value::Object(criteria),
+                rule_index,
+                0,
+                route_destination,
+                request_transform,
+                redirect,
+                fault,
+                &entry,
+            )],
+            false,
+        );
+    }
+
+    if has_route_actions {
+        let default_match = gateway_api_default_path_prefix_match();
+        return (
+            vec![gateway_api_dispatch_route_rule(
+                object,
+                default_match.clone(),
+                rule_index,
+                0,
+                route_destination,
+                request_transform,
+                redirect,
+                fault,
+                &default_match,
+            )],
+            true,
+        );
+    }
+
+    (Vec::new(), true)
 }
 
 fn gateway_api_default_path_prefix_match() -> Value {
@@ -3178,10 +3561,17 @@ fn gateway_api_dispatch_rule_precedence(
     match_index: usize,
 ) -> Value {
     let mut precedence = serde_json::Map::new();
-    precedence.insert(
-        "method_match".to_string(),
-        Value::Bool(string_field(entry, "method").is_some()),
-    );
+    // HTTPRoute `matches[].method` is a string; GRPCRoute's is an object
+    // carrying `service`/`method`. Both count as a method predicate for
+    // dispatch-order specificity.
+    let method_match = if object.kind == "GRPCRoute" {
+        entry
+            .get("method")
+            .is_some_and(|method| !method.is_null() && method.as_object().is_some())
+    } else {
+        string_field(entry, "method").is_some()
+    };
+    precedence.insert("method_match".to_string(), Value::Bool(method_match));
     precedence.insert(
         "header_count".to_string(),
         serde_json::json!(translated_header_match_count(entry)),
@@ -7000,11 +7390,32 @@ mod tests {
         );
     }
 
+    fn grpc_dispatch_plugin<'a>(
+        result: &'a crate::config_sources::k8s::K8sTranslation,
+        proxy: &Proxy,
+    ) -> &'a PluginConfig {
+        result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+            })
+            .expect("gRPC predicate proxy carries a mesh_route_dispatch plugin")
+    }
+
+    fn grpc_catch_all_proxy(result: &crate::config_sources::k8s::K8sTranslation) -> &Proxy {
+        result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.listen_path.as_deref() == Some("/"))
+            .expect("pathless gRPC predicate materializes a `/` listener")
+    }
+
     #[test]
-    fn grpc_route_drops_pathless_method_only_matches() {
-        // GRPCRoute method-only matches (no explicit path) must NOT create
-        // a catch-all "/" proxy. Until per-method dispatch is implemented,
-        // pathless matches are dropped to prevent overbroad traffic routing.
+    fn grpc_route_service_and_method_match_becomes_exact_path() {
         let result = translate_k8s_objects(
             &[object(
                 "GRPCRoute",
@@ -7023,9 +7434,437 @@ mod tests {
         )
         .expect("translation succeeds");
 
+        let mut paths: Vec<_> = result
+            .config
+            .proxies
+            .iter()
+            .filter_map(|proxy| proxy.listen_path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "=/helloworld.Greeter/SayGoodbye".to_string(),
+                "=/helloworld.Greeter/SayHello".to_string(),
+            ],
+            "fully-qualified gRPC methods must become exact listen paths, not a catch-all"
+        );
         assert!(
-            result.config.proxies.is_empty(),
-            "pathless GRPCRoute matches should not produce proxies"
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+            "an exact gRPC path needs no request-time predicate"
+        );
+    }
+
+    #[test]
+    fn grpc_route_service_only_match_becomes_service_prefix() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [{"method": {"service": "helloworld.Greeter"}}],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("/helloworld.Greeter/"),
+            "a service-only match is a single-service prefix, never `/`"
+        );
+    }
+
+    #[test]
+    fn grpc_route_method_only_match_uses_grpc_uri_predicate() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [{"method": {"method": "SayHello"}}],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        assert_eq!(
+            plugin.config["reject_unmatched"].as_bool(),
+            Some(true),
+            "a predicate-only gRPC route must not serve unmatched traffic from the `/` listener"
+        );
+        let matcher = &plugin.config["rules"][0]["match"];
+        let pattern = matcher["uri"]["regex"]
+            .as_str()
+            .expect("method-only match carries a URI regex");
+        assert_eq!(pattern, "/[^/]+/SayHello");
+        assert_eq!(
+            matcher["headers"]["content-type"]["prefix"].as_str(),
+            Some("application/grpc"),
+            "a pathless gRPC predicate must be gated on the gRPC content type"
+        );
+
+        let compiled = compile_grpc_uri_regex(pattern).expect("emitted pattern compiles");
+        assert!(compiled.is_match("/helloworld.Greeter/SayHello"));
+        assert!(compiled.is_match("/other.Svc/SayHello"));
+        assert!(!compiled.is_match("/helloworld.Greeter/SayHelloAgain"));
+        assert!(!compiled.is_match("/SayHello"));
+        assert!(!compiled.is_match("/a/b/SayHello"));
+    }
+
+    #[test]
+    fn grpc_route_header_only_match_gates_on_grpc_shape_and_content_type() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [{"headers": [{"name": "X-Tenant", "value": "a"}]}],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        let matcher = &plugin.config["rules"][0]["match"];
+        assert_eq!(matcher["uri"]["regex"].as_str(), Some("/[^/]+/[^/]+"));
+        assert_eq!(matcher["headers"]["x-tenant"].as_str(), Some("a"));
+        assert_eq!(
+            matcher["headers"]["content-type"]["prefix"].as_str(),
+            Some("application/grpc")
+        );
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn grpc_route_regex_method_match_stays_inside_its_path_segment() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [{"method": {
+                            "type": "RegularExpression",
+                            "service": "helloworld\\..*",
+                            "method": "Say.*"
+                        }}],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        let pattern = plugin.config["rules"][0]["match"]["uri"]["regex"]
+            .as_str()
+            .expect("regex method match carries a URI regex");
+        assert_eq!(pattern, "/(?:helloworld\\..*)/(?:Say.*)");
+        let compiled = compile_grpc_uri_regex(pattern).expect("emitted pattern compiles");
+        assert!(compiled.is_match("/helloworld.Greeter/SayHello"));
+        assert!(!compiled.is_match("/other.Greeter/SayHello"));
+        assert!(!compiled.is_match("/helloworld.Greeter/Ping"));
+    }
+
+    #[test]
+    fn grpc_route_regex_operand_alternation_cannot_escape_its_segment() {
+        // A top-level alternation must stay grouped, otherwise
+        // `svc|.*` would widen the whole expression to "any path".
+        let plan = grpc_route_method_plan(&serde_json::json!({
+            "type": "RegularExpression",
+            "service": "a|b"
+        }))
+        .expect("alternation operand is accepted");
+        let GrpcRouteMatchPlan::UriRegex { pattern } = plan else {
+            panic!("regex method match must be a URI predicate");
+        };
+        assert_eq!(pattern, "/(?:a|b)/(?:[^/]+)");
+        let compiled = compile_grpc_uri_regex(&pattern).expect("compiles");
+        assert!(compiled.is_match("/a/Ping"));
+        assert!(compiled.is_match("/b/Ping"));
+        assert!(!compiled.is_match("/c/Ping"));
+        assert!(!compiled.is_match("/anything/else/here"));
+    }
+
+    #[test]
+    fn grpc_route_unrepresentable_matches_are_dropped_with_field_diagnostics() {
+        for (entry, expected_fragment) in [
+            (
+                serde_json::json!({"method": {"type": "Prefix", "service": "a.B"}}),
+                "matches[].method.type 'Prefix' is not supported",
+            ),
+            (
+                serde_json::json!({"method": {}}),
+                "matches[].method requires at least one of service / method",
+            ),
+            (
+                serde_json::json!({"method": {"service": "a/B"}}),
+                "matches[].method.service must contain only ASCII alphanumerics",
+            ),
+            (
+                serde_json::json!({"method": {"service": ""}}),
+                "matches[].method.service must not be empty",
+            ),
+            (
+                serde_json::json!({
+                    "method": {"type": "RegularExpression", "service": "a("}
+                }),
+                "matches[].method.service regex is invalid",
+            ),
+            (
+                serde_json::json!({
+                    "method": {"type": "RegularExpression", "service": "a/b"}
+                }),
+                "matches[].method.service regex must not contain '/'",
+            ),
+            (
+                serde_json::json!({
+                    "method": {"service": "a.B", "method": "C"},
+                    "headers": [{"type": "RegularExpression", "name": "x", "value": ".*"}]
+                }),
+                "matches[].headers[].type 'RegularExpression' is not supported",
+            ),
+            (
+                serde_json::json!({"headers": [{"name": "x"}]}),
+                "matches[].headers[].value is required",
+            ),
+        ] {
+            let reason = grpc_route_match(&entry)
+                .expect_err("unrepresentable gRPC match must fail closed")
+                .to_string();
+            assert!(
+                reason.contains(expected_fragment),
+                "expected `{expected_fragment}` in `{reason}`"
+            );
+
+            let result = translate_k8s_objects(
+                &[object(
+                    "GRPCRoute",
+                    serde_json::json!({
+                        "hostnames": ["grpc.example.com"],
+                        "rules": [{
+                            "matches": [entry],
+                            "backendRefs": [{"name": "grpc-api"}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect("translation succeeds");
+
+            assert!(
+                result.config.proxies.is_empty(),
+                "unrepresentable gRPC match must not materialize a route: {reason}"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("dropped fail-closed")
+                        && warning.contains(expected_fragment)),
+                "expected a field-specific drop warning for `{expected_fragment}` in {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_route_without_matches_still_gates_on_grpc_shape() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{"backendRefs": [{"name": "grpc-api"}]}]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        assert_eq!(
+            plugin.config["rules"][0]["match"]["uri"]["regex"].as_str(),
+            Some("/[^/]+/[^/]+"),
+            "a match-less GRPCRoute matches every gRPC call, not every HTTP request"
+        );
+        assert_eq!(
+            plugin.config["rules"][0]["match"]["headers"]["content-type"]["prefix"].as_str(),
+            Some("application/grpc")
+        );
+    }
+
+    #[test]
+    fn grpc_route_preserves_rule_order_and_fallthrough_on_shared_listener() {
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [
+                        {
+                            "matches": [{
+                                "method": {"method": "SayHello"},
+                                "headers": [{"name": "x-tenant", "value": "a"}]
+                            }],
+                            "backendRefs": [{"name": "tenant-a", "port": 50051}]
+                        },
+                        {
+                            "matches": [{"method": {"method": "SayHello"}}],
+                            "backendRefs": [{"name": "shared", "port": 50052}]
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        assert_eq!(
+            result.config.proxies.len(),
+            1,
+            "both pathless rules collapse onto one `/` listener"
+        );
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        let rules = plugin.config["rules"]
+            .as_array()
+            .expect("ordered dispatch rules");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0]["match"]["headers"]["x-tenant"].as_str(),
+            Some("a"),
+            "the more specific header-bearing rule must be evaluated first"
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(50051));
+        assert!(rules[1]["match"]["headers"].get("x-tenant").is_none());
+        assert_eq!(rules[1]["destination"]["backend_port"].as_u64(), Some(50052));
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn grpc_route_coexists_with_http_route_on_the_same_host_and_path() {
+        let mut http_route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["edge.example.com"],
+                "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+            }),
+        );
+        http_route.metadata.name = "web".to_string();
+        let mut grpc_route = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["edge.example.com"],
+                "rules": [{
+                    "matches": [{"method": {"method": "SayHello"}}],
+                    "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                }]
+            }),
+        );
+        grpc_route.metadata.name = "grpc".to_string();
+
+        let result = translate_k8s_objects(&[http_route, grpc_route], options())
+            .expect("translation succeeds");
+
+        assert_eq!(
+            result.config.proxies.len(),
+            1,
+            "the HTTP catch-all and the gRPC predicate share one `/` listener"
+        );
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        assert_eq!(
+            plugin.config["reject_unmatched"].as_bool(),
+            Some(false),
+            "plain HTTP must still fall through to the HTTPRoute default backend"
+        );
+        let rules = plugin.config["rules"]
+            .as_array()
+            .expect("ordered dispatch rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["match"]["headers"]["content-type"]["prefix"].as_str(),
+            Some("application/grpc")
+        );
+        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(50051));
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+    }
+
+    #[test]
+    fn distinct_grpc_predicates_on_one_listener_do_not_conflict() {
+        let mut hello = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["grpc.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"method": {"method": "SayHello"}}],
+                    "backendRefs": [{"name": "hello", "port": 50051}]
+                }]
+            }),
+        );
+        hello.metadata.name = "hello".to_string();
+        hello.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        let mut goodbye = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["grpc.example.com"],
+                "parentRefs": [{"name": "edge"}],
+                "rules": [{
+                    "matches": [{"method": {"method": "SayGoodbye"}}],
+                    "backendRefs": [{"name": "goodbye", "port": 50052}]
+                }]
+            }),
+        );
+        goodbye.metadata.name = "goodbye".to_string();
+        goodbye.metadata.creation_timestamp = Some("2026-01-02T00:00:00Z".to_string());
+
+        let result =
+            translate_k8s_objects(&[hello, goodbye], options()).expect("translation succeeds");
+
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        let rules = plugin.config["rules"]
+            .as_array()
+            .expect("ordered dispatch rules");
+        assert_eq!(
+            rules.len(),
+            2,
+            "different gRPC methods are different predicates, not a route conflict"
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("conflicted on parent")),
+            "unexpected conflict warning: {:?}",
+            result.warnings
         );
     }
 

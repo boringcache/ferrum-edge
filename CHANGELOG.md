@@ -159,6 +159,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Gateway API `GRPCRoute` predicates are now translated instead of dropped.
+  A pathless `matches[]` entry (method-only, `RegularExpression`, header-only,
+  or a rule with no `matches` at all) previously disappeared during
+  translation, so valid gRPC rules never routed and their traffic fell through
+  or 404'd. gRPC predicates are now represented independently of HTTP paths:
+  an `Exact` `method` with both `service` and `method` becomes an exact
+  `=/{service}/{method}` listen path, a service-only match becomes a
+  `/{service}/` prefix, and every remaining shape materializes on the `/`
+  listener behind a `mesh_route_dispatch` URI regex plus an `application/grpc`
+  `content-type` prefix gate, so a pathless gRPC rule can never capture
+  ordinary HTTP traffic on the same hostname. GRPCRoute now shares HTTPRoute's
+  same-`(hostname, listen path)` collapse, so rule/match ordering and
+  fall-through are preserved and a GRPCRoute can coexist with an HTTPRoute
+  catch-all on the same listener. gRPC shapes Ferrum still cannot represent
+  exactly — an unsupported `method.type`, a `method` block with neither
+  `service` nor `method`, an out-of-alphabet or over-long `Exact` operand, an
+  invalid / `/`-bearing / over-long regex operand, or a non-`Exact` header
+  match — are dropped fail closed with a field-specific translator warning.
+  See
+  [GRPCRoute predicate translation](docs/gateway_api_conformance.md#grpcroute-predicate-translation).
+
 - **Breaking:** `kafka_logging` now fails closed under any restrictive backend
   egress policy, including the default posture. librdkafka resolves bootstrap
   hostnames itself and dials brokers advertised by cluster metadata, and the
