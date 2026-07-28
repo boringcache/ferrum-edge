@@ -5314,7 +5314,7 @@ config:
 
 ### `ai_response_guard`
 
-Validates and filters HTTP LLM response content before it reaches the client. Complements `ai_prompt_shield` (which guards inputs) by providing output-side guardrails including PII detection in responses, keyword/phrase blocklists, and response format validation. Native gRPC is intentionally unsupported: protobuf messages require schema-aware frame/decompression handling, so the plugin is excluded instead of advertising inert enforcement.
+Validates and filters LLM response content before it reaches the client. Complements `ai_prompt_shield` (which guards inputs) by providing output-side guardrails including PII detection in responses, keyword/phrase blocklists, and response format validation. Native gRPC responses are supported through an explicit, descriptor-based `grpc` enrollment block (see **Native gRPC inspection** below); methods that are not enrolled are never decoded, never inspected, and never forced onto the buffered path.
 
 **Priority:** 4075
 
@@ -5331,8 +5331,31 @@ Validates and filters HTTP LLM response content before it reaches the client. Co
 | `require_json` | bool | `false` | Reject responses that are not valid JSON |
 | `required_fields` | String[] | `[]` | Required top-level JSON fields (rejects with 502 if missing) |
 | `max_completion_length` | Integer | `0` | Maximum completion text length in characters — Unicode scalar values, not UTF-8 bytes (0 = unlimited) |
+| `grpc` | Object | — | Native-gRPC inspection contract (see below). Absent means the plugin stays HTTP-only |
 
 At least one of `pii_patterns`, `blocked_phrases`, `blocked_patterns`, `require_json`, `required_fields`, or `max_completion_length` must be configured.
+
+**Native gRPC inspection.** Set `grpc` to enroll specific methods for schema-aware protobuf response inspection. The block is closed (`descriptor_path`, `methods`, `max_message_bytes`, `max_messages`); each `methods` entry is closed too (`response_type`, `text_fields`).
+
+| `grpc` field | Type | Default | Description |
+|---|---|---|---|
+| `descriptor_path` | String | — | **Required.** Node-local path to a compiled `FileDescriptorSet` (`protoc --descriptor_set_out`) |
+| `methods` | Object | — | **Required, non-empty.** Map of `/package.Service/Method` → method contract. Only these methods are inspected |
+| `methods.<path>.response_type` | String | — | **Required.** Fully-qualified response message type, resolved in the descriptor pool at construction |
+| `methods.<path>.text_fields` | String[] | all string fields | Dotted field paths (e.g. `reply.text`) restricting what is scanned and rewritten. Each path must end at a `string` field and may not traverse a `map` field |
+| `max_message_bytes` | Integer | `1048576` | Per-message ceiling, applied to the declared frame length and enforced while inflating a compressed frame |
+| `max_messages` | Integer | `64` | Maximum length-prefixed frames in one buffered response |
+
+Semantics:
+
+- **Enrollment is the whole scope.** A gRPC response whose method is not in `methods` is not inspected and does not vote for response-body buffering, so unrelated gRPC traffic keeps streaming. The method comes from `grpc_full_method` (published by `grpc_method_router`, so a method rewrite is honored) or the canonical request path.
+- **Framing and compression.** The buffered body is parsed as complete length-prefixed frames; a truncated frame, a stray trailing byte, or an unrecognized compressed-flag value is malformed. A compressed frame is inflated only when `grpc-encoding` is `gzip`; any other encoding is uninspectable. Redaction re-frames the response and re-compresses the frames that arrived compressed, so `grpc-encoding` stays truthful. Trailers are never touched.
+- **Streaming.** Server-streaming responses are inspected as their concatenated frames, bounded by `max_messages` and `max_message_bytes`; nothing is buffered without a bound, and exceeding either bound is uninspectable rather than partially inspected.
+- **Redaction is verified, not assumed.** `action: redact` rewrites the selected string fields, re-encodes, then re-parses and re-scans the exact bytes the client would receive. Anything that does not come back clean — a protobuf map key (which, like a JSON object member name, cannot be rewritten), a rewrite that does not survive the round trip, or a gRPC-Web translated response whose body is re-framed by `grpc_web` before this transform could run — is rejected with a gRPC error instead of being reported as redacted.
+- **Fail-closed cases.** For `reject` and `redact`, all of these produce a gRPC error: a descriptor that cannot be read on this node, a payload that does not decode as the configured type, a message carrying fields outside the descriptor (their bytes are not inspectable, so a clean scan of the known fields is not evidence), a body above `max_scan_bytes`, exceeding the walk depth/node budgets, and every framing/compression case above. `action: warn` records the same reasons in `ai_response_guard_warning` and passes the response through.
+- **Not covered.** `bytes` fields are opaque and are not scanned. `require_json` and `required_fields` describe a JSON document model a protobuf message cannot satisfy, so combining either with `grpc` is rejected at construction rather than silently unenforced. Request-side protobuf inspection is `body_validator`'s job.
+- **Reject shape.** A plugin reject on an `application/grpc` response is normalized by the proxy into a trailers-only gRPC error, so clients see a gRPC status rather than an HTTP JSON body.
+- **Config admission.** The `grpc` block is validated shape-only at Admin/CP admission (no data-plane descriptor file required) and against the real `FileDescriptorSet` by mode-aware file-dependency validation: fatal in file mode, warn in DB mode, and rejected-with-retained-generation on a DP. A readable but invalid descriptor rejects the candidate configuration; an absent descriptor keeps the enrollment set so enrolled methods fail closed at request time.
 
 **Built-in PII patterns** (same as `ai_prompt_shield`): `ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`
 
@@ -5363,6 +5386,22 @@ config:
     - name: profanity
       regex: "\\b(?:badword1|badword2)\\b"
   max_completion_length: 10000
+```
+
+Native gRPC example:
+
+```yaml
+plugin_name: ai_response_guard
+config:
+  action: redact
+  pii_patterns: [ssn, email]
+  grpc:
+    descriptor_path: /etc/ferrum/descriptors/assistant.bin
+    max_messages: 32
+    methods:
+      "/assistant.Chat/Complete":
+        response_type: assistant.CompleteResponse
+        text_fields: ["reply.text"]
 ```
 
 ### AI Plugin Composition Example

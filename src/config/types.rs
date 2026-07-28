@@ -9289,8 +9289,9 @@ impl GatewayConfig {
     }
 
     /// Validate file dependencies for plugins that reference external files
-    /// (e.g., geo_restriction `.mmdb` databases, body_validator protobuf
-    /// descriptors, and `udp_logging` DTLS sources).
+    /// (e.g., geo_restriction `.mmdb` databases, `body_validator` and
+    /// `ai_response_guard` protobuf descriptors, and `udp_logging` DTLS
+    /// sources).
     ///
     /// This is separate from `validate_all_fields_with_ip_policy()` so that
     /// each mode can handle missing files independently:
@@ -9342,6 +9343,13 @@ impl GatewayConfig {
             Result<prost_reflect::DescriptorPool, String>,
         >::new();
         let mut reported_protobuf_path_errors = std::collections::HashSet::new();
+        // Kept separate from the `body_validator` cache above so a shared path
+        // cannot report one plugin's diagnostic under the other plugin's name.
+        let mut guard_descriptor_cache = std::collections::HashMap::<
+            String,
+            Result<prost_reflect::DescriptorPool, String>,
+        >::new();
+        let mut reported_guard_path_errors = std::collections::HashSet::new();
         // Identical enabled UDP DTLS validation inputs share one materialization
         // (provider/file read) per pass; cached errors are still attached to
         // each affected PluginConfig id.
@@ -9388,6 +9396,33 @@ impl GatewayConfig {
                             Err(error)
                                 if reported_protobuf_path_errors.insert(path.to_string()) =>
                             {
+                                errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                    }
+                }
+            }
+            if pc.plugin_name == "ai_response_guard" {
+                use crate::plugins::ai_response_guard as guard;
+                match guard::grpc_descriptor_path(&pc.config) {
+                    Ok(Some(path)) => {
+                        let cached = guard_descriptor_cache
+                            .entry(path.clone())
+                            .or_insert_with(|| guard::load_grpc_descriptor_pool(&path));
+                        match cached {
+                            Ok(pool) => {
+                                if let Err(error) =
+                                    guard::validate_grpc_descriptor_config(&pc.config, pool)
+                                {
+                                    errors.push(format!("PluginConfig '{}': {}", pc.id, error));
+                                }
+                            }
+                            Err(error) if reported_guard_path_errors.insert(path.clone()) => {
                                 errors.push(format!("PluginConfig '{}': {}", pc.id, error));
                             }
                             Err(_) => {}
