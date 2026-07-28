@@ -123,7 +123,9 @@ use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1734,6 +1736,51 @@ pub enum ResponsePresentationPolicy {
     Dynamic,
 }
 
+/// Frontend-supplied watch on the client transport carrying a request.
+///
+/// Implementations must be observable **without** reading or polling the
+/// request body: the request stream stays owned by the proxy path, and no
+/// detached watcher may race it for bytes. A QUIC connection-close watch
+/// qualifies; draining a socket to "check liveness" does not.
+pub trait PeerConnectionWatch: Send + Sync {
+    /// Resolve once the client transport is known to be gone.
+    ///
+    /// Must be cancel-safe: callers place it in a `select!` and drop it when
+    /// another branch wins.
+    fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Non-blocking check for an already-closed transport.
+    fn is_closed(&self) -> bool;
+}
+
+/// Cloneable handle to a [`PeerConnectionWatch`].
+#[derive(Clone)]
+pub struct PeerConnectionSignal(Arc<dyn PeerConnectionWatch>);
+
+impl PeerConnectionSignal {
+    pub fn new(watch: Arc<dyn PeerConnectionWatch>) -> Self {
+        Self(watch)
+    }
+
+    /// See [`PeerConnectionWatch::closed`].
+    pub fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.0.closed()
+    }
+
+    /// See [`PeerConnectionWatch::is_closed`].
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+impl std::fmt::Debug for PeerConnectionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque on purpose: the underlying handle carries transport state
+        // that has no business in a `RequestContext` debug dump.
+        f.write_str("PeerConnectionSignal")
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2286,6 +2333,19 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Optional watch on the *client transport* carrying this request.
+    ///
+    /// Stamped by frontends that can observe peer departure without polling
+    /// (and therefore without competing for ownership of) the request body.
+    /// Today that is the HTTP/3 frontend, which watches QUIC connection close.
+    /// `None` on HTTP/1.1 and HTTP/2, where hyper owns the connection state and
+    /// no such side-channel exists.
+    ///
+    /// Only deliberately parked work consults this — currently injected fault
+    /// delays. It is not a general request-cancellation channel and must not
+    /// become one without a hot-path review: awaiting it costs a boxed future.
+    #[doc(hidden)]
+    pub peer_connection: Option<PeerConnectionSignal>,
     /// Aggregate fail-closed decision staged by cache-managed
     /// `mesh_route_dispatch` instances. The cache inserts a finalizer directly
     /// after the last instance so disjoint rules can all participate before a
@@ -2555,6 +2615,7 @@ impl RequestContext {
             max_response_body_size_bytes: 0,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            peer_connection: None,
             mesh_route_dispatch_reject_unmatched: false,
             mesh_route_dispatch_matched: false,
             route_override_upstream_id: None,
@@ -3380,6 +3441,7 @@ impl RequestContext {
             max_response_body_size_bytes: self.max_response_body_size_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
+            peer_connection: self.peer_connection.clone(),
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
             mesh_route_dispatch_matched: self.mesh_route_dispatch_matched,
             route_override_upstream_id: self.route_override_upstream_id.clone(),

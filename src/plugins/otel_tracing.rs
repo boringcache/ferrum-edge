@@ -2648,18 +2648,12 @@ fn normalized_url_hostname(url: &Url) -> Option<String> {
 }
 
 /// Structurally redacted collector URL for diagnostics (path/query omitted).
+///
+/// Delegates to the shared sink helper so every HTTP-backed collector renders
+/// one identical form. Retained as a named item because the exporter config and
+/// unit tests refer to it directly.
 pub(crate) fn redacted_endpoint_url(endpoint: &Url) -> String {
-    let host = match endpoint.host() {
-        Some(Host::Domain(host)) => host.to_string(),
-        Some(Host::Ipv4(host)) => host.to_string(),
-        Some(Host::Ipv6(host)) => format!("[{host}]"),
-        None => "redacted-host".to_string(),
-    };
-    let port = endpoint
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    format!("{}://{}{}/redacted", endpoint.scheme(), host, port)
+    super::utils::redacted_endpoint_url(endpoint)
 }
 
 pub(crate) fn build_traceparent(
