@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::util::json_dup_keys::{self, JsonScanMemo};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
@@ -993,14 +994,16 @@ impl Plugin for OpenapiValidator {
             self.mark_skip(ctx, "content_type");
             return PluginResult::Continue;
         };
-        match validate_media_body(
+        let result = validate_media_body(
             headers,
             body,
             content_type,
             validator,
             self.max_body_bytes,
             ValidationSide::Request,
-        ) {
+            Some(&mut ctx.json_scan_memo),
+        );
+        match result {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
@@ -1192,14 +1195,16 @@ impl Plugin for OpenapiValidator {
                 );
             }
         };
-        match validate_media_body(
+        let result = validate_media_body(
             response_headers,
             body,
             content_type,
             validator,
             self.max_body_bytes,
             ValidationSide::Response,
-        ) {
+            Some(&mut ctx.json_scan_memo),
+        );
+        match result {
             Ok(()) => PluginResult::Continue,
             Err(error) => self.handle_violation(
                 ctx,
@@ -2087,6 +2092,20 @@ enum SchemaInstance {
     BinaryLengthOnly,
 }
 
+/// Duplicate-object-member screen for a governed JSON document, reusing the
+/// per-request memo when one is available so a multi-plugin chain scans one
+/// buffered body once.
+///
+/// The returned reason is a fixed-cardinality `&'static str` that never echoes
+/// any byte of the inspected body, so it is safe on both the request-side
+/// (client-visible) and response-side error paths.
+fn screen_json_ambiguity(body: &[u8], memo: Option<&mut JsonScanMemo>) -> Option<&'static str> {
+    match memo {
+        Some(memo) => memo.ambiguity(body),
+        None => json_dup_keys::slice_ambiguity(body),
+    }
+}
+
 fn validate_media_body(
     headers: &HashMap<String, String>,
     body: &[u8],
@@ -2094,19 +2113,27 @@ fn validate_media_body(
     validator: &MediaValidator,
     max_body_bytes: usize,
     side: ValidationSide,
+    json_scan_memo: Option<&mut JsonScanMemo>,
 ) -> Result<(), String> {
-    let instance = body_to_schema_instance(headers, body, content_type, validator, max_body_bytes)
-        .map_err(|error| match side {
-            ValidationSide::Request => error,
-            ValidationSide::Response => {
-                // Conversion errors can contain backend-controlled scalar,
-                // multipart, XML, or header values. Schema failures below have a
-                // structured safe formatter; conversion failures deliberately
-                // expose no backend bytes.
-                "Response body could not be safely decoded or converted for schema validation"
-                    .to_string()
-            }
-        })?;
+    let instance = body_to_schema_instance(
+        headers,
+        body,
+        content_type,
+        validator,
+        max_body_bytes,
+        json_scan_memo,
+    )
+    .map_err(|error| match side {
+        ValidationSide::Request => error,
+        ValidationSide::Response => {
+            // Conversion errors can contain backend-controlled scalar,
+            // multipart, XML, or header values. Schema failures below have a
+            // structured safe formatter; conversion failures deliberately
+            // expose no backend bytes.
+            "Response body could not be safely decoded or converted for schema validation"
+                .to_string()
+        }
+    })?;
     match instance {
         SchemaInstance::Value(instance) => validator
             .validator
@@ -2122,6 +2149,7 @@ fn body_to_schema_instance(
     content_type: Option<&str>,
     validator: &MediaValidator,
     max_body_bytes: usize,
+    json_scan_memo: Option<&mut JsonScanMemo>,
 ) -> Result<SchemaInstance, String> {
     let schema = validator.schema.as_ref();
     let encoding = &validator.encoding;
@@ -2131,6 +2159,15 @@ fn body_to_schema_instance(
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     if is_json_media_type(&media_type) {
+        // Screen for duplicate object member names BEFORE the schema sees a
+        // `serde_json`-collapsed view of the document (advisory
+        // `GHSA-c78j-5w9p-cpq6`). Validating the last-wins value while
+        // forwarding the original bytes lets a first-key-wins backend act on a
+        // schema-forbidden earlier value, so ambiguity is rejected outright
+        // rather than canonicalized.
+        if let Some(reason) = screen_json_ambiguity(decoded.as_ref(), json_scan_memo) {
+            return Err(reason.to_string());
+        }
         return serde_json::from_slice(decoded.as_ref())
             .map(SchemaInstance::Value)
             .map_err(|error| format!("Invalid JSON body: {error}"));
@@ -3641,6 +3678,15 @@ fn multipart_part_to_schema_value(
                 .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
         {
             if is_json_media_type(&media_type) {
+                // Form-derived embedded JSON is governed by the same schema, so
+                // it gets the same duplicate-member screen as a top-level JSON
+                // body — the enclosing multipart body is not itself JSON, so
+                // nothing else screens these bytes. No memo: a part is a
+                // bounded fragment that is never the whole body another plugin
+                // re-screens, so it could only evict useful entries.
+                if let Some(reason) = screen_json_ambiguity(&part.body, None) {
+                    return Err(format!("Multipart field '{}': {reason}", part.name));
+                }
                 return serde_json::from_slice(&part.body).map_err(|error| {
                     format!(
                         "Multipart field '{}' contains invalid JSON: {error}",

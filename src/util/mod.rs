@@ -9,5 +9,6 @@ pub mod body_limit;
 pub mod cidr;
 pub mod conn_limit;
 pub mod http_headers;
+pub mod json_dup_keys;
 pub mod sharding;
 pub mod unknown_keys;
