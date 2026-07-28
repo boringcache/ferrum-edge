@@ -2735,27 +2735,16 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
-        // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
-        // extended filename parameters as an ordinary non-file field would
-        // re-enable structured JSON/XML body spoofing. Reject unsupported
-        // extended/continued forms instead of dropping their file semantics.
-        if params.keys().any(|key| key.starts_with("filename*")) {
-            return Err(
-                "Malformed multipart part: extended filename parameters are unsupported"
-                    .to_string(),
-            );
-        }
         if name.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
-        if let Some(filename) = params.get("filename")
-            && filename.value.len() > MAX_MULTIPART_PARAM_BYTES
-        {
-            return Err("Multipart filename exceeds size limit".to_string());
-        }
+        // Resolve ordinary `filename` and RFC 5987/8187 `filename*` with
+        // fail-closed conflict/continuation rules. Presence of either form
+        // marks a file part so structured JSON/XML body spoofing stays closed.
+        let filename = resolve_multipart_filename(&params)?;
         parts.push(MultipartPart {
             name: name.to_string(),
-            filename: params.get("filename").map(|value| value.value.clone()),
+            filename,
             content_type: headers.get("content-type").cloned(),
             headers,
             body: part_body.to_vec(),
@@ -4609,6 +4598,191 @@ fn decode_header_param_value(value: &str) -> Result<HeaderParamValue, String> {
         value: value.to_string(),
         was_quoted: false,
     })
+}
+
+/// Resolve the effective multipart filename from Content-Disposition params.
+///
+/// Supports ordinary RFC 7578 `filename` and a single RFC 5987/8187
+/// `filename*` extended value (`charset'language'value-chars`). Continuations
+/// (`filename*0*`, …), duplicates, ambiguous `filename`+`filename*`,
+/// unsupported charsets, malformed percent-encoding, invalid UTF-8, CR/LF/NUL,
+/// and encoded/decoded length overflow fail closed. Either form marks a file
+/// part so structured body spoofing cannot demote the part to a non-file field.
+fn resolve_multipart_filename(
+    params: &HashMap<String, HeaderParamValue>,
+) -> Result<Option<String>, String> {
+    let mut filename_star: Option<&HeaderParamValue> = None;
+    for (key, value) in params {
+        if key == "filename*" {
+            filename_star = Some(value);
+        } else if key.starts_with("filename*") {
+            // RFC 2231 continuations / sectioned forms are unsupported.
+            return Err(
+                "Malformed multipart part: filename* continuations are unsupported".to_string(),
+            );
+        }
+    }
+
+    let ordinary = params.get("filename");
+    match (ordinary, filename_star) {
+        (Some(_), Some(_)) => Err(
+            "Malformed multipart part: ambiguous filename and filename* parameters".to_string(),
+        ),
+        (Some(ordinary), None) => {
+            if ordinary.value.len() > MAX_MULTIPART_PARAM_BYTES {
+                return Err("Multipart filename exceeds size limit".to_string());
+            }
+            reject_filename_injection(&ordinary.value)?;
+            Ok(Some(ordinary.value.clone()))
+        }
+        (None, Some(extended)) => {
+            let decoded = decode_rfc8187_filename_star(&extended.value)?;
+            Ok(Some(decoded))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Decode RFC 8187 `ext-value` for `filename*`: `charset'language'value-chars`.
+///
+/// Supported charset is UTF-8 only (case-insensitive). Language tags, when
+/// present, must be a conservative ASCII subset and are otherwise ignored for
+/// decoding. `value-chars` may contain only `attr-char` and well-formed
+/// percent-encoded octets; the decoded byte sequence must be valid UTF-8.
+fn decode_rfc8187_filename_star(raw: &str) -> Result<String, String> {
+    if raw.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* exceeds size limit".to_string());
+    }
+    let Some((charset, rest)) = raw.split_once('\'') else {
+        return Err(
+            "Malformed multipart part: filename* must use charset'language'value form".to_string(),
+        );
+    };
+    let Some((language, value_chars)) = rest.split_once('\'') else {
+        return Err(
+            "Malformed multipart part: filename* must use charset'language'value form".to_string(),
+        );
+    };
+    if !charset.eq_ignore_ascii_case("utf-8") {
+        return Err(format!(
+            "Malformed multipart part: unsupported filename* charset '{charset}' (only UTF-8 is supported)"
+        ));
+    }
+    if !is_supported_rfc8187_language(language) {
+        return Err("Malformed multipart part: invalid filename* language tag".to_string());
+    }
+    if value_chars.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* exceeds size limit".to_string());
+    }
+    let decoded_bytes = decode_rfc8187_value_chars(value_chars)?;
+    if decoded_bytes.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* decoded value exceeds size limit".to_string());
+    }
+    let decoded = String::from_utf8(decoded_bytes).map_err(|_| {
+        "Malformed multipart part: filename* decoded value is not valid UTF-8".to_string()
+    })?;
+    reject_filename_injection(&decoded)?;
+    Ok(decoded)
+}
+
+fn is_supported_rfc8187_language(language: &str) -> bool {
+    // Empty language is common (`UTF-8''file.txt`). Non-empty tags are limited
+    // to a conservative Language-Tag subset: 1*8ALPHA *("-" 1*8alphanum).
+    if language.is_empty() {
+        return true;
+    }
+    let mut parts = language.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(1..=8).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    for subtag in parts {
+        if !(1..=8).contains(&subtag.len()) || !subtag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn decode_rfc8187_value_chars(value_chars: &str) -> Result<Vec<u8>, String> {
+    let bytes = value_chars.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let Some(hi) = bytes
+                    .get(index + 1)
+                    .copied()
+                    .and_then(|byte| char::from(byte).to_digit(16))
+                else {
+                    return Err(
+                        "Malformed multipart part: filename* contains malformed percent-encoding"
+                            .to_string(),
+                    );
+                };
+                let Some(lo) = bytes
+                    .get(index + 2)
+                    .copied()
+                    .and_then(|byte| char::from(byte).to_digit(16))
+                else {
+                    return Err(
+                        "Malformed multipart part: filename* contains malformed percent-encoding"
+                            .to_string(),
+                    );
+                };
+                out.push(((hi << 4) | lo) as u8);
+                index += 3;
+            }
+            byte if is_rfc8187_attr_char(byte) => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => {
+                return Err(
+                    "Malformed multipart part: filename* value contains characters outside attr-char"
+                        .to_string(),
+                );
+            }
+        }
+        if out.len() > MAX_MULTIPART_PARAM_BYTES {
+            return Err("Multipart filename* decoded value exceeds size limit".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// RFC 8187 `attr-char`.
+fn is_rfc8187_attr_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
+fn reject_filename_injection(filename: &str) -> Result<(), String> {
+    if filename.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+        return Err(
+            "Malformed multipart part: filename contains CR, LF, or NUL".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.

@@ -2691,6 +2691,313 @@ async fn multipart_file_part_with_structured_content_type_validates_actual_metad
 }
 
 #[tokio::test]
+async fn multipart_filename_star_decodes_utf8_extended_value() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "résumé.txt"},
+                                    "content_type": {"type": "string", "const": "text/plain"},
+                                    "size": {"type": "integer", "const": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    // UTF-8 percent-encoded non-ASCII filename via RFC 8187 ext-value.
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+
+    // Language tag is accepted and ignored for decoding.
+    let with_lang = body.replace(
+        "filename*=UTF-8''r%C3%A9sum%C3%A9.txt",
+        "filename*=utf-8'en'r%C3%A9sum%C3%A9.txt",
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, with_lang.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_filename_star_hostile_inputs_fail_closed() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename"],
+                                "properties": {
+                                    "filename": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let cases: &[(&str, &str)] = &[
+        (
+            "ambiguous ordinary filename plus filename*",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"; filename*=UTF-8''a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "RFC 2231 continuation",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*0*=UTF-8''a; filename*1*=.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "unsupported charset",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=ISO-8859-1''a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "malformed percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%GGtxt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "truncated percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%C3\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "invalid UTF-8 after percent-decoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''%80.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "CR injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%0D.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "LF injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%0A.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "NUL injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%00.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "raw space outside attr-char",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a b.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "missing charset/language delimiters",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "invalid language tag",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8'en_US'a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+    ];
+
+    for (label, body) in cases {
+        let mut ctx = post_ctx("/upload");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+            Some(400),
+        );
+        assert!(
+            request_error(&ctx).is_some(),
+            "{label}: expected request validation error"
+        );
+    }
+
+    // Encoded-value length overflow (value-chars alone exceed the param cap).
+    let oversized = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
+        "a".repeat(4 * 1024 + 1)
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, oversized.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Decoded length overflow: many `%41` triplets expand past the decoded cap.
+    // Keep the wire value under the raw header/param budget while decoding past
+    // MAX_MULTIPART_PARAM_BYTES (4 KiB).
+    let decoded_overflow = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
+        "%41".repeat(4 * 1024 + 1)
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, decoded_overflow.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
+async fn multipart_filename_star_keeps_structured_body_spoofing_fail_closed() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size", "content"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "safe.png"},
+                                    "content_type": {"type": "string", "const": "image/png"},
+                                    "size": {"type": "integer", "maximum": 2},
+                                    "content": {"type": "string", "const": "ok"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    // filename* must preserve file-part semantics: validate real metadata, not
+    // the attacker-controlled JSON body that claims safe.png / image/png.
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''evil.svg\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"filename\":\"safe.png\",\"content_type\":\"image/png\",\"size\":2,\"content\":\"ok\"}\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn text_and_binary_response_validation_use_matching_schema_rules() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{
