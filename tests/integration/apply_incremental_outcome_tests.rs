@@ -2815,3 +2815,119 @@ async fn proxy_delta_updates_only_the_owning_namespace_for_a_shared_proxy_id() {
         "both namespaces must keep their own proxy row: {shared:?}"
     );
 }
+
+// ── GHSA-8f27-23x9-f825: ai_rate_limiter is HTTP-only ────────────────────
+
+fn ai_rate_limiter_plugin_config(id: &str) -> PluginConfig {
+    PluginConfig {
+        id: id.to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "ai_rate_limiter".to_string(),
+        config: serde_json::json!({"token_limit": 1000, "window_seconds": 60}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Assert the live plugin cache installs `ai_rate_limiter` on the HTTP view and
+/// never on the native-gRPC view.
+fn assert_ai_rate_limiter_http_only(state: &ProxyState, proxy_id: &str, context: &str) {
+    let http = state
+        .plugin_cache
+        .request_view("ferrum", proxy_id, ProxyProtocol::Http)
+        .plugins()
+        .iter()
+        .any(|plugin| plugin.name() == "ai_rate_limiter");
+    assert!(
+        http,
+        "{context}: ordinary HTTP AI traffic must remain eligible for token budgeting"
+    );
+
+    let grpc = state
+        .plugin_cache
+        .request_view("ferrum", proxy_id, ProxyProtocol::Grpc)
+        .plugins()
+        .iter()
+        .any(|plugin| plugin.name() == "ai_rate_limiter");
+    assert!(
+        !grpc,
+        "{context}: native gRPC must not receive an ai_rate_limiter instance that \
+         can never charge the configured token budget"
+    );
+}
+
+/// Every configuration path shares one plugin/protocol compatibility build, so
+/// none of them can attach the HTTP-only limiter to native gRPC traffic: file
+/// mode, database/admin-authored config, control-plane validation, and the data
+/// plane's full-snapshot and incremental apply are all covered here.
+#[tokio::test(flavor = "multi_thread")]
+async fn ai_rate_limiter_is_never_installed_on_native_grpc_across_config_paths() {
+    let config = GatewayConfig {
+        version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: vec![test_proxy("ai-proxy", "/ai")],
+        plugin_configs: vec![ai_rate_limiter_plugin_config("ai-limit")],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+
+    // File mode: config parsed and validated by the file loader.
+    let directory = TempDir::new().unwrap();
+    let config_path = directory.path().join("config.json");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let file_config = load_config_from_file(
+        config_path.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("file-mode config loads");
+    let file_state = proxy_state_with_config_and_mode(
+        file_config,
+        ferrum_edge::config::env_config::OperatingMode::File,
+    );
+    assert_ai_rate_limiter_http_only(&file_state, "ai-proxy", "file mode");
+
+    // Database/admin-authored config.
+    let db_state = proxy_state_with_config_and_mode(
+        config.clone(),
+        ferrum_edge::config::env_config::OperatingMode::Database,
+    );
+    assert_ai_rate_limiter_http_only(&db_state, "ai-proxy", "database/admin mode");
+
+    // Control-plane validation of the same resource set.
+    let cp_state = proxy_state_with_config_and_mode(
+        config.clone(),
+        ferrum_edge::config::env_config::OperatingMode::ControlPlane,
+    );
+    assert_ai_rate_limiter_http_only(&cp_state, "ai-proxy", "control plane");
+
+    // Data plane: distributed full snapshot, then an incremental delta that
+    // re-publishes the same plugin config.
+    let mut dp_bootstrap = config.clone();
+    dp_bootstrap.plugin_configs.clear();
+    let dp_state = proxy_state_with_config_and_mode(
+        dp_bootstrap,
+        ferrum_edge::config::env_config::OperatingMode::DataPlane,
+    );
+    assert_eq!(
+        dp_state.update_config(config.clone()),
+        ConfigApplyOutcome::Applied
+    );
+    assert_ai_rate_limiter_http_only(&dp_state, "ai-proxy", "data plane full snapshot");
+
+    let mut updated = ai_rate_limiter_plugin_config("ai-limit");
+    updated.config = serde_json::json!({"token_limit": 2000, "window_seconds": 60});
+    updated.updated_at = Utc::now();
+    assert_eq!(
+        dp_state
+            .apply_incremental(delta_with_plugin(updated, Utc::now()))
+            .await,
+        ConfigApplyOutcome::Applied
+    );
+    assert_ai_rate_limiter_http_only(&dp_state, "ai-proxy", "data plane incremental apply");
+}
