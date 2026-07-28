@@ -595,7 +595,9 @@ fn normalization_does_not_collapse_safe_fields_onto_sensitive_rules() {
 /// Direct heuristic / Redis-URL callers must honor the compact normalization.
 #[test]
 fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
-    for spelling in ["api_key", "api-key", "apiKey", "API_KEY", "api.key", "apikey"] {
+    for spelling in [
+        "api_key", "api-key", "apiKey", "API_KEY", "api.key", "apikey",
+    ] {
         assert!(
             is_sensitive_plugin_config_key(spelling),
             "heuristic missed sensitive spelling {spelling}"
