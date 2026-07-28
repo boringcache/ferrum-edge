@@ -1499,7 +1499,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
             .any(|plugin| plugin.name() == "ai_stream_router")
     );
 
-    for (label, bad_config, needle) in [
+    for (label, bad_config, expected) in [
         (
             "enabled-typo",
             serde_json::json!({
@@ -1512,7 +1512,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
                     "model_patterns": ["gpt-*"]
                 }]
             }),
-            "config.enabeld",
+            &["unknown configuration key", "config.enabeld"][..],
         ),
         (
             "provider-typo",
@@ -1526,10 +1526,13 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
                     "inherit_backend_tl": true
                 }]
             }),
-            "config.providers[0].inherit_backend_tl",
+            &[
+                "unknown configuration key",
+                "config.providers[0].inherit_backend_tl",
+            ][..],
         ),
         (
-            "fallback-typo",
+            "fallback-block",
             serde_json::json!({
                 "providers": [{
                     "name": "openai",
@@ -1538,9 +1541,12 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
                     "api_key": "sk-must-not-publish",
                     "model_patterns": ["gpt-*"]
                 }],
-                "fallback": {"on_connect_erro": true}
+                "fallback": {"on_connect_error": true}
             }),
-            "config.fallback.on_connect_erro",
+            &[
+                "unsupported field 'fallback'",
+                "provider fallback is not implemented",
+            ][..],
         ),
     ] {
         let mut invalid = valid.clone();
@@ -1552,8 +1558,7 @@ async fn ai_stream_router_unknown_key_reload_keeps_last_known_good_policy() {
         assert!(
             errors.iter().any(|error| {
                 error.contains("ai_stream_router")
-                    && error.contains("unknown configuration key")
-                    && error.contains(needle)
+                    && expected.iter().all(|needle| error.contains(needle))
             }),
             "{label}: unexpected rejection errors: {errors:?}"
         );

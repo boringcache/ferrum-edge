@@ -182,14 +182,53 @@ impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
 }
 
 type FailedBatchHook<T> = Arc<dyn Fn(Vec<T>, String) + Send + Sync>;
-type OverflowHook<T> = Arc<dyn Fn(T, &'static str) + Send + Sync>;
+/// Overflow handoff. Returns `true` only when the hook actually accepted
+/// ownership of the item (durable diversion, intentional shed, or equivalent).
+/// Returning `false` means the item was not accepted; callers must not treat
+/// that as a successful diversion.
+type OverflowHook<T> = Arc<dyn Fn(T, &'static str) -> bool + Send + Sync>;
 type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
+
+/// Explicit result of a non-blocking [`BatchingLogger::try_send_outcome`].
+///
+/// [`BatchingLogger::try_send`] remains a compatibility wrapper that is `true`
+/// only for [`Self::ChannelAccepted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrySendOutcome {
+    /// Item admitted to the bounded in-memory channel.
+    ChannelAccepted,
+    /// `on_overflow` returned true and took ownership of the item.
+    DiversionAccepted,
+    /// Overflow was offered (typically at high water) but the hook declined
+    /// ownership. Any loss accounting belongs to the hook (for example spool
+    /// delivery saturation), not to a full in-memory channel drop.
+    DiversionRejected,
+    /// Bounded channel was full and no overflow hook accepted ownership.
+    BufferFull,
+    /// Flush worker is not admitting or the sender is closed (shutdown).
+    WorkerUnavailable,
+}
+
+impl TrySendOutcome {
+    /// Historical `try_send` semantics: true only when the item entered the channel.
+    #[inline]
+    pub fn as_bool(self) -> bool {
+        matches!(self, Self::ChannelAccepted)
+    }
+}
 
 pub struct LoggerHooks<T: Send + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
+    /// Diverts an item away from the bounded channel. When the observed depth
+    /// is at/above the high-water mark, presence of this hook **consumes** the
+    /// item without attempting channel `try_send`. Install only when the hook can
+    /// accept ownership (durable handoff or intentional shed) and return whether
+    /// that acceptance succeeded. Use [`Self::on_high_water`] for telemetry-only
+    /// notification that must not discard remaining channel capacity.
     pub on_overflow: Option<OverflowHook<T>>,
     /// Called whenever the observed queue depth is above the configured
-    /// high-water mark. This hook is independent of `on_overflow`.
+    /// high-water mark. This hook is independent of `on_overflow` and never
+    /// takes ownership of the item.
     pub on_high_water: Option<HighWaterHook>,
     pub high_watermark_percent: u8,
 }
@@ -405,16 +444,23 @@ impl<T: Send + 'static> BatchingLogger<T> {
         self.worker.abort();
     }
 
-    /// Non-blocking send. On full buffer, logs a warning once per N drops and
-    /// silently drops intermediate entries so the hot path never blocks.
+    /// Non-blocking send. Compatibility wrapper: `true` only when the item was
+    /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
+    /// diversion, full-buffer drops, and shutdown must be distinguished.
+    #[allow(dead_code)] // Retained compatibility API exercised by the external unit-test crate.
     pub fn try_send(&self, item: T) -> bool {
+        self.try_send_outcome(item).as_bool()
+    }
+
+    /// Non-blocking send with an explicit ownership outcome.
+    pub fn try_send_outcome(&self, item: T) -> TrySendOutcome {
         let Some(_admission) = self.worker.try_admit() else {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
                 "worker unavailable during shutdown",
             );
-            return false;
+            return TrySendOutcome::WorkerUnavailable;
         };
         self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let Some(sender) = self.sender.as_ref() else {
@@ -424,7 +470,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
                 self.plugin_name,
                 "worker unavailable during shutdown",
             );
-            return false;
+            return TrySendOutcome::WorkerUnavailable;
         };
         let depth = self.queue_depth.load(Ordering::Relaxed);
         if is_high_water(
@@ -437,22 +483,33 @@ impl<T: Send + 'static> BatchingLogger<T> {
             }
             if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                 decrement_queue_depth(&self.outstanding_count);
-                on_overflow(item, "queue high water");
-                return false;
+                return if on_overflow(item, "queue high water") {
+                    TrySendOutcome::DiversionAccepted
+                } else {
+                    // Hook declined ownership; loss accounting belongs to the
+                    // hook (for example spool delivery saturation counters).
+                    // This is not a full in-memory channel drop.
+                    TrySendOutcome::DiversionRejected
+                };
             }
         }
 
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match sender.try_send(item) {
-            Ok(()) => true,
+            Ok(()) => TrySendOutcome::ChannelAccepted,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
-                    on_overflow(item, "buffer full");
+                    return if on_overflow(item, "buffer full") {
+                        TrySendOutcome::DiversionAccepted
+                    } else {
+                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                        TrySendOutcome::BufferFull
+                    };
                 }
-                false
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 decrement_queue_depth(&self.queue_depth);
@@ -462,7 +519,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
                     self.plugin_name,
                     "worker unavailable during shutdown",
                 );
-                false
+                TrySendOutcome::WorkerUnavailable
             }
         }
     }
@@ -651,12 +708,18 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
     }
 
     /// Non-blocking send. Returns `false` when the worker has not started yet
-    /// or the underlying logger drops the entry. Queued items stay buffered
-    /// until [`Self::commit`] releases the flush loop.
+    /// or the underlying logger does not admit the entry to the channel. Queued
+    /// items stay buffered until [`Self::commit`] releases the flush loop.
     pub fn try_send(&self, item: T) -> bool {
+        self.try_send_outcome(item).as_bool()
+    }
+
+    /// Non-blocking send with an explicit ownership outcome. Unstarted workers
+    /// report [`TrySendOutcome::WorkerUnavailable`].
+    pub fn try_send_outcome(&self, item: T) -> TrySendOutcome {
         match self.logger.get() {
-            Some(logger) => logger.try_send(item),
-            None => false,
+            Some(logger) => logger.try_send_outcome(item),
+            None => TrySendOutcome::WorkerUnavailable,
         }
     }
 
@@ -668,16 +731,22 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
 }
 
 impl<T: Send + 'static> BatchingLoggerHandle<T> {
-    /// Non-blocking send. On full buffer, logs a warning once per N drops and
-    /// silently drops intermediate entries so the hot path never blocks.
+    /// Non-blocking send. Compatibility wrapper: `true` only when the item was
+    /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
+    /// diversion, full-buffer drops, and shutdown must be distinguished.
     pub fn try_send(&self, item: T) -> bool {
+        self.try_send_outcome(item).as_bool()
+    }
+
+    /// Non-blocking send with an explicit ownership outcome.
+    pub fn try_send_outcome(&self, item: T) -> TrySendOutcome {
         let Some(_admission) = self.worker.try_admit() else {
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
                 "worker unavailable during shutdown",
             );
-            return false;
+            return TrySendOutcome::WorkerUnavailable;
         };
         self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let depth = self.queue_depth.load(Ordering::Relaxed);
@@ -691,22 +760,30 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
             }
             if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                 decrement_queue_depth(&self.outstanding_count);
-                on_overflow(item, "queue high water");
-                return false;
+                return if on_overflow(item, "queue high water") {
+                    TrySendOutcome::DiversionAccepted
+                } else {
+                    TrySendOutcome::DiversionRejected
+                };
             }
         }
 
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(item) {
-            Ok(()) => true,
+            Ok(()) => TrySendOutcome::ChannelAccepted,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
-                    on_overflow(item, "buffer full");
+                    return if on_overflow(item, "buffer full") {
+                        TrySendOutcome::DiversionAccepted
+                    } else {
+                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                        TrySendOutcome::BufferFull
+                    };
                 }
-                false
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
+                TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 decrement_queue_depth(&self.queue_depth);
@@ -716,7 +793,7 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
                     self.plugin_name,
                     "worker unavailable during shutdown",
                 );
-                false
+                TrySendOutcome::WorkerUnavailable
             }
         }
     }
