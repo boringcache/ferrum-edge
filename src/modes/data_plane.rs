@@ -820,7 +820,7 @@ pub async fn run(
     // (Connection: close + reject new requests) unconditionally so the close
     // hint fires even when the operator has disabled the wait loop with
     // FERRUM_SHUTDOWN_DRAIN_SECONDS=0. Only the wait loop itself is gated.
-    crate::overload::begin_drain(&proxy_state.overload);
+    crate::overload::begin_shutdown_drain(&proxy_state.overload);
     let drain_seconds = env_config.shutdown_drain_seconds;
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))

@@ -660,3 +660,161 @@ async fn test_http_logging_delivers_stream_sni_hostname() {
     assert_eq!(entries[0]["sni_hostname"], "device.example");
     assert_eq!(entries[0]["protocol"], "dtls");
 }
+
+// ---------------------------------------------------------------------------
+// Endpoint credential redaction — advisory GHSA-8594-2xhc-8g38
+//
+// `http_logging` documents collectors that authenticate with a token in the
+// URL path (Sumo Logic) or query (Mezmo), so `endpoint_url` legitimately holds
+// a reusable credential. It must never reach a diagnostic surface.
+// ---------------------------------------------------------------------------
+
+/// Sentinel credentials planted in the path and query of a configured endpoint.
+const PATH_SENTINEL: &str = "sumo-path-token-canary";
+const QUERY_SENTINEL: &str = "mezmo-apikey-canary";
+
+fn sentinel_endpoint(base: &str) -> String {
+    format!("{base}/receiver/v1/http/{PATH_SENTINEL}?apikey={QUERY_SENTINEL}")
+}
+
+fn assert_endpoint_sentinels_absent(logs: &str, context: &str) {
+    super::plugin_utils::assert_no_secrets(logs, context, &[PATH_SENTINEL, QUERY_SENTINEL]);
+}
+
+#[tokio::test]
+async fn endpoint_url_rejects_userinfo_credentials() {
+    let err = match HttpLogging::new(
+        &json!({
+            "endpoint_url": format!("https://logs:{PATH_SENTINEL}@collector.example.com/ingest"),
+        }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("userinfo credentials must be rejected at construction"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.contains("must not contain user information"),
+        "rejection must name the problem: {err}"
+    );
+    assert_endpoint_sentinels_absent(&err, "http_logging userinfo rejection");
+}
+
+#[tokio::test]
+async fn malformed_endpoint_rejection_does_not_echo_credentials() {
+    // Scheme rejection happens after parsing, so the error is built from a URL
+    // that still carries both sentinels.
+    let err = match HttpLogging::new(
+        &json!({ "endpoint_url": sentinel_endpoint("ftp://collector.example.com") }),
+        default_client(),
+    ) {
+        Ok(_) => panic!("non-HTTP scheme must be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(err.contains("http:// or https://"), "got: {err}");
+    assert_endpoint_sentinels_absent(&err, "http_logging scheme rejection");
+}
+
+/// Connect failure + retry + slow-call diagnostics on a dead port.
+///
+/// A closed loopback port exercises the shared client's transport-failure path;
+/// `slow_threshold_ms = 0` forces the slow-call warning on the same request, so
+/// one fixture covers three of the advisory's failure classes at once.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    // Bind then drop, so the port is almost certainly unused.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let client = PluginHttpClient::from_pool_config_with_settings(
+        &ferrum_edge::config::PoolConfig::default(),
+        0, // every call is "slow"
+        2, // retries enabled
+        1,
+    );
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": sentinel_endpoint(&format!("http://{addr}")),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 2,
+            "retry_delay_ms": 1,
+        }),
+        client,
+    )
+    .expect("sentinel endpoint is a valid configuration");
+    start_http_logging(&plugin);
+    plugin.log(&create_test_transaction_summary()).await;
+
+    for _ in 0..100 {
+        if logs.contents().contains("HTTP logging") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(plugin);
+    drop(guard);
+
+    let captured = logs.contents();
+    assert!(
+        !captured.is_empty(),
+        "the failing flush must produce a diagnostic to inspect"
+    );
+    assert_endpoint_sentinels_absent(&captured, "http_logging transport failure");
+    assert!(
+        !captured.contains("/receiver/v1/http/"),
+        "no raw credential-bearing path may survive: {captured}"
+    );
+}
+
+/// Non-2xx status classification must not name the endpoint either.
+#[tokio::test(flavor = "current_thread")]
+async fn status_failure_diagnostics_are_redacted() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if !read_http11_request_headers(&mut socket).await {
+                continue;
+            }
+            let _ = socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+
+    let plugin = HttpLogging::new(
+        &json!({
+            "endpoint_url": sentinel_endpoint(&format!("http://{addr}")),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+        }),
+        default_client(),
+    )
+    .unwrap();
+    start_http_logging(&plugin);
+    plugin.log(&create_test_transaction_summary()).await;
+
+    for _ in 0..100 {
+        if logs.contents().contains("401") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(plugin);
+    drop(guard);
+
+    let captured = logs.contents();
+    assert!(
+        captured.contains("401"),
+        "the 401 discard diagnostic must have been emitted: {captured}"
+    );
+    assert_endpoint_sentinels_absent(&captured, "http_logging status failure");
+}

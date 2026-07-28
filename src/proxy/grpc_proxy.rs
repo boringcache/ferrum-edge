@@ -93,6 +93,18 @@ pub trait GrpcUploadTerminationObserver: Send + Sync {
 pub enum GrpcBody {
     /// Complete body in memory (retries, plugin transforms).
     Buffered(Full<Bytes>),
+    /// Complete body in memory that terminates with an HTTP/2 TRAILERS frame.
+    ///
+    /// `Full<Bytes>` cannot emit a terminal trailers frame, so a request whose
+    /// end-of-stream metadata arrived out-of-band — today, a gRPC-Web client
+    /// that encoded its trailers as a `0x80` body frame the `grpc_web` plugin
+    /// split off — uses this variant instead. The DATA is emitted first and the
+    /// trailers exactly once, so the backend observes the native gRPC request
+    /// representation rather than a body with framing bytes appended to it.
+    BufferedWithTrailers {
+        data: Option<Bytes>,
+        trailers: Option<hyper::HeaderMap>,
+    },
     /// Streaming body from the client with inline size enforcement.
     /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
     /// `exceeded` flag if the limit is breached. The caller checks the flag
@@ -157,7 +169,7 @@ impl Drop for GrpcBody {
             | GrpcBody::Channel {
                 upload_observer, ..
             } => upload_observer.as_ref(),
-            GrpcBody::Buffered(_) => None,
+            GrpcBody::Buffered(_) | GrpcBody::BufferedWithTrailers { .. } => None,
         };
         if let Some(observer) = upload_observer {
             observer.on_upload_terminated();
@@ -177,6 +189,19 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Buffered(full) => Pin::new(full)
                 .poll_frame(cx)
                 .map_err(|never| match never {}),
+            GrpcBody::BufferedWithTrailers { data, trailers } => {
+                // Skip an empty DATA frame so hyper does not emit a zero-length
+                // frame before the trailers block.
+                if let Some(bytes) = data.take()
+                    && !bytes.is_empty()
+                {
+                    return Poll::Ready(Some(Ok(Frame::data(bytes))));
+                }
+                match trailers.take() {
+                    Some(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+                    None => Poll::Ready(None),
+                }
+            }
             GrpcBody::Streaming {
                 incoming,
                 bytes_seen,
@@ -246,6 +271,9 @@ impl http_body::Body for GrpcBody {
     fn is_end_stream(&self) -> bool {
         match self {
             GrpcBody::Buffered(full) => full.is_end_stream(),
+            GrpcBody::BufferedWithTrailers { data, trailers } => {
+                data.is_none() && trailers.is_none()
+            }
             GrpcBody::Streaming {
                 incoming, exceeded, ..
             } => incoming.is_end_stream() || exceeded.load(Ordering::Relaxed),
@@ -259,6 +287,14 @@ impl http_body::Body for GrpcBody {
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
             GrpcBody::Buffered(full) => full.size_hint(),
+            GrpcBody::BufferedWithTrailers { data, .. } => {
+                // Exact DATA length only. The trailers block is header bytes,
+                // not content, so it must not appear in the size hint hyper
+                // uses to frame (and length-declare) the request body.
+                let mut hint = http_body::SizeHint::new();
+                hint.set_exact(data.as_ref().map_or(0, Bytes::len) as u64);
+                hint
+            }
             GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
             GrpcBody::Channel { .. } => http_body::SizeHint::default(),
         }
@@ -2397,6 +2433,13 @@ pub fn build_grpc_error_response_with_policy(
 /// defense-in-depth on the pinned h2 0.4.x transport: h2 already writes the
 /// response HEADERS before its permitted NO_ERROR request cancellation, and a
 /// raw client can still observe that reset after the complete response.
+///
+/// #3422 re-confirmed the emitted shape is terminal: the synthesized error body
+/// is `ProxyBody::empty()`, whose `is_end_stream()` makes hyper's h2 server take
+/// the `send_response(res, end_of_stream = true)` branch, so `grpc-status` ships
+/// in a single Trailers-Only HEADERS frame that precedes any reset. A client
+/// must therefore treat the observed HEADERS END_STREAM bit — not h2 stream
+/// state it can no longer trust after the reset — as the terminal-shape signal.
 pub fn attach_held_frontend_grpc_upload(
     mut response: hyper::Response<super::ProxyBody>,
     held_frontend_upload: Option<GrpcBody>,
@@ -2493,6 +2536,7 @@ pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,
     headers: hyper::HeaderMap,
     body_bytes: Bytes,
+    request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
@@ -2506,6 +2550,7 @@ pub async fn proxy_grpc_request_from_bytes(
         method,
         headers,
         body_bytes,
+        request_trailers,
         proxy,
         backend_url,
         grpc_pool,
@@ -2946,11 +2991,17 @@ pub(crate) async fn collect_grpc_request_body(
 /// When `stream_response` is true, returns `GrpcResponseKind::Streaming` with
 /// the live `Incoming` body instead of buffering the full response. The caller
 /// is responsible for ensuring this is only used when retries are not needed.
+///
+/// `request_trailers` carries validated end-of-stream request metadata that did
+/// not arrive as HTTP/2 trailers — today, a gRPC-Web body trailer frame. It is
+/// sent as a real TRAILERS frame after the buffered DATA, and it is passed to
+/// every attempt because a retry replays the same complete request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_grpc_request_core(
     method: hyper::Method,
     mut headers: hyper::HeaderMap,
     body_bytes: Bytes,
+    request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
@@ -3033,7 +3084,17 @@ pub(crate) async fn proxy_grpc_request_core(
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
     };
 
-    let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
+    // A validated end-of-stream metadata block (today: a gRPC-Web request
+    // trailer frame the `grpc_web` plugin split off the body) is re-emitted as
+    // a native HTTP/2 TRAILERS frame after the DATA. An empty map is treated as
+    // "no trailers" so a stray empty block cannot cost the backend a frame.
+    let mut backend_req = Request::new(match request_trailers {
+        Some(trailers) if !trailers.is_empty() => GrpcBody::BufferedWithTrailers {
+            data: Some(body_bytes),
+            trailers: Some(trailers),
+        },
+        _ => GrpcBody::Buffered(Full::new(body_bytes)),
+    });
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;

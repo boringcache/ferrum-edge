@@ -22,6 +22,30 @@ When `async_insert` is enabled and `wait_for_async_insert` is omitted, the sink
 pins `wait_for_async_insert=1` on the request instead of inheriting a potentially
 lossy ClickHouse user/profile default.
 
+### Credentials and `insert_query_params`
+
+ClickHouse accepts `user`, `password`, and `access_token` as HTTP query
+parameters. Ferrum does **not** support authenticating that way: parameter names
+that carry a reusable credential are rejected at configuration time. The
+rejected set is the exact names `user`, `password`, `access_token`, and
+`session_id`, plus any name containing `apikey`, `api_key`, `credential`,
+`passwd`, `secret`, or `token`.
+
+Use `clickhouse.username` together with `clickhouse.password_ref` instead.
+`password_ref` names a `FERRUM_*` environment variable; the resolved value is
+sent as an HTTP Basic `Authorization` header, so it is never appended to a URL
+and never rendered in diagnostics.
+
+Parameter *values* remain arbitrary bounded strings (ClickHouse settings are
+operator tuning), so the sink never renders the INSERT query string. Every
+diagnostic path — literal-IP egress denial, DNS/TLS/connect failure, retry,
+slow-call warning, custom-TLS client failure, and spool replay/flush errors —
+records only a structurally redacted `scheme://host:port/redacted` form. The
+complete INSERT URL is used solely to build the outbound request. `clickhouse.url`
+also rejects userinfo credentials (`https://user:pass@host`), and the admin API's
+audit projection redacts both `clickhouse.url` and every
+`insert_query_params` value.
+
 `wait_for_async_insert=0` (and equivalent falsy values `false` / `no` / `off`)
 is rejected unless `clickhouse.allow_lossy_async_insert` is explicitly `true`.
 That named opt-in is intentionally separate from durable mode: ClickHouse may
@@ -377,11 +401,25 @@ per-file `owner_tag` binds each record individually, so a record moved between
 directories is still attributable and is never replayed by a different owner.
 
 The sink writes failed batches and queue high-water overflow to an async spool
-delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
-terminal hooks only enqueue to that worker; compression, directory scans, writes,
-and fsync never run inline on those hooks. Saturation of the delivery queue is
-counted (`chargeback_sink_spool_jobs_lost_total` /
-`chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
+delivery worker (bounded by `spool.delivery_queue_capacity`) **only when
+`spool.enabled=true`**. That durable diversion hook is installed only when spool
+delivery can take ownership of the event. With `spool.enabled=false`, the 80%
+high-water mark is telemetry only (`high_water_hits_total` /
+`chargeback_sink_queue_high_water_hits_total`); every configured
+`batch.buffer_capacity` slot remains usable until the channel is actually full,
+and true full-buffer losses increment `full_drops_total` /
+`chargeback_sink_queue_full_drops_total` (never shutdown/unavailable
+admission). High-water durable diversions increment
+`high_water_diversions_total` /
+`chargeback_sink_queue_high_water_diversions_total` only when the spool-delivery
+handoff actually accepts the job; a saturated or closed delivery queue is
+counted by `chargeback_sink_spool_jobs_lost_total` /
+`chargeback_sink_spool_events_lost_total` instead (with rate-limited warnings)
+and must not be reported as a successful diversion or enqueue.
+`events_enqueued_total` / `chargeback_sink_events_enqueued_total` counts channel
+admission or an overflow handoff that actually succeeded. Request and body
+terminal hooks only enqueue to that worker; compression, directory scans,
+writes, and fsync never run inline on those hooks. Files are
 created with private permissions, written as process/generation-attributed
 `*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
 directory-fsynced on Unix. The `spool.meta.json` ownership manifest uses the same
@@ -665,7 +703,8 @@ Response contract:
 - `instance_count` is the number of published instances.
 - `snapshot_finalizations_pending` is the number of retired snapshot
   generations retaining an unspooled terminal delta for bounded retry.
-- `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
+- `totals` aggregates queue depth/capacity/high-water hits/high-water
+  diversions/full-buffer drops, spool files/bytes/
   drops/prepare failures, and export counters across every current accepted
   instance.
   `totals.spool.available` is `true` only when every spool-enabled live instance
@@ -687,6 +726,9 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_queue_high_water_hits_total`
+- `chargeback_sink_queue_high_water_diversions_total`
+- `chargeback_sink_queue_full_drops_total`
 - `chargeback_sink_snapshot_finalizations_pending`
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, in-flight claim, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)

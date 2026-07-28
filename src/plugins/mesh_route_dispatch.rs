@@ -68,7 +68,10 @@ use crate::config::types::{
     normalize_backend_tls_san_allow_list_entry, validate_backend_tls_san_allow_list_entry,
     validate_backend_tls_sni,
 };
-use crate::plugins::fault_injection::{ROUTE_FAULT_INJECTED_METADATA_KEY, is_native_grpc_request};
+use crate::plugins::fault_injection::{
+    CLIENT_GONE_STATUS, FaultDelayDisposition, ROUTE_FAULT_INJECTED_METADATA_KEY,
+    is_native_grpc_request, run_http_fault_delay,
+};
 use crate::plugins::mesh::authz::{
     NODE_WAYPOINT_AUTHORIZED_BACKEND_ALIASES_METADATA, NODE_WAYPOINT_AUTHORIZED_BACKEND_METADATA,
     NODE_WAYPOINT_AUTHORIZED_UPSTREAM_ID_METADATA, NODE_WAYPOINT_SCOPED_AUTHZ_ACTIVE_METADATA,
@@ -429,6 +432,12 @@ fn validate_and_normalize_redirect(
     if redirect.port == Some(0) {
         return Err(format!(
             "mesh_route_dispatch.rules[{rule_idx}].redirect.port must be in the 1-65535 range"
+        ));
+    }
+    if redirect.port.is_some() && redirect.derive_port.is_some() {
+        return Err(format!(
+            "mesh_route_dispatch.rules[{rule_idx}].redirect.port and redirect.derive_port \
+             are mutually exclusive"
         ));
     }
     if let Some(scheme) = redirect.scheme.as_mut() {
@@ -1381,9 +1390,13 @@ impl RouteRewriteConfig {
 /// rule matches, the plugin short-circuits the dispatch chain with a redirect
 /// response (3xx + `Location`) and the request never reaches a backend.
 ///
-/// If `uri` / `authority` / `port` / `scheme` are all unset, the redirect keeps
-/// the original request URL and only changes the status code. `redirect_code`
-/// defaults to 301 and is constrained to the 3xx range.
+/// If `uri` / `authority` / `port` / `derive_port` / `scheme` are all unset,
+/// the redirect keeps the original request URL and only changes the status
+/// code. `redirect_code` defaults to 301 and is constrained to the 3xx range.
+///
+/// `port` and `derive_port` are mutually exclusive (Istio `HTTPRedirect`
+/// oneof). Scheme-default ports (`80`/`http`, `443`/`https`) are omitted from
+/// the rendered authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteRedirectConfig {
@@ -1401,8 +1414,13 @@ pub struct RouteRedirectConfig {
     pub authority: Option<String>,
     /// Replacement authority port for the `Location` header. When `authority`
     /// is unset this preserves the request host and swaps only the port.
+    /// Mutually exclusive with [`Self::derive_port`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Dynamically derive the `Location` authority port (Istio `derivePort`).
+    /// Mutually exclusive with [`Self::port`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derive_port: Option<RedirectDerivePort>,
     /// Replacement scheme (`http` / `https`) for the `Location` header. When
     /// unset, the request's own frontend scheme is preserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1410,6 +1428,23 @@ pub struct RouteRedirectConfig {
     /// HTTP redirect status code. Defaults to 301. Constrained to `300..=399`.
     #[serde(default = "default_redirect_code")]
     pub redirect_code: u16,
+}
+
+/// Istio `HTTPRedirect.RedirectPortSelection` projected onto
+/// [`RouteRedirectConfig::derive_port`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RedirectDerivePort {
+    /// Use the scheme default port (`80` for `http`, `443` for `https`),
+    /// including when `scheme` is also overridden on the same redirect.
+    #[serde(rename = "FROM_PROTOCOL_DEFAULT")]
+    FromProtocolDefault,
+    /// Use the trusted frontend listener port that accepted the request
+    /// (`RequestContext::frontend_listen_port`). Spoofable forwarding headers
+    /// such as `X-Forwarded-Port` / `Forwarded` are never consulted.
+    /// When capture rewrote the accept socket, the original-destination port
+    /// (`RequestContext::orig_dst`) is preferred over the capture listener.
+    #[serde(rename = "FROM_REQUEST_PORT")]
+    FromRequestPort,
 }
 
 fn default_redirect_code() -> u16 {
@@ -2029,10 +2064,13 @@ fn build_redirect_response(
             .or_else(|| headers.get(":authority"))
             .map(String::as_str)
     });
-    let authority = authority.map(|authority| match redirect.port {
-        Some(port) => authority_with_redirect_port(authority, port, scheme),
-        None => authority.to_string(),
-    });
+    let authority =
+        authority.map(
+            |authority| match resolve_redirect_authority_port(ctx, redirect, scheme) {
+                Some(port) => authority_with_redirect_port(authority, port, scheme),
+                None => authority.to_string(),
+            },
+        );
     let path = redirect
         .uri
         .as_deref()
@@ -2069,6 +2107,46 @@ fn build_redirect_response(
         status_code: redirect.redirect_code,
         body: String::new(),
         headers: reject_headers,
+    }
+}
+
+/// Resolve the authority port for a redirect `Location`.
+///
+/// Precedence mirrors Istio's `HTTPRedirect` oneof: an explicit `port` wins,
+/// otherwise `derive_port` selects the scheme default or the trusted request
+/// port. Spoofable client headers (`X-Forwarded-Port`, `Forwarded`) are never
+/// used as port provenance.
+fn resolve_redirect_authority_port(
+    ctx: &RequestContext,
+    redirect: &RouteRedirectConfig,
+    scheme: &str,
+) -> Option<u16> {
+    if let Some(port) = redirect.port {
+        return Some(port);
+    }
+    match redirect.derive_port {
+        Some(RedirectDerivePort::FromProtocolDefault) => Some(scheme_default_redirect_port(scheme)),
+        Some(RedirectDerivePort::FromRequestPort) => trusted_request_port(ctx),
+        None => None,
+    }
+}
+
+/// Trusted port the client intended to reach for `FROM_REQUEST_PORT`.
+///
+/// Prefer the kernel/conntrack original destination when capture rewrote the
+/// accept socket (sidecar/ambient), then fall back to the frontend listener
+/// port (gateways and direct dials). Never consult forwarding headers.
+fn trusted_request_port(ctx: &RequestContext) -> Option<u16> {
+    ctx.orig_dst
+        .map(|addr| addr.port())
+        .or(ctx.frontend_listen_port)
+}
+
+fn scheme_default_redirect_port(scheme: &str) -> u16 {
+    if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
     }
 }
 
@@ -2170,7 +2248,19 @@ async fn apply_fault_action(
     if outcome.delay_triggered
         && let Some(delay) = fault.delay.as_ref()
     {
-        tokio::time::sleep(std::time::Duration::from_millis(delay.duration_ms)).await;
+        // Same retention bounds as the proxy-scoped `fault_injection` plugin:
+        // shared process-wide delayed-work budget, shutdown cancellation, and
+        // the frontend's peer-gone watch when one is available.
+        let disposition = run_http_fault_delay(ctx, delay.duration_ms).await;
+        if matches!(disposition, FaultDelayDisposition::ClientGone) {
+            // Client transport is gone — do not fall through to the route
+            // override and dial a backend for an unread response.
+            return Some(PluginResult::Reject {
+                status_code: CLIENT_GONE_STATUS,
+                body: String::new(),
+                headers: HashMap::new(),
+            });
+        }
     }
 
     if outcome.abort_triggered
@@ -5722,6 +5812,179 @@ mod tests {
             }
             other => panic!("expected redirect Reject, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn redirect_derive_port_from_protocol_default_strips_non_default_request_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {
+                    "scheme": "https",
+                    "derive_port": "FROM_PROTOCOL_DEFAULT"
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/secure");
+        let mut headers =
+            HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com/secure")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_derive_port_from_request_port_uses_frontend_listen_port() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {
+                    "scheme": "https",
+                    "derive_port": "FROM_REQUEST_PORT"
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/foo");
+        ctx.frontend_listen_port = Some(8080);
+        // Spoofable forwarding headers must never win over the trusted listener port.
+        let mut headers = HashMap::from([
+            ("host".to_string(), "site.example.com".to_string()),
+            ("x-forwarded-port".to_string(), "65535".to_string()),
+            (
+                "forwarded".to_string(),
+                "for=1.2.3.4;host=evil;proto=https;port=65535".to_string(),
+            ),
+        ]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com:8080/foo")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_derive_port_from_request_port_prefers_orig_dst_over_listener() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {
+                    "scheme": "https",
+                    "derive_port": "FROM_REQUEST_PORT"
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/foo");
+        // Capture listener (:15006) must not win over the original destination.
+        ctx.frontend_listen_port = Some(15006);
+        ctx.orig_dst = Some("10.0.0.5:9090".parse().unwrap());
+        let mut headers = HashMap::from([
+            ("host".to_string(), "site.example.com".to_string()),
+            ("x-forwarded-port".to_string(), "65535".to_string()),
+        ]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://site.example.com:9090/foo")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_derive_port_from_request_port_canonicalizes_scheme_default() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"derive_port": "FROM_REQUEST_PORT"}
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/foo");
+        ctx.metadata
+            .insert("ferrum.frontend_scheme".to_string(), "http".to_string());
+        ctx.frontend_listen_port = Some(80);
+        let mut headers =
+            HashMap::from([("host".to_string(), "site.example.com:8080".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("http://site.example.com/foo")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_derive_port_from_request_port_preserves_bracketed_ipv6() {
+        let plugin = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {
+                    "scheme": "https",
+                    "derive_port": "FROM_REQUEST_PORT"
+                }
+            }]
+        }))
+        .unwrap();
+        let mut ctx = ctx_with("GET", "/v6");
+        ctx.frontend_listen_port = Some(8443);
+        let mut headers = HashMap::from([("host".to_string(), "[2001:db8::1]".to_string())]);
+        match plugin.before_proxy(&mut ctx, &mut headers).await {
+            PluginResult::Reject { headers, .. } => {
+                assert_eq!(
+                    headers.get("location").map(String::as_str),
+                    Some("https://[2001:db8::1]:8443/v6")
+                );
+            }
+            other => panic!("expected redirect Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_redirect_port_and_derive_port_together() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"port": 8443, "derive_port": "FROM_REQUEST_PORT"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("port and redirect.derive_port are mutually exclusive"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_redirect_derive_port() {
+        let err = MeshRouteDispatch::new(&json!({
+            "rules": [{
+                "match": {},
+                "redirect": {"derive_port": "FROM_X_FORWARDED_PORT"}
+            }]
+        }))
+        .unwrap_err();
+        assert!(
+            err.contains("derive_port") || err.contains("unknown variant"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

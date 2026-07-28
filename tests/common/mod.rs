@@ -79,7 +79,8 @@ pub use echo_servers::{
 };
 pub use gateway_harness::{
     DbType, GatewayMode, TestGateway, TestGatewayBuilder, configure_coverage_gateway_command,
-    ensure_gateway_built, ephemeral_port, explicit_test_binary, shutdown_gateway_child,
+    ensure_gateway_built, ephemeral_port, explicit_test_binary, probe_gateway_identity,
+    shutdown_gateway_child,
 };
 pub use hmac_helpers::{
     empty_digest_header, generate_hmac_signature, generate_hmac_signature_with_digest,

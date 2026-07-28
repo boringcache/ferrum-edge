@@ -1477,6 +1477,7 @@ pub(crate) async fn handle_h3_websocket(
         // tungstenite's permissive accept-unmasked mode can normalize them.
         true,
         ws_idle_tracker,
+        crate::proxy::WsFragmentPolicy::from_env(&state.env_config),
         &adaptive_buf,
     )
     .await;
