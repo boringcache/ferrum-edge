@@ -111,6 +111,23 @@ python3 -m py_compile tests/performance/multi_protocol/run_protocol_regression_s
 Full-mode PR CI runs the same static set in `Performance Regression Check`
 immediately after checkout.
 
+## Mesh in-process vs E2E suites
+
+`tests/performance/mesh/` is the **in-process** Criterion crate (`authz_match`,
+`ip_restriction`, `slice_apply`, `xds_translation`). HBONE tunnel throughput and
+mesh DNS proxy resolution latency are **not** criterion micro-benches; they ship
+as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
+
+| Suite | Path | Measures | Residual |
+|---|---|---|---|
+| HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Provenance-complete `baseline.md` rows still `_TBD_` — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+| Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same baseline-publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
+
+Trusted Cross automation policy freezes executable prose in
+`tests/performance/**/README.md` files. Reconcile mesh suite status here and in
+[`tests/performance/mesh/README.md`](../tests/performance/mesh/README.md)
+without rewriting fenced benchmark command blocks.
+
 ## Related surfaces
 
 - Manual exploratory matrix: `.github/workflows/perf-benchmark.yml`

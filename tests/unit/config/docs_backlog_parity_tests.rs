@@ -8,6 +8,9 @@ const PRODUCTION_READINESS: &str = include_str!("../../../PRODUCTION_READINESS.m
 const RESPONSE_BODY_STREAMING: &str = include_str!("../../../docs/response_body_streaming.md");
 const MESH_SUPPORTED_MATRIX: &str = include_str!("../../../docs/mesh_supported_matrix.md");
 const SPIRE_DEPLOYMENT: &str = include_str!("../../../docs/spire_deployment.md");
+const MESH_PERF_README: &str = include_str!("../../../tests/performance/mesh/README.md");
+const PROTOCOL_PERF_REGRESSION: &str = include_str!("../../../docs/protocol_perf_regression.md");
+const ISSUE_2110_REGISTER: &str = include_str!("../../../docs/backlog/issue_2110_register.md");
 const MULTICLUSTER_RUNBOOK: &str =
     include_str!("../../../docs/mesh_multicluster_federation_runbook.md");
 const SCRIPTED_BACKEND_PLAN: &str =
@@ -81,6 +84,69 @@ fn spire_dashboard_checklist_references_shipped_assets() {
     assert!(
         SPIRE_DEPLOYMENT.contains("certificate-posture.json"),
         "checklist must name the shipped certificate-posture dashboard"
+    );
+}
+
+#[test]
+fn mesh_perf_readme_points_at_existing_e2e_harnesses() {
+    assert!(
+        !MESH_PERF_README.contains("Benches deferred (not yet implemented)"),
+        "HBONE/DNS E2E harnesses exist; deferred heading is stale"
+    );
+    assert!(
+        MESH_PERF_README.contains("mesh-hbone-e2e") && MESH_PERF_README.contains("mesh-dns-e2e"),
+        "README must point operators at the existing E2E harness directories"
+    );
+    assert!(
+        MESH_PERF_README.contains("#3332"),
+        "baseline-publication residual must cite #3332"
+    );
+}
+
+#[test]
+fn protocol_perf_regression_documents_mesh_e2e_status() {
+    assert!(
+        PROTOCOL_PERF_REGRESSION.contains("Mesh in-process vs E2E suites"),
+        "protocol perf runbook must reconcile mesh criterion vs E2E harness scope"
+    );
+    assert!(
+        PROTOCOL_PERF_REGRESSION.contains("mesh-hbone-e2e")
+            && PROTOCOL_PERF_REGRESSION.contains("mesh-dns-e2e"),
+        "runbook must name both live mesh perf harnesses"
+    );
+    assert!(
+        PROTOCOL_PERF_REGRESSION.contains("#3332"),
+        "runbook must cite the baseline-publication tracker"
+    );
+}
+
+#[test]
+fn issue_2110_register_maps_completed_work_and_live_trackers() {
+    assert!(
+        ISSUE_2110_REGISTER.contains("Historical snapshot only"),
+        "register must be labeled historical, not live backlog"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("#2475"),
+        "remote-discovery JWT audience binding must remain recorded as implemented"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("intentional mixed strategy"),
+        "k8s status ownership must document the intentional RMW+SSA mixed strategy"
+    );
+    for issue in ["#3228", "#3263", "#3299", "#3302", "#3304", "#3331", "#3332"] {
+        assert!(
+            ISSUE_2110_REGISTER.contains(issue),
+            "register must cite live tracker {issue}"
+        );
+    }
+    assert!(
+        ISSUE_2110_REGISTER.contains("EnvoyFilter / WasmPlugin"),
+        "explicit non-goals must remain documented"
+    );
+    assert!(
+        !ISSUE_2110_REGISTER.contains("TLS-SNI L4 routing “on roadmap”"),
+        "completed TLS-SNI support must not remain a roadmap deferral"
     );
 }
 
