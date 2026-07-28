@@ -844,9 +844,7 @@ impl GatewayOwnedResponseHeaders {
             "via" => GatewayOwnedResponseHeader::Via as u8,
             "alt-svc" => GatewayOwnedResponseHeader::AltSvc as u8,
             "x-gateway-error" => GatewayOwnedResponseHeader::GatewayError as u8,
-            "x-gateway-upstream-status" => {
-                GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8
-            }
+            "x-gateway-upstream-status" => GatewayOwnedResponseHeader::GatewayUpstreamStatus as u8,
             _ => return false,
         };
         self.0 & bit != 0

@@ -26434,20 +26434,16 @@ async fn handle_proxy_request_inner(
     let mut h2_streaming_trailer_governor = None;
     if let Some((pre_policy, unbounded)) = h2_streaming_trailer_policy {
         let mut final_headers = response_headers.clone();
-        let mut gateway_owned_headers =
-            headers_mod::GatewayOwnedResponseHeaders::default();
+        let mut gateway_owned_headers = headers_mod::GatewayOwnedResponseHeaders::default();
         if backend_resp.connection_error {
             final_headers.insert("x-gateway-error".into(), "connection_failure".into());
-            gateway_owned_headers
-                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         } else if response_status == 504 {
             final_headers.insert("x-gateway-error".into(), "backend_timeout".into());
-            gateway_owned_headers
-                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         } else if response_status >= 500 {
             final_headers.insert("x-gateway-error".into(), "backend_error".into());
-            gateway_owned_headers
-                .insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
+            gateway_owned_headers.insert(headers_mod::GatewayOwnedResponseHeader::GatewayError);
         }
         if upstream_is_fallback {
             final_headers.insert("x-gateway-upstream-status".into(), "degraded".into());
