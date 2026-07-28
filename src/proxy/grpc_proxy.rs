@@ -947,11 +947,12 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
-            // Preserve the configured initial outbound bound until the peer's
-            // SETTINGS frame replaces it.
+            // Cap server-initiated streams (push).
             builder.max_concurrent_streams(max_streams);
-            builder.initial_max_send_streams(max_streams as usize);
         }
+        // Zero is a pre-SETTINGS sentinel only. The peer's initial SETTINGS
+        // replaces it, including the RFC default when the parameter is absent.
+        builder.initial_max_send_streams(0);
 
         builder
     }
@@ -965,7 +966,7 @@ impl GrpcPoolManager {
         let io = TokioIo::new(tcp);
         let builder = Self::build_h2_builder(pool_config);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+        let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 format!("h2c handshake failed: {}", e),
@@ -973,32 +974,40 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // Unlike TLS-backed H2, h2c has no ALPN proof. Give the spawned driver
-        // one short observation window to surface an immediate protocol error
-        // (for example an HTTP/1.1 response to the prior-knowledge preface)
-        // before this DNS candidate is accepted.
-        let (driver_closed_tx, mut driver_closed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = conn.await.map_err(|error| error.to_string());
-            if let Err(ref e) = result {
-                debug!("gRPC h2c connection closed: {}", e);
+        // handshake() resolves after writing the client preface. Poll the
+        // driver until peer SETTINGS replace the zero-stream sentinel before
+        // accepting this DNS candidate.
+        std::future::poll_fn(|cx| {
+            if conn.current_max_send_streams() > 0 {
+                return std::task::Poll::Ready(Ok(()));
             }
-            let _ = driver_closed_tx.send(result);
-        });
-        if let Ok(result) =
-            tokio::time::timeout(Duration::from_millis(25), &mut driver_closed_rx).await
-        {
-            let message = match result {
-                Ok(Err(message)) => format!("h2c handshake failed: {message}"),
-                Ok(Ok(())) => "h2c connection closed during handshake".to_string(),
-                Err(_) => "h2c connection driver ended during handshake".to_string(),
-            };
-            return Err(GrpcProxyError::backend_unavailable_with_source(
+            match std::future::Future::poll(std::pin::Pin::new(&mut conn), cx) {
+                std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Err(
+                    "h2c connection closed before peer SETTINGS".to_string(),
+                )),
+                std::task::Poll::Ready(Err(error)) => {
+                    std::task::Poll::Ready(Err(format!("h2c handshake failed: {error}")))
+                }
+                std::task::Poll::Pending if conn.current_max_send_streams() > 0 => {
+                    std::task::Poll::Ready(Ok(()))
+                }
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        })
+        .await
+        .map_err(|message| {
+            GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
                 std::io::Error::new(std::io::ErrorKind::InvalidData, message),
-            ));
-        }
+            )
+        })?;
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("gRPC h2c connection closed: {}", e);
+            }
+        });
 
         Ok(sender)
     }

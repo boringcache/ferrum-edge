@@ -286,21 +286,6 @@ fn multi_address_dns_cache(dns_addr: SocketAddr) -> DnsCache {
     })
 }
 
-fn spawn_h2c_backend_on(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Ok((socket, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let service = service_fn(|_req: Request<Incoming>| async move {
-                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
-                });
-                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(socket), service)
-                    .await;
-            });
-        }
-    })
-}
-
 async fn bind_dual_loopback_listeners() -> (
     tokio::net::TcpListener,
     tokio::net::TcpListener,
@@ -602,15 +587,29 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
     let _failing_task = tokio::spawn(async move {
         while let Ok((mut socket, _)) = failing_listener.accept().await {
             task_attempts.fetch_add(1, Ordering::Relaxed);
-            // Prior-knowledge h2c writes the client preface before reading peer
-            // SETTINGS. Respond with HTTP/1.1 so the preface exchange fails and
-            // the pool must advance to the healthy second address exactly once.
+            // Keep this non-H2 socket open beyond the former 25 ms negative
+            // observation window, then prove it is not an H2 peer.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                 .await;
         }
     });
-    let _healthy_task = spawn_h2c_backend_on(healthy_listener);
+    let healthy_attempts = Arc::new(AtomicUsize::new(0));
+    let task_attempts = Arc::clone(&healthy_attempts);
+    let _healthy_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = healthy_listener.accept().await {
+            task_attempts.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let service = service_fn(|_req: Request<Incoming>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
     let dns = TestDnsServer::spawn(vec![
         IpAddr::V4(failing_ip),
         IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -640,6 +639,11 @@ async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
         failing_attempts.load(Ordering::Relaxed),
         1,
         "the TCP-successful, H2-failing first address must be attempted exactly once"
+    );
+    assert_eq!(
+        healthy_attempts.load(Ordering::Relaxed),
+        1,
+        "the pool must reject the stalled non-H2 peer and dial the healthy candidate"
     );
 }
 
