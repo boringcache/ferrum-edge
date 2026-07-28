@@ -1466,15 +1466,24 @@ async fn test_sampling_dispatch_observes_selection_not_just_continue() {
 // should_buffer_request_body
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_should_buffer_request_body_when_body_mirroring_enabled() {
+#[tokio::test]
+async fn test_should_buffer_request_body_when_body_mirroring_enabled() {
     let plugin = RequestMirror::new(
         &json!({ "mirror_host": "mirror.local", "mirror_request_body": true }),
         PluginHttpClient::default(),
     )
     .unwrap();
-    let ctx = make_ctx();
-    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(plugin.is_authorize_plugin());
+    assert!(plugin.requires_request_body_before_before_proxy());
+
+    let mut ctx = make_ctx();
+    // `should_buffer_request_body` is a pure read of authorize-phase admission.
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "admitted body-mirroring requests must buffer once authorize stages admission"
+    );
 }
 
 #[test]
