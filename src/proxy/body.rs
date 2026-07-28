@@ -3590,13 +3590,6 @@ pub(crate) struct StripHopByHopTrailers<B> {
 }
 
 impl<B> StripHopByHopTrailers<B> {
-    pub(crate) fn new(inner: B) -> Self {
-        Self {
-            inner,
-            governor: None,
-        }
-    }
-
     /// Same filter, plus the streaming HTTP/2 response-trailer policy
     /// boundary. See [`crate::proxy::headers::StreamingResponseTrailerGovernor`].
     pub(crate) fn with_trailer_governor(
@@ -4871,7 +4864,7 @@ mod tests {
             inner: MockSource::new(steps),
             _marker: PhantomData,
         };
-        StripHopByHopTrailers::new(body)
+        StripHopByHopTrailers::with_trailer_governor(body, None)
     }
 
     /// Drive a `Body` to `Ready(None)`, returning the collected frames.
