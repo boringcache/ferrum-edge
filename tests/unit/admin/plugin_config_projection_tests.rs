@@ -487,10 +487,7 @@ fn schema_paths_match_case_and_delimiter_variants() {
             json!({"x-scope-orgid": "loki-variant-canary"}),
         );
         // Safe sibling that must not collapse onto the sensitive map rule.
-        config.insert(
-            "custom_headers_enabled".to_string(),
-            json!(true),
-        );
+        config.insert("custom_headers_enabled".to_string(), json!(true));
         config.insert("batch_size".to_string(), json!(10));
         let projected = project("loki_logging", Value::Object(config));
         assert_eq!(
@@ -592,23 +589,13 @@ fn normalization_does_not_collapse_safe_fields_onto_sensitive_rules() {
     assert_eq!(projected["headers_count"], 3);
     assert_eq!(projected["endpoint_url_timeout_ms"], 1500);
     assert_eq!(projected["batch_size"], 50);
-    assert_no_canaries(
-        &projected,
-        &["http-path-canary", "http-header-canary"],
-    );
+    assert_no_canaries(&projected, &["http-path-canary", "http-header-canary"]);
 }
 
 /// Direct heuristic / Redis-URL callers must honor the compact normalization.
 #[test]
 fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
-    for spelling in [
-        "api_key",
-        "api-key",
-        "apiKey",
-        "API_KEY",
-        "api.key",
-        "apikey",
-    ] {
+    for spelling in ["api_key", "api-key", "apiKey", "API_KEY", "api.key", "apikey"] {
         assert!(
             is_sensitive_plugin_config_key(spelling),
             "heuristic missed sensitive spelling {spelling}"
@@ -671,10 +658,7 @@ fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
     );
     assert_eq!(projected["redisUsername"], "cacheuser");
     assert_eq!(projected["batchSize"], 9);
-    assert_no_canaries(
-        &projected,
-        &["custom-apikey-canary", "custom-redis-canary"],
-    );
+    assert_no_canaries(&projected, &["custom-apikey-canary", "custom-redis-canary"]);
 }
 
 #[test]
