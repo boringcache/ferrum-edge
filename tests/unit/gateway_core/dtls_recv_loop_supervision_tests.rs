@@ -70,7 +70,9 @@ async fn supervise_observes_ordinary_recv_loop_error() {
     let started = Arc::new(AtomicBool::new(true));
 
     let server_task = tokio::spawn(async {
-        Err(anyhow::anyhow!("DTLS server recv error: permanent I/O failure"))
+        Err(anyhow::anyhow!(
+            "DTLS server recv error: permanent I/O failure"
+        ))
     });
 
     let began = Instant::now();
