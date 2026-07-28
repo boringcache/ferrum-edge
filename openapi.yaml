@@ -15851,12 +15851,33 @@ components:
                 type: object
                 required: [replay_scope]
         - if:
-            required: [sync_mode]
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
+            required: [nonce]
+          then:
+            required: [sync_mode, redis_url]
             properties:
               sync_mode:
                 const: redis
+        - if:
+            properties:
+              sync_mode:
+                const: redis
+            required: [sync_mode]
           then:
-            required: [redis_url]
+            required: [nonce, redis_url]
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
       properties:
         reject_missing_security_header:
           type: boolean

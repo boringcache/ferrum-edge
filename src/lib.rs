@@ -1450,6 +1450,24 @@ pub mod _test_support {
         Ok(())
     }
 
+    /// Retire a replay scope whose cache and age index retain equal cardinality
+    /// but no longer describe the same claim.
+    pub fn soap_retire_same_cardinality_drift_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.check_nonce_replay("same-cardinality-retired-seed")?;
+        plugin.corrupt_nonce_age_index_value_for_tests()?;
+        drop(plugin);
+        Ok(())
+    }
+
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
     /// request-time fallback computes)`. Cached nodes are filled once per
     /// registered schema during ConversionPlan compile (#3024).

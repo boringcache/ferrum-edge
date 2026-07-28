@@ -5,6 +5,7 @@ use ferrum_edge::_test_support::{
     soap_nonce_replay_registry_contains_for_test, soap_nonce_replay_scope_key_for_test,
     soap_poison_process_replay_scope_for_test,
     soap_retire_inconsistent_process_replay_scope_for_test,
+    soap_retire_same_cardinality_drift_scope_for_test,
     soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
@@ -5509,6 +5510,52 @@ fn openapi_requires_replay_scope_for_password_digest_only() {
         "PasswordDigest with an explicit replay_scope must validate"
     );
 
+    let shared_without_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "shared" }
+    });
+    assert!(
+        validator.validate(&shared_without_redis).is_err(),
+        "shared replay scope must require sync_mode=redis and redis_url"
+    );
+
+    let shared_with_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "shared" },
+        "sync_mode": "redis",
+        "redis_url": "redis://redis.internal:6379"
+    });
+    assert!(
+        validator.validate(&shared_with_redis).is_ok(),
+        "shared replay scope with Redis must validate"
+    );
+
+    let process_with_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "process" },
+        "sync_mode": "redis",
+        "redis_url": "redis://redis.internal:6379"
+    });
+    assert!(
+        validator.validate(&process_with_redis).is_err(),
+        "sync_mode=redis must require replay_scope=shared"
+    );
+
     let text_ok = json!({
         "timestamp": { "require": false },
         "username_token": {
@@ -5818,6 +5865,19 @@ async fn inconsistent_retired_scopes_are_not_replaced() {
             .check_nonce_replay("inconsistent-probe-nonce")
             .expect_err("inconsistent state must fail closed"),
         "WS-Security: replay protection state is at capacity"
+    );
+}
+
+#[tokio::test]
+async fn same_cardinality_index_drift_is_not_reclaimed() {
+    let scope = "soap-prune-same-cardinality-drift";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_retire_same_cardinality_drift_scope_for_test(&username_token_digest_config(), scope)
+        .expect("same-cardinality retire helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-same-cardinality-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "cache/index mapping drift must not be reclaimed as expired state"
     );
 }
 

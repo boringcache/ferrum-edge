@@ -819,6 +819,27 @@ impl NonceReplayState {
             && (!self.cache.is_empty() || self.retained_key_bytes == 0)
     }
 
+    /// Full cold-path proof that the ordered index and lookup map describe the
+    /// same claims and byte accounting. Request admission intentionally uses
+    /// the O(1) [`Self::structurally_consistent`] guard; retired-scope
+    /// reclamation may afford this O(n) scan before it discards replay state.
+    fn fully_structurally_consistent(&self) -> bool {
+        if !self.structurally_consistent() {
+            return false;
+        }
+        let mut retained_key_bytes = 0usize;
+        for (age_key, nonce) in &self.age_index {
+            if !self.age_entry_matches(age_key, nonce) {
+                return false;
+            }
+            let Some(total) = retained_key_bytes.checked_add(nonce.len()) else {
+                return false;
+            };
+            retained_key_bytes = total;
+        }
+        retained_key_bytes == self.retained_key_bytes
+    }
+
     fn allocate_age_key(&mut self, now: Instant) -> Option<NonceAgeKey> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.checked_add(1)?;
@@ -958,7 +979,7 @@ fn retired_replay_scope_is_reclaimable(state: &Arc<Mutex<NonceReplayState>>, now
     let Ok(guard) = state.lock() else {
         return false;
     };
-    if !guard.structurally_consistent() {
+    if !guard.fully_structurally_consistent() {
         return false;
     }
     let Some((&(inserted_at, _), _)) = guard.age_index.last_key_value() else {
@@ -2560,6 +2581,28 @@ impl SoapWsSecurity {
         if state.age_index.remove(&age_key).is_none() {
             return Err("soap_ws_security: nonce replay test corruption failed".to_string());
         }
+        Ok(())
+    }
+
+    /// Preserve index cardinality while breaking its cache mapping (test
+    /// support). This distinguishes full reclamation validation from the O(1)
+    /// request-path cardinality guard.
+    #[allow(dead_code)]
+    pub(crate) fn corrupt_nonce_age_index_value_for_tests(&self) -> Result<(), String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay test state is process-scope only".to_string());
+        };
+        let mut state = replay_state
+            .lock()
+            .map_err(|_| "soap_ws_security: nonce replay test state unavailable".to_string())?;
+        let age_key = state
+            .age_index
+            .first_key_value()
+            .map(|(age_key, _)| *age_key)
+            .ok_or_else(|| "soap_ws_security: nonce replay test state is empty".to_string())?;
+        state
+            .age_index
+            .insert(age_key, Arc::<str>::from("same-cardinality-index-drift"));
         Ok(())
     }
 
