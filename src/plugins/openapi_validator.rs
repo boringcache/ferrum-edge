@@ -4631,9 +4631,9 @@ fn resolve_multipart_filename(
 
     let ordinary = params.get("filename");
     match (ordinary, filename_star) {
-        (Some(_), Some(_)) => Err(
-            "Malformed multipart part: ambiguous filename and filename* parameters".to_string(),
-        ),
+        (Some(_), Some(_)) => {
+            Err("Malformed multipart part: ambiguous filename and filename* parameters".to_string())
+        }
         (Some(ordinary), None) => {
             if ordinary.value.len() > MAX_MULTIPART_PARAM_BYTES {
                 return Err("Multipart filename exceeds size limit".to_string());
@@ -4795,7 +4795,10 @@ fn is_rfc8187_attr_char(byte: u8) -> bool {
 }
 
 fn reject_filename_injection(filename: &str) -> Result<(), String> {
-    if filename.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+    if filename
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
         return Err("Malformed multipart part: filename contains CR, LF, or NUL".to_string());
     }
     Ok(())
