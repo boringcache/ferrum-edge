@@ -25,8 +25,12 @@ const LEGACY_DEDUP_FIELDS: &[&str] = &[
     "_DedupRedisLockToken",
 ];
 
-const NON_INTERNAL_DEDUP_CONTROLS: &[&str] =
-    &["dedup_key", "request_dedup_key", "_deduplication", "cache_key"];
+const NON_INTERNAL_DEDUP_CONTROLS: &[&str] = &[
+    "dedup_key",
+    "request_dedup_key",
+    "_deduplication",
+    "cache_key",
+];
 
 const API_CREDENTIAL_KEYS: &[&str] = &[
     "api_key",

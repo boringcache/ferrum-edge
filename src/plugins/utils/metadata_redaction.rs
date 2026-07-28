@@ -536,7 +536,12 @@ mod tests {
                 "{key} must fail closed for schema / static field checks"
             );
         }
-        for key in ["dedup_key", "request_dedup_key", "_deduplication", "cache_key"] {
+        for key in [
+            "dedup_key",
+            "request_dedup_key",
+            "_deduplication",
+            "cache_key",
+        ] {
             assert!(
                 !is_internal_only_metadata_key(key),
                 "{key} must not be internal-only"
@@ -563,7 +568,10 @@ mod tests {
             "camel-redis-secret".to_string(),
         );
         metadata.insert("trace_id".to_string(), "abc-123".to_string());
-        metadata.insert("request_dedup_key".to_string(), "visible-control".to_string());
+        metadata.insert(
+            "request_dedup_key".to_string(),
+            "visible-control".to_string(),
+        );
 
         let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
