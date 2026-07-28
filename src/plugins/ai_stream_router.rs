@@ -3125,5 +3125,4 @@ mod sse_buffer_tests {
         );
         assert_eq!(normalizer.bytes_ingested, iterations * event.len());
     }
-
 }
