@@ -12125,14 +12125,18 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     // 2. Otherwise, reaching here while still HOLDING terminate authorization
     //    means the authored representation was invalidated, and the contract's
     //    `grpc-status: 0` must not be emitted as an empty Trailers-Only success.
+    // 3. The status-only contract's `grpc-message` is OPTIONAL, so an omitted
+    //    one is emitted as no field at all — never as a synthesized reason and
+    //    never as an empty value.
     let h3_mapped_status =
         crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
     let status_only =
         crate::proxy::status_only_grpc_signal(framed_unary_provenance, http_status, http_body);
     let (grpc_status, grpc_message) = match status_only {
-        Some((authored_status, authored_message)) => {
-            (authored_status, std::borrow::Cow::Owned(authored_message))
-        }
+        Some(ref authored) => (
+            authored.grpc_status,
+            authored.grpc_message.clone().map(std::borrow::Cow::Owned),
+        ),
         None => {
             let fail_closed = crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
                 framed_unary_provenance,
@@ -12140,8 +12144,8 @@ async fn send_h3_reject_flavor_aware_with_header_state(
                 h3_mapped_status,
             );
             match fail_closed {
-                Some((status, message)) => (status, std::borrow::Cow::Borrowed(message)),
-                None => (grpc_status, grpc_message),
+                Some((status, message)) => (status, Some(std::borrow::Cow::Borrowed(message))),
+                None => (grpc_status, Some(grpc_message)),
             }
         }
     };
@@ -12168,6 +12172,17 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         {
             continue;
         }
+        // Same eviction the H1/H2 normalizer performs: while a terminate
+        // contract is authorizing, no terminal metadata survives out of the
+        // mutable reject header map — neither what the contract authored nor a
+        // `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance below; an
+        // invalidated contract emits none of them, so the replacement status
+        // can never ride out beside the original contract's details or
+        // custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(k) {
+            continue;
+        }
         if k.eq_ignore_ascii_case("set-cookie") {
             // Newline-separated cookies must each become their own header line.
             for cookie_val in v.split('\n') {
@@ -12184,9 +12199,24 @@ async fn send_h3_reject_flavor_aware_with_header_state(
             builder = builder.header(name, val);
         }
     }
+    // Restore the intact status-only contract's remaining terminal metadata from
+    // the validated provenance, so decorators can add initial response headers
+    // but cannot alter, drop, or inject what the contract terminated with.
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                hyper::header::HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(name, val);
+            }
+        }
+    }
+    builder = builder.header("grpc-status", grpc_status.to_string());
+    if let Some(message) = grpc_message.as_deref().filter(|value| !value.is_empty()) {
+        builder = builder.header("grpc-message", message);
+    }
     let resp = builder
-        .header("grpc-status", grpc_status.to_string())
-        .header("grpc-message", grpc_message.as_ref())
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;

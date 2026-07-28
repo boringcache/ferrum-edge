@@ -108,8 +108,14 @@ status) FAILS CLOSED: the body is dropped and a residual `grpc-status: 0` is rep
 the rejection's own status, or `INTERNAL` — never emitted as an empty Trailers-Only
 success. The status-only shape stamps the same provenance with an EMPTY frame: it can
 never authorize DATA, but while the reply is unchanged (authored status, still-empty body)
-it stays trailers-only with the contract's own terminal metadata instead of the decorated
-reject header map, and a changed status or an unauthored body fails closed identically.
+it stays trailers-only and its COMPLETE terminal metadata (`grpc-status`, optional
+`grpc-message`, `grpc-status-details-bin`, validated custom trailers) is restored from the
+authored provenance instead of the decorated reject header map; an omitted `grpc_message`
+stays omitted rather than becoming a synthesized reason. A changed status or an unauthored
+body fails closed identically AND discards every terminal key the contract authored, so a
+replacement error never ships beside the original contract's `grpc-status-details-bin` or
+custom trailers. `grpc_message` is authored as text and emitted percent-encoded per the
+gRPC HTTP mapping, with the 8 KiB wire ceiling measured on the encoded value.
 `request_deduplication` is not in this picture at all — it is `HTTP_ONLY_PROTOCOLS` while
 `HttpFlavor::Grpc` selects the `ProxyProtocol::Grpc` plugin view, so it is never effective
 on a native-gRPC request.

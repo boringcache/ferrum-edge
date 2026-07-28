@@ -1777,6 +1777,346 @@ fn test_status_only_terminate_response_body_lifecycle_gate() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Terminal-metadata correctness for the terminate contract: case-insensitive
+// trailer names, the percent-encoded `grpc-message` wire form, preserved
+// omission of an optional message, and complete restore/removal of authored
+// terminal metadata across the shared emitter-facing result.
+// ---------------------------------------------------------------------------
+
+/// HTTP/gRPC metadata names are case-insensitive; JSON object members are not.
+/// Two members differing only in case are therefore the same trailer, and
+/// letting both through would emit whichever the map iterated last — losing an
+/// authored value nondeterministically.
+#[test]
+fn test_native_grpc_terminate_rejects_case_equivalent_trailer_names() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    const MAX_BODY: usize = 1024 * 1024;
+
+    let clashing = json!({
+        "grpc_status": 0,
+        "trailers": { "X-Foo": "first", "x-foo": "second" }
+    });
+    let body = serde_json::to_vec(&clashing).unwrap();
+    let err = build(200, &body, MAX_BODY).unwrap_err();
+    assert!(err.contains("x-foo"), "field-specific detail: {err}");
+    assert!(err.contains("case-insensitive"), "explains the rule: {err}");
+
+    // Distinct names are still accepted, and mixed-case authored input is
+    // normalized to the lowercase wire form.
+    let distinct = json!({
+        "grpc_status": 0,
+        "trailers": { "X-Foo": "first", "X-Bar": "second" }
+    });
+    let body = serde_json::to_vec(&distinct).unwrap();
+    let (_, _, headers) = build(200, &body, MAX_BODY).unwrap();
+    assert_eq!(headers.get("x-foo").map(String::as_str), Some("first"));
+    assert_eq!(headers.get("x-bar").map(String::as_str), Some("second"));
+}
+
+/// `grpc_message` is authored as human-readable text, but the wire field is
+/// `Percent-Encoded` per the gRPC HTTP mapping. Emitting the raw text would put
+/// a bare `%` (which clients decode as an escape introducer) and raw non-ASCII
+/// bytes into a field whose grammar forbids both.
+#[test]
+fn test_native_grpc_terminate_percent_encodes_grpc_message() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    fn emitted_message(message: &str) -> String {
+        let contract = json!({ "grpc_status": 9, "grpc_message": message });
+        let body = serde_json::to_vec(&contract).unwrap();
+        let (_, _, headers) = build(200, &body, 1024 * 1024).unwrap();
+        headers.get("grpc-message").cloned().unwrap()
+    }
+
+    // A literal percent sign must not reach the client as an escape introducer.
+    assert_eq!(emitted_message("100% failed"), "100%25 failed");
+    // Bytes the grammar allows unescaped stay literal: %x20-%x24 and %x26-%x7E.
+    assert_eq!(emitted_message("ok: a-b_c~d!\"#$&/"), "ok: a-b_c~d!\"#$&/");
+    // Non-ASCII is encoded per UTF-8 byte with uppercase hex.
+    assert_eq!(emitted_message("héllo"), "h%C3%A9llo");
+    assert_eq!(emitted_message("なし"), "%E3%81%AA%E3%81%97");
+    // Control bytes the CR/LF sanitizer does not cover are encoded rather than
+    // silently dropped at trailer construction.
+    assert_eq!(emitted_message("a\u{7}b"), "a%07b");
+    assert_eq!(emitted_message("del\u{7f}"), "del%7F");
+    // CR/LF normalization stays deterministic and runs BEFORE encoding, so a
+    // newline becomes a literal space rather than `%0A`.
+    assert_eq!(emitted_message("line\r\none"), "line  one");
+    assert_eq!(emitted_message("  padded  "), "padded");
+}
+
+/// The advertised 8 KiB trailer wire ceiling is measured on the ENCODED value.
+/// Percent-encoding expands a byte threefold, so bounding the pre-encoding
+/// string would have admitted roughly 24 KiB onto the wire.
+#[test]
+fn test_native_grpc_terminate_bounds_encoded_grpc_message() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+    use ferrum_edge::plugins::serverless_function::test_helpers::percent_encode_grpc_message_test as encode;
+
+    const WIRE_CAP: usize = 8 * 1024;
+    const MAX_BODY: usize = 1024 * 1024;
+
+    // Each `%` encodes to three bytes; the `a` padding keeps the encoded value
+    // exactly at the ceiling.
+    let at_cap = format!("{}{}", "%".repeat(WIRE_CAP / 3), "a".repeat(WIRE_CAP % 3));
+    assert_eq!(encode(&at_cap).len(), WIRE_CAP);
+    let contract = json!({ "grpc_status": 0, "grpc_message": at_cap });
+    let body = serde_json::to_vec(&contract).unwrap();
+    let (_, _, headers) = build(200, &body, MAX_BODY).unwrap();
+    assert_eq!(headers.get("grpc-message").map(String::len), Some(WIRE_CAP));
+
+    // One more source character crosses the ceiling even though the authored
+    // string is barely a third of it.
+    let over_cap = format!("{at_cap}a");
+    assert!(over_cap.len() < WIRE_CAP, "pre-image is under the cap");
+    let contract = json!({ "grpc_status": 0, "grpc_message": over_cap });
+    let body = serde_json::to_vec(&contract).unwrap();
+    let err = build(200, &body, MAX_BODY).unwrap_err();
+    assert!(err.contains("grpc_message"), "field-specific detail: {err}");
+    assert!(err.contains("percent-encoded"), "names the encoding: {err}");
+}
+
+/// The authored terminal metadata of a status-only contract that used every
+/// optional field.
+fn status_only_full_terminate_trailers() -> HashMap<String, String> {
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("grpc-message".to_string(), "all%20good".to_string());
+    trailers.insert("grpc-status-details-bin".to_string(), "AAECAw==".to_string());
+    trailers.insert("x-tenant".to_string(), "acme".to_string());
+    trailers
+}
+
+/// `grpc_message` is optional. A status-only success must not gain an invented
+/// error string, and neither must a nonzero contract that deliberately omitted
+/// one. Omission is also not represented by an empty `grpc-message` field.
+#[test]
+fn test_status_only_terminate_preserves_omitted_grpc_message() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+        status_only_grpc_terminate_signal_for_test,
+    };
+    use http::StatusCode;
+
+    for status in [0u32, 5u32] {
+        let mut ctx = create_test_context();
+        let mut trailers = HashMap::new();
+        trailers.insert("grpc-status".to_string(), status.to_string());
+        set_serverless_grpc_terminate_frame_for_test(&mut ctx, b"", trailers);
+
+        // The decorated reject header map carries terminal metadata the
+        // contract never authored; none of it may be promoted onto the
+        // contract's own status.
+        let mut headers = framed_grpc_terminate_reject_headers();
+        headers.insert("grpc-message".to_string(), "decorator text".to_string());
+        headers.insert(
+            "grpc-status-details-bin".to_string(),
+            "ZGVjb3JhdG9y".to_string(),
+        );
+
+        let normalized =
+            normalize_reject_response_with_context(&ctx, StatusCode::OK, b"", &headers, true);
+        assert_eq!(normalized.grpc_status, Some(status));
+        assert_eq!(
+            normalized.grpc_message, None,
+            "an omitted grpc_message stays omitted for status {status}"
+        );
+        assert!(
+            !normalized.headers.contains_key("grpc-message"),
+            "omission is not represented by an empty grpc-message field"
+        );
+        assert!(
+            !normalized.headers.contains_key("grpc-status-details-bin"),
+            "a decorator cannot inject terminal metadata the contract never authored"
+        );
+
+        // The direct-H3 writer consumes exactly this shared result, so agreeing
+        // here is what keeps the two emitters aligned.
+        let shared = status_only_grpc_terminate_signal_for_test(&ctx, StatusCode::OK, b"");
+        let shared = shared.unwrap();
+        assert_eq!(shared.0, status);
+        assert_eq!(shared.1, None, "the shared emitter result omits it too");
+    }
+}
+
+/// An intact status-only reply emits the COMPLETE authored terminal metadata,
+/// restored from the validated provenance. Non-terminal decoration may remain
+/// in the initial response headers, but a decorator can neither alter, drop,
+/// nor inject contract terminal metadata.
+#[test]
+fn test_status_only_terminate_restores_complete_authored_metadata() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+        status_only_grpc_terminate_signal_for_test,
+    };
+    use http::StatusCode;
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        b"",
+        status_only_full_terminate_trailers(),
+    );
+
+    // A decorator rewrote every terminal key and added an ordinary header.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("grpc-status".to_string(), "13".to_string());
+    headers.insert("grpc-message".to_string(), "decorator text".to_string());
+    headers.insert(
+        "grpc-status-details-bin".to_string(),
+        "ZGVjb3JhdG9y".to_string(),
+    );
+    headers.insert("x-tenant".to_string(), "attacker".to_string());
+    headers.insert("x-decorated".to_string(), "kept".to_string());
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, b"", &headers, true);
+
+    assert_eq!(normalized.grpc_status, Some(0));
+    assert_eq!(normalized.grpc_message.as_deref(), Some("all%20good"));
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        normalized.headers.get("grpc-message").map(String::as_str),
+        Some("all%20good")
+    );
+    assert_eq!(
+        normalized
+            .headers
+            .get("grpc-status-details-bin")
+            .map(String::as_str),
+        Some("AAECAw=="),
+        "details-bin is restored from the contract, never read out of the decorated map"
+    );
+    assert_eq!(
+        normalized.headers.get("x-tenant").map(String::as_str),
+        Some("acme"),
+        "an authored custom trailer is restored, not the decorator's replacement"
+    );
+    assert_eq!(
+        normalized.headers.get("x-decorated").map(String::as_str),
+        Some("kept"),
+        "non-terminal decoration is left alone"
+    );
+
+    // The direct-H3 writer builds its header block from this same result.
+    let shared = status_only_grpc_terminate_signal_for_test(&ctx, StatusCode::OK, b"");
+    let shared = shared.unwrap();
+    assert_eq!(shared.0, 0);
+    assert_eq!(shared.1.as_deref(), Some("all%20good"));
+    assert_eq!(
+        shared.2,
+        vec![
+            ("grpc-status-details-bin".to_string(), "AAECAw==".to_string()),
+            ("x-tenant".to_string(), "acme".to_string()),
+        ],
+        "sorted, and limited to authored terminal metadata beyond status/message"
+    );
+}
+
+/// Invalidating a status-only contract discards EVERY terminal key it authored.
+/// Pairing the replacement nonzero status with the original
+/// `grpc-status-details-bin` would describe the successful response the client
+/// is not receiving, and the contract's custom trailers would misattribute the
+/// replacement error.
+#[test]
+fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+        status_only_grpc_terminate_signal_for_test,
+    };
+    use http::StatusCode;
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        b"",
+        status_only_full_terminate_trailers(),
+    );
+
+    // The authored terminal metadata is sitting in the reject header map, as it
+    // is on the real path.
+    let mut headers = status_only_full_terminate_trailers();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-decorated".to_string(), "kept".to_string());
+
+    // A body the contract never authored invalidates the representation.
+    let injected = frame_terminate_message(b"injected");
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &injected, &headers, true);
+
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(13));
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated")
+    );
+    assert!(
+        !normalized.headers.contains_key("grpc-status-details-bin"),
+        "a stale details-bin encoding the original SUCCESS must not ride out beside \
+         the replacement error"
+    );
+    assert!(
+        !normalized.headers.contains_key("x-tenant"),
+        "the contract's custom trailers must not leak into the replacement"
+    );
+    assert_eq!(
+        normalized.headers.get("x-decorated").map(String::as_str),
+        Some("kept"),
+        "only the contract's OWN terminal keys are discarded"
+    );
+
+    let invalidated = status_only_grpc_terminate_signal_for_test(&ctx, StatusCode::OK, &injected);
+    assert!(invalidated.is_none());
+}
+
+/// The same complete removal applies when a FRAMED contract is invalidated: at
+/// that point the reject header map still holds the contract's terminal
+/// metadata, so a plain fallback would leak it beside the replacement error.
+#[test]
+fn test_invalidated_framed_terminate_drops_all_authored_metadata() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let framed = frame_terminate_message(b"hello");
+    let mut authored = framed_grpc_terminate_trailers();
+    authored.insert("grpc-status-details-bin".to_string(), "AAECAw==".to_string());
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(&mut ctx, &framed, authored.clone());
+
+    let mut headers = authored;
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-decorated".to_string(), "kept".to_string());
+
+    // A response-body transform rewrote the authorized frame.
+    let rewritten = frame_terminate_message(b"rewritten");
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &rewritten, &headers, true);
+
+    assert!(normalized.body.is_empty());
+    assert_eq!(normalized.grpc_status, Some(13));
+    assert!(
+        !normalized.headers.contains_key("grpc-status-details-bin"),
+        "the successful contract's details-bin must not survive its invalidation"
+    );
+    assert!(
+        !normalized.headers.contains_key("x-custom"),
+        "the contract's custom trailers must not leak into the replacement"
+    );
+    assert_eq!(
+        normalized.headers.get("x-decorated").map(String::as_str),
+        Some("kept")
+    );
+}
+
 /// A mutable `content-type` must not opt a plain HTTP request into the
 /// native-gRPC terminate contract.
 ///

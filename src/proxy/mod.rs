@@ -16751,23 +16751,30 @@ impl<'a> FramedGrpcUnaryProvenance<'a> {
         (authored.frame.as_ref() == body).then_some(&authored.trailers)
     }
 
-    /// The authorized terminal `(grpc-status, grpc-message)` for the *status-only*
+    /// The COMPLETE authorized terminal metadata for the *status-only*
     /// terminate contract — the shape that authored no frame and whose correct
     /// client representation therefore IS trailers-only.
     ///
     /// `Some` only while the response is still exactly what the contract
-    /// authored: the authored HTTP status and a still-empty body. The signal
-    /// comes from the authored terminal metadata rather than the reject header
-    /// map, which has been through `after_proxy` decorators, initial-header
-    /// policy, and — since the framed representation now runs it — the shared
-    /// response-body lifecycle.
+    /// authored: the authored HTTP status and a still-empty body. Every field
+    /// comes from the authored provenance rather than the reject header map,
+    /// which has been through `after_proxy` decorators, initial-header policy,
+    /// and — since the framed representation now runs it — the shared
+    /// response-body lifecycle. That covers `grpc-status`, an optional
+    /// `grpc-message`, `grpc-status-details-bin`, and the validated custom
+    /// trailers, so restoring this result is what makes the reply immune to
+    /// decorator mutation.
     ///
     /// `None` for a framed authorization (it authored DATA, so trailers-only is
     /// not its representation), for a changed status or a body the contract
     /// never authored, and for a status-only record whose own `grpc-status` no
     /// longer parses. Each of those is an invalidation and falls through to
     /// [`invalidated_grpc_terminate_fail_closed_signal`].
-    fn intact_status_only_signal(&self, status: StatusCode, body: &[u8]) -> Option<(u32, String)> {
+    fn intact_status_only_signal(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<StatusOnlyTerminalMetadata<'a>> {
         let authored = self.authored?;
         if !authored.frame.is_empty() || !body.is_empty() {
             return None;
@@ -16776,14 +16783,96 @@ impl<'a> FramedGrpcUnaryProvenance<'a> {
             return None;
         }
         let grpc_status = authored.trailers.get("grpc-status")?.parse::<u32>().ok()?;
+        // `grpc_message` is OPTIONAL in the contract, and omission is carried
+        // through as omission. Substituting a canonical reason here would invent
+        // "Gateway rejected request" for a status-only SUCCESS, and would
+        // override a nonzero contract's deliberate silence just as wrongly.
         let grpc_message = authored
             .trailers
             .get("grpc-message")
             .map(|message| sanitize_grpc_message(message))
-            .filter(|message| !message.is_empty())
-            .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
-        Some((grpc_status, grpc_message))
+            .filter(|message| !message.is_empty());
+        // Everything else the contract authored — `grpc-status-details-bin` and
+        // the validated custom trailers — is restored alongside the status.
+        // Sorted so the emitted header block is deterministic regardless of map
+        // iteration order.
+        let mut additional: Vec<(&'a str, &'a str)> = authored
+            .trailers
+            .iter()
+            .filter(|(name, _)| !is_status_or_message_trailer(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        additional.sort_unstable();
+        Some(StatusOnlyTerminalMetadata {
+            grpc_status,
+            grpc_message,
+            additional,
+        })
     }
+
+    /// Whether a trailers-only emitter must evict `name` from the mutable
+    /// reject header map because this request holds terminate authorization.
+    ///
+    /// Covers two things: every name the contract itself authored, and the
+    /// reserved gRPC terminal-metadata namespace whether the contract authored
+    /// it or not. So a decorator can neither replace what the contract
+    /// terminated with, nor inject a `grpc-status-details-bin` the contract
+    /// never authored onto the contract's own status.
+    ///
+    /// On the intact status-only path the authoritative copies are restored
+    /// from [`Self::intact_status_only_signal`] immediately afterwards. On any
+    /// invalidated path nothing is restored: pairing a replacement nonzero
+    /// `grpc-status` with the original contract's `grpc-status-details-bin` (or
+    /// its custom trailers) would describe the successful response the client
+    /// is not receiving.
+    ///
+    /// `grpc-status` and `grpc-message` are already dropped unconditionally by
+    /// every emitter; they are named here so the rule reads complete rather
+    /// than depending on that.
+    ///
+    /// Costs nothing when nothing is authorizing, which is every ordinary gRPC
+    /// rejection.
+    pub(crate) fn evicts_terminal_metadata(&self, name: &str) -> bool {
+        let Some(authored) = self.authored else {
+            return false;
+        };
+        if is_reserved_grpc_terminal_name(name) {
+            return true;
+        }
+        let mut authored_names = authored.trailers.keys();
+        authored_names.any(|authored_name| authored_name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Terminal names a [`StatusOnlyTerminalMetadata`] carries in its own
+/// `grpc_status` / `grpc_message` fields rather than in `additional`.
+fn is_status_or_message_trailer(name: &str) -> bool {
+    name.eq_ignore_ascii_case("grpc-status") || name.eq_ignore_ascii_case("grpc-message")
+}
+
+/// The reserved gRPC terminal-metadata namespace, matched case-insensitively
+/// because reject header maps are not normalized to lowercase.
+fn is_reserved_grpc_terminal_name(name: &str) -> bool {
+    is_status_or_message_trailer(name) || name.eq_ignore_ascii_case("grpc-status-details-bin")
+}
+
+/// The complete terminal metadata an UNCHANGED status-only
+/// `serverless_function` terminate contract must emit, taken from the validated
+/// authored provenance rather than the mutable reject header map.
+///
+/// This is the one representation shared by the H1/H2 normalizer and the
+/// direct-H3 writer, so a non-terminal response decorator can add initial
+/// response headers but can never alter, drop, or inject contract terminal
+/// metadata on either path.
+pub(crate) struct StatusOnlyTerminalMetadata<'a> {
+    pub(crate) grpc_status: u32,
+    /// `None` when the contract omitted `grpc_message`. Omission is emitted as
+    /// omission — never as an empty field and never as a synthesized reason.
+    pub(crate) grpc_message: Option<String>,
+    /// Authored terminal metadata other than `grpc-status`/`grpc-message`:
+    /// `grpc-status-details-bin` and the validated custom trailers, sorted by
+    /// name. Names are already lowercase.
+    pub(crate) additional: Vec<(&'a str, &'a str)>,
 }
 
 /// The authorized trailers-only signal for an unchanged status-only
@@ -16797,11 +16886,11 @@ impl<'a> FramedGrpcUnaryProvenance<'a> {
 /// means the fail-closed correction applies. Ordering it this way keeps the
 /// carve-out at the call site, so an emitter that forgets it fails closed rather
 /// than silently emitting the contract's `grpc-status`.
-pub(crate) fn status_only_grpc_signal(
-    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
+pub(crate) fn status_only_grpc_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
     status: StatusCode,
     body: &[u8],
-) -> Option<(u32, String)> {
+) -> Option<StatusOnlyTerminalMetadata<'a>> {
     framed_unary_provenance.intact_status_only_signal(status, body)
 }
 
@@ -16920,8 +17009,9 @@ pub(crate) fn normalize_reject_response_with_provenance(
     let (grpc_status, grpc_message) = match status_only {
         // The status-only terminate contract authored no frame, so trailers-only
         // IS its authorized representation, and its own terminal metadata — not
-        // the decorated reject header map — is what the client must see.
-        Some(signal) => signal,
+        // the decorated reject header map — is what the client must see. An
+        // omitted `grpc_message` stays omitted.
+        Some(ref authored) => (authored.grpc_status, authored.grpc_message.clone()),
         None => {
             let derived_grpc_status = headers
                 .get("grpc-status")
@@ -16933,19 +17023,21 @@ pub(crate) fn normalize_reject_response_with_provenance(
                 mapped_status,
             );
             match fail_closed {
-                Some((status_code, message)) => (status_code, message.to_string()),
+                Some((status_code, message)) => (status_code, Some(message.to_string())),
                 None => {
                     let message = headers
                         .get("grpc-message")
                         .cloned()
                         .or_else(|| extract_grpc_reject_message(body))
                         .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
-                    (derived_grpc_status, message)
+                    (derived_grpc_status, Some(message))
                 }
             }
         }
     };
-    let grpc_message = sanitize_grpc_message(&grpc_message);
+    let grpc_message = grpc_message
+        .map(|message| sanitize_grpc_message(&message))
+        .filter(|message| !message.is_empty());
 
     // `content-length` is dropped with the terminal metadata: this branch emits
     // an empty body, so any inbound value describes bytes that are not being
@@ -16962,12 +17054,27 @@ pub(crate) fn normalize_reject_response_with_provenance(
         {
             continue;
         }
+        // No terminal metadata is carried out of the reject header map while a
+        // terminate contract is authorizing — neither the keys it authored nor
+        // a `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance just below; every
+        // invalidated path must emit none of them, so a replacement nonzero
+        // `grpc-status` can never ship beside the original contract's
+        // `grpc-status-details-bin` or its custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(key) {
+            continue;
+        }
         normalized_headers.insert(key.clone(), value.clone());
+    }
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            normalized_headers.insert((*name).to_string(), (*value).to_string());
+        }
     }
     normalized_headers.insert("content-type".to_string(), "application/grpc".to_string());
     normalized_headers.insert("grpc-status".to_string(), grpc_status.to_string());
-    if !grpc_message.is_empty() {
-        normalized_headers.insert("grpc-message".to_string(), grpc_message.clone());
+    if let Some(ref message) = grpc_message {
+        normalized_headers.insert("grpc-message".to_string(), message.clone());
     }
 
     NormalizedRejectResponse {
@@ -16975,7 +17082,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
         headers: normalized_headers,
         body: Vec::new(),
         grpc_status: Some(grpc_status),
-        grpc_message: Some(grpc_message),
+        grpc_message,
         grpc_trailers: HashMap::new(),
     }
 }
@@ -17020,7 +17127,10 @@ fn try_normalize_framed_grpc_unary_reject(
         if lower == "content-type" || authored_trailers.contains_key(&lower) {
             continue;
         }
-        if lower == "grpc-status" || lower == "grpc-message" {
+        // The reserved gRPC terminal-metadata namespace is contract-owned even
+        // for names the contract did not author, so a decorator cannot inject
+        // `grpc-status-details-bin` alongside the contract's own trailers.
+        if grpc_proxy::is_reserved_grpc_terminal_metadata(&lower) {
             continue;
         }
         // Ferrum-owned gRPC-Web bridge fields must never reach a client.

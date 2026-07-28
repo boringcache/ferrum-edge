@@ -4046,6 +4046,32 @@ pub mod _test_support {
         }
     }
 
+    /// The shared emitter-facing terminate result for a trailers-only reply:
+    /// `(grpc-status, optional grpc-message, remaining authored terminal
+    /// metadata sorted by name)`, or `None` when this response is not an intact
+    /// status-only terminate contract.
+    ///
+    /// This is the exact value the H1/H2 normalizer and the direct-H3 writer
+    /// both consume, so asserting against it pins their parity at the one place
+    /// they share rather than at two restatements of it.
+    pub fn status_only_grpc_terminate_signal_for_test(
+        ctx: &crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<(u32, Option<String>, Vec<(String, String)>)> {
+        let authored = crate::proxy::status_only_grpc_signal(
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
+            status,
+            body,
+        )?;
+        let additional = authored
+            .additional
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        Some((authored.grpc_status, authored.grpc_message, additional))
+    }
+
     /// The emitter-side decision every gRPC reject writer shares: `Some` means
     /// "write DATA and then these terminal trailers", `None` means
     /// "trailers-only". Exercises the production predicate, so a writer that

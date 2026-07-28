@@ -2005,6 +2005,43 @@ fn sanitize_grpc_terminate_message(message: &str) -> String {
         .to_string()
 }
 
+/// Encode a sanitized status message into the canonical `grpc-message` wire
+/// form required by the gRPC HTTP/2 mapping:
+///
+/// ```text
+/// Status-Message         = Percent-Encoded
+/// Percent-Encoded        = 1*(Percent-Byte-Unescaped / Percent-Encoded-Byte)
+/// Percent-Byte-Unescaped = %x20-%x24 / %x26-%x7E
+/// Percent-Encoded-Byte   = "%" 2HEXDIG
+/// ```
+///
+/// Bytes the grammar allows unescaped stay literal. `%` (0x25) is escaped so an
+/// author's literal percent sign cannot be decoded by the client as an escape,
+/// and every byte outside `0x20..=0x7E` — ASCII controls the CR/LF sanitizer
+/// does not cover, `DEL`, and each UTF-8 continuation byte of a non-ASCII
+/// character — is escaped as `%XX`. Hex digits are uppercase, matching the
+/// canonical form other gRPC implementations emit.
+///
+/// The result is pure printable ASCII, so it is a valid HTTP field value by
+/// construction, contains no CR/LF, and is a fixed point of the gateway's
+/// downstream `sanitize_grpc_message` (the input was already trimmed, so no
+/// leading/trailing space survives to be trimmed again). That is what keeps the
+/// emitted value byte-stable across the H1/H2 normalizer and both H3 writers.
+fn percent_encode_grpc_message(message: &str) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(message.len());
+    for &byte in message.as_bytes() {
+        if matches!(byte, 0x20..=0x24 | 0x26..=0x7e) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
+            encoded.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    encoded
+}
+
 /// Frame one uncompressed unary gRPC DATA message: flag(0) + BE length + bytes.
 fn frame_uncompressed_unary_grpc_message(message: &[u8]) -> Result<Bytes, String> {
     let len = u32::try_from(message.len()).map_err(|_| {
@@ -2159,37 +2196,46 @@ fn build_native_grpc_terminate_response(
     let grpc_message = match object.get("grpc_message") {
         None => None,
         Some(Value::String(message)) => {
+            // The contract documents `grpc_message` as human-readable text, but
+            // the wire field is `Percent-Encoded` per the gRPC HTTP mapping.
+            // Normalize CR/LF deterministically first, then encode; emitting the
+            // raw text would put a bare `%` (which clients decode as an escape)
+            // and raw non-ASCII bytes into a field whose grammar forbids both.
             let sanitized = sanitize_grpc_terminate_message(message);
             if sanitized.is_empty() {
                 None
             } else {
+                let encoded = percent_encode_grpc_message(&sanitized);
                 // `grpc_message` becomes a terminal trailer value, so it is
                 // bound by the same advertised wire ceiling every other trailer
                 // value is. Without this it inherits only
                 // `max_response_body_bytes` — many MiB on a default deployment —
                 // and a single status message could dominate the TRAILERS block.
-                // The check is on the sanitized bytes because those are what
-                // reach the wire.
-                if sanitized.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                // The check is on the ENCODED bytes because those are what reach
+                // the wire: percent-encoding expands a byte threefold, so
+                // bounding the pre-encoding string would admit a ~24 KiB field.
+                if encoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
                     return Err(InvocationFailure::new(
                         "invalid_grpc_terminate_response",
                         format!(
-                            "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes after sanitization"
+                            "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes once percent-encoded"
                         ),
                     ));
                 }
                 // Custom trailers are field-value validated below; hold the
-                // protocol-owned message to the same bar. Without this a
-                // control byte the CR/LF sanitizer does not cover survives to
-                // trailer construction, where `HeaderValue::from_str` fails and
-                // silently drops `grpc-message` from the client's response.
-                if HeaderValue::from_str(&sanitized).is_err() {
+                // protocol-owned message to the same bar. Percent-encoding
+                // already guarantees printable ASCII, so this cannot fire today
+                // — it is retained so a future change to the encoder fails
+                // closed here rather than silently dropping `grpc-message` at
+                // trailer construction, where `HeaderValue::from_str` errors are
+                // discarded.
+                if HeaderValue::from_str(&encoded).is_err() {
                     return Err(InvocationFailure::new(
                         "invalid_grpc_terminate_response",
                         "gRPC terminate 'grpc_message' is not a valid HTTP field value",
                     ));
                 }
-                Some(sanitized)
+                Some(encoded)
             }
         }
         Some(_) => {
@@ -2304,6 +2350,17 @@ fn build_native_grpc_terminate_response(
                 ),
             ));
         }
+        // HTTP/gRPC metadata names are case-insensitive, so `X-Foo` and `x-foo`
+        // are the SAME trailer. JSON object members are not: both survive
+        // parsing as distinct keys and would collapse on insertion, silently
+        // emitting whichever the map iterated last. That is nondeterministic
+        // (map order) and loses an authored value, so reject it with a
+        // field-specific diagnostic instead.
+        //
+        // Deliberately scoped to case folding. Byte-identical duplicate JSON
+        // members are a `serde_json` last-wins property shared by every JSON
+        // contract in the gateway and are owned by PR #3403's detector.
+        let mut seen_trailer_names: HashSet<String> = HashSet::with_capacity(trailers.len());
         for (name, value) in trailers {
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 InvocationFailure::new(
@@ -2312,6 +2369,15 @@ fn build_native_grpc_terminate_response(
                 )
             })?;
             let lower = header_name.as_str();
+            if !seen_trailer_names.insert(lower.to_string()) {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!(
+                        "gRPC terminate 'trailers' declares '{lower}' more than once; \
+                         trailer names are case-insensitive"
+                    ),
+                ));
+            }
             if is_reserved_grpc_terminate_trailer_name(lower) {
                 return Err(InvocationFailure::new(
                     "invalid_grpc_terminate_response",
@@ -2434,6 +2500,12 @@ pub mod test_helpers {
 
     pub fn frame_uncompressed_unary_grpc_message_test(message: &[u8]) -> Result<Bytes, String> {
         frame_uncompressed_unary_grpc_message(message)
+    }
+
+    /// The canonical `grpc-message` percent encoder, so the wire form asserted
+    /// by tests is the one the plugin actually emits.
+    pub fn percent_encode_grpc_message_test(message: &str) -> String {
+        percent_encode_grpc_message(message)
     }
 
     pub fn build_native_grpc_terminate_response_test(

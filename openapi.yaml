@@ -19136,7 +19136,13 @@ components:
         The request is classified as native gRPC by the HTTP flavor the
         frontend stamps at intake, not by a mutable effective content-type.
         Every terminal trailer value is bounded by an 8 KiB wire-value
-        ceiling, measured after sanitization and after base64 re-encoding.
+        ceiling, measured after sanitization and after base64 or
+        percent-encoding. `grpc_message` is authored as human-readable text
+        and emitted in the canonical percent-encoded `grpc-message` wire form
+        (uppercase hex for `%` and every byte outside the grammar's
+        unescaped range). Custom trailer names are case-insensitive, so two
+        `trailers` members differing only in case are rejected rather than
+        one silently overwriting the other.
         gRPC-Web terminate is rejected with 500. Streaming and compression
         contract shapes fail closed. Malformed or oversized function output
         fails closed without reflecting untrusted bodies. The validated
@@ -19145,10 +19151,14 @@ components:
         policy or transform invalidates that authorized representation, the
         response fails closed to a nonzero gRPC error rather than degrading to
         an empty successful trailers-only reply. The status-only shape carries
-        the same provenance: unchanged, it stays trailers-only and takes its
-        terminal metadata from the validated contract rather than the reject
-        header map; a changed status or an unauthored body fails closed the
-        same way, and it can never authorize DATA. Cloud credential
+        the same provenance: unchanged, it stays trailers-only and restores its
+        complete terminal metadata (grpc-status, optional grpc-message,
+        grpc-status-details-bin, and validated custom trailers) from the
+        validated contract rather than the reject header map, with an omitted
+        grpc-message emitted as omission rather than a synthesized reason; a
+        changed status or an unauthored body fails closed the same way and
+        discards every authored terminal key with it, and it can never
+        authorize DATA. Cloud credential
         fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
