@@ -1,7 +1,8 @@
-//! Honest `__mesh_bpf_metrics` contract coverage (#2218/#2220/#2224/#2229).
+//! Honest `__mesh_bpf_metrics` contract coverage (#2218/#2220/#2224/#2229/#3308).
 //!
-//! Validates the public Prometheus surface, ABI decode rules, and pin-rotation
-//! dropped-baseline seeding without requiring a live BPF load.
+//! Validates the public Prometheus surface, ABI decode rules, pin-rotation
+//! dropped-baseline seeding, and the fixed TCP latency histogram contract
+//! without requiring a live BPF load.
 
 use ferrum_ebpf_common::{
     SOCK_OPS_DIRECTION_RECEIVED, SOCK_OPS_DIRECTION_SENT, SOCK_OPS_DROP_BYPASS_UID_HIT,
@@ -9,7 +10,11 @@ use ferrum_ebpf_common::{
     SOCK_OPS_DROP_NOT_IN_INCLUDE_CIDR, SOCK_OPS_EVENT_ACCEPT_TO_FIRST_BYTE_LATENCY,
     SOCK_OPS_EVENT_DROP_REASON, SOCK_OPS_EVENT_RST, SockOpsRecord,
 };
-use ferrum_edge::ebpf::bpf_metrics::{BpfDropReason, BpfMetricsState, TcpDirection};
+use ferrum_edge::ebpf::bpf_metrics::{
+    BPF_LATENCY_BUCKET_BOUNDS_US, BPF_LATENCY_BUCKET_LE_LABELS, BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT,
+    BPF_LATENCY_FINITE_BUCKET_COUNT, BpfDropReason, BpfMetricsState, TcpDirection,
+    bpf_latency_exclusive_bucket_index,
+};
 use ferrum_edge::ebpf::event_consumer::{
     PollOutcome, SockOpsConsumer, SockOpsEvent, seed_dropped_baseline,
 };
@@ -21,6 +26,18 @@ fn render_with(state: std::sync::Arc<BpfMetricsState>) -> String {
         .expect("plugin config")
         .exporter()
         .render_prometheus()
+}
+
+fn metric_value(text: &str, needle: &str) -> u64 {
+    let line = text
+        .lines()
+        .find(|line| line.starts_with(needle))
+        .unwrap_or_else(|| panic!("missing metric line starting with {needle}:\n{text}"));
+    line.rsplit_once(' ')
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| panic!("no value on line {line}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("non-u64 value on line {line}"))
 }
 
 #[test]
@@ -157,5 +174,261 @@ fn ringbuf_overrun_help_documents_reattach_seeding() {
     assert!(
         text.contains("re-attaching") || text.contains("pin rotation"),
         "overrun HELP must document pin-rotation seeding: {text}"
+    );
+}
+
+#[test]
+fn latency_histogram_bucket_boundaries_and_labels_are_stable() {
+    assert_eq!(
+        BPF_LATENCY_BUCKET_BOUNDS_US.len(),
+        BPF_LATENCY_FINITE_BUCKET_COUNT
+    );
+    assert_eq!(
+        BPF_LATENCY_BUCKET_LE_LABELS.len(),
+        BPF_LATENCY_FINITE_BUCKET_COUNT
+    );
+    assert_eq!(
+        BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT,
+        BPF_LATENCY_FINITE_BUCKET_COUNT + 1
+    );
+    assert_eq!(
+        BPF_LATENCY_BUCKET_BOUNDS_US,
+        [
+            100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+            1_000_000, 2_500_000, 5_000_000,
+        ]
+    );
+    for (bound, label) in BPF_LATENCY_BUCKET_BOUNDS_US
+        .iter()
+        .zip(BPF_LATENCY_BUCKET_LE_LABELS.iter())
+    {
+        assert_eq!(*label, bound.to_string());
+    }
+
+    // Inclusive upper bounds: exact boundary lands in that finite bucket.
+    assert_eq!(bpf_latency_exclusive_bucket_index(100), 0);
+    assert_eq!(bpf_latency_exclusive_bucket_index(101), 1);
+    assert_eq!(
+        bpf_latency_exclusive_bucket_index(5_000_000),
+        BPF_LATENCY_FINITE_BUCKET_COUNT - 1
+    );
+    assert_eq!(
+        bpf_latency_exclusive_bucket_index(5_000_001),
+        BPF_LATENCY_FINITE_BUCKET_COUNT
+    );
+    assert_eq!(
+        bpf_latency_exclusive_bucket_index(u64::MAX),
+        BPF_LATENCY_FINITE_BUCKET_COUNT
+    );
+}
+
+#[test]
+fn latency_histogram_renders_cumulative_buckets_sum_and_count() {
+    let state = BpfMetricsState::new();
+    // 100µs → first bucket; 250µs → second; 5_000_001 → +Inf only.
+    state.record_srtt_sample(100);
+    state.record_srtt_sample(250);
+    state.record_srtt_sample(5_000_001);
+    state.record_syn_to_ack(500);
+    state.record_syn_to_ack(500);
+
+    let text = render_with(state.clone());
+    let snap = state.snapshot();
+
+    assert!(text.contains("# TYPE ferrum_mesh_bpf_srtt_microseconds histogram"));
+    assert!(text.contains("# TYPE ferrum_mesh_bpf_syn_to_ack_microseconds histogram"));
+    assert!(
+        !text.contains("# TYPE ferrum_mesh_bpf_srtt_microseconds summary"),
+        "latency families must be histograms, not summaries"
+    );
+
+    // Zero-state finite buckets must still be present for series stability.
+    let empty = render_with(BpfMetricsState::new());
+    for le in BPF_LATENCY_BUCKET_LE_LABELS {
+        assert!(
+            empty.contains(&format!(
+                "ferrum_mesh_bpf_srtt_microseconds_bucket{{le=\"{le}\"}} 0"
+            )),
+            "missing zero SRTT bucket le={le}"
+        );
+        assert!(
+            empty.contains(&format!(
+                "ferrum_mesh_bpf_syn_to_ack_microseconds_bucket{{le=\"{le}\"}} 0"
+            )),
+            "missing zero SYN→ACK bucket le={le}"
+        );
+    }
+    assert!(empty.contains("ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"} 0"));
+
+    // Cumulative rendering: sample@100 and sample@250 both contribute to le="250".
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"100\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"250\"}"
+        ),
+        2
+    );
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"5000000\"}"
+        ),
+        2,
+        "overflow sample must not inflate finite buckets"
+    );
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"}"
+        ),
+        3
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_sum"),
+        100 + 250 + 5_000_001
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_count"),
+        3
+    );
+
+    // Snapshot cumulative helpers match exposition.
+    let cum = snap.srtt_cumulative_buckets();
+    assert_eq!(cum[0], 1);
+    assert_eq!(cum[1], 2);
+    assert_eq!(cum[BPF_LATENCY_FINITE_BUCKET_COUNT - 1], 2);
+    assert_eq!(
+        snap.srtt_bucket_exclusive[BPF_LATENCY_FINITE_BUCKET_COUNT],
+        1
+    );
+
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_syn_to_ack_microseconds_bucket{le=\"500\"}"
+        ),
+        2
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_syn_to_ack_microseconds_sum"),
+        1_000
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_syn_to_ack_microseconds_count"),
+        2
+    );
+}
+
+#[test]
+fn latency_histogram_distribution_shape_separates_bimodal_tail() {
+    let state = BpfMetricsState::new();
+    // Fast mode cluster around 200µs.
+    for _ in 0..10 {
+        state.record_srtt_sample(200);
+    }
+    // Slow tail cluster around 2ms.
+    for _ in 0..2 {
+        state.record_srtt_sample(2_000);
+    }
+
+    let text = render_with(state);
+    let le_250 = metric_value(
+        &text,
+        "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"250\"}",
+    );
+    let le_1000 = metric_value(
+        &text,
+        "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"1000\"}",
+    );
+    let le_2500 = metric_value(
+        &text,
+        "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"2500\"}",
+    );
+    let inf = metric_value(
+        &text,
+        "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"}",
+    );
+
+    assert_eq!(le_250, 10, "fast mode must land at/under 250µs");
+    assert_eq!(le_1000, 10, "slow samples must not inflate the 1ms bucket");
+    assert_eq!(le_2500, 12, "slow tail must appear by the 2.5ms bucket");
+    assert_eq!(inf, 12);
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_count"),
+        12
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_sum"),
+        10 * 200 + 2 * 2_000
+    );
+}
+
+#[test]
+fn latency_histogram_extreme_values_are_deterministic() {
+    let state = BpfMetricsState::new();
+
+    // Invalid zero samples are ignored for both signals.
+    state.record_srtt_sample(0);
+    state.record_syn_to_ack(0);
+    let after_zero = state.snapshot();
+    assert_eq!(after_zero.srtt_count, 0);
+    assert_eq!(after_zero.srtt_sample_us_sum, 0);
+    assert_eq!(after_zero.syn_to_ack_count, 0);
+    assert_eq!(after_zero.syn_to_ack_us_sum, 0);
+    assert!(after_zero.srtt_bucket_exclusive.iter().all(|&c| c == 0));
+    assert!(
+        after_zero
+            .syn_to_ack_bucket_exclusive
+            .iter()
+            .all(|&c| c == 0)
+    );
+
+    // Extreme finite overflow lands only in +Inf.
+    state.record_srtt_sample(u64::MAX);
+    let after_max = state.snapshot();
+    assert_eq!(after_max.srtt_count, 1);
+    assert_eq!(after_max.srtt_sample_us_sum, u64::MAX);
+    assert_eq!(
+        after_max.srtt_bucket_exclusive[BPF_LATENCY_FINITE_BUCKET_COUNT],
+        1
+    );
+    assert!(
+        after_max.srtt_bucket_exclusive[..BPF_LATENCY_FINITE_BUCKET_COUNT]
+            .iter()
+            .all(|&c| c == 0)
+    );
+
+    // A further sample that would overflow u64 sum is dropped entirely.
+    state.record_srtt_sample(1);
+    let after_overflow = state.snapshot();
+    assert_eq!(after_overflow.srtt_count, 1);
+    assert_eq!(after_overflow.srtt_sample_us_sum, u64::MAX);
+    assert_eq!(
+        after_overflow.srtt_bucket_exclusive[BPF_LATENCY_FINITE_BUCKET_COUNT],
+        1
+    );
+
+    let text = render_with(state);
+    assert_eq!(
+        metric_value(
+            &text,
+            "ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_sum"),
+        u64::MAX
+    );
+    assert_eq!(
+        metric_value(&text, "ferrum_mesh_bpf_srtt_microseconds_count"),
+        1
     );
 }
