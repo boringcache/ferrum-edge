@@ -925,6 +925,10 @@ impl SoapWsSecurity {
     /// used for a production PasswordDigest deployment that needs replay history
     /// to survive a reload. Production construction goes through
     /// [`Self::new_with_http_client_and_config_id`].
+    // Called through `lib::_test_support` and external tests; the binary target
+    // compiles this module without that facade and uses
+    // `new_with_http_client_and_config_id` for production wiring.
+    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
         Self::build(config, None, None)
     }
