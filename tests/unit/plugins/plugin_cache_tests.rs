@@ -3933,7 +3933,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
 }
 
 #[test]
-fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_good() {
+fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known_good() {
     let good_router = json!({
         "enabled": true,
         "providers": [{
@@ -3963,7 +3963,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
         "baseline cache must include ai_stream_router"
     );
 
-    for (label, bad_config, needle) in [
+    for (label, bad_config, expected) in [
         (
             "enabled-typo",
             json!({
@@ -3976,7 +3976,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "model_patterns": ["gpt-*"]
                 }]
             }),
-            "config.enabeld",
+            &["unknown configuration key", "config.enabeld"][..],
         ),
         (
             "provider-tls-typo",
@@ -3990,10 +3990,13 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "inherit_backend_tl": true
                 }]
             }),
-            "config.providers[0].inherit_backend_tl",
+            &[
+                "unknown configuration key",
+                "config.providers[0].inherit_backend_tl",
+            ][..],
         ),
         (
-            "fallback-typo",
+            "fallback-block",
             json!({
                 "providers": [{
                     "name": "openai",
@@ -4002,9 +4005,12 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "api_key": "sk-bad",
                     "model_patterns": ["gpt-*"]
                 }],
-                "fallback": {"on_connect_erro": true}
+                "fallback": {"on_connect_error": true}
             }),
-            "config.fallback.on_connect_erro",
+            &[
+                "unsupported field 'fallback'",
+                "provider fallback is not implemented",
+            ][..],
         ),
     ] {
         let config2 = make_config(
@@ -4025,7 +4031,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
         };
         let message = error.to_string();
         assert!(
-            message.contains("unknown configuration key") && message.contains(needle),
+            expected.iter().all(|needle| message.contains(needle)),
             "{label}: unexpected reload error: {message}"
         );
         assert!(
