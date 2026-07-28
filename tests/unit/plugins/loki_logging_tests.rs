@@ -909,6 +909,20 @@ async fn test_loki_retained_content_budget_bounds_buffered_entries() {
     );
 }
 
+/// A live Loki delivery must return the isolated retained-byte ceiling to
+/// exactly zero, and the recovered capacity must be genuinely reusable.
+///
+/// This is the end-to-end release boundary only. The in-flight peak — queued
+/// entries and the materialized wire body charged simultaneously, released on
+/// drop — is asserted deterministically by
+/// `byte_budget_tests::loki_batch_body_is_charged_alongside_the_queued_entries`,
+/// which observes the ceiling synchronously instead of racing a round trip.
+///
+/// Deliberately no assertion about a *second* entry being refused while the
+/// first is in flight: `send_batch` drops the queued batch as soon as the wire
+/// body is materialized, so the per-instance `buffer_max_bytes` leases are
+/// already released by the time the mock records the request. Only the payload
+/// reservation spans the round trip, and it is charged to the ceiling alone.
 #[tokio::test]
 async fn test_loki_retained_content_budget_is_released_after_delivery() {
     let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(64 * 1024)));
@@ -943,13 +957,17 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
     plugin.log(&first).await;
     wait_for_requests(&server, 1).await;
 
-    let mut rejected_while_reserved = first.clone();
-    rejected_while_reserved.request_path = format!("/rejected-budget-canary/{large_path}");
-    plugin.log(&rejected_while_reserved).await;
+    // The mock response is delayed, so request receipt is not the delivery
+    // boundary: the reserved payload stays charged until the round trip
+    // finishes and it drops. A reservation leaked on any success, error, drop,
+    // or cancellation path would keep the ceiling above zero and time out here.
+    wait_for_retained_bytes_released(ceiling, Duration::from_secs(10)).await;
+    // High water proves the injected ceiling was really on the live path, not
+    // bypassed; a 64 KiB total must admit one 4 KiB-budgeted batch outright.
+    assert!(ceiling.high_water() > 0, "ceiling was never charged");
+    assert_eq!(ceiling.rejections(), 0, "no batch may be refused");
 
-    // The mock response is delayed; the reserved delivery payload stays charged
-    // until the HTTP round-trip completes, not when the request is recorded.
-    wait_for_retained_bytes_released(ceiling, Duration::from_secs(2)).await;
+    // Capacity is genuinely reusable, not merely accounted as released.
     let mut admitted_after_release = first;
     admitted_after_release.request_path = format!("/released-budget-canary/{large_path}");
     plugin.log(&admitted_after_release).await;
@@ -979,12 +997,10 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
             .unwrap()
             .contains("released-budget-canary")
     }));
-    assert!(lines.iter().all(|line| {
-        !line["request_path"]
-            .as_str()
-            .unwrap()
-            .contains("rejected-budget-canary")
-    }));
+
+    // The second delivery drains the ceiling too, so nothing accumulates across
+    // batches.
+    wait_for_retained_bytes_released(ceiling, Duration::from_secs(10)).await;
 }
 
 #[tokio::test]

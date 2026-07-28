@@ -789,6 +789,7 @@ fn validate_minimum_entry_budget(
 
 /// Observations from [`probe_loki_batch_materialization_for_test`].
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // field reads happen only in `_test_support` wrappers
 pub(crate) struct LokiMaterializationProbe {
     /// Ceiling bytes held by the queued entries alone.
     pub(crate) queued_bytes: usize,

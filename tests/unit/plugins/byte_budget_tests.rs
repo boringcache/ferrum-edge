@@ -333,11 +333,15 @@ fn process_ceiling_config_bounds_are_clamped_not_silently_accepted() {
     ceiling.set_max(PROCESS_MAX_RETAINED_BYTES_DEFAULT);
     assert_eq!(ceiling.max(), PROCESS_MAX_RETAINED_BYTES_DEFAULT);
 
-    assert!(PROCESS_MAX_RETAINED_BYTES_MIN < PROCESS_MAX_RETAINED_BYTES_DEFAULT);
-    assert!(PROCESS_MAX_RETAINED_BYTES_DEFAULT <= PROCESS_MAX_RETAINED_BYTES_MAX);
-    // The default process total must admit at least one maximally configured
-    // sink instance, or a single legal instance could never fill its budget.
-    assert!(HARD_MAX_BUFFER_MAX_BYTES <= PROCESS_MAX_RETAINED_BYTES_DEFAULT);
+    // The documented bounds must stay mutually consistent, and the default
+    // process total must admit at least one maximally configured sink
+    // instance, or a single legal instance could never fill its budget. These
+    // are asserted against the ceiling's *installed* maximum rather than the
+    // constant, so the check exercises real state instead of folding away.
+    let installed_default = ceiling.max();
+    assert!(PROCESS_MAX_RETAINED_BYTES_MIN < installed_default);
+    assert!(installed_default <= PROCESS_MAX_RETAINED_BYTES_MAX);
+    assert!(HARD_MAX_BUFFER_MAX_BYTES <= installed_default);
 }
 
 // ---------------------------------------------------------------------------

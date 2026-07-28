@@ -1912,12 +1912,23 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     // cross-span batch semantics, so halving a refused slice preserves delivery
     // instead of dropping every span of a large `batch_size` outright.
     let mut start = 0usize;
+    // Slice width carried across iterations. Restarting every slice at the full
+    // remaining length would re-walk the same halving ladder — and re-count the
+    // same ceiling rejections — for every span once a width has been refused.
+    let mut window = batch.len().max(1);
+    // Loss is aggregated into a single line per flush. Emitting one warning per
+    // refused slice would produce up to one line per span while the ceiling is
+    // saturated, which is exactly when the process is already under memory
+    // pressure.
+    let mut lost_spans = 0usize;
+    let mut loss_reason: Option<&'static str> = None;
     while start < batch.len() {
-        let mut end = batch.len();
+        let mut end = batch.len().min(start.saturating_add(window));
         loop {
             let slice = &batch[start..end];
             match materialize_trace_body(cfg, slice) {
                 Ok(body) => {
+                    window = end - start;
                     deliver_trace_payload(cfg, body, slice.len()).await;
                     start = end;
                     break;
@@ -1926,17 +1937,24 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
                     end = start + (end - start) / 2;
                 }
                 Err(error) => {
-                    warn!(
-                        "{} export batch discarded before materialization ({} spans lost): {}",
-                        cfg.provider_name,
-                        end - start,
-                        error.reason(),
-                    );
+                    lost_spans += end - start;
+                    if loss_reason.is_none() {
+                        loss_reason = Some(error.reason());
+                    }
+                    window = end - start;
                     start = end;
                     break;
                 }
             }
         }
+    }
+    if let Some(reason) = loss_reason {
+        warn!(
+            "{} export batch discarded before materialization ({} spans lost): {}",
+            cfg.provider_name,
+            lost_spans,
+            reason,
+        );
     }
 }
 

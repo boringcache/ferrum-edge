@@ -565,6 +565,11 @@ impl ReservedPayload {
         self.bytes.len()
     }
 
+    /// Companion to [`ReservedPayload::len`], required by
+    /// `clippy::len_without_is_empty`. No sink needs it — every caller either
+    /// measures the payload or hands it to delivery — so it is dead in the
+    /// binary target, which does not compile the `_test_support` wrappers.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
