@@ -2152,10 +2152,12 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
         delta.len() < 128,
         "fixture delta must stay tiny so OpenAI envelope expansion dominates"
     );
-    assert!(
-        MAX_SSE_NORMALIZED_OUTPUT_BYTES > MAX_SSE_NORMALIZED_BODY_BYTES,
-        "output ceiling must sit above the plaintext ceiling"
-    );
+    const {
+        assert!(
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES > MAX_SSE_NORMALIZED_BODY_BYTES,
+            "output ceiling must sit above the plaintext ceiling"
+        );
+    }
 
     let batch_events = 64usize;
     let mut batch = Vec::with_capacity(batch_events * delta.len());
