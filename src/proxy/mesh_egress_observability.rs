@@ -63,7 +63,12 @@ impl CapturedMeshEgressLifecycle {
             return None;
         }
 
-        let client_ip = client_ip.to_string();
+        // Captured egress is an identity boundary like any other accept path:
+        // a dual-stack capture listener reports an IPv4 pod as
+        // `::ffff:a.b.c.d`, which would give the same workload two distinct
+        // `workload_metrics` label values and two stream-summary identities
+        // (GHSA-vjwj-657f-5w9g). Fold it once, here, before any plugin runs.
+        let client_ip = crate::util::client_identity::canonical_ip_string(client_ip);
         let mut stream_ctx = StreamConnectionContext::new(
             client_ip.clone(),
             client_ip.clone(),

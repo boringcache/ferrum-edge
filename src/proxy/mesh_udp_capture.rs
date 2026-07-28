@@ -222,12 +222,12 @@ fn is_ipv6_unavailable_error(e: &anyhow::Error) -> bool {
 /// V4-mapped V6; a real IPv6 client keeps its V6 address.
 #[cfg(target_os = "linux")]
 fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+    crate::util::client_identity::canonical_socket_addr(addr)
 }
 
 #[cfg(target_os = "linux")]
 fn mesh_udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    ip.to_canonical().to_string()
+    crate::util::client_identity::canonical_ip_string(ip)
 }
 
 /// Creates a per-session transparent UDP reply socket bound (non-locally, via

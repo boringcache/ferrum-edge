@@ -140,7 +140,7 @@ async fn shutdown_signalled_while_parked_returns_ok() {
 async fn shutdown_requested_wins_over_a_racing_exhausted_stream() {
     // Pins the `None`-arm re-read of the watch value, which is the only guard
     // for the genuine race: the watch starts un-signalled (so the loop-top check
-    // and the biased shutdown arm both fall through) and only flips to `true`
+    // and the shutdown arm both fall through) and only flips to `true`
     // during the very poll that reports the stream exhausted. Without the
     // re-read this would misclassify an operator shutdown as watcher failure
     // and exit nonzero.
