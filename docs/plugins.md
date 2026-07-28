@@ -272,6 +272,10 @@ The table below summarizes how to configure `http_logging` for popular log inges
 
 > **TLS verification:** If any service uses an internal CA, set `FERRUM_TLS_CA_BUNDLE_PATH` to your CA bundle so the plugin's HTTP client can verify the endpoint's certificate.
 
+> **Credentials in `endpoint_url`:** Prefer `custom_headers` — it is the supported authentication channel for every service that offers one, and header values are never logged. Some collectors have no header option (Sumo Logic puts its token in the URL path; Mezmo puts its API key in the query string), so `endpoint_url` may legitimately carry a reusable credential. Ferrum therefore never renders a configured `endpoint_url` in operational output. Diagnostics — egress-policy denial, DNS/TLS/connect failure, retry, slow-call warnings, and batch-failure error strings — show only a structurally redacted form (`https://host:port/redacted`) with the entire path, query, and fragment replaced, and the admin API's audit projection redacts the field the same way. The complete URL is used only to build the outbound request.
+>
+> Userinfo credentials (`https://user:password@host/...`) are **rejected at configuration time** for `http_logging`, `loki_logging`, and `ai_transcript_audit`. Use `custom_headers` (for example `Authorization: "Basic <base64>"`) instead.
+
 #### Splunk HEC Integration
 
 The `http_logging` plugin works with [Splunk HTTP Event Collector (HEC)](https://docs.splunk.com/Documentation/Splunk/latest/Data/UsetheHTTPEventCollector) using the **raw endpoint** (`/services/collector/raw`). The raw endpoint accepts arbitrary JSON — including the JSON arrays that `http_logging` sends — without requiring the HEC envelope format (`{"event": ...}`).
