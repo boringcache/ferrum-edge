@@ -2137,7 +2137,7 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
     // in every OpenAI envelope, so tiny Anthropic text deltas expand enough to
     // exercise the output bound while staying under the plaintext and
     // event-count caps.
-    let stream_id = "m".repeat(256);
+    let stream_id = "m".repeat(32 * 1024);
     let start = format!(
         "event: message_start\n\
          data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
@@ -2157,7 +2157,7 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
         "output ceiling must sit above the plaintext ceiling"
     );
 
-    let batch_events = 512usize;
+    let batch_events = 64usize;
     let mut batch = Vec::with_capacity(batch_events * delta.len());
     for _ in 0..batch_events {
         batch.extend_from_slice(delta);
@@ -2185,6 +2185,68 @@ async fn test_normalizer_rejects_excessive_normalized_output() {
         }
     }
     panic!("stream must terminate before {max_batches} batches exhaust the output cap");
+}
+
+#[tokio::test]
+async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let stream_id = "m".repeat(32 * 1024);
+    let start = format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+    );
+    let mut forwarded = match inspector.on_chunk(start.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) => bytes.len(),
+        other => panic!("message_start must forward: {other:?}"),
+    };
+
+    let delta = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    let batch_events = 8usize;
+    let mut batch = Vec::with_capacity(batch_events * delta.len());
+    for _ in 0..batch_events {
+        batch.extend_from_slice(delta);
+    }
+
+    // Stop with less than 900 KiB remaining. One batch expands by far less
+    // than the 388 KiB gap between that target and the terminal reserve.
+    const PROVIDER_MESSAGE_BYTES: usize = 900 * 1024;
+    let target = MAX_SSE_NORMALIZED_OUTPUT_BYTES - PROVIDER_MESSAGE_BYTES;
+    while forwarded < target {
+        match inspector.on_chunk(&batch).await {
+            ResponseStreamAction::Forward(bytes) => forwarded += bytes.len(),
+            other => panic!("in-budget text deltas must forward: {other:?}"),
+        }
+    }
+
+    let provider_marker = "PROVIDER-CONTROLLED-TERMINAL-SECRET:";
+    let provider_message = format!(
+        "{provider_marker}{}",
+        "p".repeat(PROVIDER_MESSAGE_BYTES - provider_marker.len())
+    );
+    let provider_error = format!(
+        "event: error\n\
+         data: {{\"type\":\"error\",\"error\":{{\"message\":\"{provider_message}\"}}}}\n\n"
+    );
+    assert!(
+        provider_error.len() < MAX_SSE_EVENT_BYTES,
+        "terminal fixture must remain within the per-event cap"
+    );
+
+    let terminal = match inspector.on_chunk(provider_error.as_bytes()).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => bytes,
+        other => panic!("oversized normalized terminal output must terminate: {other:?}"),
+    };
+    let text = String::from_utf8(terminal.to_vec()).unwrap();
+    assert_bound_termination(&text, "cumulative normalized size limit");
+    assert!(
+        !text.contains(provider_marker),
+        "provider-controlled terminal text must be replaced, not echoed"
+    );
+    assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+    assert!(
+        forwarded + text.len() <= MAX_SSE_NORMALIZED_OUTPUT_BYTES,
+        "terminal output must remain within the cumulative normalized cap"
+    );
 }
 
 #[tokio::test]

@@ -2171,6 +2171,14 @@ pub const MAX_SSE_NORMALIZED_BODY_BYTES: usize = NORMALIZE_DECODE_LIMITS.max_dec
 /// failing closed; aligned with the residual-decode cumulative byte budget.
 pub const MAX_SSE_NORMALIZED_OUTPUT_BYTES: usize = NORMALIZE_DECODE_LIMITS.max_cumulative_bytes;
 
+/// Space kept below the normalized-output ceiling for one stable fail-closed
+/// error frame plus the terminal `[DONE]` sentinel. All non-provider-controlled
+/// bound diagnostics are materially smaller than this reserve.
+const SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES: usize = 512;
+
+const SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE: &str =
+    "upstream provider SSE stream exceeded the cumulative normalized size limit; stream terminated";
+
 /// Maximum complete SSE events accepted by one normalizer instance. Defends
 /// against tiny-event floods that stay under the per-event and body-byte caps.
 pub const MAX_SSE_EVENTS: usize = 100_000;
@@ -2652,27 +2660,38 @@ impl AnthropicSseNormalizer {
 
             let terminate = self.apply_frame_outcome(outcome, out);
             self.maybe_compact();
-            if terminate {
-                self.clear_buffer();
+            if self.normalized_output_exceeded(out, terminate) {
                 return true;
             }
-            if self.normalized_output_exceeded(out) {
+            if terminate {
+                self.clear_buffer();
                 return true;
             }
         }
         false
     }
 
-    fn normalized_output_exceeded(&mut self, out: &mut String) -> bool {
+    fn normalized_output_exceeded(&mut self, out: &mut String, terminal: bool) -> bool {
         let total = self.normalized_out_bytes.saturating_add(out.len());
-        if total <= MAX_SSE_NORMALIZED_OUTPUT_BYTES {
+        let allowed = if terminal {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+        } else {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+                .saturating_sub(SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES)
+        };
+        if total <= allowed {
             return false;
         }
+
+        // A terminal provider event may itself be the bytes that cross the
+        // ceiling. Replace the complete current inspector emission, including
+        // any provider-controlled error message and an already-appended
+        // sentinel, with the fixed bound diagnostic. Prior non-terminal calls
+        // always retained enough room for this payload.
         out.clear();
-        self.fail_bound(
-            "upstream provider SSE stream exceeded the cumulative normalized size limit; stream terminated",
-            out,
-        );
+        self.done_emitted = false;
+        self.terminal = None;
+        self.fail_bound(SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE, out);
         true
     }
 
@@ -2764,10 +2783,15 @@ impl AnthropicSseNormalizer {
                         out,
                     );
                     self.finish(StreamTerminal::UpstreamFailure, out);
+                    let _ = self.normalized_output_exceeded(out, true);
                     return true;
                 }
                 outcome => {
-                    if self.apply_frame_outcome(outcome, out) {
+                    let terminate = self.apply_frame_outcome(outcome, out);
+                    if self.normalized_output_exceeded(out, terminate) {
+                        return true;
+                    }
+                    if terminate {
                         return true;
                     }
                     // Preserve prior EOF framing: a non-terminating trailing frame
@@ -2779,9 +2803,7 @@ impl AnthropicSseNormalizer {
                             out,
                         );
                         self.finish(StreamTerminal::UpstreamFailure, out);
-                        return true;
-                    }
-                    if self.normalized_output_exceeded(out) {
+                        let _ = self.normalized_output_exceeded(out, true);
                         return true;
                     }
                 }
@@ -2794,6 +2816,7 @@ impl AnthropicSseNormalizer {
             out,
         );
         self.finish(StreamTerminal::UpstreamFailure, out);
+        let _ = self.normalized_output_exceeded(out, true);
         true
     }
 
