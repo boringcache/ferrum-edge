@@ -75,7 +75,8 @@ paths:
 
 - Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.
 - Port allocation must retry. Bind-drop-rebind races with parallel tests.
-- Readiness is not identity. `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
+- Readiness is not identity — and that applies to bespoke spawners too, not just `TestGateway`. `functional_websocket_test.rs::wait_for_owned_gateway` reuses the exported `probe_gateway_identity` because a bare TCP accept let a foreign H2 fixture answer (and `PROTOCOL_ERROR`-reset) an RFC 8441 Extended CONNECT handshake (issue #3435).
+- `TestGateway` mints a per-spawn-attempt admin JWT secret/issuer and `FERRUM_METRICS_BEARER_TOKEN`, and its spawn barrier requires the authenticated detail tier of `/health` plus `ready: true`; that combination is also the proof the child owns its proxy port, because `ready` flips only after every listener bind. Do not weaken it to an unauthenticated `/health` or a bare TCP accept, and do not add sleeps or test-level retries in its place.
 - Use a struct harness with `try_new()` retry wrapper or a `start_gateway_with_retry()` helper.
 - Every retry needs fresh ports and fresh temp dirs/DBs. Reusing killed SQLite can corrupt WAL.
 - Backend/echo server should hold its listener. Do not drop+rebind; pass pre-bound `TcpListener` to `start_echo_server_on()`.
