@@ -1419,7 +1419,9 @@ fn push_field_value_bounded(out: &mut String, raw: &str) -> bool {
     // truncation is required — without copying an unbounded value.
     let (sanitized, complete) =
         sanitize_header_text_bounded(raw, MAX_FIELD_VALUE_BYTES.saturating_add(1));
-    let value = if !complete || sanitized.len() > MAX_FIELD_VALUE_BYTES {
+    let value = if !complete {
+        truncate_utf8_with_marker(&sanitized, MAX_FIELD_VALUE_BYTES, VALUE_MARKER)
+    } else if sanitized.len() > MAX_FIELD_VALUE_BYTES {
         truncate_utf8(&sanitized, MAX_FIELD_VALUE_BYTES, VALUE_MARKER)
     } else {
         sanitized
@@ -1571,7 +1573,12 @@ fn truncate_utf8(raw: &str, max_bytes: usize, marker: &str) -> String {
     if raw.len() <= max_bytes {
         return raw.to_string();
     }
-    let budget = max_bytes.saturating_sub(marker.len());
+    truncate_utf8_with_marker(raw, max_bytes, marker)
+}
+
+fn truncate_utf8_with_marker(raw: &str, max_bytes: usize, marker: &str) -> String {
+    let marker = marker_within_budget(marker, max_bytes);
+    let budget = max_bytes - marker.len();
     let mut end = budget.min(raw.len());
     while end > 0 && !raw.is_char_boundary(end) {
         end -= 1;
@@ -1579,6 +1586,14 @@ fn truncate_utf8(raw: &str, max_bytes: usize, marker: &str) -> String {
     let mut out = raw[..end].to_string();
     out.push_str(marker);
     out
+}
+
+fn marker_within_budget(marker: &str, max_bytes: usize) -> &str {
+    let mut end = marker.len().min(max_bytes);
+    while end > 0 && !marker.is_char_boundary(end) {
+        end -= 1;
+    }
+    &marker[..end]
 }
 
 // ---------------------------------------------------------------------------

@@ -46,6 +46,9 @@ pub fn render_template_bounded(
     max_bytes: usize,
     marker: &str,
 ) -> Result<String, String> {
+    // A bounded render may stop emitting before it reaches the end of the
+    // template, but malformed operator syntax must still fail consistently.
+    validate_template(template)?;
     let mut out = String::with_capacity(template.len().min(max_bytes));
     let mut i = 0;
     while i < template.len() {
@@ -174,7 +177,8 @@ fn push_str_bounded(out: &mut String, value: &str, max_bytes: usize, marker: &st
         out.push_str(value);
         return false;
     }
-    let content_budget = max_bytes.saturating_sub(marker.len());
+    let marker = marker_within_budget(marker, max_bytes);
+    let content_budget = max_bytes - marker.len();
     if out.len() < content_budget {
         let need = content_budget - out.len();
         let mut end = need.min(value.len());
@@ -200,9 +204,18 @@ fn push_char_bounded(out: &mut String, ch: char, max_bytes: usize, marker: &str)
 }
 
 fn apply_truncation_marker(out: &mut String, max_bytes: usize, marker: &str) {
-    let content_budget = max_bytes.saturating_sub(marker.len());
+    let marker = marker_within_budget(marker, max_bytes);
+    let content_budget = max_bytes - marker.len();
     truncate_string_to_budget(out, content_budget);
     out.push_str(marker);
+}
+
+fn marker_within_budget(marker: &str, max_bytes: usize) -> &str {
+    let mut end = marker.len().min(max_bytes);
+    while end > 0 && !marker.is_char_boundary(end) {
+        end -= 1;
+    }
+    &marker[..end]
 }
 
 fn truncate_string_to_budget(out: &mut String, budget: usize) {

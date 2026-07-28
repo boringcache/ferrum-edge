@@ -856,6 +856,23 @@ fn fields_block_hard_caps_oversized_names_and_crossing_final_field() {
         !fields.contains("[fields truncated]"),
         "exact-fit fields block must not claim truncation"
     );
+
+    // A multibyte codepoint that crosses the per-value probe boundary still
+    // needs the visible value-level marker. The bounded sanitizer can return
+    // fewer than 512 bytes while reporting incomplete, so length alone is not
+    // proof that the full value fit.
+    let mut unicode_boundary = notification(EventAction::Trigger);
+    unicode_boundary.fields = vec![NotificationField::new(
+        "f",
+        format!("{}😀", "a".repeat(510)),
+    )];
+    let fields = channel
+        .render_body(&unicode_boundary, &no_extras())
+        .expect("unicode-boundary fields render");
+    assert!(
+        fields.contains(&format!("{}...", "a".repeat(509))),
+        "truncated multibyte field value must retain its marker: {fields}"
+    );
 }
 
 #[test]

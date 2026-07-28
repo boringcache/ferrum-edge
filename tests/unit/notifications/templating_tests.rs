@@ -129,3 +129,16 @@ fn bounded_render_exact_fit_skips_marker() {
     let out = render_template_bounded("${a}", &vars(&[("a", "hello")]), 5, "...").unwrap();
     assert_eq!(out, "hello");
 }
+
+#[test]
+fn bounded_render_caps_a_marker_larger_than_the_budget() {
+    let out = render_template_bounded("abcdef", &HashMap::new(), 2, "[truncated]").unwrap();
+    assert_eq!(out, "[t");
+    assert!(out.len() <= 2);
+}
+
+#[test]
+fn bounded_render_rejects_unbalanced_suffix_after_output_fills() {
+    let err = render_template_bounded("x${broken", &HashMap::new(), 1, ".").unwrap_err();
+    assert!(err.contains("unbalanced"), "{err}");
+}
