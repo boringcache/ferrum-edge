@@ -388,7 +388,7 @@ fn buffered_h3_committed_deadline_preserves_binary_text_and_native_framing() {
                 .decode(&response.body)
                 .expect("text gRPC-Web deadline body must be valid base64")
         } else {
-            response.body.clone()
+            response.body.to_vec()
         };
         let frames = parse_grpc_frames(&decoded);
         assert_eq!(frames.len(), 1);
@@ -1129,7 +1129,7 @@ async fn response_transform_deadline_replaces_native_and_grpc_web_responses() {
                     .decode(&body)
                     .expect("text gRPC-Web deadline body must be base64")
             } else {
-                body
+                body.to_vec()
             };
             let frames = parse_grpc_frames(&decoded);
             assert_eq!(frames.len(), 1);
@@ -1303,7 +1303,7 @@ async fn buffered_deadline_keeps_only_provenance_owned_gateway_headers() {
                         .decode(&body)
                         .expect("text gRPC-Web deadline body must be base64")
                 } else {
-                    body
+                    body.to_vec()
                 };
                 let frames = parse_grpc_frames(&decoded);
                 assert_eq!(frames.len(), 1);
@@ -2695,7 +2695,7 @@ async fn response_normalizer_deadline_preserves_grpc_web_framing() {
                 .decode(&body)
                 .expect("text gRPC-Web deadline body must be base64")
         } else {
-            body
+            body.to_vec()
         };
         let frames = parse_grpc_frames(&decoded);
         assert_eq!(frames.len(), 1);

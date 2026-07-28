@@ -1421,7 +1421,7 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             final_status, 200,
             "ae={accept_encoding:?}: acceptable identity must keep cache HIT"
         );
-        assert_eq!(final_body, br#"{"cached":"identity"}"#);
+        assert_eq!(&final_body[..], br#"{"cached":"identity"}"#);
         assert!(
             !final_headers.contains_key("content-encoding"),
             "ae={accept_encoding:?}: must not commit content-encoding on reject path"
@@ -1481,7 +1481,7 @@ async fn test_security_rejection_not_replaced_by_406() {
         final_status, 401,
         "auth rejection must not be masked by compression 406"
     );
-    assert_eq!(final_body, br#"{"error":"unauthorized"}"#);
+    assert_eq!(&final_body[..], br#"{"error":"unauthorized"}"#);
     assert_eq!(
         final_headers.get("www-authenticate").map(String::as_str),
         Some("Bearer")
@@ -3229,7 +3229,7 @@ async fn test_buffered_normalizer_noop_preserves_existing_views_without_content_
     ctx.request_body_bytes = Some(bytes::Bytes::from_static(b"preexisting byte view"));
     let original_bytes_ptr = ctx.request_body_bytes.as_ref().unwrap().as_ptr();
     let mut headers = HashMap::new();
-    let mut body = bytes::Bytes::from_static(b"ordinary uncompressed request");
+    let mut body = b"ordinary uncompressed request".to_vec();
 
     let result = apply_buffered_request_body_normalization_before_before_proxy_for_test(
         &plugins,
@@ -4255,7 +4255,7 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
 
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut decoder = GzDecoder::new(body.as_slice());
+    let mut decoder = GzDecoder::new(&body[..]);
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
@@ -5268,7 +5268,7 @@ async fn test_content_encoding_identity_only_strips_without_body_rewrite() {
     let mut ctx = make_request_ctx_with_body("identity", b"plain");
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "identity".to_string());
-    let mut body = bytes::Bytes::from_static(b"plain");
+    let mut body = b"plain".to_vec();
     let result = plugin
         .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
         .await;
@@ -6032,7 +6032,7 @@ async fn test_response_encode_abort_restores_identity_representation() {
 
     // Simulate a missing permit / encoder abort after Content-Encoding commit.
     let _ = take_compression_response_buffer_permit_for_test(&mut ctx);
-    let mut identity = compressible_json_body();
+    let mut identity = bytes::Bytes::from(compressible_json_body());
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
         .await;
@@ -6096,7 +6096,7 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
                 "buffer admission is what gates the commit; codec saturation is later"
             );
 
-            let mut identity = compressible_json_body();
+            let mut identity = bytes::Bytes::from(compressible_json_body());
             assert!(
                 plugin
                     .transform_response_body_with_context(
@@ -6168,7 +6168,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
                 PluginResult::Continue
             ));
 
-            let mut body = compressible_json_body();
+            let mut body = bytes::Bytes::from(compressible_json_body());
             assert!(
                 plugin
                     .transform_response_body_with_context(
@@ -6199,7 +6199,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
             assert!(!resp.contains_key("content-encoding"));
             assert_eq!(resp.get("content-length"), Some(&body.len().to_string()));
             assert!(
-                String::from_utf8(body)
+                String::from_utf8(body.to_vec())
                     .expect("406 body must be UTF-8")
                     .contains("not acceptable")
             );

@@ -168,7 +168,7 @@ async fn head_no_body_finalization_drops_shared_body_bytes() {
     assert!(body.is_empty(), "HEAD must omit content bytes");
     assert_eq!(
         headers.get("content-length").map(String::as_str),
-        Some(&(256 * 1024).to_string()),
+        Some((256 * 1024).to_string().as_str()),
         "HEAD keeps representation Content-Length"
     );
 }

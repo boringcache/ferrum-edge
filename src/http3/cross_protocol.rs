@@ -6827,7 +6827,7 @@ where
     })
 }
 
-fn normalize_reject_for_client(
+pub(crate) fn normalize_reject_for_client(
     ctx: &mut RequestContext,
     status: StatusCode,
     body: Bytes,
@@ -7829,19 +7829,6 @@ fn should_skip_cross_protocol_backend_header(name: &str) -> bool {
         && CROSS_PROTOCOL_BACKEND_SKIP_NAMES
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
-}
-
-pub(crate) fn normalize_reject_for_client_for_test(
-    ctx: &mut RequestContext,
-    status: StatusCode,
-    body: Bytes,
-    headers: &HashMap<String, String>,
-    native_grpc: bool,
-) -> (
-    crate::proxy::NormalizedRejectResponse,
-    Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
-) {
-    normalize_reject_for_client(ctx, status, body, headers, native_grpc)
 }
 
 #[cfg(test)]

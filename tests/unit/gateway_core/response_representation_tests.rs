@@ -111,7 +111,7 @@ async fn run_backend_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body, reason)
+    (replaced, transformed, status, headers, body.to_vec(), reason)
 }
 
 /// The secret must not survive in the bytes the client would receive.
@@ -426,7 +426,7 @@ async fn run_synthetic_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (status, headers, body, reason)
+    (status, headers, body.to_vec(), reason)
 }
 
 /// A serverless provider answering `429` while echoing stale representation
@@ -1242,7 +1242,7 @@ async fn synthetic_body_preserves_the_first_terminal_rejection() {
     .await;
 
     assert_eq!(status, 502);
-    assert_eq!(body.as_slice(), br#"{"error":"first body rejection"}"#);
+    assert_eq!(&body[..], br#"{"error":"first body rejection"}"#);
     assert!(
         !final_invoked.load(Ordering::SeqCst),
         "final validators must not replace a previously selected terminal response"
@@ -1896,7 +1896,7 @@ async fn run_with_accept_encoding(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body, headers)
+    (replaced, status, reason, body.to_vec(), headers)
 }
 
 #[tokio::test]
@@ -2019,7 +2019,7 @@ async fn run_with_response_limit(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// A highly compressible JSON document whose decoded size far exceeds a small
@@ -2141,7 +2141,7 @@ async fn run_with_request_hook_then_encoded_response(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 #[tokio::test]
@@ -2369,7 +2369,7 @@ async fn run_framed_response_with_relabelled_content_type(
     }
 
     let mut status = 200;
-    let mut body = grpc_frame(br#"{"secret":"hunter2","keep":1}"#);
+    let mut body = bytes::Bytes::from(grpc_frame(br#"{"secret":"hunter2","keep":1}"#));
 
     // The pristine snapshot sees the backend's own headers.
     let mut headers = HashMap::new();
@@ -2395,7 +2395,7 @@ async fn run_framed_response_with_relabelled_content_type(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// One relabelling case: the request flavor, the retained gRPC-Web type, the
@@ -2697,7 +2697,7 @@ async fn run_backend_transform_with_request_headers(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body, reason)
+    (replaced, transformed, status, headers, body.to_vec(), reason)
 }
 
 /// The bypass itself: an SSE-accepting request whose response another plugin
@@ -2863,7 +2863,7 @@ async fn relabelled_framed_grpc_declines_in_the_transform_too() {
 
     let mut status = 200;
     let document = br#"{"secret":"unreachable-state","keep":1}"#.to_vec();
-    let mut body = document.clone();
+    let mut body = bytes::Bytes::from(document.clone());
 
     // The backend's own type is framed gRPC, so the snapshot records framing.
     let mut headers = HashMap::new();
@@ -2952,7 +2952,7 @@ async fn run_gateway_generated_after_framed_grpc_backend(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, body, reason)
+    (replaced, status, body.to_vec(), reason)
 }
 
 /// The finding: a stale framed-gRPC stamp must not suppress the claim over
@@ -3114,7 +3114,7 @@ async fn run_backend_transform_reporting_stamped_length(
     .await;
     (
         stamped_response_content_length_for_test(&ctx),
-        body,
+        body.to_vec(),
         headers,
     )
 }
@@ -3287,7 +3287,7 @@ async fn run_untyped_grpc_route_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// The three request shapes that reach the untyped branch: native gRPC, and
@@ -4019,7 +4019,7 @@ async fn run_untyped_grpc_route_with_accept_encoding(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body, headers)
+    (replaced, status, reason, body.to_vec(), headers)
 }
 
 /// The finding: an encoded framed RPC reply whose client sent `identity;q=0`.
@@ -4197,7 +4197,7 @@ async fn run_translated_grpc_web_lifecycle(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// The bypass: an untyped backend answering a translated gRPC-Web request with a
@@ -4338,7 +4338,7 @@ async fn run_compressing_backend_rejection(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, headers, body)
+    (replaced, status, reason, headers, body.to_vec())
 }
 
 /// The control that makes the assertions below non-vacuous: with the SAME

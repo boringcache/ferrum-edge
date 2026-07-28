@@ -1634,7 +1634,6 @@ mod tests {
     use crate::proxy::tcp_proxy::{StreamFirstFailure, StreamIoSide};
     use crate::retry::ErrorClass;
     use std::collections::HashMap;
-
     use std::time::Instant;
 
     fn minimal_proxy() -> Proxy {

@@ -200,7 +200,7 @@ fn test_response_body_buffered() {
 
     let body = ResponseBody::buffered(b"hello".to_vec());
     match body {
-        ResponseBody::Buffered(data) => assert_eq!(data, b"hello"),
+        ResponseBody::Buffered(data) => assert_eq!(&data[..], b"hello"),
         _ => panic!("Expected Buffered variant"),
     }
 }

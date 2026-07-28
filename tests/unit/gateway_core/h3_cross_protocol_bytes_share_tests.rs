@@ -50,7 +50,11 @@ fn h3_cross_protocol_reject_boundaries_avoid_slice_copies_for_owned_bytes() {
         .split("fn normalize_reject_for_client(")
         .nth(1)
         .expect("H3 cross-protocol reject normalizer")
-        .split("fn reject_committed_response_view(")
+        // NOTE: this bound must match the real signature (it carries a lifetime
+        // parameter). `split(..).next()` yields the whole remaining file when the
+        // pattern is absent, which would silently widen every assertion below
+        // from "the normalizer" to "the rest of cross_protocol.rs".
+        .split("fn reject_committed_response_view<'a>(")
         .next()
         .expect("bounded H3 cross-protocol reject normalizer");
     assert!(

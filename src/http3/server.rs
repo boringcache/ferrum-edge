@@ -11149,6 +11149,16 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
     // already applied shared HEAD/204/205/304 no-body preparation. Skip DATA
     // entirely when there is nothing to send so HEAD and no-body statuses never
     // emit an empty DATA frame before FIN.
+    //
+    // KNOWN RESIDUAL (GHSA-5fp3-pp5p-c4gh): the native-H3 reject senders in this
+    // module still take `body: &[u8]`, so a cached synthetic `RejectBinary`
+    // payload — already carried as shared `Bytes` through
+    // `RejectedResponseParts` and `apply_reject_after_proxy_and_synthetic_body_hooks`
+    // — is copied once here per hit. The H3 *cross-protocol* bridge
+    // (`http3::cross_protocol`) already carries owned `Bytes` to `send_data`;
+    // extending that to the ~70 native-H3 reject call sites in this file is
+    // deliberately left to a follow-up so the ownership change lands as one
+    // reviewable signature migration rather than piecemeal.
     if !body.is_empty() {
         stream.send_data(Bytes::copy_from_slice(body)).await?;
     }

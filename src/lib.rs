@@ -3844,7 +3844,7 @@ pub mod _test_support {
         Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
     ) {
         let (normalized, grpc_web_error) =
-            crate::http3::cross_protocol::normalize_reject_for_client_for_test(
+            crate::http3::cross_protocol::normalize_reject_for_client(
                 ctx,
                 status,
                 body,
