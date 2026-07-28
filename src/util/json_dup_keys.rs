@@ -31,14 +31,22 @@
 //! succeed": *are these bytes something a downstream parser would accept, but
 //! that this gateway cannot faithfully evaluate?* [`slice_ambiguity`] answers
 //! exactly that — it reports a reason ONLY when `serde_json` itself accepts the
-//! document. That makes the screen fail-safe against any grammar divergence
-//! between this scanner and `serde_json`: bytes the scanner mis-parses but
-//! `serde_json` accepts are reported as ambiguous (fail closed), and bytes both
-//! reject keep their existing "malformed body" handling. The confirmation parse
-//! runs only on the rejection path, so the success path stays a single pass.
-//! It uses the same `deserialize_any` acceptance path as `serde_json::Value`
-//! (not `serde::de::IgnoredAny`, whose `ignore_value` shortcut skips UTF-8 /
-//! surrogate validation and the recursion limit).
+//! document, with one explicit resource-bound exception: [`JsonScanReject::TooLarge`]
+//! fails closed immediately with its fixed reason and never runs confirmation.
+//! An over-budget body may be arbitrarily larger than [`JsonScanLimits::max_bytes`],
+//! and walking it (or allocating a decoded scratch string for an attacker-
+//! controlled escape sequence) would violate the scanner's O(max_bytes) contract.
+//! At that boundary, bounded rejection takes precedence over preserving the
+//! narrower "only when serde accepts" classification.
+//!
+//! For every other scanner rejection, confirmation makes the screen fail-safe
+//! against grammar divergence between this scanner and `serde_json`: bytes the
+//! scanner mis-parses but `serde_json` accepts are reported as ambiguous (fail
+//! closed), and bytes both reject keep their existing "malformed body" handling.
+//! The confirmation parse runs only on those rejection paths, so the success
+//! path stays a single pass. It uses the same `deserialize_any` acceptance path
+//! as `serde_json::Value` (not `serde::de::IgnoredAny`, whose `ignore_value`
+//! shortcut skips UTF-8 / surrogate validation and the recursion limit).
 //!
 //! Reasons are fixed-cardinality `&'static str` values and never echo any byte
 //! of the inspected document, so they are safe to surface in warn/audit
@@ -258,10 +266,12 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
 /// Screen `bytes` for policy-relevant JSON ambiguity under
 /// [`GOVERNED_JSON_LIMITS`].
 ///
-/// Returns `Some(reason)` only when the bytes are a document `serde_json`
-/// accepts but this scanner cannot prove unambiguous. Bytes that `serde_json`
-/// also rejects return `None` so callers keep their existing malformed-body
-/// handling instead of reclassifying every parse error as an ambiguity.
+/// Returns `Some(reason)` when the bytes are a document `serde_json` accepts
+/// but this scanner cannot prove unambiguous, or when the body exceeds
+/// [`JsonScanLimits::max_bytes`] (see [`slice_ambiguity_with`] for that
+/// resource-bound exception). Bytes that `serde_json` also rejects return
+/// `None` so callers keep their existing malformed-body handling instead of
+/// reclassifying every parse error as an ambiguity.
 ///
 /// The caller must pass exactly the bytes it will hand to `serde_json` (BOM
 /// already stripped, body already decoded), or the two verdicts describe
@@ -271,16 +281,26 @@ pub fn slice_ambiguity(bytes: &[u8]) -> Option<&'static str> {
 }
 
 /// [`slice_ambiguity`] with explicit budgets.
+///
+/// [`JsonScanReject::TooLarge`] is special-cased: confirmation must not parse or
+/// scan past `limits.max_bytes`, so an over-budget body fails closed immediately
+/// with that reject's fixed [`JsonScanReject::reason`] regardless of whether
+/// `serde_json` would accept or reject the content. Every other rejection still
+/// confirms against governed `serde_json::Value` acceptance before reporting a
+/// reason.
 pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'static str> {
     match scan(bytes, limits) {
         Ok(()) => None,
+        // Resource bound takes precedence: do not walk or decode an over-budget
+        // body just to classify it as malformed vs ambiguity.
+        Err(JsonScanReject::TooLarge) => Some(JsonScanReject::TooLarge.reason()),
         Err(reject) => {
             // Confirmation parse, rejection path only. `SerdeJsonAccept` matches
             // governed `serde_json::Value` acceptance (UTF-8, paired surrogates,
             // trailing data, default recursion limit) without building a value
-            // tree. Input on non-TooLarge paths is already <= `limits.max_bytes`;
-            // TooLarge skips content inspection and confirmation stays
-            // non-materializing so it cannot allocate a `Value` past that budget.
+            // tree. These paths already observed `bytes.len() <= limits.max_bytes`
+            // (TooLarge returned above), so confirmation stays inside the scan
+            // size budget.
             if serde_json_accepts(bytes) {
                 Some(reject.reason())
             } else {

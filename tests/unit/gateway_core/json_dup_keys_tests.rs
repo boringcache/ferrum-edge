@@ -440,21 +440,67 @@ fn explicit_budgets_are_enforced() {
     );
 }
 
-/// Size-budget exhaustion on a document `serde_json` accepts is ambiguity,
-/// matching other budget failures. Confirmation is non-materializing so it
-/// cannot build a `Value` tree larger than the scan budget.
+/// Size-budget exhaustion fails closed with the fixed TooLarge reason and does
+/// not run content confirmation: an over-budget body may be arbitrarily larger
+/// than `max_bytes`, and walking it would violate the scanner resource contract.
+/// Valid and malformed oversize bodies both get the same bounded rejection;
+/// in-budget malformed input still returns `None`, and in-budget duplicates
+/// still return DuplicateKey.
 #[test]
-fn oversize_parseable_body_is_reported_as_size_budget_ambiguity() {
+fn oversize_body_reports_size_budget_without_content_confirmation() {
     let tight = JsonScanLimits {
         max_bytes: 8,
         ..GOVERNED_JSON_LIMITS
     };
-    let body = br#"{"aaaa":1}"#;
-    assert_eq!(scan(body, &tight), Err(JsonScanReject::TooLarge));
-    assert!(serde_json::from_slice::<serde_json::Value>(body).is_ok());
+
+    // Over-budget and parseable: still TooLarge, without needing confirmation.
+    let valid = br#"{"aaaa":1}"#;
+    assert!(valid.len() > tight.max_bytes);
+    assert_eq!(scan(valid, &tight), Err(JsonScanReject::TooLarge));
+    assert!(serde_json::from_slice::<serde_json::Value>(valid).is_ok());
     assert_eq!(
-        slice_ambiguity_with(body, &tight),
+        slice_ambiguity_with(valid, &tight),
         Some(JsonScanReject::TooLarge.reason())
+    );
+
+    // Over-budget and malformed: same fixed TooLarge reason (not None). Content
+    // confirmation must not run past max_bytes just to reclassify as malformed.
+    let malformed = br#"{"aaaa":!"#;
+    assert!(malformed.len() > tight.max_bytes);
+    assert_eq!(scan(malformed, &tight), Err(JsonScanReject::TooLarge));
+    assert!(serde_json::from_slice::<serde_json::Value>(malformed).is_err());
+    assert_eq!(
+        slice_ambiguity_with(malformed, &tight),
+        Some(JsonScanReject::TooLarge.reason())
+    );
+
+    // Over-budget with an escaped payload that would allocate if confirmation
+    // decoded past the size bound: still TooLarge only.
+    let mut escaped_oversize = Vec::from(&b"{\"\\u0061\\u0061\\u0061\\u0061\":1"[..]);
+    // Ensure well past the tiny budget; trailing garbage keeps it malformed too.
+    escaped_oversize.extend_from_slice(b"!!!!");
+    assert!(escaped_oversize.len() > tight.max_bytes);
+    assert_eq!(
+        scan(&escaped_oversize, &tight),
+        Err(JsonScanReject::TooLarge)
+    );
+    assert_eq!(
+        slice_ambiguity_with(&escaped_oversize, &tight),
+        Some(JsonScanReject::TooLarge.reason())
+    );
+
+    // Contrast: in-budget malformed stays None (confirmation rejects with Value).
+    let in_budget_malformed = br#"{"a":"#;
+    assert!(in_budget_malformed.len() <= tight.max_bytes);
+    assert!(serde_json::from_slice::<serde_json::Value>(in_budget_malformed).is_err());
+    assert!(slice_ambiguity_with(in_budget_malformed, &tight).is_none());
+
+    // Contrast: in-budget valid duplicate still reports DuplicateKey.
+    let duplicate = br#"{"a":1,"a":2}"#;
+    assert!(duplicate.len() <= GOVERNED_JSON_LIMITS.max_bytes);
+    assert_eq!(
+        slice_ambiguity(duplicate),
+        Some(JsonScanReject::DuplicateKey.reason())
     );
 }
 
