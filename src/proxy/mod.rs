@@ -16868,7 +16868,7 @@ pub(crate) fn framed_unary_reject_parts(
         .then(|| (reject.body.as_slice(), &reject.grpc_trailers))
 }
 
-fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
+pub(crate) fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
     if body.len() < 5 {
         return false;
     }

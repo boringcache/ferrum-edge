@@ -106,9 +106,22 @@ const DEFAULT_INSTANCE_ID: &str = "standalone";
 /// response. Protocol-owned `grpc-status` / `grpc-message` /
 /// `grpc-status-details-bin` are counted separately via dedicated fields.
 const MAX_GRPC_TERMINATE_CUSTOM_TRAILERS: usize = 32;
-/// Per-trailer value byte cap (decoded). Prevents a function from forcing
+/// Per-trailer **wire** value byte cap. Prevents a function from forcing
 /// oversized HEADER/TRAILER blocks onto the client stream.
+///
+/// This bound is applied to the bytes that actually reach the trailer block,
+/// after sanitization and after any re-encoding — not to some pre-image of
+/// them. `grpc_message` is therefore bounded here rather than only by
+/// `max_response_body_bytes` (which can be many MiB), and
+/// `status_details_base64` is bounded by its re-encoded base64 length rather
+/// than by the decoded byte count that base64 expands 4/3 beyond.
 const MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES: usize = 8 * 1024;
+/// Largest decoded `grpc-status-details-bin` payload whose standard-base64
+/// re-encoding still fits [`MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES`]. Base64
+/// emits four characters per three input bytes, so the decoded ceiling is
+/// three quarters of the wire ceiling.
+const MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES: usize =
+    MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES / 4 * 3;
 /// Allowed top-level keys in the terminate-mode native-gRPC JSON contract.
 const GRPC_TERMINATE_RESPONSE_FIELDS: &[&str] = &[
     "grpc_status",
@@ -1942,16 +1955,24 @@ fn request_content_type<'a>(
         .or_else(|| ctx.headers.get("content-type").map(String::as_str))
 }
 
-fn is_native_grpc_terminate_request(
-    headers: &HashMap<String, String>,
-    ctx: &RequestContext,
-) -> bool {
-    if ctx.is_native_grpc_request() {
-        return true;
-    }
-    request_content_type(headers, ctx).is_some_and(|ct| {
-        crate::proxy::backend_dispatch::is_native_grpc_content_type(ct.as_bytes())
-    })
+/// True when the frontend classified this request as native gRPC.
+///
+/// The request-scoped flavor is the ONLY classification used here. Production
+/// frontends stamp `RequestContext::request_http_flavor` once at intake, and
+/// every downstream consumer of the framed terminate contract — the reject
+/// finalizer's `is_grpc_request`, the H1/H2 body builder, and the H3 writers —
+/// keys off that same intake decision. The live effective `content-type` is
+/// mutable: `request_transformer` runs before this plugin and can rewrite a
+/// Plain request's `content-type` to `application/grpc`. Honouring that would
+/// make `serverless_function` author a framed unary response for a request the
+/// frontend and finalizer still treat as ordinary HTTP, so the header is not
+/// consulted.
+///
+/// gRPC-Web is a separate question with the opposite problem — see
+/// [`is_grpc_web_terminate_request`], where the live header is *insufficient*
+/// rather than untrustworthy.
+fn is_native_grpc_terminate_request(ctx: &RequestContext) -> bool {
+    ctx.is_native_grpc_request()
 }
 
 /// True when the client spoke gRPC-Web, including after translation.
@@ -1996,17 +2017,23 @@ fn frame_uncompressed_unary_grpc_message(message: &[u8]) -> Result<Bytes, String
     Ok(Bytes::from(framed))
 }
 
+/// Decode a standard-base64 contract field under a decoded-byte ceiling.
+///
+/// `limit_label` names the ceiling that was violated so an operator can tell a
+/// `max_response_body_bytes` overrun apart from a trailer-value overrun without
+/// reading the source.
 fn decode_bounded_base64_field(
     value: &str,
     field: &str,
     max_decoded_bytes: usize,
+    limit_label: &str,
 ) -> Result<Vec<u8>, String> {
     // Reject standard/base64url alphabet waste that would decode far beyond the
-    // configured message ceiling before allocating the decoded buffer.
+    // ceiling before allocating the decoded buffer.
     let approx_decoded = value.len().saturating_mul(3) / 4;
     if approx_decoded > max_decoded_bytes.saturating_add(3) {
         return Err(format!(
-            "serverless_function: gRPC terminate '{field}' exceeds max_response_body_bytes"
+            "serverless_function: gRPC terminate '{field}' exceeds {limit_label}"
         ));
     }
     let decoded = base64::engine::general_purpose::STANDARD
@@ -2016,10 +2043,62 @@ fn decode_bounded_base64_field(
         })?;
     if decoded.len() > max_decoded_bytes {
         return Err(format!(
-            "serverless_function: gRPC terminate '{field}' exceeds max_response_body_bytes"
+            "serverless_function: gRPC terminate '{field}' exceeds {limit_label}"
         ));
     }
     Ok(decoded)
+}
+
+/// Re-validate a framed native-gRPC terminate representation that was persisted
+/// outside this process (a `request_deduplication` Redis replay record) before
+/// it is allowed to re-mint `RequestContext::serverless_grpc_terminate_frame`.
+///
+/// A persisted record outlives the process that wrote it and lives in shared
+/// infrastructure, so it is treated as untrusted input on read: nothing about
+/// its provenance can be re-derived from the store. Every bound the live
+/// contract enforces is re-applied here — the body must still be exactly one
+/// uncompressed unary frame, the terminal metadata must still carry a parseable
+/// `grpc-status`, and the trailer count and per-value wire lengths must still
+/// be within the advertised ceilings — and anything else fails closed to
+/// `None`, which the caller turns into a refused replay rather than a
+/// trailers-only response with a dropped body.
+///
+/// `MAX_GRPC_TERMINATE_CUSTOM_TRAILERS` counts operator trailers only; the
+/// three dedicated protocol-owned fields (`grpc-status`, `grpc-message`,
+/// `grpc-status-details-bin`) are admitted on top of it.
+pub(crate) fn validated_persisted_grpc_terminate_trailers(
+    body: &[u8],
+    trailers: HashMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if !crate::proxy::bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+    if trailers.is_empty() || trailers.len() > MAX_GRPC_TERMINATE_CUSTOM_TRAILERS + 3 {
+        return None;
+    }
+    trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    for (name, value) in &trailers {
+        // Persisted names must already be the lowercase wire form the emitter
+        // writes; a record whose names drifted cannot be shown to be the one
+        // this gateway authored.
+        let header_name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        if header_name.as_str() != name {
+            return None;
+        }
+        // The three dedicated protocol-owned fields are the only reserved names
+        // that legitimately appear here; every other reserved/hop-by-hop name
+        // the live contract refuses must stay refused on read.
+        if is_reserved_grpc_terminate_trailer_name(name)
+            && !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(name)
+        {
+            return None;
+        }
+        if value.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+            return None;
+        }
+        HeaderValue::from_str(value).ok()?;
+    }
+    Some(trailers)
 }
 
 fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
@@ -2136,6 +2215,21 @@ fn build_native_grpc_terminate_response(
             if sanitized.is_empty() {
                 None
             } else {
+                // `grpc_message` becomes a terminal trailer value, so it is
+                // bound by the same advertised wire ceiling every other trailer
+                // value is. Without this it inherits only
+                // `max_response_body_bytes` — many MiB on a default deployment —
+                // and a single status message could dominate the TRAILERS block.
+                // The check is on the sanitized bytes because those are what
+                // reach the wire.
+                if sanitized.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                    return Err(InvocationFailure::new(
+                        "invalid_grpc_terminate_response",
+                        format!(
+                            "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes after sanitization"
+                        ),
+                    ));
+                }
                 // Custom trailers are field-value validated below; hold the
                 // protocol-owned message to the same bar. Without this a
                 // control byte the CR/LF sanitizer does not cover survives to
@@ -2168,10 +2262,15 @@ fn build_native_grpc_terminate_response(
                 Some(Vec::new())
             } else {
                 Some(
-                    decode_bounded_base64_field(encoded, "message_base64", max_message_bytes)
-                        .map_err(|detail| {
-                            InvocationFailure::new("invalid_grpc_terminate_response", detail)
-                        })?,
+                    decode_bounded_base64_field(
+                        encoded,
+                        "message_base64",
+                        max_message_bytes,
+                        "max_response_body_bytes",
+                    )
+                    .map_err(|detail| {
+                        InvocationFailure::new("invalid_grpc_terminate_response", detail)
+                    })?,
                 )
             }
         }
@@ -2189,17 +2288,39 @@ fn build_native_grpc_terminate_response(
             if encoded.is_empty() {
                 None
             } else {
+                // The ceiling is on the re-encoded wire value, so the decoded
+                // ceiling is scaled down by base64's 4/3 expansion. Bounding the
+                // decoded bytes at the wire cap instead would admit a ~10.9 KiB
+                // trailer value.
+                let details_limit_label = format!(
+                    "the {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES}-byte \
+                     grpc-status-details-bin trailer value ceiling"
+                );
                 let decoded = decode_bounded_base64_field(
                     encoded,
                     "status_details_base64",
-                    MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES,
+                    MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES,
+                    &details_limit_label,
                 )
                 .map_err(|detail| {
                     InvocationFailure::new("invalid_grpc_terminate_response", detail)
                 })?;
                 // grpc-status-details-bin is a binary trailer; re-encode the
                 // validated bytes so only well-formed base64 reaches the wire.
-                Some(base64::engine::general_purpose::STANDARD.encode(decoded))
+                let reencoded = base64::engine::general_purpose::STANDARD.encode(decoded);
+                // Belt-and-braces on the value that is actually emitted: the
+                // decoded ceiling above is derived from this one, so a future
+                // change to either constant cannot silently widen the wire cap.
+                if reencoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
+                    return Err(InvocationFailure::new(
+                        "invalid_grpc_terminate_response",
+                        format!(
+                            "gRPC terminate 'status_details_base64' re-encodes to more than \
+                             {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                        ),
+                    ));
+                }
+                Some(reencoded)
             }
         }
         Some(_) => {
@@ -2466,8 +2587,8 @@ impl Plugin for ServerlessFunction {
             };
         }
 
-        let native_grpc_terminate = self.mode == InvocationMode::Terminate
-            && is_native_grpc_terminate_request(headers, ctx);
+        let native_grpc_terminate =
+            self.mode == InvocationMode::Terminate && is_native_grpc_terminate_request(ctx);
 
         let payload = match self.build_invocation_payload(ctx, headers) {
             Ok(payload) => payload,

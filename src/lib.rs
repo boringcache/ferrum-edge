@@ -1206,8 +1206,15 @@ pub mod _test_support {
         headers: HashMap<String, String>,
         body: &[u8],
         presentation_digest: Option<[u8; 32]>,
+        grpc_terminate_trailers: Option<HashMap<String, String>>,
     ) -> Option<Vec<u8>> {
-        plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
+        plugin.redis_payload_for_tests(
+            status_code,
+            headers,
+            body,
+            presentation_digest,
+            grpc_terminate_trailers,
+        )
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────
@@ -3966,6 +3973,17 @@ pub mod _test_support {
             trailers,
         };
         ctx.serverless_grpc_terminate_frame = Some(Arc::new(authored));
+    }
+
+    /// Read back the request-scoped framed native-gRPC terminate provenance:
+    /// `(frame, terminal trailers)`, or `None` when nothing authorized this
+    /// request to keep a body on a gRPC stream.
+    pub fn serverless_grpc_terminate_frame_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<(bytes::Bytes, HashMap<String, String>)> {
+        ctx.serverless_grpc_terminate_frame
+            .as_deref()
+            .map(|authored| (authored.frame.clone(), authored.trailers.clone()))
     }
 
     /// Normalize a rejection under the request's real framed-unary provenance —

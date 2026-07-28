@@ -19133,6 +19133,10 @@ components:
         `message_base64` (raw protobuf bytes), `grpc_message`,
         `status_details_base64`, and custom `trailers`; the gateway frames an
         uncompressed unary DATA message and owns reserved terminal metadata.
+        The request is classified as native gRPC by the HTTP flavor the
+        frontend stamps at intake, not by a mutable effective content-type.
+        Every terminal trailer value is bounded by an 8 KiB wire-value
+        ceiling, measured after sanitization and after base64 re-encoding.
         gRPC-Web terminate is rejected with 500. Streaming and compression
         contract shapes fail closed. Malformed or oversized function output
         fails closed without reflecting untrusted bodies. Cloud credential

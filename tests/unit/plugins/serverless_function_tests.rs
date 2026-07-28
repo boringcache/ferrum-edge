@@ -1420,6 +1420,215 @@ async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
     assert!(normalized.grpc_trailers.is_empty());
 }
 
+/// A mutable `content-type` must not opt a plain HTTP request into the
+/// native-gRPC terminate contract.
+///
+/// `request_transformer` runs before `serverless_function` and can rewrite the
+/// effective `content-type` to `application/grpc`. The frontend stamped this
+/// request as Plain at intake, and the reject finalizer, the H1/H2 body builder,
+/// and the H3 writers all still treat it as ordinary HTTP — so authoring a
+/// framed unary response here would put a gRPC frame on an HTTP response.
+#[tokio::test]
+async fn test_terminate_mode_ignores_rewritten_content_type_on_plain_request() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grpc_status": 0,
+            "message_base64": "CAE="
+        })))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    // Frontend classification stays Plain (the `create_test_context` default);
+    // only the live header was rewritten, exactly as a prior transformer hook
+    // would leave it.
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary { body, headers, .. } => {
+            assert!(
+                !headers.contains_key("grpc-status"),
+                "a Plain request must not receive protocol-owned gRPC terminal metadata"
+            );
+            assert_ne!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc"),
+                "a Plain request must not be relabelled as native gRPC"
+            );
+            assert!(
+                body.starts_with(b"{"),
+                "the ordinary HTTP terminate path returns the function body verbatim"
+            );
+        }
+        other => panic!("Expected ordinary HTTP terminate RejectBinary, got {other:?}"),
+    }
+
+    let minted = ferrum_edge::_test_support::serverless_grpc_terminate_frame_for_test(&ctx);
+    assert!(
+        minted.is_none(),
+        "no framed-unary provenance may be minted for a Plain request"
+    );
+}
+
+/// The mirror of the case above: the stamped native-gRPC flavor is what counts,
+/// so a prior hook that removed or rewrote the live `content-type` cannot take a
+/// genuine gRPC request off the terminate contract.
+#[tokio::test]
+async fn test_terminate_mode_uses_stamped_grpc_flavor_despite_header_rewrite() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let protobuf = b"\x08\x01";
+    let message_base64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, protobuf);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grpc_status": 0,
+            "message_base64": message_base64
+        })))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    // A prior hook replaced the live header; the intake classification stands.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/grpc")
+            );
+            assert_eq!(body, frame_terminate_message(protobuf));
+        }
+        other => panic!("Expected framed native-gRPC RejectBinary, got {other:?}"),
+    }
+}
+
+/// Every dedicated terminal value is bound by the advertised 8 KiB **wire**
+/// ceiling, measured after sanitization and after base64 re-encoding.
+#[test]
+fn test_native_grpc_terminate_bounds_dedicated_terminal_values() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    const WIRE_CAP: usize = 8 * 1024;
+    // Base64 emits four characters per three input bytes, so this is the
+    // largest decoded `grpc-status-details-bin` whose wire value still fits.
+    const DETAILS_DECODED_CAP: usize = WIRE_CAP / 4 * 3;
+    // Generous body ceiling: these bounds must bite on their own rather than
+    // being masked by `max_response_body_bytes`.
+    const MAX_BODY: usize = 1024 * 1024;
+
+    let message_at_cap = "a".repeat(WIRE_CAP);
+    let (_, _, headers) = build(
+        200,
+        serde_json::to_vec(&json!({ "grpc_status": 0, "grpc_message": message_at_cap }))
+            .unwrap()
+            .as_slice(),
+        MAX_BODY,
+    )
+    .expect("a grpc_message exactly at the wire cap is accepted");
+    assert_eq!(headers.get("grpc-message").map(String::len), Some(WIRE_CAP));
+
+    let message_over_cap = "a".repeat(WIRE_CAP + 1);
+    let err = build(
+        200,
+        serde_json::to_vec(&json!({ "grpc_status": 0, "grpc_message": message_over_cap }))
+            .unwrap()
+            .as_slice(),
+        MAX_BODY,
+    )
+    .expect_err("one byte over the wire cap is refused");
+    assert!(err.contains("grpc_message"), "field-specific detail: {err}");
+    assert!(err.contains(&WIRE_CAP.to_string()), "cap in detail: {err}");
+
+    let details_at_cap = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        vec![0xABu8; DETAILS_DECODED_CAP],
+    );
+    let (_, _, headers) = build(
+        200,
+        serde_json::to_vec(&json!({
+            "grpc_status": 0,
+            "status_details_base64": details_at_cap
+        }))
+        .unwrap()
+        .as_slice(),
+        MAX_BODY,
+    )
+    .expect("status details whose re-encoded value is exactly at the cap are accepted");
+    assert_eq!(
+        headers.get("grpc-status-details-bin").map(String::len),
+        Some(WIRE_CAP),
+        "the accepted boundary case re-encodes to exactly the wire ceiling"
+    );
+
+    // One decoded byte more expands to 8196 base64 characters — the regression
+    // this bound closes, since a decoded-byte cap of 8 KiB would have admitted
+    // a ~10.9 KiB trailer value.
+    let details_over_cap = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        vec![0xABu8; DETAILS_DECODED_CAP + 1],
+    );
+    let err = build(
+        200,
+        serde_json::to_vec(&json!({
+            "grpc_status": 0,
+            "status_details_base64": details_over_cap
+        }))
+        .unwrap()
+        .as_slice(),
+        MAX_BODY,
+    )
+    .expect_err("base64 expansion past the wire cap is refused");
+    assert!(
+        err.contains("status_details_base64"),
+        "field-specific detail: {err}"
+    );
+    assert!(
+        err.contains("grpc-status-details-bin"),
+        "the violated ceiling is named: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_terminate_mode_returns_function_response_as_reject_binary() {
     use wiremock::matchers::method;
