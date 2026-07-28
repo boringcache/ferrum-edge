@@ -726,8 +726,7 @@ fn streaming_h2_gateway_owned_idempotent_write_binds_each_builder_field() {
     // mutation witness with before == after; only the per-response
     // `gateway_owned_names` declaration closes the trailer channel — the same
     // idempotent-write shape plugin declarations handle.
-    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
-        as govern_owned;
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test as govern_owned;
 
     for (owned, seed_value, trailer_value) in [
         ("via", "2 ferrum-edge", "1.1 backend"),
@@ -758,8 +757,7 @@ fn streaming_h2_gateway_owned_idempotent_write_binds_each_builder_field() {
 fn streaming_h2_builder_field_ungoverned_when_gateway_did_not_write_it() {
     // Ownership is per-response and write-gated: a backend `via` trailer must
     // survive when this response never wrote `via` onto the builder.
-    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
-        as govern_owned;
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test as govern_owned;
 
     let backend = headers(&[("content-type", "text/plain")]);
     let surviving = govern_owned(
@@ -779,8 +777,7 @@ fn streaming_h2_builder_field_ungoverned_when_gateway_did_not_write_it() {
 
 #[test]
 fn streaming_h2_gateway_owned_name_matches_mixed_case_trailer() {
-    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
-        as govern_owned;
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test as govern_owned;
 
     let seeded = headers(&[("content-type", "text/plain"), ("via", "2 ferrum-edge")]);
     let surviving = govern_owned(
