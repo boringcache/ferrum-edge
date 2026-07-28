@@ -4078,8 +4078,11 @@ client as a gRPC-Web terminal frame) before any backend dispatch:
   `grpc-accept-encoding`, `grpc-message-type`, `user-agent`), response terminal
   metadata (`grpc-status`, `grpc-message`, `grpc-status-details-bin`),
   credentials and gateway-authoritative assertions (`authorization`, `cookie`,
-  `x-api-key`, `x-geo-country`, `x-consumer-*`, `x-ferrum-*`), and Ferrum's
-  internal gRPC-Web bridge headers.
+  `x-api-key`, `x-geo-country`, `x-consumer-*`, `x-ferrum-*`), Ferrum-owned
+  forwarding identity (`x-forwarded-for`, `x-forwarded-proto`,
+  `x-forwarded-host`, and RFC 7239 `forwarded` — rejected unconditionally even
+  when primary `Forwarded` generation is disabled), and Ferrum's internal
+  gRPC-Web bridge headers.
 - The block is bounded at 8 KiB and 64 entries (names 128 bytes, values 4096
   bytes) inside the existing gRPC receive ceiling. The block does not stay body
   bytes — it becomes a header block the backend holds decoded — so it may not

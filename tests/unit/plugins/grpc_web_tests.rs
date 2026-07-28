@@ -1200,6 +1200,51 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
     }
 }
 
+#[test]
+fn split_request_trailer_frame_rejects_proxy_owned_forwarding_identity() {
+    // Gateway-authored forwarding identity is already on the initial header
+    // block. End-of-stream metadata must not restate or contradict it for
+    // backends that read trailing metadata. The parser lowercases names before
+    // the forbidden check, so mixed-case wire forms must also fail closed.
+    let message = request_frame(0x00, b"ok");
+    let cases: &[(&str, &[u8])] = &[
+        ("x-forwarded-for", b"x-forwarded-for: 203.0.113.9\r\n"),
+        ("x-forwarded-proto", b"x-forwarded-proto: https\r\n"),
+        ("x-forwarded-host", b"x-forwarded-host: evil.example\r\n"),
+        ("forwarded", b"forwarded: for=203.0.113.9\r\n"),
+        ("X-Forwarded-For mixed case", b"X-Forwarded-For: 203.0.113.9\r\n"),
+        (
+            "X-Forwarded-Proto mixed case",
+            b"X-Forwarded-Proto: https\r\n",
+        ),
+        (
+            "X-Forwarded-Host mixed case",
+            b"X-Forwarded-Host: evil.example\r\n",
+        ),
+        ("Forwarded mixed case", b"Forwarded: for=203.0.113.9\r\n"),
+        ("FORWARDED upper case", b"FORWARDED: for=203.0.113.9\r\n"),
+    ];
+    for (case, block) in cases {
+        let mut body = message.clone();
+        body.extend_from_slice(&request_frame(0x80, block));
+        assert!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body).is_err(),
+            "{case}: proxy-owned forwarding identity must be rejected in request trailers"
+        );
+    }
+
+    // Custom application metadata remains accepted alongside the security gate.
+    let mut valid = message.clone();
+    valid.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+    assert!(
+        matches!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&valid),
+            Ok(Some(_))
+        ),
+        "valid custom metadata must still stage"
+    );
+}
+
 #[tokio::test]
 async fn request_trailer_frame_is_staged_and_stripped_in_binary_and_text_modes() {
     let message_only = request_frame(0x00, b"hello");
@@ -1297,6 +1342,16 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
         .expect("test staging serializes");
     for (case, staged) in [
         ("forbidden name", r#"[["authorization","Bearer x"]]"#),
+        ("forbidden x-forwarded-for", r#"[["x-forwarded-for","203.0.113.9"]]"#),
+        (
+            "forbidden x-forwarded-proto",
+            r#"[["x-forwarded-proto","https"]]"#,
+        ),
+        (
+            "forbidden x-forwarded-host",
+            r#"[["x-forwarded-host","evil.example"]]"#,
+        ),
+        ("forbidden forwarded", r#"[["forwarded","for=203.0.113.9"]]"#),
         ("pseudo header", r#"[[":method","DELETE"]]"#),
         ("CRLF value", "[[\"x-app-id\",\"4\\r\\n2\"]]"),
         ("invalid binary value", r#"[["x-trace-bin","not base64!"]]"#),

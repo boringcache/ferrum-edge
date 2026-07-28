@@ -104,7 +104,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::proxy::headers::{
-    is_backend_response_strip_header, parse_connection_listed_from_str_map,
+    is_backend_response_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -684,9 +685,15 @@ fn parse_request_trailer_block(payload: &[u8]) -> Result<Vec<(String, String)>, 
 ///
 /// End-of-stream metadata must not be able to restate anything the gateway has
 /// already decided or forwarded: connection/framing control, initial-only gRPC
-/// call parameters, response terminal status, or credentials and gateway
-/// identity assertions that authentication and authorization already consumed
-/// from the header block.
+/// call parameters, response terminal status, credentials and gateway identity
+/// assertions that authentication and authorization already consumed from the
+/// header block, or Ferrum-owned forwarding identity (`X-Forwarded-*` and RFC
+/// 7239 `Forwarded`). The initial header block already carries the
+/// gateway-authored forwarding identity; a trailer must not restate or
+/// contradict it for backends that read trailing metadata. `Forwarded` is
+/// rejected unconditionally (`is_proxy_owned_forwarding_header(name, true)`)
+/// even when primary generation is disabled on a route — trailer parsing has
+/// no config object, and failing closed is correct.
 #[inline]
 fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
     name.starts_with(':')
@@ -700,6 +707,9 @@ fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
         // trusted plugin state only.
         || name.starts_with("x-consumer-")
         || name.starts_with("x-ferrum-")
+        // Gateway-owned forwarding identity: reuse the canonical strip
+        // predicate so this list cannot drift from primary dispatch.
+        || is_proxy_owned_forwarding_header(name, true)
         || matches!(
             name,
             // Framing / connection control.
