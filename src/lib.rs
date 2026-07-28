@@ -3150,6 +3150,7 @@ pub mod _test_support {
         pub body: Vec<u8>,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+        pub failed_websocket_handshake: bool,
     }
 
     pub struct DeadlineBackendResponse {
@@ -3237,6 +3238,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
         }
     }
 
@@ -3271,6 +3273,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            failed_websocket_handshake: false,
         }
     }
 
@@ -3836,7 +3839,31 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            failed_websocket_handshake: normalized.failed_websocket_handshake,
         }
+    }
+
+    /// Build wire headers for a normalized reject through the production
+    /// H1/H2 builder. Used to prove ExactBody length repair still sets
+    /// Content-Length for ordinary HTTP rejects while failed WebSocket
+    /// handshakes strip it after sanitization.
+    pub fn build_normalized_reject_wire_headers_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::HeaderMap {
+        let reject = crate::proxy::NormalizedRejectResponse {
+            http_status: status,
+            headers,
+            body: body.to_vec(),
+            grpc_status: None,
+            grpc_message: None,
+            failed_websocket_handshake,
+        };
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .headers()
+            .clone()
     }
 
     pub fn set_websocket_response_boundary_for_test(

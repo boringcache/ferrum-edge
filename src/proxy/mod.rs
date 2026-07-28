@@ -16473,6 +16473,12 @@ pub(crate) struct NormalizedRejectResponse {
     pub(crate) body: Vec<u8>,
     pub(crate) grpc_status: Option<u32>,
     pub(crate) grpc_message: Option<String>,
+    /// Typed failed-WebSocket handshake boundary. Set from the request-context
+    /// flavor stamp (or an equivalent protocol-owned path), never inferred from
+    /// attacker/plugin-controlled response headers. When true, the response
+    /// builder strips transport-managed fields again after ExactBody length
+    /// repair so `Content-Length` cannot be reintroduced onto the wire.
+    pub(crate) failed_websocket_handshake: bool,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16531,6 +16537,10 @@ fn finalize_synthesized_reject_headers(
             initial_response_header_policy_plugins,
             &mut reject.headers,
         );
+        // Early strip protects intermediate observers; the builder still needs
+        // the typed signal so ExactBody length repair cannot reintroduce
+        // Content-Length immediately before the wire response is built.
+        reject.failed_websocket_handshake = true;
     } else {
         finalize_plain_gateway_error_response_headers(
             initial_response_header_policy_plugins,
@@ -16614,6 +16624,7 @@ pub(crate) fn normalize_reject_response(
             body: body.to_vec(),
             grpc_status: None,
             grpc_message: None,
+            failed_websocket_handshake: false,
         };
     }
 
@@ -16650,6 +16661,7 @@ pub(crate) fn normalize_reject_response(
         body: Vec::new(),
         grpc_status: Some(grpc_status),
         grpc_message: Some(grpc_message),
+        failed_websocket_handshake: false,
     }
 }
 
@@ -16717,8 +16729,11 @@ pub(crate) async fn normalize_grpc_plugin_rejection_with_after_proxy_hooks(
     normalized
 }
 
-fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Response<ProxyBody> {
+pub(crate) fn build_response_from_normalized_reject(
+    reject: NormalizedRejectResponse,
+) -> Response<ProxyBody> {
     let is_grpc_error = reject.grpc_status.is_some();
+    let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let mut headers = reject.headers;
     // Final protocol-aware boundary after reject after_proxy hooks: strip
@@ -16736,13 +16751,28 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
             len: reject.body.len() as u64,
         }
     };
-    let builder = headers_mod::apply_sanitized_response_headers(
-        Response::builder().status(reject.http_status),
-        &mut headers,
-        framing,
-    );
+    // Sanitize/repair first, then — for failed WebSocket handshakes only —
+    // strip transport-managed fields again so ExactBody cannot reintroduce
+    // Content-Length (mirrors the H3 failed-handshake writer ordering).
+    headers_mod::sanitize_client_response_headers_for_wire(&mut headers, framing);
+    if failed_websocket_handshake {
+        strip_websocket_transport_managed_response_header_map(&mut headers);
+    }
+    // HTTP/1.0 forces close-delimited framing when the body cannot advertise
+    // length, so Hyper does not synthesize Transfer-Encoding: chunked after we
+    // stripped Content-Length. H2 ignores the HTTP version on the response
+    // object and still omits Content-Length when size_hint is unknown.
+    let mut builder = Response::builder().status(reject.http_status);
+    if failed_websocket_handshake {
+        builder = builder.version(hyper::Version::HTTP_10);
+    }
+    let builder = headers_mod::apply_response_headers(builder, &headers);
 
-    let body = if reject.body.is_empty() {
+    let body = if failed_websocket_handshake {
+        // Exact Full size hints make Hyper's H1/H2 codecs re-insert
+        // Content-Length after the authoritative strip above.
+        ProxyBody::bytes_without_advertised_length(reject.body)
+    } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
@@ -17867,7 +17897,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+    let mut normalized =
+        normalize_reject_response(status, &response_body, &headers, is_grpc_request);
+    // Carry the request-context WebSocket boundary into the normalized reject
+    // so the response builder can strip transport-managed fields after
+    // ExactBody length repair. Do not infer this from response header names.
+    normalized.failed_websocket_handshake = ctx.has_websocket_response_boundary();
+    normalized
 }
 
 /// Finalize a terminal request-body read failure before any external operation

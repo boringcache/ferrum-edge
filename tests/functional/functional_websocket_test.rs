@@ -1431,6 +1431,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_transport_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1452,6 +1453,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_transport_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1601,6 +1603,7 @@ async fn test_websocket_key_auth_rejects_missing_key() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_transport_headers(response.headers());
             assert_eq!(
                 response
                     .headers()
@@ -1647,6 +1650,7 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
     assert_ws_security_policy(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
+    assert_no_failed_websocket_transport_headers(&rejected.headers);
     assert_eq!(
         rejected
             .headers
@@ -2078,6 +2082,7 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
             assert_ws_later_reject_hook_wins(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
+            assert_no_failed_websocket_transport_headers(response.headers());
             let body = response
                 .body()
                 .as_ref()
@@ -2263,6 +2268,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h1_rejected.headers());
     assert_no_ws_transport_policy_values(h1_rejected.headers());
     assert_no_h1_only_websocket_headers(h1_rejected.headers());
+    assert_no_failed_websocket_transport_headers(h1_rejected.headers());
 
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await
@@ -2297,6 +2303,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h2_rejected.headers());
     assert_no_ws_transport_policy_values(h2_rejected.headers());
     assert_no_h1_only_websocket_headers(h2_rejected.headers());
+    assert_no_failed_websocket_transport_headers(h2_rejected.headers());
     h2_connection_task.abort();
 
     let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
@@ -2316,6 +2323,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(&h3_rejected.headers);
     assert_no_ws_transport_policy_values(&h3_rejected.headers);
     assert_no_h1_only_websocket_headers(&h3_rejected.headers);
+    assert_no_failed_websocket_transport_headers(&h3_rejected.headers);
     assert!(
         h3_rejected
             .recv_body_text()

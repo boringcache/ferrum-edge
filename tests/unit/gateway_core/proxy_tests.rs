@@ -3116,6 +3116,54 @@ fn test_normalize_reject_response_converts_grpc_requests_to_trailers_only_errors
             .map(|s| s.as_str()),
         Some("5")
     );
+    assert!(!normalized.failed_websocket_handshake);
+}
+
+#[test]
+fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() {
+    use ferrum_edge::_test_support::build_normalized_reject_wire_headers_for_test;
+
+    let body = br#"{"error":"forbidden"}"#;
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("upgrade".to_string(), "websocket".to_string()),
+        ("connection".to_string(), "Upgrade".to_string()),
+        (
+            "sec-websocket-accept".to_string(),
+            "policy-must-not-escape".to_string(),
+        ),
+    ]);
+
+    let ordinary = build_normalized_reject_wire_headers_for_test(
+        StatusCode::FORBIDDEN,
+        body,
+        headers.clone(),
+        false,
+    );
+    assert_eq!(
+        ordinary
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(&(body.len().to_string())),
+        "ordinary HTTP rejects must keep ExactBody Content-Length"
+    );
+    // Ordinary rejects still strip hop-by-hop via the sanitizer.
+    assert!(ordinary.get(http::header::UPGRADE).is_none());
+    assert!(ordinary.get(http::header::CONNECTION).is_none());
+
+    let failed_ws = build_normalized_reject_wire_headers_for_test(
+        StatusCode::FORBIDDEN,
+        body,
+        headers,
+        true,
+    );
+    assert!(
+        failed_ws.get(http::header::CONTENT_LENGTH).is_none(),
+        "failed WebSocket rejects must strip Content-Length after ExactBody repair"
+    );
+    assert!(failed_ws.get(http::header::UPGRADE).is_none());
+    assert!(failed_ws.get(http::header::CONNECTION).is_none());
+    assert!(failed_ws.get("sec-websocket-accept").is_none());
 }
 
 #[test]
