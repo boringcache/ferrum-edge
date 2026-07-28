@@ -1729,8 +1729,12 @@ impl KafkaLogging {
         let metrics_for_hooks = Arc::clone(&metrics);
         let hooks = LoggerHooks {
             on_failed_batch: None,
+            // Intentional overflow shedding: Ferrum records the drop and accepts
+            // ownership of the shed decision so high-water / full-buffer paths
+            // report DiversionAccepted rather than leaving the item unowned.
             on_overflow: Some(Arc::new(move |_item, reason| {
                 metrics_for_hooks.record_ferrum_drop(reason);
+                true
             })),
             on_high_water: None,
             high_watermark_percent: 80,

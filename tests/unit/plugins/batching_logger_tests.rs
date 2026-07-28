@@ -1,13 +1,14 @@
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, DeferredBatchingLogger, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, RetryPolicy, build_batch_config, handle_http_batch_response,
-    parse_custom_headers, parse_http_endpoint, validate_batch_config, wait_until_committed,
+    MAX_BUFFER_CAPACITY, RetryPolicy, TrySendOutcome, build_batch_config,
+    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    wait_until_committed,
 };
 use serde_json::json;
 use tokio::sync::{Notify, watch};
@@ -722,6 +723,173 @@ async fn high_water_hook_fires_without_overflow_hook() {
     assert!(logger.try_send(1));
     assert!(!logger.try_send(2));
     assert_eq!(high_water_hits.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn without_overflow_hook_high_water_still_uses_full_capacity() {
+    let high_water_hits = Arc::new(AtomicUsize::new(0));
+    let high_water_hits_clone = Arc::clone(&high_water_hits);
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            // batch_size=1 so the first item parks the flush worker and the
+            // remaining configured slots stay in the bounded mpsc channel.
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 10,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "batching_logger_full_capacity",
+        },
+        LoggerHooks {
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_hits_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+            // No on_overflow: high water must not discard remaining slots.
+            high_watermark_percent: 80,
+            ..LoggerHooks::default()
+        },
+        move |_batch: Vec<u32>| async move {
+            // Hold the flush worker so the bounded channel stays occupied.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        },
+    );
+
+    logger.commit();
+
+    // Park the flush worker on the first item.
+    assert!(logger.try_send(0));
+    for _ in 0..10_000 {
+        if logger.queue_depth() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        logger.queue_depth(),
+        0,
+        "flush worker must take the parking item before the capacity fill"
+    );
+
+    for value in 1..=10 {
+        assert!(
+            logger.try_send(value),
+            "slot {value} of configured capacity 10 must remain usable without an overflow hook"
+        );
+    }
+    assert_eq!(
+        logger.queue_depth(),
+        10,
+        "all configured slots must be occupied"
+    );
+    assert!(
+        high_water_hits.load(Ordering::Relaxed) > 0,
+        "crossing 80% must still emit high-water telemetry"
+    );
+    assert!(
+        !logger.try_send(11),
+        "the item past configured capacity must follow the full-buffer drop path"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_send_outcome_distinguishes_accepted_vs_rejected_overflow() {
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let accept_next = Arc::new(AtomicBool::new(true));
+    let accepted_cb = Arc::clone(&accepted);
+    let rejected_cb = Arc::clone(&rejected);
+    let accept_next_cb = Arc::clone(&accept_next);
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            batch_size: 10,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 1,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "batching_logger_overflow_ownership",
+        },
+        LoggerHooks {
+            on_overflow: Some(Arc::new(move |_item, _reason| {
+                if accept_next_cb.swap(false, Ordering::Relaxed) {
+                    accepted_cb.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    rejected_cb.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            })),
+            high_watermark_percent: 1,
+            ..LoggerHooks::default()
+        },
+        move |_batch: Vec<u32>| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        },
+    );
+    logger.commit();
+
+    assert_eq!(
+        logger.try_send_outcome(1),
+        TrySendOutcome::ChannelAccepted,
+        "first item fills the only channel slot"
+    );
+    assert_eq!(
+        logger.try_send_outcome(2),
+        TrySendOutcome::DiversionAccepted,
+        "high-water overflow must report accepted ownership when the hook returns true"
+    );
+    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        logger.try_send_outcome(3),
+        TrySendOutcome::DiversionRejected,
+        "high-water overflow must report rejected ownership when the hook returns false"
+    );
+    assert_eq!(rejected.load(Ordering::Relaxed), 1);
+    assert!(
+        !logger.try_send(4),
+        "compatibility try_send remains false for non-channel outcomes"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn try_send_outcome_distinguishes_buffer_full_from_worker_unavailable() {
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            batch_size: 10,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 1,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "batching_logger_full_vs_unavailable",
+        },
+        LoggerHooks::default(),
+        move |_batch: Vec<u32>| async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        },
+    );
+    logger.commit();
+
+    assert_eq!(logger.try_send_outcome(1), TrySendOutcome::ChannelAccepted);
+    assert_eq!(
+        logger.try_send_outcome(2),
+        TrySendOutcome::BufferFull,
+        "a full channel without an overflow hook is BufferFull, not unavailable"
+    );
+
+    let mut closed = BatchingLogger::spawn(
+        test_logger_config("batching_logger_unavailable_outcome", 10, 1),
+        |_batch: Vec<u32>| async move { Ok(()) },
+    );
+    closed.commit();
+    assert!(closed.close_and_await().await);
+    assert_eq!(
+        closed.try_send_outcome(9),
+        TrySendOutcome::WorkerUnavailable,
+        "post-close admission must be WorkerUnavailable, never BufferFull"
+    );
+    assert!(
+        !closed.try_send(10),
+        "compatibility try_send remains false after close"
+    );
 }
 
 struct CloneTracked {

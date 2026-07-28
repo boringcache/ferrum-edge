@@ -22648,6 +22648,12 @@ components:
               minimum: 1
               maximum: 1000000
               default: 50000
+              description: >
+                Bounded in-memory export channel capacity. With spool.enabled=false,
+                the 80% high-water mark is telemetry only and every slot remains
+                usable until the channel is actually full. With spool enabled,
+                high-water overflow is diverted to durable spool delivery instead
+                of consuming the remaining channel slots.
             buffer_max_bytes:
               type: integer
               minimum: 9312
@@ -23063,6 +23069,24 @@ components:
                 high_water_hits_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Enqueue attempts observed while in-memory queue depth was at
+                    or above the high-water mark. Telemetry only; does not imply
+                    diversion or loss.
+                high_water_diversions_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events whose high-water durable spool-delivery handoff was
+                    accepted. Zero when spool is disabled. Saturated or closed
+                    delivery queues are counted by spool loss metrics instead.
+                full_drops_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events dropped because the bounded in-memory queue was full
+                    and no durable overflow path accepted ownership. Shutdown or
+                    unavailable admission is not counted here.
             spool:
               type: object
               properties:
@@ -23109,6 +23133,10 @@ components:
                 events_enqueued_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Events admitted to the in-memory channel or accepted by a
+                    durable overflow handoff. Failed spool-delivery admission and
+                    shutdown/unavailable outcomes are not counted.
                 events_exported_total:
                   type: integer
                   minimum: 0
@@ -23199,6 +23227,22 @@ components:
               type: integer
             high_water_hits_total:
               type: integer
+              description: >
+                Enqueue attempts observed while in-memory queue depth was at or
+                above the high-water mark. Telemetry only; does not imply
+                diversion or loss.
+            high_water_diversions_total:
+              type: integer
+              description: >
+                Events whose high-water durable spool-delivery handoff was
+                accepted. Zero when spool is disabled. Saturated or closed
+                delivery queues are counted by spool loss metrics instead.
+            full_drops_total:
+              type: integer
+              description: >
+                Events dropped because the bounded in-memory queue was full and
+                no durable overflow path accepted ownership. Shutdown or
+                unavailable admission is not counted here.
         spool:
           type: object
           properties:
@@ -23242,6 +23286,10 @@ components:
           properties:
             events_enqueued_total:
               type: integer
+              description: >
+                Events admitted to the in-memory channel or accepted by a durable
+                overflow handoff. Failed spool-delivery admission and
+                shutdown/unavailable outcomes are not counted.
             events_exported_total:
               type: integer
             failures_total:
