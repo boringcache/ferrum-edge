@@ -45,8 +45,8 @@ use tokio_rustls::TlsConnector;
 use crate::plugins::utils::http_client::PluginHttpClient;
 use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
 
-use super::super::notification::Notification;
-use super::super::templating::{render_template, validate_template};
+use super::super::notification::{Notification, NotificationField};
+use super::super::templating::{render_template_bounded, validate_template};
 use super::resolve_optional_string;
 use super::webhook::base_vars;
 
@@ -75,14 +75,15 @@ const MAX_DOMAIN_BYTES: usize = 255;
 const MAX_SUBJECT_TEMPLATE_BYTES: usize = 1024;
 const MAX_BODY_TEMPLATE_BYTES: usize = 64 * 1024;
 
-/// Rendered-output bounds, checked per dispatch. Templates can reference
-/// caller-supplied variables, so the rendered size is not implied by the
-/// template size. Oversized output is truncated with a visible marker rather
-/// than dropping the alert.
+/// Rendered-output bounds, enforced during template substitution (not only
+/// after). Templates can reference caller-supplied variables and repeat them,
+/// so the rendered size is not implied by the template size. Oversized output
+/// is truncated with a visible marker rather than dropping the alert.
 const MAX_SUBJECT_BYTES: usize = 512;
 const MAX_BODY_BYTES: usize = 32 * 1024;
-/// Cap on the generated `${fields}` block so a caller with many notification
-/// fields cannot inflate retained message data.
+/// Hard cap on the generated `${fields}` block — names, values, separators,
+/// and the truncation marker all count. A caller with many or huge
+/// notification fields cannot inflate retained message data past this ceiling.
 const MAX_FIELDS_BLOCK_BYTES: usize = 8 * 1024;
 const MAX_FIELD_VALUE_BYTES: usize = 512;
 
@@ -502,13 +503,20 @@ impl EmailChannel {
     /// Render the subject line from the notification plus caller extras.
     /// Control characters are folded to spaces before anything reaches a
     /// header, so a templated value can never inject an extra header.
+    ///
+    /// The 512-byte ceiling is enforced during substitution so a template that
+    /// repeats a large value cannot allocate far beyond the advertised limit.
     pub fn render_subject(
         &self,
         notification: &Notification,
         extras: &HashMap<String, String>,
     ) -> Result<String, String> {
         let vars = self.template_vars(notification, extras);
-        let rendered = render_template(&self.subject_template, &vars)?;
+        let rendered =
+            render_template_bounded(&self.subject_template, &vars, MAX_SUBJECT_BYTES, "...")?;
+        // Sanitization only shrinks or preserves length (controls → equal-width
+        // spaces; trim may drop edges). Re-apply the ceiling so the advertised
+        // bound remains absolute if that ever changes.
         Ok(truncate_utf8(
             &sanitize_header_text(&rendered),
             MAX_SUBJECT_BYTES,
@@ -517,13 +525,21 @@ impl EmailChannel {
     }
 
     /// Render the message body from the notification plus caller extras.
+    ///
+    /// The 32 KiB ceiling is enforced during substitution so a template that
+    /// repeats a large value cannot allocate far beyond the advertised limit.
     pub fn render_body(
         &self,
         notification: &Notification,
         extras: &HashMap<String, String>,
     ) -> Result<String, String> {
         let vars = self.template_vars(notification, extras);
-        let rendered = render_template(&self.body_template, &vars)?;
+        let rendered = render_template_bounded(
+            &self.body_template,
+            &vars,
+            MAX_BODY_BYTES,
+            "\n[truncated]",
+        )?;
         Ok(truncate_utf8(
             &sanitize_body_text(&rendered),
             MAX_BODY_BYTES,
@@ -1261,25 +1277,169 @@ fn plain_auth_payload(credentials: &SmtpCredentials) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render `Notification.fields` as `Name: value` lines for `${fields}`.
+///
+/// Hard-capped at [`MAX_FIELDS_BLOCK_BYTES`] including arbitrarily long field
+/// names, the final field that crosses the boundary, separators, and the
+/// truncation marker. Never materializes an unbounded sanitized copy of a
+/// name or value merely to truncate it afterward.
 fn render_fields(notification: &Notification) -> String {
+    const MARKER: &str = "[fields truncated]\n";
     let mut out = String::new();
-    for field in &notification.fields {
+    for (index, field) in notification.fields.iter().enumerate() {
         if out.len() >= MAX_FIELDS_BLOCK_BYTES {
-            out.push_str("[fields truncated]\n");
+            apply_fields_truncation_marker(&mut out, MARKER);
             break;
         }
-        let name = sanitize_header_text(&field.name);
-        let value = truncate_utf8(
-            &sanitize_header_text(&field.value),
-            MAX_FIELD_VALUE_BYTES,
-            "...",
-        );
-        out.push_str(&name);
-        out.push_str(": ");
-        out.push_str(&value);
-        out.push('\n');
+        if !append_field_line(&mut out, field, MARKER) {
+            break;
+        }
+        if index + 1 < notification.fields.len() && out.len() >= MAX_FIELDS_BLOCK_BYTES {
+            apply_fields_truncation_marker(&mut out, MARKER);
+            break;
+        }
     }
+    debug_assert!(out.len() <= MAX_FIELDS_BLOCK_BYTES);
     out
+}
+
+/// Append one `name: value\n` line. Returns `false` when the block was
+/// truncated to stay within [`MAX_FIELDS_BLOCK_BYTES`].
+fn append_field_line(out: &mut String, field: &NotificationField, marker: &str) -> bool {
+    if !push_sanitized_header_bounded(out, &field.name, MAX_FIELDS_BLOCK_BYTES) {
+        apply_fields_truncation_marker(out, marker);
+        return false;
+    }
+    if !push_exact_within(out, ": ", MAX_FIELDS_BLOCK_BYTES) {
+        apply_fields_truncation_marker(out, marker);
+        return false;
+    }
+    if !push_field_value_bounded(out, &field.value) {
+        apply_fields_truncation_marker(out, marker);
+        return false;
+    }
+    if !push_exact_within(out, "\n", MAX_FIELDS_BLOCK_BYTES) {
+        apply_fields_truncation_marker(out, marker);
+        return false;
+    }
+    true
+}
+
+fn push_exact_within(out: &mut String, piece: &str, max_bytes: usize) -> bool {
+    if out.len() + piece.len() <= max_bytes {
+        out.push_str(piece);
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_fields_truncation_marker(out: &mut String, marker: &str) {
+    let budget = MAX_FIELDS_BLOCK_BYTES.saturating_sub(marker.len());
+    while out.len() > budget {
+        out.pop();
+    }
+    out.push_str(marker);
+}
+
+/// Sanitize like [`sanitize_header_text`] but never produce more than
+/// `max_bytes`. Returns `(text, complete)` where `complete` means `text`
+/// equals the full `sanitize_header_text(raw)` result.
+fn sanitize_header_text_bounded(raw: &str, max_bytes: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut iter = raw.chars();
+
+    // Skip leading whitespace after control→space mapping (matches trim).
+    let mut first = None;
+    for ch in iter.by_ref() {
+        let mapped = if ch.is_control() { ' ' } else { ch };
+        if mapped.is_whitespace() {
+            continue;
+        }
+        first = Some(mapped);
+        break;
+    }
+    let Some(first) = first else {
+        return (String::new(), true);
+    };
+    if first.len_utf8() > max_bytes {
+        return (String::new(), false);
+    }
+    out.push(first);
+
+    let mut trailing_ws_at: Option<usize> = None;
+    for ch in iter.by_ref() {
+        let mapped = if ch.is_control() { ' ' } else { ch };
+        if out.len() + mapped.len_utf8() > max_bytes {
+            if mapped.is_whitespace() {
+                // Overflow on whitespace: complete iff the rest is only
+                // trailing whitespace that sanitize would have trimmed.
+                let rest_only_ws = iter.all(|c| {
+                    let m = if c.is_control() { ' ' } else { c };
+                    m.is_whitespace()
+                });
+                if rest_only_ws {
+                    if let Some(start) = trailing_ws_at {
+                        out.truncate(start);
+                    }
+                    return (out, true);
+                }
+                return (out, false);
+            }
+            return (out, false);
+        }
+        if mapped.is_whitespace() {
+            if trailing_ws_at.is_none() {
+                trailing_ws_at = Some(out.len());
+            }
+        } else {
+            trailing_ws_at = None;
+        }
+        out.push(mapped);
+    }
+    if let Some(start) = trailing_ws_at {
+        out.truncate(start);
+    }
+    (out, true)
+}
+
+fn push_sanitized_header_bounded(out: &mut String, raw: &str, max_bytes: usize) -> bool {
+    let room = max_bytes.saturating_sub(out.len());
+    let (piece, complete) = sanitize_header_text_bounded(raw, room);
+    out.push_str(&piece);
+    complete
+}
+
+/// Append a field value capped at [`MAX_FIELD_VALUE_BYTES`] (with `...`) while
+/// also respecting the `${fields}` block ceiling. Allocates at most
+/// `MAX_FIELD_VALUE_BYTES + 1` bytes for the sanitized value prefix.
+fn push_field_value_bounded(out: &mut String, raw: &str) -> bool {
+    const VALUE_MARKER: &str = "...";
+    let block_room = MAX_FIELDS_BLOCK_BYTES.saturating_sub(out.len());
+    if block_room == 0 {
+        return false;
+    }
+
+    // Probe one byte past the per-value cap so we know whether value-level
+    // truncation is required — without copying an unbounded value.
+    let (sanitized, complete) =
+        sanitize_header_text_bounded(raw, MAX_FIELD_VALUE_BYTES.saturating_add(1));
+    let value = if !complete || sanitized.len() > MAX_FIELD_VALUE_BYTES {
+        truncate_utf8(&sanitized, MAX_FIELD_VALUE_BYTES, VALUE_MARKER)
+    } else {
+        sanitized
+    };
+
+    if out.len() + value.len() <= MAX_FIELDS_BLOCK_BYTES {
+        out.push_str(&value);
+        true
+    } else {
+        let mut end = block_room.min(value.len());
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&value[..end]);
+        false
+    }
 }
 
 fn address_list(addresses: &[Arc<str>]) -> String {

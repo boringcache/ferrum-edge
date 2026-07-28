@@ -118,8 +118,8 @@ Bounds (all enforced, all fail closed or truncate visibly):
 | Recipients (`to`) | 1–32, duplicates collapsed |
 | Address length | 254 bytes; local part ≤ 64, domain ≤ 255, ASCII addr-spec only |
 | `subject_template` / `body_template` | 1 KiB / 64 KiB |
-| Rendered subject / body | 512 B / 32 KiB, truncated with `...` / `[truncated]` |
-| `${fields}` block | 8 KiB total, 512 B per value |
+| Rendered subject / body | 512 B / 32 KiB, enforced during template substitution; truncated with `...` / `[truncated]` |
+| `${fields}` block | 8 KiB hard ceiling (names, values, separators, truncation marker); 512 B per value |
 | SMTP reply | 1 KiB per line, 64 lines, 16 KiB total |
 | Concurrent SMTP sessions per channel | 4 (further dispatches fail immediately rather than queue) |
 | Timeouts | `connect_timeout_ms` covers DNS + TCP + TLS handshake; `command_timeout_ms` covers each command/reply exchange including `DATA` |

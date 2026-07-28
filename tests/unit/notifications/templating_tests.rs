@@ -4,7 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ferrum_edge::notifications::templating::{
-    render_template, render_template_json_string_escaped, unknown_variables, validate_template,
+    render_template, render_template_bounded, render_template_json_string_escaped,
+    unknown_variables, validate_template,
 };
 
 fn vars(items: &[(&str, &str)]) -> HashMap<String, String> {
@@ -107,4 +108,24 @@ fn unknown_variables_dedups_repeats() {
     let known: HashSet<&str> = HashSet::new();
     let unknown = unknown_variables("${a} ${a} ${a}", &known).unwrap();
     assert_eq!(unknown, vec!["a".to_string()]);
+}
+
+#[test]
+fn bounded_render_stops_during_substitution() {
+    let out = render_template_bounded(
+        "${a}${a}${a}${a}",
+        &vars(&[("a", &"x".repeat(100))]),
+        50,
+        "...",
+    )
+    .unwrap();
+    assert!(out.len() <= 50, "{}", out.len());
+    assert!(out.ends_with("..."), "{out}");
+    assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+}
+
+#[test]
+fn bounded_render_exact_fit_skips_marker() {
+    let out = render_template_bounded("${a}", &vars(&[("a", "hello")]), 5, "...").unwrap();
+    assert_eq!(out, "hello");
 }

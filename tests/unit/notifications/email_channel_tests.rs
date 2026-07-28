@@ -671,12 +671,272 @@ fn oversized_rendered_output_is_truncated_with_a_visible_marker() {
         .expect("subject renders");
     assert_eq!(subject.len(), 512, "subject is capped at 512 bytes");
     assert!(subject.ends_with("..."), "{subject}");
+    assert!(subject.is_char_boundary(subject.len()));
 
     let body = channel
         .render_body(&note, &no_extras())
         .expect("body renders");
     assert!(body.len() <= 32 * 1024, "body is capped at 32 KiB");
     assert!(body.ends_with("[truncated]"), "truncation must be visible");
+    assert!(body.is_char_boundary(body.len()));
+}
+
+#[test]
+fn repeated_large_values_cannot_blow_past_subject_and_body_ceilings() {
+    // A 64 KiB-class body template may repeat `${body}` / extras many times.
+    // Rendering must stay within the advertised ceilings during substitution,
+    // not only after a post-pass truncate of an unbounded intermediate string.
+    let body_template = "${body}".repeat(8000); // 56_000 bytes, under the 64 KiB template cap
+    assert!(body_template.len() <= 64 * 1024);
+    let subject_template = "${huge}".repeat(140); // 980 bytes, under the 1 KiB subject template cap
+    assert!(subject_template.len() <= 1024);
+
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": subject_template,
+        "body_template": body_template
+    }));
+
+    let mut note = notification(EventAction::Trigger);
+    note.body = "B".repeat(8_192);
+    let mut extras = HashMap::new();
+    extras.insert("huge".to_string(), "H".repeat(4_096));
+
+    let subject = channel
+        .render_subject(&note, &extras)
+        .expect("subject renders");
+    assert!(
+        subject.len() <= 512,
+        "repeated extras must not exceed the subject ceiling: {}",
+        subject.len()
+    );
+    assert!(subject.ends_with("..."), "{subject}");
+    assert!(std::str::from_utf8(subject.as_bytes()).is_ok());
+
+    let body = channel
+        .render_body(&note, &extras)
+        .expect("body renders");
+    assert!(
+        body.len() <= 32 * 1024,
+        "repeated body values must not exceed the body ceiling: {}",
+        body.len()
+    );
+    assert!(body.ends_with("[truncated]"), "{body}");
+    assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+}
+
+#[test]
+fn exact_limit_and_limit_plus_one_keep_utf8_and_visible_markers() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "${title}",
+        "body_template": "${body}"
+    }));
+
+    // Exact subject ceiling: no truncation marker.
+    let mut exact = notification(EventAction::Trigger);
+    exact.title = "s".repeat(512);
+    let subject = channel
+        .render_subject(&exact, &no_extras())
+        .expect("exact subject");
+    assert_eq!(subject.len(), 512);
+    assert!(!subject.ends_with("..."), "exact fit must not mark truncation");
+    assert!(subject.is_char_boundary(subject.len()));
+
+    // One byte over: marker replaces the tail on a UTF-8 boundary.
+    let mut over = notification(EventAction::Trigger);
+    over.title = "s".repeat(513);
+    let subject = channel
+        .render_subject(&over, &no_extras())
+        .expect("oversize subject");
+    assert_eq!(subject.len(), 512);
+    assert!(subject.ends_with("..."), "{subject}");
+
+    // Multi-byte codepoint on the subject boundary must not split a char.
+    let mut utf8 = notification(EventAction::Trigger);
+    // 509 ASCII bytes + one 3-byte char = 512 exact without marker when fit;
+    // 510 ASCII + 3-byte char = 513 → truncate before the multi-byte char.
+    utf8.title = format!("{}{}", "a".repeat(510), "界");
+    assert_eq!(utf8.title.len(), 513);
+    let subject = channel
+        .render_subject(&utf8, &no_extras())
+        .expect("utf8 subject");
+    assert!(subject.len() <= 512, "{}", subject.len());
+    assert!(subject.ends_with("..."), "{subject}");
+    assert!(std::str::from_utf8(subject.as_bytes()).is_ok());
+    assert!(!subject.contains('\u{fffd}'));
+
+    // Exact body ceiling / +1.
+    let mut body_exact = notification(EventAction::Trigger);
+    body_exact.body = "b".repeat(32 * 1024);
+    let body = channel
+        .render_body(&body_exact, &no_extras())
+        .expect("exact body");
+    assert_eq!(body.len(), 32 * 1024);
+    assert!(!body.ends_with("[truncated]"));
+
+    let mut body_over = notification(EventAction::Trigger);
+    body_over.body = "b".repeat(32 * 1024 + 1);
+    let body = channel
+        .render_body(&body_over, &no_extras())
+        .expect("oversize body");
+    assert!(body.len() <= 32 * 1024, "{}", body.len());
+    assert!(body.ends_with("[truncated]"), "{body}");
+    assert!(std::str::from_utf8(body.as_bytes()).is_ok());
+}
+
+#[test]
+fn fields_block_hard_caps_oversized_names_and_crossing_final_field() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "${title}",
+        "body_template": "${fields}"
+    }));
+
+    // A single enormous field name must not push ${fields} past 8 KiB, and
+    // must not require copying the whole name just to truncate afterward.
+    let mut huge_name = notification(EventAction::Trigger);
+    huge_name.fields = vec![NotificationField::new("N".repeat(200_000), "value")];
+    let fields = channel
+        .render_body(&huge_name, &no_extras())
+        .expect("fields render");
+    assert!(
+        fields.len() <= 8 * 1024,
+        "fields block hard ceiling exceeded: {}",
+        fields.len()
+    );
+    assert!(
+        fields.contains("[fields truncated]"),
+        "oversized name must surface the fields truncation marker: {fields}"
+    );
+    assert!(std::str::from_utf8(fields.as_bytes()).is_ok());
+
+    // Fill to just under 8 KiB with complete lines, then one more field that
+    // crosses the boundary. Each line is "f: " + 512×'v' + "\n" = 516 bytes.
+    // 15 × 516 = 7740; remaining 452 < 516, so the 16th field forces truncation.
+    let mut crossing = notification(EventAction::Trigger);
+    crossing.fields = (0..16)
+        .map(|_| NotificationField::new("f", "v".repeat(512)))
+        .collect();
+    let fields = channel
+        .render_body(&crossing, &no_extras())
+        .expect("crossing fields render");
+    assert!(
+        fields.len() <= 8 * 1024,
+        "crossing final field must stay inside the hard ceiling: {}",
+        fields.len()
+    );
+    assert!(
+        fields.contains("[fields truncated]"),
+        "crossing final field must mark truncation: {fields}"
+    );
+    assert!(std::str::from_utf8(fields.as_bytes()).is_ok());
+
+    // Exact 8 KiB fill with no leftover field: no truncation marker required.
+    // 8 KiB / 516 is not integral, so build one field whose sanitized line is
+    // exactly 8192 bytes: name (8192 - 2 - 1 - 1) + ": " + "x" + "\n".
+    let exact_name_len = 8 * 1024 - 4; // ": " + "x" + "\n"
+    let mut exact = notification(EventAction::Trigger);
+    exact.fields = vec![NotificationField::new("E".repeat(exact_name_len), "x")];
+    let fields = channel
+        .render_body(&exact, &no_extras())
+        .expect("exact fields render");
+    assert_eq!(fields.len(), 8 * 1024, "{fields}");
+    assert!(
+        !fields.contains("[fields truncated]"),
+        "exact-fit fields block must not claim truncation"
+    );
+}
+
+#[test]
+fn built_message_stays_bounded_and_neutralizes_header_injection() {
+    let body_template = "${body}".repeat(8000);
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "[${severity}] ${title}",
+        "body_template": body_template
+    }));
+
+    let mut note = notification(EventAction::Trigger);
+    note.title = "alert\r\nBcc: attacker@evil.example\r\nX-Injected: yes".to_string();
+    note.body = "Z".repeat(100_000);
+    note.fields = vec![
+        NotificationField::new("H".repeat(50_000), "V".repeat(50_000)),
+        NotificationField::new("more\r\nInjected", "row\nTwo"),
+    ];
+
+    let message = channel
+        .build_message(&note, &no_extras())
+        .expect("message builds");
+    let rendered = String::from_utf8(message).expect("message is utf-8");
+    let (headers, body) = rendered
+        .split_once("\r\n\r\n")
+        .expect("header/body separator");
+
+    // Injection defense is that CR/LF cannot start a new header field — the
+    // literal "Bcc:" text may still appear inside Subject as inert content.
+    let field_names: Vec<String> = headers
+        .split("\r\n")
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .map(|line| match line.split_once(':') {
+            Some((name, _)) => name.to_ascii_lowercase(),
+            None => format!("<not a header field: {line}>"),
+        })
+        .collect();
+    let expected_fields: Vec<String> = [
+        "date",
+        "from",
+        "to",
+        "subject",
+        "message-id",
+        "mime-version",
+        "content-type",
+        "content-transfer-encoding",
+        "auto-submitted",
+        "x-ferrum-notification-severity",
+        "x-ferrum-notification-event-action",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    assert_eq!(
+        field_names, expected_fields,
+        "hostile subject/fields must not inject header fields"
+    );
+
+    for line in headers.lines() {
+        assert!(
+            line.len() <= 998,
+            "header lines must stay within RFC 5322 limits: {line}"
+        );
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(body.replace("\r\n", ""))
+        .expect("body is base64");
+    assert!(
+        decoded.len() <= 32 * 1024,
+        "wire body payload must respect the rendered body ceiling: {}",
+        decoded.len()
+    );
+    let decoded_text = String::from_utf8(decoded).expect("decoded body is utf-8");
+    assert!(
+        decoded_text.len() <= 32 * 1024,
+        "decoded body must stay bounded: {}",
+        decoded_text.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
