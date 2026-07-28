@@ -19120,7 +19120,14 @@ components:
         mirror_request_body:
           type: boolean
           default: true
-          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy. Shared Bytes are charged against max_retained_request_body_bytes for each in-flight task."
+          description: >-
+            When true, the request body is forwarded to the mirror target.
+            Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads).
+            Body collection is gated by authorize-phase sampling and admission:
+            only an admitted request is buffered, and Shared Bytes are charged
+            against max_retained_request_body_bytes for each in-flight task.
+            When false, or when percentage quantizes to 0, this instance
+            declares no request-body capability at all.
         max_in_flight:
           type: integer
           format: uint64
