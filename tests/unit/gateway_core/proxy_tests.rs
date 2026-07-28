@@ -3134,6 +3134,7 @@ fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() 
         ),
     ]);
 
+    let expected_content_length = body.len().to_string();
     let ordinary = build_normalized_reject_wire_headers_for_test(
         StatusCode::FORBIDDEN,
         body,
@@ -3144,7 +3145,7 @@ fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() 
         ordinary
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok()),
-        Some(&(body.len().to_string())),
+        Some(expected_content_length.as_str()),
         "ordinary HTTP rejects must keep ExactBody Content-Length"
     );
     // Ordinary rejects still strip hop-by-hop via the sanitizer.
