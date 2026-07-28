@@ -573,17 +573,23 @@ impl MirrorBodyBudget {
     /// Return `bytes` to the budget.
     ///
     /// Leases release exactly what they hold exactly once, so this never
-    /// underflows in practice. It still saturates rather than wrapping: an
-    /// unsigned wrap would leave `used` near `u64::MAX` and wedge the instance's
-    /// mirroring closed for the rest of the plugin generation, which is a worse
-    /// failure than under-releasing.
+    /// underflows in practice. An invariant violation leaves the charge in
+    /// place: under-accounting would reopen the memory cap, while wrapping
+    /// would panic in debug or wedge the budget in release.
     fn release(&self, bytes: u64) {
         if bytes > 0 {
-            let _ = self
+            if let Err(current) = self
                 .used
                 .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
-                    Some(current.saturating_sub(bytes))
-                });
+                    current.checked_sub(bytes)
+                })
+            {
+                warn!(
+                    current,
+                    release_bytes = bytes,
+                    "request_mirror retained-body budget release underflow refused"
+                );
+            }
         }
     }
 
