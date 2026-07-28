@@ -3192,11 +3192,7 @@ impl Plugin for AiToolGovernor {
         // serialization-overflow branch below uses. Use the shared per-request
         // memo (exact BOM-stripped bytes as key) like every other
         // context-bearing screen on this plugin.
-        if ctx
-            .json_scan_memo
-            .ambiguity(strip_json_bom(body))
-            .is_some()
-        {
+        if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
             self.clear_response_hash(ctx);
             ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
             return None;

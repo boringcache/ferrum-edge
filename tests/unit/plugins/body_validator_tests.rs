@@ -5355,15 +5355,15 @@ async fn xml_activated_json_content_type_final_rejects_reintroduced_duplicates()
     );
 
     // Unambiguous final body still passes (parity with before_proxy).
-    assert_continue(plugin.on_final_request_body(&headers, clean.as_bytes()).await);
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, clean.as_bytes())
+            .await,
+    );
 
     // XML gating preserved: XML content type is outside this content_types list.
     let xml_headers = make_xml_headers();
-    assert_continue(
-        plugin
-            .on_final_request_body(&xml_headers, b"<root/>")
-            .await,
-    );
+    assert_continue(plugin.on_final_request_body(&xml_headers, b"<root/>").await);
 }
 
 /// Protobuf-only configs must not treat arbitrary non-gRPC payloads as JSON on
