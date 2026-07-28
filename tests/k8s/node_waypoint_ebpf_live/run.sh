@@ -595,6 +595,27 @@ render_chart_assertions() {
     exit 1
   fi
 
+  # Advisory GHSA-3f2j-wwqw-grmg: multi-namespace CP + only the fleet-wide shared
+  # secret must fail at helm render (not as a crash-looping Ready timeout).
+  if helm template "$RELEASE" "$CHART_DIR" \
+    --namespace "$MESH_NS" \
+    --set controlPlane.enabled=true \
+    --set controlPlane.database.type=sqlite \
+    --set-string controlPlane.database.sqlite.path=/tmp/ferrum.db \
+    --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
+    --set-string "controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret" \
+    --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+    >/tmp/ferrum-node-waypoint-multi-ns-shared-secret.out 2>&1; then
+    echo "Control-plane render accepted multi-namespace shared-secret posture" >&2
+    cat /tmp/ferrum-node-waypoint-multi-ns-shared-secret.out >&2 || true
+    exit 1
+  fi
+  if ! grep -q 'GHSA-3f2j' /tmp/ferrum-node-waypoint-multi-ns-shared-secret.out; then
+    echo "Control-plane multi-namespace shared-secret rejection lacked advisory context" >&2
+    cat /tmp/ferrum-node-waypoint-multi-ns-shared-secret.out >&2 || true
+    exit 1
+  fi
+
   rendered="$(helm template "$RELEASE" "$CHART_DIR" \
     --namespace "$MESH_NS" \
     --set controlPlane.enabled=true \
@@ -929,7 +950,7 @@ install_ferrum() {
     --set-string 'controlPlane.database.url=sqlite:////tmp/ferrum-node-waypoint-ebpf-live.db?mode=rwc' \
     --set-string "controlPlane.credentials.adminJwtSecret.value=$ADMIN_JWT_SECRET" \
     --set controlPlane.credentials.cpDpGrpcJwtSecret.value=ferrum-edge-node-waypoint-live-grpc-secret \
-    --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+    --set-string "controlPlane.env.FERRUM_NAMESPACE=$WORKLOAD_NS" \
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_POD_DISCOVERY_ENABLED=true \
