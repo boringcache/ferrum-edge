@@ -646,13 +646,21 @@ impl RequestMirrorAdmission {
 
 /// Staged `request_mirror` admissions for one live request context.
 ///
+/// The common case is one effective `request_mirror` instance, so the first
+/// admission is stored inline in [`Self::first`] and the overflow `Vec` stays
+/// unallocated until a distinct second instance is staged. Arbitrary multi-
+/// instance support is preserved without bounding count.
+///
 /// Owned semaphore permits and retained-byte leases live only on the live
 /// request. Custom `Clone` returns an empty wrapper so `RequestContext`'s
 /// derived `Clone` cannot duplicate or double-release admission capacity.
 /// Custom `Debug` summarizes staging count only and never prints permit,
 /// lease, or drop-reason state.
 #[derive(Default)]
-pub(crate) struct RequestMirrorAdmissions(Vec<RequestMirrorAdmission>);
+pub(crate) struct RequestMirrorAdmissions {
+    first: Option<RequestMirrorAdmission>,
+    overflow: Vec<RequestMirrorAdmission>,
+}
 
 impl Clone for RequestMirrorAdmissions {
     fn clone(&self) -> Self {
@@ -662,8 +670,9 @@ impl Clone for RequestMirrorAdmissions {
 
 impl std::fmt::Debug for RequestMirrorAdmissions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let staged = usize::from(self.first.is_some()) + self.overflow.len();
         f.debug_struct("RequestMirrorAdmissions")
-            .field("staged", &self.0.len())
+            .field("staged", &staged)
             .finish()
     }
 }
@@ -673,21 +682,36 @@ impl RequestMirrorAdmissions {
     /// same instance so a repeated evaluation cannot accumulate two leases.
     pub(crate) fn stage(&mut self, admission: RequestMirrorAdmission) {
         let instance_id = admission.instance_id();
+        if let Some(first) = self.first.as_mut() {
+            if first.instance_id() == instance_id {
+                *first = admission;
+                return;
+            }
+        }
         if let Some(slot) = self
-            .0
+            .overflow
             .iter_mut()
             .find(|staged| staged.instance_id() == instance_id)
         {
             *slot = admission;
             return;
         }
-        self.0.push(admission);
+        if self.first.is_none() {
+            self.first = Some(admission);
+        } else {
+            self.overflow.push(admission);
+        }
     }
 
     /// Whether the given instance was admitted and therefore needs the request
     /// body buffered. Read-only and idempotent.
     pub(crate) fn body_admitted(&self, instance_id: u64) -> bool {
-        self.0
+        if let Some(first) = self.first.as_ref() {
+            if first.instance_id() == instance_id {
+                return first.is_admitted();
+            }
+        }
+        self.overflow
             .iter()
             .any(|staged| staged.instance_id() == instance_id && staged.is_admitted())
     }
@@ -695,11 +719,18 @@ impl RequestMirrorAdmissions {
     /// Take one instance's staged admission, transferring ownership of its
     /// permit and retained-byte lease to the caller.
     pub(crate) fn take(&mut self, instance_id: u64) -> Option<RequestMirrorAdmission> {
+        if self
+            .first
+            .as_ref()
+            .is_some_and(|first| first.instance_id() == instance_id)
+        {
+            return self.first.take();
+        }
         let index = self
-            .0
+            .overflow
             .iter()
             .position(|staged| staged.instance_id() == instance_id)?;
-        Some(self.0.swap_remove(index))
+        Some(self.overflow.swap_remove(index))
     }
 }
 

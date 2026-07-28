@@ -4514,6 +4514,146 @@ async fn advisory_cancelled_request_releases_admission_without_dispatch() {
 }
 
 #[tokio::test]
+async fn advisory_repeated_authorize_replaces_same_instance_admission() {
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 2
+    }));
+
+    let mut ctx = advisory_ctx(Some(4096));
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        4096
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let debug_once = format!("{ctx:?}");
+    assert!(
+        debug_once.contains("RequestMirrorAdmissions { staged: 1 }"),
+        "Debug must report the single staged admission without exposing state"
+    );
+
+    // A second authorize for the same instance must replace the prior entry:
+    // the old permit/lease drop exactly once, so retained bytes do not stack.
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        4096,
+        "replacement must drop the prior lease exactly once"
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert!(
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 1 }"),
+        "replacement must keep a single staged admission"
+    );
+
+    // Taking the admission transfers ownership; the slot is empty afterward.
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 4096]));
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "take must clear the staged admission for this instance"
+    );
+    assert!(
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 0 }"),
+        "Debug must report zero staged admissions after take"
+    );
+
+    let _ = ctx.collect_mirror_result().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while request_mirror_retained_request_body_bytes_for_test(&plugin) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached task must release its lease exactly once");
+}
+
+#[tokio::test]
+async fn advisory_multiple_instances_stage_and_take_independently() {
+    let a = RequestMirror::new_with_config_id(
+        &json!({
+            "mirror_host": "mirror-a.local",
+            "percentage": 100.0,
+            "mirror_request_body": true
+        }),
+        PluginHttpClient::default(),
+        Some("advisory-mirror-a"),
+    )
+    .expect("instance a must construct");
+    let b = RequestMirror::new_with_config_id(
+        &json!({
+            "mirror_host": "mirror-b.local",
+            "percentage": 100.0,
+            "mirror_request_body": true
+        }),
+        PluginHttpClient::default(),
+        Some("advisory-mirror-b"),
+    )
+    .expect("instance b must construct");
+
+    let mut ctx = advisory_ctx(Some(2048));
+    plugin_utils::assert_continue(a.authorize(&mut ctx).await);
+    plugin_utils::assert_continue(b.authorize(&mut ctx).await);
+    assert!(a.should_buffer_request_body(&ctx));
+    assert!(b.should_buffer_request_body(&ctx));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&a),
+        2048
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&b),
+        2048
+    );
+    assert!(
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 2 }"),
+        "Debug must report both staged admissions"
+    );
+
+    // Taking one instance must leave the sibling admission intact.
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 2048]));
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(a.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !a.should_buffer_request_body(&ctx),
+        "instance a must be taken"
+    );
+    assert!(
+        b.should_buffer_request_body(&ctx),
+        "instance b must remain staged and independent"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&b),
+        2048,
+        "taking a must not release b's lease"
+    );
+    assert!(
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 1 }"),
+        "Debug must report the remaining sibling admission"
+    );
+
+    // Dropping the live context releases every remaining staged lease once.
+    drop(ctx);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&b),
+        0,
+        "context drop must release the remaining sibling lease exactly once"
+    );
+
+    // a may still hold bytes in its detached task until it settles.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while request_mirror_retained_request_body_bytes_for_test(&a) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("instance a's detached task must release its lease exactly once");
+}
+
+#[tokio::test]
 async fn advisory_oversized_declared_body_stays_streaming_and_unmirrored() {
     let plugin = advisory_plugin(json!({
         "mirror_host": "mirror.local",
