@@ -50,7 +50,7 @@ pub mod udp_endpoint;
 pub use batching_logger::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, BatchingLoggerPermit,
     DeferredBatchingLogger, LoggerHooks, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES,
-    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy,
+    MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, RetryPolicy, TrySendOutcome,
     wait_until_committed, wait_until_committed_or_closed,
 };
 pub use byte_budget::{

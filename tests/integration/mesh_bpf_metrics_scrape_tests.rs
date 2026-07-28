@@ -243,6 +243,18 @@ async fn authenticated_metrics_includes_seeded_mesh_bpf_families() {
         )),
         "seeded srtt sum missing from /metrics:\n{body}"
     );
+    assert!(
+        body.contains(&format!(
+            "# TYPE {DEFAULT_METRIC_PREFIX}_srtt_microseconds histogram"
+        )),
+        "srtt family must be a histogram:\n{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "{DEFAULT_METRIC_PREFIX}_srtt_microseconds_bucket{{le=\"250\"}} 1"
+        )),
+        "seeded srtt bucket missing from /metrics:\n{body}"
+    );
     assert_single_tcp_events_family(&body, DEFAULT_METRIC_PREFIX);
 
     let _ = shutdown.send(true);

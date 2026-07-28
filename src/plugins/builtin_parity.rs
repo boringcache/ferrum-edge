@@ -313,7 +313,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "ws_rate_limiting",
         classification: BuiltinPluginClassification::Public,
         priority: 2910,
-        active_phases: "on_ws_frame",
+        active_phases: "on_ws_frame, on_ws_reassembly_frames",
         matrix_protocols: WS_ONLY_PROTOCOLS,
         protocol_rationale: "Per-connection frame rate limiting for WebSocket",
     },
@@ -696,7 +696,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 9365,
         active_phases: "(no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer)",
         matrix_protocols: ALL_PROTOCOLS,
-        protocol_rationale: "Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks",
+        protocol_rationale: "Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks",
     },
     BuiltinPluginParityMeta {
         name: "transaction_log_schema",

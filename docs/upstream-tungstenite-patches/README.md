@@ -24,6 +24,7 @@ correct close reason when frame and reassembled-message ceilings are equal.
 | `tungstenite` | <https://github.com/snapview/tungstenite-rs/pull/556> | `117597cbfccf2af44e97561cb2efa713d8454ed2`, `78db146fb240776a3082621ce054927488423e86` | 0.29.0 |
 | `tungstenite` frame-limit origin | **Deliberate fork — not yet filed upstream** | Ferrum local | 0.29.0 |
 | `tungstenite` optional auto-pong | **Deliberate fork — not yet filed upstream** ([003](003-optional-auto-pong/)) | Ferrum local | 0.29.0 |
+| `tungstenite` / `tokio-tungstenite` fragment accounting | **Deliberate fork — not yet filed upstream** ([004](004-fragment-accounting/)) | Ferrum local | 0.29.0 |
 | `tokio-tungstenite` | <https://github.com/snapview/tokio-tungstenite/pull/380> | `ba1d8f8897a09e4cdf1088456667e8c24ee15832` | 0.29.0 |
 
 Both PRs were open when vendored. The local API names and return types match the
@@ -59,6 +60,16 @@ upstream proposals:
   (issue #2963). Documented under
   [003-optional-auto-pong](003-optional-auto-pong/). This is a deliberate
   Ferrum extension owned by `@jeremyjpj0916` under the same SLA.
+- Added physical-fragment accounting for message reassembly: `FragmentMeter`,
+  `set_fragment_accounting()` on `WebSocketContext` / `WebSocket` /
+  `WebSocketStream`, `WebSocketConfig::max_incomplete_message_frames`,
+  `WebSocketConfig::max_incomplete_message_duration` (both default `None`), and
+  the `IncompleteMessageFrameLimitExceeded` / `IncompleteMessageTimeout`
+  protocol errors. The reader only ever yields reassembled messages, so
+  fragmented — including zero-length continuation — frames were invisible to
+  per-message admission policy and unbounded in count and duration. Documented
+  under [004-fragment-accounting](004-fragment-accounting/). This is a
+  deliberate Ferrum extension owned by `@jeremyjpj0916` under the same SLA.
 - Wired both crates through root `[patch.crates-io]`.
 
 ## Direct vendor-test commands
@@ -67,6 +78,8 @@ upstream proposals:
 cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib into_inner_with_read_buffer
 cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib size_limit_hit
 cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib auto_pong
+cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib fragment
+cargo test --manifest-path vendor/tungstenite-0.29.0-ferrum-patched/Cargo.toml --lib incomplete_message
 cargo test --manifest-path vendor/tokio-tungstenite-0.29.0-ferrum-patched/Cargo.toml --config 'patch.crates-io.tungstenite.path="vendor/tungstenite-0.29.0-ferrum-patched"' --test into_inner_with_read_buffer
 ```
 
@@ -84,13 +97,26 @@ starting the existing raw relay so later backend bytes cannot overtake them.
 The parsed relay maps `FrameTooLong` only to the effective frame rule and
 `MessageTooLong` only to the effective reassembled-message rule.
 
+`run_websocket_proxy` installs one `FragmentMeter` per direction (client and
+backend framer) plus the incomplete-message frame/duration bounds from
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`, before the first read and
+before `split()`. After each successful read it drains its own direction's
+meter and charges the batch through `Plugin::on_ws_reassembly_frames`; the
+completing message is charged once by the ordinary `on_ws_frame` chain, so no
+wire frame is counted twice. `IncompleteMessageFrameLimitExceeded` /
+`IncompleteMessageTimeout` become an RFC 6455 Close 1008 with a fixed,
+non-secret reason.
+
 ## Retirement condition
 
 Do not retire these vendor directories merely because the PRs merge. Retire
 only after **both** upstream takeover changes are present in published
 compatible releases consumed by ferrum-edge and the consumed tungstenite
-surface preserves an equivalent frame-vs-message capacity origin **and** an
-equivalent opt-out for automatic Ping replies (`auto_pong` or successor). If
+surface preserves an equivalent frame-vs-message capacity origin, an
+equivalent opt-out for automatic Ping replies (`auto_pong` or successor),
+**and** an equivalent pre-reassembly fragment hook with independent
+incomplete-message count/duration bounds. If
 an extension has not shipped upstream, carry forward only that documented
 minimal extension until its own retirement condition is met.
 
@@ -103,6 +129,7 @@ At retirement:
    - `tokio-tungstenite = { path = "vendor/tokio-tungstenite-0.29.0-ferrum-patched" }`
 3. Delete both vendor directories.
 4. Keep the gateway call-site logic using
-   `WebSocketStream::into_inner_with_read_buffer()`.
+   `WebSocketStream::into_inner_with_read_buffer()` and
+   `WebSocketStream::set_fragment_accounting()`.
 5. Re-run the WebSocket tunnel regression and the broad Rust checks for the
    dependency bump.

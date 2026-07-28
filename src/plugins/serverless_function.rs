@@ -1004,32 +1004,13 @@ fn reject_encoded_request_body(
 fn unambiguous_query_params(
     ctx: &RequestContext,
 ) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
-    // A `request_transformer` (priority 3000) query rule that ran before this
-    // serverless egress (priority 3025) recorded its add/remove/update/rename on
-    // the decoded `ctx.query_params` map. The function payload is rebuilt from the
-    // raw query string to preserve plus/duplicate/decode/auth-strip invariants,
-    // and that raw representation cannot faithfully honor a decoded-parameter
-    // transform without reintroducing the ambiguity the raw path exists to
-    // eliminate (for example resurrecting a `token` the operator removed). Fail
-    // closed on the composition rather than emit a payload that silently ignores
-    // the transform.
-    if ctx
-        .metadata
-        .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY)
-    {
-        return Err(InvocationFailure::governed_input(
-            "query_params_transformed",
-            "query forwarding cannot reconcile a request_transformer query transform with the raw-query payload",
-        ));
-    }
+    // Start from the same canonical backend-visible query primary dispatch
+    // uses: transformer-published outbound query (when present) composed with
+    // authentication-owned credential strips. That representation already
+    // honors operator query transforms without resurrecting stripped secrets.
     let mut ordered = BTreeMap::new();
-    if let Some(raw_query) = ctx.raw_query_string() {
-        // Authentication plugins retain the original raw query for security
-        // inspection but mark hidden credentials for removal before backend
-        // dispatch. Apply that same removal before parsing the function
-        // payload so policy egress cannot resurrect a credential that the
-        // backend will not receive.
-        let effective_query = crate::proxy::query_string_after_plugin_strips(ctx, raw_query);
+    let effective_query = crate::proxy::effective_backend_query_string(ctx);
+    if !effective_query.is_empty() {
         for pair in effective_query.split('&').filter(|pair| !pair.is_empty()) {
             let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
             if raw_key.contains('+') || raw_value.contains('+') {
@@ -1066,7 +1047,10 @@ fn unambiguous_query_params(
                 ));
             }
         }
-    } else if !ctx.query_params.is_empty() {
+    } else if ctx.raw_query_string().is_none()
+        && ctx.outbound_query_string().is_none()
+        && !ctx.query_params.is_empty()
+    {
         return Err(InvocationFailure::governed_input(
             "raw_query_unavailable",
             "query parameters were materialized without their original encoded representation",
