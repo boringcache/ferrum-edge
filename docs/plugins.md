@@ -5632,6 +5632,27 @@ post-reassembly chain, the first terminal Close from a priority-ordered
 admission/mutating hook is preserved: later mutating plugins are skipped for
 that frame, while observational hooks still see the final Close.
 
+**Physical fragments.** Because `on_ws_frame` sees only reassembled messages, a
+peer could otherwise spend unbounded wire frames — including zero-length
+continuation frames, which accumulate no bytes and therefore never trip any size
+ceiling — while paying for a single logical message. The relay now meters those
+frames inside the codec and charges them through `on_ws_reassembly_frames`
+before admitting the completing message, in both directions and on all three
+frontends (and for an interleaved Ping/Pong; a peer Close stays exempt, as it
+already bypasses mutating admission). Each wire frame is charged exactly once: the fragments through the
+reassembly hook, the completing frame through the ordinary message hook.
+Observational plugins are skipped for fragment batches, and only a returned
+`Message::Close` is honored (there is no message to mutate).
+
+Metering cannot bound a message that never completes, so the parser also applies
+two independent ceilings — `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+(physical frame count) and `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`
+(wall clock since the first fragment) — and closes the connection with RFC 6455
+code **1008** and a fixed, non-secret reason while the message is still
+incomplete. Both reset at every message boundary, so legitimately fragmented
+traffic on a long-lived connection is unaffected. These are separate from
+`ws_message_size_limiting`, which bounds bytes and closes with **1009**.
+
 ### `ws_message_size_limiting`
 
 Enforces an actual WebSocket frame-payload ceiling before payload reservation
@@ -5675,7 +5696,7 @@ parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. Budget is charged per **physical** frame, not per logical message: a message reassembled from N wire frames costs N tokens (the N−1 fragments are charged as one batched admission when the read that surfaced them returns, then the completing message costs one more). A message built from more wire frames than `burst_size` therefore can never be admitted, which is the intended fail-closed answer to a fragmentation flood. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
 
 **Priority:** 2910
 
@@ -5835,9 +5856,9 @@ See [Mesh Observability](mesh.md#observability) for metric names, service graph 
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT / SYN-to-ACK latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
 
-See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters and the node-agent/process split.
+See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
 
 ---
 

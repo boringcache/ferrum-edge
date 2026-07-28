@@ -15838,7 +15838,8 @@ components:
       type: object
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
-        plugin that exposes BPF SOCK_OPS counters on the Prometheus scrape
+        plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
+        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
@@ -15847,7 +15848,11 @@ components:
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
           default: ferrum_mesh_bpf
-          description: Prometheus metric name prefix for emitted BPF counters.
+          description: |
+            Prometheus metric name prefix for emitted BPF counters and
+            latency histograms (default families include
+            `{prefix}_srtt_microseconds` and
+            `{prefix}_syn_to_ack_microseconds`).
 
     SoapWsSecurityConfig:
       type: object

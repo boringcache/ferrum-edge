@@ -156,7 +156,7 @@ impl WsRateLimiting {
     pub(crate) fn seed_connection_at_for_test(&self, connection_id: u64, now: Instant) {
         let _ = self
             .limiter
-            .check_local_at(connection_id, &WsRateLimitOp, now);
+            .check_local_at(connection_id, &WsRateLimitOp::ONE, now);
     }
 
     /// Attempt to seed one local/fallback key through the production atomic
@@ -169,7 +169,7 @@ impl WsRateLimiting {
         max_entries: usize,
     ) -> bool {
         self.limiter
-            .check_local_at_with_capacity(connection_id, &WsRateLimitOp, now, max_entries)
+            .check_local_at_with_capacity(connection_id, &WsRateLimitOp::ONE, now, max_entries)
             .is_some()
     }
 
@@ -227,6 +227,71 @@ impl WsRateLimiting {
             end -= 1;
         }
         end
+    }
+
+    /// Shared admission for reassembled messages and for the physical fragments
+    /// they were built from. Returns the terminal policy Close when the budget
+    /// is exhausted or the connection cannot be admitted to local state.
+    async fn charge_frames(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        op: WsRateLimitOp,
+    ) -> Option<Message> {
+        let _ = self.maybe_evict();
+        let Some(outcome) = self
+            .limiter
+            .check_with_redis_key_and_local_capacity(
+                connection_id,
+                || self.redis_connection_scope_key(proxy_id, connection_id),
+                &op,
+                MAX_STATE_ENTRIES,
+            )
+            .await
+        else {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+            return Some(self.policy_close());
+        };
+
+        if outcome.allowed {
+            return None;
+        }
+
+        // A fail-closed refusal (centralized enforcement unavailable under
+        // `redis_failure_policy: "fail_closed"`) closes the connection just like
+        // an exceeded budget — a frame stream has no other refusal channel. It is
+        // not a budget overrun, so it neither increments `rate_limit_exceeded`
+        // nor logs here; the shared backend already emits the bounded
+        // once-per-outage warning.
+        if outcome.enforcement_unavailable {
+            return Some(self.policy_close());
+        }
+
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+
+        let dir_label = match direction {
+            WebSocketFrameDirection::ClientToBackend => "client->backend",
+            WebSocketFrameDirection::BackendToClient => "backend->client",
+        };
+        // One bounded, low-cardinality warning per closed connection: this is
+        // the terminal decision, not a per-frame event.
+        warn!(
+            plugin = "ws_rate_limiting",
+            proxy_id = %proxy_id,
+            connection_id,
+            direction = dir_label,
+            charged_frames = op.frame_count(),
+            "WebSocket frame rate exceeded, closing connection"
+        );
+        Some(self.policy_close())
+    }
+
+    fn policy_close(&self) -> Message {
+        Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: self.close_reason.clone().into(),
+        }))
     }
 
     fn maybe_evict(&self) -> bool {
@@ -332,54 +397,33 @@ impl Plugin for WsRateLimiting {
             return None;
         }
 
-        let _ = self.maybe_evict();
-        let Some(outcome) = self
-            .limiter
-            .check_with_redis_key_and_local_capacity(
-                connection_id,
-                || self.redis_connection_scope_key(proxy_id, connection_id),
-                &WsRateLimitOp,
-                MAX_STATE_ENTRIES,
-            )
+        // One reassembled message or control frame == one wire frame. The
+        // fragments it was assembled from were already charged through
+        // `on_ws_reassembly_frames`, so this never double-charges them.
+        self.charge_frames(proxy_id, connection_id, direction, WsRateLimitOp::ONE)
             .await
-        else {
-            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            return Some(Message::Close(Some(CloseFrame {
-                code: CloseCode::Policy,
-                reason: self.close_reason.clone().into(),
-            })));
-        };
+    }
 
-        if outcome.allowed {
+    async fn on_ws_reassembly_frames(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<Message> {
+        if fragment_frames == 0 {
             return None;
         }
-
-        let dir_label = match direction {
-            WebSocketFrameDirection::ClientToBackend => "client->backend",
-            WebSocketFrameDirection::BackendToClient => "backend->client",
-        };
-        // A fail-closed refusal (centralized enforcement unavailable under
-        // `redis_failure_policy: "fail_closed"`) closes the connection just like
-        // an exceeded budget — a frame stream has no other refusal channel. The
-        // shared backend already emits the bounded once-per-outage warning.
-        if outcome.enforcement_unavailable {
-            return Some(Message::Close(Some(CloseFrame {
-                code: CloseCode::Policy,
-                reason: self.close_reason.clone().into(),
-            })));
-        }
-
-        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-        warn!(
-            plugin = "ws_rate_limiting",
-            proxy_id = %proxy_id,
+        // Physical fragments that produced no message: an initial non-final
+        // Text/Binary frame plus every intermediate continuation, including
+        // zero-length ones. Charged as one batched op so the Redis path stays
+        // at a single round trip (GHSA-qq94-2gv2-phh6).
+        self.charge_frames(
+            proxy_id,
             connection_id,
-            direction = dir_label,
-            "WebSocket frame rate exceeded, closing connection"
-        );
-        Some(Message::Close(Some(CloseFrame {
-            code: CloseCode::Policy,
-            reason: self.close_reason.clone().into(),
-        })))
+            direction,
+            WsRateLimitOp::frames(fragment_frames),
+        )
+        .await
     }
 }

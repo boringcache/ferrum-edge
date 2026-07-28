@@ -1961,14 +1961,34 @@ impl RedisRateLimitClient {
         current_key: &str,
         ttl_seconds: u64,
     ) -> Result<(i64, i64), ()> {
+        self.sliding_window_increment_by(previous_key, current_key, 1, ttl_seconds)
+            .await
+    }
+
+    /// [`Self::sliding_window_increment`] with an explicit charge.
+    ///
+    /// Used where one admission decision covers several units of work — the
+    /// WebSocket frame limiter charges every physical fragment of a reassembled
+    /// message in a single round trip rather than one round trip per fragment.
+    /// `amount` must be positive; the caller owns the bound on how large it can
+    /// grow.
+    pub async fn sliding_window_increment_by(
+        &self,
+        previous_key: &str,
+        current_key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+    ) -> Result<(i64, i64), ()> {
+        let amount = amount.max(1);
         let mut conn = self.get_connection().await.ok_or(())?;
 
         let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
             .atomic()
             .cmd("GET")
             .arg(previous_key)
-            .cmd("INCR")
+            .cmd("INCRBY")
             .arg(current_key)
+            .arg(amount)
             .cmd("EXPIRE")
             .arg(current_key)
             .arg(expire_seconds(ttl_seconds))
@@ -1984,7 +2004,7 @@ impl RedisRateLimitClient {
             Err(e) => {
                 warn!(
                     redis_url = %self.config.redacted_url(),
-                    operation = "GET+INCR+EXPIRE",
+                    operation = "GET+INCRBY+EXPIRE",
                     error = %e,
                     "Redis sliding-window transaction failed"
                 );
