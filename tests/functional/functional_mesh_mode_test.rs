@@ -729,7 +729,7 @@ fn gateway_child_exited(child: &mut Child) -> Option<ExitStatus> {
 /// against them — success, failure, or fail-closed rejection — proves nothing.
 fn exited_gateway_diagnostic(children: &mut [(&str, &mut Child)]) -> Option<String> {
     for (label, child) in children.iter_mut() {
-        if let Some(status) = gateway_child_exited(&mut **child) {
+        if let Some(status) = gateway_child_exited(child) {
             return Some(format!("{label} exited during the run ({status})"));
         }
     }
