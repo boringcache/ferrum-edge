@@ -1349,7 +1349,8 @@ mod grpc_route_predicate_dispatch {
         assert!(!rejected);
         assert_eq!(port, Some(50051));
         assert!(
-            host.as_deref().is_some_and(|host| host.contains("grpc-api")),
+            host.as_deref()
+                .is_some_and(|host| host.contains("grpc-api")),
             "expected the GRPCRoute backend, got {host:?}"
         );
 
@@ -1470,8 +1471,12 @@ mod grpc_route_predicate_dispatch {
             }]),
         )];
         let plugin = dispatch_plugin_for_catch_all(&updated);
-        let (_, port, rejected) =
-            resolved_backend(&plugin, "/helloworld.Greeter/SayGoodbye", &mut grpc_headers()).await;
+        let (_, port, rejected) = resolved_backend(
+            &plugin,
+            "/helloworld.Greeter/SayGoodbye",
+            &mut grpc_headers(),
+        )
+        .await;
         assert!(!rejected);
         assert_eq!(port, Some(50052));
         let (_, _, rejected) =

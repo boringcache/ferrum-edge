@@ -1631,9 +1631,9 @@ fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> 
                 }),
                 // Already rejected above; re-checked rather than panicking so
                 // the production path has no unreachable assertion.
-                (None, None) => Err(
-                    "matches[].method requires at least one of service / method".to_string(),
-                ),
+                (None, None) => {
+                    Err("matches[].method requires at least one of service / method".to_string())
+                }
             }
         }
         "RegularExpression" => {
@@ -7761,9 +7761,15 @@ mod tests {
             Some("a"),
             "the more specific header-bearing rule must be evaluated first"
         );
-        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(50051));
+        assert_eq!(
+            rules[0]["destination"]["backend_port"].as_u64(),
+            Some(50051)
+        );
         assert!(rules[1]["match"]["headers"].get("x-tenant").is_none());
-        assert_eq!(rules[1]["destination"]["backend_port"].as_u64(), Some(50052));
+        assert_eq!(
+            rules[1]["destination"]["backend_port"].as_u64(),
+            Some(50052)
+        );
         assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
     }
 
@@ -7812,7 +7818,10 @@ mod tests {
             rules[0]["match"]["headers"]["content-type"]["prefix"].as_str(),
             Some("application/grpc")
         );
-        assert_eq!(rules[0]["destination"]["backend_port"].as_u64(), Some(50051));
+        assert_eq!(
+            rules[0]["destination"]["backend_port"].as_u64(),
+            Some(50051)
+        );
         assert!(result.config.validate_unique_listen_paths().is_ok());
     }
 
