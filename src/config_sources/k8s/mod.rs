@@ -454,6 +454,14 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
+    /// Source route `kind` (`HTTPRoute` / `GRPCRoute`) of every Gateway API
+    /// route proxy materialized so far. Gateway API v1.5.1 forbids merging
+    /// between GRPCRoutes and HTTPRoutes, so the same-`(hosts, listen path)`
+    /// collapse in `gateway_api::upsert_http_route_resources` must never fold
+    /// a proxy of one kind into a proxy of the other. This is the second line
+    /// of defense: the whole-route cross-kind conflict resolution should have
+    /// already rejected the losing route before it materializes anything.
+    pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     gateway_api_gateway_classes: HashMap<String, bool>,
@@ -487,6 +495,7 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
+            gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),
@@ -897,7 +906,17 @@ where
         // signature (see `gateway_api::grpc_route_match_signature`), so two
         // gRPC routes only collide when they claim the *same* predicate on the
         // same parent, hostname, and listen path — exactly like HTTPRoute.
-        let skipped_reason = "the conflicting match was skipped";
+        //
+        // A cross-kind (HTTPRoute vs GRPCRoute) collision is different in
+        // kind, not degree: Gateway API v1.5.1 requires the whole losing Route
+        // to be rejected on that listener, so every one of its matches is
+        // suppressed rather than just the colliding one.
+        let skipped_reason = if conflict.loser.kind == conflict.winner.kind {
+            "the conflicting match was skipped"
+        } else {
+            "the whole route was rejected on that listener because Gateway API forbids merging \
+             HTTPRoute and GRPCRoute rules"
+        };
         acc.warnings.push(format!(
             "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",
             conflict.loser.kind,

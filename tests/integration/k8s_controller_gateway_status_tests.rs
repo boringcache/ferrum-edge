@@ -280,3 +280,144 @@ fn typed_route_parent_mapping_is_emitted_and_drives_programmed_status() {
             && condition["status"].as_str() == Some("True")
     }));
 }
+
+/// Gateway API v1.5.1 `GRPCRouteSpec`: an HTTPRoute and a GRPCRoute attached to
+/// the same listener with intersecting hostnames must resolve to exactly one
+/// accepted Route (oldest `creationTimestamp`, then `{namespace}/{name}`), and
+/// `GRPCRouteRule` forbids merging rules between the two kinds. The losing
+/// Route must materialize nothing and must be reported `Accepted=False` with
+/// the route-conflict reason, independent of the order objects are observed in.
+#[test]
+fn cross_kind_listener_overlap_rejects_the_whole_losing_route_in_status() {
+    let gateway_class = object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    );
+    let gateway = object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({
+            "gatewayClassName": "ferrum",
+            "listeners": [{
+                "name": "web",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]}
+            }]
+        }),
+    );
+    let mut http_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "web",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+        }),
+    );
+    http_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc_route = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "grpc",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]
+        }),
+    );
+    grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    for objects in [
+        vec![
+            gateway_class.clone(),
+            gateway.clone(),
+            http_route.clone(),
+            grpc_route.clone(),
+        ],
+        vec![
+            grpc_route.clone(),
+            http_route.clone(),
+            gateway.clone(),
+            gateway_class.clone(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+        // The losing GRPCRoute materializes no traffic state at all.
+        assert!(
+            !translation
+                .config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.backend_port == 50051),
+            "the rejected GRPCRoute must not produce a proxy"
+        );
+        assert!(
+            !translation
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+            "the rejected GRPCRoute must not produce dispatch rules"
+        );
+        assert!(
+            !translation
+                .materialized_route_parents
+                .iter()
+                .any(|entry| entry.route.kind == "GRPCRoute"),
+            "the rejected GRPCRoute must not claim a materialized parent"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+
+        let grpc_update = updates
+            .iter()
+            .find(|update| update.kind == "GRPCRoute" && update.name == "grpc")
+            .expect("the rejected GRPCRoute gets a status update");
+        let conditions = grpc_update.status["parents"][0]["conditions"]
+            .as_array()
+            .expect("route parent conditions");
+        let accepted = conditions
+            .iter()
+            .find(|condition| condition["type"].as_str() == Some("Accepted"))
+            .expect("an Accepted condition");
+        assert_eq!(accepted["status"].as_str(), Some("False"));
+        assert_eq!(accepted["reason"].as_str(), Some("Conflicted"));
+        assert!(
+            accepted["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("forbids merging")),
+            "the conflict message must name the cross-kind rule: {accepted:?}"
+        );
+
+        // The winning HTTPRoute is unaffected.
+        let http_update = updates
+            .iter()
+            .find(|update| update.kind == "HTTPRoute" && update.name == "web")
+            .expect("the accepted HTTPRoute gets a status update");
+        let conditions = http_update.status["parents"][0]["conditions"]
+            .as_array()
+            .expect("route parent conditions");
+        assert!(conditions.iter().any(|condition| {
+            condition["type"].as_str() == Some("Accepted")
+                && condition["status"].as_str() == Some("True")
+        }));
+        assert!(conditions.iter().any(|condition| {
+            condition["type"].as_str() == Some("Programmed")
+                && condition["status"].as_str() == Some("True")
+        }));
+    }
+}

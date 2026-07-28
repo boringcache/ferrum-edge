@@ -1125,6 +1125,21 @@ fn suffix_is_within(hostname: &str, suffix: &str) -> bool {
 }
 
 fn route_conflict_message(conflict: &GatewayApiRouteConflict) -> String {
+    // Gateway API v1.5.1 forbids merging between HTTPRoutes and GRPCRoutes, so
+    // a cross-kind overlap on one listener rejects the whole losing Route, not
+    // just the colliding match. Say which one happened.
+    if conflict.loser.kind != conflict.winner.kind {
+        return format!(
+            "Ferrum rejected this entire route on parent={} because Gateway API forbids merging {} and {} rules on one listener and host={} overlaps; winner is {} {}/{}",
+            conflict.key.parent_ref,
+            conflict.loser.kind,
+            conflict.winner.kind,
+            conflict.key.hostname,
+            conflict.winner.kind,
+            conflict.winner.namespace,
+            conflict.winner.name
+        );
+    }
     format!(
         "Ferrum rejected part of this route because it conflicts on parent={} host={} path={}; winner is {}/{}",
         conflict.key.parent_ref,

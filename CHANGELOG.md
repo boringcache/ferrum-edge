@@ -171,19 +171,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matches included — additionally carries a case-insensitive gRPC
   `content-type` predicate, so a GRPCRoute only ever selects gRPC calls and
   can never capture ordinary HTTP traffic sharing the same hostname and path.
-  A route-authored `content-type` match still replaces that gate, but it is
-  validated as a gRPC media type first, so an operator header can only narrow
-  the protocol boundary. GRPCRoute now shares HTTPRoute's
-  same-`(hostname, listen path)` collapse, so rule/match ordering and
-  fall-through are preserved and a GRPCRoute can coexist with an HTTPRoute
-  catch-all on the same listener. gRPC shapes Ferrum cannot represent exactly
+  That gate is the regex transcription of Ferrum's canonical native-gRPC
+  content-type contract (`proxy::backend_dispatch::is_native_grpc_content_type`),
+  so `application/grpc-web`, `application/grpc-web-text`, and lookalikes such as
+  `application/grpcfoo` are refused exactly as the proxy's own dispatcher
+  refuses them — gRPC-Web is served by configuring the trusted `grpc_web`
+  plugin, which rewrites a verified request to native `application/grpc` before
+  backend dispatch. A route-authored `content-type` match still replaces the
+  gate, but it is validated against the same native contract first, so an
+  operator header can only narrow the protocol boundary. GRPCRoutes share
+  HTTPRoute's same-`(hostname, listen path)` collapse **within their own kind**,
+  so rule/match ordering and fall-through are preserved. Gateway API v1.5.1
+  forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
+  GRPCRoute attached to the same listener with any intersecting hostname now
+  resolve to exactly one accepted Route — oldest `metadata.creationTimestamp`,
+  then `{namespace}/{name}`, independent of rule paths and of the order objects
+  are observed in — and the losing Route materializes no proxy, upstream,
+  plugin, or materialized-parent record and is reported `Accepted=False` with
+  `reason: Conflicted`. gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)
   or any other non-`Exact` `method.type`, a `method` block with neither
-  `service` nor `method`, an out-of-alphabet or over-long `Exact` operand, a
-  non-gRPC `content-type` predicate, or a non-`Exact` header match — are
-  dropped fail closed with a field-specific translator warning.
+  `service` nor `method`, an `Exact` operand that is empty, over 1024
+  characters, or outside the v1.5.1 CRD grammars, a non-native-gRPC
+  `content-type` predicate, or a non-`Exact` header match — are dropped fail
+  closed with a field-specific translator warning that never echoes the
+  operand.
   See
   [GRPCRoute predicate translation](docs/gateway_api_conformance.md#grpcroute-predicate-translation).
 

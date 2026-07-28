@@ -92,6 +92,7 @@ never dropped for being pathless.
 |---|---|
 | `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}`; no request-time predicate |
 | `method.type: Exact` with `service` only | Listen path prefix `/{service}/` — a gRPC `:path` always carries a trailing method segment, so this selects exactly that service |
+| `service` written in fully-qualified `.pkg.Svc` form | The optional leading `.` is normalized away — a gRPC `:path` never carries it, so `.pkg.Svc` and `pkg.Svc` denote the same service and collapse onto the same route |
 | `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` (the method literal is regex-escaped) |
 | `method.type: RegularExpression` | **Not supported** — dropped fail closed (see below) |
 | Header-only match (no `method`) | `/` listener plus the "any gRPC call" URI regex `/[^/]+/[^/]+` and the exact header predicates |
@@ -109,22 +110,31 @@ match is dropped with a field-specific warning. Use `Exact` `service` /
 
 **Every** emitted GRPCRoute match — including one whose predicate is carried
 entirely by an exact `=/{service}/{method}` listen path or a `/{service}/`
-prefix — additionally carries a `content-type` predicate matching the gRPC
-media types (`application/grpc`, `application/grpc+proto`,
-`application/grpc-web`, `application/grpc-web-text`, and parameterized forms,
-compared case-insensitively). A GRPCRoute therefore only ever selects gRPC
-calls: neither a pathless rule nor an exact gRPC path can capture ordinary HTTP
-traffic sharing the same hostname and path. A route-authored `content-type`
-header match replaces that gate (it is the more specific operator intent), but
-it is validated to be a gRPC media type itself, so an operator header can only
-narrow the protocol boundary and never widen it; a `content-type` predicate
-such as `text/plain` drops the match fail closed. The generated
-`mesh_route_dispatch` instance sets
-`reject_unmatched: true` unless a coexisting route contributes an
-unconditional match for the same `(hostname, listen path)` — for example an
-HTTPRoute catch-all on the same host, in which case plain HTTP still falls
-through to the HTTPRoute's default backend while gRPC calls keep matching
-their predicates.
+prefix — additionally carries a `content-type` predicate. That gate is the
+regex transcription of Ferrum's canonical **native**-gRPC content-type contract
+(`proxy::backend_dispatch::is_native_grpc_content_type`): the
+`application/grpc` essence followed by end-of-value, a `+` suffix, a `;`
+parameter list, or optional whitespace leading to either, compared
+case-insensitively. A GRPCRoute therefore only ever selects gRPC calls: neither
+a pathless rule nor an exact gRPC path can capture ordinary HTTP traffic
+sharing the same hostname and path.
+
+`application/grpc-web` and `application/grpc-web-text` are **not** native gRPC
+and are refused by the gate, exactly as the proxy's own dispatcher refuses
+them — as are lookalikes such as `application/grpcfoo` and
+`application/grpc-website`. gRPC-Web is served by configuring the trusted
+`grpc_web` plugin, which verifies the request and rewrites it to native
+`application/grpc` before backend dispatch; the route gate must not
+independently bless the raw wire form.
+
+A route-authored `content-type` header match replaces that gate (it is the more
+specific operator intent), but it is validated against the same native contract,
+so an operator header can only narrow the protocol boundary and never widen it;
+a `content-type` predicate such as `text/plain`, `application/grpc-web`, or
+`application/grpcfoo` drops the match fail closed. The generated
+`mesh_route_dispatch` instance sets `reject_unmatched: true` unless another
+**GRPCRoute** on the same listener contributes an unconditional match for the
+same `(hostname, listen path)`.
 
 Rule and match ordering is preserved: gRPC predicates sharing a listen path
 collapse into one ordered dispatch-rule list (method-bearing before
@@ -134,19 +144,63 @@ broader rule behaves as written. Two GRPCRoutes only conflict when they claim
 the *same* predicate on the same parent, hostname, and listen path; distinct
 methods on the shared `/` listener are distinct routes, not a collision.
 
-Shapes Ferrum still cannot represent exactly are **dropped fail closed** with a
+### HTTPRoute and GRPCRoute never merge
+
+Gateway API v1.5.1 `GRPCRouteRule` states that "Merging MUST not be done between
+GRPCRoutes and HTTPRoutes", and `GRPCRouteSpec` requires that when an HTTPRoute
+and a GRPCRoute attach to the same listener with **any** intersecting hostname,
+implementations accept exactly one of them.
+
+Ferrum resolves that as a **whole-route** decision, before either object
+materializes anything:
+
+- The two routes are compared by oldest `metadata.creationTimestamp`, then
+  `{namespace}/{name}` — the same deterministic tiebreaker as the same-kind
+  path, and independent of the order objects are observed in.
+- Rule paths and match predicates are **not** consulted. An HTTPRoute catch-all
+  and a GRPCRoute method predicate on the same host are a conflict even though
+  their predicates are disjoint.
+- The losing Route produces no proxy, no upstream, no plugin, and no
+  materialized-parent record on that listener, so it cannot route traffic. It is
+  reported `Accepted=False` with `reason: Conflicted` and a message naming the
+  winner, and the translator emits a matching warning.
+- Resolution is per listener and per hostname intersection. The same GRPCRoute
+  can still win on a different listener, or on a hostname the HTTPRoute does not
+  claim.
+- Rejection does not cascade: a route is only rejected when it overlaps an
+  **accepted** route of the other kind, so a second HTTPRoute is unaffected by a
+  GRPCRoute that already lost.
+
+Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
+`(hostname, listen path)` still collapse into one ordered dispatch-rule list,
+and only claim-for-claim collisions are resolved as conflicts.
+
+### Fail-closed match shapes
+
+Shapes Ferrum cannot represent exactly are **dropped fail closed** with a
 field-specific translator warning (`GRPCRoute {ns}/{name}
-rules[i].matches[j] dropped fail-closed: …`) rather than widened:
+rules[i].matches[j] dropped fail-closed: …`) rather than widened. The
+`Exact` operand grammars are exactly the ones the v1.5.1 CRD enforces, so a
+predicate the API server would have admitted is never rejected and a
+hand-authored one that it would have rejected never reaches routing state:
 
 - `method.type: RegularExpression`, and any `method.type` other than `Exact`.
 - A `method` block with neither `service` nor `method`.
-- An `Exact` `service` / `method` literal that is empty, longer than 512
-  characters, or contains anything outside ASCII alphanumerics, `.`, `_`, `-`.
-- A `content-type` header match whose value is not a gRPC media type — it would
-  replace the protocol gate and widen the route onto plain HTTP.
+- An `Exact` `service` that is empty, longer than 1024 characters, or does not
+  match `^\.?[a-z_][a-z_0-9]*(\.[a-z_][a-z_0-9]*)*$` (applied
+  case-insensitively) — so a leading digit or hyphen, an empty dotted segment,
+  a path separator, a percent escape, or whitespace is refused.
+- An `Exact` `method` that is empty, longer than 1024 characters, or does not
+  match `^[A-Za-z_][A-Za-z_0-9]*$` — a single protobuf identifier, so a dot or
+  hyphen is refused here even though `service` allows the dot.
+- A `content-type` header match whose value is not a native gRPC media type — it
+  would replace the protocol gate and widen the route onto non-gRPC traffic.
 - `headers[].type: RegularExpression`, or a header match missing `name` or
   `value` — only `Exact` header matches are translated, matching the HTTPRoute
   translator.
+
+Refusal warnings never echo the operator-supplied operand or header value back,
+since both are unbounded, attacker-influenceable input.
 
 A rule whose every match is dropped materializes no route, so its parent status
 is not reported as programmed.

@@ -1404,8 +1404,8 @@ mod grpc_route_predicate_dispatch {
         for content_type in [
             "application/grpc",
             "application/grpc+proto",
-            "application/grpc-web-text",
             "application/grpc; charset=utf-8",
+            "application/grpc ; charset=utf-8",
             // HTTP media types are case-insensitive; a gRPC client that
             // capitalizes must still be routed.
             "Application/GRPC",
@@ -1418,7 +1418,19 @@ mod grpc_route_predicate_dispatch {
             assert_eq!(port, Some(50051), "{content_type} must reach the backend");
         }
 
-        for content_type in ["text/plain", "application/json", "text/html"] {
+        // The emitted gate is the regex transcription of Ferrum's canonical
+        // native-gRPC dispatcher contract, so raw lookalikes are refused. A
+        // real gRPC-Web request reaches a native `application/grpc` only via a
+        // trusted, explicitly configured `grpc_web` plugin.
+        for content_type in [
+            "application/grpcfoo",
+            "application/grpc-web",
+            "application/grpc-website",
+            "application/grpc-web-text",
+            "text/plain",
+            "application/json",
+            "text/html",
+        ] {
             let mut headers =
                 HashMap::from([("content-type".to_string(), content_type.to_string())]);
             let (_, _, rejected) =
@@ -1584,33 +1596,173 @@ mod grpc_route_predicate_dispatch {
         );
     }
 
+    /// Gateway API v1.5.1 `GRPCRouteSpec` / `GRPCRouteRule`: an HTTPRoute and a
+    /// GRPCRoute attached to the same listener with intersecting hostnames must
+    /// resolve to exactly one accepted Route (oldest `creationTimestamp`, then
+    /// `{namespace}/{name}`), and rules must never be merged between the two
+    /// kinds. The loser must materialize no traffic state at all.
+    ///
+    /// `grpc-api:50051` is only ever the GRPCRoute's backend and `web:8080` is
+    /// only ever the HTTPRoute's, so "did the losing route materialize
+    /// anything?" is answered behaviorally rather than by parsing proxy ids.
+    fn backend_ports(objects: &[K8sObject]) -> Vec<u16> {
+        let translation =
+            translate_k8s_objects(objects, options()).expect("translation should succeed");
+        let mut ports: Vec<u16> = translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.backend_port)
+            .collect();
+        for upstream in &translation.config.upstreams {
+            ports.extend(upstream.targets.iter().map(|target| target.port));
+        }
+        for plugin in &translation.config.plugin_configs {
+            for rule in plugin
+                .config
+                .get("rules")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(port) = rule
+                    .get("destination")
+                    .and_then(|destination| destination.get("backend_port"))
+                    .and_then(Value::as_u64)
+                {
+                    ports.push(u16::try_from(port).expect("a translated backend port fits u16"));
+                }
+            }
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    }
+
+    fn dated(mut route: K8sObject, timestamp: &str) -> K8sObject {
+        route.metadata.creation_timestamp = Some(timestamp.to_string());
+        route
+    }
+
+    fn grpc_hello(name: &str) -> K8sObject {
+        grpc_route(
+            name,
+            json!([{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )
+    }
+
+    #[test]
+    fn cross_kind_listener_overlap_accepts_exactly_one_route_by_creation_timestamp() {
+        let http = dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z");
+
+        // The older HTTPRoute wins the listener outright; the GRPCRoute
+        // contributes no proxy, no upstream, and no dispatch destination.
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(
+                backend_ports(&objects),
+                vec![8080],
+                "the older HTTPRoute wins regardless of input order"
+            );
+        }
+
+        // Flip the timestamps and the GRPCRoute wins instead — the rule is the
+        // creation order, not the kind.
+        let http_newer = dated(http_catch_all_route("web"), "2024-03-01T00:00:00Z");
+        for objects in [
+            vec![http_newer.clone(), grpc.clone()],
+            vec![grpc.clone(), http_newer.clone()],
+        ] {
+            assert_eq!(
+                backend_ports(&objects),
+                vec![50051],
+                "the older GRPCRoute wins regardless of input order"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_kind_tie_on_timestamp_breaks_on_namespace_and_name() {
+        // Same creationTimestamp: `{namespace}/{name}` decides. Both routes are
+        // in `default`, so `aaa-http` sorts before `zzz-grpc`.
+        let http = dated(http_catch_all_route("aaa-http"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("zzz-grpc"), "2024-01-01T00:00:00Z");
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(backend_ports(&objects), vec![8080]);
+        }
+
+        let http = dated(http_catch_all_route("zzz-http"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("aaa-grpc"), "2024-01-01T00:00:00Z");
+        for objects in [
+            vec![http.clone(), grpc.clone()],
+            vec![grpc.clone(), http.clone()],
+        ] {
+            assert_eq!(backend_ports(&objects), vec![50051]);
+        }
+    }
+
+    #[test]
+    fn cross_kind_routes_on_disjoint_hostnames_both_materialize() {
+        // The rejection is hostname-scoped: no intersection, no conflict.
+        let http = dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z");
+        let mut grpc = dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z");
+        grpc.spec["hostnames"] = json!(["rpc.example.com"]);
+
+        assert_eq!(
+            backend_ports(&[http, grpc]),
+            vec![8080, 50051],
+            "disjoint hostnames are different listeners' worth of traffic"
+        );
+    }
+
     #[tokio::test]
-    async fn coexisting_http_catch_all_keeps_plain_http_falling_through() {
+    async fn a_cross_kind_losing_grpc_route_cannot_route_traffic() {
         let objects = [
-            http_catch_all_route("web"),
-            grpc_route(
-                "grpc",
-                json!([{
-                    "matches": [{"method": {"method": "SayHello"}}],
-                    "backendRefs": [{"name": "grpc-api", "port": 50051}]
-                }]),
-            ),
+            dated(http_catch_all_route("web"), "2024-01-01T00:00:00Z"),
+            dated(grpc_hello("grpc"), "2024-02-01T00:00:00Z"),
         ];
-        let plugin = dispatch_plugin_for_catch_all(&objects);
+        let translation =
+            translate_k8s_objects(&objects, options()).expect("translation should succeed");
 
-        let (_, port, rejected) =
-            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
-        assert!(!rejected);
-        assert_eq!(port, Some(50051));
+        // No rule anywhere can send `/helloworld.Greeter/SayHello` to the gRPC
+        // backend, because the GRPCRoute never materialized.
+        for plugin in translation
+            .config
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
+        {
+            let dispatch =
+                MeshRouteDispatch::new(&plugin.config).expect("translated dispatch config is valid");
+            let (_, port, _) = resolved_backend(
+                &dispatch,
+                "/helloworld.Greeter/SayHello",
+                &mut grpc_headers(),
+            )
+            .await;
+            assert_ne!(
+                port,
+                Some(50051),
+                "the rejected GRPCRoute must not route any traffic"
+            );
+        }
 
-        // Plain HTTP is neither captured by the gRPC rule nor rejected: it
-        // falls through to the HTTPRoute's default backend on the proxy.
-        let mut html = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
-        let (host, port, rejected) = resolved_backend(&plugin, "/index.html", &mut html).await;
-        assert!(!rejected, "HTTP traffic must not be rejected");
         assert!(
-            host.is_none() && port.is_none(),
-            "HTTP traffic keeps the proxy's own default backend"
+            translation.warnings.iter().any(|warning| {
+                warning.contains("GRPCRoute default/grpc")
+                    && warning.contains("Gateway API forbids merging")
+            }),
+            "the rejection must be reported: {:?}",
+            translation.warnings
         );
     }
 
