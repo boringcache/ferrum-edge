@@ -151,6 +151,32 @@ fn mtls_dns_admission_drop_retains_only_uncertain_mutations() {
 }
 
 #[test]
+fn mongo_backup_restore_api_specs_methods_exist() {
+    let source = include_str!("../../../src/config/mongo_store.rs");
+    assert!(
+        source.contains("async fn list_api_specs_with_content("),
+        "MongoStore must implement list_api_specs_with_content for backup/snapshot"
+    );
+    assert!(
+        source.contains("async fn batch_insert_api_specs("),
+        "MongoStore must implement batch_insert_api_specs for restore"
+    );
+    assert!(
+        source.contains("async fn apply_api_spec_ownership_from_resources("),
+        "MongoStore must stamp api_spec_id ownership during restore"
+    );
+    let load = source
+        .find("async fn load_full_config_for_purpose(")
+        .expect("load_full_config_for_purpose");
+    let load_body = &source[load..];
+    assert!(
+        load_body.contains("FullConfigLoadPurpose::BackupExport")
+            && load_body.contains("strip_api_spec_id_from_runtime_config"),
+        "BackupExport must preserve api_spec_id while runtime loads strip it"
+    );
+}
+
+#[test]
 fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
     let validator = mongo_method("validate_mtls_dns_candidate_with_mode");
     let graph_validation = validator

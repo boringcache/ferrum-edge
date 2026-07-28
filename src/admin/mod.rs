@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -31,8 +31,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
-    BackupCounts, BackupPayload, RestorePayload, filter_config_by_namespace,
-    parse_backup_resources, parse_restore_confirm,
+    ApiSpecsBackupSection, BackupCounts, BackupPayload, RestorePayload,
+    clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
+    parse_confirm_api_spec_deletion, parse_restore_confirm, validate_restore_api_specs_section,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -43,7 +44,8 @@ use crate::config::db_backend::{
     tcp_connection_throttle_attachment_conflict,
 };
 use crate::config::types::{
-    Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
+    ApiSpec, Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream,
+    max_credentials_per_type,
 };
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use crate::grpc::cp_server::DpNodeRegistry;
@@ -4251,6 +4253,11 @@ fn apply_payload_namespace(payload: &mut RestorePayload, namespace: &str) {
     for upstream in &mut payload.upstreams {
         upstream.namespace = namespace.to_string();
     }
+    if let Some(section) = payload.api_specs.as_mut() {
+        for item in &mut section.items {
+            item.namespace = namespace.to_string();
+        }
+    }
 }
 
 fn normalize_restore_payload_timestamps(payload: &mut RestorePayload, restored_at: DateTime<Utc>) {
@@ -4283,6 +4290,7 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
         consumers: config.consumers,
         plugin_configs: config.plugin_configs,
         upstreams: config.upstreams,
+        api_specs: None,
     }
 }
 
@@ -4292,8 +4300,9 @@ fn restore_payload_from_config(config: GatewayConfig) -> RestorePayload {
 struct RestoreSnapshot {
     /// Prior config resources (proxies/consumers/plugin_configs/upstreams).
     payload: RestorePayload,
-    /// Authoritative count of `api_specs` in the namespace at snapshot time.
-    api_specs_total: usize,
+    /// Authoritative API specs (including compressed documents) captured from
+    /// the primary so failed restores can recreate ownership metadata.
+    api_specs: Vec<ApiSpec>,
 }
 
 impl RestoreSnapshot {
@@ -4303,8 +4312,27 @@ impl RestoreSnapshot {
             consumers: u64::try_from(self.payload.consumers.len()).unwrap_or(u64::MAX),
             plugin_configs: u64::try_from(self.payload.plugin_configs.len()).unwrap_or(u64::MAX),
             upstreams: u64::try_from(self.payload.upstreams.len()).unwrap_or(u64::MAX),
-            api_specs: u64::try_from(self.api_specs_total).unwrap_or(u64::MAX),
+            api_specs: u64::try_from(self.api_specs.len()).unwrap_or(u64::MAX),
         }
+    }
+
+    fn api_specs_total(&self) -> usize {
+        self.api_specs.len()
+    }
+
+    fn restore_payload_with_api_specs(&self) -> RestorePayload {
+        let mut payload = RestorePayload {
+            version: self.payload.version.clone(),
+            proxies: self.payload.proxies.clone(),
+            consumers: self.payload.consumers.clone(),
+            plugin_configs: self.payload.plugin_configs.clone(),
+            upstreams: self.payload.upstreams.clone(),
+            api_specs: None,
+        };
+        if !self.api_specs.is_empty() || self.payload.api_specs.is_some() {
+            payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&self.api_specs));
+        }
+        payload
     }
 }
 
@@ -4314,8 +4342,8 @@ impl RestoreSnapshot {
 /// it does fail closed for either database unavailability or row/document
 /// integrity errors that prevent an exact rollback snapshot.
 ///
-/// Both the config resources and the `api_specs` count are read from the
-/// PRIMARY (never a lagging read replica) so the recovery report is authoritative.
+/// Both the config resources and the full `api_specs` documents are read from
+/// the PRIMARY (never a lagging read replica) so recovery is authoritative.
 async fn snapshot_namespace_for_rollback(
     db: &dyn DatabaseBackend,
     namespace: &str,
@@ -4325,17 +4353,11 @@ async fn snapshot_namespace_for_rollback(
     let config = db.load_namespace_snapshot(namespace).await?;
     let payload = restore_payload_from_config(config);
 
-    // `api_specs` are not part of `GatewayConfig`. Capture only their
-    // authoritative count from the PRIMARY: recovery requires the original
-    // documents to be re-submitted, and enumerating identities with OFFSET
-    // pagination adds no recovery value while introducing ordering hazards.
-    let api_specs_total =
-        usize::try_from(db.count_api_specs(namespace).await?).unwrap_or(usize::MAX);
+    // `api_specs` are not part of `GatewayConfig`. Capture the full documents
+    // (gzip content + ownership metadata) so rollback can recreate them.
+    let api_specs = db.list_api_specs_with_content(namespace).await?;
 
-    Ok(RestoreSnapshot {
-        payload,
-        api_specs_total,
-    })
+    Ok(RestoreSnapshot { payload, api_specs })
 }
 
 #[derive(Default)]
@@ -4344,6 +4366,7 @@ struct PersistCounts {
     consumers: usize,
     plugin_configs: usize,
     upstreams: usize,
+    api_specs: usize,
 }
 
 /// Reject a retry-enabled batch proxy whose `mesh_route_dispatch` rules route
@@ -4604,6 +4627,41 @@ async fn persist_payload_resources(
         errors.push(format!("proxy_plugins: {message}"));
     }
 
+    // API specs must be inserted after proxies so the FK holds. Ordinary batch
+    // inserts omit api_spec_id; stamp ownership from the backup payload next.
+    if should_continue(&errors)
+        && let Some(section) = payload.api_specs.as_ref()
+        && !section.items.is_empty()
+    {
+        match section.to_api_specs() {
+            Ok(specs) => {
+                match db.batch_insert_api_specs(&specs, mode).await {
+                    Ok(n) => counts.api_specs = n,
+                    Err(e) => {
+                        admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                        let message = payload_persist_error_message(&e);
+                        errors.push(format!("api_specs: {message}"));
+                    }
+                }
+                if should_continue(&errors)
+                    && let Err(e) = db
+                        .apply_api_spec_ownership_from_resources(
+                            &payload.proxies,
+                            &payload.upstreams,
+                            &payload.plugin_configs,
+                            mode,
+                        )
+                        .await
+                {
+                    admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                    let message = payload_persist_error_message(&e);
+                    errors.push(format!("api_spec_ownership: {message}"));
+                }
+            }
+            Err(message) => errors.push(format!("api_specs: {message}")),
+        }
+    }
+
     (counts, errors, admission_unavailable)
 }
 
@@ -4676,7 +4734,7 @@ fn atomic_batch_persistence_error_response(error: &anyhow::Error) -> Response<Fu
 async fn rollback_failed_restore(
     db: &dyn DatabaseBackend,
     namespace: &str,
-    snapshot: &RestorePayload,
+    snapshot: &RestoreSnapshot,
     guard_owner: &str,
 ) -> Result<(), Vec<String>> {
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
@@ -4690,7 +4748,8 @@ async fn rollback_failed_restore(
             &error,
         ));
     } else {
-        let (_, persist_errors, _) = persist_payload_resources(db, snapshot, false, &mode).await;
+        let payload = snapshot.restore_payload_with_api_specs();
+        let (_, persist_errors, _) = persist_payload_resources(db, &payload, false, &mode).await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -4750,6 +4809,7 @@ fn snapshot_resources_missing_after_intervening_write(
             .filter(|resource| !upstream_ids.contains(resource.id.as_str()))
             .cloned()
             .collect(),
+        api_specs: None,
     }
 }
 
@@ -4787,7 +4847,7 @@ async fn restore_snapshot_after_intervening_clear(
     state: &AdminState,
     db: &dyn DatabaseBackend,
     namespace: &str,
-    snapshot: &RestorePayload,
+    snapshot: &RestoreSnapshot,
     guard_owner: &str,
 ) -> Result<(), Vec<String>> {
     let current = db
@@ -4800,7 +4860,8 @@ async fn restore_snapshot_after_intervening_clear(
                 &error,
             )]
         })?;
-    let (candidate, missing) = intervening_clear_recovery_candidate(snapshot, &current);
+    let (candidate, mut missing) =
+        intervening_clear_recovery_candidate(&snapshot.payload, &current);
     let mut identity_errors = candidate
         .validate_mtls_auth_compatibility()
         .err()
@@ -4844,6 +4905,32 @@ async fn restore_snapshot_after_intervening_clear(
             ]);
         }
     }
+
+    // Restore only snapshot api_specs that are still absent after the
+    // intervening writer. Specs committed by that writer are retained.
+    let current_spec_ids = match db.list_api_specs_with_content(namespace).await {
+        Ok(specs) => specs
+            .into_iter()
+            .map(|spec| spec.id)
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            return Err(vec![redacted_recovery_error_message(
+                "restore_additive_rollback_api_specs_load",
+                "failed to load intervening api_specs",
+                &error,
+            )]);
+        }
+    };
+    let missing_specs: Vec<ApiSpec> = snapshot
+        .api_specs
+        .iter()
+        .filter(|spec| !current_spec_ids.contains(&spec.id))
+        .cloned()
+        .collect();
+    if !missing_specs.is_empty() {
+        missing.api_specs = Some(ApiSpecsBackupSection::from_specs(&missing_specs));
+    }
+
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
@@ -4876,7 +4963,7 @@ async fn finish_failed_restore(
         .run_mutation(rollback_failed_restore(
             db.as_ref(),
             namespace,
-            &snapshot.payload,
+            snapshot,
             &guard_owner,
         ))
         .await
@@ -4930,22 +5017,19 @@ async fn finish_failed_restore(
         response["rollback_errors"] = json!(rollback_errors);
     }
 
-    // A config rollback restores proxies/consumers/plugin_configs/upstreams but
-    // NOT `api_specs` (admin-only metadata outside `GatewayConfig`). When the
-    // prior namespace carried specs, give the operator a genuinely usable
-    // recovery path: report the authoritative number removed and direct the
-    // operator to list the currently stored specs and re-submit the originals.
-    if snapshot.api_specs_total > 0 {
-        // Preserve the authoritative affected count.
-        let total = snapshot.api_specs_total;
+    // When rollback completed, api_specs were restored from the recovery
+    // snapshot alongside config resources. Only report a residual gap when
+    // rollback was incomplete and the prior namespace carried specs.
+    if rollback_status != "completed" && snapshot.api_specs_total() > 0 {
+        let total = snapshot.api_specs_total();
         warn!(
             namespace = %namespace,
             api_spec_count = total,
-            "Restore: rollback restored config resources but NOT api_specs; operator must re-submit affected API specs"
+            "Restore: incomplete rollback may have left api_specs unrestored; verify with GET /api-specs"
         );
         response["api_specs_not_restored"] = json!(total);
         let note = format!(
-            "{total} API spec(s) were removed and are not part of config restore or rollback. Re-submit the original documents via POST /api-specs; list specs currently stored in the namespace with GET /api-specs."
+            "{total} API spec(s) were present before restore and may not have been recovered after incomplete rollback. Verify with GET /api-specs and re-submit originals via POST /api-specs if missing."
         );
         response["api_specs_note"] = json!(note);
     }
@@ -4973,7 +5057,7 @@ async fn finish_failed_restore_after_intervening_clear(
             state,
             db.as_ref(),
             namespace,
-            &snapshot.payload,
+            snapshot,
             &guard_owner,
         ))
         .await
@@ -5024,11 +5108,11 @@ async fn finish_failed_restore_after_intervening_clear(
     if let Some(errors) = rollback_errors {
         response["rollback_errors"] = json!(errors);
     }
-    if snapshot.api_specs_total > 0 {
-        response["api_specs_not_restored"] = json!(snapshot.api_specs_total);
+    if rollback_status != "completed" && snapshot.api_specs_total() > 0 {
+        response["api_specs_not_restored"] = json!(snapshot.api_specs_total());
         response["api_specs_note"] = json!(format!(
-            "{} pre-restore API spec(s) were removed by the clear and are not part of config rollback. API specs committed by the intervening writer were not deleted.",
-            snapshot.api_specs_total
+            "{} pre-restore API spec(s) may be missing after incomplete additive rollback. API specs committed by the intervening writer were not deleted. Verify with GET /api-specs.",
+            snapshot.api_specs_total()
         ));
     }
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
@@ -6457,6 +6541,9 @@ async fn handle_backup(
     let include_upstreams = resource_filter
         .as_ref()
         .is_none_or(|f| f.contains("upstreams"));
+    let include_api_specs = resource_filter
+        .as_ref()
+        .is_none_or(|f| f.contains("api_specs"));
 
     // Backups must stay restorable. Exactly-one-field Consumer credential
     // entries stored before that contract was enforced can carry ignored extra
@@ -6501,6 +6588,33 @@ async fn handle_backup(
         empty_upstreams.as_slice()
     };
 
+    // Load raw API specs from the primary when possible. Filtered-out exports
+    // still emit an empty versioned section so restore treats them as
+    // intentional omissions rather than legacy backups. Cached fallback without
+    // a reachable primary omits the section entirely.
+    let api_specs_owned: Option<ApiSpecsBackupSection> = if !include_api_specs {
+        Some(ApiSpecsBackupSection::empty())
+    } else if let Some(ref db) = state.db {
+        match db.list_api_specs_with_content(namespace).await {
+            Ok(specs) => Some(ApiSpecsBackupSection::from_specs(&specs)),
+            Err(_error) if source == "cached" => {
+                warn_persistence_failure_redacted("backup_api_specs_load_cached_fallback");
+                None
+            }
+            Err(_error) => {
+                warn_persistence_failure_redacted("backup_api_specs_load");
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database unavailable while exporting API specs"}),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let api_specs_section = api_specs_owned.as_ref();
+    let api_specs_count = api_specs_section.map(|section| section.items.len()).unwrap_or(0);
+
     let backup = BackupPayload {
         version: &config.version,
         ferrum_version: crate::FERRUM_VERSION,
@@ -6511,21 +6625,24 @@ async fn handle_backup(
             consumers: consumers.len(),
             plugin_configs: plugin_configs.len(),
             upstreams: upstreams.len(),
+            api_specs: api_specs_count,
         },
         proxies,
         consumers,
         plugin_configs,
         upstreams,
+        api_specs: api_specs_section,
     };
 
     // Serialize directly to bytes — no intermediate Value allocation.
     let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
     info!(
-        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams ({} bytes)",
+        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
         proxies.len(),
         consumers.len(),
         plugin_configs.len(),
         upstreams.len(),
+        api_specs_count,
         body_bytes.len()
     );
 
@@ -6667,11 +6784,16 @@ async fn handle_restore(
     }
 
     info!(
-        "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams ({} bytes)",
+        "Restore: parsed payload — {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
         payload.proxies.len(),
         payload.consumers.len(),
         payload.plugin_configs.len(),
         payload.upstreams.len(),
+        payload
+            .api_specs
+            .as_ref()
+            .map(|section| section.items.len())
+            .unwrap_or(0),
         body.len()
     );
 
@@ -6808,6 +6930,71 @@ async fn handle_restore(
     payload.consumers = candidate.consumers;
     payload.plugin_configs = candidate.plugin_configs;
     payload.upstreams = candidate.upstreams;
+
+    // Validate or prepare the versioned api_specs section before any durable
+    // mutation. Legacy backups that omit the section entirely require an
+    // explicit confirmation when the target namespace currently holds specs.
+    let _restored_api_specs: Vec<ApiSpec> = match payload.api_specs.as_ref() {
+        Some(section) => {
+            match validate_restore_api_specs_section(
+                section,
+                &payload.proxies,
+                &payload.upstreams,
+                &payload.plugin_configs,
+                state.admin_spec_max_body_size_mib,
+            ) {
+                Ok(mut specs) => {
+                    for spec in &mut specs {
+                        spec.namespace = namespace.to_string();
+                    }
+                    // Persist the namespace-stamped section so insert uses the
+                    // request namespace, not a hostile payload namespace.
+                    payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&specs));
+                    specs
+                }
+                Err(api_spec_errors) => {
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({
+                            "error": "Restore payload validation failed — existing config was NOT deleted",
+                            "validation_errors": api_spec_errors
+                        }),
+                    ));
+                }
+            }
+        }
+        None => {
+            let existing_specs = match db.count_api_specs(namespace).await {
+                Ok(count) => count,
+                Err(_error) => {
+                    warn_persistence_failure_redacted("restore_api_specs_preflight_count");
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": "Restore aborted: could not inspect existing API specs before delete. Existing config was NOT deleted.",
+                            "failure_class": "connectivity",
+                        }),
+                    ));
+                }
+            };
+            if existing_specs > 0 && !parse_confirm_api_spec_deletion(query) {
+                return Ok(json_response(
+                    StatusCode::CONFLICT,
+                    &json!({
+                        "error": format!(
+                            "This backup omits the versioned api_specs section, but the target namespace currently has {existing_specs} API spec(s). Restoring would permanently delete those documents. Pass ?confirm=true&confirm_api_spec_deletion=true to proceed, or restore from a backup that includes api_specs."
+                        ),
+                        "api_specs_at_risk": existing_specs,
+                        "confirmation_required": "confirm_api_spec_deletion=true",
+                    }),
+                ));
+            }
+            // Legacy backup: strip ownership tags so restored resources become
+            // hand-managed rather than pointing at deleted specs.
+            clear_api_spec_ownership_tags(&mut payload);
+            Vec::new()
+        }
+    };
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
@@ -7253,8 +7440,12 @@ async fn handle_restore(
     };
 
     info!(
-        "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
-        created.proxies, created.consumers, created.plugin_configs, created.upstreams
+        "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs",
+        created.proxies,
+        created.consumers,
+        created.plugin_configs,
+        created.upstreams,
+        created.api_specs
     );
 
     let response = json!({
@@ -7263,6 +7454,7 @@ async fn handle_restore(
             "consumers": created.consumers,
             "plugin_configs": created.plugin_configs,
             "upstreams": created.upstreams,
+            "api_specs": created.api_specs,
         }
     });
 
