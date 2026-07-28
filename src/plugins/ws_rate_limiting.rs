@@ -47,8 +47,10 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
 
 const MAX_STATE_ENTRIES: usize = 50_000;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
-/// Bounds below-cap full-map scans under high frame rates. Over-cap enforcement
-/// is not cooldown-gated so admission pressure still reclaims space immediately.
+/// Bounds below-cap full-map scans under high frame rates. Over-cap pressure
+/// still triggers an immediate idle-key reclaim (no cooldown), but live
+/// budgets are never force-evicted — hard cardinality is enforced by atomic
+/// admission reservation.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 
 pub struct WsRateLimiting {
@@ -146,6 +148,20 @@ impl WsRateLimiting {
             .check_local_at(connection_id, &WsRateLimitOp, now);
     }
 
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_connection_at_with_cap_for_test(
+        &self,
+        connection_id: u64,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.limiter
+            .check_local_at_with_capacity(connection_id, &WsRateLimitOp, now, max_entries)
+            .is_some()
+    }
+
     /// Arm the sampled periodic gate without spinning 100k frames. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
@@ -211,10 +227,9 @@ impl WsRateLimiting {
         let tracked_keys = self.limiter.tracked_keys_count();
         let over_capacity = tracked_keys > MAX_STATE_ENTRIES;
 
-        // Over-cap pressure force-evicts immediately (no sample/cooldown gate)
-        // so sustained traffic cannot pin the map at MAX+1 and leave the
-        // `over_capacity && !contains_local_key` branch rejecting every new
-        // connection indefinitely.
+        // Over-cap pressure immediately reclaims idle keys (no sample/cooldown
+        // gate). Live budgets are never force-evicted; previously unseen keys
+        // fail closed via atomic admission reservation.
         if over_capacity {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             return self.limiter.tracked_keys_count() > MAX_STATE_ENTRIES;
@@ -306,30 +321,23 @@ impl Plugin for WsRateLimiting {
             return None;
         }
 
-        let over_capacity = self.maybe_evict();
-        if over_capacity && !self.limiter.contains_local_key(&connection_id) {
-            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(
-                plugin = "ws_rate_limiting",
-                proxy_id = %proxy_id,
+        let _ = self.maybe_evict();
+        let Some(outcome) = self
+            .limiter
+            .check_with_redis_key_and_local_capacity(
                 connection_id,
-                max_state_entries = MAX_STATE_ENTRIES,
-                "WebSocket rate-limit state capacity exceeded, closing new connection"
-            );
+                || self.redis_connection_scope_key(proxy_id, connection_id),
+                &WsRateLimitOp,
+                MAX_STATE_ENTRIES,
+            )
+            .await
+        else {
+            super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             return Some(Message::Close(Some(CloseFrame {
                 code: CloseCode::Policy,
                 reason: self.close_reason.clone().into(),
             })));
-        }
-
-        let outcome = self
-            .limiter
-            .check_with_redis_key(
-                connection_id,
-                || self.redis_connection_scope_key(proxy_id, connection_id),
-                &WsRateLimitOp,
-            )
-            .await;
+        };
 
         if outcome.allowed {
             return None;

@@ -137,6 +137,32 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
     }
 
+    /// Classify an unexpected DTLS recv-loop JoinHandle result the same way
+    /// production does when the accept loop observes recv-task exit.
+    pub fn classify_dtls_recv_loop_exit_for_test(
+        join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        crate::proxy::udp_proxy::classify_dtls_recv_loop_exit(join_result)
+    }
+
+    /// Drive DTLS recv-loop vs shutdown supervision with synthetic tasks.
+    pub async fn supervise_dtls_recv_loop_task_for_test(
+        server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        global_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_shutdown: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::udp_proxy::supervise_dtls_recv_loop_task(
+            server_task,
+            shutdown_rx,
+            global_shutdown_rx,
+            started,
+            on_shutdown,
+        )
+        .await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -2207,6 +2233,16 @@ pub mod _test_support {
                 .seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_rate_limiting_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.rate_limiting
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_rate_limiting_periodic(&self) {
             self.rate_limiting.arm_periodic_eviction_for_test();
         }
@@ -2243,6 +2279,16 @@ pub mod _test_support {
             self.ai.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_ai_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ai
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_ai_periodic(&self) {
             self.ai.arm_periodic_eviction_for_test();
         }
@@ -2272,6 +2318,16 @@ pub mod _test_support {
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
             self.graphql.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn seed_graphql_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.graphql
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
         }
 
         pub fn arm_graphql_periodic(&self) {
@@ -2305,6 +2361,16 @@ pub mod _test_support {
             self.grpc.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_grpc_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.grpc
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_grpc_periodic(&self) {
             self.grpc.arm_periodic_eviction_for_test();
         }
@@ -2334,6 +2400,16 @@ pub mod _test_support {
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
             self.ws.seed_connection_at_for_test(connection_id, now);
+        }
+
+        pub fn seed_ws_with_cap(
+            &self,
+            connection_id: u64,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ws
+                .seed_connection_at_with_cap_for_test(connection_id, now, max_entries)
         }
 
         pub fn arm_ws_periodic(&self) {
@@ -2428,6 +2504,86 @@ pub mod _test_support {
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
     ) -> std::time::Instant {
         plugin.epoch_base_for_test()
+    }
+
+    /// Tuple view of a UDP rejection diagnostic decision for external regressions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct UdpRejectionWarnDecisionForTest {
+        pub emitted: bool,
+        pub instance_suppressed: Option<u64>,
+        pub global_suppressed: Option<u64>,
+    }
+
+    pub fn udp_rate_limiting_record_rejection_warn_detail_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> UdpRejectionWarnDecisionForTest {
+        let detail = plugin
+            .record_rate_limit_rejection_warn_detail_for_test(global, limit_kind, proxy_id, now_ms);
+        UdpRejectionWarnDecisionForTest {
+            emitted: detail.emitted,
+            instance_suppressed: detail.instance_suppressed,
+            global_suppressed: detail.global_suppressed,
+        }
+    }
+
+    pub fn udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> u64 {
+        plugin.rejection_warn_suppressed_count_for_test()
+    }
+
+    pub fn udp_rate_limiting_reset_rejection_warn_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) {
+        plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
+    pub fn atomic_log_rate_limiter_with_window_for_test(
+        window_ms: u64,
+    ) -> crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::with_window_ms(window_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_on_event_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<u64> {
+        limiter.on_event(now_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_suppressed_count_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) -> u64 {
+        limiter.suppressed_count_for_test()
+    }
+
+    pub fn atomic_log_rate_limiter_reset_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) {
+        limiter.reset_for_test();
+    }
+
+    pub fn atomic_log_rate_limiter_seed_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        last_emit_ms: u64,
+        suppressed: u64,
+    ) {
+        limiter.seed_for_test(last_emit_ms, suppressed);
+    }
+
+    pub fn atomic_log_rate_limiter_dual_gate_emit_for_test(
+        instance: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<(u64, u64)> {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::dual_gate_emit(
+            instance, global, now_ms,
+        )
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
@@ -3023,6 +3179,49 @@ pub mod _test_support {
 
     pub fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
         crate::plugins::grpc_web::parse_grpc_frames(data)
+    }
+
+    pub const GRPC_FRAME_TRAILER_COMPRESSED: u8 =
+        crate::plugins::grpc_web::GRPC_FRAME_TRAILER_COMPRESSED;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_BLOCK_BYTES;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_ENTRIES;
+
+    /// Wire-level view of the request-side gRPC-Web trailer-frame split.
+    ///
+    /// Returns `Ok(None)` when the body carries no trailer frame, the
+    /// `(data_end, trailers)` split when it carries a valid one, and the
+    /// field-specific diagnostic when the frame is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn split_grpc_web_request_trailer_frame(
+        data: &[u8],
+    ) -> Result<Option<(usize, Vec<(String, String)>)>, &'static str> {
+        crate::plugins::grpc_web::split_request_trailer_frame(data)
+            .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
+    }
+
+    /// The request trailers a gRPC dispatch would send, read back from
+    /// owner-scoped request staging exactly as the dispatch paths read them.
+    ///
+    /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
+    /// the sort is stable, so repeated values of one name keep wire order.
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String)>> {
+        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
+            let mut entries: Vec<(String, String)> = map
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        })
     }
 
     pub fn response_content_type(original_ct: &str) -> String {
@@ -4748,5 +4947,30 @@ pub mod _test_support {
             drain_timeout,
         )
         .await
+    }
+
+    /// The exact client identity the HTTP-family accept loop installs for one
+    /// accepted connection, including node-agent source-IP restoration.
+    ///
+    /// This is the production function `run_accept_loop` calls, not a mirror of
+    /// it, so external coverage of the ingress canonicalization boundary
+    /// (GHSA-vjwj-657f-5w9g) cannot drift away from the served path.
+    pub fn accept_peer_identity_for_test(
+        accepted: std::net::SocketAddr,
+        source_ip_override: Option<std::net::IpAddr>,
+    ) -> std::net::SocketAddr {
+        crate::proxy::resolve_accept_peer_identity(accepted, source_ip_override)
+    }
+
+    /// The canonical `(typed peer, pre-formatted IP string)` pair the HTTP/3
+    /// connection loop derives for a QUIC peer, at connection start and again on
+    /// every observed connection migration.
+    ///
+    /// Production function, not a mirror — see
+    /// [`accept_peer_identity_for_test`].
+    pub fn h3_client_identity_for_test(
+        addr: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<str>) {
+        crate::http3::server::h3_client_identity(addr)
     }
 }

@@ -1,4 +1,35 @@
 //! AI token-budget rate limiting with shared local/Redis/failover storage.
+//!
+//! ## Protocol scope (HTTP only)
+//!
+//! This limiter is registered for `ProxyProtocol::Http` only
+//! (`HTTP_ONLY_PROTOCOLS`). Its whole accounting lifecycle — prompt estimation,
+//! pre-reservation, and post-response reconciliation — is defined over bare
+//! JSON request bodies and JSON/SSE response bodies. Native gRPC carries
+//! length-prefixed, optionally compressed protobuf frames with no
+//! gateway-known usage schema, so there is no bounded, explicitly configured
+//! descriptor-based extraction that could charge those calls. Advertising
+//! `ProxyProtocol::Grpc` therefore meant an operator could attach an
+//! enforcement plugin to native gRPC AI traffic that charged nothing at all:
+//! every call re-checked an empty window and passed (GHSA-8f27-23x9-f825).
+//!
+//! Because native gRPC is never pinned in proxy configuration (a single
+//! `http`/`https` proxy serves REST, gRPC, and WebSocket by runtime
+//! content-type detection — see `BackendScheme` in `docs/routing.md`), the
+//! protocol contract *is* the admission boundary: `PluginCache` builds one
+//! plugin list per `ProxyProtocol` from `supported_protocols()`, so a native
+//! gRPC request resolves a `ProxyProtocol::Grpc` view that this plugin is not
+//! part of. Every configuration path — admin API, file mode, CP validation,
+//! and DP full/incremental config application — goes through that same shared
+//! cache build, so none of them can install this limiter on native gRPC.
+//!
+//! gRPC-Web is likewise unsupported, but it rides the HTTP (and composed H3
+//! gRPC-Web) view, so this plugin can still observe it. Framed
+//! `application/grpc-web*` bodies — including the `+json` variants that
+//! `is_json_content_type` matches — are never buffered, never parsed as a
+//! bare JSON AI request, and never treated as a JSON usage document on the
+//! response side. They are classified as non-AI traffic and left untouched
+//! rather than being charged zero tokens against a budget.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -33,9 +64,11 @@ use crate::util::unknown_keys::reject_unknown_keys;
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
-/// enforcement skips this cooldown so a sampled observation of pressure
-/// still force-reclaims without waiting for the next cool-down window.
+/// reclaim skips this cooldown so a sampled observation of pressure can
+/// drop idle keys without waiting for the next cool-down window. Live
+/// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
@@ -349,6 +382,25 @@ impl AiRateLimiter {
             .check_local_at(key, &AiRateLimitOp::Reserve { tokens: 1 }, now);
     }
 
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_key_at_with_cap_for_test(
+        &self,
+        key: String,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.limiter
+            .check_local_at_with_capacity(
+                key,
+                &AiRateLimitOp::Reserve { tokens: 1 },
+                now,
+                max_entries,
+            )
+            .is_some()
+    }
+
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
@@ -414,9 +466,10 @@ impl AiRateLimiter {
         }
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Sampled over-cap observation force-enforces after pruning idle
-        // keys. The below-cap cooldown must not suppress this branch once
-        // pressure is seen on a sampled pass.
+        // Sampled over-cap observation reclaims idle keys after prune. Live
+        // budgets are never force-evicted; hard cardinality is enforced by
+        // atomic admission reservation. The below-cap cooldown must not
+        // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             self.last_periodic_sweep_secs
@@ -518,9 +571,26 @@ impl AiRateLimiter {
         }
     }
 
-    async fn reserve_usage(&self, key: String, tokens: u64) -> RateLimitOutcome {
+    fn reject_capacity(&self) -> PluginResult {
+        // The metric is deliberately the only operational signal here. A
+        // warning per attacker-selected new key would turn fail-closed
+        // admission into log amplification.
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+        PluginResult::Reject {
+            status_code: 429,
+            body: CAPACITY_REJECT_BODY.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    async fn reserve_usage(&self, key: String, tokens: u64) -> Option<RateLimitOutcome> {
         self.limiter
-            .check(key.clone(), &key, &AiRateLimitOp::Reserve { tokens })
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                &AiRateLimitOp::Reserve { tokens },
+                MAX_STATE_ENTRIES,
+            )
             .await
     }
 
@@ -543,21 +613,20 @@ impl AiRateLimiter {
         if actual_tokens == 0 && delta == 0 {
             return None;
         }
-        Some(
-            self.limiter
-                .check(
-                    key.clone(),
-                    &key,
-                    &AiRateLimitOp::AdjustUsage {
-                        reservation_id,
-                        reserved_window_index,
-                        reservation_backend,
-                        actual_tokens,
-                        delta,
-                    },
-                )
-                .await,
-        )
+        self.limiter
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id,
+                    reserved_window_index,
+                    reservation_backend,
+                    actual_tokens,
+                    delta,
+                },
+                MAX_STATE_ENTRIES,
+            )
+            .await
     }
 
     /// Which backend the original reservation for this request landed on,
@@ -1420,7 +1489,14 @@ impl Plugin for AiRateLimiter {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        // HTTP only. Native gRPC protobuf frames have no supported usage
+        // schema here, so every hook of the accounting lifecycle would be
+        // inert and the budget would never advance — an operator must not be
+        // able to attach this as an enforcement control on native gRPC AI
+        // traffic (GHSA-8f27-23x9-f825). See the module-level "Protocol scope"
+        // notes: this declaration is the admission boundary, because gRPC is
+        // detected per request rather than pinned in proxy config.
+        super::HTTP_ONLY_PROTOCOLS
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -1443,11 +1519,15 @@ impl Plugin for AiRateLimiter {
         if has_non_identity_content_encoding(&ctx.headers) {
             return false;
         }
+        // Framed gRPC-Web bodies reach the HTTP view (native gRPC does not —
+        // see `supported_protocols`). Their `+json` media types match
+        // `is_json_content_type` but the payload is a length-prefixed wire
+        // frame, which `before_proxy` refuses to classify, so buffering one
+        // would spend memory for an estimate this plugin will never compute.
         ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type))
+            && ctx.headers.get("content-type").is_some_and(|content_type| {
+                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+            })
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -1526,6 +1606,15 @@ impl Plugin for AiRateLimiter {
             && headers.get("content-type").is_some_and(|content_type| {
                 is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
             });
+        // A framed request is never an AI candidate on any branch below, even if
+        // a co-located plugin left a JSON-parseable `request_body` in metadata:
+        // the wire body is a length-prefixed frame sequence, so estimating over
+        // it would attribute another representation's tokens to this request.
+        // Native gRPC never reaches here (HTTP-only protocol view); this covers
+        // gRPC-Web, which rides the HTTP view.
+        let is_framed_grpc = headers
+            .get("content-type")
+            .is_some_and(|content_type| is_framed_grpc_content_type(content_type));
         let still_compressed = has_non_identity_content_encoding(headers);
         // Detect the decompressed-by-`compression` (Case A) path from the
         // compression-owned metadata, NOT a client-settable header. See
@@ -1535,7 +1624,10 @@ impl Plugin for AiRateLimiter {
                 .metadata
                 .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
         let defer_compressed_classification = decompressed_by_compression && is_post_json;
-        let (is_ai_request, reserved_tokens) = if still_compressed {
+        let (is_ai_request, reserved_tokens) = if is_framed_grpc {
+            // Framed gRPC-Web: out of scope for this JSON policy entirely.
+            (false, 0)
+        } else if still_compressed {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
             (is_post_json, 0)
         } else if defer_compressed_classification {
@@ -1601,19 +1693,24 @@ impl Plugin for AiRateLimiter {
         //    how `ai_request_guard` treats compressed bodies (#1919) and is
         //    documented under `count_mode` / `on_unmetered_response` in
         //    docs/plugins.md.
-        let outcome = if reserved_tokens > 0 {
+        // Advance sampled idle reclamation before admission so an exactly-full
+        // map of expired keys cannot remain pinned closed when only new
+        // identities arrive. Cleanup never removes live budgets.
+        self.evict_stale_entries();
+        let Some(outcome) = (if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {
             self.limiter
-                .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
+                .check_with_redis_key_and_local_capacity(
+                    key.clone(),
+                    || key.clone(),
+                    &AiRateLimitOp::CheckBudget,
+                    MAX_STATE_ENTRIES,
+                )
                 .await
+        }) else {
+            return self.reject_capacity();
         };
-        // Evict AFTER the check so the current request's key cannot be
-        // force-evicted by `enforce_capacity` between insertion and the
-        // budget read — that race would let a hot user slip through
-        // against a freshly-allocated zero-usage window. Mirrors
-        // `rate_limiting.rs::check_rate` ordering.
-        self.evict_stale_entries();
 
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
@@ -1707,11 +1804,20 @@ impl Plugin for AiRateLimiter {
         // present (no `transform_request_body` decoded it) or the content-type was
         // relabeled to non-JSON, the body cannot be inspected — fail closed so a
         // usage-less compressed AI 2xx still cannot bypass the unmetered policy.
+        // A relabel to a framed gRPC / gRPC-Web media type counts as
+        // uninspectable too: the `+json` suffix satisfies `is_json_content_type`
+        // but the payload is a length-prefixed wire frame, so parsing it as a
+        // bare JSON document would silently exempt a deferred AI candidate.
+        // Genuine gRPC-Web traffic never reaches here — `before_proxy` refuses
+        // to defer a framed content-type in the first place.
         let content_type = headers
             .get("content-type")
             .map(String::as_str)
             .unwrap_or("");
-        if has_non_identity_content_encoding(headers) || !is_json_content_type(content_type) {
+        if has_non_identity_content_encoding(headers)
+            || !is_json_content_type(content_type)
+            || is_framed_grpc_content_type(content_type)
+        {
             ctx.metadata
                 .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
             ctx.metadata.insert(
@@ -1954,6 +2060,19 @@ impl Plugin for AiRateLimiter {
         let tokens = metadata_tokens.or_else(|| {
             if body.is_empty() {
                 unmetered_detail = "empty_body";
+                return None;
+            }
+
+            // Framed gRPC-Web responses (`application/grpc-web*`, including the
+            // `+json` variants) are length-prefixed wire frames, not a bare
+            // JSON usage document. Screen them out before the JSON branch so a
+            // framed body is never parsed as JSON — and, when the request was
+            // an identified AI call, so the response is routed through the
+            // explicit `on_unmetered_response` policy instead of silently
+            // reconciling as if the provider had reported zero usage. Native
+            // gRPC cannot reach this hook at all (HTTP-only protocol view).
+            if is_framed_grpc_content_type(content_type) {
+                unmetered_detail = "framed_grpc_content_type";
                 return None;
             }
 

@@ -3,9 +3,11 @@
 //! layers compose from.
 
 pub mod accept_backoff;
+pub mod atomic_log_rate_limiter;
 pub mod backoff;
 pub mod body_limit;
 pub mod cidr;
+pub mod client_identity;
 pub mod conn_limit;
 pub mod http_headers;
 pub mod sharding;
