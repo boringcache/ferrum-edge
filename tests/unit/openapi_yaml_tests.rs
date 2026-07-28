@@ -2666,8 +2666,7 @@ fn ai_federation_schema_publishes_security_fields_and_rejects_unknown_keys() {
 #[test]
 fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
     use ferrum_edge::plugins::ai_stream_router::{
-        AI_STREAM_ROUTER_CONFIG_KEYS, AI_STREAM_ROUTER_FALLBACK_KEYS,
-        AI_STREAM_ROUTER_PROVIDER_KEYS,
+        AI_STREAM_ROUTER_CONFIG_KEYS, AI_STREAM_ROUTER_PROVIDER_KEYS,
     };
     use std::collections::BTreeSet;
 
@@ -2681,9 +2680,12 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         schema["properties"]["providers"]["items"]["additionalProperties"],
         false
     );
-    assert_eq!(
-        schema["properties"]["fallback"]["additionalProperties"],
-        false
+    // Issue #3328: the `fallback` block is rejected at admission, so it must
+    // not exist in the published schema either. `additionalProperties: false`
+    // above then makes the spec reject it exactly as the constructor does.
+    assert!(
+        schema["properties"].get("fallback").is_none(),
+        "openapi.yaml still publishes an ai_stream_router 'fallback' block"
     );
 
     let root_fields: BTreeSet<_> = schema["properties"]
@@ -2713,24 +2715,18 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
         "provider key drift"
     );
 
-    let fallback_fields: BTreeSet<_> = schema["properties"]["fallback"]["properties"]
-        .as_object()
-        .expect("fallback properties")
-        .keys()
-        .map(String::as_str)
-        .collect();
-    let runtime_fallback_fields = AI_STREAM_ROUTER_FALLBACK_KEYS
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        fallback_fields, runtime_fallback_fields,
-        "fallback key drift"
-    );
-
     let description = schema["description"].as_str().expect("description");
-    assert!(description.contains("unknown root, provider, and fallback"));
+    assert!(description.contains("unknown root and provider fields are rejected"));
     assert!(description.contains("FailClosed"));
+    // The published contract must state the rejection, not a reserved policy.
+    assert!(
+        description.contains("`fallback` config block is REJECTED at admission"),
+        "schema description must document the fallback rejection contract"
+    );
+    assert!(
+        !description.contains("fallback_attempts is always 0"),
+        "schema description still advertises an inert fallback_attempts counter"
+    );
 
     let guide = include_str!("../../docs/plugins.md");
     assert!(guide.contains("**Strict configuration admission.**"));
@@ -2750,20 +2746,17 @@ fn ai_stream_router_schema_rejects_unknown_keys_and_matches_runtime_surface() {
                 "model_patterns": ["gpt-*"],
                 "priority": 1,
                 "inherit_backend_tls": false
-            }],
-            "fallback": {
-                "enabled": false,
-                "on_connect_error": true,
-                "on_5xx_before_first_byte": true,
-                "max_attempts": 2
-            }
+            }]
         }),
         true,
     );
     for invalid in [
         json!({"enabeld": false, "providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}]}),
         json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"], "inherit_backend_tl": true}]}),
-        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {"on_connect_erro": true}}),
+        // Issue #3328: a well-formed fallback policy is refused by the spec,
+        // matching the constructor's fail-closed admission.
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {"enabled": true, "on_connect_error": true, "on_5xx_before_first_byte": true, "max_attempts": 2}}),
+        json!({"providers": [{"name": "p", "provider_type": "openai", "endpoint": "https://a.example.com/v1", "api_key": "k", "model_patterns": ["gpt-*"]}], "fallback": {}}),
     ] {
         assert_component_validity(&spec, "AiStreamRouterConfig", &invalid, false);
     }
