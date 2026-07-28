@@ -2259,7 +2259,7 @@ impl ApiChargebackSink {
                 }
                 invalidate_status_cache();
                 accepted
-            })
+            }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
         });
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
