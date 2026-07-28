@@ -6136,6 +6136,37 @@ async fn transparent_batch_invalid_sibling_fails_closed_without_forward() {
 }
 
 #[tokio::test]
+async fn transparent_batch_invalid_sibling_does_not_respond_to_valid_notification() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} },
+        "bad-member",
+        { "jsonrpc": "2.0", "id": 3, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body
+        .as_array()
+        .expect("invalid sibling must produce a synthetic response array");
+    assert_eq!(
+        responses.len(),
+        2,
+        "the valid notification must not gain a synthetic response"
+    );
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[1]["id"], 3);
+    assert!(
+        ctx.route_override_backend_host.is_none(),
+        "invalid transparent batch must not Continue to upstream"
+    );
+}
+
+#[tokio::test]
 async fn transparent_batch_and_singleton_both_continue_for_request_transformer() {
     use ferrum_edge::plugins::request_transformer::RequestTransformer;
 

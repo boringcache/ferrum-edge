@@ -3273,15 +3273,26 @@ impl McpGateway {
         }
 
         if invalid {
-            for (slot, envelope) in responses.iter_mut().zip(envelopes.iter()) {
-                if let Some(envelope) = envelope {
-                    *slot = json_rpc_error_value(
+            let responses = responses
+                .into_iter()
+                .zip(envelopes.iter())
+                .filter_map(|(slot, envelope)| match envelope {
+                    // A valid notification never receives a JSON-RPC response,
+                    // even when an invalid sibling prevents the whole HTTP
+                    // batch from being forwarded.
+                    Some(envelope)
+                        if matches!(envelope.message_kind, McpMessageKind::Notification) =>
+                    {
+                        None
+                    }
+                    Some(envelope) => Some(json_rpc_error_value(
                         envelope.id.clone(),
                         -32600,
                         "JSON-RPC batch was not forwarded because a sibling member was invalid",
-                    );
-                }
-            }
+                    )),
+                    None => Some(slot),
+                })
+                .collect();
             self.clear_batch_item_routing_state(ctx);
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
@@ -3324,6 +3335,11 @@ impl McpGateway {
         batch: &[Value],
     ) -> PluginResult {
         let mut responses = Vec::new();
+        // Exact serialized size of the response array accumulated so far:
+        // opening + closing brackets plus each serialized item and comma.
+        // Tracking this incrementally avoids cloning and reserializing every
+        // prior response for each new batch member.
+        let mut response_bytes = 2usize;
         let mut session_header: Option<(String, String)> = None;
         let mut saw_response_bearing = false;
         let mut blocked_upstream_notification = false;
@@ -3341,7 +3357,11 @@ impl McpGateway {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     saw_response_bearing = true;
-                    if let Err(response) = self.push_bounded_batch_response(&mut responses, error) {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        error,
+                    ) {
                         self.clear_batch_item_routing_state(ctx);
                         *headers = inbound_headers;
                         return response;
@@ -3356,6 +3376,7 @@ impl McpGateway {
                 saw_response_bearing = true;
                 if let Err(response) = self.push_bounded_batch_response(
                     &mut responses,
+                    &mut response_bytes,
                     json_rpc_error_value(
                         envelope.id.clone(),
                         -32600,
@@ -3392,6 +3413,7 @@ impl McpGateway {
                                 // multiple newly minted sessions.
                                 if let Err(response) = self.push_bounded_batch_response(
                                     &mut responses,
+                                    &mut response_bytes,
                                     json_rpc_error_value(
                                         envelope.id.clone(),
                                         MCP_BATCH_SESSION_LIFECYCLE_AMBIGUOUS,
@@ -3413,7 +3435,11 @@ impl McpGateway {
                             session_header = Some((name, value));
                         }
                     }
-                    if let Err(response) = self.push_bounded_batch_response(&mut responses, value) {
+                    if let Err(response) = self.push_bounded_batch_response(
+                        &mut responses,
+                        &mut response_bytes,
+                        value,
+                    ) {
                         self.clear_batch_item_routing_state(ctx);
                         *headers = inbound_headers;
                         return response;
@@ -3429,6 +3455,7 @@ impl McpGateway {
                         saw_response_bearing = true;
                         if let Err(response) = self.push_bounded_batch_response(
                             &mut responses,
+                            &mut response_bytes,
                             json_rpc_error_value(
                                 id,
                                 MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
@@ -3539,13 +3566,12 @@ impl McpGateway {
     fn push_bounded_batch_response(
         &self,
         responses: &mut Vec<Value>,
+        response_bytes: &mut usize,
         value: Value,
     ) -> Result<(), PluginResult> {
-        responses.push(value);
-        let encoded = match serde_json::to_vec(&Value::Array(responses.clone())) {
+        let encoded_item = match serde_json::to_vec(&value) {
             Ok(bytes) => bytes,
             Err(_) => {
-                responses.pop();
                 return Err(json_rpc_error(
                     None,
                     -32600,
@@ -3554,8 +3580,19 @@ impl McpGateway {
                 ));
             }
         };
-        if encoded.len() > self.validation.max_batch_response_bytes {
-            responses.pop();
+        let separator_bytes = usize::from(!responses.is_empty());
+        let Some(next_response_bytes) = response_bytes
+            .checked_add(separator_bytes)
+            .and_then(|bytes| bytes.checked_add(encoded_item.len()))
+        else {
+            return Err(json_rpc_error(
+                None,
+                -32600,
+                "Invalid Request",
+                Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
+            ));
+        };
+        if next_response_bytes > self.validation.max_batch_response_bytes {
             return Err(json_rpc_error(
                 None,
                 -32600,
@@ -3563,6 +3600,8 @@ impl McpGateway {
                 Some("JSON-RPC batch exceeded max_batch_response_bytes".to_string()),
             ));
         }
+        responses.push(value);
+        *response_bytes = next_response_bytes;
         Ok(())
     }
 
