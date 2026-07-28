@@ -4316,10 +4316,7 @@ fn test_zero_nonce_cache_controls_are_rejected() {
     let err = SoapWsSecurity::new(&config)
         .err()
         .expect("zero must be rejected");
-    assert!(
-        err.contains("max_cache_size"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("max_cache_size"), "unexpected error: {err}");
 }
 
 // ── GHSA-3ffh-5842-8m92: bounded, cache-safe nonce state ───────────────────
