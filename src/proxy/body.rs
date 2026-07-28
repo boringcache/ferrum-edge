@@ -3459,7 +3459,7 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
-    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     // Bound the backend read so a backend that sends headers then stalls cannot
     // pin the streaming relay indefinitely. Two mutually-exclusive regimes
@@ -3498,7 +3498,7 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
-    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
@@ -3531,7 +3531,7 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     content_length: Option<u64>,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
-    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -3586,7 +3586,7 @@ pub(crate) struct StripHopByHopTrailers<B> {
     /// reserved terminal metadata, not backend-supplied header fields) and
     /// gRPC-Web (whose terminal metadata is adapted into a DATA frame) pass
     /// `None` exactly as they did before governance existed.
-    governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+    governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 }
 
 impl<B> StripHopByHopTrailers<B> {
@@ -3601,7 +3601,7 @@ impl<B> StripHopByHopTrailers<B> {
     /// boundary. See [`crate::proxy::headers::StreamingResponseTrailerGovernor`].
     pub(crate) fn with_trailer_governor(
         inner: B,
-        governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
     ) -> Self {
         Self { inner, governor }
     }

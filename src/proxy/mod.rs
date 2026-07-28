@@ -26389,14 +26389,13 @@ async fn handle_proxy_request_inner(
         if let Some(via) = resp_via {
             final_headers.insert("via".into(), via.clone());
         }
-        h2_streaming_trailer_governor = Some(Box::new(
-            headers_mod::StreamingResponseTrailerGovernor::new(
+        h2_streaming_trailer_governor =
+            Some(headers_mod::StreamingResponseTrailerGovernor::new(
                 final_headers,
                 pre_policy,
                 plugin_cache_view.response_trailer_policy_names_shared(),
                 unbounded,
-            ),
-        ));
+            ));
     }
 
     // Build response body: either stream from backend or return buffered data.

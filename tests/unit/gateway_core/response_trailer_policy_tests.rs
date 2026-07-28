@@ -686,7 +686,9 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
             .unwrap_or_else(|| panic!("missing constructor {constructor}"));
         let signature = body.split(") -> ProxyBody {").next().expect("signature");
         assert!(
-            signature.contains("trailer_governor: Option<Box<"),
+            signature.contains(
+                "trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>"
+            ),
             "{constructor} must accept the streaming trailer governor"
         );
         let block = body.split("\n}\n").next().expect("constructor body");
