@@ -1487,6 +1487,12 @@ fn route_match_entry_descriptors(
     rule: &Value,
 ) -> Vec<RouteMatchEntryDescriptor> {
     let Some(matches) = rule.get("matches").and_then(Value::as_array) else {
+        // An omitted GRPCRoute `matches` field is the valid catch-all shape,
+        // but a present non-array value is malformed. Do not reinterpret it as
+        // omission: that would widen hostile input into "every gRPC call".
+        if object.kind == "GRPCRoute" && rule.get("matches").is_some() {
+            return Vec::new();
+        }
         return vec![RouteMatchEntryDescriptor {
             match_index: 0,
             descriptor: default_route_match_descriptor(object),
@@ -1750,8 +1756,8 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
         // `path` is not a GRPCRoute CRD field; it is retained as a Ferrum
         // extension for hand-authored specs that pin an HTTP listen path
         // directly. A CRD-shaped route reaches the gRPC-shape branch below.
-        None => match entry.get("path").and_then(http_path_match) {
-            Some(listen_path) => GrpcRouteMatchPlan::PathOnly { listen_path },
+        None => match entry.get("path") {
+            Some(path) => grpc_route_extension_path_plan(path)?,
             None => GrpcRouteMatchPlan::UriRegex {
                 pattern: grpc_any_call_pattern(),
             },
@@ -1765,11 +1771,11 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
             .ok_or_else(|| "matches[].headers must be an array".to_string())?;
         for header in headers_array {
             if !gateway_match_type_is_exact(header) {
-                return Err(format!(
-                    "matches[].headers[].type '{}' is not supported; only Exact header matches \
-                     are translated",
-                    string_field(header, "type").unwrap_or("<missing>")
-                ));
+                return Err(
+                    "matches[].headers[].type is not supported; only Exact header matches are \
+                     translated"
+                        .to_string(),
+                );
             }
             let name = string_field(header, "name")
                 .ok_or_else(|| "matches[].headers[].name is required".to_string())?;
@@ -1792,6 +1798,33 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
     }
 
     Ok(GrpcRouteMatch { plan, headers })
+}
+
+/// Parse Ferrum's hand-authored `matches[].path` GRPCRoute extension without
+/// allowing a malformed explicit value to become the broader pathless match.
+fn grpc_route_extension_path_plan(path: &Value) -> Result<GrpcRouteMatchPlan, String> {
+    if path.as_object().is_none() {
+        return Err("matches[].path must be an object".to_string());
+    }
+    let value = string_field(path, "value")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "matches[].path.value is required and must not be empty".to_string())?;
+    match string_field(path, "type").unwrap_or("PathPrefix") {
+        "Exact" => Ok(GrpcRouteMatchPlan::PathOnly {
+            listen_path: exact_path_listen_path(value),
+        }),
+        "PathPrefix" => Ok(GrpcRouteMatchPlan::PathOnly {
+            listen_path: value.to_string(),
+        }),
+        "RegularExpression" => Ok(GrpcRouteMatchPlan::PathOnly {
+            listen_path: format!("~{value}"),
+        }),
+        _ => Err(
+            "matches[].path.type is not supported; expected Exact, PathPrefix, or \
+             RegularExpression"
+                .to_string(),
+        ),
+    }
 }
 
 fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> {
@@ -1850,9 +1883,7 @@ fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> 
         // method boundaries, so it is refused instead of compiled into a
         // request-path matcher.
         "RegularExpression" => Err(GRPC_REGEX_METHOD_UNSUPPORTED.to_string()),
-        other => Err(format!(
-            "matches[].method.type '{other}' is not supported; expected Exact"
-        )),
+        _ => Err("matches[].method.type is not supported; expected Exact".to_string()),
     }
 }
 
@@ -2827,13 +2858,18 @@ fn warn_unrepresentable_grpc_route_matches(object: &K8sObject, acc: &mut K8sAccu
         .flatten()
         .enumerate()
     {
-        for (match_index, entry) in rule
-            .get("matches")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
+        let Some(matches_value) = rule.get("matches") else {
+            continue;
+        };
+        let Some(matches) = matches_value.as_array() else {
+            acc.warnings.push(format!(
+                "GRPCRoute {}/{} rules[{rule_index}].matches dropped fail-closed: matches must \
+                 be an array",
+                object.metadata.namespace, object.metadata.name
+            ));
+            continue;
+        };
+        for (match_index, entry) in matches.iter().enumerate() {
             if let Err(reason) = grpc_route_match(entry) {
                 acc.warnings.push(format!(
                     "GRPCRoute {}/{} rules[{rule_index}].matches[{match_index}] dropped \
@@ -8156,7 +8192,7 @@ mod tests {
         for (entry, expected_fragment) in [
             (
                 serde_json::json!({"method": {"type": "Prefix", "service": "a.B"}}),
-                "matches[].method.type 'Prefix' is not supported",
+                "matches[].method.type is not supported",
             ),
             (
                 serde_json::json!({"method": {}}),
@@ -8211,7 +8247,7 @@ mod tests {
                     "method": {"service": "a.B", "method": "C"},
                     "headers": [{"type": "RegularExpression", "name": "x", "value": ".*"}]
                 }),
-                "matches[].headers[].type 'RegularExpression' is not supported",
+                "matches[].headers[].type is not supported",
             ),
             (
                 serde_json::json!({"headers": [{"name": "x"}]}),
@@ -8252,6 +8288,77 @@ mod tests {
                     .any(|warning| warning.contains("dropped fail-closed")
                         && warning.contains(expected_fragment)),
                 "expected a field-specific drop warning for `{expected_fragment}` in {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_route_unknown_match_types_are_not_echoed_into_diagnostics() {
+        let hostile_type = "operator-controlled-type-that-must-not-be-logged";
+        for entry in [
+            serde_json::json!({
+                "method": {"type": hostile_type, "service": "a.B"}
+            }),
+            serde_json::json!({
+                "headers": [{"type": hostile_type, "name": "x", "value": "y"}]
+            }),
+        ] {
+            let reason =
+                grpc_route_match(&entry).expect_err("unknown match types must fail closed");
+            assert!(
+                !reason.contains(hostile_type),
+                "operator-controlled match type leaked into diagnostic: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_route_malformed_matches_and_extension_paths_fail_closed() {
+        for (rules, expected_fragment) in [
+            (
+                serde_json::json!([{
+                    "matches": {"method": {"method": "SayHello"}},
+                    "backendRefs": [{"name": "grpc", "port": 50051}]
+                }]),
+                "matches must be an array",
+            ),
+            (
+                serde_json::json!([{
+                    "matches": [{"path": {"type": "Unknown", "value": "/"}}],
+                    "backendRefs": [{"name": "grpc", "port": 50051}]
+                }]),
+                "matches[].path.type is not supported",
+            ),
+            (
+                serde_json::json!([{
+                    "matches": [{"path": {"type": "PathPrefix"}}],
+                    "backendRefs": [{"name": "grpc", "port": 50051}]
+                }]),
+                "matches[].path.value is required",
+            ),
+        ] {
+            let result = translate_k8s_objects(
+                &[object(
+                    "GRPCRoute",
+                    serde_json::json!({
+                        "hostnames": ["grpc.example.com"],
+                        "rules": rules
+                    }),
+                )],
+                options(),
+            )
+            .expect("malformed predicates are dropped rather than aborting translation");
+            assert!(
+                result.config.proxies.is_empty(),
+                "malformed explicit input must not widen into a catch-all route"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains(expected_fragment)),
+                "expected `{expected_fragment}` in {:?}",
                 result.warnings
             );
         }
