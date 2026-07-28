@@ -3777,6 +3777,12 @@ paths:
             Comma-separated list of resource types to include.
             Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Including `api_specs` also requires `proxies`, `upstreams`, and
+            `plugin_configs` so the export stays directly restorable (owning
+            proxy plus generated upstream/plugin relationships). Otherwise the
+            request fails with `400` and does not emit a partial artifact.
+            `consumers` is optional because API-spec extraction does not create
+            consumers.
           schema:
             type: string
             example: "proxies,upstreams"
@@ -3799,6 +3805,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BackupResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":

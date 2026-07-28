@@ -31,6 +31,37 @@ pub(crate) fn parse_backup_resources(query: Option<&str>) -> Option<HashSet<&str
     None
 }
 
+/// Stable error when a filtered backup requests `api_specs` without the
+/// resource classes required for a directly restorable export.
+pub(crate) const BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR: &str = "Filtered backups that include api_specs must also include proxies, upstreams, and plugin_configs";
+
+/// Fail closed when a filtered backup requests `api_specs` without the owning
+/// proxy and generated upstream/plugin resource classes.
+///
+/// Spec documents declare an owning proxy and stamp `api_spec_id` on generated
+/// upstreams and plugin configs. Emitting specs without those classes produces
+/// a self-invalid backup that restore rejects. Unfiltered backups (`None`) and
+/// filters that omit `api_specs` are unchanged. `consumers` is not required
+/// because API-spec extraction does not create consumers. Never silently
+/// widens the filter or silently omits requested specs.
+pub(crate) fn validate_backup_api_specs_resource_filter(
+    filter: Option<&HashSet<&str>>,
+) -> Result<(), &'static str> {
+    let Some(filter) = filter else {
+        return Ok(());
+    };
+    if !filter.contains("api_specs") {
+        return Ok(());
+    }
+    if filter.contains("proxies")
+        && filter.contains("upstreams")
+        && filter.contains("plugin_configs")
+    {
+        return Ok(());
+    }
+    Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
+}
+
 pub(crate) fn parse_restore_confirm(query: Option<&str>) -> bool {
     parse_query_flag(query, "confirm")
 }
@@ -581,6 +612,73 @@ mod tests {
         assert!(resources.contains("proxies"));
         assert!(resources.contains("upstreams"));
         assert_eq!(resources.len(), 2);
+    }
+
+    #[test]
+    fn validate_backup_api_specs_resource_filter_accepts_no_filter_and_non_spec_filters() {
+        assert!(validate_backup_api_specs_resource_filter(None).is_ok());
+
+        let proxies_only =
+            parse_backup_resources(Some("resources=proxies")).expect("parse proxies");
+        assert!(validate_backup_api_specs_resource_filter(Some(&proxies_only)).is_ok());
+
+        let without_specs = parse_backup_resources(Some(
+            "resources=proxies,consumers,plugin_configs,upstreams",
+        ))
+        .expect("parse without api_specs");
+        assert!(validate_backup_api_specs_resource_filter(Some(&without_specs)).is_ok());
+    }
+
+    #[test]
+    fn validate_backup_api_specs_resource_filter_requires_owning_resource_classes() {
+        let api_specs_only =
+            parse_backup_resources(Some("resources=api_specs")).expect("parse api_specs");
+        assert_eq!(
+            validate_backup_api_specs_resource_filter(Some(&api_specs_only)),
+            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
+        );
+
+        let missing_plugins = parse_backup_resources(Some(
+            "resources=api_specs,proxies,upstreams",
+        ))
+        .expect("parse missing plugin_configs");
+        assert_eq!(
+            validate_backup_api_specs_resource_filter(Some(&missing_plugins)),
+            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
+        );
+
+        let missing_upstreams = parse_backup_resources(Some(
+            "resources=api_specs,proxies,plugin_configs",
+        ))
+        .expect("parse missing upstreams");
+        assert_eq!(
+            validate_backup_api_specs_resource_filter(Some(&missing_upstreams)),
+            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
+        );
+
+        let missing_proxies = parse_backup_resources(Some(
+            "resources=api_specs,upstreams,plugin_configs",
+        ))
+        .expect("parse missing proxies");
+        assert_eq!(
+            validate_backup_api_specs_resource_filter(Some(&missing_proxies)),
+            Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
+        );
+    }
+
+    #[test]
+    fn validate_backup_api_specs_resource_filter_accepts_complete_combination_any_order() {
+        let complete = parse_backup_resources(Some(
+            "resources= plugin_configs ,api_specs, proxies , upstreams ",
+        ))
+        .expect("parse complete filter with whitespace");
+        assert!(validate_backup_api_specs_resource_filter(Some(&complete)).is_ok());
+
+        let with_consumers = parse_backup_resources(Some(
+            "resources=api_specs,proxies,upstreams,plugin_configs,consumers",
+        ))
+        .expect("parse with optional consumers");
+        assert!(validate_backup_api_specs_resource_filter(Some(&with_consumers)).is_ok());
     }
 
     #[test]

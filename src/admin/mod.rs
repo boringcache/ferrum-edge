@@ -34,7 +34,8 @@ use crate::admin::audit::AuditActor;
 use crate::admin::backup::{
     ApiSpecsBackupSection, BackupCounts, BackupPayload, RestorePayload,
     clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
-    parse_confirm_api_spec_deletion, parse_restore_confirm, validate_restore_api_specs_section,
+    parse_confirm_api_spec_deletion, parse_restore_confirm,
+    validate_backup_api_specs_resource_filter, validate_restore_api_specs_section,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -6496,6 +6497,15 @@ async fn handle_backup(
     namespace: &str,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let resource_filter = parse_backup_resources(query);
+    // Fail closed before database/spec loading when a filtered export would
+    // emit api_specs without the owning/generated resource classes required
+    // for a directly restorable payload.
+    if let Err(error) = validate_backup_api_specs_resource_filter(resource_filter.as_ref()) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": error}),
+        ));
+    }
 
     // Try database first, then cached config
     let (mut config, source) = if let Some(ref db) = state.db {

@@ -3307,6 +3307,47 @@ async fn test_backup_resource_filter() {
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body["counts"]["consumers"], 1);
     assert_eq!(body["counts"]["proxies"], 0);
+
+    // api_specs without owning/generated resource classes must fail closed
+    // with 400 before emitting a self-invalid backup artifact.
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=api_specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"].as_str(),
+        Some(
+            "Filtered backups that include api_specs must also include proxies, upstreams, and plugin_configs"
+        )
+    );
+    assert!(body.get("proxies").is_none());
+    assert!(body.get("api_specs").is_none());
+
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/backup?resources=api_specs,proxies,upstreams",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"].as_str(),
+        Some(
+            "Filtered backups that include api_specs must also include proxies, upstreams, and plugin_configs"
+        )
+    );
+
+    // Complete api_specs dependency set is allowed (consumers optional).
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/backup?resources=api_specs,proxies,upstreams,plugin_configs",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["counts"]["proxies"], 1);
+    assert_eq!(body["counts"]["upstreams"], 1);
+    assert_eq!(body["counts"]["plugin_configs"], 1);
+    assert_eq!(body["counts"]["consumers"], 0);
+    assert_eq!(body["api_specs"]["section_version"], "1");
 }
 
 #[tokio::test]

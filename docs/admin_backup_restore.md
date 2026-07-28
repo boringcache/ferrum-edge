@@ -22,7 +22,7 @@ Returns the entire gateway configuration as a single JSON document. The output f
 - **Credential bounds**: Credential string maxima use Unicode character counts. Basic passwords, API keys, HMAC secrets, JWT secrets, and mTLS identities are limited to 4096 characters and reject disallowed ASCII control bytes; HMAC secrets must contain at least 32 non-whitespace characters on input and restore.
 - **Database-first with cached fallback**: Reads from the database when available. If the database is unreachable, falls back to the in-memory cached config and sets the `X-Data-Source: cached` response header.
 - **Content-Disposition header**: Includes `attachment; filename="ferrum-backup.json"` for browser-friendly downloads.
-- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything.
+- **Resource filtering**: Use `?resources=proxies,consumers` to export only specific resource types. Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`. Omit the parameter to export everything. When the filter includes `api_specs`, it must also include `proxies`, `upstreams`, and `plugin_configs` so the export stays directly restorable (owning proxy plus generated upstream/plugin relationships). Otherwise `GET /backup` fails closed with `400` and does not emit a partial artifact. `consumers` is not required. Filters that omit `api_specs` are unchanged.
 
 ### Example
 
@@ -77,6 +77,8 @@ An export that cannot carry spec documents also clears the `api_spec_id` tags on
 
 - **Cached fallback** (`X-Data-Source: cached`): the in-memory runtime config has already been stripped of ownership tags, so ownership cannot be proven. The section is omitted entirely and the file restores as a legacy backup — see restore preflight below.
 - **`?resources=` excluding `api_specs`**: the section is emitted empty (an intentional wipe) and exported proxies/upstreams/plugin configs restore as hand-managed.
+
+A filtered export that includes `api_specs` without `proxies`, `upstreams`, and `plugin_configs` is rejected with `400` before any database or spec loading, because that shape is not directly restorable.
 
 ## Restore — `POST /restore?confirm=true`
 
