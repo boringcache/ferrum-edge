@@ -14501,6 +14501,34 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     Ok(())
 }
 
+/// Resolve the authoritative client identity for one accepted HTTP-family
+/// connection.
+///
+/// Two things happen here, in this order, and nowhere else on the path:
+///
+/// 1. **Restoration.** The node-waypoint in-netns capture path rewrites a
+///    captured pod's egress to loopback, so the accepted peer is `127.0.0.1` /
+///    `::1`. When the node-agent has published the pod's real source IP, that
+///    restored address replaces the loopback peer (the port is the accepted
+///    connection's, which stays meaningful for correlation).
+/// 2. **Canonicalization.** Whichever address won is folded to one principal, so
+///    a dual-stack `::ffff:a.b.c.d` peer — accepted directly or restored from
+///    node-agent metadata — is never a second identity alongside its native IPv4
+///    form in connection logs, mesh capture dispatch, or the per-request context
+///    built from it (GHSA-vjwj-657f-5w9g).
+///
+/// Rewriting the address is safe here because the stream is already accepted:
+/// nothing downstream dials or sends to it.
+pub(super) fn resolve_accept_peer_identity(
+    accepted: SocketAddr,
+    source_ip_override: Option<std::net::IpAddr>,
+) -> SocketAddr {
+    let peer = source_ip_override
+        .map(|ip| SocketAddr::new(ip, accepted.port()))
+        .unwrap_or(accepted);
+    crate::util::client_identity::canonical_socket_addr(peer)
+}
+
 pub(super) enum SourceIpOverride {
     Static(Option<std::net::IpAddr>),
     Dynamic(watch::Receiver<Option<std::net::IpAddr>>),
@@ -14580,12 +14608,8 @@ async fn run_accept_loop(
             result = listener.accept() => {
                 match result {
                     Ok((stream, remote_addr)) => {
-                        // Override the loopback peer with the source pod IP for
-                        // in-netns capture connections (see `source_ip_override`).
-                        let remote_addr = source_ip_override
-                            .current()
-                            .map(|ip| std::net::SocketAddr::new(ip, remote_addr.port()))
-                            .unwrap_or(remote_addr);
+                        let restored = source_ip_override.current();
+                        let remote_addr = resolve_accept_peer_identity(remote_addr, restored);
                         accept_backoff.on_success();
                         // Overload check: reject new connections under critical
                         // pressure. Checked after accept (inside the select!) so
@@ -16370,6 +16394,16 @@ pub(crate) async fn run_after_proxy_hooks(
     // request on non-AI proxies. When no reservation exists the keep/release
     // decision is moot anyway (`should_release_gateway_rejection` requires a
     // non-zero reservation), so the status is only useful when the marker is set.
+    //
+    // Independently, record the same genuine status as private typed provenance
+    // on `RequestContext` and notify every plugin once. That path is
+    // non-spoofable by public metadata and lets origin-success side effects
+    // (notably `response_caching` invalidation) run even when an earlier
+    // `after_proxy` hook replaces the client-visible response.
+    ctx.record_origin_http_response_status(response_status);
+    for plugin in plugins {
+        plugin.observe_origin_http_response_status(ctx, response_status);
+    }
     if ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
         ctx.metadata.insert(
             BACKEND_STATUS_METADATA_KEY.to_string(),
@@ -18896,7 +18930,11 @@ async fn handle_proxy_request_inner(
     };
     let query_string = req.uri().query().unwrap_or("").to_string();
 
-    let socket_ip = canonicalize_client_ip(remote_addr.ip()).to_string();
+    // Single H1/H2 client-identity boundary. A dual-stack listener reports an
+    // IPv4 peer as `::ffff:a.b.c.d`; folding it here means every plugin, key,
+    // log field, metric label, and GeoIP lookup downstream sees one principal
+    // per host (GHSA-vjwj-657f-5w9g).
+    let socket_ip = crate::util::client_identity::canonical_ip_string(remote_addr.ip());
 
     // Build request context — pass cloned socket_ip to ctx (client_ip may be
     // overwritten by trusted-proxy resolution below). method and path keep
@@ -22308,6 +22346,7 @@ async fn handle_proxy_request_inner(
                 grpc_method,
                 grpc_headers,
                 grpc_req_body.clone(),
+                crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                 grpc_dispatch_proxy,
                 &grpc_backend_url,
                 &state.grpc_pool,
@@ -22566,6 +22605,7 @@ async fn handle_proxy_request_inner(
                             grpc_method,
                             grpc_headers,
                             grpc_req_body.clone(),
+                            crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                             grpc_dispatch_proxy,
                             &grpc_backend_url,
                             &state.grpc_pool,
@@ -23020,6 +23060,8 @@ async fn handle_proxy_request_inner(
                     grpc_method.clone(),
                     grpc_req_headers.clone(),
                     grpc_body_bytes.clone(),
+                    // A retry replays the complete request, trailers included.
+                    crate::plugins::grpc_web::staged_request_trailers(&ctx.metadata),
                     grpc_retry_effective_proxy.as_ref(),
                     &grpc_backend_url,
                     &state.grpc_pool,
@@ -34809,16 +34851,6 @@ async fn proxy_to_backend_http3_retry(
                 error_class: Some(error_class),
             }
         }
-    }
-}
-
-fn canonicalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(v6)),
-        other => other,
     }
 }
 
