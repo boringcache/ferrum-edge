@@ -18212,7 +18212,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. XML conversion honors OpenAPI XML Object fields
+        binary media types. Multipart Content-Disposition accepts ordinary
+        `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
+        unquoted ext-value) and rejects continuations, quoted `filename*`,
+        bare/non-token parameter segments, conflicts, and hostile extended
+        values.
+        XML conversion honors OpenAPI XML Object fields
         `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
