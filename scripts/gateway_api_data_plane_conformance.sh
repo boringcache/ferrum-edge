@@ -67,12 +67,13 @@ YAML
 }
 
 install_gateway_api_crds() {
+  # Install the experimental-channel bundle (includes standard resources plus
+  # TCPRoute). Mixing standard-install with a standalone experimental TCPRoute
+  # CRD fails upstream init with "multiple gateway API CRDs channels detected".
+  # Profile/features stay GATEWAY-HTTP / Gateway,ReferenceGrant,HTTPRoute;
+  # TCPRoute coverage remains Ferrum black-box only.
   kubectl apply --server-side=true \
-    -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/standard-install.yaml"
-  # TCPRoute remains experimental on the pinned Gateway API channel (v1.5.1);
-  # install only that CRD so the HTTP gate stays on standard resources.
-  kubectl apply --server-side=true \
-    -f "https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/${GATEWAY_API_VERSION}/config/crd/experimental/gateway.networking.k8s.io_tcproutes.yaml"
+    -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/${GATEWAY_API_VERSION}/experimental-install.yaml"
   for crd in \
     gatewayclasses.gateway.networking.k8s.io \
     gateways.gateway.networking.k8s.io \
