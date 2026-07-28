@@ -1547,6 +1547,44 @@ pub mod _test_support {
         crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
     }
 
+    /// Resolve the parser incomplete-message bounds from env config.
+    /// Returns `(max_frames, max_duration)`; `None` means that bound is off.
+    pub fn ws_fragment_policy_from_env_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> (Option<usize>, Option<std::time::Duration>) {
+        crate::proxy::WsFragmentPolicy::from_env(env_config).bounds()
+    }
+
+    /// Bounded incomplete-message policy Close (RFC 6455 1008).
+    pub fn ws_fragment_policy_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_fragment_policy_close_frame()
+    }
+
+    /// Policy-Close selection for the parser's incomplete-message bounds.
+    pub fn ws_fragment_policy_close_for_error_for_test(
+        error: &WsError,
+    ) -> Option<(CloseFrame, &'static str)> {
+        crate::proxy::ws_fragment_policy_close_for_error(error)
+    }
+
+    /// Exercise the shared H1/H2/H3 reassembly-fragment charging path.
+    pub async fn apply_ws_fragment_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<Option<CloseFrame>> {
+        crate::proxy::apply_ws_fragment_plugins(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            fragment_frames,
+        )
+        .await
+    }
+
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
     pub async fn apply_ws_frame_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
@@ -3181,6 +3219,49 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
+    pub const GRPC_FRAME_TRAILER_COMPRESSED: u8 =
+        crate::plugins::grpc_web::GRPC_FRAME_TRAILER_COMPRESSED;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_BLOCK_BYTES;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_ENTRIES;
+
+    /// Wire-level view of the request-side gRPC-Web trailer-frame split.
+    ///
+    /// Returns `Ok(None)` when the body carries no trailer frame, the
+    /// `(data_end, trailers)` split when it carries a valid one, and the
+    /// field-specific diagnostic when the frame is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn split_grpc_web_request_trailer_frame(
+        data: &[u8],
+    ) -> Result<Option<(usize, Vec<(String, String)>)>, &'static str> {
+        crate::plugins::grpc_web::split_request_trailer_frame(data)
+            .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
+    }
+
+    /// The request trailers a gRPC dispatch would send, read back from
+    /// owner-scoped request staging exactly as the dispatch paths read them.
+    ///
+    /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
+    /// the sort is stable, so repeated values of one name keep wire order.
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String)>> {
+        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
+            let mut entries: Vec<(String, String)> = map
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        })
+    }
+
     pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
@@ -3241,6 +3322,11 @@ pub mod _test_support {
             request_is_secure,
             add_forwarded_header,
         );
+    }
+
+    /// Canonical backend-visible query (transformer outbound + auth strips).
+    pub fn effective_backend_query_string_for_test(ctx: &crate::plugins::RequestContext) -> String {
+        crate::proxy::effective_backend_query_string(ctx).into_owned()
     }
 
     pub fn collect_forwardable_websocket_headers_for_test(
