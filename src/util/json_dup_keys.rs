@@ -184,6 +184,10 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
                     frames.pop();
                     live_sets -= 1;
                 } else {
+                    tokens += 1;
+                    if tokens > limits.max_tokens {
+                        return Err(JsonScanReject::TokenBudgetExceeded);
+                    }
                     read_member_name(bytes, &mut index, &mut sets[live_sets - 1], limits)?;
                     continue 'value;
                 }

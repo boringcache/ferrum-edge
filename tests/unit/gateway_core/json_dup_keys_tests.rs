@@ -416,6 +416,11 @@ fn explicit_budgets_are_enforced() {
         max_tokens: 2,
         ..GOVERNED_JSON_LIMITS
     };
+    assert_eq!(
+        scan(br#"{"a":1}"#, &few_tokens),
+        Err(JsonScanReject::TokenBudgetExceeded),
+        "the first member name of a nonempty object counts toward the token budget"
+    );
     assert!(matches!(
         scan(br#"{"a":1,"b":2,"c":3}"#, &few_tokens),
         Err(JsonScanReject::TokenBudgetExceeded)
