@@ -25655,6 +25655,7 @@ async fn handle_proxy_request_inner(
             &response_headers,
             headers_mod::ResponseTrailerGovernance {
                 policy_names: plugin_cache_view.response_trailer_policy_names(),
+                policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
                 unbounded,
             },
             !plugins.is_empty() || sticky_cookie_needed || gateway_writes_builder_only_headers,
@@ -26408,41 +26409,60 @@ async fn handle_proxy_request_inner(
     // absent->absent and let a backend trailer of the same name land on the
     // wire contradicting the gateway's own header.
     //
+    // Folding those values into the final map alone is not enough ownership:
+    // an exact-value pre-seed (backend already sent the identical string) is
+    // invisible to the mutation witness, the same idempotent-write shape
+    // plugin declarations close. Each field the gateway actually writes on
+    // THIS response is therefore also recorded in `gateway_owned_names` so
+    // the trailer channel stays governed even when before == after. Fields
+    // the gateway did not write stay off that list and remain ungoverned.
+    //
     // The drain/overload `connection: close` write above is the one deliberate
-    // omission, and needs no fold: `connection` is response-direction
-    // hop-by-hop, so `strip_response_hop_by_hop_trailers` has already removed
-    // it from the trailer section before the governor ever runs. It is left out
-    // of the capture gate for the same reason — a name that can never reach the
-    // reconciliation cannot decide whether evidence is needed.
+    // omission, and needs no fold or ownership entry: `connection` is
+    // response-direction hop-by-hop, so `strip_response_hop_by_hop_trailers`
+    // has already removed it from the trailer section before the governor
+    // ever runs. It is left out of the capture gate for the same reason — a
+    // name that can never reach the reconciliation cannot decide whether
+    // evidence is needed.
     //
     // Ownership: the body outlives this handler, so the governor owns every
     // input (one final-header clone, the pre-policy snapshot, an `Arc` bump of
-    // the per-reload policy-name list). Built at most once per governed
+    // the per-reload policy-name and prefix lists, plus the small
+    // per-response builder-owned name list). Built at most once per governed
     // streaming response; the body wrapper reads it only on the single
     // TRAILERS frame.
     let mut h2_streaming_trailer_governor = None;
     if let Some((pre_policy, unbounded)) = h2_streaming_trailer_policy {
         let mut final_headers = response_headers.clone();
+        let mut gateway_owned_names = Vec::new();
         if backend_resp.connection_error {
             final_headers.insert("x-gateway-error".into(), "connection_failure".into());
+            gateway_owned_names.push("x-gateway-error".into());
         } else if response_status == 504 {
             final_headers.insert("x-gateway-error".into(), "backend_timeout".into());
+            gateway_owned_names.push("x-gateway-error".into());
         } else if response_status >= 500 {
             final_headers.insert("x-gateway-error".into(), "backend_error".into());
+            gateway_owned_names.push("x-gateway-error".into());
         }
         if upstream_is_fallback {
             final_headers.insert("x-gateway-upstream-status".into(), "degraded".into());
+            gateway_owned_names.push("x-gateway-upstream-status".into());
         }
         if let Some(alt_svc) = state.alt_svc_header.as_ref() {
             final_headers.insert("alt-svc".into(), alt_svc.to_string());
+            gateway_owned_names.push("alt-svc".into());
         }
         if let Some(via) = resp_via {
             final_headers.insert("via".into(), via.clone());
+            gateway_owned_names.push("via".into());
         }
         h2_streaming_trailer_governor = Some(headers_mod::StreamingResponseTrailerGovernor::new(
             final_headers,
             pre_policy,
             plugin_cache_view.response_trailer_policy_names_shared(),
+            plugin_cache_view.response_trailer_policy_prefixes_shared(),
+            gateway_owned_names,
             unbounded,
         ));
     }

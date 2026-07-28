@@ -3179,6 +3179,29 @@ pub mod _test_support {
         policy_names: &[String],
         unbounded_policy: bool,
     ) -> Vec<(String, String)> {
+        reconcile_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+        )
+    }
+
+    /// Like [`reconcile_backend_trailers_with_response_policy_for_test`], but
+    /// also applies config-time policy prefixes and per-response gateway-owned
+    /// builder names.
+    pub fn reconcile_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+    ) -> Vec<(String, String)> {
         let mut map = backend_trailer_map_for_test(trailers);
         let witness =
             crate::proxy::headers::ResponseTrailerPolicyWitness::capture(&map, pre_policy_headers);
@@ -3187,6 +3210,8 @@ pub mod _test_support {
             final_headers,
             &witness,
             policy_names,
+            policy_prefixes,
+            gateway_owned_names,
             unbounded_policy,
         );
         surviving_trailer_lines_for_test(&map)
@@ -3209,9 +3234,34 @@ pub mod _test_support {
         unbounded_policy: bool,
         header_phases_can_mutate: bool,
     ) -> Vec<(String, String)> {
+        reconcile_streaming_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+            header_phases_can_mutate,
+        )
+    }
+
+    /// Like [`reconcile_streaming_backend_trailers_for_test`], with explicit
+    /// policy prefixes and gateway-owned builder names.
+    pub fn reconcile_streaming_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
         let mut map = backend_trailer_map_for_test(trailers);
         let governance = crate::proxy::headers::ResponseTrailerGovernance {
             policy_names,
+            policy_prefixes,
             unbounded: unbounded_policy,
         };
         let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
@@ -3224,6 +3274,7 @@ pub mod _test_support {
             final_headers,
             &pre_policy,
             governance,
+            gateway_owned_names,
         );
         surviving_trailer_lines_for_test(&map)
     }
@@ -3245,11 +3296,36 @@ pub mod _test_support {
         unbounded_policy: bool,
         header_phases_can_mutate: bool,
     ) -> Vec<(String, String)> {
+        govern_streaming_h2_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+            header_phases_can_mutate,
+        )
+    }
+
+    /// Like [`govern_streaming_h2_backend_trailers_for_test`], with explicit
+    /// policy prefixes and per-response gateway-owned builder names.
+    pub fn govern_streaming_h2_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
         let mut map = backend_trailer_map_for_test(trailers);
         let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
             pre_policy_headers,
             crate::proxy::headers::ResponseTrailerGovernance {
                 policy_names,
+                policy_prefixes,
                 unbounded: unbounded_policy,
             },
             header_phases_can_mutate,
@@ -3258,6 +3334,8 @@ pub mod _test_support {
             final_headers.clone(),
             pre_policy,
             std::sync::Arc::new(policy_names.to_vec()),
+            std::sync::Arc::new(policy_prefixes.to_vec()),
+            gateway_owned_names.to_vec(),
             unbounded_policy,
         );
         crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);

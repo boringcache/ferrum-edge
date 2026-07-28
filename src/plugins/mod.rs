@@ -1172,6 +1172,15 @@ pub enum ResponseTrailerPolicy<'a> {
     /// trailers carrying one of them are dropped; every other trailer field is
     /// forwarded unchanged.
     Names(&'a [String]),
+    /// Exact names plus case-insensitive ASCII prefixes. Use when the sanitizer
+    /// owns an open-ended family together with discrete fields outside it —
+    /// CORS removes every `access-control-*` response header and also rewrites
+    /// `vary`. A trailer whose name equals any `names` entry or starts with any
+    /// `prefixes` entry is dropped; every other trailer field is forwarded.
+    NamesAndPrefixes {
+        names: &'a [String],
+        prefixes: &'a [String],
+    },
     /// The governed field set is not enumerable at config time. Examples:
     /// rules published at request time by another plugin
     /// (`response_transformer`), and open-ended prefix families invalidated by
@@ -6861,10 +6870,13 @@ pub trait Plugin: Send + Sync {
     /// authenticate, or authorize correctly keep the
     /// [`ResponseTrailerPolicy::None`] default and preserve backend trailers
     /// (issue #2941). Declare the enumerable name set wherever it is
-    /// enumerable; reserve [`ResponseTrailerPolicy::Unbounded`] when the
-    /// governed set cannot be listed as finite exact names — request-time
-    /// route overrides (`response_transformer`) and open-ended prefix families
-    /// (`ai_stream_router`'s content-bound checksum invalidation).
+    /// enumerable; use [`ResponseTrailerPolicy::NamesAndPrefixes`] when an
+    /// open-ended prefix family is owned together with discrete names outside
+    /// it (CORS `access-control-*` plus `vary`); reserve
+    /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
+    /// listed even that way — request-time route overrides
+    /// (`response_transformer`) and multi-prefix representation invalidation
+    /// (`ai_stream_router`'s content-bound checksum families).
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
     }

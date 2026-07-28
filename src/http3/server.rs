@@ -572,6 +572,7 @@ where
                 trailer_policy.final_headers,
                 trailer_policy.pre_policy,
                 trailer_policy.governance,
+                &[],
             );
             if removed > 0 {
                 debug!(
@@ -2118,6 +2119,7 @@ async fn handle_h3_request(
     // buffered send path reconciles inline.
     let response_trailer_governance = ResponseTrailerGovernance {
         policy_names: plugin_cache_view.response_trailer_policy_names(),
+        policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
         unbounded: capabilities
             .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
     };
@@ -7193,6 +7195,8 @@ async fn handle_h3_request(
                 &response_headers,
                 &trailer_policy_witness,
                 plugin_cache_view.response_trailer_policy_names(),
+                plugin_cache_view.response_trailer_policy_prefixes(),
+                &[],
                 unbounded_trailer_policy,
             );
             if removed > 0 {

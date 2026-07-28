@@ -810,9 +810,12 @@ impl ResponseTrailerPolicyWitness {
 /// plugin cache and threaded down the HTTP/3 relay helpers.
 #[derive(Clone, Copy)]
 pub(crate) struct ResponseTrailerGovernance<'a> {
-    /// Union of `Plugin::response_trailer_policy()` names for this proxy and
-    /// protocol, precomputed per reload.
+    /// Union of `Plugin::response_trailer_policy()` exact names for this proxy
+    /// and protocol, precomputed per reload.
     pub(crate) policy_names: &'a [String],
+    /// Union of `Plugin::response_trailer_policy()` case-insensitive ASCII
+    /// prefixes for this proxy and protocol, precomputed per reload.
+    pub(crate) policy_prefixes: &'a [String],
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
     pub(crate) unbounded: bool,
 }
@@ -888,10 +891,12 @@ impl PrePolicyResponseHeaders {
 /// owned.
 ///
 /// Construction is once per governed streaming RESPONSE (one header-map clone
-/// for `final_headers`, one for the pre-policy snapshot, one `Arc` bump for the
-/// precomputed policy names). Never per body frame: the body wrapper only
-/// touches this on the single TRAILERS frame, and the reconciliation itself is
-/// bounded by the trailer count exactly as on the buffered path.
+/// for `final_headers`, one for the pre-policy snapshot, one `Arc` bump each for
+/// the precomputed policy names and prefixes, plus a small owned list of
+/// builder fields this response actually wrote). Never per body frame: the body
+/// wrapper only touches this on the single TRAILERS frame, and the
+/// reconciliation itself is bounded by the trailer count exactly as on the
+/// buffered path.
 pub(crate) struct StreamingResponseTrailerGovernor {
     /// The response headers exactly as they went on the wire, after every
     /// response-header phase AND the gateway's own builder-only writes.
@@ -901,6 +906,17 @@ pub(crate) struct StreamingResponseTrailerGovernor {
     /// Config-time union of `Plugin::response_trailer_policy()` names, shared
     /// from the plugin cache generation (no per-request allocation).
     policy_names: std::sync::Arc<Vec<String>>,
+    /// Config-time union of `Plugin::response_trailer_policy()` prefixes,
+    /// shared from the plugin cache generation.
+    policy_prefixes: std::sync::Arc<Vec<String>>,
+    /// End-to-end gateway builder fields this response actually wrote
+    /// (`via`, `alt-svc`, `x-gateway-error`, `x-gateway-upstream-status`).
+    /// Owned and per-response so an exact-value pre-seeded backend header
+    /// cannot hide the write from the mutation witness, and so a field the
+    /// gateway did not write on this response stays ungoverned. Empty when
+    /// none of those builder writes fired. Never includes hop-by-hop
+    /// `connection`.
+    gateway_owned_names: Vec<String>,
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
     unbounded: bool,
 }
@@ -910,12 +926,16 @@ impl StreamingResponseTrailerGovernor {
         final_headers: std::collections::HashMap<String, String>,
         pre_policy: PrePolicyResponseHeaders,
         policy_names: std::sync::Arc<Vec<String>>,
+        policy_prefixes: std::sync::Arc<Vec<String>>,
+        gateway_owned_names: Vec<String>,
         unbounded: bool,
     ) -> Self {
         Self {
             final_headers,
             pre_policy,
             policy_names,
+            policy_prefixes,
+            gateway_owned_names,
             unbounded,
         }
     }
@@ -930,8 +950,10 @@ impl StreamingResponseTrailerGovernor {
             &self.pre_policy,
             ResponseTrailerGovernance {
                 policy_names: self.policy_names.as_slice(),
+                policy_prefixes: self.policy_prefixes.as_slice(),
                 unbounded: self.unbounded,
             },
+            &self.gateway_owned_names,
         )
     }
 }
@@ -943,11 +965,16 @@ impl StreamingResponseTrailerGovernor {
 /// applies the same governance rules the buffered path applies. Call it after
 /// every response-header mutation for the path and immediately before
 /// `send_trailers`.
+///
+/// `gateway_owned_names` is the plain streaming-HTTP/2 builder-ownership list
+/// (empty on the native-H3 relays, which fold gateway writes into the shared
+/// header map before reconciling).
 pub(crate) fn reconcile_streaming_backend_trailers(
     trailers: &mut http::HeaderMap,
     response_headers: &std::collections::HashMap<String, String>,
     pre_policy: &PrePolicyResponseHeaders,
     governance: ResponseTrailerGovernance<'_>,
+    gateway_owned_names: &[String],
 ) -> usize {
     let witness = pre_policy.witness(trailers);
     reconcile_backend_trailers_with_response_policy(
@@ -955,6 +982,8 @@ pub(crate) fn reconcile_streaming_backend_trailers(
         response_headers,
         &witness,
         governance.policy_names,
+        governance.policy_prefixes,
+        gateway_owned_names,
         governance.unbounded,
     )
 }
@@ -973,13 +1002,20 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// through the owned [`StreamingResponseTrailerGovernor`] its response body
 /// carries.
 ///
-/// Two independent signals decide "governed", because neither alone is
-/// sufficient:
+/// Independent signals decide "governed", because none alone is sufficient:
 ///
 /// * `policy_names` — the config-time union of `Plugin::response_trailer_policy()`
-///   declarations. This is the only signal that can catch a policy REMOVAL which
-///   was a NO-OP on the initial header map because the backend sent the field
-///   only as a trailer.
+///   exact-name declarations. This is the only signal that can catch a policy
+///   REMOVAL which was a NO-OP on the initial header map because the backend
+///   sent the field only as a trailer, and an idempotent plugin write the
+///   mutation witness cannot see.
+/// * `policy_prefixes` — the config-time union of open-ended ASCII prefixes
+///   (CORS `access-control-`). Catches trailer-only extension names a finite
+///   write list never enumerates.
+/// * `gateway_owned_names` — per-response end-to-end fields the plain streaming
+///   HTTP/2 builder actually wrote. Same idempotent-write shape as a plugin
+///   declaration: folding the value into `final_headers` alone misses an
+///   exact-value pre-seed.
 /// * `witness` — the observed per-request mutation. This catches every realized
 ///   header change, including plugins that declare nothing (custom plugins, and
 ///   transforms published at request time).
@@ -1001,15 +1037,28 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
     response_headers: &std::collections::HashMap<String, String>,
     witness: &ResponseTrailerPolicyWitness,
     policy_names: &[String],
+    policy_prefixes: &[String],
+    gateway_owned_names: &[String],
     unbounded_policy: bool,
 ) -> usize {
     let mut to_remove: Vec<http::HeaderName> = Vec::new();
     for name in trailers.keys() {
+        let field = name.as_str();
         let explicitly_named = policy_names
             .iter()
-            .any(|policy| policy.eq_ignore_ascii_case(name.as_str()));
-        let governed =
-            explicitly_named || unbounded_policy || witness.was_mutated(name, response_headers);
+            .any(|policy| policy.eq_ignore_ascii_case(field));
+        let prefix_owned = policy_prefixes.iter().any(|prefix| {
+            field.len() >= prefix.len()
+                && field.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        });
+        let gateway_owned = gateway_owned_names
+            .iter()
+            .any(|owned| owned.eq_ignore_ascii_case(field));
+        let governed = explicitly_named
+            || prefix_owned
+            || gateway_owned
+            || unbounded_policy
+            || witness.was_mutated(name, response_headers);
         if governed {
             to_remove.push(name.clone());
         }

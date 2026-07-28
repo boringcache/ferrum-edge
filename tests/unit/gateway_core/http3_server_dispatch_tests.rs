@@ -1580,9 +1580,10 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     assert!(
         reconcile.contains("reconcile_backend_trailers_with_response_policy(")
             && reconcile.contains("plugin_cache_view.response_trailer_policy_names()")
+            && reconcile.contains("plugin_cache_view.response_trailer_policy_prefixes()")
             && reconcile.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),
         "buffered H3 must reconcile surviving trailers against the precomputed \
-         response-header policy names and the fail-closed unbounded capability"
+         response-header policy names/prefixes and the fail-closed unbounded capability"
     );
 
     // Hop-by-hop trailer names are stripped BEFORE the reconciliation, matching
@@ -1694,6 +1695,11 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
     assert!(
         governance.contains("policy_names: plugin_cache_view.response_trailer_policy_names(),"),
         "streaming governance names must come from the per-reload plugin cache view"
+    );
+    assert!(
+        governance
+            .contains("policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),"),
+        "streaming governance prefixes must come from the per-reload plugin cache view"
     );
     assert!(
         governance.contains("UNBOUNDED_RESPONSE_TRAILER_POLICY"),

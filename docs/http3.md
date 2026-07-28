@@ -276,13 +276,15 @@ policy boundary and undo it. Before the trailers are written, Ferrum reconciles
 them against the response-header policy actually in force for the request:
 
 - **Declared policy names.** Plugins classify their reach with
-  `Plugin::response_trailer_policy()`, and the plugin cache unions the names once
-  per reload so the request path reads a precomputed list instead of scanning the
-  chain. This is the only signal that can bind the two mutation shapes the
-  per-request witness below cannot see: a **removal that was a no-op on the
-  initial map** (the backend sent the field only as a trailer), and an
-  **idempotent write** (the gateway wrote a value the backend already sent
-  verbatim). Built-in coverage:
+  `Plugin::response_trailer_policy()`, and the plugin cache unions the names and
+  any declared ASCII prefixes once per reload so the request path reads
+  precomputed lists instead of scanning the chain. Exact names are the only
+  signal that can bind the two mutation shapes the per-request witness below
+  cannot see: a **removal that was a no-op on the initial map** (the backend
+  sent the field only as a trailer), and an **idempotent write** (the gateway
+  wrote a value the backend already sent verbatim). Prefixes close open-ended
+  sanitizer families a finite write list cannot enumerate (CORS
+  `access-control-`). Built-in coverage:
 
   | Plugin | Declared names |
   | --- | --- |
@@ -290,7 +292,7 @@ them against the response-header policy actually in force for the request:
   | `sse` | `content-type` (when relabeling), `cache-control`, `x-accel-buffering` (when enabled), `content-length` (when `strip_content_length`) |
   | `compression` | `content-encoding`, `content-length`, `vary` |
   | `grpc_web` | the two internal bridge headers, `content-type`, `x-grpc-web`, `vary`, `access-control-expose-headers` |
-  | `cors` (and its cache-internal finalizer) | the six `access-control-*` response fields and `vary` |
+  | `cors` (and its cache-internal finalizer) | open-ended `access-control-` prefix (mirrors `remove_access_control_headers`) plus `vary` |
   | `correlation_id` | the configured header name, when `echo_downstream` |
   | `otel_tracing`, `workload_metrics` | `traceparent` |
   | `response_caching` | `x-cache-status`, when `add_cache_status_header` |
@@ -383,14 +385,16 @@ policy-governed removal and inflate the `removed` telemetry.
 ### Direct HTTP/2 streaming
 
 The plain direct-H2 streaming relay (`ResponseBody::StreamingH2`) crosses the
-identical boundary and applies the identical three signals — see
+identical boundary and applies the identical governance signals — see
 [docs/response_body_streaming.md → Backend trailers on the direct-HTTP/2
 streaming path](response_body_streaming.md#backend-trailers-on-the-direct-http2-streaming-path).
 Its only structural difference is ownership: the body is handed to hyper and the
 handler returns, so the boundary travels with the body as an owned
 `StreamingResponseTrailerGovernor` instead of borrowing the handler's locals.
-Native gRPC (mesh-mTLS) and translated gRPC-Web on that arm are excluded exactly
-as `dispatch_grpc_native_h3` is excluded here.
+That owned form also carries a per-response `gateway_owned_names` list for the
+end-to-end builder writes (`via`, `alt-svc`, `X-Gateway-*`) so an exact-value
+pre-seed cannot bypass them. Native gRPC (mesh-mTLS) and translated gRPC-Web on
+that arm are excluded exactly as `dispatch_grpc_native_h3` is excluded here.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

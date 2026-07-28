@@ -720,6 +720,143 @@ fn streaming_h2_gateway_only_wire_header_binds_the_matching_trailer() {
 }
 
 #[test]
+fn streaming_h2_gateway_owned_idempotent_write_binds_each_builder_field() {
+    // Exact-value pre-seeding: the backend already sent the identical string the
+    // gateway builder will write. Folding into `final_headers` alone leaves the
+    // mutation witness with before == after; only the per-response
+    // `gateway_owned_names` declaration closes the trailer channel — the same
+    // idempotent-write shape plugin declarations handle.
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
+        as govern_owned;
+
+    for (owned, seed_value, trailer_value) in [
+        ("via", "2 ferrum-edge", "1.1 backend"),
+        ("alt-svc", "h3=\":443\"; ma=86400", "h3=\":443\"; ma=1"),
+        ("x-gateway-error", "backend_error", "spoofed"),
+        ("x-gateway-upstream-status", "degraded", "ok"),
+    ] {
+        let seeded = headers(&[("content-type", "text/plain"), (owned, seed_value)]);
+        let surviving = govern_owned(
+            &[(owned, trailer_value), ("x-keep", "yes")],
+            &seeded,
+            &seeded,
+            &[],
+            &[],
+            &names(&[owned]),
+            false,
+            true,
+        );
+        assert_eq!(
+            surviving,
+            vec![("x-keep".to_string(), "yes".to_string())],
+            "idempotent gateway write of {owned} must bind the trailer"
+        );
+    }
+}
+
+#[test]
+fn streaming_h2_builder_field_ungoverned_when_gateway_did_not_write_it() {
+    // Ownership is per-response and write-gated: a backend `via` trailer must
+    // survive when this response never wrote `via` onto the builder.
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
+        as govern_owned;
+
+    let backend = headers(&[("content-type", "text/plain")]);
+    let surviving = govern_owned(
+        &[("via", "1.1 backend"), ("x-keep", "yes")],
+        &backend,
+        &backend,
+        &[],
+        &[],
+        &[], // gateway wrote none of the builder-owned fields
+        false,
+        false,
+    );
+    assert_eq!(surviving.len(), 2, "surviving trailers: {surviving:?}");
+    assert!(has(&surviving, "via"));
+    assert!(has(&surviving, "x-keep"));
+}
+
+#[test]
+fn streaming_h2_gateway_owned_name_matches_mixed_case_trailer() {
+    use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_governed_for_test
+        as govern_owned;
+
+    let seeded = headers(&[("content-type", "text/plain"), ("via", "2 ferrum-edge")]);
+    let surviving = govern_owned(
+        &[("Via", "1.1 backend"), ("x-keep", "yes")],
+        &seeded,
+        &seeded,
+        &[],
+        &[],
+        &names(&["VIA"]),
+        false,
+        true,
+    );
+    assert_eq!(
+        surviving,
+        vec![("x-keep".to_string(), "yes".to_string())],
+        "mixed-case trailer must still fail closed under gateway ownership"
+    );
+}
+
+#[test]
+fn cors_prefix_binds_trailer_only_non_enumerated_access_control_field() {
+    // `finalize_cors_response` calls `remove_access_control_headers`, which
+    // strips the open-ended `access-control-` prefix. A trailer-only extension
+    // such as `access-control-allow-private-network` is absent from the initial
+    // map and absent from any finite write list, so only the prefix declaration
+    // can bind it.
+    use ferrum_edge::_test_support::reconcile_backend_trailers_governed_for_test as reconcile_owned;
+
+    let backend = headers(&[("content-type", "text/plain")]);
+    let surviving = reconcile_owned(
+        &[
+            ("access-control-allow-private-network", "true"),
+            ("access-control-allow-origin", "https://evil.example"),
+            ("x-keep", "yes"),
+        ],
+        &backend,
+        &backend,
+        &names(&["vary"]),
+        &names(&["access-control-"]),
+        &[],
+        false,
+    );
+    assert_eq!(
+        surviving,
+        vec![("x-keep".to_string(), "yes".to_string())],
+        "trailer-only access-control-* must not bypass CORS sanitization: {surviving:?}"
+    );
+}
+
+#[test]
+fn auth_logging_only_trailer_pass_through_remains_intact_with_new_signals() {
+    // Empty names, empty prefixes, empty gateway ownership, no mutation, no
+    // Unbounded: the #2941 pass-through must still forward every trailer.
+    use ferrum_edge::_test_support::reconcile_backend_trailers_governed_for_test as reconcile_owned;
+
+    let backend = headers(&[("content-type", "text/plain")]);
+    let surviving = reconcile_owned(
+        &[
+            ("x-backend-finished", "true"),
+            ("x-request-id", "trail-auth-2"),
+            ("access-control-allow-private-network", "true"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        &[],
+        &[],
+        false,
+    );
+    assert_eq!(surviving.len(), 3, "surviving trailers: {surviving:?}");
+    assert!(has(&surviving, "x-backend-finished"));
+    assert!(has(&surviving, "x-request-id"));
+    assert!(has(&surviving, "access-control-allow-private-network"));
+}
+
+#[test]
 fn streaming_h2_strips_hop_by_hop_trailers_before_reconciling() {
     // The body wrapper strips hop-by-hop names first, so they never count as
     // policy-governed removals — and an ungoverned chain still cannot leak
@@ -882,9 +1019,10 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     );
 
     // The seal folds in the gateway-authored fields written straight onto the
-    // response builder, so a backend trailer of one of those names cannot
-    // reconcile as absent->absent. `connection: close` is deliberately absent:
-    // it is hop-by-hop and never survives to the reconciliation.
+    // response builder AND records each write in `gateway_owned_names`, so an
+    // exact-value pre-seed cannot hide the ownership from the mutation witness.
+    // `connection: close` is deliberately absent: it is hop-by-hop and never
+    // survives to the reconciliation.
     let seal = region
         .split("// Build response body:")
         .next()
@@ -900,4 +1038,12 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
             "the governor's final-header view must fold in the builder-only field {field}"
         );
     }
+    assert!(
+        seal.contains("gateway_owned_names.push("),
+        "the seal must declare per-response gateway ownership for each builder write"
+    );
+    assert!(
+        seal.contains("response_trailer_policy_prefixes_shared()"),
+        "the seal must carry the precomputed policy-prefix Arc into the governor"
+    );
 }

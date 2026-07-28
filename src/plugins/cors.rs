@@ -30,29 +30,24 @@ use url::Url;
 
 use super::{Plugin, PluginResult, RequestContext};
 
-/// Every response field `finalize_cors_response` can write, in canonical
-/// lowercase form. Built once per process and shared by both the per-instance
-/// plugin and the cache-internal finalizer, so declaring trailer ownership
-/// allocates nothing and scans nothing per request.
+/// Discrete response fields `finalize_cors_response` can write that sit
+/// outside the open-ended `access-control-` family. Built once per process and
+/// shared by both the per-instance plugin and the cache-internal finalizer.
 ///
-/// This is the enumerable form of the `access-control-` prefix test in
-/// `owns_deadline_response_header`, plus `vary` — which `cors_headers` also
-/// writes (a merged token list) and which a backend trailer could otherwise
-/// overwrite after the merge.
-static CORS_RESPONSE_POLICY_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
-    [
-        "access-control-allow-origin",
-        "access-control-allow-credentials",
-        "access-control-expose-headers",
-        "access-control-allow-methods",
-        "access-control-allow-headers",
-        "access-control-max-age",
-        "vary",
-    ]
-    .iter()
-    .map(|name| (*name).to_string())
-    .collect()
-});
+/// `vary` is the only such field today: `cors_headers` merges a token list into
+/// it, and a backend trailer could otherwise overwrite that merge. Every
+/// `access-control-*` name — including trailer-only extensions the finite write
+/// list never enumerates — is covered by [`CORS_RESPONSE_POLICY_PREFIXES`].
+static CORS_RESPONSE_POLICY_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["vary".to_string()]);
+
+/// Open-ended CORS response-header family. Mirrors the case-insensitive
+/// `access-control-` prefix `remove_access_control_headers` strips on every
+/// CORS-owned response, so a trailer-only extension name
+/// (`access-control-allow-private-network`, …) cannot bypass sanitization
+/// merely by being absent from the finite write list and the initial map.
+static CORS_RESPONSE_POLICY_PREFIXES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["access-control-".to_string()]);
 
 const DEFAULT_ALLOWED_METHODS: &[&str] =
     &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -783,10 +778,14 @@ impl Plugin for CorsPlugin {
     /// authorization decision. A backend trailer repeating one of them lands
     /// after `after_proxy` and could hand the client a second, contradictory
     /// `Access-Control-Allow-Origin` — and a backend that echoes the identical
-    /// value is invisible to observed-mutation reconciliation. Bounded to the
-    /// enumerated set `finalize_cors_response` writes.
+    /// value is invisible to observed-mutation reconciliation. Ownership is the
+    /// open-ended `access-control-` prefix `remove_access_control_headers`
+    /// already strips, plus `vary` for the merge outside that family.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
-        super::ResponseTrailerPolicy::Names(&CORS_RESPONSE_POLICY_NAMES)
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
     }
 }
 
@@ -843,9 +842,12 @@ impl Plugin for CorsFinalizer {
 
     /// Same ownership contract as the per-instance plugin: this finalizer is
     /// the phase that actually writes the deferred CORS response headers, so it
-    /// declares the same bounded field set.
+    /// declares the same prefix family plus `vary`.
     fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
-        super::ResponseTrailerPolicy::Names(&CORS_RESPONSE_POLICY_NAMES)
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
     }
 }
 

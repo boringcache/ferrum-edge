@@ -2823,6 +2823,42 @@ async fn test_request_view_unions_builtin_response_trailer_policy_names() {
     assert_eq!(names, vec!["cache-control"]);
 }
 
+#[tokio::test]
+async fn test_request_view_unions_cors_response_trailer_prefix() {
+    // CORS sanitizes the open-ended `access-control-` family, not a finite write
+    // list: a trailer-only extension name must still be governed. The discrete
+    // `vary` merge sits outside that family and remains an exact-name entry.
+    let cors = make_plugin_config_with_json(
+        "cors",
+        "cors",
+        json!({"allowed_origins": ["https://app.example"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["cors"])], vec![cors]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let prefixes: Vec<&str> = view
+        .response_trailer_policy_prefixes()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["vary"]);
+    assert_eq!(prefixes, vec!["access-control-"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "CORS prefix ownership must not fail closed the whole trailer section"
+    );
+}
+
 #[test]
 fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     let mut deadline = make_plugin_config_with_json(
