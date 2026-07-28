@@ -3349,19 +3349,15 @@ fn render_prometheus_for_sinks(
                 .queue_byte_budget_exhausted_total
                 .load(Ordering::Relaxed),
         );
-        queue_high_water_hits = queue_high_water_hits.saturating_add(
-            metrics
-                .queue_high_water_hits_total
-                .load(Ordering::Relaxed),
-        );
+        queue_high_water_hits = queue_high_water_hits
+            .saturating_add(metrics.queue_high_water_hits_total.load(Ordering::Relaxed));
         queue_high_water_diversions = queue_high_water_diversions.saturating_add(
             metrics
                 .queue_high_water_diversions_total
                 .load(Ordering::Relaxed),
         );
-        queue_full_drops = queue_full_drops.saturating_add(
-            metrics.queue_full_drops_total.load(Ordering::Relaxed),
-        );
+        queue_full_drops =
+            queue_full_drops.saturating_add(metrics.queue_full_drops_total.load(Ordering::Relaxed));
         let spool_stats = runtime
             .spool
             .as_ref()

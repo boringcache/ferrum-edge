@@ -3437,9 +3437,7 @@ async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops()
     );
 
     let prom = render_prometheus();
-    assert!(
-        prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total") >= 1
-    );
+    assert!(prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total") >= 1);
     assert_eq!(
         prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
         0
@@ -3507,8 +3505,10 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
-    let enqueued_baseline =
-        prometheus_counter(&render_prometheus(), "chargeback_sink_events_enqueued_total");
+    let enqueued_baseline = prometheus_counter(
+        &render_prometheus(),
+        "chargeback_sink_events_enqueued_total",
+    );
 
     let plugin =
         Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
@@ -3537,8 +3537,10 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
         diversions_after_fill, 2,
         "second accepted handoff must count a diversion while still durable"
     );
-    let enqueued_before_reject =
-        prometheus_counter(&render_prometheus(), "chargeback_sink_events_enqueued_total");
+    let enqueued_before_reject = prometheus_counter(
+        &render_prometheus(),
+        "chargeback_sink_events_enqueued_total",
+    );
 
     // Next high-water handoff must be refused by the saturated delivery queue.
     plugin.log(&billable_summary("divert-rejected")).await;

@@ -776,7 +776,11 @@ async fn without_overflow_hook_high_water_still_uses_full_capacity() {
             "slot {value} of configured capacity 10 must remain usable without an overflow hook"
         );
     }
-    assert_eq!(logger.queue_depth(), 10, "all configured slots must be occupied");
+    assert_eq!(
+        logger.queue_depth(),
+        10,
+        "all configured slots must be occupied"
+    );
     assert!(
         high_water_hits.load(Ordering::Relaxed) > 0,
         "crossing 80% must still emit high-water telemetry"
