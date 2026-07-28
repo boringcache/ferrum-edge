@@ -27,6 +27,8 @@ The DNS cache stores **one shared answer row per hostname** (addresses, native T
 
 **Intentional sharing tradeoff:** a short-TTL peer can trigger an earlier shared refresh than a long-TTL peer alone would need. Addresses stay coherent across consumers; only freshness windows differ. Warmup still coalesces to one lookup per hostname (preferring the shortest advertised per-proxy TTL for initial refresh scheduling) but no longer first-writer-wins for freshness.
 
+If a caller past its own stale window attempts a synchronous refresh and DNS fails, Ferrum keeps the shared success row for peers whose longer TTL is still fresh. The expired caller observes a bounded cached refresh error before retrying DNS; the failure never replaces a still-usable hostname-wide answer with an error row.
+
 ## Environment Variables
 
 ### Core DNS Settings
