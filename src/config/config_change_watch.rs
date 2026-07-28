@@ -205,7 +205,8 @@ impl ConfigChangeWatcherHealth {
     }
 
     pub fn set_resume_token_retained(&self, retained: bool) {
-        self.resume_token_retained.store(retained, Ordering::Release);
+        self.resume_token_retained
+            .store(retained, Ordering::Release);
     }
 
     pub fn events_total(&self) -> u64 {

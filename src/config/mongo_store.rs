@@ -5781,7 +5781,6 @@ mod inner {
         }
     }
 
-    #[async_trait]
     /// URL-redact and length-bound a driver error before it reaches a log line.
     fn redacted_watch_error(error: &mongodb::error::Error, urls: &[&str]) -> String {
         truncate_watch_error(&crate::config::db_backend::redact_error_text(error, urls))
@@ -5807,6 +5806,7 @@ mod inner {
         classify_mongo_change_stream_failure(command_code, authentication_failure)
     }
 
+    #[async_trait]
     impl DatabaseBackend for MongoStore {
         async fn health_check(&self) -> Result<(), anyhow::Error> {
             self.db().run_command(doc! { "ping": 1 }).await?;

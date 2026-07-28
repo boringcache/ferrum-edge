@@ -248,7 +248,10 @@ fn degraded_reason_labels_round_trip_and_stay_bounded() {
         ConfigChangeWatchDegradedReason::UnsupportedTopology,
         ConfigChangeWatchDegradedReason::Stopped,
     ];
-    assert_eq!(reasons.len(), CONFIG_CHANGE_WATCH_DEGRADED_REASON_LABELS.len());
+    assert_eq!(
+        reasons.len(),
+        CONFIG_CHANGE_WATCH_DEGRADED_REASON_LABELS.len()
+    );
     for reason in reasons {
         assert!(CONFIG_CHANGE_WATCH_DEGRADED_REASON_LABELS.contains(&reason.as_str()));
         assert_eq!(

@@ -1911,7 +1911,11 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         .send()
         .await
         .expect("create proxy");
-    assert!(resp.status().is_success(), "create proxy: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "create proxy: {}",
+        resp.status()
+    );
 
     let deadline = SystemTime::now() + Duration::from_secs(30);
     let mut applied = false;

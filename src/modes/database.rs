@@ -2043,14 +2043,15 @@ pub async fn run(
     let config_change_wake = Arc::new(ConfigChangeWakeSignal::new());
     let mut change_stream_redact_urls = vec![effective_url.clone()];
     change_stream_redact_urls.extend(failover_urls.iter().cloned());
-    let config_change_watcher = db.spawn_config_change_wake_watcher(ConfigChangeWakeWatcherParams {
-        namespace: env_config.namespace.clone(),
-        signal: config_change_wake.clone(),
-        health: database_delta_poll_metrics.change_stream_health(),
-        settings: change_stream_settings,
-        shutdown: shutdown_tx.subscribe(),
-        redact_urls: change_stream_redact_urls,
-    });
+    let config_change_watcher =
+        db.spawn_config_change_wake_watcher(ConfigChangeWakeWatcherParams {
+            namespace: env_config.namespace.clone(),
+            signal: config_change_wake.clone(),
+            health: database_delta_poll_metrics.change_stream_health(),
+            settings: change_stream_settings,
+            shutdown: shutdown_tx.subscribe(),
+            redact_urls: change_stream_redact_urls,
+        });
     // `Some` only when the backend accepted the watch. The poll loop keeps its
     // periodic tick either way and simply gains a wake-up source.
     let poll_wake_signal = config_change_watcher
