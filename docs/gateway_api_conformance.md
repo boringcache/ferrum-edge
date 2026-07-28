@@ -156,7 +156,11 @@ materializes anything:
 
 - The two routes are compared by oldest `metadata.creationTimestamp`, then
   `{namespace}/{name}` — the same deterministic tiebreaker as the same-kind
-  path, and independent of the order objects are observed in.
+  path — and finally by `kind`, independent of the order objects are observed
+  in. The `kind` tiebreak matters only here: `{namespace}/{name}` is unique
+  within one kind, but an HTTPRoute and a GRPCRoute may share a name, and
+  `metadata.creationTimestamp` has second granularity, so one `kubectl apply`
+  of both ties on every Gateway API ordering field.
 - Rule paths and match predicates are **not** consulted. An HTTPRoute catch-all
   and a GRPCRoute method predicate on the same host are a conflict even though
   their predicates are disjoint.

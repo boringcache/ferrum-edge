@@ -1493,10 +1493,8 @@ mod grpc_route_predicate_dispatch {
         assert!(!rejected);
         assert_eq!(port, Some(50051));
 
-        let mut bare = HashMap::from([(
-            "content-type".to_string(),
-            "application/grpc".to_string(),
-        )]);
+        let mut bare =
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
         let (_, _, rejected) =
             resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut bare).await;
         assert!(rejected, "the authored predicate narrows the gate");
@@ -1710,6 +1708,29 @@ mod grpc_route_predicate_dispatch {
         }
     }
 
+    /// `{namespace}/{name}` is unique *within* a kind but not across kinds, and
+    /// `metadata.creationTimestamp` has second granularity — so one
+    /// `kubectl apply` of an HTTPRoute and a GRPCRoute that share a name ties
+    /// on every Gateway API ordering field. The accepted Route must still be
+    /// the same one regardless of the order the objects are observed in.
+    #[test]
+    fn cross_kind_tie_on_timestamp_and_name_is_still_order_independent() {
+        let http = dated(http_catch_all_route("echo"), "2024-01-01T00:00:00Z");
+        let grpc = dated(grpc_hello("echo"), "2024-01-01T00:00:00Z");
+
+        let forward = backend_ports(&[http.clone(), grpc.clone()]);
+        let reverse = backend_ports(&[grpc, http]);
+        assert_eq!(
+            forward, reverse,
+            "a total tie must not resolve by watch arrival order"
+        );
+        assert_eq!(
+            forward.len(),
+            1,
+            "exactly one Route may be accepted on the listener, got {forward:?}"
+        );
+    }
+
     #[test]
     fn cross_kind_routes_on_disjoint_hostnames_both_materialize() {
         // The rejection is hostname-scoped: no intersection, no conflict.
@@ -1741,8 +1762,8 @@ mod grpc_route_predicate_dispatch {
             .iter()
             .filter(|plugin| plugin.plugin_name == "mesh_route_dispatch")
         {
-            let dispatch =
-                MeshRouteDispatch::new(&plugin.config).expect("translated dispatch config is valid");
+            let dispatch = MeshRouteDispatch::new(&plugin.config)
+                .expect("translated dispatch config is valid");
             let (_, port, _) = resolved_backend(
                 &dispatch,
                 "/helloworld.Greeter/SayHello",

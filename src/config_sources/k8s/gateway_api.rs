@@ -913,13 +913,12 @@ pub(crate) fn route_conflicts(
             .and_then(parse_k8s_timestamp);
         let keys = route_conflict_keys_for_acc(object, acc);
         for key in &keys {
-            candidates_by_key
-                .entry(key.clone())
-                .or_default()
-                .push(GatewayApiRouteConflictCandidate {
+            candidates_by_key.entry(key.clone()).or_default().push(
+                GatewayApiRouteConflictCandidate {
                     resource: resource.clone(),
                     creation_timestamp,
-                });
+                },
+            );
         }
         route_entries.push(CrossKindRouteEntry {
             candidate: GatewayApiRouteConflictCandidate {
@@ -1009,8 +1008,24 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
         if claims.len() < 2 {
             continue;
         }
+        // `kind` is the final tiebreak, and it is load-bearing *only* here.
+        // Within one kind `{namespace}/{name}` is unique, so the Gateway API
+        // order (oldest `creationTimestamp`, then `{namespace}/{name}`) is
+        // already total. Across kinds it is not: `HTTPRoute demo/echo` and
+        // `GRPCRoute demo/echo` are distinct objects that can carry the same
+        // name *and* the same timestamp — `metadata.creationTimestamp` has
+        // second granularity, so one `kubectl apply` of both routinely ties.
+        // Without this the accepted Route would depend on watch arrival order.
         claims.sort_by(|left, right| {
-            compare_conflict_candidates(&left.entry.candidate, &right.entry.candidate)
+            compare_conflict_candidates(&left.entry.candidate, &right.entry.candidate).then_with(
+                || {
+                    left.entry
+                        .candidate
+                        .resource
+                        .kind
+                        .cmp(&right.entry.candidate.resource.kind)
+                },
+            )
         });
 
         let mut accepted: Vec<&CrossKindParentClaim<'_>> = Vec::new();
@@ -1659,16 +1674,14 @@ const GRPC_PATH_SEGMENT_PATTERN: &str = "[^/]+";
 const GRPC_CONTENT_TYPE_GATE_REGEX: &str = r"(?is)application/grpc(?:[+;].*|[ \t]+(?:;.*)?)?";
 
 /// Diagnostic for a refused `method.type: RegularExpression` predicate.
-const GRPC_REGEX_METHOD_UNSUPPORTED: &str =
-    "matches[].method.type 'RegularExpression' is not supported; Ferrum cannot constrain a regex \
+const GRPC_REGEX_METHOD_UNSUPPORTED: &str = "matches[].method.type 'RegularExpression' is not supported; Ferrum cannot constrain a regex \
      operand to a single gRPC path segment, so the match is dropped fail-closed (use Exact \
      service / method matches)";
 
 /// Diagnostic for a route-authored `content-type` predicate that is not itself
 /// a native gRPC media type. The operator-supplied value is deliberately not
 /// echoed — it is unbounded, attacker-influenceable input.
-const GRPC_CONTENT_TYPE_MUST_NARROW: &str =
-    "matches[].headers[] 'content-type' must be a native gRPC media type (application/grpc, \
+const GRPC_CONTENT_TYPE_MUST_NARROW: &str = "matches[].headers[] 'content-type' must be a native gRPC media type (application/grpc, \
      application/grpc+proto, or either with media-type parameters); a GRPCRoute header predicate \
      may only narrow the gRPC protocol gate, never widen it. application/grpc-web and \
      application/grpc-web-text are not native gRPC — configure the grpc_web plugin, which \
@@ -8326,7 +8339,6 @@ mod tests {
         assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
     }
 
-    #[test]
     /// Gateway API v1.5.1 `GRPCRouteRule`: "Merging MUST not be done between
     /// GRPCRoutes and HTTPRoutes", and `GRPCRouteSpec` requires that an
     /// HTTPRoute and a GRPCRoute overlapping on one listener resolve to exactly
@@ -8364,39 +8376,38 @@ mod tests {
         // input orders must produce identical routing config. `updated_at`
         // stamps differ per construction, so compare the routing fingerprint.
         fn fingerprint(result: &crate::config_sources::k8s::K8sTranslation) -> Vec<String> {
-            let mut entries: Vec<String> = result
-                .config
-                .proxies
-                .iter()
-                .map(|proxy| {
-                    format!(
-                        "proxy {} {} {:?} {:?} {}:{}",
-                        proxy.namespace,
-                        proxy.id,
-                        proxy.hosts,
-                        proxy.listen_path,
-                        proxy.backend_host,
-                        proxy.backend_port
+            let mut entries: Vec<String> =
+                result
+                    .config
+                    .proxies
+                    .iter()
+                    .map(|proxy| {
+                        format!(
+                            "proxy {} {} {:?} {:?} {}:{}",
+                            proxy.namespace,
+                            proxy.id,
+                            proxy.hosts,
+                            proxy.listen_path,
+                            proxy.backend_host,
+                            proxy.backend_port
+                        )
+                    })
+                    .chain(result.config.plugin_configs.iter().map(|plugin| {
+                        format!(
+                            "plugin {} {} {} {:?} {}",
+                            plugin.namespace,
+                            plugin.id,
+                            plugin.plugin_name,
+                            plugin.proxy_id,
+                            plugin.config
+                        )
+                    }))
+                    .chain(
+                        result.config.upstreams.iter().map(|upstream| {
+                            format!("upstream {} {}", upstream.namespace, upstream.id)
+                        }),
                     )
-                })
-                .chain(result.config.plugin_configs.iter().map(|plugin| {
-                    format!(
-                        "plugin {} {} {} {:?} {}",
-                        plugin.namespace,
-                        plugin.id,
-                        plugin.plugin_name,
-                        plugin.proxy_id,
-                        plugin.config
-                    )
-                }))
-                .chain(
-                    result
-                        .config
-                        .upstreams
-                        .iter()
-                        .map(|upstream| format!("upstream {} {}", upstream.namespace, upstream.id)),
-                )
-                .collect();
+                    .collect();
             entries.sort();
             entries
         }

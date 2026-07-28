@@ -185,8 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
   GRPCRoute attached to the same listener with any intersecting hostname now
   resolve to exactly one accepted Route — oldest `metadata.creationTimestamp`,
-  then `{namespace}/{name}`, independent of rule paths and of the order objects
-  are observed in — and the losing Route materializes no proxy, upstream,
+  then `{namespace}/{name}`, then `kind` (the last only breaks a total tie: the
+  two kinds may share a name and `creationTimestamp` has second granularity),
+  independent of rule paths and of the order objects are observed in — and the losing Route materializes no proxy, upstream,
   plugin, or materialized-parent record and is reported `Accepted=False` with
   `reason: Conflicted`. gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
