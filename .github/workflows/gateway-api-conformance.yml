@@ -174,6 +174,9 @@ jobs:
         run: bash scripts/gateway_api_data_plane_conformance.sh upstream
 
       - name: Run Ferrum Gateway API black-box checks
+        # Includes HTTPRoute checks plus live TCPRoute echo/status/update/delete
+        # coverage. Upstream profile remains GATEWAY-HTTP; TCPRoute is not claimed
+        # via an upstream GATEWAY-TCP profile on the pinned Gateway API version.
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
