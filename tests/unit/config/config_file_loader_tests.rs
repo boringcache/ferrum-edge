@@ -1249,8 +1249,10 @@ fn test_file_config_rejects_unknown_ai_stream_router_policy_keys() {
             }),
             "config.providers[0].inherit_backend_tl",
         ),
+        // Issue #3328: a well-formed fallback policy is refused at file-mode
+        // startup, not stored inert.
         (
-            "stream-router-fallback-typo",
+            "stream-router-fallback-block",
             serde_json::json!({
                 "providers": [{
                     "name": "openai",
@@ -1259,9 +1261,14 @@ fn test_file_config_rejects_unknown_ai_stream_router_policy_keys() {
                     "api_key": "sk-test",
                     "model_patterns": ["gpt-*"]
                 }],
-                "fallback": {"on_connect_erro": true}
+                "fallback": {
+                    "enabled": true,
+                    "on_connect_error": true,
+                    "on_5xx_before_first_byte": true,
+                    "max_attempts": 2
+                }
             }),
-            "config.fallback.on_connect_erro",
+            "unsupported field 'fallback'",
         ),
     ] {
         let document = serde_json::json!({

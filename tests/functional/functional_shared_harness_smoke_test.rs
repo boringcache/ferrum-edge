@@ -17,9 +17,12 @@
 
 use crate::common::{
     ConsumerBuilder, GatewayConfigBuilder, PluginConfigBuilder, ProxyBuilder, TestGateway,
-    spawn_http_echo, spawn_http_identifying,
+    probe_gateway_identity, spawn_http_echo, spawn_http_identifying,
 };
 use serde_json::json;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 // ─── Database mode ─────────────────────────────────────────────────────────
 
@@ -193,4 +196,234 @@ async fn test_harness_file_mode_yaml_config() {
     );
     let body: serde_json::Value = resp.json().await.expect("echo body");
     assert_eq!(body["echo"], "/hi");
+}
+
+// ─── Process identity (issue #3428) ────────────────────────────────────────
+//
+// `ephemeral_port()` releases the listener before the child binds, so under
+// parallel functional execution another gateway can claim either port. These
+// tests are the contract for the ownership probe that closes that hole: a
+// foreign listener — even one that answers `/health` as ready — must never be
+// mistaken for the spawned child.
+
+/// How a fake `/health` responder decides which tier to answer with.
+#[derive(Clone)]
+enum FakeHealthTier {
+    /// Always the unauthenticated `status`+`ready` body — what a *foreign*
+    /// gateway returns when probed with someone else's credential.
+    AlwaysUnauthenticated,
+    /// The authenticated detail tier, but only for this exact bearer token.
+    DetailForToken(String),
+}
+
+/// Minimal HTTP/1.1 `/health` responder. Deliberately hand-rolled rather than
+/// a real gateway so the test pins the *probe's* decision rule, independently
+/// of how much of a gateway happens to have started.
+async fn spawn_fake_health_listener(tier: FakeHealthTier) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake health listener");
+    let port = listener.local_addr().expect("fake listener addr").port();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let tier = tier.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            request.extend_from_slice(&chunk[..n]);
+                            if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let authorized = match &tier {
+                    FakeHealthTier::AlwaysUnauthenticated => false,
+                    FakeHealthTier::DetailForToken(expected) => request.lines().any(|line| {
+                        line.to_ascii_lowercase().starts_with("authorization:")
+                            && line.trim().ends_with(&format!("Bearer {expected}"))
+                    }),
+                };
+                // Both bodies say `ready: true`; only the detail tier carries
+                // `cached_config`. That is exactly the ambiguity the probe has
+                // to resolve.
+                let body = if authorized {
+                    r#"{"status":"ok","ready":true,"cached_config":{"available":true}}"#
+                } else {
+                    r#"{"status":"ok","ready":true}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (port, handle)
+}
+
+/// A listener that answers `/health` as ready but does not hold this
+/// instance's credential is rejected — this is the exact shape of the failure
+/// in issue #3428, where a parallel gateway satisfied readiness on a released
+/// port and then served its own configuration.
+#[tokio::test]
+#[ignore]
+async fn test_harness_identity_rejects_foreign_ready_gateway() {
+    let (port, listener) = spawn_fake_health_listener(FakeHealthTier::AlwaysUnauthenticated).await;
+
+    let err = probe_gateway_identity(
+        port,
+        "ferrum-edge-harness-probe-under-test",
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("a foreign ready gateway must not satisfy the ownership probe");
+    let err = err.to_string();
+    assert!(
+        err.contains("unauthenticated tier"),
+        "probe should report why the responder was rejected: {err}"
+    );
+    assert!(
+        !err.contains("ferrum-edge-harness-probe-under-test"),
+        "probe diagnostics must never echo the instance credential: {err}"
+    );
+
+    listener.abort();
+}
+
+/// The probe accepts a responder that proves it holds the instance credential,
+/// and only that one. Two tokens against one listener isolates the credential
+/// as the deciding factor.
+#[tokio::test]
+#[ignore]
+async fn test_harness_identity_accepts_only_matching_credential() {
+    let token = "ferrum-edge-harness-probe-matching-token";
+    let (port, listener) =
+        spawn_fake_health_listener(FakeHealthTier::DetailForToken(token.to_string())).await;
+
+    probe_gateway_identity(port, token, Duration::from_secs(5))
+        .await
+        .expect("the listener holding this instance's credential must be accepted");
+
+    probe_gateway_identity(port, "some-other-instances-token", Duration::from_secs(2))
+        .await
+        .expect_err("the same listener must be rejected for a different instance's credential");
+
+    listener.abort();
+}
+
+/// A bare TCP accept is not identity. `wait_for_proxy_port` used to trust
+/// exactly this much, which is why a stolen proxy port went undetected.
+#[tokio::test]
+#[ignore]
+async fn test_harness_identity_rejects_bare_tcp_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let accept_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+
+    probe_gateway_identity(port, "any-token", Duration::from_secs(2))
+        .await
+        .expect_err("a listener that accepts and closes is not a gateway");
+
+    accept_task.abort();
+}
+
+/// End-to-end: two real gateways started by the same harness are mutually
+/// unidentifiable. Each proves ownership of its own admin port and neither can
+/// prove ownership of the other's, so a test whose port was stolen by a sibling
+/// gateway now fails its spawn barrier instead of silently talking to the wrong
+/// configuration.
+#[tokio::test]
+#[ignore]
+async fn test_harness_identity_distinguishes_two_real_gateways() {
+    let first = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("spawn first gateway");
+    let second = TestGateway::builder()
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("spawn second gateway");
+
+    assert_ne!(
+        first.admin_port, second.admin_port,
+        "two live gateways must not share an admin port"
+    );
+    assert_ne!(
+        first.observability_token, second.observability_token,
+        "each spawn attempt must mint its own instance credential"
+    );
+    assert_ne!(
+        first.jwt_secret, second.jwt_secret,
+        "each spawn attempt must mint its own admin JWT secret"
+    );
+
+    // Each gateway identifies itself.
+    probe_gateway_identity(
+        first.admin_port,
+        &first.observability_token,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("first gateway should identify itself");
+    probe_gateway_identity(
+        second.admin_port,
+        &second.observability_token,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("second gateway should identify itself");
+
+    // Neither can stand in for the other, even though both are ready and both
+    // were started by the same builder defaults.
+    probe_gateway_identity(
+        second.admin_port,
+        &first.observability_token,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("the second gateway must not satisfy the first gateway's identity probe");
+    probe_gateway_identity(
+        first.admin_port,
+        &second.observability_token,
+        Duration::from_secs(2),
+    )
+    .await
+    .expect_err("the first gateway must not satisfy the second gateway's identity probe");
+
+    // A foreign gateway also must not satisfy the other's admin JWT — the
+    // second, independent identity factor.
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(second.admin_url("/proxies"))
+        .header("Authorization", first.auth_header())
+        .send()
+        .await
+        .expect("GET /proxies with the sibling gateway's token");
+    assert_eq!(
+        resp.status().as_u16(),
+        401,
+        "a sibling gateway's admin JWT must be rejected"
+    );
 }
