@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::db_backend::NamespacedResourceId;
@@ -44,7 +44,15 @@ const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
 
 /// Canonical identity used at every UDP/DTLS session-admission boundary.
 pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
-    Arc::from(client_addr.ip().to_canonical().to_string())
+    crate::util::client_identity::canonical_ip_arc(client_addr.ip())
+}
+
+/// Canonical client endpoint for diagnostics. Transport paths retain the raw
+/// socket address for reply routing and DTLS demux, but log fields must not
+/// split one IPv4 client across native and mapped-IPv6 representations.
+#[inline]
+fn udp_client_log_addr(client_addr: SocketAddr) -> SocketAddr {
+    crate::util::client_identity::canonical_socket_addr(client_addr)
 }
 
 /// Maximum response payload allowed by the UDP amplification guard.
@@ -76,6 +84,10 @@ pub struct UdpProxyMetrics {
     /// `on_udp_datagram` ingress queue was full or closed. Fail-closed:
     /// overload never bypasses required hooks.
     pub hook_ingress_drops: AtomicU64,
+    /// Payload bytes retained across all established-session hook queues and
+    /// in-flight hook awaits for this listener. Used as a listener-wide
+    /// admission budget.
+    hook_ingress_queued_bytes: AtomicUsize,
 }
 
 /// A UDP session tracking a single client's connection to a backend.
@@ -188,6 +200,9 @@ struct UdpSession {
     /// ingress worker so the recv loop can enforce a per-session byte cap
     /// without walking the channel.
     hook_ingress_queued_bytes: Arc<AtomicUsize>,
+    /// Dedicated cancellation wake for an in-flight datagram hook. Unlike
+    /// `stop_notify`, this is not shared with the backend reply task.
+    hook_ingress_stop_notify: Arc<tokio::sync::Notify>,
 }
 
 impl UdpSession {
@@ -209,6 +224,9 @@ impl UdpSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take();
+        // `notify_one` stores a permit if the worker is between its stop-flag
+        // check and registering the hook-cancellation waiter.
+        self.hook_ingress_stop_notify.notify_one();
     }
 }
 
@@ -367,11 +385,14 @@ const PENDING_SESSION_MAX_QUEUED_BYTES: usize = 16 * 1024;
 const SESSION_HOOK_INGRESS_MAX_DATAGRAMS: usize = 256;
 
 /// Maximum total bytes queued per established session awaiting
-/// `on_udp_datagram` + backend forward. Together with
-/// `FERRUM_UDP_MAX_SESSIONS` this bounds worst-case retained hook-ingress
-/// memory to `max_sessions * SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES`. Over-cap
-/// datagrams are dropped (fail closed — never forwarded without hooks).
+/// `on_udp_datagram` + backend forward. The listener-wide cap below prevents
+/// this per-session allowance from scaling retained memory with session count.
+/// Over-cap datagrams are dropped (fail closed — never forwarded without hooks).
 const SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// Maximum payload retained by established-session hook queues across one
+/// listener. This keeps the aggregate bound independent of the session cap.
+const LISTENER_HOOK_INGRESS_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Emit a rate-limited warning for hook-ingress drops (first drop, then every
 /// 100th). Omits client addresses so labels/log fields stay bounded.
@@ -412,20 +433,58 @@ fn enqueue_session_hook_datagram(
         }
     };
 
+    let listener_queued = &metrics.hook_ingress_queued_bytes;
+    let listener_prev = listener_queued.fetch_add(data.len(), Ordering::Relaxed);
+    if listener_prev.saturating_add(data.len()) > LISTENER_HOOK_INGRESS_MAX_QUEUED_BYTES {
+        listener_queued.fetch_sub(data.len(), Ordering::Relaxed);
+        record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
+        return false;
+    }
+
     let queued = &session.hook_ingress_queued_bytes;
     let prev = queued.fetch_add(data.len(), Ordering::Relaxed);
     if prev.saturating_add(data.len()) > SESSION_HOOK_INGRESS_MAX_QUEUED_BYTES {
         queued.fetch_sub(data.len(), Ordering::Relaxed);
+        listener_queued.fetch_sub(data.len(), Ordering::Relaxed);
         record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
         return false;
     }
 
     if tx.try_send(Bytes::copy_from_slice(data)).is_err() {
         queued.fetch_sub(data.len(), Ordering::Relaxed);
+        listener_queued.fetch_sub(data.len(), Ordering::Relaxed);
         record_hook_ingress_drop(metrics, &session.proxy_id, session.listen_port);
         return false;
     }
     true
+}
+
+fn release_hook_ingress_retained_bytes(
+    session: &UdpSession,
+    metrics: &UdpProxyMetrics,
+    len: usize,
+) {
+    session
+        .hook_ingress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+    metrics
+        .hook_ingress_queued_bytes
+        .fetch_sub(len, Ordering::Relaxed);
+}
+
+/// Keeps one admitted payload charged until it is no longer retained by either
+/// the queue or an in-flight hook/forward future. Drop-based release covers
+/// every early-exit and hook-cancellation path without duplicated decrements.
+struct HookIngressRetainedBytesGuard<'a> {
+    session: &'a UdpSession,
+    metrics: &'a UdpProxyMetrics,
+    len: usize,
+}
+
+impl Drop for HookIngressRetainedBytesGuard<'_> {
+    fn drop(&mut self) {
+        release_hook_ingress_retained_bytes(self.session, self.metrics, self.len);
+    }
 }
 
 /// Per-session worker: drain hook-ingress FIFO, enforce `on_udp_datagram`, then
@@ -433,8 +492,8 @@ fn enqueue_session_hook_datagram(
 /// is the bounded channel's sender drop ([`UdpSession::close_hook_ingress`]),
 /// not [`UdpSession::stop_notify`] — that Notify's `notify_one` permit is
 /// reserved for the backend reply task. Exit when the sender is dropped or
-/// stop/expired flags are observed (re-checked after receive and after the
-/// hook await so cleanup cannot leave a late backend forward).
+/// stop/expired flags are observed. A dedicated notification cancels an
+/// in-flight hook await so cleanup cannot leave detached session resources.
 fn spawn_session_hook_ingress_worker(
     session: Arc<UdpSession>,
     mut rx: mpsc::Receiver<Bytes>,
@@ -457,9 +516,11 @@ fn spawn_session_hook_ingress_worker(
             };
 
             let len = data.len();
-            session
-                .hook_ingress_queued_bytes
-                .fetch_sub(len, Ordering::Relaxed);
+            let _retained_bytes = HookIngressRetainedBytesGuard {
+                session: session.as_ref(),
+                metrics: metrics.as_ref(),
+                len,
+            };
 
             // Cleanup/expiry may have raced the receive; do not run hooks for a
             // stopped session (residuals are drained below without hooks).
@@ -471,7 +532,8 @@ fn spawn_session_hook_ingress_worker(
                 break;
             }
 
-            if !udp_datagram_allowed(
+            let allowed = tokio::select! {
+                allowed = udp_datagram_allowed(
                 &session.datagram_plugins,
                 Arc::clone(&session.datagram_client_ip),
                 Arc::clone(&session.datagram_proxy_id),
@@ -481,9 +543,10 @@ fn spawn_session_hook_ingress_worker(
                 session.datagram_payload_kind,
                 UdpDatagramDirection::ClientToBackend,
                 Some(UdpMetadataSink::new(&session.metadata)),
-            )
-            .await
-            {
+                ) => allowed,
+                _ = session.hook_ingress_stop_notify.notified() => break,
+            };
+            if !allowed {
                 continue;
             }
 
@@ -500,7 +563,7 @@ fn spawn_session_hook_ingress_worker(
             if let Err(e) = forward_client_datagram_to_backend(&session, &data).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = session.listen_port,
                     error = %e,
                     "UDP hook-ingress forward error"
@@ -515,9 +578,7 @@ fn spawn_session_hook_ingress_worker(
         // worker exits while the channel still holds payloads (sender may
         // already be closed). Never run hooks or forward after stop.
         while let Ok(data) = rx.try_recv() {
-            session
-                .hook_ingress_queued_bytes
-                .fetch_sub(data.len(), Ordering::Relaxed);
+            release_hook_ingress_retained_bytes(&session, &metrics, data.len());
         }
     });
 }
@@ -1080,7 +1141,7 @@ fn build_udp_stream_summary(context: UdpDisconnectContext<'_>) -> StreamTransact
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.session.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_canonical().to_string(),
+        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.session.consumer_username.clone(),
         auth_method: context.session.auth_method,
         backend_target: context.session.backend_target.clone(),
@@ -1160,7 +1221,7 @@ fn build_dtls_stream_summary(context: DtlsDisconnectContext<'_>) -> StreamTransa
         proxy_id: context.proxy_id.to_string(),
         proxy_lifecycle_generation: context.proxy_lifecycle_generation,
         proxy_name: context.proxy_name.map(|name| name.to_string()),
-        client_ip: context.client_addr.ip().to_canonical().to_string(),
+        client_ip: crate::util::client_identity::canonical_ip_string(context.client_addr.ip()),
         consumer_username: context.consumer_username,
         auth_method: context.auth_method,
         backend_target: context.backend_target.to_string(),
@@ -1302,7 +1363,7 @@ async fn direct_send_reply_or_drop(
 ) {
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         size = data.len(),
         reason,
         "UDP reply using direct-send escape hatch"
@@ -1311,7 +1372,7 @@ async fn direct_send_reply_or_drop(
         send_drops.record_datagram(data.len());
         warn!(
             proxy_id = %proxy_id,
-            client = %client_addr,
+            client = %udp_client_log_addr(client_addr),
             size = data.len(),
             error = %e,
             "UDP fallback direct-send failed; datagram lost"
@@ -1484,7 +1545,7 @@ async fn try_gso_send_or_fallback(
             // GSO sendmsg itself failed — abandon GSO for this session.
             debug!(
                 proxy_id = %proxy_id,
-                client = %client_addr,
+                client = %udp_client_log_addr(client_addr),
                 "GSO send failed ({}), falling back to sendmmsg",
                 e
             );
@@ -2030,7 +2091,12 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                 )
                 .await;
                 if let Err(e) = result {
-                    debug!(proxy_id = %proxy_id, client = %client_addr, "UDP forward error: {}", e);
+                    debug!(
+                        proxy_id = %proxy_id,
+                        client = %udp_client_log_addr(client_addr),
+                        "UDP forward error: {}",
+                        e
+                    );
                 }
 
                 // Drain additional pending datagrams without yielding to the runtime.
@@ -2473,7 +2539,7 @@ fn spawn_new_session_datagram(
             if is_client_or_policy_udp_setup_drop(&e) {
                 debug!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = listen_port,
                     error = %e,
                     "UDP session setup dropped client datagram"
@@ -2481,7 +2547,7 @@ fn spawn_new_session_datagram(
             } else {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = listen_port,
                     error = %e,
                     "UDP session setup or initial forward failed"
@@ -2593,9 +2659,13 @@ async fn process_new_session_datagram(
             }
             Decision::Deny => {
                 enforcement.record_stream_decision(protocol_label, Decision::Deny);
+                // Same canonical principal the session identity and rate-limit
+                // keys use, so a dropped datagram is attributable to the client
+                // those keys name (GHSA-vjwj-657f-5w9g).
+                let peer_ip = crate::util::client_identity::canonical_ip(client_addr.ip());
                 warn!(
                     proxy_id = %view.proxy.id,
-                    client = %client_addr.ip(),
+                    client = %peer_ip,
                     listen_port = listen_port,
                     backend_host = %backend_host,
                     backend_port = backend_port,
@@ -2683,7 +2753,7 @@ async fn process_new_session_datagram(
             if let Err(e) = forward_client_datagram_to_backend(&session, &dgram).await {
                 debug!(
                     proxy_id = %session.datagram_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     listen_port = session.listen_port,
                     error = %e,
                     "UDP pending datagram forward error"
@@ -2838,6 +2908,88 @@ fn spawn_session_cleanup(
     });
 }
 
+/// Classify an unexpected DTLS recv-loop task exit for listener failure.
+///
+/// Any completion of the recv-loop task while the accept loop is still live is
+/// an operational failure: graceful shutdown closes the server on a different
+/// select arm and awaits the task there. `Ok(())` without that path means the
+/// loop stopped without an operator/listener shutdown signal.
+pub(crate) fn classify_dtls_recv_loop_exit(
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match join_result {
+        Ok(Ok(())) => {
+            anyhow::anyhow!("DTLS server recv loop exited unexpectedly without error")
+        }
+        Ok(Err(err)) => err.context("DTLS server recv loop exited with error"),
+        Err(join_err) if join_err.is_cancelled() => {
+            anyhow::anyhow!("DTLS server recv loop was cancelled unexpectedly")
+        }
+        Err(join_err) if join_err.is_panic() => {
+            anyhow::anyhow!("DTLS server recv loop panicked: {join_err}")
+        }
+        Err(join_err) => {
+            anyhow::anyhow!("DTLS server recv loop failed to join: {join_err}")
+        }
+    }
+}
+
+/// Fail the DTLS frontend listener after an unexpected recv-loop exit.
+///
+/// Clears `started` so readiness cannot stay healthy while UDP demux has
+/// stopped, then returns a contextual error for `StreamListenerManager`
+/// async bind-failure / reconcile.
+pub(crate) fn fail_dtls_listener_on_recv_loop_exit(
+    started: &AtomicBool,
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    let err = classify_dtls_recv_loop_exit(join_result);
+    error!(
+        error = %err,
+        "DTLS server recv loop exited unexpectedly; failing listener"
+    );
+    started.store(false, Ordering::Release);
+    err
+}
+
+/// Supervise the DTLS recv-loop task against operator/global shutdown.
+///
+/// Production wires the same classification beside `server.accept()` in
+/// [`start_dtls_frontend_listener`]. This seam lets external tests drive
+/// panic/error/shutdown classification with synthetic tasks without a
+/// production panic or socket fault injector.
+#[allow(dead_code)] // Intentionally exposed via library `_test_support`; unused by the binary target.
+pub(crate) async fn supervise_dtls_recv_loop_task(
+    mut server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut global_shutdown_rx: Option<watch::Receiver<bool>>,
+    started: Arc<AtomicBool>,
+    on_shutdown: impl FnOnce(),
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        join_result = &mut server_task => {
+            Err(fail_dtls_listener_on_recv_loop_exit(&started, join_result))
+        }
+        _ = shutdown_rx.changed() => {
+            on_shutdown();
+            let _ = server_task.await;
+            Ok(())
+        }
+        _ = async {
+            match global_shutdown_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
+            on_shutdown();
+            let _ = server_task.await;
+            Ok(())
+        }
+    }
+}
+
 /// Start a DTLS frontend listener that accepts encrypted client connections.
 ///
 /// Uses `DtlsServer` from the `dtls` module which demultiplexes incoming UDP
@@ -2898,14 +3050,12 @@ async fn start_dtls_frontend_listener(
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
 
-    // Spawn the server's recv loop in a background task
+    // Spawn the server's recv loop in a background task. The accept select
+    // below supervises this handle (issue #3215): an unexpected exit must
+    // fail the listener promptly rather than leaving `accept()` blocked with
+    // `started` still true while no task reads UDP.
     let server_runner = server.clone();
-    let runner_proxy_id = proxy_id.clone();
-    let server_task = tokio::spawn(async move {
-        if let Err(e) = server_runner.run().await {
-            warn!(proxy_id = %runner_proxy_id, "DTLS server recv loop error: {}", e);
-        }
-    });
+    let mut server_task = tokio::spawn(async move { server_runner.run().await });
 
     let mut shutdown_rx = shutdown;
     // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
@@ -2939,7 +3089,7 @@ async fn start_dtls_frontend_listener(
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
                     warn!(
                         proxy_id = %proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         "DTLS session limit reached ({}), rejecting connection",
                         max_sessions
                     );
@@ -3043,7 +3193,7 @@ async fn start_dtls_frontend_listener(
                         {
                             debug!(
                                 proxy_id = %handler_proxy_id,
-                                client = %client_addr,
+                                client = %udp_client_log_addr(client_addr),
                                 "DTLS connection rejected by plugin"
                             );
                             client_conn.close().await;
@@ -3058,7 +3208,7 @@ async fn start_dtls_frontend_listener(
 
                     debug!(
                         proxy_id = %handler_proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         "DTLS frontend connection accepted"
                     );
 
@@ -3121,7 +3271,7 @@ async fn start_dtls_frontend_listener(
                             Err(e) => {
                                 debug!(
                                     proxy_id = %resolved_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "DTLS client session ended: {}",
                                     e
                                 );
@@ -3196,6 +3346,14 @@ async fn start_dtls_frontend_listener(
                         .active_sessions
                         .fetch_sub(1, Ordering::Relaxed);
                 });
+            }
+            join_result = &mut server_task => {
+                // Recv loop terminated while accept was still live. Close so
+                // any lingering accept waiters / sessions stop, clear started,
+                // and return Err for StreamListenerManager reconcile.
+                let err = fail_dtls_listener_on_recv_loop_exit(&started, join_result);
+                server.close().await;
+                return Err(err);
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
@@ -3477,7 +3635,7 @@ async fn handle_dtls_client_inner(
             Err(_) => {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "DTLS session rejected: circuit breaker open"
                 );
                 return Err(StreamSetupError::new(
@@ -3578,7 +3736,7 @@ async fn handle_dtls_client_inner(
 
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         backend = %backend_addr,
         dtls_backend = backend_dtls.is_some(),
         "DTLS frontend session established"
@@ -3906,7 +4064,7 @@ async fn create_session(
             Err(_) => {
                 warn!(
                     proxy_id = %proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "UDP session rejected: circuit breaker open"
                 );
                 return Err(StreamSetupError::new(
@@ -4070,6 +4228,7 @@ async fn create_session(
         ))),
         hook_ingress_tx: std::sync::Mutex::new(hook_ingress_tx),
         hook_ingress_queued_bytes,
+        hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
     if let Some(rx) = hook_ingress_rx {
@@ -4088,7 +4247,7 @@ async fn create_session(
 
     debug!(
         proxy_id = %proxy_id,
-        client = %client_addr,
+        client = %udp_client_log_addr(client_addr),
         backend = %backend_addr,
         "New UDP session created"
     );
@@ -4182,7 +4341,7 @@ async fn create_session(
                     Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "UDP backend DTLS recv error: {}",
                             e
                         );
@@ -4219,7 +4378,7 @@ async fn create_session(
                     Some(Err(e)) => {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "UDP backend recv error: {}",
                             e
                         );
@@ -4255,7 +4414,7 @@ async fn create_session(
                 if len as u64 > max_response {
                     warn!(
                         proxy_id = %reply_proxy_id,
-                        client = %client_addr,
+                        client = %udp_client_log_addr(client_addr),
                         response_size = len,
                         request_size = req_size,
                         factor = factor,
@@ -4347,7 +4506,7 @@ async fn create_session(
             } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
                 debug!(
                     proxy_id = %reply_proxy_id,
-                    client = %client_addr,
+                    client = %udp_client_log_addr(client_addr),
                     "UDP send to client failed: {}",
                     e
                 );
@@ -4451,7 +4610,7 @@ async fn create_session(
                             {
                                 debug!(
                                     proxy_id = %reply_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "UDP send to client failed: {}",
                                     e
                                 );
@@ -4538,7 +4697,7 @@ async fn create_session(
                     if let Err(e) = flush_result {
                         debug!(
                             proxy_id = %reply_proxy_id,
-                            client = %client_addr,
+                            client = %udp_client_log_addr(client_addr),
                             "GSO flush failed ({}), falling back to sendmmsg",
                             e
                         );
@@ -4569,7 +4728,7 @@ async fn create_session(
                             Err(e) => {
                                 debug!(
                                     proxy_id = %reply_proxy_id,
-                                    client = %client_addr,
+                                    client = %udp_client_log_addr(client_addr),
                                     "UDP sendmmsg to client failed: {}",
                                     e
                                 );
@@ -4767,7 +4926,7 @@ fn resolve_backend_target(
 }
 
 fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    ip.to_canonical().to_string()
+    crate::util::client_identity::canonical_ip_string(ip)
 }
 
 fn udp_port_lane_selection_supported(
@@ -4959,6 +5118,7 @@ mod tests {
             overload_guard: std::sync::Mutex::new(None),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -5757,10 +5917,28 @@ backend_tls_verify_server_cert: false
         assert_eq!(queued_bytes.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 1);
 
+        // Listener cap: refuse payload even when this session has capacity.
+        metrics.hook_ingress_queued_bytes.store(
+            super::LISTENER_HOOK_INGRESS_MAX_QUEUED_BYTES - 1,
+            Ordering::Relaxed,
+        );
+        assert!(!super::enqueue_session_hook_datagram(
+            &session,
+            b"two",
+            metrics.as_ref()
+        ));
+        assert_eq!(queued_bytes.load(Ordering::Relaxed), 3);
+        metrics
+            .hook_ingress_queued_bytes
+            .store(3, Ordering::Relaxed);
+
         // Drain the admitted payload so the channel is empty for the count test.
         let first = rx.recv().await.expect("admitted datagram");
         assert_eq!(&first[..], b"one");
         queued_bytes.fetch_sub(first.len(), Ordering::Relaxed);
+        metrics
+            .hook_ingress_queued_bytes
+            .fetch_sub(first.len(), Ordering::Relaxed);
 
         // Fill to the datagram-count bound, then the next must fail closed.
         for i in 0..super::SESSION_HOOK_INGRESS_MAX_DATAGRAMS {
@@ -5774,7 +5952,7 @@ backend_tls_verify_server_cert: false
             b"overflow",
             metrics.as_ref()
         ));
-        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 3);
 
         // Closing the sender fails closed (worker gone / session torn down).
         session.close_hook_ingress();
@@ -5783,7 +5961,7 @@ backend_tls_verify_server_cert: false
             b"after-close",
             metrics.as_ref()
         ));
-        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.hook_ingress_drops.load(Ordering::Relaxed), 4);
     }
 
     /// The hook-ingress worker must not wait on `stop_notify`: that Notify's
@@ -5904,7 +6082,13 @@ backend_tls_verify_server_cert: false
         ));
         assert_eq!(
             queued_bytes.load(Ordering::Relaxed),
-            b"second".len() + b"third".len()
+            b"first".len() + b"second".len() + b"third".len(),
+            "the in-flight hook payload must remain charged with queued residuals"
+        );
+        assert_eq!(
+            metrics.hook_ingress_queued_bytes.load(Ordering::Relaxed),
+            b"first".len() + b"second".len() + b"third".len(),
+            "listener admission must include the in-flight hook payload"
         );
 
         session
@@ -5912,8 +6096,6 @@ backend_tls_verify_server_cert: false
             .store(true, std::sync::atomic::Ordering::Release);
         super::signal_udp_reply_task_stop(&session.stop_reply_task, session.stop_notify.as_ref());
         session.close_hook_ingress();
-
-        release_tx.send(()).expect("release gated hook");
 
         for _ in 0..64 {
             if queued_bytes.load(Ordering::Relaxed) == 0 {
@@ -5931,6 +6113,15 @@ backend_tls_verify_server_cert: false
             hook_calls.load(Ordering::Relaxed),
             1,
             "residuals after stop must not run hooks"
+        );
+        assert!(
+            release_tx.send(()).is_err(),
+            "stopping the session must cancel the in-flight hook future"
+        );
+        assert_eq!(
+            metrics.hook_ingress_queued_bytes.load(Ordering::Relaxed),
+            0,
+            "stopped worker must release the listener-wide byte budget"
         );
         assert_eq!(
             metrics.datagrams_out.load(Ordering::Relaxed),
@@ -6196,6 +6387,7 @@ backend_tls_verify_server_cert: false
             ))),
             hook_ingress_tx: std::sync::Mutex::new(None),
             hook_ingress_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            hook_ingress_stop_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

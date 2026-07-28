@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::warn;
@@ -16,6 +17,7 @@ use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
     UdpDatagramVerdict,
 };
+use crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// `udp_rate_limiting`-specific top-level config keys (excludes Redis fields).
@@ -48,10 +50,26 @@ const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const EVICTION_CHECK_INTERVAL: u64 = 100_000;
 
+/// Outcome of a UDP rate-limit rejection diagnostic decision. Test-only fields
+/// expose the suppressed counts carried by an emit without logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RejectionWarnDecisionForTest {
+    pub(crate) emitted: bool,
+    pub(crate) instance_suppressed: Option<u64>,
+    pub(crate) global_suppressed: Option<u64>,
+}
+
+static GLOBAL_REJECTION_WARN: OnceLock<AtomicLogRateLimiter> = OnceLock::new();
+
+fn global_rejection_warn() -> &'static AtomicLogRateLimiter {
+    GLOBAL_REJECTION_WARN.get_or_init(AtomicLogRateLimiter::new)
+}
+
 pub struct UdpRateLimiting {
     check_counter: AtomicU64,
     epoch_base: Instant,
     last_eviction_secs: AtomicU64,
+    rejection_warn: AtomicLogRateLimiter,
     limiter: RateLimitBackend<Arc<str>, UdpRateLimitAlgorithm>,
 }
 
@@ -116,6 +134,7 @@ impl UdpRateLimiting {
             check_counter: AtomicU64::new(0),
             epoch_base,
             last_eviction_secs: AtomicU64::new(0),
+            rejection_warn: AtomicLogRateLimiter::new(),
             limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "udp_rate_limiting",
                 config_id,
@@ -228,6 +247,79 @@ impl UdpRateLimiting {
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn epoch_base_for_test(&self) -> Instant {
         self.epoch_base
+    }
+
+    /// Exercise the production dual-gate decision with an isolated global
+    /// limiter so parallel external tests never mutate process-global state.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn record_rate_limit_rejection_warn_detail_for_test(
+        &self,
+        global: &AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> RejectionWarnDecisionForTest {
+        self.record_rate_limit_rejection_warn_with_global(global, limit_kind, proxy_id, now_ms)
+    }
+
+    /// Observed per-instance suppressed-event accumulator. Test-only.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn rejection_warn_suppressed_count_for_test(&self) -> u64 {
+        self.rejection_warn.suppressed_count_for_test()
+    }
+
+    /// Reset this instance's rejection diagnostic limiter. Test-only.
+    #[doc(hidden)]
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn reset_rate_limit_rejection_warn_for_test(&self) {
+        self.rejection_warn.reset_for_test();
+    }
+
+    fn record_rate_limit_rejection_warn(
+        &self,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> RejectionWarnDecisionForTest {
+        self.record_rate_limit_rejection_warn_with_global(
+            global_rejection_warn(),
+            limit_kind,
+            proxy_id,
+            now_ms,
+        )
+    }
+
+    fn record_rate_limit_rejection_warn_with_global(
+        &self,
+        global: &AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> RejectionWarnDecisionForTest {
+        let Some((instance_suppressed, global_suppressed)) =
+            AtomicLogRateLimiter::dual_gate_emit(&self.rejection_warn, global, now_ms)
+        else {
+            return RejectionWarnDecisionForTest {
+                emitted: false,
+                instance_suppressed: None,
+                global_suppressed: None,
+            };
+        };
+        warn!(
+            plugin = "udp_rate_limiting",
+            proxy_id = %proxy_id,
+            limit_kind,
+            suppressed = instance_suppressed,
+            globally_suppressed = global_suppressed,
+            "UDP rate limit exceeded, dropping datagram"
+        );
+        RejectionWarnDecisionForTest {
+            emitted: true,
+            instance_suppressed: Some(instance_suppressed),
+            global_suppressed: Some(global_suppressed),
+        }
     }
 
     fn redis_ip_key(client_ip: &str) -> String {
@@ -343,24 +435,15 @@ impl Plugin for UdpRateLimiting {
         }
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
-        match outcome.metric {
-            Some("bytes") => warn!(
-                plugin = "udp_rate_limiting",
-                proxy_id = %ctx.proxy_id,
-                client_ip = %ctx.client_ip,
-                bytes = outcome.usage.unwrap_or(0),
-                limit = outcome.limit.unwrap_or(0),
-                "UDP byte rate exceeded, dropping"
-            ),
-            _ => warn!(
-                plugin = "udp_rate_limiting",
-                proxy_id = %ctx.proxy_id,
-                client_ip = %ctx.client_ip,
-                count = outcome.usage.unwrap_or(0),
-                limit = outcome.limit.unwrap_or(0),
-                "UDP datagram rate exceeded, dropping"
-            ),
-        }
+        let limit_kind = match outcome.metric {
+            Some("bytes") => "byte_count",
+            _ => "datagram_count",
+        };
+        self.record_rate_limit_rejection_warn(
+            limit_kind,
+            ctx.proxy_id.as_ref(),
+            crate::socket_opts::monotonic_now_ms(),
+        );
 
         UdpDatagramVerdict::Drop
     }

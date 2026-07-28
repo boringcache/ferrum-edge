@@ -215,13 +215,7 @@ fn ranges_cover_full(ranges: &mut [(u128, u128)], max: u128) -> bool {
 /// Collapse an IPv4-mapped IPv6 address to its embedded IPv4 form so that v4
 /// rules and v4 queries compare apples-to-apples regardless of representation.
 fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    }
+    crate::util::client_identity::canonical_ip(ip)
 }
 
 /// Canonicalise a CIDR network: an IPv4-mapped IPv6 network with a `>= /96`

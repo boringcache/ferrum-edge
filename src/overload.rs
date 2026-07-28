@@ -1052,6 +1052,24 @@ pub fn begin_drain(state: &Arc<OverloadState>) {
     state.reject_new_requests.store(true, Ordering::Release);
 }
 
+/// Serving-mode shutdown entry point: [`begin_drain`] plus cancellation of any
+/// deliberately parked work that a drain wait would otherwise block on.
+///
+/// Today that is injected fault delays. Their timers are the one place where a
+/// live request or connection is held open by gateway policy rather than by a
+/// peer, so waiting for them would burn the entire
+/// `FERRUM_SHUTDOWN_DRAIN_SECONDS` budget (or hit the forced-shutdown deadline)
+/// for work that has no reason to finish.
+///
+/// Kept separate from [`begin_drain`] on purpose. The fault-delay token is
+/// process-global and one-shot, so cancelling it from the plain drain-flag
+/// helper — which ordinary tests call directly — would silently disarm every
+/// later fault delay in the same test binary.
+pub fn begin_shutdown_drain(state: &Arc<OverloadState>) {
+    begin_drain(state);
+    crate::plugins::utils::fault_delay::cancel_fault_delays_for_shutdown();
+}
+
 /// Wait for all in-flight connections and requests to drain, up to the
 /// configured timeout.
 ///

@@ -591,6 +591,9 @@ impl Plugin for PriorityOverridePlugin {
             .after_proxy(ctx, response_status, response_headers)
             .await
     }
+    fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
+        self.inner.observe_origin_http_response_status(ctx, status);
+    }
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
         self.inner.owns_deadline_response_header(ctx, name)
     }

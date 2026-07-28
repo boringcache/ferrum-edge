@@ -98,6 +98,7 @@ paths:
 - Stream proxy port validation happens at config, admin API, startup reconcile, and runtime reconcile. Startup bind is fatal in db/file and non-fatal in DP. Runtime reconcile never crashes.
 - DP does not revalidate CP-pushed port conflicts; bind failure skips only the conflicting proxy.
 - TCP `FERRUM_ACCEPT_THREADS > 1` SO_REUSEPORT accept loops are supervised as peers: any unexpected loop exit cancels siblings, clears `started`, and fails the listener task so reconcile/readiness cannot stay healthy with silently reduced accept capacity. Operator shutdown remains a clean success.
+- DTLS frontend `DtlsServer::run` is supervised beside `accept()`: unexpected recv-loop exit (error, panic, or unexpected cancel) clears `started` and fails the listener for reconcile/restart; operator/global shutdown remains a clean success.
 
 ## Pool Keys And DNS
 

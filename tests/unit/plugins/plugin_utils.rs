@@ -365,3 +365,78 @@ pub fn assert_reject(result: PluginResult, expected_status: Option<u16>) {
         _ => panic!("Expected Reject, got {:?}", result),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tracing capture (advisory GHSA-8594-2xhc-8g38 sink-URL redaction tests)
+// ---------------------------------------------------------------------------
+
+/// In-memory `tracing` sink for asserting that a diagnostic never renders a
+/// credential.
+///
+/// Log-capture assertions for the observability sinks are negative ("this
+/// sentinel must not appear anywhere"), so they need the complete emitted text
+/// rather than a structured record.
+#[derive(Clone, Default)]
+pub struct CapturedLogs {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl CapturedLogs {
+    #[allow(dead_code)]
+    pub fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+pub struct CapturedLogsGuard {
+    buffer: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl std::io::Write for CapturedLogsGuard {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogsGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedLogsGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+/// Install a thread-local capturing subscriber for the duration of the returned
+/// guard. Use `flavor = "current_thread"` so plugin flush workers stay on the
+/// thread the subscriber is installed for.
+#[allow(dead_code)]
+pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    let writer = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (writer, guard)
+}
+
+/// Assert that no sentinel — and no raw credential-bearing URL — survived into
+/// captured diagnostics.
+#[allow(dead_code)]
+pub fn assert_no_secrets(logs: &str, context: &str, secrets: &[&str]) {
+    for secret in secrets {
+        assert!(
+            !logs.contains(secret),
+            "{context} leaked {secret:?} into diagnostics: {logs}"
+        );
+    }
+}
