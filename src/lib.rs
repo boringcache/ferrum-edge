@@ -3764,6 +3764,25 @@ pub mod _test_support {
         crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
     }
 
+    pub fn h3_normalize_reject_for_client_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: http::StatusCode,
+        body: bytes::Bytes,
+        headers: &std::collections::HashMap<String, String>,
+        native_grpc: bool,
+    ) -> (
+        crate::proxy::NormalizedRejectResponse,
+        Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    ) {
+        crate::http3::cross_protocol::normalize_reject_for_client_for_test(
+            ctx,
+            status,
+            body,
+            headers,
+            native_grpc,
+        )
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }

@@ -16285,7 +16285,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
                 ctx,
                 normalized.http_status.as_u16(),
                 &normalized.headers,
-                &normalized.body,
+                normalized.body.clone(),
                 terminal_gateway_deadline,
             )
             .await
@@ -17455,13 +17455,18 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &HashMap<String, String>,
-    response_body: &[u8],
+    response_body: Bytes,
     terminal_gateway_deadline: bool,
 ) -> Option<OwnedResponseCommittedHookFuture> {
     let deadline = ctx.grpc_deadline_at();
     if !terminal_gateway_deadline && deadline.is_none() {
         plugin
-            .on_response_committed(ctx, response_status, response_headers, response_body)
+            .on_response_committed(
+                ctx,
+                response_status,
+                response_headers,
+                response_body.as_ref(),
+            )
             .await;
         return None;
     }
@@ -17470,7 +17475,7 @@ pub(crate) async fn run_response_committed_hook_until_deadline(
         ctx.clone(),
         response_status,
         Arc::new(response_headers.clone()),
-        Bytes::copy_from_slice(response_body),
+        response_body,
     );
     if terminal_gateway_deadline {
         let completed = futures_util::future::poll_fn(|cx| {
@@ -17561,7 +17566,7 @@ pub(crate) async fn run_deadline_bounded_response_committed_hooks(
             ctx,
             *response_status,
             response_headers,
-            response_body,
+            response_body.clone(),
             terminal_gateway_deadline,
         )
         .await
@@ -17676,7 +17681,7 @@ async fn build_grpc_web_reject_response(
                 ctx,
                 StatusCode::OK.as_u16(),
                 &translated.headers,
-                &translated.body,
+                Bytes::from(translated.body.clone()),
                 terminal_gateway_deadline,
             )
             .await
@@ -27966,7 +27971,7 @@ fn buffered_backend_response_from_body_read(
     match result {
         Ok(b) => retry::BackendResponse {
             status_code: status,
-            body: ResponseBody::buffered(b.to_vec()),
+            body: ResponseBody::buffered(b),
             headers: resp_headers,
             connection_error: false,
             backend_resolved_ip: resolved_ip,
