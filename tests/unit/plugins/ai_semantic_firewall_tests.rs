@@ -5138,7 +5138,11 @@ fn max_hold_ms_accepts_bounded_values() {
         json!({"max_hold_ms": 250, "on_hold_timeout": "forward", "enforcement": "detect"}),
         json!({"max_hold_ms": 250, "enforcement": "detect"}),
     ] {
-        let config = hold_config("http://127.0.0.1:9/v1/embeddings", "reject", streaming.clone());
+        let config = hold_config(
+            "http://127.0.0.1:9/v1/embeddings",
+            "reject",
+            streaming.clone(),
+        );
         assert!(
             AiSemanticFirewall::new(&config, PluginHttpClient::default()).is_ok(),
             "config should be accepted: {streaming}"
@@ -5245,7 +5249,11 @@ async fn hold_deadline_default_policy_follows_on_error() {
     assert_eq!(released.as_ref(), CLEAN_SENTENCE_EVENT);
 
     // on_error=reject is fail-closed, so the same default policy cuts.
-    let strict = plugin(&hold_config(&endpoint, "reject", json!({"max_hold_ms": 120})));
+    let strict = plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120}),
+    ));
     let ctx = inspect_marked_ctx();
     let mut inspector = strict
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
