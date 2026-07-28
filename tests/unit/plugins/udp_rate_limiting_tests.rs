@@ -653,6 +653,256 @@ fn concurrent_insert_prune_and_cap_keep_exact_entry_count() {
     assert!(!h.seed_udp_with_cap("198.51.100.1", active, 32));
 }
 
+// ── Bounded rejection diagnostics (GHSA-x6v4-3gwg-3rw6) ───────────────
+
+fn reset_udp_rejection_warn_state(
+    plugin: &ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting,
+) {
+    ferrum_edge::_test_support::udp_rate_limiting_reset_rejection_warn_for_test(plugin);
+}
+
+fn rejection_warn_global() -> ferrum_edge::util::atomic_log_rate_limiter::AtomicLogRateLimiter {
+    ferrum_edge::_test_support::atomic_log_rate_limiter_with_window_for_test(1_000)
+}
+
+fn record_rejection_warn(
+    plugin: &ferrum_edge::plugins::udp_rate_limiting::UdpRateLimiting,
+    global: &ferrum_edge::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    limit_kind: &'static str,
+    proxy_id: &str,
+    now_ms: u64,
+) -> ferrum_edge::_test_support::UdpRejectionWarnDecisionForTest {
+    ferrum_edge::_test_support::udp_rate_limiting_record_rejection_warn_detail_for_test(
+        plugin, global, limit_kind, proxy_id, now_ms,
+    )
+}
+
+#[test]
+fn rejection_warn_emits_once_per_window_under_identical_timestamp_flood() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    let global = rejection_warn_global();
+    reset_udp_rejection_warn_state(&plugin);
+
+    let mut emissions = 0usize;
+    for _ in 0..10_000 {
+        if record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000).emitted {
+            emissions += 1;
+        }
+    }
+    assert_eq!(
+        emissions, 1,
+        "identical timestamps within one 1s window must emit at most once per instance"
+    );
+}
+
+#[test]
+fn rejection_warn_rolls_window_and_carries_suppressed_count() {
+    let plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    let global = rejection_warn_global();
+    reset_udp_rejection_warn_state(&plugin);
+
+    let first = record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 0);
+    assert!(first.emitted);
+    assert_eq!(first.instance_suppressed, Some(0));
+    assert_eq!(first.global_suppressed, Some(0));
+
+    for t in 1..=999 {
+        let decision = record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", t);
+        assert!(!decision.emitted);
+        assert_eq!(decision.instance_suppressed, None);
+        assert_eq!(decision.global_suppressed, None);
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin
+        ),
+        999,
+        "per-instance suppressed accounting must retain every in-window rejection"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::atomic_log_rate_limiter_suppressed_count_for_test(&global),
+        999,
+        "global suppressed accounting must retain every in-window rejection"
+    );
+
+    let rollover = record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000);
+    assert!(rollover.emitted, "window rollover must emit a summary");
+    assert_eq!(rollover.instance_suppressed, Some(999));
+    assert_eq!(rollover.global_suppressed, Some(999));
+}
+
+#[tokio::test]
+async fn datagram_and_byte_limit_rejections_share_bounded_diagnostics() {
+    let count_plugin = make_plugin(json!({"datagrams_per_second": 1}));
+    let byte_plugin = make_plugin(json!({"bytes_per_second": 100}));
+
+    let mut ctx = make_ctx("10.0.0.1", 50);
+    assert_eq!(
+        count_plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Forward
+    );
+    ctx.direction = UdpDatagramDirection::BackendToClient;
+    assert_eq!(
+        count_plugin.on_udp_datagram(&ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+
+    let mut byte_ctx = make_ctx("10.0.0.2", 200);
+    assert_eq!(
+        byte_plugin.on_udp_datagram(&byte_ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+    byte_ctx.direction = UdpDatagramDirection::BackendToClient;
+    assert_eq!(
+        byte_plugin.on_udp_datagram(&byte_ctx).await,
+        UdpDatagramVerdict::Drop
+    );
+
+    let global = rejection_warn_global();
+    reset_udp_rejection_warn_state(&count_plugin);
+    reset_udp_rejection_warn_state(&byte_plugin);
+    let mut count_emissions = 0usize;
+    let mut byte_emissions = 0usize;
+    for t in 0..5_000 {
+        if record_rejection_warn(&count_plugin, &global, "datagram_count", "proxy-1", t).emitted {
+            count_emissions += 1;
+        }
+        if record_rejection_warn(&byte_plugin, &global, "byte_count", "proxy-1", t).emitted {
+            byte_emissions += 1;
+        }
+    }
+    assert!(
+        count_emissions <= 6,
+        "count-limit diagnostics stayed bounded across flood: {count_emissions}"
+    );
+    assert!(
+        byte_emissions <= 6,
+        "byte-limit diagnostics stayed bounded across flood: {byte_emissions}"
+    );
+}
+
+#[test]
+fn multiple_plugin_instances_each_emit_independently_with_global_ceiling() {
+    let plugin_a = make_plugin(json!({"datagrams_per_second": 1}));
+    let plugin_b = make_plugin(json!({"datagrams_per_second": 1}));
+    let global = rejection_warn_global();
+    reset_udp_rejection_warn_state(&plugin_a);
+    reset_udp_rejection_warn_state(&plugin_b);
+
+    assert!(record_rejection_warn(&plugin_a, &global, "datagram_count", "proxy-a", 0).emitted);
+    let denied = record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", 0);
+    assert!(
+        !denied.emitted,
+        "global gate must deny the second instance's first rejection in the same window"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin_b
+        ),
+        1,
+        "denied instance must retain its pending rejection"
+    );
+    assert_eq!(
+        ferrum_edge::_test_support::atomic_log_rate_limiter_suppressed_count_for_test(&global),
+        1,
+        "global accounting must retain the denied rejection"
+    );
+
+    for t in 1..=999 {
+        let _ = record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", t);
+    }
+    assert_eq!(
+        ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+            &plugin_b
+        ),
+        1_000,
+        "instance aggregate must carry every rejection through a denied rollover"
+    );
+
+    let rollover = record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", 1_000);
+    assert!(rollover.emitted);
+    assert_eq!(rollover.instance_suppressed, Some(1_000));
+    assert_eq!(rollover.global_suppressed, Some(1_000));
+
+    let mut global_emissions = 0usize;
+    for t in 1..=10_000 {
+        if record_rejection_warn(&plugin_a, &global, "datagram_count", "proxy-a", t).emitted {
+            global_emissions += 1;
+        }
+        if record_rejection_warn(&plugin_b, &global, "datagram_count", "proxy-b", t).emitted {
+            global_emissions += 1;
+        }
+    }
+    assert!(
+        global_emissions <= 12,
+        "global + per-instance bounds must cap warnings across instances: {global_emissions}"
+    );
+}
+
+#[test]
+fn concurrent_rejection_warns_stay_bounded_with_preserved_accounting() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let plugin = Arc::new(make_plugin(json!({"datagrams_per_second": 1})));
+    let global = Arc::new(rejection_warn_global());
+    reset_udp_rejection_warn_state(&plugin);
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let plugin = Arc::clone(&plugin);
+        let global = Arc::clone(&global);
+        handles.push(thread::spawn(move || {
+            let mut emissions = 0usize;
+            let mut instance_reported = 0u64;
+            let mut global_reported = 0u64;
+            for _ in 0..2_000 {
+                let decision =
+                    record_rejection_warn(&plugin, &global, "datagram_count", "proxy-1", 1_000);
+                if decision.emitted {
+                    emissions += 1;
+                    instance_reported =
+                        instance_reported.saturating_add(decision.instance_suppressed.unwrap_or(0));
+                    global_reported =
+                        global_reported.saturating_add(decision.global_suppressed.unwrap_or(0));
+                }
+            }
+            (emissions, instance_reported, global_reported)
+        }));
+    }
+
+    let (emissions, instance_reported, global_reported) = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .fold((0usize, 0u64, 0u64), |acc, result| {
+            (
+                acc.0 + result.0,
+                acc.1.saturating_add(result.1),
+                acc.2.saturating_add(result.2),
+            )
+        });
+    assert_eq!(
+        emissions, 1,
+        "identical timestamps within one window must emit at most once per instance"
+    );
+    assert_eq!(
+        instance_reported
+            + ferrum_edge::_test_support::udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+                &plugin,
+            ),
+        (8 * 2_000 - 1) as u64,
+        "reported plus pending instance accounting must cover every suppressed rejection"
+    );
+    assert_eq!(
+        global_reported
+            + ferrum_edge::_test_support::atomic_log_rate_limiter_suppressed_count_for_test(
+                &global
+            ),
+        (8 * 2_000 - 1) as u64,
+        "reported plus pending global accounting must cover every suppressed rejection"
+    );
+}
+
 // ── Default Trait Methods ─────────────────────────────────────────────
 
 #[tokio::test]

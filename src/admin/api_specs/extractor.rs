@@ -25,6 +25,7 @@ use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, 
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use url::Url;
 
 /// HTTP method keys counted when computing `operation_count`.
@@ -126,6 +127,14 @@ pub enum ExtractError {
     SchemaReference(String),
     #[error("schema reference depth exceeded while resolving '{location}'")]
     SchemaTooDeep { location: String },
+    /// A local `$ref` chain re-entered a target that is still being expanded.
+    ///
+    /// `path` is the chain of `$ref` literals from the outermost reference to
+    /// the one that closed the cycle. Those literals come from the submitted
+    /// document and name document structure only, so the message carries no
+    /// resolver-internal state and no operator secret.
+    #[error("schema reference cycle detected: {path}")]
+    SchemaReferenceCycle { path: String },
     #[error("resolved schema exceeds the expansion limit while resolving '{location}'")]
     SchemaTooLarge { location: String },
 }
@@ -903,6 +912,12 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
     };
     let mut operations = Vec::new();
     let mut generated_operation_bytes = 0usize;
+    // One reference-resolution account for the whole document. Cycle
+    // detection, memoization, and the cumulative node/byte budget are all
+    // document-scoped, so a hostile document cannot reset any of them by
+    // spreading expansion across many paths, operations, or media types
+    // (GHSA-8jc7-c52g-85xr).
+    let mut resolution_state = ResolutionState::new();
     // Draft selection is emitted once on the top-level openapi_validator config
     // (`schema_draft`). Runtime compiles every operation with that selector;
     // per-operation copies are not part of the published Admin schema.
@@ -919,6 +934,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             MAX_SCHEMA_REF_DEPTH,
             resolver.document_base(),
             &resolver,
+            &mut resolution_state,
         )?;
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
@@ -961,6 +977,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                     version,
                     &resolver,
                     &mut operation_budget,
+                    &mut resolution_state,
                 )?
             } else {
                 extract_openapi_request_body(
@@ -969,6 +986,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                     version,
                     &resolver,
                     &mut operation_budget,
+                    &mut resolution_state,
                 )?
             };
             let responses = if version == "2.0" {
@@ -979,6 +997,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                     version,
                     &resolver,
                     &mut operation_budget,
+                    &mut resolution_state,
                 )?
             } else {
                 extract_openapi_responses(
@@ -987,6 +1006,7 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
                     version,
                     &resolver,
                     &mut operation_budget,
+                    &mut resolution_state,
                 )?
             };
 
@@ -1406,6 +1426,7 @@ fn resolve_path_item(
     depth: usize,
     current_base: &Url,
     resolver: &LocalSchemaResolver,
+    state: &mut ResolutionState,
 ) -> Result<Value, ExtractError> {
     resolve_refs(
         root,
@@ -1415,6 +1436,7 @@ fn resolve_path_item(
         current_base,
         resolver,
         ResolveContext::ReferenceObject,
+        state,
     )
 }
 
@@ -1424,6 +1446,7 @@ fn extract_openapi_request_body(
     version: &str,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let Some(request_body) = operation.get("requestBody") else {
         return Ok(None);
@@ -1436,6 +1459,7 @@ fn extract_openapi_request_body(
         resolver.document_base(),
         resolver,
         ResolveContext::ReferenceObject,
+        state,
     )?;
     let Some(object) = resolved.as_object() else {
         return Ok(None);
@@ -1461,12 +1485,13 @@ fn extract_openapi_request_body(
                 resolver.document_base(),
                 resolver,
                 ResolveContext::Schema,
+                state,
             )?;
             let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
             let encoding = match media_object.get("encoding") {
                 None | Some(Value::Null) => None,
                 Some(encoding) => Some(normalize_request_body_encoding(
-                    root, media_type, encoding, &schema, version, resolver, budget,
+                    root, media_type, encoding, &schema, version, resolver, budget, state,
                 )?),
             };
             let media_value = match encoding {
@@ -1498,6 +1523,7 @@ fn extract_openapi_request_body(
 ///
 /// Unsupported styles and media-type combinations fail closed at admission so
 /// generated validator config never silently drops serialization metadata.
+#[allow(clippy::too_many_arguments)]
 fn normalize_request_body_encoding(
     root: &Value,
     media_type: &str,
@@ -1506,6 +1532,7 @@ fn normalize_request_body_encoding(
     version: &str,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
 ) -> Result<Value, ExtractError> {
     const HEADER_OBJECT_SCHEMA_KEYS: &[&str] = &[
         "description",
@@ -1744,6 +1771,7 @@ fn normalize_request_body_encoding(
                     resolver.document_base(),
                     resolver,
                     ResolveContext::ReferenceObject,
+                    state,
                 )?;
                 let Some(header_object) = resolved_header.as_object() else {
                     return Err(ExtractError::MalformedExtension {
@@ -1964,6 +1992,7 @@ fn normalize_request_body_encoding(
                         resolver.document_base(),
                         resolver,
                         ResolveContext::Schema,
+                        state,
                     )?;
                     let mut normalized_media = media_object.clone();
                     let normalized_schema = normalize_schema_for_openapi(
@@ -2000,6 +2029,7 @@ fn normalize_request_body_encoding(
                         resolver.document_base(),
                         resolver,
                         ResolveContext::Schema,
+                        state,
                     )?;
                     normalized_header.remove("content");
                     normalized_header.insert(
@@ -2165,6 +2195,7 @@ fn extract_openapi_responses(
     version: &str,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
@@ -2180,6 +2211,7 @@ fn extract_openapi_responses(
             resolver.document_base(),
             resolver,
             ResolveContext::ReferenceObject,
+            state,
         )?;
         let Some(response_object) = resolved.as_object() else {
             continue;
@@ -2196,6 +2228,7 @@ fn extract_openapi_responses(
                         resolver.document_base(),
                         resolver,
                         ResolveContext::Schema,
+                        state,
                     )?;
                     let schema =
                         normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
@@ -2220,6 +2253,7 @@ fn extract_swagger_request_body(
     version: &str,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
 ) -> Result<ExtractedRequestBodySchemas, ExtractError> {
     let parameters = operation
         .get("parameters")
@@ -2242,6 +2276,7 @@ fn extract_swagger_request_body(
             resolver.document_base(),
             resolver,
             ResolveContext::ReferenceObject,
+            state,
         )?;
         let Some(parameter_object) = resolved.as_object() else {
             continue;
@@ -2260,6 +2295,7 @@ fn extract_swagger_request_body(
             resolver.document_base(),
             resolver,
             ResolveContext::Schema,
+            state,
         )?;
         let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Request);
         let required = parameter_object
@@ -2283,6 +2319,7 @@ fn extract_swagger_responses(
     version: &str,
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
+    state: &mut ResolutionState,
 ) -> Result<Map<String, Value>, ExtractError> {
     let mut out = Map::new();
     let Some(responses) = operation.get("responses").and_then(Value::as_object) else {
@@ -2299,6 +2336,7 @@ fn extract_swagger_responses(
             resolver.document_base(),
             resolver,
             ResolveContext::ReferenceObject,
+            state,
         )?;
         let Some(response_object) = resolved.as_object() else {
             continue;
@@ -2315,6 +2353,7 @@ fn extract_swagger_responses(
                 resolver.document_base(),
                 resolver,
                 ResolveContext::Schema,
+                state,
             )?;
             let schema = normalize_schema_for_openapi(schema, version, SchemaDirection::Response);
             for media_type in &produces {
@@ -2355,6 +2394,31 @@ const MAX_SCHEMA_REF_DEPTH: usize = 32;
 /// A shallow schema can otherwise use repeated local `$ref` branches to grow
 /// exponentially before the generated-config byte limit is checked.
 const MAX_RESOLVED_SCHEMA_NODES: usize = 500_000;
+/// Cumulative cap on values materialized by *every* reference expansion
+/// performed while importing one document (GHSA-8jc7-c52g-85xr).
+///
+/// The per-expansion cap above bounds a single schema. It does not bound a
+/// document that repeats a bounded-but-large expansion across many paths,
+/// operations, media types, or response statuses: each of those used to start
+/// from a fresh budget, so total materialization scaled with the number of
+/// expansion sites rather than with any fixed ceiling. One document-scoped
+/// account is threaded through the whole extraction so the importer's peak
+/// materialization is a constant, independent of document shape.
+///
+/// Sized at four times the single-expansion cap. Byte accounting below is the
+/// binding constraint on memory; this is the secondary structural guard, set
+/// with enough headroom that a large real document (hundreds of operations
+/// sharing sizable schemas) still imports — the largest public specs
+/// materialize well under 100k values in total.
+const MAX_TOTAL_RESOLVED_SCHEMA_NODES: usize = 4 * MAX_RESOLVED_SCHEMA_NODES;
+/// Cumulative byte cap companion to [`MAX_TOTAL_RESOLVED_SCHEMA_NODES`].
+///
+/// Bytes are charged against the JSON-serialized representation, so this is a
+/// direct ceiling on how much attacker-influenced memory one import may
+/// materialize before it is rejected. The expansion memo retains at most one
+/// copy of each distinct expansion it caches, so an import's peak retained
+/// resolution memory is at most twice this figure.
+const MAX_TOTAL_RESOLVED_SCHEMA_BYTES: usize = 2 * MAX_OPENAPI_VALIDATOR_CONFIG_SIZE;
 const MAX_SCHEMA_INDEX_DEPTH: usize = 64;
 /// Path Item recursion grows several YAML/JSON container levels per callback.
 /// Keep its explicit resolver budget below the parsers' own recursion ceiling
@@ -3304,7 +3368,7 @@ fn schema_reference_error(message: String) -> ExtractError {
     ExtractError::SchemaReference(message)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ResolveContext {
     ReferenceObject,
     Schema,
@@ -3392,7 +3456,7 @@ struct RefComposition<'a, 'b> {
     depth: usize,
     child_base: &'a Url,
     resolver: &'a LocalSchemaResolver,
-    budget: &'b mut ResolutionBudget,
+    state: &'b mut ResolutionState,
 }
 
 /// Compose a Schema Object `$ref` with its adjacent keywords without letting an
@@ -3421,7 +3485,7 @@ fn compose_schema_ref_siblings(
         depth,
         child_base,
         resolver,
-        budget,
+        state,
     } = ctx;
     let mut wrapper_fields = Map::new();
     let mut assertions = Map::new();
@@ -3442,7 +3506,7 @@ fn compose_schema_ref_siblings(
             child_base,
             resolver,
             schema_child_context(key, child),
-            budget,
+            state,
         )?;
         if SCHEMA_NON_ASSERTION_KEYWORDS.contains(&key.as_str())
             || key.starts_with("x-")
@@ -3467,17 +3531,23 @@ fn compose_schema_ref_siblings(
         return Ok(resolved_target);
     }
 
-    consume_resolution_budget(budget, location, 1, 2)?;
+    consume_resolution_budget(state, location, 1, 2)?;
     let mut wrapper = wrapper_fields;
     let mut branches = vec![resolved_target];
     if !assertions.is_empty() {
-        consume_resolution_budget(budget, location, 1, 2)?;
+        consume_resolution_budget(state, location, 1, 2)?;
         branches.push(Value::Object(assertions));
     }
     wrapper.insert("allOf".to_string(), Value::Array(branches));
     Ok(Value::Object(wrapper))
 }
 
+/// Expand one schema / reference position under the document-scoped account.
+///
+/// The per-expansion budget is reset here, so the documented single-expansion
+/// ceiling still applies to each schema individually, while the document
+/// account in `state` keeps accumulating across every expansion site.
+#[allow(clippy::too_many_arguments)]
 fn resolve_refs(
     root: &Value,
     value: &Value,
@@ -3486,8 +3556,9 @@ fn resolve_refs(
     current_base: &Url,
     resolver: &LocalSchemaResolver,
     context: ResolveContext,
+    state: &mut ResolutionState,
 ) -> Result<Value, ExtractError> {
-    let mut budget = ResolutionBudget {
+    state.expansion = ResolutionBudget {
         remaining_nodes: MAX_RESOLVED_SCHEMA_NODES,
         remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
     };
@@ -3499,7 +3570,7 @@ fn resolve_refs(
         current_base,
         resolver,
         context,
-        &mut budget,
+        state,
     )
 }
 
@@ -3508,25 +3579,140 @@ struct ResolutionBudget {
     remaining_bytes: usize,
 }
 
+/// Identity of a `$ref` target within the parsed document.
+///
+/// Every target is borrowed out of the same `root` tree, so the address of the
+/// target node uniquely identifies it. Using node identity (rather than the
+/// `$ref` literal) makes cycle detection independent of how a target is
+/// spelled: a pointer fragment, a plain-name anchor, and an `$id`-rebased
+/// relative reference that all land on the same node are the same target.
+type RefTargetId = usize;
+
+fn ref_target_id(target: &Value) -> RefTargetId {
+    std::ptr::from_ref(target) as RefTargetId
+}
+
+/// Memoization key for a completed reference expansion.
+///
+/// `depth` is part of the key on purpose. The remaining-depth ceiling is a
+/// documented part of the import contract, and the same target expanded with
+/// less remaining depth may legitimately be rejected where a shallower
+/// occurrence succeeded. Keying on it preserves that boundary exactly while
+/// still collapsing a high-branching DAG from exponential re-expansion to at
+/// most `MAX_SCHEMA_REF_DEPTH` expansions per target.
+#[derive(PartialEq, Eq, Hash)]
+struct MemoKey {
+    target: RefTargetId,
+    context: ResolveContext,
+    depth: usize,
+}
+
+/// A previously computed expansion plus the exact budget it cost.
+///
+/// Reuse still clones the value into its new position, so reuse is charged the
+/// same nodes/bytes the original computation was charged. Memoization removes
+/// duplicated *work*, never duplicated *accounting*.
+struct MemoEntry {
+    value: Arc<Value>,
+    nodes: usize,
+    bytes: usize,
+}
+
+/// Document-scoped reference-resolution state.
+///
+/// Holds the cumulative account, the active reference chain used for immediate
+/// cycle rejection, and the expansion memo. One instance covers a whole
+/// document import.
+struct ResolutionState {
+    /// Cumulative across every expansion site in the document.
+    document: ResolutionBudget,
+    /// Reset per [`resolve_refs`] call.
+    expansion: ResolutionBudget,
+    /// `$ref` literals for the targets currently being expanded, outermost first.
+    active_path: Vec<String>,
+    /// Membership index for `active_path`, keyed by target node identity.
+    active_targets: HashSet<RefTargetId>,
+    memo: HashMap<MemoKey, MemoEntry>,
+}
+
+impl ResolutionState {
+    fn new() -> Self {
+        Self {
+            document: ResolutionBudget {
+                remaining_nodes: MAX_TOTAL_RESOLVED_SCHEMA_NODES,
+                remaining_bytes: MAX_TOTAL_RESOLVED_SCHEMA_BYTES,
+            },
+            expansion: ResolutionBudget {
+                remaining_nodes: MAX_RESOLVED_SCHEMA_NODES,
+                remaining_bytes: MAX_OPENAPI_VALIDATOR_CONFIG_SIZE,
+            },
+            active_path: Vec::new(),
+            active_targets: HashSet::new(),
+            memo: HashMap::new(),
+        }
+    }
+
+    /// The reference chain that closed a cycle, rendered for the error message.
+    ///
+    /// Only `$ref` literals from the submitted document appear here.
+    fn cycle_path(&self, closing_reference: &str) -> String {
+        let mut path = self.active_path.join(" -> ");
+        if path.is_empty() {
+            closing_reference.to_string()
+        } else {
+            path.push_str(" -> ");
+            path.push_str(closing_reference);
+            path
+        }
+    }
+}
+
+/// Charge `nodes`/`bytes` against both the per-expansion and the document
+/// account before the corresponding memory is materialized.
 fn consume_resolution_budget(
-    budget: &mut ResolutionBudget,
+    state: &mut ResolutionState,
     location: &str,
     nodes: usize,
     bytes: usize,
 ) -> Result<(), ExtractError> {
-    let Some(remaining_nodes) = budget.remaining_nodes.checked_sub(nodes) else {
-        return Err(ExtractError::SchemaTooLarge {
-            location: location.to_string(),
-        });
-    };
-    let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(bytes) else {
-        return Err(ExtractError::SchemaTooLarge {
-            location: location.to_string(),
-        });
-    };
-    budget.remaining_nodes = remaining_nodes;
-    budget.remaining_bytes = remaining_bytes;
+    for budget in [&mut state.expansion, &mut state.document] {
+        let Some(remaining_nodes) = budget.remaining_nodes.checked_sub(nodes) else {
+            return Err(ExtractError::SchemaTooLarge {
+                location: location.to_string(),
+            });
+        };
+        let Some(remaining_bytes) = budget.remaining_bytes.checked_sub(bytes) else {
+            return Err(ExtractError::SchemaTooLarge {
+                location: location.to_string(),
+            });
+        };
+        budget.remaining_nodes = remaining_nodes;
+        budget.remaining_bytes = remaining_bytes;
+    }
     Ok(())
+}
+
+/// Charge the weight of a subtree that is about to be cloned wholesale, minus
+/// the container weight the caller already charged.
+///
+/// Whole-subtree clones (`Opaque` positions, Reference Objects that carry no
+/// `$ref`, and non-schema arrays) previously escaped accounting: only the
+/// container's shallow weight was charged while the entire subtree was cloned.
+/// A document could then repeat one large clone target across many references
+/// and materialize unbounded memory while staying well inside every declared
+/// budget.
+fn consume_subtree_clone_budget(
+    state: &mut ResolutionState,
+    location: &str,
+    value: &Value,
+) -> Result<(), ExtractError> {
+    let (nodes, bytes) = opaque_value_weight(value);
+    consume_resolution_budget(
+        state,
+        location,
+        nodes.saturating_sub(1),
+        bytes.saturating_sub(shallow_value_bytes(value)),
+    )
 }
 
 fn opaque_value_weight(value: &Value) -> (usize, usize) {
@@ -3601,11 +3787,11 @@ fn resolve_refs_bounded(
     current_base: &Url,
     resolver: &LocalSchemaResolver,
     context: ResolveContext,
-    budget: &mut ResolutionBudget,
+    state: &mut ResolutionState,
 ) -> Result<Value, ExtractError> {
     if context == ResolveContext::Opaque {
         let (nodes, bytes) = opaque_value_weight(value);
-        consume_resolution_budget(budget, location, nodes, bytes)?;
+        consume_resolution_budget(state, location, nodes, bytes)?;
         return Ok(value.clone());
     }
     if depth == 0 {
@@ -3613,7 +3799,7 @@ fn resolve_refs_bounded(
             location: location.to_string(),
         });
     }
-    consume_resolution_budget(budget, location, 1, shallow_value_bytes(value))?;
+    consume_resolution_budget(state, location, 1, shallow_value_bytes(value))?;
     match value {
         Value::Object(object) => {
             let child_base = if context == ResolveContext::Schema {
@@ -3634,15 +3820,15 @@ fn resolve_refs_bounded(
                 // are rejected inside `resolve_reference` as UnsupportedExternalRef.
                 let (target, target_base) =
                     resolver.resolve_reference(root, reference, &child_base)?;
-                let mut resolved = resolve_refs_bounded(
+                let mut resolved = resolve_ref_target(
                     root,
                     target,
-                    reference,
-                    depth - 1,
                     &target_base,
+                    reference,
+                    depth,
                     resolver,
                     context,
-                    budget,
+                    state,
                 )?;
                 if object.len() > 1 {
                     if context == ResolveContext::Schema {
@@ -3655,7 +3841,7 @@ fn resolve_refs_bounded(
                                 depth,
                                 child_base: &child_base,
                                 resolver,
-                                budget,
+                                state,
                             },
                             object,
                             resolved,
@@ -3680,7 +3866,7 @@ fn resolve_refs_bounded(
                                         &child_base,
                                         resolver,
                                         ResolveContext::Opaque,
-                                        budget,
+                                        state,
                                     )?,
                                 );
                             }
@@ -3690,6 +3876,9 @@ fn resolve_refs_bounded(
                 return Ok(resolved);
             }
             if context == ResolveContext::ReferenceObject {
+                // Whole-subtree clone: charge everything below the container,
+                // which the shallow charge above did not cover.
+                consume_subtree_clone_budget(state, location, value)?;
                 return Ok(value.clone());
             }
             let mut resolved = Map::new();
@@ -3709,7 +3898,7 @@ fn resolve_refs_bounded(
                         &child_base,
                         resolver,
                         child_context,
-                        budget,
+                        state,
                     )?,
                 );
             }
@@ -3726,13 +3915,96 @@ fn resolve_refs_bounded(
                     current_base,
                     resolver,
                     ResolveContext::Schema,
-                    budget,
+                    state,
                 )
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
-        other => Ok(other.clone()),
+        other => {
+            // Arrays that are not schema arrays (and every scalar) are cloned
+            // wholesale. Nested array contents are not covered by the shallow
+            // charge above, so account for them before cloning.
+            consume_subtree_clone_budget(state, location, other)?;
+            Ok(other.clone())
+        }
     }
+}
+
+/// Expand a `$ref` target, rejecting cycles immediately and reusing a prior
+/// identical expansion instead of recomputing it (GHSA-8jc7-c52g-85xr).
+///
+/// Cycle rejection happens the moment a target that is still on the active
+/// chain is re-entered, so a self-cycle or a mutual cycle fails without first
+/// expanding the remaining depth budget's worth of sibling branches.
+///
+/// Memoization is what keeps a high-branching acyclic DAG from re-expanding
+/// exponentially: the same `(target, context, remaining depth)` is computed
+/// once and afterwards only cloned. Because reuse is charged the recorded cost,
+/// total materialization stays bounded by the document account and total work
+/// stays proportional to it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_ref_target(
+    root: &Value,
+    target: &Value,
+    target_base: &Url,
+    reference: &str,
+    depth: usize,
+    resolver: &LocalSchemaResolver,
+    context: ResolveContext,
+    state: &mut ResolutionState,
+) -> Result<Value, ExtractError> {
+    let target_id = ref_target_id(target);
+    if state.active_targets.contains(&target_id) {
+        return Err(ExtractError::SchemaReferenceCycle {
+            path: state.cycle_path(reference),
+        });
+    }
+    let key = MemoKey {
+        target: target_id,
+        context,
+        depth: depth - 1,
+    };
+    // Take a cheap handle first so the deep clone still happens *after* the
+    // budget for it has been charged.
+    let cached = state
+        .memo
+        .get(&key)
+        .map(|entry| (Arc::clone(&entry.value), entry.nodes, entry.bytes));
+    if let Some((value, nodes, bytes)) = cached {
+        consume_resolution_budget(state, reference, nodes, bytes)?;
+        return Ok(value.as_ref().clone());
+    }
+
+    state.active_targets.insert(target_id);
+    state.active_path.push(reference.to_string());
+    let before_nodes = state.document.remaining_nodes;
+    let before_bytes = state.document.remaining_bytes;
+    let resolved = resolve_refs_bounded(
+        root,
+        target,
+        reference,
+        depth - 1,
+        target_base,
+        resolver,
+        context,
+        state,
+    );
+    state.active_path.pop();
+    state.active_targets.remove(&target_id);
+    let resolved = resolved?;
+
+    let nodes = before_nodes.saturating_sub(state.document.remaining_nodes);
+    let bytes = before_bytes.saturating_sub(state.document.remaining_bytes);
+    let value = Arc::new(resolved);
+    state.memo.insert(
+        key,
+        MemoEntry {
+            value: Arc::clone(&value),
+            nodes,
+            bytes,
+        },
+    );
+    Ok(value.as_ref().clone())
 }
 
 /// Whether a schema is being compiled for request or response validation.
@@ -4248,16 +4520,25 @@ fn parse_root_document(
         }
     };
 
-    // Defence-in-depth for very large literal YAML trees.  Anchor/alias syntax
-    // is rejected before serde_yaml materializes the Value, so this post-parse
-    // walk does not serve as the primary alias-bomb memory cap.
-    if parsed_via_yaml {
-        let mut budget = MAX_YAML_EXPANDED_NODES;
-        if !count_value_nodes(&root, &mut budget) {
-            return Err(ExtractError::InvalidYaml(
+    // Source-tree node cap, applied to **both** formats.
+    //
+    // For YAML this is defence-in-depth: anchor/alias syntax is rejected before
+    // serde_yaml materializes the Value, so this post-parse walk is not the
+    // primary alias-bomb memory cap. For JSON it is the only structural bound
+    // besides the request-body byte ceiling; without it, a JSON document could
+    // present far more reference sites than an equivalently sized YAML one and
+    // face a strictly weaker admission check (GHSA-8jc7-c52g-85xr).
+    let mut budget = MAX_SOURCE_DOCUMENT_NODES;
+    if !count_value_nodes(&root, &mut budget) {
+        return Err(if parsed_via_yaml {
+            ExtractError::InvalidYaml(
                 "YAML document exceeds expanded node limit; reduce nesting".to_string(),
-            ));
-        }
+            )
+        } else {
+            ExtractError::InvalidJson(
+                "JSON document exceeds expanded node limit; reduce nesting".to_string(),
+            )
+        });
     }
 
     Ok((root, actual_format))
@@ -4270,11 +4551,13 @@ fn parse_root_document(
 const YAML_ANCHORS_UNSUPPORTED_MESSAGE: &str =
     "YAML anchors and aliases are not supported in API specs; inline repeated content instead";
 
-/// Maximum number of `serde_json::Value` nodes allowed after YAML → JSON
-/// conversion.  500k nodes is generous for any real OpenAPI spec (the largest
-/// public specs top out around 50k nodes). Anchors and aliases are rejected
-/// before parsing; this guard caps large literal YAML documents.
-pub(crate) const MAX_YAML_EXPANDED_NODES: usize = 500_000;
+/// Maximum number of `serde_json::Value` nodes allowed in a parsed source
+/// document, and after a stored YAML → JSON representation conversion.
+///
+/// 500k nodes is generous for any real OpenAPI spec (the largest public specs
+/// top out around 50k nodes). Anchors and aliases are rejected before parsing;
+/// this guard caps large literal documents in either source format.
+pub(crate) const MAX_SOURCE_DOCUMENT_NODES: usize = 500_000;
 
 fn reject_yaml_alias_or_anchor_syntax(body: &[u8]) -> Result<(), ExtractError> {
     let mut in_single_quote = false;

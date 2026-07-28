@@ -2480,6 +2480,86 @@ pub mod _test_support {
         plugin.epoch_base_for_test()
     }
 
+    /// Tuple view of a UDP rejection diagnostic decision for external regressions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct UdpRejectionWarnDecisionForTest {
+        pub emitted: bool,
+        pub instance_suppressed: Option<u64>,
+        pub global_suppressed: Option<u64>,
+    }
+
+    pub fn udp_rate_limiting_record_rejection_warn_detail_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> UdpRejectionWarnDecisionForTest {
+        let detail = plugin
+            .record_rate_limit_rejection_warn_detail_for_test(global, limit_kind, proxy_id, now_ms);
+        UdpRejectionWarnDecisionForTest {
+            emitted: detail.emitted,
+            instance_suppressed: detail.instance_suppressed,
+            global_suppressed: detail.global_suppressed,
+        }
+    }
+
+    pub fn udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> u64 {
+        plugin.rejection_warn_suppressed_count_for_test()
+    }
+
+    pub fn udp_rate_limiting_reset_rejection_warn_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) {
+        plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
+    pub fn atomic_log_rate_limiter_with_window_for_test(
+        window_ms: u64,
+    ) -> crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::with_window_ms(window_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_on_event_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<u64> {
+        limiter.on_event(now_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_suppressed_count_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) -> u64 {
+        limiter.suppressed_count_for_test()
+    }
+
+    pub fn atomic_log_rate_limiter_reset_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) {
+        limiter.reset_for_test();
+    }
+
+    pub fn atomic_log_rate_limiter_seed_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        last_emit_ms: u64,
+        suppressed: u64,
+    ) {
+        limiter.seed_for_test(last_emit_ms, suppressed);
+    }
+
+    pub fn atomic_log_rate_limiter_dual_gate_emit_for_test(
+        instance: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<(u64, u64)> {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::dual_gate_emit(
+            instance, global, now_ms,
+        )
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two

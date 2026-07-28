@@ -24103,13 +24103,17 @@ components:
             - UnsupportedExternalRef
             - SchemaReference
             - SchemaTooDeep
+            - SchemaReferenceCycle
+            - SchemaTooLarge
           description: |
             Machine-readable error discriminant.
 
             **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
-            - `InvalidJson` — body is not valid JSON
-            - `InvalidYaml` — body is not valid YAML
+            - `InvalidJson` — body is not valid JSON, or the parsed JSON document exceeds the
+              500,000-node source-tree ceiling
+            - `InvalidYaml` — body is not valid YAML, uses anchors/aliases, or the parsed YAML
+              document exceeds the same 500,000-node source-tree ceiling
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
             - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
@@ -24125,6 +24129,13 @@ components:
             - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
             - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
+            - `SchemaReferenceCycle` — a local `$ref` chain re-enters a target that is still being
+              expanded (self-cycle, mutual cycle, or a longer ref loop). Rejected immediately on
+              re-entry rather than after exhausting the depth limit; `details` carries the chain of
+              `$ref` literals that closed the cycle
+            - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
+              per-document materialized-node / byte budget, or the generated operation table
+              exceeded the generated-config byte ceiling
         details:
           type: string
           description: |
