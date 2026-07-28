@@ -198,10 +198,10 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
     // namespace also exercises gateway_namespace label append on the live series.
     registry.configure(5, 3600, 60_000, "ferrum");
 
-    // Series selector omits the closing `}` so optional `,gateway_namespace=…`
-    // after the required labels still matches.
+    // Live harness passes closed selectors; optional gateway_namespace may be
+    // appended before the closing `}` when the Prometheus plugin is configured.
     const INBOUND_TLS_FAILURE: &str =
-        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"";
+        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}";
 
     let before_output = registry.render();
     let before_failure = prometheus_counter_value(&before_output, INBOUND_TLS_FAILURE);
@@ -241,25 +241,93 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
     );
 }
 
-/// Parse a Prometheus counter whose required labels may be followed by extra
-/// bounded labels (e.g. `gateway_namespace`) before the closing `}`.
-fn prometheus_counter_value(output: &str, series_prefix: &str) -> u64 {
+/// Parse a Prometheus counter for an exact closed selector (`metric{…}`).
+/// Matches the no-extra-label form and the same required labels with optional
+/// `gateway_namespace` appended before `}` — the same contract as
+/// `sum_ambient_metric_total` in the NodeWaypoint live harness.
+fn prometheus_counter_value(output: &str, selector: &str) -> u64 {
+    let Some(required_prefix) = selector.strip_suffix('}') else {
+        return 0;
+    };
+    let mut total = 0u64;
     for line in output.lines() {
-        if line.starts_with('#') || !line.starts_with(series_prefix) {
+        if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        let rest = &line[series_prefix.len()..];
-        if !(rest.starts_with('}') || rest.starts_with(',')) {
-            continue;
-        }
-        let Some(value) = line.rsplit_once(' ').map(|(_, v)| v) else {
+        let Some(rest) = line.strip_prefix(required_prefix) else {
             continue;
         };
-        if let Ok(parsed) = value.parse::<u64>() {
-            return parsed;
+        let Some(sample) = match_optional_gateway_namespace_sample(rest) else {
+            continue;
+        };
+        if let Ok(parsed) = sample.parse::<u64>() {
+            total = total.saturating_add(parsed);
         }
     }
-    0
+    total
+}
+
+/// After the required-label prefix, accept `} <n>` or
+/// `,gateway_namespace="…"} <n>`. Reject other extra labels and malformed tails.
+fn match_optional_gateway_namespace_sample(rest: &str) -> Option<&str> {
+    let after_labels = if let Some(after) = rest.strip_prefix('}') {
+        after
+    } else {
+        let Some(after_key) = rest.strip_prefix(",gateway_namespace=\"") else {
+            return None;
+        };
+        let Some((_value, after_value)) = after_key.split_once('"') else {
+            return None;
+        };
+        let Some(after) = after_value.strip_prefix('}') else {
+            return None;
+        };
+        after
+    };
+    // Prometheus exposition requires whitespace between `}` and the sample.
+    if after_labels.is_empty() || !after_labels.chars().next()?.is_whitespace() {
+        return None;
+    }
+    let sample = after_labels.trim_start();
+    if sample.is_empty() || sample.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(sample)
+}
+
+#[test]
+fn closed_metric_selector_matches_both_gateway_namespace_shapes() {
+    const SELECTOR: &str =
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}"#;
+
+    let without_ns = concat!(
+        "# HELP ferrum_mesh_node_waypoint_hbone_handshakes_total HBONE handshake outcomes\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"} 3"#,
+        "\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="success"} 9"#,
+        "\n",
+    );
+    assert_eq!(prometheus_counter_value(without_ns, SELECTOR), 3);
+
+    let with_ns = concat!(
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure",gateway_namespace="ferrum"} 4"#,
+        "\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure",gateway_namespace="other"} 1"#,
+        "\n",
+        // Wrong metric name / wrong required label must not contribute.
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total_extra{phase="inbound_tls",result="failure"} 100"#,
+        "\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure_extra"} 100"#,
+        "\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure",other="x"} 100"#,
+        "\n",
+        // Malformed sample (no value / non-numeric) fail closed.
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}"#,
+        "\n",
+        r#"ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"} not_a_number"#,
+        "\n",
+    );
+    assert_eq!(prometheus_counter_value(with_ns, SELECTOR), 5);
 }
 
 #[test]

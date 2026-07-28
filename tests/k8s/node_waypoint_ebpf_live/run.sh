@@ -2602,30 +2602,44 @@ collect_ambient_observability_metrics() {
 }
 
 sum_ambient_metric_total() {
-  # Sum a Prometheus series across all ambient NodeWaypoint pods. Matches lines
-  # that begin with the exact metric selector prefix and ends with a numeric
-  # sample. Missing series count as zero so first-scrape baselines work.
+  # Sum a Prometheus series across all ambient NodeWaypoint pods. Callers pass
+  # an exact selector ending in `}`, e.g. metric{phase="x",result="y"}. Match
+  # both that form and the same required labels with optional
+  # gateway_namespace appended before the closing brace. Missing series count
+  # as zero so first-scrape baselines work. Malformed samples are skipped.
   local metric_selector="$1"
   collect_ambient_observability_metrics
   python3 - "$RESULTS_DIR/ambient-observability-metrics" "$metric_selector" <<'PY'
 import pathlib
+import re
 import sys
 
 out_dir = pathlib.Path(sys.argv[1])
 selector = sys.argv[2]
 total = 0
+# Exact closed selectors end with `}`; strip it so a rendered series with
+# `,gateway_namespace="…"` still matches the required metric+label prefix.
+if not selector.endswith("}"):
+    print(0)
+    raise SystemExit(0)
+required_prefix = selector[:-1]
+# After the required-label prefix: either `} <sample>` or
+# `,gateway_namespace="<value>"} <sample>`. Reject other extra labels and
+# junk between the label set and the sample (fail closed).
+rest_re = re.compile(
+    r'^(?:\}|,gateway_namespace="[^"]*"\})\s+(\S+)\s*$'
+)
 for path in sorted(out_dir.glob("*.prom")):
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("#") or not line:
             continue
-        if not line.startswith(selector):
+        if not line.startswith(required_prefix):
             continue
-        # Allow optional gateway_namespace label suffix before the sample.
-        parts = line.rsplit(None, 1)
-        if len(parts) != 2:
+        match = rest_re.match(line[len(required_prefix):])
+        if match is None:
             continue
         try:
-            total += int(float(parts[1]))
+            total += int(float(match.group(1)))
         except ValueError:
             continue
 print(total)
