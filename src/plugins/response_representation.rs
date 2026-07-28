@@ -148,8 +148,8 @@
 //!   `ai_semantic_firewall`. It is stricter than browsers about padding after the
 //!   final member, so such a body is rejected rather than decoded.
 
-use std::collections::HashMap;
 use bytes::Bytes;
+use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
 

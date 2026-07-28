@@ -6545,7 +6545,9 @@ async fn handle_h3_request(
                     );
                     result = H3BufferedDispatchResult {
                         status: 502,
-                        body: Bytes::from_static(br#"{"error":"backend address blocked by egress policy"}"#),
+                        body: Bytes::from_static(
+                            br#"{"error":"backend address blocked by egress policy"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
@@ -8252,7 +8254,9 @@ async fn collect_h3_open_response_body(
                 {
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
+                        body: Bytes::from_static(
+                            br#"{"error":"Backend response body exceeds maximum size"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -8277,7 +8281,9 @@ async fn collect_h3_open_response_body(
                     );
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: Bytes::from_static(br#"{"error":"HTTP/3 backend response truncated"}"#),
+                        body: Bytes::from_static(
+                            br#"{"error":"HTTP/3 backend response truncated"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
@@ -10873,7 +10879,9 @@ async fn proxy_to_backend_h3(
                 );
                 return H3BufferedDispatchResult {
                     status: 502,
-                    body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
+                    body: Bytes::from_static(
+                        br#"{"error":"Backend response body exceeds maximum size"}"#,
+                    ),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),

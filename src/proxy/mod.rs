@@ -21350,7 +21350,9 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Bytes::from_static(br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#),
+                    Bytes::from_static(
+                        br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    ),
                     HashMap::new(),
                     is_grpc_request,
                 )
@@ -24189,10 +24191,8 @@ async fn handle_proxy_request_inner(
                         let synced_len = owned_body.len();
                         ResponseBody::store_buffered_vec(&mut response_body, owned_body);
                         if synced {
-                            plugin_response_headers.insert(
-                                "content-length".to_string(),
-                                synced_len.to_string(),
-                            );
+                            plugin_response_headers
+                                .insert("content-length".to_string(), synced_len.to_string());
                         }
                     }
                     // Retire compatibility-view application trailers only after

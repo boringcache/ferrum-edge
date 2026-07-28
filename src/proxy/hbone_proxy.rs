@@ -543,7 +543,9 @@ pub(super) async fn handle_hbone_request(
                     plugins,
                     ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Bytes::from_static(br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#),
+                    Bytes::from_static(
+                        br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    ),
                     HashMap::new(),
                     false,
                 )
@@ -896,7 +898,9 @@ pub(super) async fn handle_hbone_udp_request(
             plugins,
             ctx,
             StatusCode::FORBIDDEN,
-            Bytes::from_static(br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#),
+            Bytes::from_static(
+                br#"{"error":"HBONE UDP tunnel requires an authenticated mesh peer"}"#,
+            ),
             HashMap::new(),
             false,
         )
@@ -1631,7 +1635,7 @@ mod tests {
     use crate::retry::ErrorClass;
     use std::collections::HashMap;
 
-use bytes::Bytes;
+    use bytes::Bytes;
     use std::time::Instant;
 
     fn minimal_proxy() -> Proxy {

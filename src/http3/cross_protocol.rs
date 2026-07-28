@@ -5066,20 +5066,20 @@ where
                 let content_type = plugin_response_headers
                     .get("content-type")
                     .map(String::as_str);
-                let mut owned_body = crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
-                let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                    &mut owned_body,
-                    content_type,
-                    &response_trailers,
-                    http_status,
-                );
+                let mut owned_body =
+                    crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
+                let synced =
+                    crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                        &mut owned_body,
+                        content_type,
+                        &response_trailers,
+                        http_status,
+                    );
                 let synced_len = owned_body.len();
                 crate::retry::ResponseBody::store_buffered_vec(&mut response_body, owned_body);
                 if synced {
-                    plugin_response_headers.insert(
-                        "content-length".to_string(),
-                        synced_len.to_string(),
-                    );
+                    plugin_response_headers
+                        .insert("content-length".to_string(), synced_len.to_string());
                 }
             }
             // Retire compatibility-view application trailers only after the
