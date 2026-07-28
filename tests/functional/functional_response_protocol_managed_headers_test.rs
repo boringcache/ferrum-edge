@@ -362,7 +362,11 @@ async fn functional_empty_and_head_reject_framing_h1_h2_h3() {
     for (label, client) in [("H1", &h1), ("H2", &h2)] {
         // Empty reject: canonical zero, never a preserved streaming length.
         let empty = client.get(&empty_url).send().await.expect("empty reject");
-        assert_eq!(empty.status(), StatusCode::FORBIDDEN, "{label} empty status");
+        assert_eq!(
+            empty.status(),
+            StatusCode::FORBIDDEN,
+            "{label} empty status"
+        );
         assert_no_protocol_managed(empty.headers(), &format!("{label} empty reject"));
         assert_eq!(
             empty
@@ -387,11 +391,7 @@ async fn functional_empty_and_head_reject_framing_h1_h2_h3() {
         assert!(head.bytes().await.expect("HEAD body").is_empty());
 
         // 204 forbids a body: no length at all.
-        let no_content = client
-            .get(&nocontent_url)
-            .send()
-            .await
-            .expect("204 reject");
+        let no_content = client.get(&nocontent_url).send().await.expect("204 reject");
         assert_eq!(no_content.status(), StatusCode::NO_CONTENT);
         assert!(
             no_content.headers().get(header::CONTENT_LENGTH).is_none(),
@@ -443,10 +443,7 @@ async fn functional_empty_and_head_reject_framing_h1_h2_h3() {
     .await;
     assert_eq!(h3_no_content.status, StatusCode::NO_CONTENT);
     assert!(
-        h3_no_content
-            .headers
-            .get(header::CONTENT_LENGTH)
-            .is_none(),
+        h3_no_content.headers.get(header::CONTENT_LENGTH).is_none(),
         "H3: 204 must not advertise a body length"
     );
 }
