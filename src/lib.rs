@@ -3843,16 +3843,17 @@ pub mod _test_support {
         }
     }
 
-    /// Build wire headers for a normalized reject through the production
-    /// H1/H2 builder. Used to prove ExactBody length repair still sets
-    /// Content-Length for ordinary HTTP rejects while failed WebSocket
-    /// handshakes strip it after sanitization.
-    pub fn build_normalized_reject_wire_headers_for_test(
+    /// Build the wire response parts for a normalized reject through the
+    /// production H1/H2 builder. Used to prove that ExactBody length repair
+    /// publishes an authoritative `Content-Length` on both ordinary HTTP rejects
+    /// and failed WebSocket handshakes, and that the failed handshake stays a
+    /// valid HTTP/1.1-or-newer non-upgrade response.
+    pub fn build_normalized_reject_wire_parts_for_test(
         status: StatusCode,
         body: &[u8],
         headers: HashMap<String, String>,
         failed_websocket_handshake: bool,
-    ) -> http::HeaderMap {
+    ) -> http::response::Parts {
         let reject = crate::proxy::NormalizedRejectResponse {
             http_status: status,
             headers,
@@ -3862,8 +3863,8 @@ pub mod _test_support {
             failed_websocket_handshake,
         };
         crate::proxy::build_response_from_normalized_reject(reject)
-            .headers()
-            .clone()
+            .into_parts()
+            .0
     }
 
     pub fn set_websocket_response_boundary_for_test(

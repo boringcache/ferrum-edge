@@ -9648,35 +9648,39 @@ pub(crate) fn finalize_successful_websocket_response_headers(
 
 fn build_websocket_error_response(
     status: StatusCode,
-    body: &'static str,
+    body: &str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
     let mut response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+    // Strips WebSocket negotiation / hop-by-hop fields *and* any policy-authored
+    // `Content-Length` so the authoritative length below is the only one.
     finalize_websocket_response_headers(
         initial_response_header_policy_plugins,
         &mut response_headers,
     );
-    // A failed handshake must not acquire transport-managed framing after the
-    // policy strip. Unknown body length prevents Hyper's H2 encoder from
-    // synthesizing Content-Length; HTTP/1.0 selects close-delimited H1 framing
-    // instead of Transfer-Encoding: chunked.
-    headers_mod::apply_response_headers(
-        Response::builder()
-            .status(status)
-            .version(hyper::Version::HTTP_10),
-        &response_headers,
+    // A failed handshake is an ordinary HTTP response (RFC 6455 §4.2.2): it keeps
+    // the negotiated HTTP version and an authoritative `Content-Length` derived
+    // from the error body. Only the transport-owned negotiation fields above are
+    // forbidden. Forcing HTTP/1.0 here would make the reject unreadable to RFC
+    // 6455 clients, which require a 1.1-or-newer handshake response.
+    headers_mod::apply_sanitized_response_headers(
+        Response::builder().status(status),
+        &mut response_headers,
+        headers_mod::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        },
     )
-    .body(ProxyBody::bytes_without_advertised_length(body))
+    .body(ProxyBody::from_string(body))
     .unwrap_or_else(|_| build_websocket_error_fallback_response(status))
 }
 
 fn build_websocket_error_fallback_response(status: StatusCode) -> Response<ProxyBody> {
-    let mut response = Response::new(ProxyBody::bytes_without_advertised_length(
+    let mut response = Response::new(ProxyBody::from_string(
         r#"{"error":"Internal server error"}"#,
     ));
     *response.status_mut() = status;
-    *response.version_mut() = hyper::Version::HTTP_10;
     response
 }
 
@@ -16486,8 +16490,10 @@ pub(crate) struct NormalizedRejectResponse {
     /// Typed failed-WebSocket handshake boundary. Set from the request-context
     /// flavor stamp (or an equivalent protocol-owned path), never inferred from
     /// attacker/plugin-controlled response headers. When true, the response
-    /// builder strips transport-managed fields again after ExactBody length
-    /// repair so `Content-Length` cannot be reintroduced onto the wire.
+    /// builder re-strips transport-owned negotiation fields (and any
+    /// plugin-authored `Content-Length`) before framing repair, so only the
+    /// gateway-derived body length reaches the wire. The response stays a valid
+    /// HTTP/1.1-or-newer non-upgrade response.
     pub(crate) failed_websocket_handshake: bool,
 }
 
@@ -16548,8 +16554,8 @@ fn finalize_synthesized_reject_headers(
             &mut reject.headers,
         );
         // Early strip protects intermediate observers; the builder still needs
-        // the typed signal so ExactBody length repair cannot reintroduce
-        // Content-Length immediately before the wire response is built.
+        // the typed signal so a later hook cannot reintroduce transport-owned
+        // negotiation fields immediately before the wire response is built.
         reject.failed_websocket_handshake = true;
     } else {
         finalize_plain_gateway_error_response_headers(
@@ -16746,6 +16752,15 @@ pub(crate) fn build_response_from_normalized_reject(
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
     let mut headers = reject.headers;
+    // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
+    // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
+    // body length. What it must never carry is transport-owned negotiation
+    // metadata (`Upgrade`, `Connection`, `Sec-WebSocket-*`) or a plugin-authored
+    // `Content-Length`. Strip those *before* the framing sanitizer so the
+    // derived length below is the only one that can reach the wire.
+    if failed_websocket_handshake {
+        strip_websocket_transport_managed_response_header_map(&mut headers);
+    }
     // Final protocol-aware boundary after reject after_proxy hooks: strip
     // hop-by-hop / Connection-listed fields and derive Content-Length from the
     // synthetic body. Empty bodies (HEAD representation CL from
@@ -16759,28 +16774,11 @@ pub(crate) fn build_response_from_normalized_reject(
             len: reject.body.len() as u64,
         }
     };
-    // Sanitize/repair first, then — for failed WebSocket handshakes only —
-    // strip transport-managed fields again so ExactBody cannot reintroduce
-    // Content-Length (mirrors the H3 failed-handshake writer ordering).
     headers_mod::sanitize_client_response_headers_for_wire(&mut headers, framing);
-    if failed_websocket_handshake {
-        strip_websocket_transport_managed_response_header_map(&mut headers);
-    }
-    // HTTP/1.0 forces close-delimited framing when the body cannot advertise
-    // length, so Hyper does not synthesize Transfer-Encoding: chunked after we
-    // stripped Content-Length. H2 ignores the HTTP version on the response
-    // object and still omits Content-Length when size_hint is unknown.
-    let mut builder = Response::builder().status(reject.http_status);
-    if failed_websocket_handshake {
-        builder = builder.version(hyper::Version::HTTP_10);
-    }
-    let builder = headers_mod::apply_response_headers(builder, &headers);
+    let reject_builder = Response::builder().status(reject.http_status);
+    let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if failed_websocket_handshake {
-        // Exact Full size hints make Hyper's H1/H2 codecs re-insert
-        // Content-Length after the authoritative strip above.
-        ProxyBody::bytes_without_advertised_length(reject.body)
-    } else if reject.body.is_empty() {
+    let body = if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).

@@ -1236,7 +1236,12 @@ fn assert_no_h1_only_websocket_headers(headers: &http::HeaderMap) {
     }
 }
 
-fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
+/// A failed WebSocket handshake is an ordinary HTTP response (RFC 6455 §4.2.2):
+/// it must not carry transport-owned negotiation or hop-by-hop fields, but it
+/// keeps ordinary representation metadata such as `Content-Length`. Framing
+/// coverage lives in [`assert_failed_websocket_handshake_framing`] and
+/// [`assert_authoritative_content_length`].
+fn assert_no_failed_websocket_negotiation_headers(headers: &http::HeaderMap) {
     for name in [
         "connection",
         "keep-alive",
@@ -1246,7 +1251,6 @@ fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
         "trailer",
         "transfer-encoding",
         "upgrade",
-        "content-length",
         "sec-websocket-accept",
         "sec-websocket-key",
         "sec-websocket-version",
@@ -1258,6 +1262,39 @@ fn assert_no_failed_websocket_transport_headers(headers: &http::HeaderMap) {
             "failed WebSocket handshake must not carry transport-managed {name}"
         );
     }
+}
+
+/// The reject must be self-delimiting through an authoritative gateway-derived
+/// `Content-Length`, never through `Transfer-Encoding` or connection close. A
+/// missing length here is how the earlier HTTP/1.0 framing workaround made
+/// RFC 6455 clients fail the handshake response outright.
+fn assert_failed_websocket_handshake_framing(headers: &http::HeaderMap) {
+    let Some(content_length) = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        panic!("failed WebSocket handshake must advertise Content-Length; headers={headers:?}");
+    };
+    assert!(
+        !content_length.is_empty() && content_length.bytes().all(|b| b.is_ascii_digit()),
+        "Content-Length must be a plain decimal, got {content_length:?}"
+    );
+    assert!(
+        headers.get(http::header::TRANSFER_ENCODING).is_none(),
+        "failed WebSocket handshake must not be chunked; headers={headers:?}"
+    );
+}
+
+/// Exact-length variant for call sites that can read the reject body.
+fn assert_authoritative_content_length(headers: &http::HeaderMap, body_len: usize) {
+    let expected = body_len.to_string();
+    assert_eq!(
+        headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "Content-Length must equal the {body_len}-byte reject body; headers={headers:?}"
+    );
 }
 
 // ============================================================================
@@ -1431,7 +1468,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
-            assert_no_failed_websocket_transport_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1453,7 +1490,7 @@ async fn test_websocket_origin_allowlist_rejects_missing_and_disallowed_h1() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
-            assert_no_failed_websocket_transport_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
         }
         other => panic!("expected HTTP 403 handshake rejection, got {other:?}"),
     }
@@ -1603,7 +1640,7 @@ async fn test_websocket_key_auth_rejects_missing_key() {
             assert_ws_security_policy(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
-            assert_no_failed_websocket_transport_headers(response.headers());
+            assert_no_failed_websocket_negotiation_headers(response.headers());
             assert_eq!(
                 response
                     .headers()
@@ -1650,7 +1687,7 @@ async fn test_h3_websocket_key_auth_reject_strips_transport_policy_fields() {
     assert_ws_security_policy(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
-    assert_no_failed_websocket_transport_headers(&rejected.headers);
+    assert_no_failed_websocket_negotiation_headers(&rejected.headers);
     assert_eq!(
         rejected
             .headers
@@ -2082,12 +2119,14 @@ async fn test_websocket_backend_admission_reject_strips_transport_policy_fields(
             assert_ws_later_reject_hook_wins(response.headers());
             assert_no_ws_transport_policy_values(response.headers());
             assert_no_h1_only_websocket_headers(response.headers());
-            assert_no_failed_websocket_transport_headers(response.headers());
-            let body = response
-                .body()
-                .as_ref()
-                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-                .unwrap_or_default();
+            assert_no_failed_websocket_negotiation_headers(response.headers());
+            assert_failed_websocket_handshake_framing(response.headers());
+            let body_bytes = response.body().as_ref().cloned().unwrap_or_default();
+            // The H1 reject must stay a valid HTTP/1.1 response whose length the
+            // gateway derives itself: tungstenite rejects HTTP/1.0 handshake
+            // responses outright (RFC 6455 §4.1).
+            assert_authoritative_content_length(response.headers(), body_bytes.len());
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
             assert!(
                 body.contains("Upstream concurrency limit reached"),
                 "unexpected rejection body: {body}"
@@ -2154,18 +2193,21 @@ async fn test_h3_websocket_backend_admission_preserves_later_reject_hook_order()
     assert_ws_later_reject_hook_wins(&rejected.headers);
     assert_no_ws_transport_policy_values(&rejected.headers);
     assert_no_h1_only_websocket_headers(&rejected.headers);
-    assert_no_failed_websocket_transport_headers(&rejected.headers);
+    assert_no_failed_websocket_negotiation_headers(&rejected.headers);
     assert!(
         !rejected.headers.contains_key(http::header::CONTENT_TYPE),
         "the final H3 reject writer must preserve policy removal of content-type"
     );
-    assert!(
-        rejected
-            .recv_body_text()
-            .await
-            .expect("backend-admission rejection body")
-            .contains("Upstream concurrency limit reached")
-    );
+    assert_failed_websocket_handshake_framing(&rejected.headers);
+    let rejected_headers = rejected.headers.clone();
+    let rejected_body = rejected
+        .recv_body_text()
+        .await
+        .expect("backend-admission rejection body");
+    assert!(rejected_body.contains("Upstream concurrency limit reached"));
+    // RFC 9220 failed Extended CONNECT: negotiation fields are stripped, but the
+    // gateway-derived representation length stays authoritative.
+    assert_authoritative_content_length(&rejected_headers, rejected_body.len());
 
     first_ws
         .send_close()
@@ -2214,14 +2256,15 @@ async fn test_h3_websocket_open_circuit_reject_strips_transport_policy_fields() 
     assert_ws_security_policy(&circuit_rejected.headers);
     assert_no_ws_transport_policy_values(&circuit_rejected.headers);
     assert_no_h1_only_websocket_headers(&circuit_rejected.headers);
-    assert_no_failed_websocket_transport_headers(&circuit_rejected.headers);
-    assert!(
-        circuit_rejected
-            .recv_body_text()
-            .await
-            .expect("open-circuit rejection body")
-            .contains("circuit breaker open")
-    );
+    assert_no_failed_websocket_negotiation_headers(&circuit_rejected.headers);
+    assert_failed_websocket_handshake_framing(&circuit_rejected.headers);
+    let circuit_headers = circuit_rejected.headers.clone();
+    let circuit_body = circuit_rejected
+        .recv_body_text()
+        .await
+        .expect("open-circuit rejection body");
+    assert!(circuit_body.contains("circuit breaker open"));
+    assert_authoritative_content_length(&circuit_headers, circuit_body.len());
 
     let _ = gateway.kill();
     let _ = gateway.wait();
@@ -2268,7 +2311,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h1_rejected.headers());
     assert_no_ws_transport_policy_values(h1_rejected.headers());
     assert_no_h1_only_websocket_headers(h1_rejected.headers());
-    assert_no_failed_websocket_transport_headers(h1_rejected.headers());
+    assert_no_failed_websocket_negotiation_headers(h1_rejected.headers());
 
     let h2_stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{gateway_http_port}"))
         .await
@@ -2303,7 +2346,7 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(h2_rejected.headers());
     assert_no_ws_transport_policy_values(h2_rejected.headers());
     assert_no_h1_only_websocket_headers(h2_rejected.headers());
-    assert_no_failed_websocket_transport_headers(h2_rejected.headers());
+    assert_no_failed_websocket_negotiation_headers(h2_rejected.headers());
     h2_connection_task.abort();
 
     let h3_url = format!("https://localhost:{gateway_https_port}/ws-echo");
@@ -2323,14 +2366,15 @@ async fn test_websocket_method_filter_reject_applies_security_policy_h1_h2_and_h
     assert_ws_security_policy(&h3_rejected.headers);
     assert_no_ws_transport_policy_values(&h3_rejected.headers);
     assert_no_h1_only_websocket_headers(&h3_rejected.headers);
-    assert_no_failed_websocket_transport_headers(&h3_rejected.headers);
-    assert!(
-        h3_rejected
-            .recv_body_text()
-            .await
-            .expect("H3 method-filter rejection body")
-            .contains("Method Not Allowed")
-    );
+    assert_no_failed_websocket_negotiation_headers(&h3_rejected.headers);
+    assert_failed_websocket_handshake_framing(&h3_rejected.headers);
+    let h3_reject_headers = h3_rejected.headers.clone();
+    let h3_reject_body = h3_rejected
+        .recv_body_text()
+        .await
+        .expect("H3 method-filter rejection body");
+    assert!(h3_reject_body.contains("Method Not Allowed"));
+    assert_authoritative_content_length(&h3_reject_headers, h3_reject_body.len());
 
     let _ = gateway.kill();
     let _ = gateway.wait();

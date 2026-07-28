@@ -3119,9 +3119,14 @@ fn test_normalize_reject_response_converts_grpc_requests_to_trailers_only_errors
     assert!(!normalized.failed_websocket_handshake);
 }
 
+/// A failed WebSocket handshake is an ordinary HTTP response (RFC 6455 §4.2.2):
+/// transport-owned negotiation metadata must not survive, but the response keeps
+/// an authoritative gateway-derived `Content-Length`. Using an invalid HTTP
+/// version or an unframed body instead makes RFC 6455 clients fail the reject
+/// before they can observe its status.
 #[test]
-fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() {
-    use ferrum_edge::_test_support::build_normalized_reject_wire_headers_for_test;
+fn test_normalized_reject_builder_keeps_authoritative_length_and_drops_negotiation_fields() {
+    use ferrum_edge::_test_support::build_normalized_reject_wire_parts_for_test;
 
     let body = br#"{"error":"forbidden"}"#;
     let headers = HashMap::from([
@@ -3132,35 +3137,53 @@ fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() 
             "sec-websocket-accept".to_string(),
             "policy-must-not-escape".to_string(),
         ),
+        // Hostile / stale plugin-authored length: must be replaced, not trusted.
+        ("content-length".to_string(), "999999".to_string()),
     ]);
 
     let expected_content_length = body.len().to_string();
-    let ordinary = build_normalized_reject_wire_headers_for_test(
-        StatusCode::FORBIDDEN,
-        body,
-        headers.clone(),
-        false,
-    );
-    assert_eq!(
-        ordinary
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok()),
-        Some(expected_content_length.as_str()),
-        "ordinary HTTP rejects must keep ExactBody Content-Length"
-    );
-    // Ordinary rejects still strip hop-by-hop via the sanitizer.
-    assert!(ordinary.get(http::header::UPGRADE).is_none());
-    assert!(ordinary.get(http::header::CONNECTION).is_none());
+    for failed_websocket_handshake in [false, true] {
+        let parts = build_normalized_reject_wire_parts_for_test(
+            StatusCode::FORBIDDEN,
+            body,
+            headers.clone(),
+            failed_websocket_handshake,
+        );
+        assert_eq!(parts.status, StatusCode::FORBIDDEN);
+        assert!(
+            parts.version >= http::Version::HTTP_11,
+            "reject must stay HTTP/1.1 or newer, got {:?} \
+             (failed_websocket_handshake={failed_websocket_handshake})",
+            parts.version
+        );
+        let wire = parts.headers;
+        assert_eq!(
+            wire.get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_content_length.as_str()),
+            "ExactBody repair must publish the real body length \
+             (failed_websocket_handshake={failed_websocket_handshake})"
+        );
+        assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+        assert!(wire.get(http::header::UPGRADE).is_none());
+        assert!(wire.get(http::header::CONNECTION).is_none());
+        assert_eq!(
+            wire.get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "ordinary representation metadata must survive the boundary"
+        );
+    }
 
+    // `Sec-WebSocket-*` is transport-owned only on the typed WebSocket boundary;
+    // the ordinary HTTP reject path has no reason to special-case it.
     let failed_ws =
-        build_normalized_reject_wire_headers_for_test(StatusCode::FORBIDDEN, body, headers, true);
+        build_normalized_reject_wire_parts_for_test(StatusCode::FORBIDDEN, body, headers, true)
+            .headers;
     assert!(
-        failed_ws.get(http::header::CONTENT_LENGTH).is_none(),
-        "failed WebSocket rejects must strip Content-Length after ExactBody repair"
+        failed_ws.get("sec-websocket-accept").is_none(),
+        "failed WebSocket rejects must not leak a policy-authored Sec-WebSocket-Accept"
     );
-    assert!(failed_ws.get(http::header::UPGRADE).is_none());
-    assert!(failed_ws.get(http::header::CONNECTION).is_none());
-    assert!(failed_ws.get("sec-websocket-accept").is_none());
 }
 
 #[test]

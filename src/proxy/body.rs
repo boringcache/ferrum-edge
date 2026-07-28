@@ -526,39 +526,6 @@ impl http_body::Body for EmptyUnknownLengthBody {
     }
 }
 
-/// Buffered body bytes that never advertise an exact length.
-///
-/// Failed WebSocket handshake rejects strip `Content-Length` after ExactBody
-/// repair, but Hyper's H1 and H2 codecs re-insert it whenever `size_hint()` is
-/// exact. This body keeps the synthetic error payload while forcing
-/// close-delimited (H1/1.0) or DATA-without-CL (H2) framing instead.
-struct BytesUnknownLengthBody {
-    data: Option<Bytes>,
-}
-
-impl http_body::Body for BytesUnknownLengthBody {
-    type Data = Bytes;
-    type Error = ProxyBodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.data.take() {
-            Some(data) if !data.is_empty() => Poll::Ready(Some(Ok(Frame::data(data)))),
-            _ => Poll::Ready(None),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.data.as_ref().is_none_or(|data| data.is_empty())
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        http_body::SizeHint::new()
-    }
-}
-
 impl ProxyBody {
     /// Create a buffered body from bytes.
     pub fn full(data: impl Into<Bytes>) -> Self {
@@ -621,20 +588,6 @@ impl ProxyBody {
             Self::streaming(Box::pin(EmptyUnknownLengthBody { done: false }))
         } else {
             Self::empty()
-        }
-    }
-
-    /// Buffered bytes that must not advertise `Content-Length` via size hints.
-    ///
-    /// Used by failed WebSocket handshake rejects after the authoritative
-    /// transport-managed strip so Hyper cannot reintroduce `Content-Length`
-    /// from an exact `Full` body length on H1 or H2.
-    pub(crate) fn bytes_without_advertised_length(data: impl Into<Bytes>) -> Self {
-        let data = data.into();
-        if data.is_empty() {
-            Self::streaming(Box::pin(EmptyUnknownLengthBody { done: false }))
-        } else {
-            Self::streaming(Box::pin(BytesUnknownLengthBody { data: Some(data) }))
         }
     }
 

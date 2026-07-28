@@ -11105,9 +11105,9 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
 }
 
 /// Send an already protocol-sanitized reject. Callers that must strip
-/// additional transport-managed fields (failed H3 WebSocket handshake) run
-/// that strip after length repair and invoke this helper so ExactBody cannot
-/// reintroduce `Content-Length` on the wire.
+/// additional transport-owned fields (failed H3 WebSocket handshake) run that
+/// strip *before* length repair and invoke this helper, so only the
+/// gateway-derived `Content-Length` reaches the wire.
 async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
@@ -11994,10 +11994,12 @@ async fn send_h3_reject_flavor_aware_with_header_state(
                     .insert("content-type".to_string(), "application/json".to_string());
             }
             // Final protocol-aware boundary for a failed Extended CONNECT
-            // handshake: hop-by-hop / Connection-listed strip and body-length
-            // repair first, then remove transport-managed handshake fields
-            // (including Content-Length) so ExactBody cannot reintroduce them
-            // immediately before the H3 builder.
+            // handshake: remove transport-owned handshake fields (and any
+            // policy-authored Content-Length) first, then apply the hop-by-hop /
+            // Connection-listed strip and derive the authoritative body length.
+            // A failed handshake is an ordinary HTTP response, so it keeps that
+            // length; only the negotiation metadata is forbidden.
+            crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
             let framing = if http_body.is_empty() {
                 ClientResponseFraming::Streaming {
                     status: http_status.as_u16(),
@@ -12009,7 +12011,6 @@ async fn send_h3_reject_flavor_aware_with_header_state(
                 }
             };
             sanitize_client_response_headers_for_wire(&mut finalized_headers, framing);
-            crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
             return send_h3_pre_sanitized_reject_response_with_recv_halt(
                 stream,
                 http_status,
