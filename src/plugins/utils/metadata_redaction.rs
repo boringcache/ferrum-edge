@@ -290,7 +290,11 @@ fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
 /// Returns true when the key is request-private lifecycle state that must be
 /// omitted from every transaction-log / audit projection.
 pub fn is_internal_only_metadata_key(key: &str) -> bool {
-    key.starts_with(INTERNAL_ONLY_METADATA_KEY_PREFIX)
+    key.as_bytes()
+        .get(..INTERNAL_ONLY_METADATA_KEY_PREFIX.len())
+        .is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(INTERNAL_ONLY_METADATA_KEY_PREFIX.as_bytes())
+        })
 }
 
 /// Strip every internal-only metadata key from a cloned observability map.

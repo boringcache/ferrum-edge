@@ -319,8 +319,9 @@ reload.
 
 ### Internal-only lifecycle metadata
 
-Keys whose names start with `_dedup_` are **internal-only**. They are stripped
-by `clone_log_metadata` and omitted by every native / schema serializer.
+Keys whose names start case-insensitively with `_dedup_` are
+**internal-only**. They are stripped by `clone_log_metadata` and omitted by
+every native / schema serializer.
 `request_deduplication` keeps ownership key, fingerprint, local inflight token,
 and Redis lock token in typed non-serializable request state instead of public
 metadata; the `_dedup_` filter is the shared fail-closed contract if any

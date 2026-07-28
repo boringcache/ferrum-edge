@@ -21,6 +21,8 @@ const LEGACY_DEDUP_FIELDS: &[&str] = &[
     "_dedup_fingerprint",
     "_dedup_local_inflight_token",
     "_dedup_redis_lock_token",
+    "_DEDUP_REDIS_LOCK_TOKEN",
+    "_DeDuP_Local_Inflight_Token",
 ];
 
 const API_CREDENTIAL_KEYS: &[&str] = &[
