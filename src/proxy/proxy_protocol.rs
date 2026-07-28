@@ -371,10 +371,13 @@ pub fn apply_proxy_result(
     result: ProxyProtocolResult,
     socket_peer: &std::net::SocketAddr,
 ) -> (String, String) {
-    let direct = socket_peer.ip().to_canonical().to_string();
+    let direct = crate::util::client_identity::canonical_ip_string(socket_peer.ip());
     match result {
         ProxyProtocolResult::Forwarded { src, .. } => {
-            let resolved = src.ip().to_canonical().to_string();
+            // A PROXY v2 `AF_INET6` block legitimately carries the mapped form for
+            // an IPv4 client; fold it so the forwarded principal matches the
+            // native-IPv4 one (GHSA-vjwj-657f-5w9g).
+            let resolved = crate::util::client_identity::canonical_ip_string(src.ip());
             (resolved, direct)
         }
         ProxyProtocolResult::NoAddress => (direct.clone(), direct),

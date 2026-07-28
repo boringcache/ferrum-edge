@@ -68,10 +68,16 @@ impl AiTokenUsage {
         }
     }
 
+    /// Resolve the configured `count_mode` counter.
+    ///
+    /// Prompt/completion modes return `None` when the selected counter was not
+    /// explicitly reported. `Some(0)` is preserved only for an explicit numeric
+    /// zero. Total mode may combine or fall back to a single reported component,
+    /// but only when at least one component or an explicit total was present.
     pub fn total_for_mode(&self, count_mode: &str) -> Option<u64> {
         match count_mode {
-            "prompt_tokens" => self.prompt_tokens.or(Some(0)),
-            "completion_tokens" => self.completion_tokens.or(Some(0)),
+            "prompt_tokens" => self.prompt_tokens,
+            "completion_tokens" => self.completion_tokens,
             _ => self
                 .total_tokens
                 .or_else(|| match (self.prompt_tokens, self.completion_tokens) {
@@ -541,10 +547,38 @@ fn sum_pair(prompt: Option<u64>, completion: Option<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiProvider, detect_response_provider, detect_sse_provider, extract_response_texts,
-        extract_response_usage, for_each_response_text_mut,
+        AiProvider, AiTokenUsage, detect_response_provider, detect_sse_provider,
+        extract_response_texts, extract_response_usage, for_each_response_text_mut,
     };
     use serde_json::json;
+
+    #[test]
+    fn total_for_mode_distinguishes_absent_from_explicit_zero() {
+        let absent = AiTokenUsage::default();
+        assert_eq!(absent.total_for_mode("prompt_tokens"), None);
+        assert_eq!(absent.total_for_mode("completion_tokens"), None);
+        assert_eq!(absent.total_for_mode("total_tokens"), None);
+
+        let explicit_zero = AiTokenUsage {
+            prompt_tokens: Some(0),
+            completion_tokens: Some(0),
+            total_tokens: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(explicit_zero.total_for_mode("prompt_tokens"), Some(0));
+        assert_eq!(explicit_zero.total_for_mode("completion_tokens"), Some(0));
+        assert_eq!(explicit_zero.total_for_mode("total_tokens"), Some(0));
+
+        let partial = AiTokenUsage {
+            prompt_tokens: Some(12),
+            completion_tokens: None,
+            total_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(partial.total_for_mode("prompt_tokens"), Some(12));
+        assert_eq!(partial.total_for_mode("completion_tokens"), None);
+        assert_eq!(partial.total_for_mode("total_tokens"), Some(12));
+    }
 
     #[test]
     fn detects_supported_provider_shapes() {
