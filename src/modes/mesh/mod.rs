@@ -14110,7 +14110,7 @@ async fn shutdown_and_join_mesh(
     finalize_global_plugins: bool,
 ) {
     proxy_state.stream_listener_manager.shutdown_all().await;
-    crate::overload::begin_drain(&proxy_state.overload);
+    crate::overload::begin_shutdown_drain(&proxy_state.overload);
     if drain_seconds > 0 {
         crate::overload::wait_for_drain(&proxy_state.overload, Duration::from_secs(drain_seconds))
             .await;

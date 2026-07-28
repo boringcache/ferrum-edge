@@ -2943,8 +2943,92 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
         if resource.plugin_name == "otel_tracing" {
             redact_otel_tracing_config_projection(config);
         }
+        if resource.plugin_name == "http_logging" {
+            redact_endpoint_url_config_projection(config, "endpoint_url");
+        }
+        if resource.plugin_name == "ai_transcript_audit"
+            && let Some(sink) = config.get_mut("sink")
+            && !sink.is_null()
+        {
+            redact_endpoint_url_config_projection(sink, "endpoint_url");
+        }
+        if resource.plugin_name == "api_chargeback_sink" {
+            redact_chargeback_sink_config_projection(config);
+        }
     }
     body
+}
+
+/// Replace a sink `endpoint_url` with its structurally redacted rendering.
+///
+/// `http_logging` and `ai_transcript_audit` accept collector URLs whose path or
+/// query legitimately carries a reusable credential (a Sumo Logic path token, a
+/// Mezmo `apikey` parameter), so the configured value must not be echoed back
+/// through the audit projection any more than it may reach a log line. Mirrors
+/// [`redact_loki_logging_config_projection`]; `custom_headers` values are
+/// already redacted by [`redact_sensitive_plugin_config_fields`]'s recursive
+/// pass only when the header *name* looks sensitive, so redact them wholesale
+/// here for the same reason Loki does — a sink token may be carried under any
+/// vendor-specific header name.
+fn redact_endpoint_url_config_projection(config: &mut Value, endpoint_key: &str) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
+    let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
+        return;
+    };
+
+    if let Some(endpoint) = config.get_mut(endpoint_key)
+        && !endpoint.is_null()
+    {
+        *endpoint = match endpoint
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+        {
+            Some(endpoint) => json!(crate::plugins::utils::redacted_endpoint_url(&endpoint)),
+            None => json!(marker),
+        };
+    }
+    if let Some(custom_headers) = config.get_mut("custom_headers") {
+        redact_loki_custom_header_values(custom_headers, marker);
+    }
+}
+
+/// Redact the ClickHouse endpoint and INSERT parameters for the chargeback sink.
+///
+/// `clickhouse.url` may carry a credential in its query, and while
+/// credential-*named* `insert_query_params` are rejected at validation, the
+/// values remain arbitrary operator strings that are appended to the INSERT
+/// URL. Neither belongs in an audit projection. `password_ref` names an
+/// environment variable rather than holding a secret, so it is left readable —
+/// an operator needs it to tell two configurations apart.
+fn redact_chargeback_sink_config_projection(config: &mut Value) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
+    let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
+        return;
+    };
+    let Some(clickhouse) = config.get_mut("clickhouse") else {
+        return;
+    };
+    if clickhouse.is_null() {
+        return;
+    }
+    let Some(clickhouse) = clickhouse.as_object_mut() else {
+        *clickhouse = json!(marker);
+        return;
+    };
+
+    if let Some(url) = clickhouse.get_mut("url")
+        && !url.is_null()
+    {
+        *url = match url.as_str().and_then(|value| url::Url::parse(value).ok()) {
+            Some(url) => json!(crate::plugins::utils::redacted_endpoint_url(&url)),
+            None => json!(marker),
+        };
+    }
+    if let Some(params) = clickhouse.get_mut("insert_query_params") {
+        redact_loki_custom_header_values(params, marker);
+    }
 }
 
 fn redact_loki_logging_config_projection(config: &mut Value) {

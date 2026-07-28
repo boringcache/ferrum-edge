@@ -9327,3 +9327,76 @@ fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
         json!(["draft2020-12", "draft7"])
     );
 }
+
+/// Advisory GHSA-8594-2xhc-8g38: the observability sinks whose endpoint may
+/// embed a reusable credential must document that contract, and the
+/// `insert_query_params` credential-name rejection must be stated in the spec
+/// the same way the runtime enforces it.
+///
+/// The runtime side of this pairing lives in
+/// `tests/unit/plugins/api_chargeback_sink_tests.rs`
+/// (`insert_query_params_reject_credential_bearing_names`); together they keep
+/// schema prose and validation from drifting apart.
+#[test]
+fn observability_sink_endpoint_schemas_document_credential_redaction() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let http_logging = spec
+        .pointer("/components/schemas/HttpLoggingConfig/properties/endpoint_url/description")
+        .and_then(|value| value.as_str())
+        .expect("http_logging endpoint_url description");
+    let transcript = spec
+        .pointer(
+            "/components/schemas/AiTranscriptAuditConfig/properties/sink/properties/endpoint_url/description",
+        )
+        .and_then(|value| value.as_str())
+        .expect("ai_transcript_audit sink.endpoint_url description");
+
+    for (plugin, description) in [
+        ("http_logging", http_logging),
+        ("ai_transcript_audit", transcript),
+    ] {
+        assert!(
+            description.to_ascii_lowercase().contains("userinfo"),
+            "{plugin} endpoint_url must document userinfo rejection: {description}"
+        );
+        assert!(
+            description.contains("/redacted"),
+            "{plugin} endpoint_url must document the structurally redacted diagnostic form: {description}"
+        );
+    }
+
+    let params = spec
+        .pointer(
+            "/components/schemas/ApiChargebackSinkConfig/properties/clickhouse/properties/insert_query_params/description",
+        )
+        .and_then(|value| value.as_str())
+        .expect("api_chargeback_sink insert_query_params description");
+    // Exact names and substring markers rejected by `validate_query_params`.
+    for rejected in [
+        "user",
+        "password",
+        "access_token",
+        "session_id",
+        "apikey",
+        "api_key",
+        "credential",
+        "passwd",
+        "secret",
+        "token",
+    ] {
+        assert!(
+            params.contains(rejected),
+            "insert_query_params description must name the rejected `{rejected}`: {params}"
+        );
+    }
+    assert!(
+        params.contains("password_ref"),
+        "insert_query_params description must point at the supported channel: {params}"
+    );
+    assert!(
+        params.contains("/redacted"),
+        "insert_query_params description must document the redacted diagnostic form: {params}"
+    );
+}

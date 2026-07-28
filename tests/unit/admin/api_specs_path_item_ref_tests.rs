@@ -277,9 +277,14 @@ fn cyclic_path_item_refs_are_rejected() {
     );
 
     let err = extract_err(&spec);
+    // Mutual Path Item cycles are rejected on re-entry (GHSA-8jc7-c52g-85xr),
+    // not after the depth ceiling has expanded every sibling branch first.
+    let ExtractError::SchemaReferenceCycle { path } = &err else {
+        panic!("cyclic Path Item refs must fail as SchemaReferenceCycle: {err}");
+    };
     assert!(
-        matches!(err, ExtractError::SchemaTooDeep { .. }),
-        "cyclic Path Item refs must fail as SchemaTooDeep: {err}"
+        path.contains("#/components/pathItems/A") && path.contains("#/components/pathItems/B"),
+        "cycle path must name both references in the loop: {path}"
     );
 }
 

@@ -2207,6 +2207,16 @@ pub mod _test_support {
                 .seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_rate_limiting_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.rate_limiting
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_rate_limiting_periodic(&self) {
             self.rate_limiting.arm_periodic_eviction_for_test();
         }
@@ -2243,6 +2253,16 @@ pub mod _test_support {
             self.ai.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_ai_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ai
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_ai_periodic(&self) {
             self.ai.arm_periodic_eviction_for_test();
         }
@@ -2272,6 +2292,16 @@ pub mod _test_support {
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
             self.graphql.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn seed_graphql_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.graphql
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
         }
 
         pub fn arm_graphql_periodic(&self) {
@@ -2305,6 +2335,16 @@ pub mod _test_support {
             self.grpc.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_grpc_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.grpc
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_grpc_periodic(&self) {
             self.grpc.arm_periodic_eviction_for_test();
         }
@@ -2334,6 +2374,16 @@ pub mod _test_support {
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
             self.ws.seed_connection_at_for_test(connection_id, now);
+        }
+
+        pub fn seed_ws_with_cap(
+            &self,
+            connection_id: u64,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ws
+                .seed_connection_at_with_cap_for_test(connection_id, now, max_entries)
         }
 
         pub fn arm_ws_periodic(&self) {
@@ -2428,6 +2478,86 @@ pub mod _test_support {
         plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
     ) -> std::time::Instant {
         plugin.epoch_base_for_test()
+    }
+
+    /// Tuple view of a UDP rejection diagnostic decision for external regressions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct UdpRejectionWarnDecisionForTest {
+        pub emitted: bool,
+        pub instance_suppressed: Option<u64>,
+        pub global_suppressed: Option<u64>,
+    }
+
+    pub fn udp_rate_limiting_record_rejection_warn_detail_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        limit_kind: &'static str,
+        proxy_id: &str,
+        now_ms: u64,
+    ) -> UdpRejectionWarnDecisionForTest {
+        let detail = plugin
+            .record_rate_limit_rejection_warn_detail_for_test(global, limit_kind, proxy_id, now_ms);
+        UdpRejectionWarnDecisionForTest {
+            emitted: detail.emitted,
+            instance_suppressed: detail.instance_suppressed,
+            global_suppressed: detail.global_suppressed,
+        }
+    }
+
+    pub fn udp_rate_limiting_rejection_warn_suppressed_count_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) -> u64 {
+        plugin.rejection_warn_suppressed_count_for_test()
+    }
+
+    pub fn udp_rate_limiting_reset_rejection_warn_for_test(
+        plugin: &crate::plugins::udp_rate_limiting::UdpRateLimiting,
+    ) {
+        plugin.reset_rate_limit_rejection_warn_for_test();
+    }
+
+    // ── util/atomic_log_rate_limiter ─────────────────────────────────────────
+    pub fn atomic_log_rate_limiter_with_window_for_test(
+        window_ms: u64,
+    ) -> crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::with_window_ms(window_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_on_event_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<u64> {
+        limiter.on_event(now_ms)
+    }
+
+    pub fn atomic_log_rate_limiter_suppressed_count_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) -> u64 {
+        limiter.suppressed_count_for_test()
+    }
+
+    pub fn atomic_log_rate_limiter_reset_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+    ) {
+        limiter.reset_for_test();
+    }
+
+    pub fn atomic_log_rate_limiter_seed_for_test(
+        limiter: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        last_emit_ms: u64,
+        suppressed: u64,
+    ) {
+        limiter.seed_for_test(last_emit_ms, suppressed);
+    }
+
+    pub fn atomic_log_rate_limiter_dual_gate_emit_for_test(
+        instance: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        global: &crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter,
+        now_ms: u64,
+    ) -> Option<(u64, u64)> {
+        crate::util::atomic_log_rate_limiter::AtomicLogRateLimiter::dual_gate_emit(
+            instance, global, now_ms,
+        )
     }
 
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────

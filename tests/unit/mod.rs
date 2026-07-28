@@ -10,3 +10,4 @@ mod openapi_yaml_tests;
 mod plugins;
 mod secrets;
 mod tls;
+mod util;
