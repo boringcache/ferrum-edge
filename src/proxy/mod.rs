@@ -26137,6 +26137,10 @@ async fn handle_proxy_request_inner(
     if response_inspector.is_some() {
         response_headers.remove("content-length");
     }
+    // Capture this before `method` is moved into the optional transaction
+    // summary below. Response framing still needs the request-method semantic,
+    // but the hot path does not need to clone the method string.
+    let is_head = method.eq_ignore_ascii_case("HEAD");
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
@@ -26261,7 +26265,6 @@ async fn handle_proxy_request_inner(
     // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
     // and derive or repair Content-Length from the actual body/status/method.
     // Gateway-owned Connection: close (drain/overload) is applied below.
-    let is_head = method.eq_ignore_ascii_case("HEAD");
     let framing = match &response_body {
         // HEAD keeps a valid backend representation length; do not invent
         // Content-Length: 0 from the empty wire body.
