@@ -4192,7 +4192,10 @@ async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
             "application/grpc",
             "\u{0}\u{0}\u{0}\u{0}\u{2a}{\"model\":\"gpt-4o\",\"messages\":[],\"max_tokens\":500}",
         ),
-        ("application/grpc+proto", "\u{0}\u{0}\u{0}\u{0}\u{6}\u{a}\u{4}chat"),
+        (
+            "application/grpc+proto",
+            "\u{0}\u{0}\u{0}\u{0}\u{6}\u{a}\u{4}chat",
+        ),
         // `+json` variants satisfy the ordinary JSON content-type screen.
         (
             "application/grpc+json",
