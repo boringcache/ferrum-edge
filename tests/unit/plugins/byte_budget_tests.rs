@@ -292,7 +292,11 @@ fn a_saturated_ceiling_refuses_before_the_record_is_serialized() {
     let rejected = serialize_under_byte_budget(&budget, 65_536, &json!({ "ua": hostile }));
     assert!(rejected.is_none(), "saturated ceiling must refuse");
     assert_eq!(budget.used(), 0);
-    assert_eq!(ceiling.used(), 262_144, "only the pre-existing hold remains");
+    assert_eq!(
+        ceiling.used(),
+        262_144,
+        "only the pre-existing hold remains"
+    );
     assert!(budget.drops_total() > 0);
 
     drop(filled);
