@@ -8863,8 +8863,7 @@ fn inject_mesh_global_plugins(
                 serde_json::json!(tracing.custom_header_tags);
         }
         if !tracing.custom_env_tags.is_empty() {
-            workload_metrics_config["custom_env_tags"] =
-                serde_json::json!(tracing.custom_env_tags);
+            workload_metrics_config["custom_env_tags"] = serde_json::json!(tracing.custom_env_tags);
         }
         if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);

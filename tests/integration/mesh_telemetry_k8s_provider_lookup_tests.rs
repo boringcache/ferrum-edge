@@ -744,7 +744,9 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
     let mut empty_ctx =
         RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     assert!(matches!(
-        empty_plugin.before_proxy(&mut empty_ctx, &mut headers).await,
+        empty_plugin
+            .before_proxy(&mut empty_ctx, &mut headers)
+            .await,
         PluginResult::Continue
     ));
     assert_eq!(
