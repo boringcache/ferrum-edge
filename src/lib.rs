@@ -3248,6 +3248,7 @@ pub mod _test_support {
 
     /// Like [`reconcile_streaming_backend_trailers_for_test`], with explicit
     /// policy prefixes and gateway-owned builder names.
+    #[allow(clippy::too_many_arguments)]
     pub fn reconcile_streaming_backend_trailers_governed_for_test(
         trailers: &[(&str, &str)],
         pre_policy_headers: &HashMap<String, String>,
@@ -3310,6 +3311,7 @@ pub mod _test_support {
 
     /// Like [`govern_streaming_h2_backend_trailers_for_test`], with explicit
     /// policy prefixes and per-response gateway-owned builder names.
+    #[allow(clippy::too_many_arguments)]
     pub fn govern_streaming_h2_backend_trailers_governed_for_test(
         trailers: &[(&str, &str)],
         pre_policy_headers: &HashMap<String, String>,
