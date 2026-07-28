@@ -7648,6 +7648,10 @@ fn oidc_relying_party_schema_matches_strict_runtime_surface() {
 
 #[test]
 fn transaction_debugger_schema_matches_closed_runtime_surface() {
+    use ferrum_edge::plugins::transaction_debugger::{
+        DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES, TRANSACTION_DEBUGGER_CONFIG_KEYS,
+    };
+
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -7661,7 +7665,55 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
         .keys()
         .map(String::as_str)
         .collect();
-    assert_eq!(properties, BTreeSet::from(["redacted_headers"]));
+    let runtime: BTreeSet<_> = TRANSACTION_DEBUGGER_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(properties, runtime, "OpenAPI/runtime key drift");
+
+    for field in ["max_request_body_bytes", "max_response_body_bytes"] {
+        assert_eq!(
+            schema["properties"][field]["default"],
+            json!(DEFAULT_BODY_CAPTURE_BYTES),
+            "{field} default drift"
+        );
+        assert_eq!(
+            schema["properties"][field]["maximum"],
+            json!(MAX_BODY_CAPTURE_BYTES),
+            "{field} maximum drift"
+        );
+        assert_eq!(schema["properties"][field]["minimum"], json!(1));
+    }
+    for field in ["log_request_body", "log_response_body"] {
+        assert_eq!(schema["properties"][field]["default"], json!(false));
+    }
+
+    let description = schema["description"]
+        .as_str()
+        .expect("TransactionDebuggerConfig description");
+    for contract in [
+        "never forces buffering",
+        "text/event-stream",
+        "application/grpc",
+        "redacted",
+        "truncated",
+    ] {
+        assert!(
+            description.contains(contract),
+            "description missing `{contract}`"
+        );
+    }
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    for key in TRANSACTION_DEBUGGER_CONFIG_KEYS {
+        assert!(
+            plugin_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md transaction_debugger section missing `{key}`"
+        );
+    }
+    for contract in ["<non-utf8-body-omitted>", "over_capture_limit", "unknown_length"] {
+        assert!(
+            plugin_docs.contains(contract),
+            "docs/plugins.md missing transaction_debugger contract `{contract}`"
+        );
+    }
 }
 
 #[test]

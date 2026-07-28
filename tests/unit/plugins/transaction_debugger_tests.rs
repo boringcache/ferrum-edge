@@ -4,6 +4,9 @@ use ferrum_edge::plugins::{
     Direction, DisconnectCause, Plugin, ProxyProtocol, RequestContext, StreamTransactionSummary,
     WsDisconnectContext, transaction_debugger::TransactionDebugger, validate_plugin_config,
 };
+use ferrum_edge::plugins::transaction_debugger::{
+    BODY_BINARY_MARKER, BodyKind, DEFAULT_BODY_CAPTURE_BYTES, MAX_BODY_CAPTURE_BYTES,
+};
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
 use serde_json::json;
@@ -374,16 +377,101 @@ fn test_transaction_debugger_invalid_config_shapes_rejected() {
 }
 
 #[test]
-fn test_transaction_debugger_rejects_removed_body_options() {
+fn test_transaction_debugger_accepts_bounded_body_capture_options() {
     for config in [
         json!({"log_request_body": false}),
         json!({"log_response_body": true}),
         json!({"log_request_body": true, "log_response_body": true}),
+        json!({
+            "log_request_body": true,
+            "max_request_body_bytes": 8192,
+            "redacted_body_fields": ["x_internal_field"]
+        }),
+    ] {
+        TransactionDebugger::new(&config).expect("bounded body capture options are supported");
+    }
+}
+
+#[test]
+fn test_transaction_debugger_body_capture_defaults_and_bounds() {
+    let default = TransactionDebugger::new(&json!({})).unwrap();
+    assert!(!default.log_request_body());
+    assert!(!default.log_response_body());
+    assert_eq!(
+        default.max_request_body_bytes(),
+        DEFAULT_BODY_CAPTURE_BYTES as usize
+    );
+    assert_eq!(
+        default.max_response_body_bytes(),
+        DEFAULT_BODY_CAPTURE_BYTES as usize
+    );
+
+    let configured = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 64,
+        "max_response_body_bytes": MAX_BODY_CAPTURE_BYTES,
+    }))
+    .unwrap();
+    assert_eq!(configured.max_request_body_bytes(), 64);
+    assert_eq!(
+        configured.max_response_body_bytes(),
+        MAX_BODY_CAPTURE_BYTES as usize
+    );
+}
+
+#[test]
+fn test_transaction_debugger_rejects_invalid_body_capture_options() {
+    for (config, needle) in [
+        (
+            json!({"log_request_body": null}),
+            "'log_request_body' must be a boolean; null is not allowed",
+        ),
+        (
+            json!({"log_response_body": "true"}),
+            "'log_response_body' must be a boolean",
+        ),
+        (
+            json!({"log_request_body": true, "max_request_body_bytes": 0}),
+            "'max_request_body_bytes' must be greater than zero",
+        ),
+        (
+            json!({"log_request_body": true, "max_request_body_bytes": 8193}),
+            "'max_request_body_bytes' must be <= 8192 (got 8193)",
+        ),
+        (
+            json!({"log_response_body": true, "max_response_body_bytes": -1}),
+            "'max_response_body_bytes' must be a positive integer",
+        ),
+        (
+            json!({"max_request_body_bytes": 128}),
+            "'max_request_body_bytes' requires 'log_request_body' to be true",
+        ),
+        (
+            json!({"log_request_body": true, "max_response_body_bytes": 128}),
+            "'max_response_body_bytes' requires 'log_response_body' to be true",
+        ),
+        (
+            json!({"redacted_body_fields": ["x"]}),
+            "'redacted_body_fields' requires 'log_request_body' or 'log_response_body' to be true",
+        ),
+        (
+            json!({"log_request_body": true, "redacted_body_fields": [""]}),
+            "'redacted_body_fields[0]' must not be empty",
+        ),
+        (
+            json!({"log_request_body": true, "redacted_body_fields": [7]}),
+            "'redacted_body_fields[0]' must be a string",
+        ),
+        (
+            json!({"log_request_body": true, "redacted_body_fields": "token"}),
+            "'redacted_body_fields' must be an array",
+        ),
     ] {
         let err = TransactionDebugger::new(&config)
             .err()
-            .expect("removed body capture options must be rejected");
-        assert!(err.contains("payloads are not captured"), "got: {err}");
+            .unwrap_or_else(|| panic!("expected rejection for {config}"));
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
     }
 }
 
@@ -428,10 +516,18 @@ fn test_shared_validation_matches_transaction_debugger_config_surface() {
     )
     .unwrap();
 
-    let removed =
-        validate_plugin_config("transaction_debugger", &json!({"log_request_body": false}))
-            .expect_err("shared validation must reject removed body options");
-    assert!(removed.contains("payloads are not captured"));
+    validate_plugin_config(
+        "transaction_debugger",
+        &json!({"log_request_body": true, "max_request_body_bytes": 512}),
+    )
+    .expect("shared validation must accept bounded body capture");
+
+    let over_limit = validate_plugin_config(
+        "transaction_debugger",
+        &json!({"log_request_body": true, "max_request_body_bytes": 1_000_000}),
+    )
+    .expect_err("shared validation must reject an out-of-range capture budget");
+    assert!(over_limit.contains("must be <= 8192"));
 
     let unknown = validate_plugin_config(
         "transaction_debugger",
@@ -797,4 +893,343 @@ async fn test_transaction_debugger_websocket_clean_disconnect() {
 
     let logs = capture_debug_logs(|| async { plugin.on_ws_disconnect(&summary).await }).await;
     assert!(logs.contains("outcome=completed"), "got: {logs}");
+}
+
+// ── Bounded body capture (issue #3316) ─────────────────────────────────
+
+fn body_headers(content_type: &str, len: usize) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
+    headers.insert("content-length".to_string(), len.to_string());
+    headers
+}
+
+fn capture_plugin() -> TransactionDebugger {
+    TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "log_response_body": true,
+        "max_request_body_bytes": 512,
+        "max_response_body_bytes": 512,
+    }))
+    .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_body_capture_disabled_by_default_is_zero_cost() {
+    let plugin = TransactionDebugger::new(&json!({})).unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-length".to_string(), "12".to_string());
+
+    assert!(!plugin.requires_request_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
+    assert!(!plugin.should_buffer_request_body(&ctx));
+    assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.needs_request_body_text());
+    assert_eq!(
+        plugin.request_body_capture_decision(&ctx.headers).skip_reason(),
+        Some("disabled")
+    );
+
+    let headers = body_headers("application/json", 12);
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin
+            .on_final_request_body(&headers, br#"{"a":"bcde"}"#)
+            .await;
+    })
+    .await;
+    assert!(logs.is_empty(), "disabled capture must emit nothing: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_small_json_request_body_is_captured_and_redacted() {
+    let plugin = capture_plugin();
+    let headers = body_headers("application/json; charset=utf-8", 64);
+    let body = br#"{"user":"alice","password":"hunter2","note":"ok"}"#;
+
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.request_body_capture_decision(&headers).is_capture());
+
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.on_final_request_body(&headers, body).await;
+    })
+    .await;
+
+    assert!(logs.contains("Bounded body capture"), "got: {logs}");
+    assert!(logs.contains("direction=request"), "got: {logs}");
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+    assert!(logs.contains("body_kind=json"), "got: {logs}");
+    assert!(logs.contains("truncated=false"), "got: {logs}");
+    assert!(logs.contains("alice"), "non-sensitive field lost: {logs}");
+    assert!(!logs.contains("hunter2"), "secret leaked: {logs}");
+    assert!(logs.contains("***REDACTED***"), "got: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_json_response_body_capture_covers_error_responses() {
+    let plugin = capture_plugin();
+    let mut ctx = make_ctx();
+    let headers = body_headers("application/problem+json", 48);
+    let body = br#"{"title":"upstream failed","detail":"pool exhausted"}"#;
+
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 500, &headers, body)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("direction=response"), "got: {logs}");
+    assert!(logs.contains("upstream failed"), "got: {logs}");
+    assert!(logs.contains("pool exhausted"), "got: {logs}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_credential_shaped_values_are_redacted_regardless_of_field_name() {
+    let plugin = capture_plugin();
+    let headers = body_headers("application/json", 128);
+    let body = br#"{"note":"Bearer sk-live-abcdefghijklmnop","jot":"eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}"#;
+
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.on_final_request_body(&headers, body).await;
+    })
+    .await;
+    assert!(!logs.contains("sk-live-abcdefghijklmnop"), "got: {logs}");
+    assert!(!logs.contains("eyJhbGciOiJIUzI1NiJ9"), "got: {logs}");
+}
+
+#[test]
+fn test_form_and_text_body_redaction() {
+    let plugin = capture_plugin();
+
+    let form_body = b"user=alice&client_secret=shhh&note=fine";
+    let form = plugin.render_captured_body(form_body, BodyKind::Form, 512);
+    assert_eq!(form.kind, "form");
+    assert!(form.rendered.contains("user=alice"), "{}", form.rendered);
+    assert!(!form.rendered.contains("shhh"), "{}", form.rendered);
+    assert!(form.rendered.contains("note=fine"), "{}", form.rendered);
+
+    let text_body = b"line one is fine\nauthorization: Bearer abc\nline three is fine";
+    let text = plugin.render_captured_body(text_body, BodyKind::Text, 512);
+    assert_eq!(text.kind, "text");
+    assert!(text.rendered.contains("line one is fine"));
+    assert!(text.rendered.contains("line three is fine"));
+    assert!(!text.rendered.contains("Bearer abc"), "{}", text.rendered);
+}
+
+#[test]
+fn test_configured_extra_body_fields_are_redacted() {
+    let plugin = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "redacted_body_fields": ["Tenant_Ref"],
+    }))
+    .unwrap();
+    let body = br#"{"tenant_ref":"acme-9","keep":"yes"}"#;
+    let sample = plugin.render_captured_body(body, BodyKind::Json, 512);
+    assert!(!sample.rendered.contains("acme-9"), "{}", sample.rendered);
+    assert!(sample.rendered.contains("yes"), "{}", sample.rendered);
+}
+
+#[test]
+fn test_capture_decision_exact_cap_and_cap_plus_one() {
+    let plugin = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "max_request_body_bytes": 64,
+    }))
+    .unwrap();
+
+    let at_cap = body_headers("application/json", 64);
+    assert!(plugin.request_body_capture_decision(&at_cap).is_capture());
+    let over_cap = body_headers("application/json", 65);
+    assert_eq!(
+        plugin.request_body_capture_decision(&over_cap).skip_reason(),
+        Some("over_capture_limit")
+    );
+    let empty = body_headers("application/json", 0);
+    assert_eq!(
+        plugin.request_body_capture_decision(&empty).skip_reason(),
+        Some("empty_body")
+    );
+}
+
+#[test]
+fn test_capture_decision_excludes_streaming_encoded_and_binary_traffic() {
+    let plugin = capture_plugin();
+
+    let mut chunked = HashMap::new();
+    chunked.insert("content-type".to_string(), "application/json".to_string());
+    chunked.insert("transfer-encoding".to_string(), "chunked".to_string());
+    assert_eq!(
+        plugin.request_body_capture_decision(&chunked).skip_reason(),
+        Some("unknown_length")
+    );
+
+    let mut encoded = body_headers("application/json", 32);
+    encoded.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_eq!(
+        plugin.request_body_capture_decision(&encoded).skip_reason(),
+        Some("content_encoding")
+    );
+
+    let mut identity = body_headers("application/json", 32);
+    identity.insert("content-encoding".to_string(), "identity".to_string());
+    assert!(plugin.request_body_capture_decision(&identity).is_capture());
+
+    for (content_type, reason) in [
+        ("application/grpc+proto", "protocol_excluded"),
+        ("text/event-stream", "protocol_excluded"),
+        ("application/octet-stream", "content_type_excluded"),
+        ("multipart/form-data; boundary=x", "content_type_excluded"),
+        ("image/png", "content_type_excluded"),
+        ("text/html", "content_type_excluded"),
+    ] {
+        let headers = body_headers(content_type, 32);
+        assert_eq!(
+            plugin.request_body_capture_decision(&headers).skip_reason(),
+            Some(reason),
+            "content_type={content_type}"
+        );
+    }
+
+    let mut upgrade = body_headers("application/json", 32);
+    upgrade.insert("upgrade".to_string(), "websocket".to_string());
+    assert_eq!(
+        plugin.request_body_capture_decision(&upgrade).skip_reason(),
+        Some("protocol_excluded")
+    );
+
+    let bare = HashMap::new();
+    assert_eq!(
+        plugin.request_body_capture_decision(&bare).skip_reason(),
+        Some("no_content_type")
+    );
+}
+
+#[test]
+fn test_response_buffering_predicates_only_narrow() {
+    let plugin = capture_plugin();
+    let ctx = make_ctx();
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    // Header-time refinement keeps unknown-length and non-textual responses on
+    // the streaming path.
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &body_headers("application/json", 32),
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &body_headers("text/event-stream", 32),
+    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &HashMap::new(),
+    ));
+
+    // A client that asked for a stream is never pinned onto the buffered path.
+    let mut sse_ctx = make_ctx();
+    sse_ctx
+        .headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(!plugin.should_buffer_response_body(&sse_ctx));
+
+    let mut ws_ctx = make_ctx();
+    ws_ctx
+        .headers
+        .insert("upgrade".to_string(), "websocket".to_string());
+    assert!(!plugin.should_buffer_response_body(&ws_ctx));
+
+    let mut grpc_ctx = make_ctx();
+    grpc_ctx
+        .headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    assert!(!plugin.should_buffer_response_body(&grpc_ctx));
+}
+
+#[test]
+fn test_render_binary_unicode_and_truncation_markers() {
+    let plugin = capture_plugin();
+
+    let binary = plugin.render_captured_body(&[0xff, 0xfe, 0x00, 0x01], BodyKind::Text, 512);
+    assert_eq!(binary.state, "binary");
+    assert_eq!(binary.kind, "binary");
+    assert_eq!(binary.rendered, BODY_BINARY_MARKER);
+    assert!(!binary.truncated);
+
+    // Multi-byte characters are truncated on a character boundary: the cap is
+    // 5 bytes but each `é` is 2 bytes, so 2 characters survive intact.
+    let unicode = plugin.render_captured_body("ééééé".as_bytes(), BodyKind::Text, 5);
+    assert!(unicode.truncated);
+    assert_eq!(unicode.state, "truncated");
+    assert_eq!(unicode.rendered, "éé");
+    assert_eq!(unicode.original_bytes, 10);
+
+    // Bidi-spoofing and control characters are escaped, never emitted raw.
+    let spoof = plugin.render_captured_body("a\u{202E}b\u{0007}".as_bytes(), BodyKind::Text, 512);
+    assert!(!spoof.rendered.contains('\u{202E}'), "{}", spoof.rendered);
+    assert!(spoof.rendered.contains("\\u{202e}"), "{}", spoof.rendered);
+    assert!(spoof.rendered.contains("\\u{0007}"), "{}", spoof.rendered);
+}
+
+#[test]
+fn test_render_truncated_json_falls_back_to_line_redaction() {
+    let plugin = capture_plugin();
+    // Malformed/unparseable JSON is never dumped raw: the line-level pass
+    // replaces any line carrying a sensitive marker.
+    let body = br#"{"password":"hunter2","x":"#;
+    let sample = plugin.render_captured_body(body, BodyKind::Json, 512);
+    assert!(!sample.rendered.contains("hunter2"), "{}", sample.rendered);
+    assert_eq!(sample.rendered, "***REDACTED***");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_omission_records_are_emitted_with_stable_reasons() {
+    let plugin = capture_plugin();
+    let mut ctx = make_ctx();
+    let mut headers = body_headers("application/octet-stream", 32);
+
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    })
+    .await;
+    assert!(logs.contains("Bounded body capture omitted"), "got: {logs}");
+    assert!(logs.contains("capture=omitted"), "got: {logs}");
+    assert!(logs.contains("reason=content_type_excluded"), "got: {logs}");
+
+    let mut response_headers = body_headers("text/event-stream", 32);
+    let mut ctx = make_ctx();
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("direction=response"), "got: {logs}");
+    assert!(logs.contains("reason=protocol_excluded"), "got: {logs}");
+}
+
+#[test]
+fn test_reload_style_reconfiguration_changes_capture_behavior() {
+    // A rebuilt plugin cache constructs a fresh instance; the new configuration
+    // must govern buffering immediately, with no shared state from the old one.
+    let before = TransactionDebugger::new(&json!({})).unwrap();
+    let after = TransactionDebugger::new(&json!({
+        "log_request_body": true,
+        "max_request_body_bytes": 32,
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    ctx.headers
+        .insert("content-length".to_string(), "16".to_string());
+    assert!(!before.should_buffer_request_body(&ctx));
+    assert!(after.should_buffer_request_body(&ctx));
+    assert!(!before.requires_request_body_buffering());
+    assert!(after.requires_request_body_buffering());
 }

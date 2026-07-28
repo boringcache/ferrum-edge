@@ -323,8 +323,12 @@ metrics with label names baked into the time-series store; chargeback is
 an in-memory accounting plugin; transaction_debugger emits debug-only
 traces. None of them serialize summaries for shipping, so customization
 doesn't apply. The transaction debugger's config is otherwise closed as well:
-only `redacted_headers` is accepted, and every other unsupported key is
-rejected rather than ignored.
+only `redacted_headers`, `log_request_body`, `log_response_body`,
+`max_request_body_bytes`, `max_response_body_bytes`, and
+`redacted_body_fields` are accepted, and every other unsupported key is
+rejected rather than ignored. Bounded body samples are emitted only on the
+`transaction_debug` tracing target and are never projected into
+`TransactionSummary` metadata, so no shipping sink can observe them.
 
 ## Validation
 

@@ -1331,7 +1331,36 @@ The channel slot is reserved before serialization. Serialization is capped by `m
 
 Emits verbose request/response and terminal diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
 
-The plugin does not capture request or response payloads. The former `log_request_body` and `log_response_body` options are rejected instead of silently accepting no-op body settings. Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+
+#### Bounded body capture
+
+`log_request_body` and `log_response_body` are opt-in, default-off switches that emit a **bounded, redacted sample** of the body. They are intended for incident debugging only; a capture is an information-disclosure surface even after redaction.
+
+**Capture never forces buffering.** A message is admitted to the buffered path only when *all* of the following hold; otherwise it keeps streaming exactly as it does with capture disabled, and the debugger emits an omission record with a stable `reason`:
+
+| Requirement | Omission `reason` when unmet |
+|---|---|
+| A `Content-Type` header is present | `no_content_type` |
+| Not gRPC (`application/grpc*`) or SSE (`text/event-stream`), and not a WebSocket upgrade | `protocol_excluded` |
+| A capturable textual media type | `content_type_excluded` |
+| Identity (or absent) `Content-Encoding` | `content_encoding` |
+| A parseable `Content-Length` (so chunked/unknown-length keeps streaming) | `unknown_length` |
+| `Content-Length` greater than zero | `empty_body` |
+| `Content-Length` at most the configured cap | `over_capture_limit` |
+| Capture enabled for that direction | `disabled` |
+
+Capturable media types are `application/json`, `text/json`, any `+json` structured suffix, `application/x-www-form-urlencoded`, `text/plain`, `application/xml`, `text/xml`, any `+xml` suffix, and `application/graphql`. Everything else — including `text/html`, `multipart/*`, and all binary media types — is excluded.
+
+**Capture point.** The request sample is taken in `on_final_request_body`, after every request transform, so it is the backend-visible representation. The response sample is taken in `on_final_response_body`, after every response transform, so it is the client-visible representation. Capture is observational: it never rejects, mutates, or reorders a request, and it never changes trailers, content lengths, or body limits.
+
+**Redaction runs before rendering, over the complete body.** JSON documents are parsed and every value under a credential-bearing key is replaced; form bodies are redacted per pair; unstructured text is redacted per line — any line carrying a sensitive marker is replaced wholesale, because unstructured text has no field grammar. Credential-shaped string values (`Bearer …`, `Basic …`, JWT-shaped) are replaced wherever they appear, regardless of field name. Unparseable JSON falls back to line-level redaction rather than a raw dump. Sensitive names come from the built-in credential markers (`password`, `passwd`, `passphrase`, `secret`, `token`, `apikey`/`api_key`/`api-key`, `credential`, `private_key`, `access_key`, `secret_key`, `authorization`, `session`, `signature`, `assertion`, and exact `auth`/`code`/`cookie`/`jwt`/`key`/`otp`/`pin`/`pwd`/`sig`), the built-in sensitive header list, `redacted_headers`, `redacted_body_fields`, and the central metadata classifier (which honors `FERRUM_LOG_REDACT_METADATA_KEYS`).
+
+**Bounds.** Redaction parses at most 32 KiB (larger bodies fall back to line-level redaction), walks at most 64 levels of JSON nesting, retains at most 256 text lines, truncates the redacted rendering to the configured cap on a character boundary, escapes control and bidi-spoofing characters, and caps the rendered field at 64 KiB so escaping cannot expand a capture without limit. Non-UTF-8 bodies are never dumped — not even base64-encoded — and render as `<non-utf8-body-omitted>`.
+
+**Provenance.** Every request and response emits exactly one capture record on the `transaction_debug` target whose `capture` field is `captured`, `truncated`, `binary`, or `omitted` (with `reason`), alongside `body_kind`, `body_bytes`, and `truncated`. An absent sample is therefore always distinguishable from an empty one. Captured bytes are never written into `ctx.metadata` or `TransactionSummary`, so no log-shipping sink can observe them, and nothing is retained across hooks.
+
+When both switches are false — the default — the plugin reports no body buffering requirement, allocates nothing on the body path, and emits no capture records.
 
 WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
 
@@ -1340,10 +1369,15 @@ WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic an
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
+| `log_request_body` | bool | `false` | Enable bounded, redacted capture of the backend-visible request body |
+| `log_response_body` | bool | `false` | Enable bounded, redacted capture of the client-visible response body |
+| `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
+| `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
+| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key other than `redacted_headers` is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error.
+The configuration object is closed: any key outside the table above is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
 
 ### `correlation_id`
 

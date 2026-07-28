@@ -3,15 +3,51 @@
 //! Emits debug output via `tracing::debug!` on the `transaction_debug` target,
 //! showing the request/response lifecycle: matched proxy, consumer identity,
 //! plugin execution timing, backend connection details, and authoritative
-//! terminal state. Request and response payloads are never captured. Sensitive
-//! headers (Authorization, Cookie, API keys) are automatically redacted.
-//! Intended for development and troubleshooting — should not be enabled in
-//! production due to information disclosure risk.
+//! terminal state. Sensitive headers (Authorization, Cookie, API keys) are
+//! automatically redacted. Intended for development and troubleshooting —
+//! should not be enabled in production due to information disclosure risk.
+//!
+//! # Bounded body capture (issue #3316)
+//!
+//! `log_request_body` / `log_response_body` are opt-in, default-off switches
+//! that emit a **bounded, redacted sample** of the request or response body.
+//! The capture design is deliberately conservative:
+//!
+//! * **Bounded.** `max_request_body_bytes` / `max_response_body_bytes` default
+//!   to [`DEFAULT_BODY_CAPTURE_BYTES`] and are hard-capped at
+//!   [`MAX_BODY_CAPTURE_BYTES`] at construction. The rendered field is
+//!   additionally capped at [`MAX_RENDERED_BODY_BYTES`] after escaping, so
+//!   Unicode/control escaping cannot expand a capture without limit.
+//! * **Never forces a stream to buffer.** Both buffering predicates return
+//!   `false` unless the message declares a `Content-Length` that fits inside the
+//!   configured cap, declares an identity `Content-Encoding`, and declares a
+//!   capturable textual `Content-Type`. gRPC, SSE (`text/event-stream`),
+//!   WebSocket upgrades, chunked/unknown-length, encoded, oversized, and binary
+//!   traffic keep streaming exactly as they do with capture disabled.
+//! * **Captured after normalization/transformation.** The request sample is
+//!   taken in `on_final_request_body` (backend-visible bytes, after every
+//!   request transform) and the response sample in `on_final_response_body`
+//!   (client-visible bytes, after every response transform).
+//! * **Redacted before rendering.** JSON objects and form bodies are redacted
+//!   per field; unstructured text is redacted per line (any line holding a
+//!   sensitive marker is replaced wholesale); credential-shaped string values
+//!   (`Bearer …`, `Basic …`, JWT-shaped) are replaced anywhere they appear.
+//!   Non-UTF-8 payloads are never dumped — they render as
+//!   [`BODY_BINARY_MARKER`].
+//! * **Explicit provenance.** Every request/response emits exactly one capture
+//!   record whose `capture` field distinguishes `captured`, `truncated`,
+//!   `binary`, and `omitted` (with a stable `reason`), so an absent body sample
+//!   is never confused with an empty one.
+//!
+//! No captured bytes are written into `ctx.metadata` or the transaction
+//! summary: the sample exists only on the `transaction_debug` tracing target and
+//! is not retained across hooks.
 
 use async_trait::async_trait;
 use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
@@ -40,9 +76,146 @@ const SENSITIVE_HEADERS: &[&str] = &[
 /// Redaction placeholder for sensitive header values.
 const REDACTED: &str = "***REDACTED***";
 
+/// Closed configuration surface. Kept in lockstep with the OpenAPI
+/// `TransactionDebuggerConfig` schema (`openapi_yaml_tests`).
+pub const TRANSACTION_DEBUGGER_CONFIG_KEYS: &[&str] = &[
+    "log_request_body",
+    "log_response_body",
+    "max_request_body_bytes",
+    "max_response_body_bytes",
+    "redacted_body_fields",
+    "redacted_headers",
+];
+
+/// Default per-direction body capture budget in bytes.
+pub const DEFAULT_BODY_CAPTURE_BYTES: u64 = 1024;
+
+/// Hard per-direction ceiling for a configured body capture budget. Values
+/// above this are rejected at construction rather than silently clamped.
+pub const MAX_BODY_CAPTURE_BYTES: u64 = 8192;
+
+/// Absolute ceiling for the rendered (redacted + escaped) body field. Escaping
+/// can expand one source byte into six output bytes; this bounds the emitted
+/// string regardless of the configured capture budget.
+pub const MAX_RENDERED_BODY_BYTES: usize = 64 * 1024;
+
+/// Largest body that structured (JSON/form) redaction will parse. Above this a
+/// capture falls back to the coarser line-level text redaction.
+const REDACTION_PARSE_BUDGET_BYTES: usize = 32 * 1024;
+
+/// Maximum number of lines retained by unstructured-text redaction.
+const MAX_TEXT_REDACTION_LINES: usize = 256;
+
+/// Maximum JSON nesting depth walked by field redaction.
+const MAX_JSON_REDACTION_DEPTH: usize = 64;
+
+/// Rendered stand-in for a body that is not valid UTF-8. Binary payloads are
+/// never dumped, not even base64-encoded.
+pub const BODY_BINARY_MARKER: &str = "<non-utf8-body-omitted>";
+
+/// Rendered stand-in for a JSON subtree deeper than [`MAX_JSON_REDACTION_DEPTH`].
+const BODY_DEPTH_MARKER: &str = "***DEPTH-LIMIT***";
+
+/// Substrings that make a body field name (or an unstructured text line)
+/// credential-bearing. Matched case-insensitively against the lowercased name.
+const SENSITIVE_BODY_KEY_SUBSTRINGS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "credential",
+    "private_key",
+    "privatekey",
+    "access_key",
+    "secret_key",
+    "authorization",
+    "session",
+    "signature",
+    "assertion",
+];
+
+/// Short field names that are credential-bearing only as an exact match, so a
+/// benign name such as `pinned` or `keyboard` is not redacted away.
+const SENSITIVE_BODY_KEY_EXACT: &[&str] = &[
+    "auth", "code", "cookie", "jwt", "key", "otp", "pin", "pwd", "sig",
+];
+
+/// Capturable textual body families. Everything outside this set is skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyKind {
+    /// `application/json`, `text/json`, or any `+json` structured suffix.
+    Json,
+    /// `application/x-www-form-urlencoded`.
+    Form,
+    /// Plain/structured text: `text/plain`, XML families, `application/graphql`.
+    Text,
+}
+
+impl BodyKind {
+    /// Stable label emitted in the `body_kind` diagnostic field.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Form => "form",
+            Self::Text => "text",
+        }
+    }
+}
+
+/// Whether the current message is eligible for a bounded body capture, and if
+/// not, the stable operator-visible reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyCaptureDecision {
+    /// Capture up to `max_bytes` of a `kind` body.
+    Capture { kind: BodyKind, max_bytes: usize },
+    /// Do not capture. The reason is a fixed, non-echoing label.
+    Skip(&'static str),
+}
+
+impl BodyCaptureDecision {
+    /// `Some(reason)` when this message will not be captured.
+    pub const fn skip_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Capture { .. } => None,
+            Self::Skip(reason) => Some(reason),
+        }
+    }
+
+    /// Whether this message is eligible for capture.
+    pub const fn is_capture(self) -> bool {
+        matches!(self, Self::Capture { .. })
+    }
+}
+
+/// A rendered, bounded, redacted body sample.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedBody {
+    /// `captured`, `truncated`, or `binary`.
+    pub state: &'static str,
+    /// Body family the sample was redacted as (`binary` for non-UTF-8).
+    pub kind: &'static str,
+    /// Byte length of the complete post-transform body.
+    pub original_bytes: usize,
+    /// Whether the sample omits part of the body (byte cap, line cap, or the
+    /// rendered ceiling).
+    pub truncated: bool,
+    /// Redacted, escaped, bounded rendering.
+    pub rendered: String,
+}
+
 pub struct TransactionDebugger {
     /// Additional header names (lowercase) to redact beyond the built-in list.
     extra_redacted_headers: Vec<String>,
+    /// Additional body field names (lowercase) to redact.
+    redacted_body_fields: Vec<String>,
+    log_request_body: bool,
+    log_response_body: bool,
+    max_request_body_bytes: usize,
+    max_response_body_bytes: usize,
 }
 
 impl TransactionDebugger {
@@ -58,18 +231,10 @@ impl TransactionDebugger {
                     .to_string(),
             );
         }
-        if config.get("log_request_body").is_some() || config.get("log_response_body").is_some() {
-            return Err(
-                "transaction_debugger: 'log_request_body' / 'log_response_body' is not supported \
-                 because request and response payloads are not captured"
-                    .to_string(),
-            );
-        }
-
         let mut unknown_keys: Vec<&str> = object
             .keys()
             .map(String::as_str)
-            .filter(|key| *key != "redacted_headers")
+            .filter(|key| !TRANSACTION_DEBUGGER_CONFIG_KEYS.contains(key))
             .collect();
         if !unknown_keys.is_empty() {
             unknown_keys.sort_unstable();
@@ -82,9 +247,51 @@ impl TransactionDebugger {
         let extra_redacted_headers =
             optional_header_names(config, "redacted_headers")?.unwrap_or_default();
 
+        let log_request_body = optional_bool(config, "log_request_body")?.unwrap_or(false);
+        let log_response_body = optional_bool(config, "log_response_body")?.unwrap_or(false);
+        let max_request_body_bytes =
+            optional_capture_budget(config, "max_request_body_bytes", log_request_body)?;
+        let max_response_body_bytes =
+            optional_capture_budget(config, "max_response_body_bytes", log_response_body)?;
+
+        let redacted_body_fields =
+            optional_body_field_names(config, "redacted_body_fields")?.unwrap_or_default();
+        if !redacted_body_fields.is_empty() && !(log_request_body || log_response_body) {
+            return Err(
+                "transaction_debugger: 'redacted_body_fields' requires 'log_request_body' or \
+                 'log_response_body' to be true"
+                    .to_string(),
+            );
+        }
+
         Ok(Self {
             extra_redacted_headers,
+            redacted_body_fields,
+            log_request_body,
+            log_response_body,
+            max_request_body_bytes,
+            max_response_body_bytes,
         })
+    }
+
+    /// Whether bounded request-body capture is enabled.
+    pub const fn log_request_body(&self) -> bool {
+        self.log_request_body
+    }
+
+    /// Whether bounded response-body capture is enabled.
+    pub const fn log_response_body(&self) -> bool {
+        self.log_response_body
+    }
+
+    /// Effective request-body capture budget in bytes.
+    pub const fn max_request_body_bytes(&self) -> usize {
+        self.max_request_body_bytes
+    }
+
+    /// Effective response-body capture budget in bytes.
+    pub const fn max_response_body_bytes(&self) -> usize {
+        self.max_response_body_bytes
     }
 
     /// Stable terminal classification derived from the final HTTP/gRPC summary.
@@ -175,6 +382,273 @@ impl TransactionDebugger {
             })
             .collect()
     }
+
+    /// Eligibility of the current request for a bounded body capture.
+    ///
+    /// Evaluated from request headers only, so it is identical at the
+    /// buffering decision and at emission time. Any answer other than
+    /// `Capture` leaves the request on its ordinary streaming path.
+    pub fn request_body_capture_decision(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> BodyCaptureDecision {
+        if !self.log_request_body {
+            return BodyCaptureDecision::Skip("disabled");
+        }
+        if header_value(headers, "upgrade").is_some() {
+            return BodyCaptureDecision::Skip("protocol_excluded");
+        }
+        capture_decision(headers, self.max_request_body_bytes)
+    }
+
+    /// Eligibility of the current response for a bounded body capture.
+    pub fn response_body_capture_decision(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> BodyCaptureDecision {
+        if !self.log_response_body {
+            return BodyCaptureDecision::Skip("disabled");
+        }
+        capture_decision(headers, self.max_response_body_bytes)
+    }
+
+    /// Whether the request shape rules out response capture before backend
+    /// response headers are known. Long-lived and streaming request flavors
+    /// must never be pinned onto the buffered path by the debugger.
+    fn request_shape_allows_response_capture(&self, ctx: &RequestContext) -> bool {
+        if header_value(&ctx.headers, "upgrade").is_some() {
+            return false;
+        }
+        if header_value(&ctx.headers, "content-type").is_some_and(is_grpc_content_type) {
+            return false;
+        }
+        if header_value(&ctx.headers, "accept")
+            .is_some_and(|accept| accept.to_ascii_lowercase().contains("text/event-stream"))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Render a bounded, redacted sample of `body`.
+    ///
+    /// Redaction runs over the complete post-transform body first and the
+    /// byte cap is applied to the redacted rendering, so a truncated capture
+    /// can never expose a secret that a full capture would have removed.
+    pub fn render_captured_body(
+        &self,
+        body: &[u8],
+        kind: BodyKind,
+        max_bytes: usize,
+    ) -> CapturedBody {
+        let original_bytes = body.len();
+        let Some(text) = utf8_prefix(body) else {
+            return CapturedBody {
+                state: "binary",
+                kind: "binary",
+                original_bytes,
+                truncated: false,
+                rendered: BODY_BINARY_MARKER.to_string(),
+            };
+        };
+        let non_utf8_tail = text.len() < original_bytes;
+
+        let (redacted, dropped_lines) = if original_bytes > REDACTION_PARSE_BUDGET_BYTES {
+            self.redact_text_lines(text)
+        } else {
+            match kind {
+                BodyKind::Json => match serde_json::from_str::<Value>(text) {
+                    Ok(mut value) => {
+                        self.redact_json_value(&mut value, 0);
+                        // Serialization of an already-parsed, redacted document
+                        // cannot fail; fall back to the text path defensively.
+                        match serde_json::to_string(&value) {
+                            Ok(rendered) => (rendered, false),
+                            Err(_) => self.redact_text_lines(text),
+                        }
+                    }
+                    // Unparseable JSON (malformed, or a body the operator
+                    // mislabelled) gets the conservative line-level treatment
+                    // rather than a raw dump.
+                    Err(_) => self.redact_text_lines(text),
+                },
+                BodyKind::Form => (self.redact_form_body(text), false),
+                BodyKind::Text => self.redact_text_lines(text),
+            }
+        };
+
+        let (slice, byte_capped) = truncate_on_char_boundary(&redacted, max_bytes);
+        let (rendered, render_capped) = escape_for_diagnostics(slice);
+        let truncated = byte_capped || render_capped || dropped_lines || non_utf8_tail;
+        CapturedBody {
+            state: if truncated { "truncated" } else { "captured" },
+            kind: kind.as_str(),
+            original_bytes,
+            truncated,
+            rendered,
+        }
+    }
+
+    /// Whether a body field name (or an unstructured text line) is
+    /// credential-bearing under the built-in list, the operator's
+    /// `redacted_body_fields` / `redacted_headers`, and the central metadata
+    /// sensitivity classifier (which carries `FERRUM_LOG_REDACT_METADATA_KEYS`).
+    fn is_sensitive_body_key(&self, key: &str) -> bool {
+        let lowered = key.to_ascii_lowercase();
+        let matches_marker = SENSITIVE_BODY_KEY_SUBSTRINGS
+            .iter()
+            .any(|marker| lowered.contains(marker));
+        matches_marker
+            || SENSITIVE_BODY_KEY_EXACT.iter().any(|name| lowered == *name)
+            || SENSITIVE_HEADERS.iter().any(|name| lowered == *name)
+            || self.extra_redacted_headers.iter().any(|n| lowered == *n)
+            || self.redacted_body_fields.iter().any(|n| lowered == *n)
+            || is_sensitive_metadata_key(&lowered)
+    }
+
+    /// Whether an unstructured line carries any sensitive marker. Line-level
+    /// matching is deliberately coarse: unstructured text has no field grammar,
+    /// so a line that mentions a credential marker is dropped wholesale.
+    fn line_is_sensitive(&self, line: &str) -> bool {
+        let lowered = line.to_ascii_lowercase();
+        let matches_marker = SENSITIVE_BODY_KEY_SUBSTRINGS
+            .iter()
+            .any(|marker| lowered.contains(marker));
+        matches_marker
+            || SENSITIVE_HEADERS.iter().any(|name| lowered.contains(name))
+            || self.extra_redacted_headers.iter().any(|n| lowered.contains(n))
+            || self.redacted_body_fields.iter().any(|n| lowered.contains(n))
+            || is_sensitive_metadata_key(&lowered)
+            || lowered.contains("bearer ")
+            || lowered.contains("basic ")
+            || lowered.contains("eyj")
+    }
+
+    fn redact_json_value(&self, value: &mut Value, depth: usize) {
+        if depth > MAX_JSON_REDACTION_DEPTH {
+            *value = Value::String(BODY_DEPTH_MARKER.to_string());
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, entry) in map.iter_mut() {
+                    if self.is_sensitive_body_key(key) {
+                        *entry = Value::String(REDACTED.to_string());
+                    } else {
+                        self.redact_json_value(entry, depth + 1);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for entry in items.iter_mut() {
+                    self.redact_json_value(entry, depth + 1);
+                }
+            }
+            Value::String(text) => {
+                if looks_like_credential(text) {
+                    *text = REDACTED.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn redact_form_body(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        for (index, pair) in text.split('&').enumerate() {
+            if index > 0 {
+                out.push('&');
+            }
+            match pair.split_once('=') {
+                Some((raw_key, raw_value)) => {
+                    out.push_str(raw_key);
+                    out.push('=');
+                    if self.is_sensitive_body_key(&decode_form_component(raw_key))
+                        || looks_like_credential(&decode_form_component(raw_value))
+                    {
+                        out.push_str(REDACTED);
+                    } else {
+                        out.push_str(raw_value);
+                    }
+                }
+                // A bare token carries no field name to classify; keep the
+                // credential screen so a raw bearer value cannot slip through.
+                None => {
+                    if self.is_sensitive_body_key(&decode_form_component(pair))
+                        || looks_like_credential(&decode_form_component(pair))
+                    {
+                        out.push_str(REDACTED);
+                    } else {
+                        out.push_str(pair);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Line-level redaction for unstructured text. Returns the redacted text
+    /// and whether lines beyond [`MAX_TEXT_REDACTION_LINES`] were dropped.
+    fn redact_text_lines(&self, text: &str) -> (String, bool) {
+        let mut out = String::with_capacity(text.len().min(REDACTION_PARSE_BUDGET_BYTES));
+        let mut dropped = false;
+        for (index, line) in text.lines().enumerate() {
+            if index >= MAX_TEXT_REDACTION_LINES {
+                dropped = true;
+                break;
+            }
+            if index > 0 {
+                out.push('\n');
+            }
+            if self.line_is_sensitive(line) {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(line);
+            }
+        }
+        (out, dropped)
+    }
+
+    /// Emit one capture record for a direction. `decision` describes what the
+    /// buffering predicates concluded; `captured` is present only when the body
+    /// was actually available.
+    fn emit_body_capture(
+        &self,
+        direction: &'static str,
+        method: &str,
+        path: &str,
+        decision: BodyCaptureDecision,
+        captured: Option<&CapturedBody>,
+    ) {
+        match (decision, captured) {
+            (BodyCaptureDecision::Capture { .. }, Some(sample)) => {
+                tracing::debug!(
+                    target: "transaction_debug",
+                    direction = %direction,
+                    capture = %sample.state,
+                    body_kind = %sample.kind,
+                    body_bytes = sample.original_bytes,
+                    truncated = sample.truncated,
+                    method = %method,
+                    path = %path,
+                    body = %sample.rendered,
+                    "Bounded body capture",
+                );
+            }
+            (BodyCaptureDecision::Skip(reason), _) => {
+                tracing::debug!(
+                    target: "transaction_debug",
+                    direction = %direction,
+                    capture = "omitted",
+                    reason = %reason,
+                    method = %method,
+                    path = %path,
+                    "Bounded body capture omitted",
+                );
+            }
+            (BodyCaptureDecision::Capture { .. }, None) => {}
+        }
+    }
 }
 
 #[async_trait]
@@ -199,6 +673,83 @@ impl Plugin for TransactionDebugger {
         PluginResult::Continue
     }
 
+    fn requires_request_body_buffering(&self) -> bool {
+        self.log_request_body
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.request_body_capture_decision(&ctx.headers).is_capture()
+    }
+
+    /// The capture reads the body from the `on_final_request_body` parameter,
+    /// so the debugger never asks for the extra UTF-8 copy in
+    /// `ctx.metadata["request_body"]`.
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    fn requires_response_body_buffering(&self) -> bool {
+        self.log_response_body
+    }
+
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        self.log_response_body && self.request_shape_allows_response_capture(ctx)
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        _content_type: Option<&str>,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && self.response_body_capture_decision(response_headers).is_capture()
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        // Emit the omission record for a request that will keep streaming. The
+        // capture record itself is emitted by `on_final_request_body`, which
+        // only runs once the body has actually been buffered.
+        if self.log_request_body
+            && tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+        {
+            let decision = self.request_body_capture_decision(headers);
+            if decision.skip_reason().is_some() {
+                self.emit_body_capture("request", &ctx.method, &ctx.path, decision, None);
+            }
+        }
+        PluginResult::Continue
+    }
+
+    async fn on_final_request_body(
+        &self,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.log_request_body
+            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+        {
+            return PluginResult::Continue;
+        }
+        let decision = self.request_body_capture_decision(headers);
+        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
+            let sample = self.render_captured_body(body, kind, max_bytes);
+            self.emit_body_capture(
+                "request",
+                header_value(headers, ":method").unwrap_or("-"),
+                header_value(headers, ":path").unwrap_or("-"),
+                decision,
+                Some(&sample),
+            );
+        }
+        PluginResult::Continue
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -208,6 +759,39 @@ impl Plugin for TransactionDebugger {
         if tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             let safe_headers = self.redact_headers(ctx, response_headers);
             tracing::debug!(target: "transaction_debug", status = response_status, method = %ctx.method, path = %ctx.path, headers = ?safe_headers, "Backend response");
+            if self.log_response_body {
+                let decision = if self.request_shape_allows_response_capture(ctx) {
+                    self.response_body_capture_decision(response_headers)
+                } else {
+                    BodyCaptureDecision::Skip("protocol_excluded")
+                };
+                if decision.skip_reason().is_some() {
+                    self.emit_body_capture("response", &ctx.method, &ctx.path, decision, None);
+                }
+            }
+        }
+        PluginResult::Continue
+    }
+
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.log_response_body
+            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+        {
+            return PluginResult::Continue;
+        }
+        if !self.request_shape_allows_response_capture(ctx) {
+            return PluginResult::Continue;
+        }
+        let decision = self.response_body_capture_decision(response_headers);
+        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
+            let sample = self.render_captured_body(body, kind, max_bytes);
+            self.emit_body_capture("response", &ctx.method, &ctx.path, decision, Some(&sample));
         }
         PluginResult::Continue
     }
@@ -372,6 +956,277 @@ const fn stream_io_side_label(side: StreamIoSide) -> &'static str {
         StreamIoSide::Read => "read",
         StreamIoSide::Write => "write",
     }
+}
+
+/// Case-insensitive header lookup that does not allocate.
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn ends_with_ignore_ascii_case(value: &str, suffix: &str) -> bool {
+    match value.len().checked_sub(suffix.len()) {
+        Some(start) => value.as_bytes()[start..].eq_ignore_ascii_case(suffix.as_bytes()),
+        None => false,
+    }
+}
+
+/// Media type without parameters, trimmed.
+fn base_media_type(content_type: &str) -> &str {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+}
+
+fn is_grpc_content_type(content_type: &str) -> bool {
+    const GRPC: &str = "application/grpc";
+    let base = base_media_type(content_type);
+    match base.as_bytes().get(..GRPC.len()) {
+        Some(prefix) => prefix.eq_ignore_ascii_case(GRPC.as_bytes()),
+        None => false,
+    }
+}
+
+/// Map a media type to the capturable body family, or `None` when the media
+/// type is outside the debugger's safe-capture allow-list.
+fn capturable_body_kind(content_type: &str) -> Option<BodyKind> {
+    let base = base_media_type(content_type);
+    if base.eq_ignore_ascii_case("application/json")
+        || base.eq_ignore_ascii_case("text/json")
+        || ends_with_ignore_ascii_case(base, "+json")
+    {
+        return Some(BodyKind::Json);
+    }
+    if base.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        return Some(BodyKind::Form);
+    }
+    if base.eq_ignore_ascii_case("text/plain")
+        || base.eq_ignore_ascii_case("application/xml")
+        || base.eq_ignore_ascii_case("text/xml")
+        || base.eq_ignore_ascii_case("application/graphql")
+        || ends_with_ignore_ascii_case(base, "+xml")
+    {
+        return Some(BodyKind::Text);
+    }
+    None
+}
+
+/// Shared request/response capture eligibility over a header map.
+///
+/// Every rejection keeps the message on its ordinary path: an unknown-length,
+/// encoded, oversized, streaming, or non-textual message is never pinned onto
+/// the buffered path just because the debugger is enabled.
+fn capture_decision(headers: &HashMap<String, String>, max_bytes: usize) -> BodyCaptureDecision {
+    let Some(content_type) = header_value(headers, "content-type") else {
+        return BodyCaptureDecision::Skip("no_content_type");
+    };
+    if is_grpc_content_type(content_type)
+        || base_media_type(content_type).eq_ignore_ascii_case("text/event-stream")
+    {
+        return BodyCaptureDecision::Skip("protocol_excluded");
+    }
+    let Some(kind) = capturable_body_kind(content_type) else {
+        return BodyCaptureDecision::Skip("content_type_excluded");
+    };
+    if header_value(headers, "content-encoding")
+        .is_some_and(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
+    {
+        return BodyCaptureDecision::Skip("content_encoding");
+    }
+    let Some(declared_length) = header_value(headers, "content-length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return BodyCaptureDecision::Skip("unknown_length");
+    };
+    if declared_length == 0 {
+        return BodyCaptureDecision::Skip("empty_body");
+    }
+    if declared_length > max_bytes as u64 {
+        return BodyCaptureDecision::Skip("over_capture_limit");
+    }
+    BodyCaptureDecision::Capture { kind, max_bytes }
+}
+
+/// Longest valid UTF-8 prefix of `body`, or `None` when the body contains an
+/// actual invalid sequence (a binary payload) rather than a truncated tail.
+fn utf8_prefix(body: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(body) {
+        Ok(text) => Some(text),
+        Err(err) if err.error_len().is_none() => {
+            std::str::from_utf8(&body[..err.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// Truncate to at most `max_bytes` on a character boundary. Returns the slice
+/// and whether anything was dropped.
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> (&str, bool) {
+    if text.len() <= max_bytes {
+        return (text, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&text[..end], true)
+}
+
+/// Bidirectional/invisible formatting characters that can spoof a log line.
+const fn is_spoofing_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
+/// Escape control and bidi-spoofing characters and cap the rendered length.
+///
+/// Escaping can expand one source character into six output bytes, so the
+/// output is additionally bounded by [`MAX_RENDERED_BODY_BYTES`]. Returns the
+/// rendered string and whether the render ceiling truncated it.
+fn escape_for_diagnostics(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut capped = false;
+    for ch in text.chars() {
+        if out.len() >= MAX_RENDERED_BODY_BYTES {
+            capped = true;
+            break;
+        }
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\\' => out.push_str("\\\\"),
+            ch if ch.is_control() || is_spoofing_control(ch) => {
+                let _ = write!(out, "\\u{{{:04x}}}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    (out, capped)
+}
+
+/// Whether a string value is credential-shaped regardless of the field name
+/// that carried it.
+fn looks_like_credential(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() >= 8 {
+        let lowered_prefix = trimmed.get(..7).map(str::to_ascii_lowercase);
+        if lowered_prefix.as_deref() == Some("bearer ") {
+            return true;
+        }
+        let lowered_basic = trimmed.get(..6).map(str::to_ascii_lowercase);
+        if lowered_basic.as_deref() == Some("basic ") {
+            return true;
+        }
+    }
+    // JWT / JWS compact serialization: `eyJ…` header, at least two dots.
+    if trimmed.len() >= 20 && trimmed.starts_with("eyJ") {
+        return trimmed.bytes().filter(|byte| *byte == b'.').count() >= 2;
+    }
+    false
+}
+
+/// Decode one `application/x-www-form-urlencoded` component for sensitivity
+/// classification only. The rendered output keeps the original encoding.
+fn decode_form_component(component: &str) -> String {
+    let plus_decoded = component.replace('+', " ");
+    percent_encoding::percent_decode_str(&plus_decoded)
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
+    match config.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Err(format!(
+            "transaction_debugger: '{field}' must be a boolean; null is not allowed"
+        )),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| format!("transaction_debugger: '{field}' must be a boolean")),
+    }
+}
+
+/// Parse a per-direction capture budget. Out-of-range values are rejected
+/// rather than clamped so OpenAPI, docs, and runtime admission stay identical,
+/// and a budget without its capture switch is rejected as inert configuration.
+fn optional_capture_budget(
+    config: &Value,
+    field: &'static str,
+    capture_enabled: bool,
+) -> Result<usize, String> {
+    let raw = match config.get(field) {
+        None => return Ok(DEFAULT_BODY_CAPTURE_BYTES as usize),
+        Some(Value::Null) => {
+            return Err(format!(
+                "transaction_debugger: '{field}' must be a positive integer; null is not allowed"
+            ));
+        }
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("transaction_debugger: '{field}' must be a positive integer"))?,
+    };
+    let switch = if field == "max_request_body_bytes" {
+        "log_request_body"
+    } else {
+        "log_response_body"
+    };
+    if !capture_enabled {
+        return Err(format!(
+            "transaction_debugger: '{field}' requires '{switch}' to be true"
+        ));
+    }
+    if raw == 0 {
+        return Err(format!(
+            "transaction_debugger: '{field}' must be greater than zero"
+        ));
+    }
+    if raw > MAX_BODY_CAPTURE_BYTES {
+        return Err(format!(
+            "transaction_debugger: '{field}' must be <= {MAX_BODY_CAPTURE_BYTES} (got {raw})"
+        ));
+    }
+    Ok(raw as usize)
+}
+
+fn optional_body_field_names(
+    config: &Value,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        return Err(format!("transaction_debugger: '{field}' must be an array"));
+    };
+    let mut names = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let Some(raw) = value.as_str() else {
+            return Err(format!(
+                "transaction_debugger: '{field}[{idx}]' must be a string"
+            ));
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!(
+                "transaction_debugger: '{field}[{idx}]' must not be empty"
+            ));
+        }
+        if trimmed.len() > 128 {
+            return Err(format!(
+                "transaction_debugger: '{field}[{idx}]' must be at most 128 characters"
+            ));
+        }
+        names.push(trimmed.to_ascii_lowercase());
+    }
+    Ok(Some(names))
 }
 
 fn optional_header_names(

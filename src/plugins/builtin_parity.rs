@@ -646,7 +646,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "transaction_debugger",
         classification: BuiltinPluginClassification::Public,
         priority: 9200,
-        active_phases: "on_request_received, after_proxy, log, on_stream_disconnect, on_ws_disconnect",
+        active_phases: "on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect",
         matrix_protocols: ALL_PROTOCOLS,
         protocol_rationale: "Observability applies everywhere",
     },
