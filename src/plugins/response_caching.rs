@@ -1110,11 +1110,21 @@ impl ResponseCaching {
     /// sibling instances' namespaced keys. Used on method/SSE bypass and
     /// HIT/REVALIDATED so leftover base/snapshot/predict/timing from an
     /// earlier phase of this instance cannot leak into a later final hook.
+    /// Pending unsafe-method invalidation host is intentionally retained
+    /// unless [`Self::clear_pending_invalidation`] is also called.
     fn clear_lookup_staging(&self, ctx: &mut RequestContext) {
         ctx.metadata.remove(&self.meta_base_key);
         ctx.metadata.remove(&self.meta_predict_key);
         ctx.metadata.remove(&self.meta_request_started);
         ctx.metadata.remove(&self.meta_headers_snapshot);
+    }
+
+    /// Drop a staged unsafe-method invalidation without applying it.
+    ///
+    /// Used when a cache HIT/REVALIDATED short-circuits before origin contact:
+    /// serving a stored representation must not flush peer path variants.
+    fn clear_pending_invalidation(&self, ctx: &mut RequestContext) {
+        ctx.metadata.remove(&self.meta_pending_invalidate_host);
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -1723,13 +1733,24 @@ impl ResponseCaching {
             .insert(self.meta_pending_invalidate_host.clone(), host_part);
     }
 
-    /// Apply a previously staged unsafe-method invalidation when the backend
-    /// (or gateway) produced a non-error final status.
+    /// Apply a previously staged unsafe-method invalidation when the origin
+    /// produced a non-error status.
+    ///
+    /// Prefers private typed origin provenance
+    /// ([`RequestContext::origin_http_response_status`]) when present so an
+    /// earlier `after_proxy` rejection that replaces the client-visible status
+    /// cannot suppress eviction after a successful mutation. Falls back to
+    /// `response_status` for direct `after_proxy` calls (unit tests) that never
+    /// went through `run_after_proxy_hooks`. Consumes the staged host exactly
+    /// once so observe + after_proxy cannot double-invalidate.
     fn maybe_apply_pending_invalidation(&self, ctx: &mut RequestContext, response_status: u16) {
         let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
             return;
         };
-        if Self::is_non_error_status(response_status) {
+        let status = ctx
+            .origin_http_response_status()
+            .unwrap_or(response_status);
+        if Self::is_non_error_status(status) {
             self.invalidate_path(ctx, &host_part);
         }
     }
@@ -2121,19 +2142,25 @@ impl Plugin for ResponseCaching {
         // refuses to store a representation produced across a publication.
         // One ArcSwap load, memoized on the context for sibling instances.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
+
+        // Method safety is independent of storage eligibility (RFC 9111 §4.4 /
+        // RFC 9110 §9.2.1). An unsafe method listed in `cacheable_methods`
+        // (e.g. POST) must still stage authority-scoped invalidation; a safe
+        // method merely absent from that set must not. Staging uses the live
+        // `headers` view so a rewritten Host partitions identically to lookup.
+        // HIT/REVALIDATED paths clear this staging below — a served cache HIT
+        // never contacted the origin and must not flush peer variants.
+        let stage_unsafe_invalidation = self.config.invalidate_on_unsafe_methods
+            && Self::is_unsafe_method(&ctx.method);
+        if stage_unsafe_invalidation {
+            self.stage_pending_invalidation(ctx, headers);
+        }
+
         if !self.is_cacheable_method(&ctx.method) {
-            // Only genuinely unsafe methods may evict, and only after a
-            // non-error response (staged here, applied in `after_proxy`). A
-            // safe method that is merely ineligible for storage (OPTIONS with
-            // the default cacheable set, HEAD with a GET-only set) must bypass
-            // without flushing hot entries. Use the `headers` parameter so a
-            // rewritten Host partitions invalidation identically to lookup.
-            if self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method) {
-                self.stage_pending_invalidation(ctx, headers);
-            }
-            // Clear only this instance's staging so a sibling cache keeps
+            // Clear only this instance's lookup staging so a sibling cache keeps
             // its independently staged base/snapshot/status. Pending
-            // invalidation host is intentionally retained until after_proxy.
+            // invalidation host is intentionally retained until origin success
+            // is observed (or cleared on a later HIT of a cacheable sibling).
             self.clear_lookup_staging(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
@@ -2184,7 +2211,9 @@ impl Plugin for ResponseCaching {
             if directives.request_bypasses_cache() {
                 // Keep this instance's staged base/snapshot/predict so a
                 // no-cache refresh can still store the replacement response
-                // under the same instance-owned key inputs.
+                // under the same instance-owned key inputs. Pending unsafe
+                // invalidation (if any) is retained — the request contacts
+                // the origin.
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
@@ -2235,8 +2264,11 @@ impl Plugin for ResponseCaching {
                     self.set_cache_status(ctx, "REVALIDATED");
                     // HIT/REVALIDATED will not store; drop this instance's
                     // lookup staging so a later final hook cannot mix it with
-                    // another instance's store path.
+                    // another instance's store path. Also drop pending
+                    // invalidation — this representation was served without
+                    // contacting the origin.
                     self.clear_lookup_staging(ctx);
+                    self.clear_pending_invalidation(ctx);
                     // Stored validators/headers are already the final
                     // post-transform representation. Mark the private finalized
                     // replay capability so synthetic presentation transforms
@@ -2255,6 +2287,7 @@ impl Plugin for ResponseCaching {
                 self.add_cache_status_header(&mut headers, "HIT");
                 self.set_cache_status(ctx, "HIT");
                 self.clear_lookup_staging(ctx);
+                self.clear_pending_invalidation(ctx);
                 // Same finalized-replay contract as REVALIDATED / idempotent
                 // replay: the entry was stored after transform_response_body
                 // and after_proxy header rules on the miss path.
@@ -2272,17 +2305,25 @@ impl Plugin for ResponseCaching {
         PluginResult::Continue
     }
 
+    fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
+        // RFC 9111 §4.4: mandatory invalidation runs on a non-error origin
+        // response, not on successful client presentation. This hook is
+        // invoked by proxy core before any `after_proxy` plugin can reject,
+        // so an earlier response-size / OpenAPI rejection cannot suppress
+        // eviction after a successful mutation.
+        self.maybe_apply_pending_invalidation(ctx, status);
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // RFC 9111 §4.4: mandatory invalidation for unsafe methods runs only
-        // after a non-error response establishes that the mutation succeeded
-        // at the origin (or gateway). Failed/unauthorized mutations and
-        // transport failures that surface as 4xx/5xx leave other authorities'
-        // cache entries intact.
+        // Safety net for direct `after_proxy` calls (unit tests) and any path
+        // that reached this hook with staging still pending. When
+        // `observe_origin_http_response_status` already consumed the staging
+        // key, this is a no-op.
         self.maybe_apply_pending_invalidation(ctx, response_status);
 
         let Some(status) = self.cache_status(ctx) else {
