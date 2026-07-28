@@ -19,9 +19,17 @@
 //!
 //! Matching strategy: most built-in keys use substring-on-lowercased-key, so a
 //! key like `request_authorization_header` redacts because it contains
-//! `authorization`. Token keys are narrower: only singular `token` keys with a
-//! credential/session/auth context redact. This keeps usage metrics like
-//! `ai_total_tokens` visible while still protecting real token secrets.
+//! `authorization`. Token and API-key concepts use per-segment classifiers so
+//! delimiter forms (`api_key`, `api-key`), concatenated forms (`apikey`), and
+//! acronym camelCase (`APIKey`, `APIToken`) redact while usage metrics like
+//! `ai_total_tokens` stay visible.
+//!
+//! Request-private lifecycle keys in the `_dedup_*` namespace (case, delimiter,
+//! and camelCase spellings under a leading `_` + first segment `dedup`) are
+//! never emitted into transaction-log projections at all (omitted, not
+//! redacted). Typed request state is the primary home for that material; this
+//! filter is the shared fail-closed contract if any producer still writes the
+//! legacy keys.
 
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -30,9 +38,11 @@ use std::sync::OnceLock;
 
 /// Default substrings (lowercase) that mark a metadata key as sensitive.
 ///
-/// Substring match, not exact match — see module docs. Broad `token` matching
-/// is intentionally excluded; token-shaped keys go through
-/// `is_sensitive_token_metadata_key` so token-count metrics do not disappear.
+/// Substring match, not exact match — see module docs. Broad `token` / `api key`
+/// matching is intentionally excluded from this list; those shapes go through
+/// the per-segment classifiers so token-count metrics do not disappear and
+/// delimiter / acronym spellings share one decision with native and schema
+/// projections.
 pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "authorization",
     "cookie",
@@ -54,36 +64,13 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "last-event-id",
 ];
 
-/// Key segments that make a singular `token` metadata key credential-shaped.
-const SENSITIVE_TOKEN_CONTEXT_SEGMENTS: &[&str] = &[
-    "access",
-    "api",
-    "auth",
-    "authorization",
-    "bearer",
-    "client",
-    "csrf",
-    "github",
-    "gitlab",
-    "id",
-    "identity",
-    "jwt",
-    "oauth",
-    "oidc",
-    "pat",
-    "personal",
-    "refresh",
-    "request",
-    "saml",
-    "security",
-    "session",
-    "slack",
-    "webhook",
-    "xsrf",
-];
-
-/// Generic descriptors that commonly wrap a raw token key.
-const TOKEN_VALUE_SEGMENTS: &[&str] = &["digest", "hash", "hashed", "raw", "sha256", "value"];
+/// Prefix reserved for request-private lifecycle coordination state.
+///
+/// Keys under this prefix (historically `_dedup_key`, `_dedup_fingerprint`,
+/// `_dedup_local_inflight_token`, `_dedup_redis_lock_token`) must never appear
+/// in transaction-log or audit projections. Prefer typed non-serializable
+/// request state; this prefix is the fail-closed observability contract.
+pub const INTERNAL_ONLY_METADATA_KEY_PREFIX: &str = "_dedup_";
 
 /// Placeholder string written in place of sensitive metadata values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
@@ -140,6 +127,12 @@ fn for_each_metadata_key_segment(mut key: &str, mut visit: impl FnMut(&str)) {
 
 fn visit_ascii_metadata_key_segments(key: &str, visit: &mut impl FnMut(&str)) {
     let mut start: Option<usize> = None;
+    // Index of the most recent uppercase character in the current segment.
+    // Used to split acronym boundaries (`APIKey` → `API` + `Key`,
+    // `APIToken` → `API` + `Token`) without splitting single-letter prefixes
+    // (`AToken` stays one leading `A` + `Token` only when a longer uppercase
+    // run precedes the final capital).
+    let mut last_upper: Option<usize> = None;
     let mut previous_was_lower_or_digit = false;
 
     for ch in key.chars() {
@@ -151,20 +144,47 @@ fn visit_ascii_metadata_key_segments(key: &str, visit: &mut impl FnMut(&str)) {
             if let Some(segment_start) = start.take() {
                 visit(&key[segment_start..idx]);
             }
+            last_upper = None;
             previous_was_lower_or_digit = false;
             continue;
         }
 
-        if ch.is_ascii_uppercase() && previous_was_lower_or_digit {
-            if let Some(segment_start) = start {
-                visit(&key[segment_start..idx]);
+        if ch.is_ascii_uppercase() {
+            if previous_was_lower_or_digit {
+                if let Some(segment_start) = start {
+                    visit(&key[segment_start..idx]);
+                }
+                start = Some(idx);
+            } else if start.is_none() {
+                start = Some(idx);
             }
-            start = Some(idx);
-        } else if start.is_none() {
-            start = Some(idx);
+            last_upper = Some(idx);
+            previous_was_lower_or_digit = false;
+            continue;
         }
 
-        previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        if ch.is_ascii_lowercase() {
+            if let (Some(segment_start), Some(upper_idx)) = (start, last_upper) {
+                // `APIKey`: flush `API`, keep `Key` with this lowercase.
+                if upper_idx > segment_start {
+                    visit(&key[segment_start..upper_idx]);
+                    start = Some(upper_idx);
+                }
+            } else if start.is_none() {
+                start = Some(idx);
+            }
+            last_upper = None;
+            previous_was_lower_or_digit = true;
+            continue;
+        }
+
+        // Digits: extend the current segment; treat like lowercase for the
+        // next camelCase boundary (`token2Value` → `token2` + `Value`).
+        if start.is_none() {
+            start = Some(idx);
+        }
+        last_upper = None;
+        previous_was_lower_or_digit = true;
     }
 
     if let Some(segment_start) = start {
@@ -172,45 +192,92 @@ fn visit_ascii_metadata_key_segments(key: &str, visit: &mut impl FnMut(&str)) {
     }
 }
 
-fn segment_is_any(segment: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| segment.eq_ignore_ascii_case(candidate))
-}
-
 fn is_sensitive_token_metadata_key(key: &str) -> bool {
-    let mut segment_count = 0usize;
     let mut has_token_segment = false;
-    let mut has_sensitive_context = false;
-    let mut all_non_token_segments_are_value_descriptors = true;
 
     for_each_metadata_key_segment(key, |segment| {
-        segment_count += 1;
         if segment.eq_ignore_ascii_case("token") {
             has_token_segment = true;
-            return;
-        }
-        if segment_is_any(segment, SENSITIVE_TOKEN_CONTEXT_SEGMENTS) {
-            has_sensitive_context = true;
-        }
-        if !segment_is_any(segment, TOKEN_VALUE_SEGMENTS) {
-            all_non_token_segments_are_value_descriptors = false;
         }
     });
 
-    if !has_token_segment {
+    // Singular `token` is credential-shaped regardless of its producer or
+    // provider prefix. An allowlist of known contexts fails open for custom
+    // plugins (`vendor_token`) and new providers (`openaiToken`). Usage
+    // counters conventionally use the distinct plural segment `tokens`, so
+    // `ai_total_tokens` and peers remain observable.
+    has_token_segment
+}
+
+/// `api` + `key` / concatenated `apikey` credential spellings.
+///
+/// Covers delimiter forms (`api_key`, `api-key`), concatenated (`apikey`), and
+/// acronym camelCase (`APIKey` → segments `API` + `Key`). Does not treat bare
+/// `key` / `cache_key` / metric counters as sensitive.
+fn is_sensitive_api_key_metadata_key(key: &str) -> bool {
+    let mut has_api = false;
+    let mut has_key = false;
+    let mut has_apikey = false;
+
+    for_each_metadata_key_segment(key, |segment| {
+        if segment.eq_ignore_ascii_case("apikey") {
+            has_apikey = true;
+        }
+        if segment.eq_ignore_ascii_case("api") {
+            has_api = true;
+        }
+        if segment.eq_ignore_ascii_case("key") {
+            has_key = true;
+        }
+    });
+
+    has_apikey || (has_api && has_key)
+}
+
+/// Returns true when the key is request-private lifecycle state that must be
+/// omitted from every transaction-log / audit projection.
+///
+/// Fail-closed across case, delimiter, and camelCase spellings of the reserved
+/// `_dedup_*` namespace: a leading `_` whose first alphanumeric segment is
+/// `dedup` (ASCII case-insensitive). Canonical producer names still use
+/// [`INTERNAL_ONLY_METADATA_KEY_PREFIX`]; this matcher is the shared
+/// observability contract if residual lifecycle keys appear under any of those
+/// spellings. Non-prefixed names (`dedup_key`, `request_dedup_*`) and longer
+/// first segments (`_deduplication`) stay observable.
+pub fn is_internal_only_metadata_key(key: &str) -> bool {
+    if !key.as_bytes().first().is_some_and(|byte| *byte == b'_') {
         return false;
     }
 
-    if segment_count == 1 {
+    // Fast path for the canonical / case-folded `_dedup_*` prefix.
+    if key
+        .as_bytes()
+        .get(..INTERNAL_ONLY_METADATA_KEY_PREFIX.len())
+        .is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case(INTERNAL_ONLY_METADATA_KEY_PREFIX.as_bytes())
+        })
+    {
         return true;
     }
 
-    if has_sensitive_context {
-        return true;
-    }
+    // Normalized spellings (`_dedup-…`, `_DedupRedisLockToken`, …): leading `_`
+    // with first segment exactly `dedup`.
+    let mut first_segment_is_dedup: Option<bool> = None;
+    for_each_metadata_key_segment(key, |segment| {
+        if first_segment_is_dedup.is_none() {
+            first_segment_is_dedup = Some(segment.eq_ignore_ascii_case("dedup"));
+        }
+    });
+    first_segment_is_dedup == Some(true)
+}
 
-    all_non_token_segments_are_value_descriptors
+/// Strip every internal-only metadata key from a cloned observability map.
+///
+/// Shared by `clone_log_metadata` and any other summary construction path so
+/// lifecycle coordination state cannot reach a logger even if a producer wrote
+/// the legacy `_dedup_*` names into the public metadata map.
+pub fn strip_internal_only_metadata(metadata: &mut HashMap<String, String>) {
+    metadata.retain(|key, _| !is_internal_only_metadata_key(key));
 }
 
 /// Returns true when the given metadata key matches any sensitive substring
@@ -218,10 +285,17 @@ fn is_sensitive_token_metadata_key(key: &str) -> bool {
 /// (case-insensitive). The lower-level entry point used by tests; production
 /// callers should use [`is_sensitive_metadata_key`].
 pub fn is_sensitive_metadata_key_with_extras(key: &str, extras: &[String]) -> bool {
+    if is_internal_only_metadata_key(key) {
+        // Internal-only keys are omitted before serialization; treat them as
+        // sensitive so schema compile-time rejection / static_fields checks
+        // also fail closed if an operator tries to project them explicitly.
+        return true;
+    }
     if DEFAULT_SENSITIVE_METADATA_KEYS
         .iter()
         .any(|needle| contains_ascii_case_insensitive(key, needle))
         || is_sensitive_token_metadata_key(key)
+        || is_sensitive_api_key_metadata_key(key)
     {
         return true;
     }
@@ -239,7 +313,8 @@ pub fn is_sensitive_metadata_key(key: &str) -> bool {
 /// Serde `serialize_with` adapter for `HashMap<String, String>` metadata
 /// fields on log summary structs. Replaces the value with
 /// `REDACTED_PLACEHOLDER` for any key that matches a sensitive substring.
-/// Non-sensitive keys pass through unchanged.
+/// Internal-only lifecycle keys are omitted entirely. Non-sensitive keys pass
+/// through unchanged.
 ///
 /// The serialized order is the natural HashMap iteration order — same as the
 /// default `Serialize` impl for `HashMap`. Logs are not sorted by key today,
@@ -265,8 +340,15 @@ impl Serialize for RedactedMetadata<'_> {
         S: Serializer,
     {
         let metadata = self.0;
-        let mut map = serializer.serialize_map(Some(metadata.len()))?;
+        let emit_count = metadata
+            .keys()
+            .filter(|key| !is_internal_only_metadata_key(key))
+            .count();
+        let mut map = serializer.serialize_map(Some(emit_count))?;
         for (key, value) in metadata {
+            if is_internal_only_metadata_key(key) {
+                continue;
+            }
             if is_sensitive_metadata_key(key) {
                 map.serialize_entry(key, REDACTED_PLACEHOLDER)?;
             } else {
@@ -393,7 +475,134 @@ mod tests {
             "sessionétoken",
             &extras
         ));
-        assert!(!is_sensitive_metadata_key_with_extras("APIToken", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("APIToken", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("APIKey", &extras));
+    }
+
+    #[test]
+    fn api_key_spellings_match_without_redacting_token_metrics() {
+        let extras: Vec<String> = Vec::new();
+
+        for key in [
+            "api_key",
+            "api-key",
+            "apikey",
+            "APIKey",
+            "API_KEY",
+            "x-api-key",
+            "openai_api_key",
+            "APIToken",
+        ] {
+            assert!(
+                is_sensitive_metadata_key_with_extras(key, &extras),
+                "{key} should be redacted"
+            );
+        }
+
+        for key in [
+            "ai_total_tokens",
+            "ai_prompt_tokens",
+            "cache_key",
+            "routing_key",
+            "api_response_count",
+            "keyboard_layout",
+        ] {
+            assert!(
+                !is_sensitive_metadata_key_with_extras(key, &extras),
+                "{key} should remain visible"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_only_dedup_keys_are_sensitive_and_omitted_on_serialize() {
+        let extras: Vec<String> = Vec::new();
+        for key in [
+            "_dedup_key",
+            "_dedup_fingerprint",
+            "_dedup_local_inflight_token",
+            "_dedup_redis_lock_token",
+            "_DEDUP_REDIS_LOCK_TOKEN",
+            "_DeDuP_Local_Inflight_Token",
+            "_dedup-redis-lock-token",
+            "_DedupRedisLockToken",
+        ] {
+            assert!(
+                is_internal_only_metadata_key(key),
+                "{key} must be internal-only"
+            );
+            assert!(
+                is_sensitive_metadata_key_with_extras(key, &extras),
+                "{key} must fail closed for schema / static field checks"
+            );
+        }
+        for key in [
+            "dedup_key",
+            "request_dedup_key",
+            "_deduplication",
+            "cache_key",
+        ] {
+            assert!(
+                !is_internal_only_metadata_key(key),
+                "{key} must not be internal-only"
+            );
+        }
+
+        let mut metadata = HashMap::new();
+        metadata.insert("_dedup_key".to_string(), "idem-secret".to_string());
+        metadata.insert("_dedup_fingerprint".to_string(), "fp-secret".to_string());
+        metadata.insert(
+            "_dedup_local_inflight_token".to_string(),
+            "local-secret".to_string(),
+        );
+        metadata.insert(
+            "_dedup_redis_lock_token".to_string(),
+            "redis-secret".to_string(),
+        );
+        metadata.insert(
+            "_DEDUP_REDIS_LOCK_TOKEN".to_string(),
+            "upper-redis-secret".to_string(),
+        );
+        metadata.insert(
+            "_DedupRedisLockToken".to_string(),
+            "camel-redis-secret".to_string(),
+        );
+        metadata.insert("trace_id".to_string(), "abc-123".to_string());
+        metadata.insert(
+            "request_dedup_key".to_string(),
+            "visible-control".to_string(),
+        );
+
+        let json = serde_json::to_string(&MetadataWrapper(&metadata)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["trace_id"], "abc-123");
+        assert_eq!(parsed["request_dedup_key"], "visible-control");
+        for key in [
+            "_dedup_key",
+            "_dedup_fingerprint",
+            "_dedup_local_inflight_token",
+            "_dedup_redis_lock_token",
+            "_DEDUP_REDIS_LOCK_TOKEN",
+            "_DedupRedisLockToken",
+        ] {
+            assert!(
+                parsed.get(key).is_none(),
+                "{key} must be omitted from log projection, got: {json}"
+            );
+        }
+        for leaked in [
+            "idem-secret",
+            "fp-secret",
+            "local-secret",
+            "redis-secret",
+            "upper-redis-secret",
+            "camel-redis-secret",
+        ] {
+            assert!(
+                !json.contains(leaked),
+                "lifecycle value leaked from projection"
+            );
+        }
     }
 
     #[test]
@@ -570,13 +779,17 @@ mod tests {
     }
 
     #[test]
-    fn segments_consecutive_uppercase_stays_together() {
-        // "APIToken" -> "APIToken" as one segment because the camelCase
-        // split only fires when previousWasLowerOrDigit; all-caps does not
-        // trigger a split until a lowercase follows.
-        let mut segments = Vec::new();
-        for_each_metadata_key_segment("APIToken", |s| segments.push(s.to_string()));
-        assert_eq!(segments, vec!["APIToken"]);
+    fn segments_acronym_then_camel_case_split() {
+        // `APIToken` / `APIKey` split the leading acronym from the final
+        // capitalized word so credential classifiers see `api` + `token` /
+        // `api` + `key`.
+        let mut token_segments = Vec::new();
+        for_each_metadata_key_segment("APIToken", |s| token_segments.push(s.to_string()));
+        assert_eq!(token_segments, vec!["API", "Token"]);
+
+        let mut key_segments = Vec::new();
+        for_each_metadata_key_segment("APIKey", |s| key_segments.push(s.to_string()));
+        assert_eq!(key_segments, vec!["API", "Key"]);
     }
 
     #[test]
@@ -647,11 +860,15 @@ mod tests {
     }
 
     #[test]
-    fn token_with_context_segment_is_sensitive() {
-        for ctx in SENSITIVE_TOKEN_CONTEXT_SEGMENTS {
-            let key = format!("{ctx}_token");
+    fn token_with_any_context_segment_is_sensitive() {
+        for key in [
+            "access_token",
+            "vendor_token",
+            "openaiToken",
+            "deployment.token",
+        ] {
             assert!(
-                is_sensitive_token_metadata_key(&key),
+                is_sensitive_token_metadata_key(key),
                 "{key} should be sensitive"
             );
         }
@@ -916,13 +1133,13 @@ mod tests {
     }
 
     #[test]
-    fn all_caps_token_not_split_so_not_sensitive_unless_substring() {
-        // "APIToken" is one segment "APIToken", which is not "token" exactly
-        // and does not contain any default sensitive substring. The token
-        // context check does not fire because it needs a separate "token"
-        // segment.
+    fn acronym_api_token_and_api_key_are_sensitive() {
         let extras: Vec<String> = Vec::new();
-        assert!(!is_sensitive_metadata_key_with_extras("APIToken", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("APIToken", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("APIKey", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("apikey", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("api_key", &extras));
+        assert!(is_sensitive_metadata_key_with_extras("api-key", &extras));
     }
 
     // ── REDACTED_PLACEHOLDER value ───────────────────────────────────────

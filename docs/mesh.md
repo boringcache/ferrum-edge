@@ -2726,8 +2726,14 @@ Per-route `redirect` (Istio `http[].redirect`) rides on each emitted `mesh_route
 
 - `redirect.uri` → replacement path (request path preserved when unset).
 - `redirect.authority` → replacement authority (request `Host`/`:authority` preserved when unset).
+- `redirect.port` → replacement authority port (mutually exclusive with `derivePort`; request host preserved when authority is unset).
+- `redirect.derivePort` → dynamic port selection projected as `derive_port`:
+  - `FROM_PROTOCOL_DEFAULT` → scheme default (`80` for `http`, `443` for `https`), including when `scheme` is also overridden.
+  - `FROM_REQUEST_PORT` → trusted request port: original-destination port when capture rewrote the accept socket, otherwise the frontend listener port. Spoofable forwarding headers (`X-Forwarded-Port`, `Forwarded`) are never consulted.
 - `redirect.scheme` → replacement scheme (`http`/`https`; request frontend scheme preserved when unset).
 - `redirect.redirectCode` → status code (`300–399`, default `301`).
+
+Scheme-default ports are omitted from the rendered `Location` authority (`http://host` not `http://host:80`; `https://host` not `https://host:443`). Bracketed IPv6 authorities keep their brackets when a non-default port is applied. Invalid `port` / `derivePort` values and setting both fields together fail translation closed with field-specific diagnostics.
 
 The redirect takes precedence over `rewrite` and the route-override destination on the same rule. When no authority is resolvable, an origin-relative `Location` (path only) is emitted.
 

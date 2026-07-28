@@ -409,12 +409,10 @@ pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_
 pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
 
 /// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
-/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
-/// transformations operate on the decoded parameter map, which cannot be
-/// reconciled with `serverless_function`'s raw-query payload without losing the
-/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
-/// preserve, so the serverless egress fails closed on the composition rather than
-/// emitting a payload that silently ignores the operator's query transform.
+/// actually mutated the ordered outbound query (add/remove/update/rename).
+/// Downstream consumers that previously failed closed on this marker can now
+/// read [`RequestContext::outbound_query_string`] / the auth-composed effective
+/// query instead of rebuilding from the untransformed raw string.
 pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
 
 /// True when a `Content-Encoding` field-line declares a coding other than
@@ -3218,6 +3216,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // Fail-closed shared contract: request-deduplication lifecycle keys under
+    // `_dedup_*` never enter any transaction-log projection. Ownership lives in
+    // typed request state; this strips any residual public-metadata copies.
+    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -21106,7 +21108,7 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -30107,6 +30109,37 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         Cow::Owned(stripped)
     } else {
         Cow::Borrowed(query_string)
+    }
+}
+
+/// Canonical backend-visible query: transformer-published outbound query when
+/// present (including empty), otherwise the retained raw wire query, then
+/// authentication-owned credential strips. Transformers already strip marked
+/// credentials from their input before query rules run; this final pass is
+/// defense in depth for the no-transform path and any residual marked names.
+/// Ordinary no-transform / no-strip requests borrow the raw string with no
+/// allocation.
+pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    let base = match ctx.outbound_query_string() {
+        Some(q) => q,
+        None => ctx.raw_query_string().unwrap_or(""),
+    };
+    query_string_after_plugin_strips(ctx, base)
+}
+
+/// Same as [`effective_backend_query_string`], but prefer a caller-held raw
+/// query borrow when no outbound transform was published. An outbound
+/// transform is copied into the returned value so callers may continue
+/// mutating the request context while they retain the canonical query. The
+/// ordinary no-transform / no-strip hot path still borrows `raw_query`
+/// without allocating.
+pub(crate) fn effective_backend_query_string_with_raw<'a>(
+    ctx: &RequestContext,
+    raw_query: &'a str,
+) -> Cow<'a, str> {
+    match ctx.outbound_query_string() {
+        Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
+        None => query_string_after_plugin_strips(ctx, raw_query),
     }
 }
 
