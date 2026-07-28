@@ -22,7 +22,62 @@ use log::*;
 use std::{
     io::{self, Read, Write},
     mem::replace,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
+
+/// Shared, lock-free accounting of the physical data frames a peer spends on
+/// message reassembly (Ferrum local extension).
+///
+/// The reader API only ever yields fully reassembled messages, so an initial
+/// non-final Text/Binary frame and every Continuation frame before the final
+/// one are invisible to the caller — including zero-length ones. A peer can
+/// therefore drive unbounded framing work while the caller observes at most
+/// one message, which defeats any per-message admission policy layered on top
+/// of this codec.
+///
+/// A caller that needs to charge those frames installs one meter per read
+/// direction with [`WebSocketContext::set_fragment_accounting`] and drains it
+/// whenever a read returns (a complete message, or an interleaved control
+/// frame). The counter is only ever incremented by the single reader task that
+/// owns the codec and drained by the same relay half, so `Relaxed` ordering is
+/// sufficient; the `Arc` exists to survive a `StreamExt::split()` that hides
+/// the codec behind a `SplitStream`.
+///
+/// Metering alone cannot bound a message that never completes. Pair it with
+/// [`WebSocketConfig::max_incomplete_message_frames`] and
+/// [`WebSocketConfig::max_incomplete_message_duration`], which fail the
+/// connection closed while the message is still incomplete.
+#[derive(Debug, Default)]
+pub struct FragmentMeter {
+    reassembly_frames: AtomicU64,
+}
+
+impl FragmentMeter {
+    /// A meter with nothing recorded yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one physical data frame that was folded into an incomplete
+    /// message and therefore produced no `Message` for the reader.
+    fn record_reassembly_frame(&self) {
+        self.reassembly_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read and reset the pending count in one atomic step.
+    pub fn take_reassembly_frames(&self) -> u64 {
+        self.reassembly_frames.swap(0, Ordering::Relaxed)
+    }
+
+    /// Read the pending count without resetting it.
+    pub fn pending_reassembly_frames(&self) -> u64 {
+        self.reassembly_frames.load(Ordering::Relaxed)
+    }
+}
 
 /// Indicates a Client or Server role of the websocket
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +155,25 @@ pub struct WebSocketConfig {
     ///
     /// Explicit `Message::Pong` writes are unaffected.
     pub auto_pong: bool,
+    /// Maximum number of physical data frames one *incomplete* (fragmented)
+    /// message may consume before the connection fails. Counts the initial
+    /// non-final Text/Binary frame plus every Continuation frame that does not
+    /// finish the message, regardless of payload length — a zero-length
+    /// continuation costs exactly as much as a full one.
+    ///
+    /// This is independent of [`Self::max_message_size`], which only bounds
+    /// accumulated *bytes* and is therefore never reached by a flood of
+    /// empty continuation frames.
+    ///
+    /// `None` (the default) means unbounded, matching upstream behavior.
+    pub max_incomplete_message_frames: Option<usize>,
+    /// Maximum wall-clock time a message may stay incomplete, measured from
+    /// the first fragment. Checked when a further fragment arrives, so it
+    /// bounds an actively fed but never-finished message; a fully idle
+    /// connection is the caller's idle-timeout concern.
+    ///
+    /// `None` (the default) means unbounded, matching upstream behavior.
+    pub max_incomplete_message_duration: Option<Duration>,
 }
 
 impl Default for WebSocketConfig {
@@ -112,6 +186,8 @@ impl Default for WebSocketConfig {
             max_frame_size: Some(16 << 20),
             accept_unmasked_frames: false,
             auto_pong: true,
+            max_incomplete_message_frames: None,
+            max_incomplete_message_duration: None,
         }
     }
 }
@@ -156,6 +232,18 @@ impl WebSocketConfig {
     /// Set [`Self::auto_pong`].
     pub fn auto_pong(mut self, auto_pong: bool) -> Self {
         self.auto_pong = auto_pong;
+        self
+    }
+
+    /// Set [`Self::max_incomplete_message_frames`].
+    pub fn max_incomplete_message_frames(mut self, max_frames: Option<usize>) -> Self {
+        self.max_incomplete_message_frames = max_frames;
+        self
+    }
+
+    /// Set [`Self::max_incomplete_message_duration`].
+    pub fn max_incomplete_message_duration(mut self, max_duration: Option<Duration>) -> Self {
+        self.max_incomplete_message_duration = max_duration;
         self
     }
 
@@ -268,6 +356,17 @@ impl<Stream> WebSocket<Stream> {
     /// Read the configuration.
     pub fn get_config(&self) -> &WebSocketConfig {
         self.context.get_config()
+    }
+
+    /// Install fragment accounting for this read direction (Ferrum local
+    /// extension). See [`WebSocketContext::set_fragment_accounting`].
+    pub fn set_fragment_accounting(
+        &mut self,
+        meter: Option<Arc<FragmentMeter>>,
+        max_frames: Option<usize>,
+        max_duration: Option<Duration>,
+    ) {
+        self.context.set_fragment_accounting(meter, max_frames, max_duration);
     }
 
     /// Check if it is possible to read messages.
@@ -412,6 +511,17 @@ pub struct WebSocketContext {
     state: WebSocketState,
     /// Receive: an incomplete message being processed.
     incomplete: Option<IncompleteMessage>,
+    /// Ferrum local extension: optional per-direction accounting sink for the
+    /// physical data frames spent on the current reassembly. See
+    /// [`FragmentMeter`].
+    fragment_meter: Option<Arc<FragmentMeter>>,
+    /// Physical data frames folded into `incomplete` so far (the initial
+    /// non-final frame plus each non-final continuation). Reset when a message
+    /// completes.
+    incomplete_frames: usize,
+    /// When the current incomplete message received its first fragment. `None`
+    /// while no message is in flight, or when no duration bound is configured.
+    incomplete_started_at: Option<Instant>,
     /// Send in addition to regular messages E.g. "pong" or "close".
     additional_send: Option<Frame>,
     /// True indicates there is an additional message (like a pong)
@@ -449,6 +559,9 @@ impl WebSocketContext {
             frame,
             state: WebSocketState::Active,
             incomplete: None,
+            fragment_meter: None,
+            incomplete_frames: 0,
+            incomplete_started_at: None,
             additional_send: None,
             unflushed_additional: false,
             config,
@@ -469,6 +582,56 @@ impl WebSocketContext {
     /// Read the configuration.
     pub fn get_config(&self) -> &WebSocketConfig {
         &self.config
+    }
+
+    /// Install fragment accounting for this read direction (Ferrum local
+    /// extension).
+    ///
+    /// `meter` receives one tick per physical data frame folded into an
+    /// incomplete message, so a caller that meters or charges per frame can
+    /// account for fragments the reader never sees. `max_frames` /
+    /// `max_duration` set [`WebSocketConfig::max_incomplete_message_frames`]
+    /// and [`WebSocketConfig::max_incomplete_message_duration`], which fail the
+    /// connection closed while the message is still incomplete.
+    ///
+    /// Call before reading any frame; the counters describe only the message
+    /// currently being reassembled.
+    pub fn set_fragment_accounting(
+        &mut self,
+        meter: Option<Arc<FragmentMeter>>,
+        max_frames: Option<usize>,
+        max_duration: Option<Duration>,
+    ) {
+        self.fragment_meter = meter;
+        self.config.max_incomplete_message_frames = max_frames;
+        self.config.max_incomplete_message_duration = max_duration;
+    }
+
+    /// Record one physical data frame consumed by the in-flight reassembly and
+    /// enforce the independent count/duration bounds.
+    fn account_reassembly_frame(&mut self) -> Result<()> {
+        if let Some(meter) = &self.fragment_meter {
+            meter.record_reassembly_frame();
+        }
+        self.incomplete_frames = self.incomplete_frames.saturating_add(1);
+        if let Some(max_frames) = self.config.max_incomplete_message_frames {
+            if self.incomplete_frames > max_frames {
+                return Err(Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded));
+            }
+        }
+        if let Some(max_duration) = self.config.max_incomplete_message_duration {
+            let started = *self.incomplete_started_at.get_or_insert_with(Instant::now);
+            if started.elapsed() > max_duration {
+                return Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout));
+            }
+        }
+        Ok(())
+    }
+
+    /// Clear per-message fragment accounting at a message boundary.
+    fn reset_reassembly_accounting(&mut self) {
+        self.incomplete_frames = 0;
+        self.incomplete_started_at = None;
     }
 
     /// Consume the context, returning the bytes that were read from the stream
@@ -758,10 +921,22 @@ impl WebSocketContext {
                 }?;
 
                 match (payload, fin) {
-                    (None, true) => Ok(Some(self.incomplete.take().unwrap().complete()?)),
-                    (None, false) => Ok(None),
+                    (None, true) => {
+                        // Final continuation: the logical message is complete
+                        // and is returned to the reader, which charges it once.
+                        self.reset_reassembly_accounting();
+                        Ok(Some(self.incomplete.take().unwrap().complete()?))
+                    }
+                    (None, false) => {
+                        // Non-final continuation: invisible to the reader, so
+                        // meter it here and enforce the incomplete-message
+                        // count/duration bounds (Ferrum local extension).
+                        self.account_reassembly_frame()?;
+                        Ok(None)
+                    }
                     (Some((payload, t)), true) => {
                         check_max_size(payload.len(), self.config.max_message_size)?;
+                        self.reset_reassembly_accounting();
                         match t {
                             MessageType::Text => Ok(Some(Message::Text(payload.try_into()?))),
                             MessageType::Binary => Ok(Some(Message::Binary(payload))),
@@ -771,6 +946,8 @@ impl WebSocketContext {
                         let mut incomplete = IncompleteMessage::new(t);
                         incomplete.extend(payload, self.config.max_message_size)?;
                         self.incomplete = Some(incomplete);
+                        // Initial non-final frame: also invisible to the reader.
+                        self.account_reassembly_frame()?;
                         Ok(None)
                     }
                 }
@@ -914,10 +1091,10 @@ impl<T> CheckConnectionReset for Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, Role, WebSocket, WebSocketConfig};
-    use crate::error::{CapacityError, Error};
+    use super::{FragmentMeter, Message, Role, WebSocket, WebSocketConfig};
+    use crate::error::{CapacityError, Error, ProtocolError};
 
-    use std::{io, io::Cursor};
+    use std::{io, io::Cursor, sync::Arc, time::Duration};
 
     struct WriteMoc<Stream>(Stream);
 
@@ -1007,6 +1184,116 @@ mod tests {
             "auto_pong=false must not emit a local Pong, wrote {:02x?}",
             stream.written
         );
+    }
+
+    /// A zero-length fragment chain accumulates no bytes, so `max_message_size`
+    /// never fires. The meter must still count every physical data frame the
+    /// reader cannot see, and must count the completing frame exactly once via
+    /// the returned message rather than twice.
+    #[test]
+    fn fragment_meter_counts_zero_length_continuations() {
+        let mut incoming = vec![0x01, 0x00];
+        for _ in 0..5 {
+            incoming.extend_from_slice(&[0x00, 0x00]);
+        }
+        incoming.extend_from_slice(&[0x80, 0x00]);
+        let meter = Arc::new(FragmentMeter::new());
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(Some(Arc::clone(&meter)), None, None);
+
+        assert_eq!(socket.read().unwrap(), Message::Text("".into()));
+        // Initial non-final frame + 5 non-final continuations. The final
+        // continuation is represented by the returned message itself.
+        assert_eq!(meter.take_reassembly_frames(), 6);
+        assert_eq!(meter.take_reassembly_frames(), 0, "drain must reset the meter");
+    }
+
+    /// An unfragmented message consumes exactly one physical frame and must not
+    /// leave any reassembly charge behind.
+    #[test]
+    fn fragment_meter_ignores_unfragmented_messages() {
+        let incoming = Cursor::new(vec![0x82, 0x03, 0x01, 0x02, 0x03]);
+        let meter = Arc::new(FragmentMeter::new());
+        let mut socket = WebSocket::from_raw_socket(WriteMoc(incoming), Role::Client, None);
+        socket.set_fragment_accounting(Some(Arc::clone(&meter)), None, None);
+
+        assert_eq!(socket.read().unwrap(), Message::Binary(vec![1, 2, 3].into()));
+        assert_eq!(meter.pending_reassembly_frames(), 0);
+    }
+
+    /// The frame-count bound fails the connection closed while the message is
+    /// still incomplete — the flood never has to finish to be stopped.
+    #[test]
+    fn incomplete_message_frame_limit_fails_closed() {
+        let mut incoming = vec![0x01, 0x00];
+        for _ in 0..8 {
+            incoming.extend_from_slice(&[0x00, 0x00]);
+        }
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(None, Some(3), None);
+
+        assert!(matches!(
+            socket.read(),
+            Err(Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded))
+        ));
+    }
+
+    /// The duration bound is independent of the frame-count bound: a slow
+    /// fragment drip that stays under the count ceiling still terminates.
+    #[test]
+    fn incomplete_message_duration_limit_fails_closed() {
+        let mut incoming = vec![0x01, 0x00];
+        for _ in 0..8 {
+            incoming.extend_from_slice(&[0x00, 0x00]);
+        }
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        // Zero budget: the second fragment is already past the deadline stamped
+        // by the first one, while the count bound stays disabled.
+        socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+        assert!(matches!(
+            socket.read(),
+            Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout))
+        ));
+    }
+
+    /// Accounting is per message: a completed message resets both bounds so a
+    /// long-lived connection of legitimately fragmented messages is unaffected.
+    #[test]
+    fn fragment_accounting_resets_between_messages() {
+        let mut incoming = Vec::new();
+        for _ in 0..3 {
+            incoming.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x80, 0x00]);
+        }
+        let meter = Arc::new(FragmentMeter::new());
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(Some(Arc::clone(&meter)), Some(2), None);
+
+        for _ in 0..3 {
+            assert_eq!(socket.read().unwrap(), Message::Text("".into()));
+            assert_eq!(meter.take_reassembly_frames(), 2);
+        }
+    }
+
+    /// Default config keeps upstream behavior: no bounds, no accounting.
+    #[test]
+    fn fragment_bounds_default_to_unbounded() {
+        let config = WebSocketConfig::default();
+        assert_eq!(config.max_incomplete_message_frames, None);
+        assert_eq!(config.max_incomplete_message_duration, None);
+
+        let mut incoming = vec![0x01, 0x00];
+        for _ in 0..64 {
+            incoming.extend_from_slice(&[0x00, 0x00]);
+        }
+        incoming.extend_from_slice(&[0x80, 0x00]);
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, Some(config));
+        assert_eq!(socket.read().unwrap(), Message::Text("".into()));
     }
 
     #[test]

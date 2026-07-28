@@ -3026,6 +3026,8 @@ impl EnvConfig {
             websocket_write_buffer_size: usize = "FERRUM_WEBSOCKET_WRITE_BUFFER_SIZE" => 131_072usize;
             websocket_tunnel_mode: bool = "FERRUM_WEBSOCKET_TUNNEL_MODE" => false;
             websocket_idle_timeout_seconds: u64 = "FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS" => 300u64;
+            websocket_max_incomplete_message_frames: usize = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES" => 1_024usize;
+            websocket_max_incomplete_message_seconds: u64 = "FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS" => 60u64;
             max_credentials_per_type: usize = "FERRUM_MAX_CREDENTIALS_PER_TYPE" => 2usize;
             http_header_read_timeout_seconds: u64 = "FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS" => 10u64;
             frontend_tls_handshake_timeout_seconds: u64 = "FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS" => 10u64;

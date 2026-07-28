@@ -1521,6 +1521,44 @@ pub mod _test_support {
         crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
     }
 
+    /// Resolve the parser incomplete-message bounds from env config.
+    /// Returns `(max_frames, max_duration)`; `None` means that bound is off.
+    pub fn ws_fragment_policy_from_env_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> (Option<usize>, Option<std::time::Duration>) {
+        crate::proxy::WsFragmentPolicy::from_env(env_config).bounds()
+    }
+
+    /// Bounded incomplete-message policy Close (RFC 6455 1008).
+    pub fn ws_fragment_policy_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_fragment_policy_close_frame()
+    }
+
+    /// Policy-Close selection for the parser's incomplete-message bounds.
+    pub fn ws_fragment_policy_close_for_error_for_test(
+        error: &WsError,
+    ) -> Option<(CloseFrame, &'static str)> {
+        crate::proxy::ws_fragment_policy_close_for_error(error)
+    }
+
+    /// Exercise the shared H1/H2/H3 reassembly-fragment charging path.
+    pub async fn apply_ws_fragment_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<Option<CloseFrame>> {
+        crate::proxy::apply_ws_fragment_plugins(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            fragment_frames,
+        )
+        .await
+    }
+
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
     pub async fn apply_ws_frame_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
