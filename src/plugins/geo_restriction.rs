@@ -246,15 +246,21 @@ impl GeoRestriction {
         }
     }
 
-    /// Look up the country ISO code for a given IP address string.
-    fn lookup_country(&self, ip_str: &str) -> Result<Option<CountryCode>, String> {
+    /// Look up the country ISO code for an already-canonical client address.
+    ///
+    /// The caller supplies the request/connection-scoped canonical typed IP
+    /// (`RequestContext::canonical_client_ip` / the stream equivalent), so an
+    /// IPv4-mapped IPv6 client reaches MaxMind as native IPv4 and its lookup
+    /// descends the database's IPv4 tree. Passing the mapped form instead makes
+    /// an IPv4-only database reject the query outright and a combined database
+    /// search the mapped IPv6 range rather than the IPv4 country record —
+    /// either way the request falls through to `on_lookup_failure`, whose
+    /// default is `allow` (GHSA-vjwj-657f-5w9g).
+    fn lookup_country(&self, ip: std::net::IpAddr) -> Result<Option<CountryCode>, String> {
         let reader = self
             .reader
             .as_ref()
             .ok_or_else(|| "MaxMind database not loaded".to_string())?;
-
-        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("invalid IP: {e}"))?;
-        let ip = ip.to_canonical();
 
         let result = reader.lookup(ip).map_err(|e| e.to_string())?;
         let direct: Option<&str> = result
@@ -275,7 +281,17 @@ impl GeoRestriction {
     }
 
     /// Check whether the client IP's country is allowed.
-    fn check_ip(&self, client_ip: &str) -> (PluginResult, Option<CountryCode>) {
+    ///
+    /// `canonical_ip` is the shared per-request/per-connection typed identity
+    /// and `client_ip` is only its display form for logs. A `None` typed
+    /// identity means the authoritative client IP is not an address literal, so
+    /// no country can be determined and the configured `on_lookup_failure`
+    /// policy decides — the same branch an unresolvable address takes.
+    fn check_ip(
+        &self,
+        canonical_ip: Option<std::net::IpAddr>,
+        client_ip: &str,
+    ) -> (PluginResult, Option<CountryCode>) {
         if self.reader.is_none() {
             // Database file not loaded — apply the configured failure policy.
             return match self.on_lookup_failure {
@@ -306,9 +322,11 @@ impl GeoRestriction {
             };
         }
 
-        let country = match self.lookup_country(client_ip) {
-            Ok(Some(code)) => code,
-            Ok(None) | Err(_) => {
+        // No typed identity, a lookup error, and an address absent from the
+        // database are one outcome: no country could be determined.
+        let country = match canonical_ip.and_then(|ip| self.lookup_country(ip).ok().flatten()) {
+            Some(code) => code,
+            None => {
                 // Lookup failed or IP not in database
                 match self.on_lookup_failure {
                     LookupFailureAction::Allow => {
@@ -534,12 +552,12 @@ impl Plugin for GeoRestriction {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        let (result, _country) = self.check_ip(&ctx.client_ip);
+        let (result, _country) = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
         result
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        let (result, country) = self.check_ip(&ctx.client_ip);
+        let (result, country) = self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip);
 
         // Header materialization centrally strips every client-supplied value
         // before the plugin chain. Writing the authoritative value here avoids

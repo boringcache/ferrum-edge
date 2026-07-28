@@ -6,6 +6,7 @@ mod backend_dispatch_tests;
 mod backend_reqwest_no_proxy_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
+mod client_identity_tests;
 mod client_ip_tests;
 mod config_delta_namespace_prune_tests;
 mod config_delta_tests;

@@ -124,7 +124,7 @@ use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1467,10 +1467,14 @@ impl CorrelationIdState {
 }
 
 impl CanonicalClientIpCache {
+    /// Ingress already folded IPv4-mapped IPv6 identities to native IPv4
+    /// (GHSA-vjwj-657f-5w9g). The shared helper is applied once more here so a
+    /// context built outside the gateway accept paths — a custom plugin, an
+    /// external test — still resolves one principal per host.
     fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
         *self
             .value
-            .get_or_init(|| parse_canonical_client_ip(client_ip))
+            .get_or_init(|| crate::util::client_identity::parse_canonical_client_ip(client_ip))
     }
 
     /// Whether a policy has already resolved the typed address.
@@ -1499,30 +1503,6 @@ impl CanonicalClientIpCache {
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         self.correlation_ids.project_correlation_ids(metadata);
     }
-}
-
-fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
-    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
-}
-
-/// Parse the legacy client/rule literal forms without allocation.
-///
-/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
-/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
-/// established policy grammar.
-fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Ok(ipv4) = client_ip.parse() {
-        return Some(IpAddr::V4(ipv4));
-    }
-
-    let unbracketed = client_ip
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(client_ip);
-    let without_zone = unbracketed
-        .find('%')
-        .map_or(unbracketed, |index| &unbracketed[..index]);
-    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
 /// AI usage that was produced by a built-in accounting path.
