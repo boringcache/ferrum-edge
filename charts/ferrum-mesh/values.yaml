@@ -109,6 +109,12 @@ controlPlane:
       initialDelaySeconds: 5
       periodSeconds: 10
       override: {}
+  # Operator-supplied mounts (TLS material, CP/DP trust bundle, etc.).
+  # Multi-namespace CP (FERRUM_CP_NAMESPACES=* or a CSV set) requires a real
+  # file at FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH — declaring the path alone is
+  # not enough (advisory GHSA-3f2j-wwqw-grmg).
+  extraVolumes: []
+  extraVolumeMounts: []
 
 injector:
   # Disabled by default: the webhook requires a serving-cert Secret and should

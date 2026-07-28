@@ -2007,6 +2007,20 @@ jobs:
             echo "::error title=Production multi-namespace example missing trust bundle path::FERRUM_CP_NAMESPACES=* requires FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH (GHSA-3f2j-wwqw-grmg)"
             exit 1
           fi
+          # Path alone is not enough: the production example must also mount a
+          # real trust-bundle file so the CP can fail closed on a missing
+          # dependency at helm-render time for operators, and so kind readiness
+          # smoke does not crash-loop waiting for a file that was never mounted.
+          if ! grep -Fq 'mountPath: /etc/ferrum/cp-dp-trust-bundle.json' \
+            "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"; then
+            echo "::error title=Production example missing trust bundle mount::FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH requires a volumeMount at that path (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
+          if ! grep -Fq 'secretName: ferrum-mesh-production-trust-bundle' \
+            "$RUNNER_TEMP/ferrum-helm-results/production-existing-secrets-rendered.yaml"; then
+            echo "::error title=Production example missing trust bundle Secret volume::production-existing-secrets-values.yaml must mount ferrum-mesh-production-trust-bundle (GHSA-3f2j-wwqw-grmg)"
+            exit 1
+          fi
           if grep -A1 'name: FERRUM_CP_NAMESPACES' "$RUNNER_TEMP/ferrum-helm-results/development-rendered.yaml" | grep -Fq 'value: "*"'; then
             echo "::error title=Development example still uses cluster-wide CP without trust binding::development-values.yaml must stay single-namespace or mount a trust bundle (GHSA-3f2j-wwqw-grmg)"
             exit 1
@@ -3233,6 +3247,29 @@ jobs:
           kubectl -n ferrum-prod create secret generic ferrum-mesh-production-credentials \
             --from-literal=admin-jwt-secret="${admin_secret}" \
             --from-literal=cp-dp-grpc-jwt-secret="${grpc_secret}"
+          # Multi-namespace production example declares
+          # FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH and mounts this Secret. Supply a
+          # real JSON bundle so fail-closed startup can load it (GHSA-3f2j).
+          # secret_env references the already-injected fleet JWT secret as the
+          # HS256 migration shape; kid selects the credential, namespaces are
+          # the server-derived ceiling. Do not embed secret bytes in the file.
+          trust_bundle_dir="$(mktemp -d)"
+          cat > "${trust_bundle_dir}/cp-dp-trust-bundle.json" <<'EOF'
+          {
+            "version": 1,
+            "keys": [
+              {
+                "kid": "ci-production-smoke",
+                "algorithm": "HS256",
+                "secret_env": "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "namespaces": ["ferrum"]
+              }
+            ]
+          }
+          EOF
+          kubectl -n ferrum-prod create secret generic ferrum-mesh-production-trust-bundle \
+            --from-file=cp-dp-trust-bundle.json="${trust_bundle_dir}/cp-dp-trust-bundle.json"
+          rm -rf "${trust_bundle_dir}"
           # Kind smoke keeps the production example's secret wiring, but the
           # example intentionally omits CP gRPC TLS. Without this escape hatch the
           # binary refuses non-loopback plaintext at startup; readiness probes then
@@ -3244,11 +3281,15 @@ jobs:
             --set image.tag=helm-chart-ci \
             --set image.pullPolicy=IfNotPresent \
             --set controlPlane.env.FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT=true
+          set +e
           kubectl -n ferrum-prod rollout status deployment/ferrum-mesh-control-plane --timeout=180s
+          rollout_rc=$?
+          set -e
           kubectl -n ferrum-prod get pods -o wide > "$RUNNER_TEMP/ferrum-helm-results/production-pods.txt"
           kubectl -n ferrum-prod describe deployment/ferrum-mesh-control-plane > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane-deployment.txt"
           kubectl -n ferrum-prod get events --sort-by=.lastTimestamp > "$RUNNER_TEMP/ferrum-helm-results/production-events.txt"
-          kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
+          kubectl -n ferrum-prod logs deployment/ferrum-mesh-control-plane --all-containers --tail=1000 \
+            > "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log" 2>&1 || true
           for secret in "$pg_password" "$db_url" "$admin_secret" "$grpc_secret"; do
             if grep -Fq "$secret" "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"; then
               rm -f "$RUNNER_TEMP/ferrum-helm-results/production-control-plane.log"
@@ -3256,6 +3297,9 @@ jobs:
               exit 1
             fi
           done
+          if [ "$rollout_rc" -ne 0 ]; then
+            exit "$rollout_rc"
+          fi
 
       - name: Collect Helm chart diagnostics
         if: always()
