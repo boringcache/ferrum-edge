@@ -7,9 +7,8 @@ use ferrum_edge::_test_support::{
 use ferrum_edge::plugins::utils::byte_budget::{
     ByteBudget, DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
     HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES, PROCESS_MAX_RETAINED_BYTES_DEFAULT,
-    PROCESS_MAX_RETAINED_BYTES_MAX, PROCESS_MAX_RETAINED_BYTES_MIN,
-    PayloadMaterializationError, RetainedByteCeiling, admit_byte_limits,
-    materialize_reserved_payload,
+    PROCESS_MAX_RETAINED_BYTES_MAX, PROCESS_MAX_RETAINED_BYTES_MIN, PayloadMaterializationError,
+    RetainedByteCeiling, admit_byte_limits, materialize_reserved_payload,
 };
 use ferrum_edge::plugins::utils::summary_log_budget::serialize_under_byte_budget;
 use serde_json::json;
@@ -397,7 +396,10 @@ fn batch_materialization_refuses_before_writing_when_the_ceiling_is_exhausted() 
     let refused = materialize_reserved_payload(ceiling, 2_048, |_writer| {
         panic!("the writer must never run once the ceiling refuses the bound");
     });
-    assert_eq!(refused.unwrap_err(), PayloadMaterializationError::CeilingExhausted);
+    assert_eq!(
+        refused.unwrap_err(),
+        PayloadMaterializationError::CeilingExhausted
+    );
     assert_eq!(
         ceiling.used(),
         4_000,
@@ -419,7 +421,10 @@ fn batch_materialization_fails_closed_when_a_write_exceeds_its_bound() {
             .write_all(&b"y".repeat(1_536))
             .map_err(|error| error.to_string())
     });
-    assert_eq!(overrun.unwrap_err(), PayloadMaterializationError::BoundExceeded);
+    assert_eq!(
+        overrun.unwrap_err(),
+        PayloadMaterializationError::BoundExceeded
+    );
     assert_eq!(
         ceiling.used(),
         0,
@@ -429,7 +434,10 @@ fn batch_materialization_fails_closed_when_a_write_exceeds_its_bound() {
     let failed = materialize_reserved_payload(ceiling, 512, |_writer| {
         Err("synthetic serializer failure".to_string())
     });
-    assert_eq!(failed.unwrap_err(), PayloadMaterializationError::WriteFailed);
+    assert_eq!(
+        failed.unwrap_err(),
+        PayloadMaterializationError::WriteFailed
+    );
     assert_eq!(ceiling.used(), 0);
 }
 
@@ -456,7 +464,9 @@ fn concurrent_instances_cannot_multiply_batch_materialization_past_the_ceiling()
     let ceiling = test_ceiling(32 * 1024);
 
     let first = materialize_reserved_payload(ceiling, 24 * 1024, |writer| {
-        writer.write_all(b"first").map_err(|error| error.to_string())
+        writer
+            .write_all(b"first")
+            .map_err(|error| error.to_string())
     })
     .expect("first instance's batch fits");
 
@@ -465,7 +475,10 @@ fn concurrent_instances_cannot_multiply_batch_materialization_past_the_ceiling()
     let second = materialize_reserved_payload(ceiling, 24 * 1024, |_writer| {
         panic!("the second instance must be refused before it materializes anything");
     });
-    assert_eq!(second.unwrap_err(), PayloadMaterializationError::CeilingExhausted);
+    assert_eq!(
+        second.unwrap_err(),
+        PayloadMaterializationError::CeilingExhausted
+    );
 
     drop(first);
     assert_eq!(ceiling.used(), 0);

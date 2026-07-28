@@ -1180,10 +1180,9 @@ fn build_loki_body(
     // dropped below, so it gets its own reservation rather than reusing one.
     // Bound the result to a `let` so the closure's borrow of `json` ends before
     // the uncompressed fallback moves it.
-    let compressed =
-        materialize_reserved_payload(cfg.ceiling, gzip_bound, |writer| {
-            gzip_into(json.as_slice(), writer)
-        });
+    let compressed = materialize_reserved_payload(cfg.ceiling, gzip_bound, |writer| {
+        gzip_into(json.as_slice(), writer)
+    });
     match compressed {
         Ok(compressed) => Ok((compressed, Some("gzip"))),
         Err(error) => {

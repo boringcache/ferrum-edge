@@ -7704,26 +7704,25 @@ async fn replay_spool_lines(
             .iter()
             .try_fold(chunk.len(), |total, line| total.checked_add(line.len()))
             .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay body byte bound overflowed"))?;
-        let body =
-            materialize_reserved_payload(flush_config.ceiling, body_bound, |writer| {
-                for (index, line) in chunk.iter().enumerate() {
-                    if index > 0 {
-                        writer
-                            .write_all(b"\n")
-                            .map_err(|error| format!("row separator: {error}"))?;
-                    }
+        let body = materialize_reserved_payload(flush_config.ceiling, body_bound, |writer| {
+            for (index, line) in chunk.iter().enumerate() {
+                if index > 0 {
                     writer
-                        .write_all(line.as_bytes())
-                        .map_err(|error| format!("row: {error}"))?;
+                        .write_all(b"\n")
+                        .map_err(|error| format!("row separator: {error}"))?;
                 }
-                Ok(())
-            })
-            .map_err(|error| {
-                format!(
-                    "{PLUGIN_NAME}: spool replay body was not materialized: {}",
-                    error.reason()
-                )
-            })?;
+                writer
+                    .write_all(line.as_bytes())
+                    .map_err(|error| format!("row: {error}"))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| {
+            format!(
+                "{PLUGIN_NAME}: spool replay body was not materialized: {}",
+                error.reason()
+            )
+        })?;
         match post_json_each_row(flush_config, body, chunk.len()).await {
             DeliveryOutcome::Delivered => {}
             DeliveryOutcome::Retryable { message } => return Err(message),

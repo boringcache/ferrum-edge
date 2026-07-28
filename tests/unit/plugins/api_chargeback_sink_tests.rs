@@ -12,9 +12,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, probe_charge_body_materialization_for_tests, render_prometheus, render_status_json,
-    replay_spool_once_for_tests,
-    replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
-    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
+    serialize_json_each_row, set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };

@@ -1450,8 +1450,12 @@ fn leaked_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
 #[test]
 fn kafka_lease_is_held_while_librdkafka_retains_the_record_and_released_on_destroy() {
     let ceiling = leaked_test_ceiling(8 * 1024 * 1024);
-    let Some((instance_after_send, ceiling_after_send, instance_after_destroy, ceiling_after_destroy)) =
-        kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 4)
+    let Some((
+        instance_after_send,
+        ceiling_after_send,
+        instance_after_destroy,
+        ceiling_after_destroy,
+    )) = kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 4)
     else {
         // A librdkafka client could not be created in this environment; the
         // ownership contract cannot be observed, so do not assert on it.
