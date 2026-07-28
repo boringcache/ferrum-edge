@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
@@ -2032,6 +2033,13 @@ fn parse_property_encoding(
                         && !examples.is_object()
                     {
                         return Err(format!("{media_path}.examples must be an object"));
+                    }
+                    if media_object.contains_key("example")
+                        && media_object.contains_key("examples")
+                    {
+                        return Err(format!(
+                            "{media_path}.example and .examples are mutually exclusive"
+                        ));
                     }
                     let schema = media_object
                         .get("schema")
@@ -4463,20 +4471,7 @@ fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
             "{ERROR_PREFIX}'{path}' must be a valid HTTP header value"
         ));
     }
-    let base = value.split(';').next().unwrap_or("").trim();
-    let Some((type_, subtype)) = base.split_once('/') else {
-        // Malformed names (no type/subtype separator) share the concrete-media
-        // diagnostic with wildcards and non-token segments so admission, the
-        // importer, and the published schema describe one contract.
-        return Err(format!(
-            "{ERROR_PREFIX}'{path}' must be a concrete media type"
-        ));
-    };
-    if type_ == "*"
-        || subtype == "*"
-        || !is_http_media_type_token(type_)
-        || !is_http_media_type_token(subtype)
-    {
+    if !is_concrete_http_media_type(value) {
         return Err(format!(
             "{ERROR_PREFIX}'{path}' must be a concrete media type"
         ));
@@ -4928,39 +4923,6 @@ fn reject_filename_injection(filename: &str) -> Result<(), String> {
         return Err("Malformed multipart part: filename contains CR, LF, or NUL".to_string());
     }
     Ok(())
-}
-
-/// HTTP media-type type/subtype token (RFC 9110 §5.6.2). Used by concrete
-/// media-type admission (Header Object `content`, error_response content_type)
-/// so braces fail closed in parity with the published OpenAPI regex. Kept
-/// separate from [`is_mime_token`], which retains the older RFC 2045 set for
-/// multipart parameter/boundary parsing.
-fn is_http_media_type_token(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(is_http_media_type_token_char)
-}
-
-fn is_http_media_type_token_char(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'0'..=b'9'
-            | b'a'..=b'z'
-            | b'A'..=b'Z'
-            | b'!'
-            | b'#'
-            | b'$'
-            | b'%'
-            | b'&'
-            | b'\''
-            | b'*'
-            | b'+'
-            | b'-'
-            | b'.'
-            | b'^'
-            | b'_'
-            | b'`'
-            | b'|'
-            | b'~'
-    )
 }
 
 /// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.

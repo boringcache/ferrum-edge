@@ -4772,11 +4772,12 @@ async fn multipart_encoding_header_content_json_validates_on_live_path() {
         }
     }
 
-    // Concrete media keys may carry valid parameters; the base type still selects JSON decoding.
+    // Concrete media keys may carry valid token and quoted-string parameters;
+    // semicolons inside quotes remain data while the base type selects decoding.
     let parameterized = multipart_header_content_plugin(json!({
         "required": true,
         "content": {
-            "application/json; charset=utf-8": {
+            "application/json; charset=\"utf-8\"; profile=\"v1;beta\"": {
                 "schema": {
                     "type": "object",
                     "required": ["kind"],
@@ -4871,6 +4872,68 @@ fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_s
                 }
             }),
             "valid HTTP header value",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset =utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset= utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=\"unterminated": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "example": {"kind": "one"},
+                        "examples": {"two": {"value": {"kind": "two"}}}
+                    }
+                }
+            }),
+            "mutually exclusive",
         ),
         (
             json!({

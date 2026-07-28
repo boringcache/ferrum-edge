@@ -547,7 +547,7 @@ fn importer_rejects_multipart_encoding_header_content_media_encoding_field() {
 }
 
 #[test]
-fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_parameters() {
+fn importer_rejects_malformed_multipart_encoding_header_content() {
     for (header_object, expected) in [
         (
             r#"{ "content": { "application/*": { "schema": { "type": "string" } } } }"#,
@@ -568,6 +568,38 @@ fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_para
         (
             "{ \"content\": { \"application/json;\\u0001charset=utf-8\": { \"schema\": { \"type\": \"object\" } } } }",
             "valid HTTP header value",
+        ),
+        (
+            r#"{ "content": { "application/json; charset": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "application/json; charset=": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "application/json; charset =utf-8": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "application/json; charset= utf-8": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "application/json; charset=\"unterminated": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{
+              "content": {
+                "application/json": {
+                  "schema": {"type": "object"},
+                  "example": {"kind": "one"},
+                  "examples": {"two": {"value": {"kind": "two"}}}
+                }
+              }
+            }"#,
+            "mutually exclusive",
         ),
         (
             r#"{
@@ -604,11 +636,12 @@ fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_para
 
 #[test]
 fn importer_preserves_multipart_encoding_header_content_with_valid_parameters() {
+    let media_type = r#"application/json; charset="utf-8"; profile="v1;beta""#;
     let spec = multipart_encoding_header_content_spec(
         r##"{
           "required": true,
           "content": {
-            "application/json; charset=utf-8": {
+            "application/json; charset=\"utf-8\"; profile=\"v1;beta\"": {
               "schema": {"$ref": "#/components/schemas/PartMeta"}
             }
           }
@@ -617,7 +650,7 @@ fn importer_preserves_multipart_encoding_header_content_with_valid_parameters() 
     let config = extract_validator_config(&spec);
     let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]["encoding"]
         ["file"]["headers"]["X-Part-Meta"];
-    assert!(header["content"]["application/json; charset=utf-8"]["schema"].is_object());
+    assert!(header["content"][media_type]["schema"].is_object());
     assert_valid_against_admin_schema(&config, "multipart header content with parameters");
 }
 
@@ -759,6 +792,25 @@ fn published_schema_rejects_encoding_header_content_wildcards_and_inert_fields()
         json!({
             "content": {
                 "text/pl{ain}": {"schema": {"type": "string"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json; charset": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json; charset=\"unterminated": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object"},
+                    "example": {"kind": "one"},
+                    "examples": {"two": {"value": {"kind": "two"}}}
+                }
             }
         }),
         json!({

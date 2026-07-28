@@ -18651,25 +18651,28 @@ components:
               propertyNames:
                 # Concrete type/subtype only: each side is an RFC 9110 token that
                 # is not exactly `*` (so `*/*` and `application/*` fail closed,
-                # while `*` remains allowed inside a longer token).
-                pattern: "^(?:[!#$%&'+.^_`|~0-9A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*|\\*[!#$%&'*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&'+.^_`|~0-9A-Za-z-][!#$%&'*+.^_`|~0-9A-Za-z-]*|\\*[!#$%&'*+.^_`|~0-9A-Za-z-]+)(?:;.*)?$"
+                # while `*` remains allowed inside a longer token). Parameters
+                # require token names and token or quoted-string values.
+                pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))?)*[ \t]*$'
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
               description: >
                 OpenAPI Header Object content map. Exactly one concrete media
                 type is required (no `type/*` or `*/*`). The full key, including
-                any parameters, must be a valid HTTP header value. The header
-                value is decoded as that media type under multipart header-size
-                limits before schema validation.
+                any parameters, must be a valid RFC 9110 media type and HTTP
+                header value. The header value is decoded as that media type
+                under multipart header-size limits before schema validation.
 
     OpenapiValidatorEncodingHeaderContentMedia:
       type: object
       required: [schema]
       additionalProperties: false
+      not:
+        required: [example, examples]
       description: >
         Media Type Object inside an Encoding Header Object `content` map.
         Encoding Objects are not valid on part headers; only schema (plus
-        optional example metadata) is accepted.
+        mutually-exclusive optional example metadata) is accepted.
       properties:
         schema:
           $ref: "#/components/schemas/OpenapiValidatorJsonSchema"

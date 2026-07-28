@@ -22,6 +22,7 @@ use crate::config::types::{
     OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES, json_depth, validate_resource_id,
 };
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
+use crate::util::media_type::is_concrete_http_media_type;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1985,6 +1986,16 @@ fn normalize_request_body_encoding(
                             ),
                         });
                     }
+                    if media_object.contains_key("example")
+                        && media_object.contains_key("examples")
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'].example and .examples are mutually exclusive"
+                            ),
+                        });
+                    }
                     let resolved_schema = resolve_refs(
                         root,
                         header_schema,
@@ -2056,8 +2067,8 @@ fn normalize_request_body_encoding(
 }
 
 /// Fail closed on Header Object `content` map keys using the same concrete
-/// media-type + HTTP header-value gate as plugin admission. Validates the full
-/// key (including parameters) so control-bearing or otherwise non-header
+/// RFC 9110 media-type + HTTP header-value gate as plugin admission. Validates
+/// the full key (including parameter grammar) so malformed or control-bearing
 /// suffixes cannot be silently discarded after a `;` split.
 fn validate_header_content_media_type_key(
     value: &str,
@@ -2071,54 +2082,13 @@ fn validate_header_content_media_type_key(
             error: format!("{path} must be a valid HTTP header value"),
         });
     }
-    let base = value.split(';').next().unwrap_or("").trim();
-    let Some((type_, subtype)) = base.split_once('/') else {
-        return Err(ExtractError::MalformedExtension {
-            which: "requestBody.content.encoding",
-            error: format!("{path} must be a concrete media type"),
-        });
-    };
-    if type_ == "*"
-        || subtype == "*"
-        || !is_header_content_http_media_token(type_)
-        || !is_header_content_http_media_token(subtype)
-    {
+    if !is_concrete_http_media_type(value) {
         return Err(ExtractError::MalformedExtension {
             which: "requestBody.content.encoding",
             error: format!("{path} must be a concrete media type"),
         });
     }
     Ok(())
-}
-
-/// HTTP media-type type/subtype token (RFC 9110 §5.6.2). Matches the published
-/// Header Object `content` propertyNames regex and rejects `{`/`}` that older
-/// RFC 2045 MIME tokens allowed.
-fn is_header_content_http_media_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            matches!(
-                byte,
-                b'0'..=b'9'
-                    | b'a'..=b'z'
-                    | b'A'..=b'Z'
-                    | b'!'
-                    | b'#'
-                    | b'$'
-                    | b'%'
-                    | b'&'
-                    | b'\''
-                    | b'*'
-                    | b'+'
-                    | b'-'
-                    | b'.'
-                    | b'^'
-                    | b'_'
-                    | b'`'
-                    | b'|'
-                    | b'~'
-            )
-        })
 }
 
 fn request_body_property_schema<'a>(schema: &'a Value, property: &str) -> Option<&'a Value> {
