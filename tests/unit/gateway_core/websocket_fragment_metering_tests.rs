@@ -261,11 +261,7 @@ async fn oversized_fragment_batch_closes_in_both_directions() {
     ] {
         let plugins: Vec<Arc<dyn Plugin>> = vec![rate_limiter(10, 10)];
         let outcome = ferrum_edge::_test_support::apply_ws_fragment_plugins_for_test(
-            &plugins,
-            PROXY_ID,
-            7,
-            direction,
-            500,
+            &plugins, PROXY_ID, 7, direction, 500,
         )
         .await;
         let close = outcome
@@ -350,7 +346,9 @@ fn incomplete_message_duration_bound_fails_closed() {
     );
     socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
 
-    let error = socket.read().expect_err("duration bound must fail the read");
+    let error = socket
+        .read()
+        .expect_err("duration bound must fail the read");
     assert!(matches!(
         error,
         WsError::Protocol(ProtocolError::IncompleteMessageTimeout)
