@@ -2396,11 +2396,13 @@ impl ApiChargebackSink {
                 self.config.spool.clone(),
                 owner,
                 generation,
-                Arc::clone(&metrics),
-                STALE_TEMP_AGE_SECS,
-                spool_claim_lease_secs(&self.config),
-                SpoolFsOps::REAL,
-                process_ceiling(),
+                SpoolManagerOptions {
+                    metrics: Arc::clone(&metrics),
+                    stale_temp_age_secs: STALE_TEMP_AGE_SECS,
+                    claim_lease_secs: spool_claim_lease_secs(&self.config),
+                    fs_ops: SpoolFsOps::REAL,
+                    ceiling: process_ceiling(),
+                },
             )?))
         } else {
             None
@@ -5368,16 +5370,20 @@ pub struct SpoolManager {
     ceiling: &'static RetainedByteCeiling,
 }
 
+struct SpoolManagerOptions {
+    metrics: Arc<SinkMetrics>,
+    stale_temp_age_secs: u64,
+    claim_lease_secs: u64,
+    fs_ops: SpoolFsOps,
+    ceiling: &'static RetainedByteCeiling,
+}
+
 impl SpoolManager {
     fn new(
         cfg: SpoolSettings,
         owner: SpoolOwner,
         generation: u64,
-        metrics: Arc<SinkMetrics>,
-        stale_temp_age_secs: u64,
-        claim_lease_secs: u64,
-        fs_ops: SpoolFsOps,
-        ceiling: &'static RetainedByteCeiling,
+        options: SpoolManagerOptions,
     ) -> Result<Self, String> {
         let namespace_root = build_namespace_root(&cfg.dir, &owner)?;
         Ok(Self {
@@ -5386,15 +5392,15 @@ impl SpoolManager {
             generation,
             namespace_root,
             canonical_root: OnceLock::new(),
-            metrics,
+            metrics: options.metrics,
             last_drop_warn_at: AtomicI64::new(0),
             last_unbound_warn_at: AtomicI64::new(0),
             live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
-            stale_temp_age_secs,
-            claim_lease_secs,
-            fs_ops,
-            ceiling,
+            stale_temp_age_secs: options.stale_temp_age_secs,
+            claim_lease_secs: options.claim_lease_secs,
+            fs_ops: options.fs_ops,
+            ceiling: options.ceiling,
         })
     }
 
@@ -5495,11 +5501,13 @@ impl SpoolManager {
             cfg,
             spec.to_owner(),
             generation,
-            Arc::new(SinkMetrics::default()),
-            stale_temp_age_secs,
-            claim_lease_secs,
-            SpoolFsOps::REAL,
-            ceiling,
+            SpoolManagerOptions {
+                metrics: Arc::new(SinkMetrics::default()),
+                stale_temp_age_secs,
+                claim_lease_secs,
+                fs_ops: SpoolFsOps::REAL,
+                ceiling,
+            },
         )?;
         // Test callers model a committed/live sink and retain the historical
         // eager startup validation contract. The managed tree is prepared with
@@ -7486,10 +7494,7 @@ impl ReservedSpoolArtifact {
 fn for_each_spool_line(text: &str, mut visit: impl FnMut(usize, usize)) {
     let bytes = text.as_bytes();
     let mut start = 0usize;
-    loop {
-        let Some(rest) = bytes.get(start..) else {
-            break;
-        };
+    while let Some(rest) = bytes.get(start..) {
         let separator = match rest.iter().position(|byte| *byte == b'\n') {
             Some(offset) => start.saturating_add(offset),
             None => bytes.len(),
@@ -9733,12 +9738,12 @@ fn emit_periodic_snapshot(
     // The projection coexists with the still-charged accumulator, so reserve it
     // before it is built. Refusal is a retryable emission failure: no baseline
     // is advanced and the next tick retries.
-    let _projection = reserve_delta_projection(accumulator, config, node_id).map_err(|error| {
-        runtime
-            .metrics
-            .record_failure(FailureReason::Serialize, error.clone());
-        error
-    })?;
+    let _projection =
+        reserve_delta_projection(accumulator, config, node_id).inspect_err(|error| {
+            runtime
+                .metrics
+                .record_failure(FailureReason::Serialize, error.clone());
+        })?;
     let prepared = match accumulator.prepare_deltas(config, node_id, received_at, &snapshot_id) {
         Ok(prepared) => prepared,
         Err(error) => {
