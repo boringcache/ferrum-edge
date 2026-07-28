@@ -278,7 +278,10 @@ pub(crate) fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str
 }
 
 /// Validate the versioned `api_specs` backup section without logging document
-/// contents or hashes that could leak source-spec material into operator logs.
+/// contents, hashes, URLs, or other hostile metadata that could leak into
+/// operator logs. Enforces the same stored-metadata bounds and declared-format
+/// document parse used by ordinary POST/PUT admission, without re-extracting
+/// resources or resolving external references.
 pub(crate) fn validate_restore_api_specs_section(
     section: &ApiSpecsBackupSection,
     proxies: &[Proxy],
@@ -393,6 +396,46 @@ pub(crate) fn validate_restore_api_specs_section(
                 "api_spec '{}': content_hash does not match decompressed content",
                 item.id
             ));
+            continue;
+        }
+        // Fail closed on stored metadata: restore must not admit bounds,
+        // cardinality, sort/dedup, or tag-whitelist violations that ordinary
+        // POST/PUT extraction rejects. Do not echo hostile field values.
+        if let Err(reason) = crate::admin::api_specs::extractor::validate_stored_api_spec_metadata(
+            spec.title.as_deref(),
+            spec.info_version.as_deref(),
+            spec.description.as_deref(),
+            spec.contact_name.as_deref(),
+            spec.contact_email.as_deref(),
+            spec.license_name.as_deref(),
+            spec.license_identifier.as_deref(),
+            &spec.tags,
+            &spec.server_urls,
+        ) {
+            errors.push(format!("api_spec '{}': {reason}", item.id));
+            continue;
+        }
+        // Validate document syntax for the *declared* format with the same
+        // bounded parser as ingestion. Do not re-extract resources or resolve
+        // external refs — historical backups must remain restorable as-is.
+        // Parse errors are mapped to generic messages so serde snippets that
+        // may contain document fragments never enter operator responses/logs.
+        if let Err(parse_error) =
+            crate::admin::api_specs::extractor::parse_declared_spec_document(
+                &decompressed,
+                spec.spec_format,
+            )
+        {
+            let reason = match parse_error {
+                crate::admin::api_specs::ExtractError::InvalidJson(_) => {
+                    "document is not valid JSON for declared spec_format"
+                }
+                crate::admin::api_specs::ExtractError::InvalidYaml(_) => {
+                    "document is not valid YAML for declared spec_format"
+                }
+                _ => "document failed bounded format validation",
+            };
+            errors.push(format!("api_spec '{}': {reason}", item.id));
             continue;
         }
         match proxy_by_id.get(spec.proxy_id.as_str()) {
@@ -799,6 +842,94 @@ mod tests {
             validate_restore_api_specs_section(&section, &proxies, &[upstream], &[plugin], 25)
                 .expect_err("orphan plugin tag");
         assert!(err.iter().any(|e| e.contains("plugin_config 'plug-1'")));
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_hostile_metadata_and_format_mismatch() {
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+
+        // Forbidden LIKE wildcard in a stored tag must fail closed.
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.tags = vec!["api_v1".to_string()];
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("forbidden tag");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("tag contains forbidden character")),
+            "expected forbidden-tag rejection, got {err:?}"
+        );
+        // Hostile tag value must not be echoed into the validation error.
+        assert!(
+            err.iter().all(|e| !e.contains("api_v1")),
+            "validation errors must not echo hostile tag values: {err:?}"
+        );
+
+        // Oversized title exceeds the shared extraction bound.
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.title = Some("t".repeat(1025));
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("oversized title");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("title exceeds maximum length")),
+            "expected title bound rejection, got {err:?}"
+        );
+
+        // Unsorted / duplicate tags violate the list/filter membership invariant.
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.tags = vec!["b".to_string(), "a".to_string()];
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("unsorted tags");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("tags must be sorted and de-duplicated")),
+            "expected sorted/deduped rejection, got {err:?}"
+        );
+
+        // Declared JSON with YAML body must not be admitted.
+        let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
+        let mut item = sample_spec_item("spec-1", "proxy-1", yaml_raw);
+        item.spec_format = SpecFormat::Json;
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("format mismatch");
+        assert!(
+            err.iter().any(|e| e.contains(
+                "document is not valid JSON for declared spec_format"
+            )),
+            "expected declared-format rejection, got {err:?}"
+        );
+
+        // Too many server URLs.
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.server_urls = (0..33).map(|i| format!("https://example.test/{i}")).collect();
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("too many server_urls");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("server_urls exceed maximum cardinality")),
+            "expected server_urls cardinality rejection, got {err:?}"
+        );
     }
 
     #[test]

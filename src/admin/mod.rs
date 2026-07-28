@@ -6949,15 +6949,40 @@ async fn handle_restore(
     // Validate or prepare the versioned api_specs section before any durable
     // mutation. Legacy backups that omit the section entirely require an
     // explicit confirmation when the target namespace currently holds specs.
-    match payload.api_specs.as_ref() {
+    //
+    // Decompression + declared-format parse are CPU-bound and can touch up to
+    // the admin body ceiling per item; run them on the blocking pool so the
+    // async runtime stays responsive. Validation still completes before any
+    // delete/write.
+    match payload.api_specs.take() {
         Some(section) => {
-            match validate_restore_api_specs_section(
-                section,
-                &payload.proxies,
-                &payload.upstreams,
-                &payload.plugin_configs,
-                state.admin_spec_max_body_size_mib,
-            ) {
+            let proxies = payload.proxies.clone();
+            let upstreams = payload.upstreams.clone();
+            let plugin_configs = payload.plugin_configs.clone();
+            let max_spec_body_mib = state.admin_spec_max_body_size_mib;
+            let validation = tokio::task::spawn_blocking(move || {
+                validate_restore_api_specs_section(
+                    &section,
+                    &proxies,
+                    &upstreams,
+                    &plugin_configs,
+                    max_spec_body_mib,
+                )
+            })
+            .await;
+            let validated = match validation {
+                Ok(result) => result,
+                Err(_error) => {
+                    warn_persistence_failure_redacted("restore_api_specs_validation_join");
+                    return Ok(json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &json!({
+                            "error": "Restore aborted: API spec validation task failed. Existing config was NOT deleted."
+                        }),
+                    ));
+                }
+            };
+            match validated {
                 Ok(mut specs) => {
                     for spec in &mut specs {
                         spec.namespace = namespace.to_string();

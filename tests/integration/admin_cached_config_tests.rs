@@ -4766,6 +4766,213 @@ async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
     );
 }
 
+/// Crafted restore payloads must not bypass POST/PUT metadata/document
+/// admission: forbidden tags and declared-format mismatches are rejected
+/// before any durable delete, leaving the prior namespace intact.
+#[tokio::test]
+async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_apispec_hostile.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "kept-proxy",
+        "namespace": "ferrum",
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "listen_path": "/kept"
+    }))
+    .expect("proxy deserialization failed");
+    let bundle = ferrum_edge::ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let kept_raw =
+        br#"{"openapi":"3.1.0","info":{"title":"Kept","version":"1"},"paths":{}}"#;
+    let kept_spec = ferrum_edge::config::types::ApiSpec {
+        id: "kept-spec".to_string(),
+        namespace: "ferrum".to_string(),
+        proxy_id: "kept-proxy".to_string(),
+        spec_version: "3.1.0".to_string(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(kept_raw)
+            .expect("compress failed"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: kept_raw.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(kept_raw),
+        title: Some("Kept".to_string()),
+        info_version: Some("1".to_string()),
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec!["public".to_string()],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    db.submit_api_spec_bundle(&bundle, &kept_spec)
+        .await
+        .expect("Failed to seed kept api_spec bundle");
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let hostile_raw =
+        br#"{"openapi":"3.1.0","info":{"title":"Hostile","version":"1"},"paths":{}}"#;
+    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(hostile_raw)
+        .expect("compress hostile");
+    let hostile_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&compressed)
+    };
+    let hostile_payload = json!({
+        "proxies": [{
+            "id": "hostile-proxy",
+            "listen_path": "/hostile",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "api_spec_id": "hostile-spec"
+        }],
+        "api_specs": {
+            "section_version": "1",
+            "items": [{
+                "id": "hostile-spec",
+                "namespace": "ferrum",
+                "proxy_id": "hostile-proxy",
+                "spec_version": "3.1.0",
+                "spec_format": "json",
+                "spec_content_base64": hostile_b64,
+                "content_encoding": "gzip",
+                "uncompressed_size": hostile_raw.len() as u64,
+                "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(hostile_raw),
+                "title": "Hostile",
+                "info_version": "1",
+                "tags": ["api_v1"],
+                "server_urls": [],
+                "operation_count": 0,
+                "resource_hash": "hash",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }]
+        }
+    });
+
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &hostile_payload).await;
+    assert_eq!(
+        status, 400,
+        "hostile tag restore must be rejected: {:?}",
+        body
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .is_some_and(|s| s.contains("tag contains forbidden character"))),
+        "expected forbidden-tag validation error, got {:?}",
+        body
+    );
+    assert!(
+        body.to_string().contains("existing config was NOT deleted"),
+        "rejection must advertise pre-delete failure: {:?}",
+        body
+    );
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "hostile restore must leave prior specs untouched: {:?}",
+        specs
+    );
+    assert_eq!(specs["items"][0]["id"], "kept-spec");
+
+    // Declared JSON with non-JSON body must also fail closed pre-delete.
+    let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
+    let yaml_compressed =
+        ferrum_edge::admin::spec_codec::compress_gzip(yaml_raw).expect("compress yaml");
+    let mismatch_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&yaml_compressed)
+    };
+    let mismatch_payload = json!({
+        "proxies": [{
+            "id": "mismatch-proxy",
+            "listen_path": "/mismatch",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "api_spec_id": "mismatch-spec"
+        }],
+        "api_specs": {
+            "section_version": "1",
+            "items": [{
+                "id": "mismatch-spec",
+                "namespace": "ferrum",
+                "proxy_id": "mismatch-proxy",
+                "spec_version": "3.0.3",
+                "spec_format": "json",
+                "spec_content_base64": mismatch_b64,
+                "content_encoding": "gzip",
+                "uncompressed_size": yaml_raw.len() as u64,
+                "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(yaml_raw),
+                "title": "y",
+                "info_version": "1",
+                "tags": [],
+                "server_urls": [],
+                "operation_count": 0,
+                "resource_hash": "hash",
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }]
+        }
+    });
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &mismatch_payload).await;
+    assert_eq!(
+        status, 400,
+        "format-mismatch restore must be rejected: {:?}",
+        body
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        errors.iter().any(|e| e.as_str().is_some_and(|s| {
+            s.contains("document is not valid JSON for declared spec_format")
+        })),
+        "expected declared-format validation error, got {:?}",
+        body
+    );
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "format-mismatch restore must leave prior specs untouched: {:?}",
+        specs
+    );
+}
+
 /// When `delete_all_resources` fails on an ATOMIC backend (SQL runs the clear in
 /// one transaction), nothing was deleted, so the prior config is fully intact.
 /// Restore must return `500` with `rollback: "not_needed"` and retain the prior

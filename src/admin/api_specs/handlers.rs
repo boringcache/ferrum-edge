@@ -2786,8 +2786,9 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 // multi-row pattern match.
                 //
                 // Apply the identical character whitelist used by
-                // `ExtractError::InvalidTagName`.
-                if let Some(c) = val.chars().find(|c| matches!(c, '"' | '%' | '_' | '\\')) {
+                // `api_spec_tag_forbidden_char` / `ExtractError::InvalidTagName`.
+                if let Some(c) = crate::admin::api_specs::extractor::api_spec_tag_forbidden_char(&val)
+                {
                     return Err(ApiSpecError::BadRequest(format!(
                         "has_tag value contains forbidden character '{}'; tag names \
                          cannot contain '\"', '%', '_', or '\\\\'",
