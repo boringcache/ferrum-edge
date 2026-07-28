@@ -48,8 +48,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, redacted_endpoint_url, redacted_endpoint_url_str, wait_until_committed,
-    wait_until_committed_or_closed,
+    RetryPolicy, TrySendOutcome, redacted_endpoint_url, redacted_endpoint_url_str,
+    wait_until_committed, wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -1833,10 +1833,13 @@ struct SinkMetrics {
     failure_reasons: FailureReasonCounters,
     /// Observed queue depth at/above the high-water mark (telemetry only).
     queue_high_water_hits_total: AtomicU64,
-    /// Events diverted from the in-memory channel to durable spool at high water.
+    /// High-water events whose durable spool-delivery handoff actually accepted
+    /// the job. Saturation/closure of the delivery queue is counted by spool
+    /// loss metrics instead.
     queue_high_water_diversions_total: AtomicU64,
-    /// Events lost because the bounded channel was actually full and no durable
-    /// overflow path took ownership.
+    /// Events lost because the bounded in-memory channel was actually full and
+    /// no durable overflow path accepted ownership. Never incremented for
+    /// shutdown/unavailable admission.
     queue_full_drops_total: AtomicU64,
     queue_byte_budget_exhausted_total: AtomicU64,
     spool_drops_total: AtomicU64,
@@ -2236,24 +2239,28 @@ impl ApiChargebackSink {
         // Install diversion only when a durable owner exists. Without spool,
         // high water is telemetry-only and the bounded channel remains usable
         // until it is actually full (issue #3038).
-        let on_overflow: Option<Arc<dyn Fn(QueuedChargeEvent, &'static str) + Send + Sync>> =
-            spool_enqueue.as_ref().map(|overflow_enqueue| {
-                let overflow_metrics = Arc::clone(&metrics);
-                let overflow_enqueue = Arc::clone(overflow_enqueue);
-                Arc::new(move |queued: QueuedChargeEvent, reason: &'static str| {
-                    if snapshot_events_are_pre_spooled {
-                        invalidate_status_cache();
-                        return;
-                    }
-                    if reason == "queue high water" {
-                        overflow_metrics
-                            .queue_high_water_diversions_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    let _ = overflow_enqueue.try_enqueue(vec![queued], reason);
+        let on_overflow: Option<
+            Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>,
+        > = spool_enqueue.as_ref().map(|overflow_enqueue| {
+            let overflow_metrics = Arc::clone(&metrics);
+            let overflow_enqueue = Arc::clone(overflow_enqueue);
+            Arc::new(move |queued: QueuedChargeEvent, reason: &'static str| {
+                if snapshot_events_are_pre_spooled {
+                    // Snapshot charges are already durably owned; acknowledge
+                    // ownership without counting a fresh high-water diversion.
                     invalidate_status_cache();
-                })
-            });
+                    return true;
+                }
+                let accepted = overflow_enqueue.try_enqueue(vec![queued], reason);
+                if accepted && reason == "queue high water" {
+                    overflow_metrics
+                        .queue_high_water_diversions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                invalidate_status_cache();
+                accepted
+            })
+        });
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
                 if snapshot_events_are_pre_spooled {
@@ -3403,7 +3410,7 @@ fn render_prometheus_for_sinks(
         latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
     }
 
-    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events accepted by the exporter.\n");
+    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.\n");
     output.push_str("# TYPE chargeback_sink_events_enqueued_total counter\n");
     output.push_str(&format!(
         "chargeback_sink_events_enqueued_total {}\n",
@@ -3442,7 +3449,7 @@ fn render_prometheus_for_sinks(
         queue_high_water_hits
     ));
     output.push_str(
-        "# HELP chargeback_sink_queue_high_water_diversions_total Chargeback sink events diverted from the in-memory queue to durable spool at high water.\n",
+        "# HELP chargeback_sink_queue_high_water_diversions_total Chargeback sink events whose high-water durable spool-delivery handoff was accepted. Spool delivery saturation/closure is counted by spool loss metrics, not this counter.\n",
     );
     output.push_str("# TYPE chargeback_sink_queue_high_water_diversions_total counter\n");
     output.push_str(&format!(
@@ -3450,7 +3457,7 @@ fn render_prometheus_for_sinks(
         queue_high_water_diversions
     ));
     output.push_str(
-        "# HELP chargeback_sink_queue_full_drops_total Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path took ownership.\n",
+        "# HELP chargeback_sink_queue_full_drops_total Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path accepted ownership. Shutdown/unavailable admission is not counted here.\n",
     );
     output.push_str("# TYPE chargeback_sink_queue_full_drops_total counter\n");
     output.push_str(&format!(
@@ -9246,25 +9253,28 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    if runtime.logger.try_send(QueuedChargeEvent { event, lease }) {
-        runtime
-            .metrics
-            .events_enqueued_total
-            .fetch_add(1, Ordering::Relaxed);
-    } else if runtime.spool_delivery.is_some() {
-        // Durable overflow diversion (or spool-delivery loss accounting) took
-        // ownership inside try_send; count admission the same as a channel hit.
-        runtime
-            .metrics
-            .events_enqueued_total
-            .fetch_add(1, Ordering::Relaxed);
-    } else {
-        // No durable overflow hook: the bounded channel was full/closed and the
-        // event was lost. Do not count it as enqueued.
-        runtime
-            .metrics
-            .queue_full_drops_total
-            .fetch_add(1, Ordering::Relaxed);
+    match runtime
+        .logger
+        .try_send_outcome(QueuedChargeEvent { event, lease })
+    {
+        TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
+            runtime
+                .metrics
+                .events_enqueued_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::BufferFull => {
+            // Genuine full in-memory channel with no accepted durable ownership.
+            runtime
+                .metrics
+                .queue_full_drops_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::DiversionRejected | TrySendOutcome::WorkerUnavailable => {
+            // DiversionRejected: spool delivery saturation/closure already
+            // recorded spool job/event loss. WorkerUnavailable: shutdown must
+            // not masquerade as a full-buffer drop.
+        }
     }
     invalidate_status_cache();
 }

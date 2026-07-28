@@ -3461,6 +3461,118 @@ async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops()
     drop(plugin);
 }
 
+/// Saturated spool delivery must not report a successful high-water diversion or
+/// enqueue, and must not masquerade as a full in-memory channel drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
+    let mut held_export = HeldClickHouseExport::start().await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(held_export.url);
+    config["clickhouse"]["timeout_ms"] = json!(60_000);
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(600_000);
+    config["batch"]["buffer_capacity"] = json!(1);
+    config["retry"]["max_attempts"] = json!(1);
+    // Capacity 1: one job can sit in the delivery channel while the worker is
+    // parked inside a blocked write, so the next high-water handoff is refused.
+    config["spool"]["delivery_queue_capacity"] = json!(1);
+    config["spool"]["replay_interval_secs"] = json!(3600);
+
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let _clear_hook = ClearSpoolWriteHookOnDrop {
+        release: Arc::clone(&release),
+    };
+    let entered_for_hook = Arc::clone(&entered);
+    let release_for_hook = Arc::clone(&release);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+        if matches!(point, SpoolWriteHookPoint::BeforeWrite) {
+            let (lock, cv) = &*release_for_hook;
+            let mut guard = lock.lock().expect("release gate lock");
+            {
+                let (entered_lock, entered_cv) = &*entered_for_hook;
+                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
+                if !*entered_guard {
+                    *entered_guard = true;
+                    entered_cv.notify_all();
+                }
+            }
+            while !*guard {
+                guard = cv.wait(guard).expect("release gate wait");
+            }
+        }
+    })));
+
+    let (_, _, spool_lost_baseline) = spool_delivery_totals();
+    let enqueued_baseline =
+        prometheus_counter(&render_prometheus(), "chargeback_sink_events_enqueued_total");
+
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    plugin.log(&billable_summary("block-flush")).await;
+    wait_condvar_flag(Arc::clone(&held_export.first_accept)).await;
+    plugin.log(&billable_summary("fill-queue")).await;
+
+    // First high-water diversion is accepted and parks the delivery worker.
+    plugin.log(&billable_summary("divert-accepted")).await;
+    wait_condvar_flag(Arc::clone(&entered)).await;
+
+    let (_, _, _, diversions_after_accept, drops_after_accept) = queue_status_counters();
+    assert_eq!(
+        diversions_after_accept, 1,
+        "accepted high-water handoff must count exactly one diversion"
+    );
+    assert_eq!(drops_after_accept, 0);
+
+    // Fill the only delivery-queue slot while the worker remains blocked.
+    plugin.log(&billable_summary("divert-fills-delivery")).await;
+    let (_, _, _, diversions_after_fill, _) = queue_status_counters();
+    assert_eq!(
+        diversions_after_fill, 2,
+        "second accepted handoff must count a diversion while still durable"
+    );
+    let enqueued_before_reject =
+        prometheus_counter(&render_prometheus(), "chargeback_sink_events_enqueued_total");
+
+    // Next high-water handoff must be refused by the saturated delivery queue.
+    plugin.log(&billable_summary("divert-rejected")).await;
+
+    let (_, _, _, diversions_after_reject, drops_after_reject) = queue_status_counters();
+    assert_eq!(
+        diversions_after_reject, diversions_after_fill,
+        "refused spool-delivery handoff must not increment high-water diversions"
+    );
+    assert_eq!(
+        drops_after_reject, 0,
+        "spool-delivery saturation must not masquerade as a full-buffer drop"
+    );
+
+    let prom = render_prometheus();
+    let enqueued_after = prometheus_counter(&prom, "chargeback_sink_events_enqueued_total");
+    let (_, _, spool_lost_after) = spool_delivery_totals();
+    assert!(
+        spool_lost_after > spool_lost_baseline,
+        "refused handoff must remain visible on spool loss counters"
+    );
+    assert_eq!(
+        enqueued_after, enqueued_before_reject,
+        "rejected diversion must not increment events_enqueued_total"
+    );
+    assert!(
+        enqueued_before_reject > enqueued_baseline,
+        "accepted channel/diversion admissions must still increment events_enqueued_total"
+    );
+
+    held_export.release_held_connections();
+    drop(plugin);
+}
+
 #[test]
 fn clickhouse_timeout_bound_keeps_claim_lease_above_delivery_budget() {
     let temp = tempfile::tempdir().unwrap();

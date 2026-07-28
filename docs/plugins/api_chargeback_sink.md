@@ -408,14 +408,18 @@ high-water mark is telemetry only (`high_water_hits_total` /
 `chargeback_sink_queue_high_water_hits_total`); every configured
 `batch.buffer_capacity` slot remains usable until the channel is actually full,
 and true full-buffer losses increment `full_drops_total` /
-`chargeback_sink_queue_full_drops_total`. High-water durable diversions
-increment `high_water_diversions_total` /
-`chargeback_sink_queue_high_water_diversions_total` separately from drops.
-Request and body terminal hooks only enqueue to that worker; compression,
-directory scans, writes, and fsync never run inline on those hooks. Saturation
-of the delivery queue is
-counted (`chargeback_sink_spool_jobs_lost_total` /
-`chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
+`chargeback_sink_queue_full_drops_total` (never shutdown/unavailable
+admission). High-water durable diversions increment
+`high_water_diversions_total` /
+`chargeback_sink_queue_high_water_diversions_total` only when the spool-delivery
+handoff actually accepts the job; a saturated or closed delivery queue is
+counted by `chargeback_sink_spool_jobs_lost_total` /
+`chargeback_sink_spool_events_lost_total` instead (with rate-limited warnings)
+and must not be reported as a successful diversion or enqueue.
+`events_enqueued_total` / `chargeback_sink_events_enqueued_total` counts channel
+admission or an overflow handoff that actually succeeded. Request and body
+terminal hooks only enqueue to that worker; compression, directory scans,
+writes, and fsync never run inline on those hooks. Files are
 created with private permissions, written as process/generation-attributed
 `*.write-<process_tag>-<generation>.tmp` temps, fsynced, renamed into place, then
 directory-fsynced on Unix. The `spool.meta.json` ownership manifest uses the same

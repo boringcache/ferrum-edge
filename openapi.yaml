@@ -23023,14 +23023,16 @@ components:
                   type: integer
                   minimum: 0
                   description: >
-                    Events diverted from the in-memory queue to durable spool at
-                    high water. Zero when spool is disabled.
+                    Events whose high-water durable spool-delivery handoff was
+                    accepted. Zero when spool is disabled. Saturated or closed
+                    delivery queues are counted by spool loss metrics instead.
                 full_drops_total:
                   type: integer
                   minimum: 0
                   description: >
                     Events dropped because the bounded in-memory queue was full
-                    and no durable overflow path took ownership.
+                    and no durable overflow path accepted ownership. Shutdown or
+                    unavailable admission is not counted here.
             spool:
               type: object
               properties:
@@ -23077,6 +23079,10 @@ components:
                 events_enqueued_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Events admitted to the in-memory channel or accepted by a
+                    durable overflow handoff. Failed spool-delivery admission and
+                    shutdown/unavailable outcomes are not counted.
                 events_exported_total:
                   type: integer
                   minimum: 0
@@ -23174,13 +23180,15 @@ components:
             high_water_diversions_total:
               type: integer
               description: >
-                Events diverted from the in-memory queue to durable spool at high
-                water. Zero when spool is disabled.
+                Events whose high-water durable spool-delivery handoff was
+                accepted. Zero when spool is disabled. Saturated or closed
+                delivery queues are counted by spool loss metrics instead.
             full_drops_total:
               type: integer
               description: >
                 Events dropped because the bounded in-memory queue was full and
-                no durable overflow path took ownership.
+                no durable overflow path accepted ownership. Shutdown or
+                unavailable admission is not counted here.
         spool:
           type: object
           properties:
@@ -23224,6 +23232,10 @@ components:
           properties:
             events_enqueued_total:
               type: integer
+              description: >
+                Events admitted to the in-memory channel or accepted by a durable
+                overflow handoff. Failed spool-delivery admission and
+                shutdown/unavailable outcomes are not counted.
             events_exported_total:
               type: integer
             failures_total:
