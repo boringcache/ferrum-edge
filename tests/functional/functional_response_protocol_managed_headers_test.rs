@@ -194,8 +194,13 @@ fn assert_no_protocol_managed(headers: &http::HeaderMap, label: &str) {
 async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     let hits = Arc::new(AtomicUsize::new(0));
     let backend_port = start_scripted_backend(Arc::clone(&hits)).await;
-    let (gateway, https_port) = spawn_gateway(backend_port).await;
-    let base = format!("http://127.0.0.1:{}", gateway.http_port());
+    let (mut gateway, https_port) = spawn_gateway(backend_port).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+    let echo_url = gateway.proxy_url("/api/echo");
+    let mocked_url = gateway.proxy_url("/api/mocked");
 
     // --- Ordinary upstream via transformer (H1) ---
     let h1 = reqwest::Client::builder()
@@ -203,7 +208,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         .build()
         .expect("h1 client");
     let h1_resp = h1
-        .get(format!("{base}/api/echo"))
+        .get(&echo_url)
         .send()
         .await
         .expect("H1 ordinary");
@@ -235,7 +240,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
 
     // --- Synthetic mock (H1) ---
     let mock = h1
-        .get(format!("{base}/api/mocked"))
+        .get(&mocked_url)
         .send()
         .await
         .expect("H1 mock");
@@ -267,7 +272,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
         .build()
         .expect("h2 client");
     let h2_resp = h2
-        .get(format!("{base}/api/echo"))
+        .get(&echo_url)
         .send()
         .await
         .expect("H2 ordinary");
@@ -284,7 +289,7 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     assert!(h2_resp.headers().get("x-request-id").is_some());
 
     let h2_mock = h2
-        .get(format!("{base}/api/mocked"))
+        .get(&mocked_url)
         .send()
         .await
         .expect("H2 mock");
