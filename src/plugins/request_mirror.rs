@@ -638,6 +638,65 @@ impl RequestMirrorAdmission {
     }
 }
 
+/// Staged `request_mirror` admissions for one live request context.
+///
+/// Owned semaphore permits and retained-byte leases live only on the live
+/// request. Custom `Clone` returns an empty wrapper so `RequestContext`'s
+/// derived `Clone` cannot duplicate or double-release admission capacity.
+/// Custom `Debug` summarizes staging count only and never prints permit,
+/// lease, or drop-reason state.
+#[derive(Default)]
+pub(crate) struct RequestMirrorAdmissions(Vec<RequestMirrorAdmission>);
+
+impl Clone for RequestMirrorAdmissions {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for RequestMirrorAdmissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestMirrorAdmissions")
+            .field("staged", &self.0.len())
+            .finish()
+    }
+}
+
+impl RequestMirrorAdmissions {
+    /// Stage one instance's admission, replacing any earlier entry for the
+    /// same instance so a repeated evaluation cannot accumulate two leases.
+    pub(crate) fn stage(&mut self, admission: RequestMirrorAdmission) {
+        let instance_id = admission.instance_id();
+        if let Some(slot) = self
+            .0
+            .iter_mut()
+            .find(|staged| staged.instance_id() == instance_id)
+        {
+            *slot = admission;
+            return;
+        }
+        self.0.push(admission);
+    }
+
+    /// Whether the given instance was admitted and therefore needs the request
+    /// body buffered. Read-only and idempotent.
+    pub(crate) fn body_admitted(&self, instance_id: u64) -> bool {
+        self.0
+            .iter()
+            .any(|staged| staged.instance_id() == instance_id && staged.is_admitted())
+    }
+
+    /// Take one instance's staged admission, transferring ownership of its
+    /// permit and retained-byte lease to the caller.
+    pub(crate) fn take(&mut self, instance_id: u64) -> Option<RequestMirrorAdmission> {
+        let index = self
+            .0
+            .iter()
+            .position(|staged| staged.instance_id() == instance_id)?;
+        Some(self.0.swap_remove(index))
+    }
+}
+
 /// Per-instance, bounded-lifetime mirror observability counters.
 ///
 /// Lifetime is bounded to the plugin instance: a config reload rebuilds the

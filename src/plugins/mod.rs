@@ -2252,7 +2252,7 @@ pub struct RequestContext {
     /// observe another instance's admission. Its custom `Clone` intentionally
     /// clears the staged value: response-side context clones must not release a
     /// lease the live request still owns.
-    request_mirror_admissions: Vec<request_mirror::RequestMirrorAdmission>,
+    request_mirror_admissions: request_mirror::RequestMirrorAdmissions,
     /// One-shot HMAC work staged before request-body collection and consumed
     /// at authentication. This is private rather than transaction metadata so
     /// credential/signature/Consumer secret data cannot be forwarded or
@@ -2566,7 +2566,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rxs: Vec::new(),
-            request_mirror_admissions: Vec::new(),
+            request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3395,7 +3395,7 @@ impl RequestContext {
             // Mirror admission leases are owned by the live request context.
             // Copying them here would double-release a permit / byte
             // reservation when the clone is dropped.
-            request_mirror_admissions: Vec::new(),
+            request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -4135,16 +4135,7 @@ impl RequestContext {
         &mut self,
         admission: request_mirror::RequestMirrorAdmission,
     ) {
-        let instance_id = admission.instance_id();
-        if let Some(slot) = self
-            .request_mirror_admissions
-            .iter_mut()
-            .find(|staged| staged.instance_id() == instance_id)
-        {
-            *slot = admission;
-            return;
-        }
-        self.request_mirror_admissions.push(admission);
+        self.request_mirror_admissions.stage(admission);
     }
 
     /// Whether the given `request_mirror` instance was admitted for this
@@ -4154,9 +4145,7 @@ impl RequestContext {
     /// several times per request and must never advance the sampler or acquire
     /// capacity itself.
     pub(crate) fn request_mirror_body_admitted(&self, instance_id: u64) -> bool {
-        self.request_mirror_admissions
-            .iter()
-            .any(|staged| staged.instance_id() == instance_id && staged.is_admitted())
+        self.request_mirror_admissions.body_admitted(instance_id)
     }
 
     /// Take one instance's staged admission, transferring ownership of its
@@ -4167,11 +4156,7 @@ impl RequestContext {
         &mut self,
         instance_id: u64,
     ) -> Option<request_mirror::RequestMirrorAdmission> {
-        let index = self
-            .request_mirror_admissions
-            .iter()
-            .position(|staged| staged.instance_id() == instance_id)?;
-        Some(self.request_mirror_admissions.swap_remove(index))
+        self.request_mirror_admissions.take(instance_id)
     }
 
     /// Return the stable authenticated identity for downstream policy and
