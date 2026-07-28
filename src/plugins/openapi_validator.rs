@@ -4778,9 +4778,7 @@ fn is_rfc8187_attr_char(byte: u8) -> bool {
 
 fn reject_filename_injection(filename: &str) -> Result<(), String> {
     if filename.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
-        return Err(
-            "Malformed multipart part: filename contains CR, LF, or NUL".to_string(),
-        );
+        return Err("Malformed multipart part: filename contains CR, LF, or NUL".to_string());
     }
     Ok(())
 }
