@@ -1006,6 +1006,14 @@ async fn handle_h3_connection(
     // the IP string on the rare occasion it changes. This prevents stale IPs
     // from poisoning rate-limit keys and access logs after migration.
     let quinn_conn = connection.clone();
+    // Built once per QUIC connection and cloned (one `Arc` bump) into each
+    // accepted request stream. Watching connection close needs no access to
+    // the request stream, so nothing here can race the proxy path for request
+    // bytes or mask a stream-accounting failure.
+    let peer_connection =
+        crate::plugins::PeerConnectionSignal::new(std::sync::Arc::new(QuicPeerConnectionWatch {
+            connection: connection.clone(),
+        }));
     // RFC 9220: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so H3 clients can
     // bootstrap a WebSocket via Extended CONNECT (:method=CONNECT,
     // :protocol=websocket). Mirrors the H2 listener's `enable_connect_protocol()`
@@ -1097,6 +1105,7 @@ async fn handle_h3_connection(
                 let mtls_auth_connection_cache = identity.mtls_auth_connection_cache.clone();
                 let peer_spiffe_extraction_cache = identity.peer_spiffe_extraction_cache.clone();
                 let is_early_data = identity.is_early_data;
+                let peer_connection = peer_connection.clone();
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -1113,6 +1122,7 @@ async fn handle_h3_connection(
                                 mtls_auth_connection_cache,
                                 peer_spiffe_extraction_cache,
                                 is_early_data,
+                                peer_connection,
                             )
                             .await
                             {
@@ -1139,6 +1149,34 @@ async fn handle_h3_connection(
     Ok(())
 }
 
+/// Peer-gone watch backed by QUIC connection close.
+///
+/// Resolves on any connection termination the peer can cause — CONNECTION_CLOSE
+/// (graceful or error), idle timeout, or path failure — and on local close.
+/// It deliberately observes only connection state: the request stream stays
+/// exclusively owned by the request task, so this never competes for request
+/// bytes and never suppresses a stream-accounting error. A per-stream
+/// RESET_STREAM that leaves the connection open is not observable through the
+/// public `h3` API and is therefore bounded by the fault-delay ceiling and the
+/// process-wide delayed-work budget instead.
+struct QuicPeerConnectionWatch {
+    connection: quinn::Connection,
+}
+
+impl crate::plugins::PeerConnectionWatch for QuicPeerConnectionWatch {
+    fn closed(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            // `Connection::closed()` is cancel-safe and resolves with the
+            // termination reason; the reason itself is irrelevant here.
+            let _ = self.connection.closed().await;
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
+}
+
 /// Handle a single HTTP/3 request stream.
 ///
 /// `remote_addr` is the connection's current (post-migration) QUIC peer already
@@ -1161,6 +1199,7 @@ async fn handle_h3_request(
         Arc<crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache>,
     >,
     is_early_data: bool,
+    peer_connection: crate::plugins::PeerConnectionSignal,
 ) -> Result<(), anyhow::Error> {
     let start_time = std::time::Instant::now();
 
@@ -1328,6 +1367,10 @@ async fn handle_h3_request(
     ctx.tls_client_cert_chain_der = tls_client_cert_chain_der;
     ctx.mtls_auth_connection_cache = mtls_auth_connection_cache;
     ctx.peer_spiffe_extraction_cache = peer_spiffe_extraction_cache;
+    // Lets deliberately parked work (injected fault delays) observe QUIC
+    // connection close instead of holding this stream, its `RequestGuard`, and
+    // its plugin snapshot until the timer expires.
+    ctx.peer_connection = Some(peer_connection);
 
     // Store raw headers for deferred materialization.
     ctx.set_raw_headers(req.headers().clone());

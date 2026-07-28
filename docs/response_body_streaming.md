@@ -128,7 +128,10 @@ response_body_mode = buffer?
                 └─ No (all plugins skip for this request) → stream
             └─ No →
                 Retries configured?
-                    └─ Yes → buffer (all attempts except final)
+                    └─ Yes → stream on every attempt when the proxy streams
+                       (retry decides from headers alone; a retryable attempt
+                       drops its undrained body before client commit). Buffer
+                       only when response_body_mode/plugins force buffering.
                     └─ No → continue
                 Response size limit enabled?
                     └─ Yes →

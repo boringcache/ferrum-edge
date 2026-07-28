@@ -181,26 +181,123 @@ fn udp_rate_limiting_accepts_every_documented_root_key() {
 }
 
 #[test]
-fn ai_and_websocket_roots_remain_intentionally_open() {
-    // GHSA-q3p3-94cj-8wh6 names ordinary HTTP, GraphQL, and gRPC-method
-    // limiter roots; neither AI nor WebSocket appears in its affected
-    // components, reproductions, impact, or component-progress list.
-    create_plugin(
-        "ai_rate_limiter",
-        &json!({
-            "token_limit": 100,
-            "future_policy_field": {"enabled": true}
-        }),
-    )
-    .expect("AI root remains forward-compatible");
+fn ws_rate_limiting_rejects_misspelled_frame_and_redis_keys() {
+    let fps_error = create_plugin("ws_rate_limiting", &json!({"frames_per_secod": 1}))
+        .err()
+        .expect("misspelled frames_per_second must fail admission");
+    assert!(
+        fps_error.contains("unknown configuration key(s)"),
+        "{fps_error}"
+    );
+    assert!(fps_error.contains("frames_per_secod"), "{fps_error}");
+    assert!(fps_error.contains("frames_per_second"), "{fps_error}");
+
+    for key in [
+        "sync_mdoe",
+        "redis_tsl",
+        "redis_key_prefx",
+        "redis_pool_sze",
+        "redis_connect_timeout_second",
+        "redis_health_check_interval_second",
+        "redis_usernam",
+        "redis_passwrd",
+    ] {
+        let mut config = serde_json::Map::new();
+        config.insert("frames_per_second".to_string(), json!(10));
+        config.insert(key.to_string(), json!("redis"));
+        let error = create_plugin("ws_rate_limiting", &Value::Object(config))
+            .err()
+            .expect("a misspelled root key must fail admission");
+        assert!(error.contains("unknown configuration key(s)"), "{error}");
+        assert!(error.contains(key), "{error}");
+    }
+}
+
+#[test]
+fn ws_rate_limiting_accepts_every_documented_root_key() {
     create_plugin(
         "ws_rate_limiting",
         &json!({
             "frames_per_second": 10,
-            "future_policy_field": {"enabled": true}
+            "burst_size": 20,
+            "close_reason": "slow down",
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tls": false,
+            "redis_key_prefix": "explicit:prefix",
+            "redis_pool_size": 4,
+            "redis_connect_timeout_seconds": 5,
+            "redis_health_check_interval_seconds": 5,
+            "redis_username": "user",
+            "redis_password": "pass",
         }),
     )
-    .expect("WebSocket root remains forward-compatible");
+    .expect("the documented root key set must remain accepted");
+}
+
+#[test]
+fn ai_rate_limiter_rejects_misspelled_sync_mode_even_with_valid_token_limit() {
+    let error = create_plugin(
+        "ai_rate_limiter",
+        &json!({
+            "token_limit": 1000,
+            "sync_mdoe": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+        }),
+    )
+    .err()
+    .expect("misspelled sync_mode must fail admission");
+    assert!(error.contains("unknown configuration key(s)"), "{error}");
+    assert!(error.contains("config.sync_mdoe"), "{error}");
+    assert!(error.contains("sync_mode"), "suggestion missing: {error}");
+}
+
+#[test]
+fn ai_rate_limiter_rejects_misspelled_enforcement_and_redis_keys() {
+    for key in [
+        "on_unmetered_responce",
+        "count_mdoe",
+        "limit_byy",
+        "provder",
+        "expose_header",
+        "redis_tsl",
+        "redis_key_prefx",
+        "redis_pool_sze",
+    ] {
+        let mut config = serde_json::Map::new();
+        config.insert("token_limit".to_string(), json!(1000));
+        config.insert(key.to_string(), json!("consumer"));
+        let error = create_plugin("ai_rate_limiter", &Value::Object(config))
+            .err()
+            .expect("a misspelled root key must fail admission");
+        assert!(error.contains(key), "{error}");
+    }
+}
+
+#[test]
+fn ai_rate_limiter_accepts_every_documented_root_key() {
+    create_plugin(
+        "ai_rate_limiter",
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "count_mode": "total_tokens",
+            "limit_by": "consumer",
+            "expose_headers": true,
+            "provider": "openai",
+            "on_unmetered_response": "reject",
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_tls": false,
+            "redis_key_prefix": "explicit:prefix",
+            "redis_pool_size": 4,
+            "redis_connect_timeout_seconds": 5,
+            "redis_health_check_interval_seconds": 5,
+            "redis_username": "user",
+            "redis_password": "pass",
+        }),
+    )
+    .expect("the documented root key set must remain accepted");
 }
 
 // ── GHSA-jjjw-rqjm-fvf3: bounded numeric configuration ──────────────────────

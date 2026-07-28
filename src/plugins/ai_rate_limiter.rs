@@ -13,8 +13,10 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
-    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, validate_window_seconds,
+    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
@@ -26,13 +28,16 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::proxy::{
     AI_REQUEST_METADATA_KEY, BACKEND_STATUS_METADATA_KEY, RESERVED_TOKENS_METADATA_KEY,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
-/// enforcement skips this cooldown so a sampled observation of pressure
-/// still force-reclaims without waiting for the next cool-down window.
+/// reclaim skips this cooldown so a sampled observation of pressure can
+/// drop idle keys without waiting for the next cool-down window. Live
+/// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str = r#"{"error":"AI token rate limit exceeded","details":"Rate-limit state capacity exceeded (max 100000 keys)"}"#;
 const RESERVATION_ID_METADATA_KEY: &str = "ai_ratelimit_reservation_id";
 /// Redis sliding-window index the reservation credited (centralized mode only).
 /// Carried back to the reconciliation op so a negative correction debits the
@@ -141,6 +146,45 @@ const EXPOSED_RATELIMIT_HEADERS: &[(&str, &str)] = &[
     ("ai_ratelimit_usage", "x-ai-ratelimit-usage"),
 ];
 
+/// `ai_rate_limiter`-specific top-level config keys (excludes shared Redis fields).
+const AI_RATE_LIMITER_POLICY_CONFIG_KEYS: &[&str] = &[
+    "token_limit",
+    "window_seconds",
+    "count_mode",
+    "limit_by",
+    "expose_headers",
+    "provider",
+    "on_unmetered_response",
+];
+
+/// Closed top-level key set for `ai_rate_limiter` plugin config.
+///
+/// Must stay aligned with OpenAPI `AiRateLimiterConfig` (which must declare
+/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `docs/plugins.md`. Unknown root keys fail closed: a valid `token_limit` can
+/// mask a misspelled `sync_mdoe`, `on_unmetered_responce`, or `limit_byy`, so
+/// construction would succeed while distributed enforcement, identity scope,
+/// unmetered posture, or provider extraction silently fell back to defaults.
+pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
+    "token_limit",
+    "window_seconds",
+    "count_mode",
+    "limit_by",
+    "expose_headers",
+    "provider",
+    "on_unmetered_response",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
 pub struct AiRateLimiter {
     token_limit: u64,
     window_seconds: u64,
@@ -177,9 +221,20 @@ impl AiRateLimiter {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("ai_rate_limiter: config must be an object".to_string());
-        }
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ai_rate_limiter: config must be an object".to_string())?;
+        debug_assert_closed_root_keys(
+            AI_RATE_LIMITER_CONFIG_KEYS,
+            AI_RATE_LIMITER_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            AI_RATE_LIMITER_CONFIG_KEYS,
+            "ai_rate_limiter: ",
+        )?;
 
         let token_limit = required_u64(config, "token_limit")?;
         if token_limit == 0 {
@@ -296,6 +351,25 @@ impl AiRateLimiter {
             .check_local_at(key, &AiRateLimitOp::Reserve { tokens: 1 }, now);
     }
 
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_key_at_with_cap_for_test(
+        &self,
+        key: String,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.limiter
+            .check_local_at_with_capacity(
+                key,
+                &AiRateLimitOp::Reserve { tokens: 1 },
+                now,
+                max_entries,
+            )
+            .is_some()
+    }
+
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
@@ -361,9 +435,10 @@ impl AiRateLimiter {
         }
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Sampled over-cap observation force-enforces after pruning idle
-        // keys. The below-cap cooldown must not suppress this branch once
-        // pressure is seen on a sampled pass.
+        // Sampled over-cap observation reclaims idle keys after prune. Live
+        // budgets are never force-evicted; hard cardinality is enforced by
+        // atomic admission reservation. The below-cap cooldown must not
+        // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             self.last_periodic_sweep_secs
@@ -465,9 +540,26 @@ impl AiRateLimiter {
         }
     }
 
-    async fn reserve_usage(&self, key: String, tokens: u64) -> RateLimitOutcome {
+    fn reject_capacity(&self) -> PluginResult {
+        // The metric is deliberately the only operational signal here. A
+        // warning per attacker-selected new key would turn fail-closed
+        // admission into log amplification.
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+        PluginResult::Reject {
+            status_code: 429,
+            body: CAPACITY_REJECT_BODY.to_string(),
+            headers: HashMap::new(),
+        }
+    }
+
+    async fn reserve_usage(&self, key: String, tokens: u64) -> Option<RateLimitOutcome> {
         self.limiter
-            .check(key.clone(), &key, &AiRateLimitOp::Reserve { tokens })
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                &AiRateLimitOp::Reserve { tokens },
+                MAX_STATE_ENTRIES,
+            )
             .await
     }
 
@@ -490,21 +582,20 @@ impl AiRateLimiter {
         if actual_tokens == 0 && delta == 0 {
             return None;
         }
-        Some(
-            self.limiter
-                .check(
-                    key.clone(),
-                    &key,
-                    &AiRateLimitOp::AdjustUsage {
-                        reservation_id,
-                        reserved_window_index,
-                        reservation_backend,
-                        actual_tokens,
-                        delta,
-                    },
-                )
-                .await,
-        )
+        self.limiter
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                &AiRateLimitOp::AdjustUsage {
+                    reservation_id,
+                    reserved_window_index,
+                    reservation_backend,
+                    actual_tokens,
+                    delta,
+                },
+                MAX_STATE_ENTRIES,
+            )
+            .await
     }
 
     /// Which backend the original reservation for this request landed on,
@@ -1548,19 +1639,24 @@ impl Plugin for AiRateLimiter {
         //    how `ai_request_guard` treats compressed bodies (#1919) and is
         //    documented under `count_mode` / `on_unmetered_response` in
         //    docs/plugins.md.
-        let outcome = if reserved_tokens > 0 {
+        // Advance sampled idle reclamation before admission so an exactly-full
+        // map of expired keys cannot remain pinned closed when only new
+        // identities arrive. Cleanup never removes live budgets.
+        self.evict_stale_entries();
+        let Some(outcome) = (if reserved_tokens > 0 {
             self.reserve_usage(key.clone(), reserved_tokens).await
         } else {
             self.limiter
-                .check(key.clone(), &key, &AiRateLimitOp::CheckBudget)
+                .check_with_redis_key_and_local_capacity(
+                    key.clone(),
+                    || key.clone(),
+                    &AiRateLimitOp::CheckBudget,
+                    MAX_STATE_ENTRIES,
+                )
                 .await
+        }) else {
+            return self.reject_capacity();
         };
-        // Evict AFTER the check so the current request's key cannot be
-        // force-evicted by `enforce_capacity` between insertion and the
-        // budget read — that race would let a hot user slip through
-        // against a freshly-allocated zero-usage window. Mirrors
-        // `rate_limiting.rs::check_rate` ordering.
-        self.evict_stale_entries();
 
         if !outcome.allowed {
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();

@@ -74,6 +74,7 @@ mod tcp_accept_loop_supervision_tests;
 mod tcp_proxy_tests;
 mod tls_offload_tests;
 mod tls_tests;
+mod udp_dtls_idle_activity_tests;
 mod udp_reply_stop_tests;
 mod websocket_auth_tests;
 mod websocket_auto_pong_tests;

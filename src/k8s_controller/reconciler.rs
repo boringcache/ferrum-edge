@@ -16,6 +16,7 @@ use crate::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry, NamespaceBro
 use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::grpc::mesh_server::{MeshConfigBroadcast, MeshGrpcServer};
 use crate::identity::spiffe::TrustDomain;
+use crate::k8s_controller::ControllerTaskRegistry;
 use crate::k8s_controller::istio_status::{IstioStatusWriter, plan_istio_status_updates};
 use crate::k8s_controller::metrics::ControllerMetrics;
 use crate::k8s_controller::resource_store::ResourceStoreSet;
@@ -165,8 +166,13 @@ pub struct ReconcileBroadcasters {
     pub publication_gate: CpPublicationGate,
 }
 
+/// Register the reconcile loop with `registry`, returning whether it was
+/// accepted (it is refused only if shutdown already closed the registry).
+///
+/// Registering rather than returning a `JoinHandle` is what gives control-plane
+/// teardown a terminal join boundary for the reconciler (#3220).
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_reconcile_loop(
+pub(crate) fn spawn_reconcile_loop(
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     config_arc: Arc<ArcSwap<GatewayConfig>>,
     overlay_slot: K8sOverlaySlot,
@@ -176,14 +182,15 @@ pub fn spawn_reconcile_loop(
     istio_status_writer: Option<IstioStatusWriter>,
     metrics: Arc<ControllerMetrics>,
     shutdown: watch::Receiver<bool>,
-) -> tokio::task::JoinHandle<()> {
+    registry: &ControllerTaskRegistry,
+) -> bool {
     // Funnel the loop through a named `async fn` so the spawned future has a
     // concrete type signature (no anonymous future generated from an
     // `async move { ... }`). The previous inline form tripped a rustc HRTB
     // limitation on `tokio::spawn`'s `Send + 'static` bound for the
     // `&Arc<tokio::sync::Mutex<ResourceStoreSet>>` borrows held across the
     // `do_reconcile(...).await` calls.
-    tokio::spawn(run_reconcile_loop(
+    let reconcile_task = run_reconcile_loop(
         store_set,
         config_arc,
         overlay_slot,
@@ -192,8 +199,10 @@ pub fn spawn_reconcile_loop(
         gateway_status_writer,
         istio_status_writer,
         metrics,
-        shutdown,
-    ))
+        shutdown.clone(),
+    );
+
+    registry.spawn_named("reconciler", reconcile_task, shutdown)
 }
 
 #[allow(clippy::too_many_arguments)]

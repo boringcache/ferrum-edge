@@ -48,7 +48,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, wait_until_committed, wait_until_committed_or_closed,
+    RetryPolicy, redacted_endpoint_url, redacted_endpoint_url_str, wait_until_committed,
+    wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -2022,7 +2023,15 @@ impl LatencyHistogram {
 #[derive(Clone)]
 struct ClickHouseFlushConfig {
     http: ClickHouseHttpClient,
+    /// Complete INSERT URL, including the `database`/`query` parameters and
+    /// every operator `insert_query_params` pair. Used **only** to build the
+    /// outbound request.
     insert_url: String,
+    /// Structurally redacted rendering of [`Self::insert_url`] for every
+    /// diagnostic surface. Credential-bearing `insert_query_params` names are
+    /// already rejected at validation, but arbitrary values remain admitted, so
+    /// no diagnostic ever renders the query string.
+    redacted_insert_url: String,
     username: Option<String>,
     password: Option<String>,
     timeout: Duration,
@@ -2036,12 +2045,25 @@ enum ClickHouseHttpClient {
 }
 
 impl ClickHouseHttpClient {
+    /// Send the INSERT while keeping the complete URL out of diagnostics.
+    ///
+    /// The shared-client arm routes through `execute_with_redacted_url` so the
+    /// literal-IP egress denial, retry, and slow-call warnings emitted inside
+    /// `PluginHttpClient` record `redacted_url` instead of the INSERT URL. The
+    /// dedicated custom-TLS arm emits no diagnostics of its own; its
+    /// `reqwest::Error` is reduced to a fixed [`FailureReason`] by the caller
+    /// and never rendered, so the URL cannot reach a log line there either.
     async fn execute(
         &self,
         request: reqwest::RequestBuilder,
+        redacted_url: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         match self {
-            ClickHouseHttpClient::Shared(client) => client.execute(request, PLUGIN_NAME).await,
+            ClickHouseHttpClient::Shared(client) => {
+                client
+                    .execute_with_redacted_url(request, PLUGIN_NAME, redacted_url)
+                    .await
+            }
             ClickHouseHttpClient::Dedicated(_) => request.send().await,
         }
     }
@@ -2138,6 +2160,9 @@ impl ApiChargebackSink {
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
+        // Structural, not substring: nothing from the INSERT query string is
+        // copied into the diagnostic rendering.
+        let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
         // Build the spool-replay client before staging so a TLS/file failure
@@ -2181,6 +2206,7 @@ impl ApiChargebackSink {
         let flush_config = ClickHouseFlushConfig {
             http,
             insert_url: insert_url.clone(),
+            redacted_insert_url: redacted_insert_url.clone(),
             username: self.config.clickhouse.username.clone(),
             password,
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -2312,6 +2338,7 @@ impl ApiChargebackSink {
                 ClickHouseFlushConfig {
                     http: replay_http,
                     insert_url,
+                    redacted_insert_url,
                     username: self.config.clickhouse.username.clone(),
                     password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -3618,7 +3645,7 @@ async fn post_json_each_row(
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
-    let result = cfg.http.execute(request).await;
+    let result = cfg.http.execute(request, &cfg.redacted_insert_url).await;
     match result {
         Ok(response) => {
             let status = response.status();
@@ -4099,11 +4126,58 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
     Ok(())
 }
 
+/// ClickHouse parameter names that carry a reusable credential.
+///
+/// ClickHouse accepts `user`/`password`/`access_token` as HTTP query
+/// parameters, so an operator could authenticate that way. Ferrum does not
+/// support it: `clickhouse.username` and `clickhouse.password_ref` are the
+/// dedicated channel and send the credential as an HTTP Basic header, which is
+/// never rendered in diagnostics and never appended to a URL. Admitting the
+/// query form would put a reusable database credential into the configured
+/// `insert_query_params` map — a value that admin projections and config
+/// exports treat as ordinary tuning.
+///
+/// This list is exact-match and lowercase; it is deliberately bounded rather
+/// than a substring screen so that legitimate ClickHouse settings are never
+/// refused by accident.
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &["access_token", "password", "session_id", "user"];
+
+/// Substrings that mark an operator-invented credential-bearing parameter name.
+///
+/// ClickHouse has no settings containing these tokens, so a name that does is
+/// far more likely to be a hand-rolled secret than a tuning knob. Kept short
+/// and explicit for the same reason as [`CREDENTIAL_QUERY_PARAM_NAMES`].
+const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
+    "apikey",
+    "api_key",
+    "credential",
+    "passwd",
+    "secret",
+    "token",
+];
+
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
             return Err(format!(
                 "{PLUGIN_NAME}: clickhouse.insert_query_params contains invalid key"
+            ));
+        }
+        // Reject credential-bearing *names* outright. Values stay arbitrary
+        // (bounded length, no control characters) and are protected instead by
+        // never rendering the INSERT query string in any diagnostic — see
+        // `ClickHouseFlushConfig::redacted_insert_url`.
+        let lowered = key.to_ascii_lowercase();
+        if CREDENTIAL_QUERY_PARAM_NAMES.contains(&lowered.as_str())
+            || CREDENTIAL_QUERY_PARAM_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: clickhouse.insert_query_params['{key}'] names a credential; \
+                 ClickHouse credentials belong in clickhouse.username and \
+                 clickhouse.password_ref, which are sent as an HTTP Basic header rather than \
+                 appended to the INSERT URL"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
@@ -4302,6 +4376,38 @@ fn build_clickhouse_http_client(
 pub struct SpoolStats {
     pub files: u64,
     pub bytes: u64,
+}
+
+/// One owned spool artifact with the size used for quota accounting.
+#[derive(Debug, Clone)]
+struct OwnedSpoolEntry {
+    path: PathBuf,
+    len: u64,
+}
+
+/// Single walk/sort/stat snapshot of owned spool usage.
+#[derive(Debug, Clone, Default)]
+struct OwnedSpoolInventory {
+    entries: Vec<OwnedSpoolEntry>,
+    stats: SpoolStats,
+}
+
+/// Deterministic report from one quota-eviction admission attempt.
+///
+/// External tests use this to prove multi-file reclaim is planned from a single
+/// inventory/sort rather than rescanning after every deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuotaEvictionReport {
+    /// How many times owned spool metadata was inventoried/sorted.
+    pub inventory_passes: u64,
+    /// Owned files present in that inventory snapshot.
+    pub files_inventoried: u64,
+    /// Owned bytes observed before deletions.
+    pub bytes_before: u64,
+    /// Files successfully unlinked during the pass.
+    pub files_deleted: u64,
+    /// Bytes freed according to the inventory snapshot sizes.
+    pub bytes_freed: u64,
 }
 
 /// Versioned durable ownership record for one managed chargeback spool namespace.
@@ -5180,6 +5286,23 @@ impl SpoolManager {
         self.list_owned_spool_files()
     }
 
+    /// Run quota eviction under the writer lock and return the planning report.
+    ///
+    /// External tests use this to assert multi-file reclaim is driven by one
+    /// inventory/sort pass rather than a per-deletion rescan.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn evict_until_can_admit_for_tests(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.evict_until_can_admit_with_report(incoming_len)
+    }
+
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_with_entry_limit_for_tests(
@@ -5513,16 +5636,29 @@ impl SpoolManager {
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
+        Ok(self.inventory_owned_spool_files()?.stats)
+    }
+
+    /// Collect owned `(path, size)` metadata once, sorted oldest-first.
+    ///
+    /// Quota eviction plans from this snapshot so reclaiming K files never
+    /// repeats a full directory walk/sort per deletion.
+    fn inventory_owned_spool_files(&self) -> Result<OwnedSpoolInventory, String> {
         let files = self.list_owned_spool_files()?;
-        let mut stats = SpoolStats::default();
+        let mut inventory = OwnedSpoolInventory {
+            entries: Vec::with_capacity(files.len()),
+            stats: SpoolStats::default(),
+        };
         for file in files {
             match fs::symlink_metadata(&file) {
                 Ok(meta) => {
                     if meta.file_type().is_symlink() {
                         continue;
                     }
-                    stats.files = stats.files.saturating_add(1);
-                    stats.bytes = stats.bytes.saturating_add(meta.len());
+                    let len = meta.len();
+                    inventory.stats.files = inventory.stats.files.saturating_add(1);
+                    inventory.stats.bytes = inventory.stats.bytes.saturating_add(len);
+                    inventory.entries.push(OwnedSpoolEntry { path: file, len });
                 }
                 Err(error) => {
                     return Err(format!(
@@ -5532,7 +5668,7 @@ impl SpoolManager {
                 }
             }
         }
-        Ok(stats)
+        Ok(inventory)
     }
 
     /// Drop oldest evictable owned spool files until
@@ -5546,61 +5682,98 @@ impl SpoolManager {
     /// destroy another owner's or another delivery's billing data. When only
     /// such files remain the write fails closed instead of over-admitting or
     /// stealing them.
+    ///
+    /// Planning inventories and sorts the owned set once, then deletes enough
+    /// eligible files from that snapshot in a single bounded pass.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
+        self.evict_until_can_admit_with_report(incoming_len)
+            .map(|_| ())
+    }
+
+    fn evict_until_can_admit_with_report(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
                 self.cfg.max_bytes
             ));
         }
-        loop {
-            let stats = self.scan_stats()?;
-            if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
-                return Ok(());
+        let inventory = self.inventory_owned_spool_files()?;
+        let mut report = QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: inventory.stats.files,
+            bytes_before: inventory.stats.bytes,
+            files_deleted: 0,
+            bytes_freed: 0,
+        };
+        let mut remaining_bytes = inventory.stats.bytes;
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+
+        let wall_clock = SystemTime::now();
+        let mut protected = 0u64;
+        let mut warned = false;
+        for entry in &inventory.entries {
+            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                return Ok(report);
             }
-            let owned = self.list_owned_spool_files()?;
-            let wall_clock = SystemTime::now();
-            let Some(oldest) = owned
-                .iter()
-                .find(|path| self.is_evictable_owned_file(path.as_path(), wall_clock))
-                .cloned()
-            else {
-                let protected = owned.len();
-                return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
-                    self.cfg.max_bytes
-                ));
-            };
-            self.assert_managed_path(&oldest)?;
-            match fs::remove_file(&oldest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
+                protected = protected.saturating_add(1);
+                continue;
+            }
+            self.assert_managed_path(&entry.path)?;
+            match fs::remove_file(&entry.path) {
+                Ok(()) => {
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.files_deleted = report.files_deleted.saturating_add(1);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                    self.metrics
+                        .spool_drops_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !warned {
+                        let now = unix_timestamp_seconds();
+                        let last = self.last_drop_warn_at.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
+                            && self
+                                .last_drop_warn_at
+                                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            warn!(
+                                plugin = PLUGIN_NAME,
+                                max_bytes = self.cfg.max_bytes,
+                                incoming_bytes = incoming_len,
+                                "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
+                            );
+                            warned = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone: credit the snapshot size so admission can
+                    // continue from this one inventory without rescanning.
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                }
                 Err(error) => {
                     return Err(format!(
                         "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
-                        oldest.display()
+                        entry.path.display()
                     ));
                 }
             }
-            self.metrics
-                .spool_drops_total
-                .fetch_add(1, Ordering::Relaxed);
-            let now = unix_timestamp_seconds();
-            let last = self.last_drop_warn_at.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
-                && self
-                    .last_drop_warn_at
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    max_bytes = self.cfg.max_bytes,
-                    incoming_bytes = incoming_len,
-                    "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
-                );
-            }
         }
+
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+        Err(format!(
+            "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
+            self.cfg.max_bytes
+        ))
     }
 
     /// Whether one owned file may be dropped to make room for a new batch.
@@ -6912,6 +7085,7 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
+        redacted_insert_url: redacted_endpoint_url_str(insert_url),
         username: None,
         password: None,
         timeout: Duration::from_secs(5),
@@ -6963,6 +7137,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     let cfg = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: "http://127.0.0.1/".to_string(),
+        redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
         password: None,
         timeout: Duration::from_secs(1),

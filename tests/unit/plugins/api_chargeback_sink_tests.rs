@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
-    SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault, SpoolManager,
-    SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
+    QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
+    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
@@ -1414,6 +1414,115 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let after = spool.scan_stats().unwrap();
     assert_eq!(after.files, 1);
     assert_eq!(after.bytes, encoded_len);
+}
+
+#[test]
+fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    // Keep room for two resident files after reclaim; admitting one more
+    // file_len requires deleting eight oldest files from one snapshot.
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!(
+            "000000000000000000000000{index:02}"
+        )));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+    let before = spool.scan_stats().unwrap();
+    assert_eq!(before.files, file_count);
+    assert_eq!(before.bytes, file_len.saturating_mul(file_count));
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("multi-file reclaim must succeed from one inventory");
+    assert_eq!(
+        report,
+        QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: file_count,
+            bytes_before: file_len.saturating_mul(file_count),
+            files_deleted: 8,
+            bytes_freed: file_len.saturating_mul(8),
+        },
+        "eviction must inventory/sort once and delete enough files in that pass"
+    );
+
+    for (index, path) in planted.iter().enumerate() {
+        if index < 8 {
+            assert!(
+                !path.exists(),
+                "oldest planted file {index} must be reclaimed"
+            );
+        } else {
+            assert!(
+                path.exists(),
+                "newest planted file {index} must be retained"
+            );
+        }
+    }
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 2);
+    assert_eq!(after.bytes, file_len.saturating_mul(2));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "remaining owned bytes must leave room for the incoming batch"
+    );
+}
+
+#[test]
+fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 32u64;
+    // Large enough to prove reclaim work is not O(K) inventory passes, small
+    // enough for deterministic CI unit coverage (not a local benchmark).
+    let file_count = 1_024u64;
+    let max_bytes = file_len.saturating_mul(4);
+    // remaining + incoming <= max_bytes => remaining <= 3 * file_len.
+    let retain_after = 3u64;
+    let expected_deleted = file_count.saturating_sub(retain_after);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!(
+            "01ARZ3NDEKTSV4RRFFQ69G{index:05}"
+        )));
+        fs::write(&path, vec![b'y'; file_len as usize]).unwrap();
+    }
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("large spool reclaim must succeed");
+    assert_eq!(
+        report.inventory_passes, 1,
+        "large file-count eviction must still be one inventory/sort planning pass"
+    );
+    assert_eq!(report.files_inventoried, file_count);
+    assert_eq!(report.bytes_before, file_len.saturating_mul(file_count));
+    assert_eq!(report.files_deleted, expected_deleted);
+    assert_eq!(
+        report.bytes_freed,
+        file_len.saturating_mul(expected_deleted)
+    );
+
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, retain_after);
+    assert_eq!(after.bytes, file_len.saturating_mul(retain_after));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "post-eviction usage must admit the planned incoming batch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5550,4 +5659,129 @@ fn snapshot_exports_at_limit_identity_verbatim() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].consumer_id, consumer);
+}
+
+// ---------------------------------------------------------------------------
+// ClickHouse endpoint credential handling — advisory GHSA-8594-2xhc-8g38
+// ---------------------------------------------------------------------------
+
+/// Sentinel planted in an `insert_query_params` value. Parameter *values* stay
+/// arbitrary (ClickHouse settings are operator tuning), so the guarantee is
+/// that the INSERT query string never reaches a diagnostic.
+const CH_VALUE_SENTINEL: &str = "clickhouse-setting-value-canary";
+
+#[test]
+fn insert_query_params_reject_credential_bearing_names() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    for name in [
+        "user",
+        "password",
+        "access_token",
+        "session_id",
+        "USER",
+        "Password",
+        "x_api_key",
+        "myapikey",
+        "vendor_secret",
+        "svc_credential",
+        "db_passwd",
+        "refresh_token",
+    ] {
+        let mut config = valid_config(temp.path());
+        config["clickhouse"]["insert_query_params"] = json!({ name: CH_VALUE_SENTINEL });
+        let err = validate_plugin_config("api_chargeback_sink", &config)
+            .expect_err("credential-bearing parameter names must be rejected");
+        assert!(
+            err.contains("names a credential"),
+            "rejection must explain the contract for {name}: {err}"
+        );
+        assert!(
+            err.contains("password_ref"),
+            "rejection must point at the supported channel for {name}: {err}"
+        );
+        assert!(
+            !err.contains(CH_VALUE_SENTINEL),
+            "rejection must not echo the value for {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn insert_query_params_still_accept_ordinary_clickhouse_settings() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "1",
+        "max_insert_threads": "4",
+        "date_time_input_format": "best_effort",
+    });
+    validate_plugin_config("api_chargeback_sink", &config)
+        .expect("ordinary ClickHouse settings must remain admitted");
+}
+
+/// The INSERT URL carries every configured parameter (so the export works),
+/// while the diagnostic rendering keeps only scheme/host/port.
+#[test]
+fn insert_url_carries_params_but_redacted_form_does_not() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://clickhouse.example.com:8443/base-path");
+    config["clickhouse"]["insert_query_params"] = json!({ "async_insert": CH_VALUE_SENTINEL });
+    let parsed: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+
+    let insert_url = clickhouse_insert_url_for_tests(&parsed).unwrap();
+    assert!(
+        insert_url.contains(CH_VALUE_SENTINEL),
+        "the real request must still carry the configured parameter: {insert_url}"
+    );
+
+    let redacted = ferrum_edge::plugins::utils::redacted_endpoint_url_str(&insert_url);
+    assert_eq!(redacted, "https://clickhouse.example.com:8443/redacted");
+    assert!(!redacted.contains(CH_VALUE_SENTINEL));
+    assert!(
+        !redacted.contains("base-path"),
+        "redaction is structural: the path is dropped, not substring-replaced"
+    );
+    assert!(!redacted.contains("INSERT"));
+}
+
+/// The custom-TLS (`Dedicated`) client path classifies its transport failure
+/// rather than rendering the `reqwest::Error`, so the INSERT URL cannot reach a
+/// log line or the returned replay error.
+#[tokio::test(flavor = "current_thread")]
+async fn spool_replay_failure_does_not_leak_insert_url() {
+    let (logs, guard) = super::plugin_utils::capture_logs();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let insert_url =
+        format!("http://{addr}/?database=ferrum&query=INSERT&password={CH_VALUE_SENTINEL}");
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    spool
+        .write_events(&[sample_event("evt-redaction")])
+        .unwrap();
+
+    let outcome = replay_spool_once_for_tests(&spool, &insert_url).await;
+    drop(guard);
+
+    if let Err(error) = &outcome {
+        assert!(
+            !error.contains(CH_VALUE_SENTINEL),
+            "replay error leaked the INSERT credential: {error}"
+        );
+    }
+    let captured = logs.contents();
+    super::plugin_utils::assert_no_secrets(
+        &captured,
+        "chargeback spool replay",
+        &[CH_VALUE_SENTINEL],
+    );
 }

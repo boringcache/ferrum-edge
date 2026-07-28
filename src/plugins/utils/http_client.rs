@@ -867,6 +867,30 @@ impl PluginHttpClient {
             })
     }
 
+    /// Send a pre-built request, logging only a caller-supplied redacted URL
+    /// while still returning the typed `reqwest::Error`.
+    ///
+    /// Same redaction guarantee as [`execute_redacted`] for every diagnostic
+    /// this client emits — literal-IP egress denial, retry-eligible transport
+    /// failures, and slow-call warnings all record `redacted_url` instead of
+    /// the request URL. It differs only in the error type: callers that
+    /// classify the failure themselves (`api_chargeback_sink` maps it to a
+    /// fixed `FailureReason` and never renders the `reqwest::Error`) need the
+    /// typed error, and stringifying it here would force them to re-parse a
+    /// message. Callers that *do* render the error must use
+    /// [`execute_redacted`] instead — `reqwest::Error`'s `Display` prints the
+    /// complete request URL.
+    pub async fn execute_with_redacted_url(
+        &self,
+        request: reqwest::RequestBuilder,
+        label: &str,
+        redacted_url: &str,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let request = request.build()?;
+        self.execute_request(request, label, None, Some(redacted_url))
+            .await
+    }
+
     /// Send a request through the trusted HTTP/2-prior-knowledge companion
     /// while logging only a caller-supplied redacted URL.
     ///

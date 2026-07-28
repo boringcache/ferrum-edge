@@ -5,8 +5,8 @@
 //! (`FERRUM_DB_URL`) and asks the active database backend to reconnect,
 //! letting SQL and MongoDB stores preserve their existing atomic swap
 //! behavior. While sticky failover is active, a successful primary TLS
-//! reconnect records primary topology (and may emit the opt-in
-//! divergence-risk marker); it never labels a failover URL as primary.
+//! reconnect records primary topology unless an admitted failover-window
+//! Admin mutation fences failback; it never labels a failover URL as primary.
 //! Failover-URL TLS refresh continues to go through failover reconnect
 //! paths after poll failure.
 

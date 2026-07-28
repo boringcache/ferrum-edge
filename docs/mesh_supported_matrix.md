@@ -147,8 +147,15 @@ need them, or because they are blocked upstream / architecturally:
   (`http1MaxPendingRequests` IS enforced — a 503-on-overflow pending-request gate
   on the HTTP/1.1 dispatch path; see the DR table in `docs/mesh.md`.)
 - **LB `MAGLEV` / `PASSTHROUGH`** — niche; `PASSTHROUGH` approximates to round-robin.
-- **VirtualService `tcp[]` source/dest-CIDR L4 routing** — uncommon; model with a
-  stream `Proxy` or east-west SNI passthrough (TLS-SNI L4 routing is on the roadmap).
+- **VirtualService `tcp[]` / `tls[]` unsupported L4 match predicates** —
+  `tls[]` SNI passthrough (`sniHosts` + port → passthrough stream proxy) and
+  plain `tcp[]` port routing **are supported** (see `docs/mesh.md` L4 routing
+  and `tests/integration/mesh_l7_routing_tests.rs`). Residual fail-closed
+  predicates the stream layer cannot express:
+  `sourceLabels` / `sourceSubnets` / `destinationSubnets` / `gateways` /
+  `sourceNamespace`, plus weighted multi-destination splitting. Model those
+  with an explicit stream `Proxy` or upstream-backed split — do not treat
+  TLS-SNI itself as roadmap work.
 - **Active-active multi-cluster endpoint discovery at scale** — minority need;
   targets verified-Beta, not GA.
 
@@ -166,7 +173,12 @@ ledger unless they change the support contract.
 
 | Deferral | Issue | Doc anchor |
 |---|---|---|
-| Live UDP/raw-TCP **source-capture** e2e (`netns-capture-live`). The Ambient per-pod-netns UDP capture producer is now **implemented** (rule generation, reconcile, and registry publishing are unit-tested; matrix UDP/DTLS Ambient rows are `Supported (Experimental)`); the remaining deferral is only the privileged live datapath e2e (TPROXY → tunnel → return-source spoofing). | [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) | `docs/mesh.md` matrix UDP/DTLS rows + note [10], UDP TPROXY capture section |
+| EgressGateway UDP `ServiceEntry` materialization (HTTP/TCP stream egress exists; UDP ports still skipped) | [#3263](https://github.com/ferrum-edge/ferrum-edge/issues/3263) | `docs/mesh.md` Egress Gateway / ServiceEntry materialization |
+| Subset-scoped DestinationRule HTTP connection-pool policy (`h2UpgradePolicy`, `maxRetries`, `http1MaxPendingRequests`) | [#3228](https://github.com/ferrum-edge/ferrum-edge/issues/3228) / [#3240](https://github.com/ferrum-edge/ferrum-edge/issues/3240)–[#3242](https://github.com/ferrum-edge/ferrum-edge/issues/3242) | `docs/mesh.md` DestinationRule deferred_fields / subset `connectionPool.http` |
+| Multicluster poller-driven partition / last-good-retention live gate | [#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331) | `docs/mesh_multicluster_federation_runbook.md` Harness |
+| NodeWaypoint observability contract + maturity promotion gates | [#3334](https://github.com/ferrum-edge/ferrum-edge/issues/3334) | this matrix Experimental `NodeWaypoint` bullet |
+
+Completed historical rows (do **not** re-list as open): Ambient UDP capture producer + privileged live source-capture e2e (#2013 / #2038); VirtualService `tls[]` SNI passthrough L4 routing; remote-discovery JWT audience binding (#2475).
 
 ## How a feature graduates
 

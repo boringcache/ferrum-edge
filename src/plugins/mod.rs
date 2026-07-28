@@ -123,7 +123,9 @@ use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -1714,6 +1716,51 @@ pub enum ResponsePresentationPolicy {
     Dynamic,
 }
 
+/// Frontend-supplied watch on the client transport carrying a request.
+///
+/// Implementations must be observable **without** reading or polling the
+/// request body: the request stream stays owned by the proxy path, and no
+/// detached watcher may race it for bytes. A QUIC connection-close watch
+/// qualifies; draining a socket to "check liveness" does not.
+pub trait PeerConnectionWatch: Send + Sync {
+    /// Resolve once the client transport is known to be gone.
+    ///
+    /// Must be cancel-safe: callers place it in a `select!` and drop it when
+    /// another branch wins.
+    fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Non-blocking check for an already-closed transport.
+    fn is_closed(&self) -> bool;
+}
+
+/// Cloneable handle to a [`PeerConnectionWatch`].
+#[derive(Clone)]
+pub struct PeerConnectionSignal(Arc<dyn PeerConnectionWatch>);
+
+impl PeerConnectionSignal {
+    pub fn new(watch: Arc<dyn PeerConnectionWatch>) -> Self {
+        Self(watch)
+    }
+
+    /// See [`PeerConnectionWatch::closed`].
+    pub fn closed(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.0.closed()
+    }
+
+    /// See [`PeerConnectionWatch::is_closed`].
+    pub fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+impl std::fmt::Debug for PeerConnectionSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Opaque on purpose: the underlying handle carries transport state
+        // that has no business in a `RequestContext` debug dump.
+        f.write_str("PeerConnectionSignal")
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2266,6 +2313,19 @@ pub struct RequestContext {
     /// Set on HTTP/3 via quinn's `into_0rtt()` detection, and on HTTPS via the
     /// `Early-Data: 1` header (RFC 8470) from upstream proxies/CDNs.
     pub is_early_data: bool,
+    /// Optional watch on the *client transport* carrying this request.
+    ///
+    /// Stamped by frontends that can observe peer departure without polling
+    /// (and therefore without competing for ownership of) the request body.
+    /// Today that is the HTTP/3 frontend, which watches QUIC connection close.
+    /// `None` on HTTP/1.1 and HTTP/2, where hyper owns the connection state and
+    /// no such side-channel exists.
+    ///
+    /// Only deliberately parked work consults this — currently injected fault
+    /// delays. It is not a general request-cancellation channel and must not
+    /// become one without a hot-path review: awaiting it costs a boxed future.
+    #[doc(hidden)]
+    pub peer_connection: Option<PeerConnectionSignal>,
     /// Aggregate fail-closed decision staged by cache-managed
     /// `mesh_route_dispatch` instances. The cache inserts a finalizer directly
     /// after the last instance so disjoint rules can all participate before a
@@ -2535,6 +2595,7 @@ impl RequestContext {
             max_response_body_size_bytes: 0,
             bytes_sent_observed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             is_early_data: false,
+            peer_connection: None,
             mesh_route_dispatch_reject_unmatched: false,
             mesh_route_dispatch_matched: false,
             route_override_upstream_id: None,
@@ -3360,6 +3421,7 @@ impl RequestContext {
             max_response_body_size_bytes: self.max_response_body_size_bytes,
             bytes_sent_observed: Arc::clone(&self.bytes_sent_observed),
             is_early_data: self.is_early_data,
+            peer_connection: self.peer_connection.clone(),
             mesh_route_dispatch_reject_unmatched: self.mesh_route_dispatch_reject_unmatched,
             mesh_route_dispatch_matched: self.mesh_route_dispatch_matched,
             route_override_upstream_id: self.route_override_upstream_id.clone(),
@@ -8141,7 +8203,9 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// - `geo_restriction` opens the configured MaxMind `.mmdb` database,
 /// - `udp_logging` opens node-local DTLS key material,
 /// - `oidc_relying_party` performs OIDC discovery / JWKS work and retains
-///   background refresh state.
+///   background refresh state,
+/// - `transaction_log_schema` registers schemas in the process-wide reload
+///   staging map when another thread owns an active reload bracket.
 ///
 /// None of them can ever require request-body buffering, so the screen answers
 /// [`RequestBodyBufferingScreen::Streams`] for them without construction. That
@@ -8151,8 +8215,12 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// new shape-only carve-out appears in
 /// [`validate_plugin_config_with_http_client`] without being classified here or
 /// in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`].
-pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] =
-    &["geo_restriction", "oidc_relying_party", "udp_logging"];
+pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
+    "geo_restriction",
+    "oidc_relying_party",
+    "transaction_log_schema",
+    "udp_logging",
+];
 
 /// Built-in plugins the screen constructs through a shape-only path instead of
 /// the ordinary factory.
@@ -8229,10 +8297,10 @@ impl RequestBodyBufferingScreen {
 ///
 /// - the plugin is dropped immediately and never enters a cache, so no
 ///   candidate state is published,
-/// - `Plugin::start_background_tasks()` is never called, which is where every
-///   built-in defers its workers, timers, spool files, and registry
+/// - `Plugin::start_background_tasks()` is never called, which is where
+///   built-ins normally defer workers, timers, spool files, and registry
 ///   publication,
-/// - the node-local / networked constructors are carved out entirely
+/// - side-effectful constructors are carved out entirely
 ///   ([`REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT`]) or routed through their
 ///   existing shape-only constructor
 ///   ([`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]),
@@ -8373,6 +8441,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
+    }
+    if name == "transaction_log_schema" {
+        // Shape-only: shared Admin / CP validation and the buffering screen must
+        // not stage schemas in the process-wide reload map. Graph validation and
+        // cache reloads construct explicitly inside an open reload bracket.
+        return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),

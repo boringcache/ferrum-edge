@@ -45,6 +45,8 @@ pub struct DbFailoverTopologyStatus {
     /// any point while on failover. Conservative process-local risk marker only;
     /// it does not count successful mutations.
     pub opt_in_writes_enabled_during_window: bool,
+    /// `true` after this process admits a failover-window Admin mutation.
+    pub primary_failback_fenced: bool,
 }
 
 impl Default for DbFailoverTopologyStatus {
@@ -55,6 +57,7 @@ impl Default for DbFailoverTopologyStatus {
             active_url_redacted: None,
             allow_writes: false,
             opt_in_writes_enabled_during_window: false,
+            primary_failback_fenced: false,
         }
     }
 }
@@ -102,9 +105,10 @@ impl DbWriteTopologyPermit {
 /// Tracks topology transitions and a process-local opt-in risk marker for
 /// issue #3001. Contract: default fail-closed admin writes on failover;
 /// `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` is only for operator-asserted
-/// synchronously replicated multi-primary topologies; automatic failback is
-/// allowed and emits one bounded divergence-risk signal for that window.
-/// This state is not durable across process restart.
+/// synchronously replicated multi-primary topologies. An admitted mutation
+/// fences automatic primary failback until the process is restarted after
+/// operator reconciliation or confirmed replication catch-up. This state is
+/// not durable across process restart.
 #[derive(Clone)]
 pub struct DbFailoverTopologyState {
     primary_active: Arc<AtomicBool>,
@@ -112,6 +116,8 @@ pub struct DbFailoverTopologyState {
     active_url_redacted: Arc<ArcSwap<Option<String>>>,
     allow_writes: Arc<AtomicBool>,
     opt_in_during_window: Arc<AtomicBool>,
+    /// Conservative process-local fence: an Admin mutation was admitted on failover.
+    failover_write_admitted: Arc<AtomicBool>,
     /// Ensures the opt-in-enabled signal logs at most once per failover window.
     opt_in_signal_logged: Arc<AtomicBool>,
 }
@@ -130,6 +136,7 @@ impl DbFailoverTopologyState {
             active_url_redacted: Arc::new(ArcSwap::from_pointee(None)),
             allow_writes: Arc::new(AtomicBool::new(false)),
             opt_in_during_window: Arc::new(AtomicBool::new(false)),
+            failover_write_admitted: Arc::new(AtomicBool::new(false)),
             opt_in_signal_logged: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -157,6 +164,7 @@ impl DbFailoverTopologyState {
             active_url_redacted: (**self.active_url_redacted.load()).clone(),
             allow_writes: self.allow_writes(),
             opt_in_writes_enabled_during_window: self.opt_in_during_window.load(Ordering::Acquire),
+            primary_failback_fenced: self.failover_write_admitted.load(Ordering::Acquire),
         }
     }
 
@@ -183,7 +191,7 @@ impl DbFailoverTopologyState {
             warn!(
                 active_url_redacted = %redacted,
                 failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
-                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; Ferrum will allow automatic primary failback and emit a single divergence-risk marker for this window. Use only with operator-asserted synchronously replicated multi-primary replication; this process-local marker is cleared by restart"
+                "FERRUM_DB_FAILOVER_ALLOW_WRITES is enabled on failover topology; an admitted Admin mutation will fence automatic primary failback until this process is restarted after operator reconciliation or confirmed replication catch-up. Use only with operator-asserted synchronously replicated multi-primary replication"
             );
         }
     }
@@ -199,6 +207,7 @@ impl DbFailoverTopologyState {
             let since = Self::now_unix_ms();
             self.failover_since_unix_ms.store(since, Ordering::Release);
             self.opt_in_during_window.store(false, Ordering::Release);
+            self.failover_write_admitted.store(false, Ordering::Release);
             self.opt_in_signal_logged.store(false, Ordering::Release);
             let allow = self.allow_writes();
             warn!(
@@ -243,6 +252,56 @@ impl DbFailoverTopologyState {
             }
         }
     }
+
+    /// Record an Admin mutation admitted while the failover topology is pinned.
+    pub fn note_admin_write(&self) {
+        if !self.primary_active()
+            && self
+                .failover_write_admitted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let redacted = (**self.active_url_redacted.load())
+                .clone()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            warn!(
+                active_url_redacted = %redacted,
+                failover_since_unix_ms = self.failover_since_unix_ms.load(Ordering::Acquire),
+                "Admin mutation admitted on failover topology; automatic primary failback is now fenced until this process is restarted after operator reconciliation or confirmed replication catch-up"
+            );
+        }
+    }
+
+    /// Prevent a stale recovered primary from replacing failover-side writes.
+    pub fn ensure_primary_failback_allowed(&self) -> Result<(), anyhow::Error> {
+        if self.primary_active() || !self.failover_write_admitted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(PrimaryFailbackFenced.into())
+    }
+}
+
+/// Typed policy refusal so reconnect loops can skip a stale primary without
+/// mistaking the fence for a permanent database error that suppresses healthy
+/// failover candidates.
+#[derive(Debug)]
+pub struct PrimaryFailbackFenced;
+
+impl std::fmt::Display for PrimaryFailbackFenced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "Refusing primary database failback because an Admin write was admitted on the active failover topology; reconcile the failover changes onto the primary or confirm replication catch-up, then restart this process",
+        )
+    }
+}
+
+impl std::error::Error for PrimaryFailbackFenced {}
+
+/// Return whether an error chain carries the primary-failback policy refusal.
+pub fn primary_failback_fenced(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<PrimaryFailbackFenced>().is_some())
 }
 
 /// Validate that a plugin row can be restored as an explicit association on
@@ -1491,6 +1550,9 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     fn set_failover_allow_writes(&mut self, allow: bool) {
         let _ = allow;
     }
+
+    /// Record an Admin mutation admitted while the failover topology is pinned.
+    fn note_failover_admin_write(&self) {}
 
     /// Acquire a mutation-only pin of the current write topology.
     ///
