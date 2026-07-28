@@ -12,16 +12,17 @@ use crate::plugins::utils::route_header_transform::route_header_transform_rules_
 
 use super::{
     GatewayApiAllowedRoutesNamespaces, GatewayApiListenerKey, GatewayApiListenerPolicy,
-    GatewayApiNamespaceSelector, GatewayApiNamespaceSelectorExpression,
-    GatewayApiNamespaceSelectorOperator, GatewayApiRouteConflict, GatewayApiRouteConflictKey,
-    K8sAccumulator, K8sObject, K8sResourceKey, K8sTranslateError, K8sTranslationOptions,
-    MeshRouteDispatchDestination, RouteBackend, RouteProxySpec, SourceKind,
-    attach_route_plugins_to_proxy, exact_path_listen_path, invalid_resource,
-    mesh_route_dispatch_plugin_from_rules, optional_port_field, optional_target_weight_field,
-    port_from_u64, proxy_for_route, resource_id, route_backends_require_node_waypoint_authz,
-    route_request_transformer_plugin_for_proxy, service_dns_name, string_array, string_field,
-    upstream_for_route,
+    GatewayApiListenerValidationError, GatewayApiNamespaceSelector,
+    GatewayApiNamespaceSelectorExpression, GatewayApiNamespaceSelectorOperator,
+    GatewayApiRouteConflict, GatewayApiRouteConflictKey, K8sAccumulator, K8sObject, K8sResourceKey,
+    K8sTranslateError, K8sTranslationOptions, MeshRouteDispatchDestination, RouteBackend,
+    RouteProxySpec, SourceKind, attach_route_plugins_to_proxy, exact_path_listen_path,
+    invalid_resource, mesh_route_dispatch_plugin_from_rules, namespaced_resource_key,
+    optional_port_field, optional_target_weight_field, port_from_u64, proxy_for_route, resource_id,
+    route_backends_require_node_waypoint_authz, route_request_transformer_plugin_for_proxy,
+    service_dns_name, string_array, string_field, upstream_for_route,
 };
+use crate::config::db_backend::NamespacedResourceId;
 use crate::config::types::{PluginConfig, Proxy};
 
 // Use an absolute DNS name (trailing dot) so resolvers must query this exact
@@ -229,9 +230,21 @@ pub(super) fn collect_gateway_listener_policy(
     for listener in listeners {
         let listener_name = string_field(listener, "name").unwrap_or("listener");
         let requires_frontend_tls = listener_is_terminating_tls(listener);
-        let materializable = listener_is_materializable(acc, object, listener);
+        let (namespaces, validation_error) = match allowed_route_namespaces(listener) {
+            Ok(namespaces) => (namespaces, None),
+            Err(error) => {
+                acc.warnings.push(format!(
+                    "Gateway API Gateway {}/{} listener {} rejected: {}",
+                    object.metadata.namespace, object.metadata.name, listener_name, error
+                ));
+                (GatewayApiAllowedRoutesNamespaces::Invalid, Some(error))
+            }
+        };
+        let materializable =
+            validation_error.is_none() && listener_is_materializable(acc, object, listener);
         let policy = GatewayApiListenerPolicy {
-            namespaces: allowed_route_namespaces(listener),
+            namespaces,
+            validation_error,
             hostname: string_field(listener, "hostname").map(normalize_gateway_hostname),
             port: listener.get("port").and_then(Value::as_u64),
             route_kinds: listener_allowed_route_kinds(listener),
@@ -499,72 +512,286 @@ fn gateway_tls_secret_ref(
     ))
 }
 
-fn allowed_route_namespaces(listener: &Value) -> GatewayApiAllowedRoutesNamespaces {
-    let Some(namespaces) = listener
-        .get("allowedRoutes")
-        .and_then(|allowed_routes| allowed_routes.get("namespaces"))
-    else {
-        return GatewayApiAllowedRoutesNamespaces::Same;
+pub(crate) fn allowed_route_namespaces(
+    listener: &Value,
+) -> Result<GatewayApiAllowedRoutesNamespaces, GatewayApiListenerValidationError> {
+    let Some(allowed_routes) = listener.get("allowedRoutes") else {
+        return Ok(GatewayApiAllowedRoutesNamespaces::Same);
     };
-    match string_field(namespaces, "from").unwrap_or("Same") {
-        "All" => GatewayApiAllowedRoutesNamespaces::All,
-        "Selector" => GatewayApiAllowedRoutesNamespaces::Selector(namespace_selector(
-            namespaces.get("selector"),
+    let Some(allowed_routes) = allowed_routes.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes",
+            "must be an object",
+        ));
+    };
+    let Some(namespaces) = allowed_routes.get("namespaces") else {
+        return Ok(GatewayApiAllowedRoutesNamespaces::Same);
+    };
+    let Some(namespaces) = namespaces.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces",
+            "must be an object",
+        ));
+    };
+    let from = match namespaces.get("from") {
+        None => "Same",
+        Some(Value::String(from)) => from.as_str(),
+        Some(_) => {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.from",
+                "must be one of All, Same, or Selector",
+            ));
+        }
+    };
+    match from {
+        "All" => Ok(GatewayApiAllowedRoutesNamespaces::All),
+        "Same" => Ok(GatewayApiAllowedRoutesNamespaces::Same),
+        "Selector" => namespaces
+            .get("selector")
+            .ok_or_else(|| {
+                listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector",
+                    "must be an object when namespaces.from is Selector",
+                )
+            })
+            .and_then(namespace_selector)
+            .map(GatewayApiAllowedRoutesNamespaces::Selector),
+        _ => Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.from",
+            "must be one of All, Same, or Selector",
         )),
-        _ => GatewayApiAllowedRoutesNamespaces::Same,
     }
 }
 
-fn namespace_selector(selector: Option<&Value>) -> GatewayApiNamespaceSelector {
-    let match_labels = selector
-        .and_then(|selector| selector.get("matchLabels"))
-        .and_then(Value::as_object)
-        .map(|labels| {
-            labels
-                .iter()
-                .filter_map(|(key, value)| {
-                    value
-                        .as_str()
-                        .map(|label_value| (key.clone(), label_value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let match_expressions = selector
-        .and_then(|selector| selector.get("matchExpressions"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(namespace_selector_expression)
-        .collect();
-    GatewayApiNamespaceSelector {
+fn namespace_selector(
+    selector: &Value,
+) -> Result<GatewayApiNamespaceSelector, GatewayApiListenerValidationError> {
+    let Some(selector) = selector.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector",
+            "must be an object when namespaces.from is Selector",
+        ));
+    };
+    if selector
+        .keys()
+        .any(|key| key != "matchLabels" && key != "matchExpressions")
+    {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector",
+            "may contain only matchLabels and matchExpressions",
+        ));
+    }
+
+    let mut match_labels = HashMap::new();
+    if let Some(labels) = selector.get("matchLabels") {
+        let Some(labels) = labels.as_object() else {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels",
+                "must be an object",
+            ));
+        };
+        for (key, value) in labels {
+            if !valid_kubernetes_label_key(key) {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels key",
+                    "must be a valid Kubernetes label key",
+                ));
+            }
+            let Some(value) = value.as_str() else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels value",
+                    "must be a string",
+                ));
+            };
+            if !valid_kubernetes_label_value(value) {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchLabels value",
+                    "must be a valid Kubernetes label value",
+                ));
+            }
+            match_labels.insert(key.clone(), value.to_string());
+        }
+    }
+
+    let mut match_expressions = Vec::new();
+    if let Some(expressions) = selector.get("matchExpressions") {
+        let Some(expressions) = expressions.as_array() else {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions",
+                "must be an array",
+            ));
+        };
+        match_expressions.reserve(expressions.len());
+        for expression in expressions {
+            match_expressions.push(namespace_selector_expression(expression)?);
+        }
+    }
+
+    Ok(GatewayApiNamespaceSelector {
         match_labels,
         match_expressions,
-    }
+    })
 }
 
-fn namespace_selector_expression(value: &Value) -> Option<GatewayApiNamespaceSelectorExpression> {
-    let key = string_field(value, "key")?.to_string();
-    let operator = match string_field(value, "operator")? {
+fn namespace_selector_expression(
+    value: &Value,
+) -> Result<GatewayApiNamespaceSelectorExpression, GatewayApiListenerValidationError> {
+    let Some(expression) = value.as_object() else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[]",
+            "entries must be objects",
+        ));
+    };
+    if expression
+        .keys()
+        .any(|key| key != "key" && key != "operator" && key != "values")
+    {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[]",
+            "may contain only key, operator, and values",
+        ));
+    }
+    let Some(key) = expression.get("key").and_then(Value::as_str) else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].key",
+            "is required and must be a string",
+        ));
+    };
+    if !valid_kubernetes_label_key(key) {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].key",
+            "must be a valid Kubernetes label key",
+        ));
+    }
+    let Some(operator) = expression.get("operator").and_then(Value::as_str) else {
+        return Err(listener_validation_error(
+            "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].operator",
+            "is required and must be one of In, NotIn, Exists, or DoesNotExist",
+        ));
+    };
+    let operator = match operator {
         "In" => GatewayApiNamespaceSelectorOperator::In,
         "NotIn" => GatewayApiNamespaceSelectorOperator::NotIn,
         "Exists" => GatewayApiNamespaceSelectorOperator::Exists,
         "DoesNotExist" => GatewayApiNamespaceSelectorOperator::DoesNotExist,
-        _ => return None,
+        _ => {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].operator",
+                "is required and must be one of In, NotIn, Exists, or DoesNotExist",
+            ));
+        }
     };
-    let values = value
-        .get("values")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(ToOwned::to_owned)
-        .collect();
-    Some(GatewayApiNamespaceSelectorExpression {
-        key,
+    let values = match expression.get("values") {
+        None => Vec::new(),
+        Some(values) => {
+            let Some(values) = values.as_array() else {
+                return Err(listener_validation_error(
+                    "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                    "must be an array of strings",
+                ));
+            };
+            let mut parsed = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(value) = value.as_str() else {
+                    return Err(listener_validation_error(
+                        "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                        "must be an array of strings",
+                    ));
+                };
+                if !valid_kubernetes_label_value(value) {
+                    return Err(listener_validation_error(
+                        "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                        "must contain only valid Kubernetes label values",
+                    ));
+                }
+                parsed.push(value.to_string());
+            }
+            parsed
+        }
+    };
+    match operator {
+        GatewayApiNamespaceSelectorOperator::In | GatewayApiNamespaceSelectorOperator::NotIn
+            if values.is_empty() =>
+        {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                "In and NotIn require at least one value",
+            ));
+        }
+        GatewayApiNamespaceSelectorOperator::Exists
+        | GatewayApiNamespaceSelectorOperator::DoesNotExist
+            if !values.is_empty() =>
+        {
+            return Err(listener_validation_error(
+                "spec.listeners[].allowedRoutes.namespaces.selector.matchExpressions[].values",
+                "Exists and DoesNotExist require no values",
+            ));
+        }
+        _ => {}
+    }
+    Ok(GatewayApiNamespaceSelectorExpression {
+        key: key.to_string(),
         operator,
         values,
     })
+}
+
+const fn listener_validation_error(
+    field: &'static str,
+    message: &'static str,
+) -> GatewayApiListenerValidationError {
+    GatewayApiListenerValidationError::new(field, message)
+}
+
+fn valid_kubernetes_label_key(value: &str) -> bool {
+    let (prefix, name) = match value.split_once('/') {
+        Some((prefix, name)) => (Some(prefix), name),
+        None => (None, value),
+    };
+    if !valid_kubernetes_label_name(name) {
+        return false;
+    }
+    prefix.is_none_or(valid_kubernetes_dns_subdomain)
+}
+
+fn valid_kubernetes_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        })
+}
+
+fn valid_kubernetes_label_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn valid_kubernetes_label_value(value: &str) -> bool {
+    value.is_empty() || valid_kubernetes_label_name(value)
 }
 
 /// True when this Gateway is a GAMMA Waypoint Gateway (gatewayClassName is
@@ -780,17 +1007,26 @@ fn upsert_http_route_resources(
     proxies: Vec<Proxy>,
     plugins: Vec<PluginConfig>,
 ) {
-    let mut plugins_by_proxy: HashMap<String, Vec<PluginConfig>> = HashMap::new();
+    let mut plugins_by_proxy: HashMap<NamespacedResourceId, Vec<PluginConfig>> = HashMap::new();
     for plugin in plugins {
         if let Some(proxy_id) = plugin.proxy_id.clone() {
-            plugins_by_proxy.entry(proxy_id).or_default().push(plugin);
+            let Some(key) = namespaced_resource_key(&plugin.namespace, &proxy_id) else {
+                acc.warnings.push(format!(
+                    "route plugin '{}/{}' with empty namespace or proxy_id was ignored",
+                    plugin.namespace, plugin.id
+                ));
+                continue;
+            };
+            plugins_by_proxy.entry(key).or_default().push(plugin);
         } else {
             acc.config.plugin_configs.push(plugin);
         }
     }
 
     for proxy in proxies {
-        let route_plugins = plugins_by_proxy.remove(&proxy.id).unwrap_or_default();
+        let route_plugins = namespaced_resource_key(&proxy.namespace, &proxy.id)
+            .and_then(|key| plugins_by_proxy.remove(&key))
+            .unwrap_or_default();
         if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins) {
             acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             acc.config.plugin_configs.extend(route_plugins);
@@ -820,12 +1056,17 @@ fn merge_http_route_proxy(
         .iter()
         .find(|plugin| plugin.plugin_name == "mesh_route_dispatch");
     let existing_id = acc.config.proxies[existing_index].id.clone();
+    let existing_namespace = acc.config.proxies[existing_index].namespace.clone();
     let mut route_action_plugins: Vec<PluginConfig> = route_plugins
         .iter()
         .filter(|plugin| plugin.plugin_name != "mesh_route_dispatch")
         .filter_map(|plugin| retarget_route_action_plugin(plugin.clone(), &existing_id))
         .collect();
-    let existing_dispatch_index = dispatch_plugin_index(&acc.config.plugin_configs, &existing_id);
+    let existing_dispatch_index = dispatch_plugin_index(
+        &acc.config.plugin_configs,
+        &existing_namespace,
+        &existing_id,
+    );
     if new_dispatch.is_none() && existing_dispatch_index.is_none() {
         return false;
     }
@@ -870,6 +1111,7 @@ fn merge_http_route_proxy(
     route_action_plugins.retain(|plugin| {
         !acc.config.plugin_configs.iter().any(|existing| {
             existing.plugin_name == plugin.plugin_name
+                && existing.namespace == existing_namespace
                 && existing.proxy_id.as_deref() == Some(existing_id.as_str())
         })
     });
@@ -885,15 +1127,21 @@ fn merge_http_route_proxy(
 }
 
 fn can_merge_http_route_proxy(acc: &K8sAccumulator, existing: &Proxy, proxy: &Proxy) -> bool {
-    acc.proxy_sources.get(&existing.id) == Some(&SourceKind::GatewayApi)
+    acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && existing.namespace == proxy.namespace
         && existing.listen_path == proxy.listen_path
         && existing.hosts == proxy.hosts
 }
 
-fn dispatch_plugin_index(plugins: &[PluginConfig], proxy_id: &str) -> Option<usize> {
+fn dispatch_plugin_index(
+    plugins: &[PluginConfig],
+    namespace: &str,
+    proxy_id: &str,
+) -> Option<usize> {
     plugins.iter().position(|plugin| {
-        plugin.plugin_name == "mesh_route_dispatch" && plugin.proxy_id.as_deref() == Some(proxy_id)
+        plugin.plugin_name == "mesh_route_dispatch"
+            && plugin.namespace == namespace
+            && plugin.proxy_id.as_deref() == Some(proxy_id)
     })
 }
 
@@ -914,8 +1162,8 @@ fn retarget_dispatch_plugin(mut plugin: PluginConfig, proxy_id: &str) -> PluginC
 
 fn retarget_route_action_plugin(mut plugin: PluginConfig, proxy_id: &str) -> Option<PluginConfig> {
     plugin.id = match plugin.plugin_name.as_str() {
-        "request_transformer" => format!("__istio_vs_req_xform_{proxy_id}"),
-        "response_transformer" => format!("__istio_vs_resp_xform_{proxy_id}"),
+        "request_transformer" => format!("istio-vs-req-xform-{proxy_id}"),
+        "response_transformer" => format!("istio-vs-resp-xform-{proxy_id}"),
         _ => return None,
     };
     plugin.proxy_id = Some(proxy_id.to_string());
@@ -1511,6 +1759,18 @@ fn mesh_services_from_gateway(
         .into_iter()
         .flatten()
         .try_for_each(|listener| {
+            let listener_name = string_field(listener, "name").unwrap_or("listener");
+            if acc
+                .gateway_api_listener_policies
+                .get(&GatewayApiListenerKey {
+                    namespace: object.metadata.namespace.clone(),
+                    gateway: object.metadata.name.clone(),
+                    listener: listener_name.to_string(),
+                })
+                .is_some_and(|policy| policy.validation_error.is_some())
+            {
+                return Ok(());
+            }
             if listener_is_terminating_tls(listener)
                 && (!namespace_tls_ready || !listener_is_materializable(acc, object, listener))
             {
@@ -1518,7 +1778,7 @@ fn mesh_services_from_gateway(
                     "Gateway API Gateway {}/{} listener {} has unresolved TLS material and will not be exposed",
                     object.metadata.namespace,
                     object.metadata.name,
-                    string_field(listener, "name").unwrap_or("listener")
+                    listener_name
                 ));
                 return Ok(());
             }
@@ -1526,7 +1786,7 @@ fn mesh_services_from_gateway(
                 return Ok(());
             };
             let port = port_from_u64(object, raw_port, "listeners[].port")?;
-            let name = string_field(listener, "name").unwrap_or("listener");
+            let name = listener_name;
             services.push(MeshService {
                 name: format!("{}-{name}", object.metadata.name),
                 namespace: object.metadata.namespace.clone(),
@@ -1713,10 +1973,11 @@ fn route_namespace_matches_policy(
             .namespace_labels
             .get(&route.metadata.namespace)
             .is_some_and(|labels| namespace_selector_matches(labels, selector)),
+        GatewayApiAllowedRoutesNamespaces::Invalid => false,
     }
 }
 
-fn namespace_selector_matches(
+pub(crate) fn namespace_selector_matches(
     labels: &HashMap<String, String>,
     selector: &GatewayApiNamespaceSelector,
 ) -> bool {
@@ -5813,7 +6074,7 @@ mod tests {
         assert_eq!(request_transformer.proxy_id.as_deref(), Some(proxy_id));
         assert_eq!(
             request_transformer.id,
-            format!("__istio_vs_req_xform_{proxy_id}")
+            format!("istio-vs-req-xform-{proxy_id}")
         );
         assert!(
             result.config.proxies[0]
@@ -7695,6 +7956,146 @@ mod tests {
         assert_eq!(
             result.config.proxies[0].backend_host,
             "db.default.svc.corp.example"
+        );
+    }
+
+    #[test]
+    fn lossy_http_route_ids_in_two_namespaces_both_survive_with_scoped_plugins() {
+        // resource_id joins with dashes, so ns `a` / name `b-c` collides with
+        // ns `a-b` / name `c` on the bare proxy/plugin id string.
+        let mut route_a = object_in_namespace(
+            "HTTPRoute",
+            "a",
+            serde_json::json!({
+                "hostnames": ["a.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET"
+                    }],
+                    "filters": [{
+                        "type": "RequestHeaderModifier",
+                        "requestHeaderModifier": {
+                            "set": [{"name": "X-Tenant", "value": "a"}]
+                        }
+                    }],
+                    "backendRefs": [{"name": "api-a", "port": 8080}]
+                }, {
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "POST"
+                    }],
+                    "backendRefs": [{"name": "api-a-post", "port": 8081}]
+                }]
+            }),
+        );
+        route_a.metadata.name = "b-c".to_string();
+
+        let mut route_b = object_in_namespace(
+            "HTTPRoute",
+            "a-b",
+            serde_json::json!({
+                "hostnames": ["b.example.com"],
+                "rules": [{
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "GET"
+                    }],
+                    "filters": [{
+                        "type": "RequestHeaderModifier",
+                        "requestHeaderModifier": {
+                            "set": [{"name": "X-Tenant", "value": "a-b"}]
+                        }
+                    }],
+                    "backendRefs": [{"name": "api-b", "port": 9080}]
+                }, {
+                    "matches": [{
+                        "path": {"type": "PathPrefix", "value": "/api"},
+                        "method": "POST"
+                    }],
+                    "backendRefs": [{"name": "api-b-post", "port": 9081}]
+                }]
+            }),
+        );
+        route_b.metadata.name = "c".to_string();
+
+        let result = translate_k8s_objects(
+            &[route_a, route_b],
+            options().with_source_namespaces(vec!["a".to_string(), "a-b".to_string()]),
+        )
+        .expect("lossy cross-namespace HTTPRoutes must both translate");
+
+        let expected_id = resource_id("gwapi-route", "a", "b-c", "httproute-0");
+        assert_eq!(
+            expected_id,
+            resource_id("gwapi-route", "a-b", "c", "httproute-0"),
+            "fixture must exercise the lossy dash-join collision"
+        );
+
+        let proxy_a = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a" && proxy.id == expected_id)
+            .expect("namespace a proxy must survive");
+        let proxy_b = result
+            .config
+            .proxies
+            .iter()
+            .find(|proxy| proxy.namespace == "a-b" && proxy.id == expected_id)
+            .expect("namespace a-b proxy must survive");
+        assert_eq!(proxy_a.hosts, vec!["a.example.com".to_string()]);
+        assert_eq!(proxy_b.hosts, vec!["b.example.com".to_string()]);
+
+        let dispatch_a = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.namespace == "a"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            })
+            .expect("namespace a must keep its own dispatch plugin");
+        let dispatch_b = result
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| {
+                plugin.plugin_name == "mesh_route_dispatch"
+                    && plugin.namespace == "a-b"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            })
+            .expect("namespace a-b must keep its own dispatch plugin");
+        assert_eq!(
+            dispatch_a.config["rules"]
+                .as_array()
+                .map(|rules| rules.len()),
+            Some(2),
+            "Gateway API merge within namespace a must still combine GET+POST rules"
+        );
+        assert_eq!(
+            dispatch_b.config["rules"]
+                .as_array()
+                .map(|rules| rules.len()),
+            Some(2),
+            "Gateway API merge within namespace a-b must still combine GET+POST rules"
+        );
+        assert!(
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
+            "tenant a request_transformer must not be suppressed by tenant a-b"
+        );
+        assert!(
+            result.config.plugin_configs.iter().any(|plugin| {
+                plugin.plugin_name == "request_transformer"
+                    && plugin.namespace == "a-b"
+                    && plugin.proxy_id.as_deref() == Some(expected_id.as_str())
+            }),
+            "tenant a-b request_transformer must not be suppressed by tenant a"
         );
     }
 

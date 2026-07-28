@@ -32,9 +32,13 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 ## Drift Guard
 
-- `tests/integration/vendor_integrity_tests.rs` hashes every `vendor/` file
-  (LF-normalized SHA-256) against `vendor/VENDOR_INTEGRITY.sha256` and runs in
-  the `protocols-data-plane` integration shard. Drift beyond the manifest fails CI.
+- `tests/integration/vendor_integrity_tests.rs` hashes every governed `vendor/`
+  file against `vendor/VENDOR_INTEGRITY.sha256` (LF-normalized SHA-256 for
+  allowlisted text paths; byte-exact for binary/unrecognized paths) and runs in
+  the `protocols-data-plane` integration shard. Incidental vendor `Cargo.lock`
+  files are ignored unless listed in `GOVERNED_VENDOR_LOCKFILES` (currently the
+  committed dimpl standalone-regression lockfile). Drift beyond the manifest
+  fails CI.
 - Regenerate only via `scripts/update_vendor_integrity.sh` (or
   `UPDATE_VENDOR_INTEGRITY=1 cargo test --test integration_tests vendor_integrity`),
   which shares the guard's hashing so the two cannot diverge.
@@ -61,3 +65,6 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - HTTP/3 graceful close with a buffered response is not a false 502:
   `tests/integration/http3_integration_tests.rs` +
   `tests/functional/scripted_backend_h3_tests.rs`.
+- Tungstenite `auto_pong` opt-out (issue #2963): vendored `--lib auto_pong`,
+  `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, and functional
+  H1/H2/H3 Ping transparency tests in `functional_websocket_test.rs`.

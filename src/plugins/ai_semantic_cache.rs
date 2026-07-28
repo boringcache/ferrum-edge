@@ -59,8 +59,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
-use url::Host;
+use tracing::{debug, warn};
+use url::{Host, Url};
 
 use super::utils::auth_flow::constant_time_eq;
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
@@ -198,6 +198,20 @@ const HNSW_BUILD_EMBEDDING_COPIES: usize = 2;
 /// Minimum interval between expired-entry cleanup passes, measured against a
 /// monotonic clock so the throttle is immune to wall-clock jumps.
 const CLEANUP_INTERVAL_SECONDS: u64 = 30;
+
+/// How long a per-key local Redis quarantine marker suppresses repeated
+/// download/parse/delete of the same inadmissible remote value after a
+/// quarantine `DEL` fails. Bounded so a repaired/replaced remote value is
+/// reconsidered within this interval without a config knob.
+const REDIS_QUARANTINE_TTL_SECONDS: u64 = 30;
+/// Hard ceiling on per-instance local Redis quarantine markers. Keeps memory
+/// and key-cardinality strictly bounded even when `max_entries` is large.
+const MAX_REDIS_QUARANTINE_ENTRIES: usize = 4_096;
+/// Minimum spacing between rate-limited quarantine-delete failure warnings.
+const REDIS_QUARANTINE_WARN_INTERVAL_SECS: u64 = 60;
+/// Emit an operational warning on the first failure and every N thereafter
+/// (also gated by [`REDIS_QUARANTINE_WARN_INTERVAL_SECS`]).
+const REDIS_QUARANTINE_WARN_EVERY: u64 = 100;
 
 /// Deployment-safe hard maximum for a single cached response body. Configured
 /// `max_entry_size_bytes` values above this are rejected at admission so Redis
@@ -373,6 +387,11 @@ struct CachedResponse {
 struct SemanticConfig {
     provider: EmbeddingProvider,
     endpoint: String,
+    /// Canonical diagnostic URL with path/query/fragment stripped for logs and
+    /// sanitized transport/build errors. The outbound request still uses
+    /// [`Self::endpoint`], including signed query parameters or credential-
+    /// bearing path tokens required by the provider.
+    redacted_endpoint: String,
     /// Lowercased domain hostname used for DNS pre-warming, or `None` when
     /// the endpoint uses a literal IP and requires no DNS lookup.
     warmup_hostname: Option<String>,
@@ -656,6 +675,228 @@ impl Drop for EmbeddingFlightCleanup {
     }
 }
 
+/// Local negative marker for a Redis key whose quarantine `DEL` failed.
+///
+/// `fingerprint` identifies the observed inadmissible remote value so a
+/// repaired/replaced payload can be distinguished when the marker is
+/// reconsidered after TTL without logging key material or payloads.
+struct RedisQuarantineMarker {
+    fingerprint: [u8; 32],
+    expires_at: Instant,
+}
+
+/// Bounded per-plugin suppressor for failed Redis quarantine deletes.
+///
+/// Prevents the same poisoned remote value from being re-downloaded, reparsed,
+/// and re-deleted on every request when Redis write/ACL failures leave the key
+/// in place. Memory and cardinality are hard-capped; hot-path checks are
+/// DashMap lookups with no avoidable allocations.
+struct RedisQuarantineSuppressor {
+    entries: DashMap<String, RedisQuarantineMarker>,
+    entry_count: AtomicUsize,
+    max_entries: usize,
+    ttl: Duration,
+    delete_failures_total: AtomicU64,
+    suppressions_total: AtomicU64,
+    /// Elapsed seconds (against the owning plugin's `created_at`) of the last
+    /// rate-limited operational warning.
+    last_warn_elapsed_secs: AtomicU64,
+}
+
+impl RedisQuarantineSuppressor {
+    fn new(max_entries: usize, ttl: Duration, shard_amount: usize) -> Self {
+        Self {
+            entries: DashMap::with_shard_amount(shard_amount),
+            entry_count: AtomicUsize::new(0),
+            max_entries: max_entries.max(1),
+            ttl,
+            delete_failures_total: AtomicU64::new(0),
+            suppressions_total: AtomicU64::new(0),
+            // Sentinel: never warned, so the first failure can emit immediately.
+            last_warn_elapsed_secs: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn is_suppressed(&self, cache_key: &str, now: Instant) -> bool {
+        let expired = match self.entries.get(cache_key) {
+            Some(entry) if entry.expires_at > now => {
+                self.suppressions_total.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if expired {
+            self.clear(cache_key);
+        }
+        false
+    }
+
+    /// Whether an active marker still matches `fingerprint`.
+    ///
+    /// Used when a remote value is observed again (for example after TTL): the
+    /// same poison refreshes suppression without treating a replaced fingerprint
+    /// as still quarantined.
+    fn matches_active(&self, cache_key: &str, fingerprint: &[u8; 32], now: Instant) -> bool {
+        match self.entries.get(cache_key) {
+            Some(entry) if entry.expires_at > now && entry.fingerprint == *fingerprint => true,
+            Some(entry) if entry.expires_at <= now => {
+                drop(entry);
+                self.clear(cache_key);
+                false
+            }
+            Some(entry) => {
+                // Active marker for a different remote value: clear so the
+                // repaired/replaced payload can be reconsidered immediately.
+                drop(entry);
+                self.clear(cache_key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_delete_failure(&self, cache_key: &str, fingerprint: [u8; 32], now: Instant) {
+        self.delete_failures_total.fetch_add(1, Ordering::Relaxed);
+        let marker = RedisQuarantineMarker {
+            fingerprint,
+            expires_at: now + self.ttl,
+        };
+        self.insert(cache_key, marker);
+    }
+
+    fn clear(&self, cache_key: &str) {
+        if self.entries.remove(cache_key).is_some() {
+            self.release_slot();
+        }
+    }
+
+    /// Insert or refresh a marker under the hard cap.
+    ///
+    /// Capacity pressure uses constant-work victim selection (one arbitrary
+    /// DashMap sample), never a request-driven full-map expired sweep.
+    /// Expired markers are cleared lazily on lookup (`is_suppressed` /
+    /// `matches_active`). Slot accounting stays exact under concurrency via
+    /// `entry_count` reserve/release without a process-wide lock.
+    fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker) {
+        use dashmap::mapref::entry::Entry as DashEntry;
+
+        let mut marker = Some(marker);
+        loop {
+            match self.entries.entry(cache_key.to_string()) {
+                DashEntry::Occupied(mut occupied) => {
+                    if let Some(marker) = marker.take() {
+                        occupied.insert(marker);
+                    }
+                    return;
+                }
+                DashEntry::Vacant(vacant) => {
+                    let reserved = self
+                        .entry_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < self.max_entries).then_some(count + 1)
+                        })
+                        .is_ok();
+                    if reserved {
+                        if let Some(marker) = marker.take() {
+                            vacant.insert(marker);
+                        } else {
+                            self.release_slot();
+                        }
+                        return;
+                    }
+                    drop(vacant);
+                }
+            }
+
+            // Hard cap reached: free one arbitrary victim (O(1) sample), then
+            // retry. Do not scan the map for expired keys on this path.
+            if self.entry_count.load(Ordering::Acquire) >= self.max_entries {
+                let victim = self.entries.iter().next().map(|entry| entry.key().clone());
+                if let Some(victim) = victim {
+                    self.clear(&victim);
+                } else {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn release_slot(&self) {
+        let _ = self
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
+    }
+
+    fn len(&self) -> usize {
+        self.entry_count.load(Ordering::Acquire)
+    }
+
+    fn delete_failures_total(&self) -> u64 {
+        self.delete_failures_total.load(Ordering::Relaxed)
+    }
+
+    fn suppressions_total(&self) -> u64 {
+        self.suppressions_total.load(Ordering::Relaxed)
+    }
+
+    fn note_suppression(&self) {
+        self.suppressions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Rate-limited operational signal for quarantine-delete failure.
+    ///
+    /// Never logs keys, payloads, credentials, endpoints, or attacker-controlled
+    /// values — only bounded counters and the plugin instance id.
+    fn maybe_warn_delete_failure(&self, instance_id: u64, created_at: Instant) {
+        let failures = self.delete_failures_total();
+        let elapsed = created_at.elapsed().as_secs();
+        let last = self.last_warn_elapsed_secs.load(Ordering::Relaxed);
+        let interval_elapsed =
+            last == u64::MAX || elapsed.saturating_sub(last) >= REDIS_QUARANTINE_WARN_INTERVAL_SECS;
+        let should_warn = (failures == 1 || failures.is_multiple_of(REDIS_QUARANTINE_WARN_EVERY))
+            && interval_elapsed
+            && self
+                .last_warn_elapsed_secs
+                .compare_exchange(last, elapsed, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok();
+        if should_warn {
+            warn!(
+                plugin = "ai_semantic_cache",
+                instance_id,
+                delete_failures_total = failures,
+                suppressions_total = self.suppressions_total(),
+                active_markers = self.len(),
+                "ai_semantic_cache: Redis quarantine delete failed; suppressing repeated remote-entry processing (rate-limited)"
+            );
+        }
+    }
+}
+
+/// Content fingerprint for an inadmissible Redis value observed on the hit path.
+fn redis_quarantine_fingerprint_content(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ai_semantic_cache.redis_quarantine.content.v1\0");
+    hasher.update((data.len() as u64).to_le_bytes());
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn redis_quarantine_fingerprint_oversized(length: usize) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ai_semantic_cache.redis_quarantine.oversized.v1\0");
+    hasher.update((length as u64).to_le_bytes());
+    hasher.finalize().into()
+}
+
+fn redis_quarantine_fingerprint_empty() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ai_semantic_cache.redis_quarantine.empty.v1\0");
+    hasher.finalize().into()
+}
+
 pub struct AiSemanticCache {
     /// Process-unique ownership key for request-private staging. Fresh on every
     /// constructor call so reload generations and sibling instances never share
@@ -722,6 +963,10 @@ pub struct AiSemanticCache {
     embedding_dimension: Arc<OnceLock<usize>>,
     /// Optional Redis client for centralized caching.
     redis_client: Option<Arc<RedisRateLimitClient>>,
+    /// Bounded local suppressor for Redis keys whose quarantine delete failed.
+    /// Prevents immediate re-download/parse/delete amplification of the same
+    /// inadmissible remote value. Per-instance so reload generations isolate.
+    redis_quarantine: RedisQuarantineSuppressor,
     /// HMAC key authenticating Redis envelopes. Required whenever
     /// `redis_client` is `Some`; also accepted without Redis so hit-side
     /// authenticity helpers remain unit-testable. Never logged.
@@ -931,6 +1176,7 @@ impl AiSemanticCache {
 
         let instance_id = NEXT_AI_SEMANTIC_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let shard_amount = http_client.pool_shard_amount();
+        let redis_quarantine_cap = max_entries.min(MAX_REDIS_QUARANTINE_ENTRIES);
         Ok(Self {
             instance_id,
             meta_cache_key: staging_metadata_key(instance_id, CACHE_KEY_SUFFIX),
@@ -956,6 +1202,11 @@ impl AiSemanticCache {
             vector_index: Arc::new(ArcSwapOption::empty()),
             embedding_dimension: Arc::new(OnceLock::new()),
             redis_client,
+            redis_quarantine: RedisQuarantineSuppressor::new(
+                redis_quarantine_cap,
+                Duration::from_secs(REDIS_QUARANTINE_TTL_SECONDS),
+                shard_amount,
+            ),
             redis_integrity_key,
             created_at: Instant::now(),
             // Sentinel: never cleaned, so the first cleanup pass always runs.
@@ -1280,7 +1531,11 @@ impl AiSemanticCache {
 
         let response = self
             .http_client
-            .execute(request, "ai_semantic_cache_embedding")
+            .execute_redacted(
+                request,
+                "ai_semantic_cache_embedding",
+                &semantic.redacted_endpoint,
+            )
             .await
             .map_err(|err| format!("embedding request failed: {err}"))?;
 
@@ -1471,6 +1726,41 @@ impl AiSemanticCache {
             headers,
             body: Bytes::from(entry.body),
         })
+    }
+
+    /// Apply a Redis quarantine-`DEL` outcome (production and test seam).
+    ///
+    /// Success clears any local suppressor. Failure installs a fingerprint+TTL
+    /// marker and emits a rate-limited redacted warning. Never converts a miss
+    /// into a hit; never logs key/payload material.
+    fn apply_redis_quarantine_delete_outcome(
+        &self,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        if delete_ok {
+            self.redis_quarantine.clear(cache_key);
+            return;
+        }
+        let now = Instant::now();
+        self.redis_quarantine
+            .record_delete_failure(cache_key, fingerprint, now);
+        self.redis_quarantine
+            .maybe_warn_delete_failure(self.instance_id, self.created_at);
+    }
+
+    /// Quarantine an inadmissible Redis entry: attempt `DEL`, then map the
+    /// outcome through [`Self::apply_redis_quarantine_delete_outcome`].
+    async fn quarantine_invalid_redis_entry(
+        &self,
+        redis: &RedisRateLimitClient,
+        redis_key: &str,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+    ) {
+        let delete_ok = redis.delete(redis_key).await.is_ok();
+        self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
     }
 
     async fn build_vector_snapshot(
@@ -2011,6 +2301,101 @@ impl AiSemanticCache {
             .unwrap_or(0);
         self.embedding_singleflight_wait_override_ms
             .store(ms, Ordering::Relaxed);
+    }
+
+    /// Exercise the production quarantine-delete outcome handler with a
+    /// synthetic Redis `DEL` result (no network).
+    #[allow(dead_code)]
+    pub(crate) fn apply_redis_quarantine_delete_outcome_for_tests(
+        &self,
+        cache_key: &str,
+        fingerprint: [u8; 32],
+        delete_ok: bool,
+    ) {
+        self.apply_redis_quarantine_delete_outcome(cache_key, fingerprint, delete_ok);
+    }
+
+    /// Whether the local Redis quarantine suppressor is active for `cache_key`.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_suppressed_for_tests(&self, cache_key: &str) -> bool {
+        // Read-only probe: do not bump the suppression counter.
+        matches!(
+            self.redis_quarantine.entries.get(cache_key),
+            Some(entry) if entry.expires_at > Instant::now()
+        )
+    }
+
+    /// Force-expire a quarantine marker so TTL recovery can be tested without sleep.
+    #[allow(dead_code)]
+    pub(crate) fn expire_redis_quarantine_for_tests(&self, cache_key: &str) {
+        if let Some(mut entry) = self.redis_quarantine.entries.get_mut(cache_key) {
+            entry.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_len_for_tests(&self) -> usize {
+        self.redis_quarantine.len()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_delete_failures_for_tests(&self) -> u64 {
+        self.redis_quarantine.delete_failures_total()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_suppressions_for_tests(&self) -> u64 {
+        self.redis_quarantine.suppressions_total()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_cap_for_tests(&self) -> usize {
+        self.redis_quarantine.max_entries
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_ttl_for_tests(&self) -> Duration {
+        self.redis_quarantine.ttl
+    }
+
+    /// Hot-path suppressor probe that increments the suppression counter when
+    /// active (mirrors production `before_proxy` behavior).
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_is_suppressed_for_tests(&self, cache_key: &str) -> bool {
+        self.redis_quarantine
+            .is_suppressed(cache_key, Instant::now())
+    }
+
+    /// Fingerprint reconsideration helper: same poison stays suppressed; a
+    /// replaced fingerprint clears the marker so the new value can be admitted.
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_matches_active_for_tests(
+        &self,
+        cache_key: &str,
+        fingerprint: &[u8; 32],
+    ) -> bool {
+        self.redis_quarantine
+            .matches_active(cache_key, fingerprint, Instant::now())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_fingerprint_content_for_tests(data: &[u8]) -> [u8; 32] {
+        redis_quarantine_fingerprint_content(data)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_fingerprint_oversized_for_tests(length: usize) -> [u8; 32] {
+        redis_quarantine_fingerprint_oversized(length)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redis_quarantine_fingerprint_empty_for_tests() -> [u8; 32] {
+        redis_quarantine_fingerprint_empty()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear_redis_quarantine_for_tests(&self, cache_key: &str) {
+        self.redis_quarantine.clear(cache_key);
     }
 }
 
@@ -4194,62 +4579,129 @@ impl Plugin for AiSemanticCache {
         // and re-validated against the same status/content-type/size/JSON/header
         // admission contract as a local store, and any entry that fails is
         // quarantined so it cannot inject an oversized, non-JSON, wrong-status,
-        // or unsanitized response.
-        if let Some(ref redis) = self.redis_client
-            && redis.is_available()
-        {
-            let redis_key = redis.make_key(&[&cache_key]);
-            match redis
-                .get_bytes_bounded(&redis_key, self.redis_value_byte_cap())
-                .await
-            {
-                Ok(BoundedRedisValue::Found(data)) => {
-                    match serde_json::from_slice::<SerializableCacheEntry>(&data)
-                        .ok()
-                        .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
-                    {
-                        Some(cached) => {
-                            debug!(
-                                cache_key = %cache_key,
-                                "ai_semantic_cache: Redis cache HIT, returning cached response"
-                            );
-                            let mut response_headers = cached.headers;
-                            response_headers
-                                .insert("x-ai-cache-status".to_string(), "HIT".to_string());
-                            self.clear_instance_staging(ctx);
-                            self.set_cache_status(ctx, "HIT");
-                            return PluginResult::RejectBinary {
-                                status_code: cached.status_code,
-                                body: cached.body,
-                                headers: response_headers,
-                            };
-                        }
-                        None => {
-                            debug!(
-                                cache_key = %cache_key,
-                                "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"
-                            );
-                            let _ = redis.delete(&redis_key).await;
+        // or unsanitized response. Quarantine `DEL` failures are observed and
+        // locally suppressed (TTL + content fingerprint) so the same poisoned
+        // remote value cannot amplify download/parse/delete on every request.
+        if let Some(ref redis) = self.redis_client {
+            // Always consult the local suppressor first so a failed quarantine
+            // delete remains observable even while Redis is marked unavailable
+            // (health checks can restore availability and would otherwise
+            // re-amplify the same poisoned key).
+            let quarantine_suppressed = self
+                .redis_quarantine
+                .is_suppressed(&cache_key, Instant::now());
+            if redis.is_available() && !quarantine_suppressed {
+                let redis_key = redis.make_key(&[&cache_key]);
+                match redis
+                    .get_bytes_bounded(&redis_key, self.redis_value_byte_cap())
+                    .await
+                {
+                    Ok(BoundedRedisValue::Found(data)) => {
+                        // Admit first: a valid hit must not pay a full-buffer
+                        // quarantine fingerprint. Fingerprints exist only for
+                        // poison quarantine/races after the value is known
+                        // inadmissible. A concurrent valid replacement clears
+                        // any stale marker without hashing.
+                        match serde_json::from_slice::<SerializableCacheEntry>(&data)
+                            .ok()
+                            .and_then(|entry| self.admit_redis_hit(entry, &redis_key))
+                        {
+                            Some(cached) => {
+                                debug!(
+                                    cache_key = %cache_key,
+                                    "ai_semantic_cache: Redis cache HIT, returning cached response"
+                                );
+                                self.redis_quarantine.clear(&cache_key);
+                                let mut response_headers = cached.headers;
+                                response_headers
+                                    .insert("x-ai-cache-status".to_string(), "HIT".to_string());
+                                self.clear_instance_staging(ctx);
+                                self.set_cache_status(ctx, "HIT");
+                                return PluginResult::RejectBinary {
+                                    status_code: cached.status_code,
+                                    body: cached.body,
+                                    headers: response_headers,
+                                };
+                            }
+                            None => {
+                                let fingerprint = redis_quarantine_fingerprint_content(&data);
+                                // Concurrent same-poison marker (installed while
+                                // this request was fetching): skip another DEL.
+                                if self.redis_quarantine.matches_active(
+                                    &cache_key,
+                                    &fingerprint,
+                                    Instant::now(),
+                                ) {
+                                    self.redis_quarantine.note_suppression();
+                                } else {
+                                    debug!(
+                                        cache_key = %cache_key,
+                                        "ai_semantic_cache: quarantining Redis entry that failed hit-side admission"
+                                    );
+                                    self.quarantine_invalid_redis_entry(
+                                        redis,
+                                        &redis_key,
+                                        &cache_key,
+                                        fingerprint,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                     }
+                    Ok(BoundedRedisValue::Oversized { length }) => {
+                        let fingerprint = redis_quarantine_fingerprint_oversized(length);
+                        if self.redis_quarantine.matches_active(
+                            &cache_key,
+                            &fingerprint,
+                            Instant::now(),
+                        ) {
+                            self.redis_quarantine.note_suppression();
+                        } else {
+                            debug!(
+                                cache_key = %cache_key,
+                                length,
+                                cap = self.redis_value_byte_cap(),
+                                "ai_semantic_cache: quarantining oversized Redis entry"
+                            );
+                            self.quarantine_invalid_redis_entry(
+                                redis,
+                                &redis_key,
+                                &cache_key,
+                                fingerprint,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(BoundedRedisValue::Empty) => {
+                        let fingerprint = redis_quarantine_fingerprint_empty();
+                        if self.redis_quarantine.matches_active(
+                            &cache_key,
+                            &fingerprint,
+                            Instant::now(),
+                        ) {
+                            self.redis_quarantine.note_suppression();
+                        } else {
+                            debug!(
+                                cache_key = %cache_key,
+                                "ai_semantic_cache: quarantining empty Redis entry"
+                            );
+                            self.quarantine_invalid_redis_entry(
+                                redis,
+                                &redis_key,
+                                &cache_key,
+                                fingerprint,
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(BoundedRedisValue::Missing) => {
+                        // Key absent: drop any stale local suppressor so a later
+                        // write can hit without waiting out the TTL.
+                        self.redis_quarantine.clear(&cache_key);
+                    }
+                    Err(()) => {}
                 }
-                Ok(BoundedRedisValue::Oversized { length }) => {
-                    debug!(
-                        cache_key = %cache_key,
-                        length,
-                        cap = self.redis_value_byte_cap(),
-                        "ai_semantic_cache: quarantining oversized Redis entry"
-                    );
-                    let _ = redis.delete(&redis_key).await;
-                }
-                Ok(BoundedRedisValue::Empty) => {
-                    debug!(
-                        cache_key = %cache_key,
-                        "ai_semantic_cache: quarantining empty Redis entry"
-                    );
-                    let _ = redis.delete(&redis_key).await;
-                }
-                Ok(BoundedRedisValue::Missing) | Err(()) => {}
             }
         }
 
@@ -4516,9 +4968,15 @@ impl Plugin for AiSemanticCache {
                 && let Ok(data) = serde_json::to_vec(&serializable)
             {
                 let ttl_seconds = self.ttl.as_secs().max(1);
-                let _ = redis
+                if let Ok(()) = redis
                     .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
-                    .await;
+                    .await
+                {
+                    // A successful repair/replacement must be visible on the
+                    // next Redis lookup without waiting out a prior
+                    // quarantine-delete suppressor.
+                    self.redis_quarantine.clear(&cache_key);
+                }
             }
         }
 
@@ -4775,12 +5233,13 @@ fn parse_semantic_config(
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    let warmup_hostname = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let validated_endpoint = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
         endpoint,
-        warmup_hostname,
+        redacted_endpoint: validated_endpoint.redacted,
+        warmup_hostname: validated_endpoint.warmup_hostname,
         model,
         api_key,
         auth_header,
@@ -4793,15 +5252,34 @@ fn parse_semantic_config(
     }))
 }
 
+struct ValidatedSemanticEmbeddingEndpoint {
+    redacted: String,
+    warmup_hostname: Option<String>,
+}
+
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<Option<String>, String> {
-    let parsed_endpoint = url::Url::parse(endpoint)
+) -> Result<ValidatedSemanticEmbeddingEndpoint, String> {
+    let parsed_endpoint = Url::parse(endpoint)
         .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
         return Err(
             "ai_semantic_cache: 'semantic_embedding_endpoint' must use http or https".to_string(),
+        );
+    }
+    let authority_start = parsed_endpoint.scheme().len() + "://".len();
+    let authority_has_userinfo = endpoint
+        .get(authority_start..)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'));
+    if authority_has_userinfo
+        || !parsed_endpoint.username().is_empty()
+        || parsed_endpoint.password().is_some()
+    {
+        return Err(
+            "ai_semantic_cache: 'semantic_embedding_endpoint' must not include username or password; use semantic_embedding_api_key for credentials"
+                .to_string(),
         );
     }
 
@@ -4823,7 +5301,16 @@ fn validate_semantic_embedding_endpoint(
         ));
     }
 
-    Ok(warmup_hostname)
+    Ok(ValidatedSemanticEmbeddingEndpoint {
+        redacted: redacted_semantic_embedding_endpoint(&parsed_endpoint),
+        warmup_hostname,
+    })
+}
+
+fn redacted_semantic_embedding_endpoint(parsed: &Url) -> String {
+    let mut redacted = parsed.origin().ascii_serialization();
+    redacted.push_str("/...");
+    redacted
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
@@ -4870,6 +5357,19 @@ mod tests {
     fn force_cleanup(plugin: &AiSemanticCache) {
         plugin.last_cleanup.store(u64::MAX, Ordering::Relaxed);
         plugin.cleanup_expired();
+    }
+
+    #[test]
+    fn redacted_semantic_embedding_endpoint_strips_credential_path_and_query() {
+        let parsed = Url::parse(
+            "https://embeddings.example:8443/private/signed-secret?code=query-secret#frag",
+        )
+        .expect("test URL must parse");
+        let redacted = redacted_semantic_embedding_endpoint(&parsed);
+        assert_eq!(redacted, "https://embeddings.example:8443/...");
+        assert!(!redacted.contains("signed-secret"));
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains('#'));
     }
 
     #[test]
@@ -5192,6 +5692,7 @@ mod tests {
         SemanticConfig {
             provider,
             endpoint: "http://127.0.0.1:1/embeddings".to_string(),
+            redacted_endpoint: "http://127.0.0.1:1/embeddings".to_string(),
             warmup_hostname: None,
             model: Some("test-embedding-model".to_string()),
             api_key: Some("test-key".to_string()),

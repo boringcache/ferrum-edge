@@ -1,13 +1,27 @@
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test,
     ai_semantic_cache_cache_budget_used_for_test,
+    ai_semantic_cache_clear_redis_quarantine_for_test,
     ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
-    ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
+    ai_semantic_cache_expire_all_entries_for_test,
+    ai_semantic_cache_expire_redis_quarantine_for_test, ai_semantic_cache_force_cleanup_for_test,
     ai_semantic_cache_force_vector_rebuild_budget_failure_for_test,
     ai_semantic_cache_instance_id_for_test, ai_semantic_cache_maintenance_committed_for_test,
     ai_semantic_cache_maintenance_handle_count_for_test,
     ai_semantic_cache_maintenance_staged_for_test, ai_semantic_cache_notify_cleanup_for_test,
-    ai_semantic_cache_scope_key, ai_semantic_cache_set_singleflight_wait_override_for_test,
+    ai_semantic_cache_redis_quarantine_cap_for_test,
+    ai_semantic_cache_redis_quarantine_delete_failures_for_test,
+    ai_semantic_cache_redis_quarantine_fingerprint_content_for_test,
+    ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test,
+    ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test,
+    ai_semantic_cache_redis_quarantine_is_suppressed_for_test,
+    ai_semantic_cache_redis_quarantine_len_for_test,
+    ai_semantic_cache_redis_quarantine_matches_active_for_test,
+    ai_semantic_cache_redis_quarantine_suppressed_for_test,
+    ai_semantic_cache_redis_quarantine_suppressions_for_test,
+    ai_semantic_cache_redis_quarantine_ttl_for_test, ai_semantic_cache_scope_key,
+    ai_semantic_cache_set_singleflight_wait_override_for_test,
     ai_semantic_cache_set_store_post_admit_hook_for_test,
     ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
@@ -27,9 +41,11 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
+use tracing_subscriber::fmt::MakeWriter;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -38,6 +54,59 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct SharedWriterGuard {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedWriterGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedWriter {
+    type Writer = SharedWriterGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedWriterGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+fn semantic_request_body() -> Value {
+    json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "What embedding diagnostics are redacted?"}]
+    })
+}
+
+fn semantic_endpoint_config(endpoint: String) -> serde_json::Value {
+    json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": endpoint,
+        "semantic_embedding_model": "test-embedding-model",
+        "semantic_similarity_threshold": 0.95,
+        "semantic_embedding_timeout_ms": 500
+    })
+}
 
 struct SingleflightWaitOverrideGuard<'a> {
     plugin: &'a AiSemanticCache,
@@ -523,6 +592,192 @@ fn test_semantic_endpoint_allows_literal_ips_permitted_by_backend_policy() {
 }
 
 #[test]
+fn test_semantic_embedding_endpoint_rejects_userinfo_without_echoing_credentials() {
+    let secret = "userinfo-secret-canary";
+    let result = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": format!(
+                "https://operator:{secret}@embeddings.example.com/v1/embeddings"
+            ),
+        }),
+        PluginHttpClient::default(),
+    );
+    let error = result.err().expect("URL userinfo must be rejected");
+    assert!(
+        error.contains("must not include username or password"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !error.contains(secret),
+        "config error leaked URL credential: {error}"
+    );
+
+    let empty_userinfo = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "https://@embeddings.example.com/v1/embeddings",
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        empty_userinfo.is_err(),
+        "an explicit empty userinfo section must also be rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_semantic_embedding_signed_query_endpoint_still_reaches_provider() {
+    let mock_server = MockServer::start().await;
+    let query_secret = "signed-query-secret-canary";
+    let path_secret = "path-secret-canary";
+    Mock::given(method("POST"))
+        .and(path(format!("/{path_secret}/embeddings")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [1.0, 0.0, 0.0]}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "{}/{path_secret}/embeddings?api_key={query_secret}",
+            mock_server.uri()
+        )),
+        PluginHttpClient::default(),
+    )
+    .expect("signed query endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let (_, result) = run_before_proxy(&plugin, &body, None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "embedding call must fall through as a miss when no semantic hit exists"
+    );
+    assert_eq!(
+        mock_server.received_requests().await.unwrap().len(),
+        1,
+        "signed query/path endpoint must still reach the provider"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_embedding_transport_diagnostics_redact_endpoint_secrets() {
+    use tokio::net::TcpListener;
+
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let path_secret = "path-token-secret-canary";
+    let query_secret = "query-token-secret-canary";
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "http://{addr}/{path_secret}/embeddings?token={query_secret}"
+        )),
+        PluginHttpClient::default(),
+    )
+    .expect("credential-bearing endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let _ = run_before_proxy(&plugin, &body, None).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !writer.contents().contains("semantic embedding unavailable")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(guard);
+
+    let logs = writer.contents();
+    for secret in [path_secret, query_secret] {
+        assert!(
+            !logs.contains(secret),
+            "transport diagnostic leaked {secret}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains("/..."),
+        "expected canonical redacted endpoint form in diagnostics: {logs}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let mock_server = MockServer::start().await;
+    let path_secret = "path-token-secret-canary";
+    let query_secret = "query-token-secret-canary";
+    Mock::given(method("POST"))
+        .and(path(format!("/{path_secret}/embeddings")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(200))
+                .set_body_json(json!({
+                    "data": [{"embedding": [1.0, 0.0, 0.0]}]
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let http_client = PluginHttpClient::from_pool_config_with_threshold(&PoolConfig::default(), 50);
+    let plugin = AiSemanticCache::new(
+        &semantic_endpoint_config(format!(
+            "{}/{path_secret}/embeddings?token={query_secret}",
+            mock_server.uri()
+        )),
+        http_client,
+    )
+    .expect("credential-bearing endpoint must be admitted");
+
+    let body = serde_json::to_string(&semantic_request_body()).unwrap();
+    let _ = run_before_proxy(&plugin, &body, None).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !writer.contents().contains("Slow plugin HTTP call")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(guard);
+
+    let logs = writer.contents();
+    assert!(
+        logs.contains("Slow plugin HTTP call"),
+        "expected slow-call log: {logs}"
+    );
+    for secret in [path_secret, query_secret] {
+        assert!(
+            !logs.contains(secret),
+            "slow-call diagnostic leaked {secret}: {logs}"
+        );
+    }
+    assert!(
+        logs.contains("/..."),
+        "expected canonical redacted endpoint form in slow-call diagnostics: {logs}"
+    );
+}
+
+#[test]
 fn semantic_and_redis_hostnames_participate_in_dns_warmup() {
     let embedding_only = make_plugin(json!({
         "semantic_similarity_enabled": true,
@@ -703,8 +958,9 @@ async fn validate_plugin_config_with_policy_screens_denied_direct_client_endpoin
     });
     assert!(
         validate_plugin_config_with_policy("kafka_logging", &kafka_loopback, &default_policy)
-            .is_ok(),
-        "loopback kafka broker must remain valid by default"
+            .is_err(),
+        "kafka_logging must be refused under policies that can deny any address because \
+         librdkafka cannot enforce metadata-advertised broker dials"
     );
 
     // ws_logging dials its endpoint_url via tungstenite (outside the shared
@@ -5363,4 +5619,381 @@ fn priority_is_after_route_dispatch_plugins() {
             "cache lookup must observe ai_stream_router destination overrides"
         );
     }
+}
+
+// ── Redis quarantine-delete failure suppressor (issue #3213) ─────────────────
+
+fn quarantine_fp(label: &str) -> [u8; 32] {
+    ai_semantic_cache_redis_quarantine_fingerprint_content_for_test(label.as_bytes())
+}
+
+#[test]
+fn redis_quarantine_denied_del_installs_local_suppressor() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "max_entries": 100,
+    }));
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_ttl_for_test(&plugin),
+        std::time::Duration::from_secs(30)
+    );
+    assert!(ai_semantic_cache_redis_quarantine_cap_for_test(&plugin) <= 4096);
+
+    let key = "semantic-key-denied-del";
+    let fp = quarantine_fp("poison-v1");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
+
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+        1,
+        "denied/failed DEL must be counted"
+    );
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key),
+        "failed quarantine delete must install a local suppressor"
+    );
+    assert!(
+        ai_semantic_cache_redis_quarantine_is_suppressed_for_test(&plugin, key),
+        "hot-path probe must treat the key as suppressed"
+    );
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin),
+        1,
+        "suppression probe must be observable"
+    );
+}
+
+#[test]
+fn redis_quarantine_successful_del_clears_suppressor() {
+    let plugin = make_plugin(json!({}));
+    let key = "semantic-key-del-ok";
+    let fp = quarantine_fp("poison");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
+
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, true);
+    assert!(
+        !ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key),
+        "successful DEL must clear the local suppressor"
+    );
+}
+
+#[test]
+fn redis_quarantine_transient_failure_suppresses_repeated_access() {
+    let plugin = make_plugin(json!({}));
+    let key = "semantic-key-transient";
+    let fp = quarantine_fp("same-poison");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
+
+    for _ in 0..5 {
+        assert!(ai_semantic_cache_redis_quarantine_is_suppressed_for_test(
+            &plugin, key
+        ));
+    }
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin) >= 5,
+        "repeated access while suppressed must not require another Redis round-trip"
+    );
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin),
+        1,
+        "suppressed repeats must not re-count delete failures"
+    );
+}
+
+#[test]
+fn redis_quarantine_ttl_recovery_reconsiders_key() {
+    let plugin = make_plugin(json!({}));
+    let key = "semantic-key-ttl";
+    let fp = quarantine_fp("poison");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp, false);
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &plugin, key
+    ));
+
+    ai_semantic_cache_expire_redis_quarantine_for_test(&plugin, key);
+    assert!(
+        !ai_semantic_cache_redis_quarantine_is_suppressed_for_test(&plugin, key),
+        "after TTL the same key must be reconsidered (suppressor cleared)"
+    );
+    assert!(
+        !ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key),
+        "expired markers must be removed on the reconsider path"
+    );
+}
+
+#[test]
+fn redis_quarantine_fingerprint_replacement_clears_marker() {
+    let plugin = make_plugin(json!({}));
+    let key = "semantic-key-replaced";
+    let fp_old = quarantine_fp("old-poison");
+    let fp_new = quarantine_fp("repaired-value");
+    assert_ne!(fp_old, fp_new);
+
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, key, fp_old, false);
+    assert!(ai_semantic_cache_redis_quarantine_matches_active_for_test(
+        &plugin, key, &fp_old
+    ));
+    assert!(
+        !ai_semantic_cache_redis_quarantine_matches_active_for_test(&plugin, key, &fp_new),
+        "a replaced remote fingerprint must clear the suppressor for reconsideration"
+    );
+    assert!(
+        !ai_semantic_cache_redis_quarantine_suppressed_for_test(&plugin, key),
+        "replaced fingerprint must leave the key unsuppressed"
+    );
+}
+
+#[test]
+fn redis_quarantine_fingerprints_distinguish_inadmissible_shapes() {
+    let content = ai_semantic_cache_redis_quarantine_fingerprint_content_for_test(b"{\"bad\":1}");
+    let oversized = ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test(1_000_000);
+    let empty = ai_semantic_cache_redis_quarantine_fingerprint_empty_for_test();
+    assert_ne!(content, oversized);
+    assert_ne!(content, empty);
+    assert_ne!(oversized, empty);
+    assert_eq!(
+        ai_semantic_cache_redis_quarantine_fingerprint_oversized_for_test(1_000_000),
+        oversized
+    );
+}
+
+#[test]
+fn redis_quarantine_capacity_eviction_is_bounded() {
+    let plugin = make_plugin(json!({
+        "max_entries": 8,
+    }));
+    let cap = ai_semantic_cache_redis_quarantine_cap_for_test(&plugin);
+    assert_eq!(cap, 8);
+
+    for i in 0..(cap + 16) {
+        let key = format!("q-key-{i}");
+        let fp = quarantine_fp(&key);
+        ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, &key, fp, false);
+    }
+    assert!(
+        ai_semantic_cache_redis_quarantine_len_for_test(&plugin) <= cap,
+        "quarantine map must never exceed its hard cap"
+    );
+}
+
+#[test]
+fn redis_quarantine_concurrent_record_and_probe_stay_bounded() {
+    let plugin = std::sync::Arc::new(make_plugin(json!({
+        "max_entries": 64,
+    })));
+    let cap = ai_semantic_cache_redis_quarantine_cap_for_test(&plugin);
+
+    std::thread::scope(|scope| {
+        for worker in 0..8 {
+            let plugin = std::sync::Arc::clone(&plugin);
+            scope.spawn(move || {
+                for i in 0..64 {
+                    let key = format!("w{worker}-k{i}");
+                    let fp = quarantine_fp(&key);
+                    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+                        &plugin, &key, fp, false,
+                    );
+                    let _ =
+                        ai_semantic_cache_redis_quarantine_is_suppressed_for_test(&plugin, &key);
+                }
+            });
+        }
+    });
+
+    assert!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin) <= cap);
+    assert!(ai_semantic_cache_redis_quarantine_delete_failures_for_test(&plugin) > 0);
+}
+
+#[test]
+fn redis_quarantine_reload_instances_are_isolated() {
+    let first = make_plugin(json!({}));
+    let second = make_plugin(json!({}));
+    assert_ne!(instance_id(&first), instance_id(&second));
+
+    let key = "shared-looking-key";
+    let fp = quarantine_fp("poison");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&first, key, fp, false);
+
+    assert!(ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &first, key
+    ));
+    assert!(
+        !ai_semantic_cache_redis_quarantine_suppressed_for_test(&second, key),
+        "reload/sibling instances must not share quarantine suppressors"
+    );
+    ai_semantic_cache_clear_redis_quarantine_for_test(&first, key);
+    assert!(!ai_semantic_cache_redis_quarantine_suppressed_for_test(
+        &first, key
+    ));
+}
+
+#[tokio::test]
+async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
+    // Redis client is constructed but pointing at an unused port; the local
+    // suppressor must keep the request on the miss path without converting a
+    // quarantine failure into a hit.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
+    }));
+    let proxy = Arc::new(create_test_proxy());
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "quarantine miss"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.clone());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    let first = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(first, PluginResult::Continue));
+    let cache_key = staged_cache_key_value(&plugin, &ctx)
+        .expect("miss must stage a cache key")
+        .to_string();
+
+    let fp = quarantine_fp("remote-poison");
+    ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(
+        &plugin, &cache_key, fp, false,
+    );
+    let before = ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin);
+
+    let mut ctx2 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx2.matched_proxy = Some(proxy);
+    ctx2.metadata.insert("request_body".to_string(), body_str);
+    let mut headers2 = HashMap::new();
+    headers2.insert("content-type".to_string(), "application/json".to_string());
+    let second = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(
+        matches!(second, PluginResult::Continue),
+        "suppressed quarantine must remain a miss, never a hit"
+    );
+    assert_eq!(staged_status(&plugin, &ctx2), Some("MISS"));
+    assert!(
+        ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin) > before,
+        "before_proxy must observe the local suppressor on the Redis path"
+    );
+}
+
+#[test]
+fn redis_quarantine_found_hit_admits_before_fingerprint() {
+    // Behavioral seam that counted hash invocations would distort production;
+    // pin the Found-path order in source so valid hits never pay a quarantine
+    // SHA-256 pass and fingerprints run only after admission failure.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let found = source
+        .split_once("Ok(BoundedRedisValue::Found(data)) => {")
+        .and_then(|(_, rest)| rest.split_once("Ok(BoundedRedisValue::Oversized { length }) => {"))
+        .map(|(body, _)| body)
+        .expect("BoundedRedisValue::Found hit-path region");
+    let admit = found
+        .find("admit_redis_hit(")
+        .expect("Found path must admit before fingerprinting");
+    let fingerprint = found
+        .find("redis_quarantine_fingerprint_content(&data)")
+        .expect("Found path must fingerprint only after admission failure");
+    assert!(
+        admit < fingerprint,
+        "valid Redis Found hits must admit/serve without a quarantine fingerprint pass"
+    );
+    assert!(
+        found.contains("None => {")
+            && found[fingerprint..].contains("matches_active(")
+            && found[fingerprint..].contains("quarantine_invalid_redis_entry("),
+        "inadmissible Found values must fingerprint, then check concurrent same-poison markers before DEL"
+    );
+    assert!(
+        !found[..admit].contains("redis_quarantine_fingerprint_content"),
+        "quarantine fingerprint must not precede admit_redis_hit on the Found path"
+    );
+}
+
+#[test]
+fn redis_quarantine_insert_avoids_full_map_expired_sweep() {
+    // Sustained over-cap unique poison churn must not invoke a request-driven
+    // O(capacity) expired sweep; pin constant-work victim policy in source.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let insert = source
+        .split_once("fn insert(&self, cache_key: &str, marker: RedisQuarantineMarker)")
+        .and_then(|(_, rest)| rest.split_once("fn release_slot(&self)"))
+        .map(|(body, _)| body)
+        .expect("RedisQuarantineSuppressor::insert region");
+    assert!(
+        !insert.contains("evict_expired"),
+        "insert must not call a full-map expired sweep under capacity pressure"
+    );
+    assert!(
+        !insert.contains("Vec<String>") && !insert.contains(".collect()"),
+        "insert must not allocate a vector of cloned keys for a map-wide scan"
+    );
+    assert!(
+        insert.contains("entries.iter().next()") || insert.contains("self.entries.iter().next()"),
+        "over-cap insert must use constant-work arbitrary/sample victim selection"
+    );
+    assert!(
+        !source.contains("fn evict_expired(&self"),
+        "request-path full-map expired sweep helper must remain removed"
+    );
+    // Behavioral: sustained unique over-cap churn stays hard-capped.
+    let plugin = make_plugin(json!({ "max_entries": 16 }));
+    let cap = ai_semantic_cache_redis_quarantine_cap_for_test(&plugin);
+    for i in 0..(cap * 8) {
+        let key = format!("churn-{i}");
+        let fp = quarantine_fp(&key);
+        ai_semantic_cache_apply_redis_quarantine_delete_outcome_for_test(&plugin, &key, fp, false);
+    }
+    assert!(ai_semantic_cache_redis_quarantine_len_for_test(&plugin) <= cap);
+}
+
+#[test]
+fn redis_quarantine_delete_outcome_handler_is_shared() {
+    // Production DEL mapping and the external test seam must share one private
+    // synchronous outcome handler rather than duplicating success/failure logic.
+    let source = include_str!("../../../src/plugins/ai_semantic_cache.rs");
+    let production = source
+        .split_once("async fn quarantine_invalid_redis_entry(")
+        .and_then(|(_, rest)| rest.split_once("async fn build_vector_snapshot("))
+        .map(|(body, _)| body)
+        .expect("quarantine_invalid_redis_entry region");
+    assert!(
+        production.contains("apply_redis_quarantine_delete_outcome(")
+            && production.contains("redis.delete(redis_key).await.is_ok()"),
+        "production must map the real Redis DEL result through the shared handler"
+    );
+    assert!(
+        !production.contains("record_delete_failure(")
+            && !production.contains("maybe_warn_delete_failure("),
+        "production quarantine path must not re-implement outcome mapping inline"
+    );
+    let test_seam = source
+        .split_once("fn apply_redis_quarantine_delete_outcome_for_tests(")
+        .and_then(|(_, rest)| rest.split_once("fn redis_quarantine_suppressed_for_tests("))
+        .map(|(body, _)| body)
+        .expect("apply_redis_quarantine_delete_outcome_for_tests region");
+    assert!(
+        test_seam.contains("self.apply_redis_quarantine_delete_outcome("),
+        "test seam must call the same private outcome handler"
+    );
+    assert!(
+        !test_seam.contains("record_delete_failure(")
+            && !test_seam.contains("maybe_warn_delete_failure("),
+        "test seam must not duplicate success/failure mapping"
+    );
 }

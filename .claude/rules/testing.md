@@ -11,6 +11,7 @@ paths:
   - "docs/functional_testing*.md"
   - "docs/ci_cd.md"
   - "docs/connection_saturation_benchmark.md"
+  - "docs/protocol_perf_regression.md"
   - "docs/infrastructure_sizing.md"
   - "comparison/**"
 ---
@@ -61,6 +62,15 @@ paths:
 - Functional and conformance suites are intentionally excluded; they spawn subprocesses or use separate coverage reporters. Line coverage for lib/unit/integration runs in CI through `.github/workflows/coverage.yml`.
 - Coverage outputs (`target/llvm-cov/`, `target/llvm-cov-target/`) are gitignored.
 
+## Simulating A Server Going Away (tonic)
+
+- `JoinHandle::abort()` on a task running `tonic::transport::Server::serve_with_incoming` does **not** disconnect existing clients. tonic spawns a detached `tokio::spawn` task per accepted connection, so aborting the accept loop only closes the listener; every established stream keeps being served.
+- A long-lived server-streaming RPC (`ConfigSync.Subscribe`, `MeshSubscribe`, xDS ADS) therefore survives the "shutdown", and any assertion that depends on the client noticing — reconnect, CP/DP failover, stale-snapshot fencing — passes vacuously.
+- `serve_with_incoming_shutdown` is not sufficient either: its signal triggers a *graceful* per-connection shutdown (GOAWAY), which never ends an infinite response stream.
+- To genuinely sever the transport, own the server's runtime and shut it down (`tests/integration/cp_dp_grpc_tests.rs::SeverableTestCpServer`): dropping the runtime aborts the accept loop and every per-connection task, closing their sockets.
+- Any failover test must additionally assert the client actually reached the fallback (e.g. `wait_for_cp_url`) before asserting what the fallback may or may not do. A negative-only assertion after a fake shutdown proves nothing.
+- A `tokio::sync::broadcast` push to a CP that currently has no subscriber is silently dropped, so "the DP never applied X" can pass because X was never delivered. Assert delivery (`Sender::send` returns the receiver count) and a DP-side effect of the rejection (sticky `config_diverged` or its `config_divergence_recoveries_total`) rather than the absence alone.
+
 ## Functional Test Rules
 
 - Use `Stdio::null()` for gateway stdout/stderr unless the test reads the pipe. `Stdio::piped()` without reading can deadlock.
@@ -75,7 +85,7 @@ paths:
 
 ## CI Expectations
 
-- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, all secret backends, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF path gates so irrelevant jobs skip before runner allocation. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip it. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
+- Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, all secret backends, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF path gates so irrelevant jobs skip before runner allocation. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.
 - Branch protection must directly require `Tests`, `Merge Coverage`, `Gateway API Conformance`, and `Mesh E2E Sidecar Live`. The three dedicated workflows trigger on every PR and path-filter internally; do not add polling mirror jobs back to `ci.yml`.
 - Push to main overwrites the `latest` release and publishes multi-arch Docker images to Docker Hub and GHCR.
 - Tags `v*` create versioned releases and Docker tags.

@@ -103,6 +103,18 @@ message MeshSubscribeRequest {
   // Ambient UDP consumers need the namespace-visible policy candidate
   // superset so trusted per-pod baggage can be scoped at the destination.
   bool ambient_udp_source_scoping = 7;
+  // True when this subscription is a CROSS-CLUSTER remote-discovery poll
+  // (`RemoteCluster.control_plane_url`), false for an ordinary local mesh
+  // data-plane subscription. It selects between two REQUIRED, mutually
+  // exclusive JWT audiences (issue #2475), so the flag is not a trust
+  // decision and the proto3 false/default cannot admit a no-audience token:
+  //   true  -> the bearer token must carry exactly one `aud` equal to
+  //            "ferrum-mesh-discovery:<FERRUM_MESH_CLUSTER_AUDIENCE>" of THIS
+  //            control plane; an unconfigured control plane refuses outright.
+  //   false -> the bearer token must carry exactly one `aud` equal to
+  //            "ferrum-mesh-subscribe:local"; missing or discovery-purpose
+  //            audiences are refused.
+  bool remote_discovery = 8;
 }
 
 // A MeshSubscribe response frame.
@@ -118,8 +130,22 @@ message MeshSubscribeRequest {
 //     MeshSubscribeRequest that opened the stream, and when the request pinned
 //     `workload_spiffe_id` / `waypoint_name` the slice MUST echo that same value
 //     (an omitted echo is a mismatch, not an exemption).
+//   * `config_authority` / `config_sequence` MUST equal the embedded
+//     `MeshSlice.revision` (both absent, or both present and equal) — like
+//     `version`, the envelope stamp is a duplicate of the slice's own value.
 // A frame that violates any of these is refused without mutating the
 // subscriber's last-good state.
+//
+// ORDERING CONTRACT (issue #2473). `config_authority` names the ordering domain
+// and `config_sequence` is the durable, monotonic config-change sequence within
+// it. Every control-plane replica reading the same config store advertises the
+// same authority, so a data plane failing over between replicas compares config
+// GENERATIONS, not wall clocks. A candidate is installed only when it is
+// strictly newer than, or equal to, the last accepted revision from the SAME
+// authority; an older revision, a foreign authority, or an absent revision when
+// one is already accepted is quarantined and the last-good slice keeps serving.
+// An intentional operator rollback republishes content at a HIGHER sequence — a
+// data plane is never moved backward by replaying an old generation.
 message MeshConfigUpdate {
   // Transport version stamp. MUST equal the embedded MeshSlice.version on
   // non-heartbeat frames.
@@ -135,4 +161,16 @@ message MeshConfigUpdate {
   // registry liveness fresh without forcing receivers to re-apply a slice.
   // A heartbeat carries no slice and is never an install candidate.
   bool heartbeat = 5;
+  // Ordering domain of `config_sequence`. Empty means the control plane's
+  // config authority has no shared monotonic sequence (Kubernetes CRD
+  // controller, file source) — the subscriber then applies no ordering unless
+  // it has already accepted a revisioned slice, in which case an unrevisioned
+  // frame is refused fail-closed.
+  string config_authority = 6;
+  // Durable, monotonically increasing config-change sequence within
+  // `config_authority`. MUST be zero when `config_authority` is empty; a
+  // sequence without its ordering domain is malformed. Never a wall clock: it
+  // survives control-plane restarts and is identical on every replica of one
+  // config store.
+  uint64 config_sequence = 7;
 }

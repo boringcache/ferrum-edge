@@ -39,7 +39,8 @@ use tracing::{debug, warn};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, apply_rate_limit_cleanup,
+    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    validate_max_requests, validate_window_seconds,
 };
 use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
@@ -49,9 +50,12 @@ use crate::util::unknown_keys::reject_unknown_keys;
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
-/// enforcement skips this cooldown so a sampled observation of pressure
-/// still force-reclaims without waiting for the next cool-down window.
+/// reclaim skips this cooldown so a sampled observation of pressure can
+/// drop idle keys without waiting for the next cool-down window. Live
+/// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str =
+    r#"{"errors":[{"message":"Rate limit state capacity exceeded"}]}"#;
 const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
     &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
@@ -135,7 +139,20 @@ pub struct GraphqlPlugin {
 }
 
 impl GraphqlPlugin {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `graphql` instances in the
+    /// same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "graphql: config must be an object".to_string())?;
@@ -214,8 +231,9 @@ impl GraphqlPlugin {
             limit_by,
             type_rate_limits,
             operation_rate_limits,
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "graphql",
+                config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
@@ -233,6 +251,13 @@ impl GraphqlPlugin {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
@@ -241,6 +266,24 @@ impl GraphqlPlugin {
             duration: std::time::Duration::from_secs(1),
         }]);
         let _ = self.limiter.check_local_at(key, &op, now);
+    }
+
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_key_at_with_cap_for_test(
+        &self,
+        key: String,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+            limit: 100,
+            duration: std::time::Duration::from_secs(1),
+        }]);
+        self.limiter
+            .check_local_at_with_capacity(key, &op, now, max_entries)
+            .is_some()
     }
 
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
@@ -293,9 +336,10 @@ impl GraphqlPlugin {
         }
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Sampled over-cap observation force-enforces after pruning idle keys.
-        // The below-cap cooldown must not suppress this branch once pressure
-        // is seen on a sampled pass.
+        // Sampled over-cap observation reclaims idle keys after prune. Live
+        // budgets are never force-evicted; hard cardinality is enforced by
+        // atomic admission reservation. The below-cap cooldown must not
+        // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             self.last_periodic_sweep_secs
@@ -321,9 +365,19 @@ impl GraphqlPlugin {
     }
 
     /// Check a rate limit by key, creating a bucket if needed.
-    async fn check_rate(&self, key: &str, spec: &RateSpec) -> RateLimitOutcome {
+    ///
+    /// Returns `None` when a previously unseen local/fallback key is denied at
+    /// the hard cardinality cap (Redis-healthy admission is unaffected).
+    async fn check_rate(&self, key: &str, spec: &RateSpec) -> Option<RateLimitOutcome> {
         self.evict_stale_entries();
-        self.limiter.check(key.to_string(), key, &spec.op).await
+        self.limiter
+            .check_with_redis_key_and_local_capacity(
+                key.to_string(),
+                || key.to_string(),
+                &spec.op,
+                MAX_STATE_ENTRIES,
+            )
+            .await
     }
 
     /// Build the rate limit key based on `limit_by` config.
@@ -422,6 +476,14 @@ fn parse_rate_spec(field: &str, key: &str, spec: &Value) -> Result<RateSpec, Str
     reject_unknown_keys(object, &path, RATE_SPEC_KEYS, "graphql: ")?;
     let max_requests = required_positive_u64(spec, field, key, "max_requests")?;
     let window_seconds = required_positive_u64(spec, field, key, "window_seconds")?;
+    // Bound both axes before they reach the shared dynamic HTTP window: an
+    // extreme window underflows local `Instant` subtraction and overflows the
+    // signed Redis TTL, and an extreme cap is rejected so budgets stay within
+    // the shared production maxima. Local sliding-window memory itself is
+    // bounded by a fixed aggregate-bucket ring, not by one timestamp per request.
+    let label = format!("graphql: {field}['{key}']");
+    let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+    let window_seconds = validate_window_seconds(&label, "window_seconds", window_seconds)?;
     let window = Duration::from_secs(window_seconds);
     Ok(RateSpec {
         max_requests,
@@ -1549,28 +1611,38 @@ impl Plugin for GraphqlPlugin {
         // Check operation type rate limit
         if let Some(spec) = self.type_rate_limits.get(op.op_type) {
             let key = self.rate_key(ctx, "type", op.op_type);
-            let outcome = self.check_rate(&key, spec).await;
-            if !outcome.allowed {
-                warn!(
-                    op_type = %op.op_type,
-                    plugin = "graphql",
-                    "GraphQL operation type rate limit exceeded"
-                );
-                let remaining = outcome.remaining.unwrap_or(0);
-                let mut headers = json_content_type_header();
-                headers.insert(
-                    "x-graphql-ratelimit-limit".to_string(),
-                    spec.max_requests.to_string(),
-                );
-                headers.insert(
-                    "x-graphql-ratelimit-remaining".to_string(),
-                    remaining.to_string(),
-                );
-                return PluginResult::Reject {
-                    status_code: 429,
-                    body: type_rate_limit_error_body(op.op_type),
-                    headers,
-                };
+            match self.check_rate(&key, spec).await {
+                None => {
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: CAPACITY_REJECT_BODY.to_string(),
+                        headers: json_content_type_header(),
+                    };
+                }
+                Some(outcome) if !outcome.allowed => {
+                    warn!(
+                        op_type = %op.op_type,
+                        plugin = "graphql",
+                        "GraphQL operation type rate limit exceeded"
+                    );
+                    let remaining = outcome.remaining.unwrap_or(0);
+                    let mut headers = json_content_type_header();
+                    headers.insert(
+                        "x-graphql-ratelimit-limit".to_string(),
+                        spec.max_requests.to_string(),
+                    );
+                    headers.insert(
+                        "x-graphql-ratelimit-remaining".to_string(),
+                        remaining.to_string(),
+                    );
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: type_rate_limit_error_body(op.op_type),
+                        headers,
+                    };
+                }
+                Some(_) => {}
             }
         }
 
@@ -1579,28 +1651,38 @@ impl Plugin for GraphqlPlugin {
             && let Some(spec) = self.operation_rate_limits.get(op_name)
         {
             let key = self.rate_key(ctx, "op", op_name);
-            let outcome = self.check_rate(&key, spec).await;
-            if !outcome.allowed {
-                warn!(
-                    operation = %op_name,
-                    plugin = "graphql",
-                    "GraphQL named operation rate limit exceeded"
-                );
-                let remaining = outcome.remaining.unwrap_or(0);
-                let mut headers = json_content_type_header();
-                headers.insert(
-                    "x-graphql-ratelimit-limit".to_string(),
-                    spec.max_requests.to_string(),
-                );
-                headers.insert(
-                    "x-graphql-ratelimit-remaining".to_string(),
-                    remaining.to_string(),
-                );
-                return PluginResult::Reject {
-                    status_code: 429,
-                    body: operation_rate_limit_error_body(op_name),
-                    headers,
-                };
+            match self.check_rate(&key, spec).await {
+                None => {
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: CAPACITY_REJECT_BODY.to_string(),
+                        headers: json_content_type_header(),
+                    };
+                }
+                Some(outcome) if !outcome.allowed => {
+                    warn!(
+                        operation = %op_name,
+                        plugin = "graphql",
+                        "GraphQL named operation rate limit exceeded"
+                    );
+                    let remaining = outcome.remaining.unwrap_or(0);
+                    let mut headers = json_content_type_header();
+                    headers.insert(
+                        "x-graphql-ratelimit-limit".to_string(),
+                        spec.max_requests.to_string(),
+                    );
+                    headers.insert(
+                        "x-graphql-ratelimit-remaining".to_string(),
+                        remaining.to_string(),
+                    );
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: operation_rate_limit_error_body(op_name),
+                        headers,
+                    };
+                }
+                Some(_) => {}
             }
         }
 

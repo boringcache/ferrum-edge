@@ -1007,7 +1007,7 @@ fn mtls_auth_compatibility_checks_proxy_and_proxy_group_scopes() {
 }
 
 #[test]
-fn mtls_auth_compatibility_rejects_chain_fingerprints_on_dtls() {
+fn mtls_auth_compatibility_allows_chain_fingerprints_on_dtls() {
     let config = GatewayConfig {
         proxies: vec![stream_proxy("dtls", BackendScheme::Dtls, true)],
         plugin_configs: vec![mtls_plugin(
@@ -1021,9 +1021,7 @@ fn mtls_auth_compatibility_rejects_chain_fingerprints_on_dtls() {
         ..empty_config()
     };
 
-    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
-    assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("UDP/DTLS does not expose"));
+    assert!(config.validate_mtls_auth_compatibility().is_ok());
 }
 
 #[test]
@@ -1051,7 +1049,7 @@ fn mtls_auth_compatibility_allows_terminated_tcp_and_dtls_issuer_pins() {
 }
 
 #[test]
-fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
+fn local_mtls_auth_shadowing_and_fallback_allow_dtls_chain_fingerprints() {
     let mut proxy = stream_proxy("dtls", BackendScheme::Dtls, true);
     proxy.plugins = vec![PluginAssociation {
         plugin_config_id: "mtls-local".to_string(),
@@ -1083,12 +1081,7 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
     removed
         .plugin_configs
         .retain(|plugin| plugin.id != "mtls-local");
-    let removal_errors = removed.validate_mtls_auth_compatibility().unwrap_err();
-    assert!(
-        removal_errors
-            .iter()
-            .any(|error| error.contains("UDP/DTLS does not expose"))
-    );
+    assert!(removed.validate_mtls_auth_compatibility().is_ok());
 
     let mut renamed = config;
     renamed
@@ -1097,11 +1090,65 @@ fn local_mtls_auth_shadows_incompatible_global_fingerprint_policy() {
         .find(|plugin| plugin.id == "mtls-local")
         .expect("local plugin exists")
         .plugin_name = "cors".to_string();
-    let rename_errors = renamed.validate_mtls_auth_compatibility().unwrap_err();
+    assert!(renamed.validate_mtls_auth_compatibility().is_ok());
+}
+
+#[test]
+fn global_mtls_auth_is_screened_across_namespaces() {
+    // `PluginScope::Global` is gateway-wide at runtime: `PluginCache` seeds
+    // every proxy's merged list from the single global list regardless of
+    // namespace. Compatibility screening must therefore be cross-namespace
+    // too, or a tenant-b global would install on a tenant-a plaintext stream
+    // proxy with no validation error at all.
+    let mut tenant_a_proxy = stream_proxy("plain", BackendScheme::Tcp, false);
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    let mut tenant_b_global = mtls_plugin(
+        "mtls-global",
+        PluginScope::Global,
+        None,
+        serde_json::json!({}),
+    );
+    tenant_b_global.namespace = "tenant-b".to_string();
+    let config = GatewayConfig {
+        proxies: vec![tenant_a_proxy],
+        plugin_configs: vec![tenant_b_global],
+        ..empty_config()
+    };
+
+    let errors = config.validate_mtls_auth_compatibility().unwrap_err();
     assert!(
-        rename_errors
-            .iter()
-            .any(|error| error.contains("UDP/DTLS does not expose"))
+        errors.iter().any(|error| error.contains("Proxy 'plain'")),
+        "a cross-namespace global plugin still applies at runtime and must be screened: {errors:?}"
+    );
+}
+
+#[test]
+fn scoped_mtls_auth_does_not_cross_namespaces() {
+    // The namespace-local half: a tenant-b PROXY-scoped config naming proxy id
+    // "plain" must not bind to tenant-a's same-id proxy. `validate_plugin_
+    // references` reports the dangling reference; compatibility screening must
+    // not additionally screen it against the foreign proxy.
+    let mut tenant_a_proxy = stream_proxy("plain", BackendScheme::Tcp, false);
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    tenant_a_proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "mtls-scoped".to_string(),
+    }];
+    let mut tenant_b_scoped = mtls_plugin(
+        "mtls-scoped",
+        PluginScope::Proxy,
+        Some("plain"),
+        serde_json::json!({}),
+    );
+    tenant_b_scoped.namespace = "tenant-b".to_string();
+    let config = GatewayConfig {
+        proxies: vec![tenant_a_proxy],
+        plugin_configs: vec![tenant_b_scoped],
+        ..empty_config()
+    };
+
+    assert!(
+        config.validate_mtls_auth_compatibility().is_ok(),
+        "a tenant-b proxy-scoped plugin must not attach to tenant-a's same-id proxy"
     );
 }
 
@@ -2655,6 +2702,270 @@ fn backend_tls_sni_with_grpc_web_buffering_fails_validate() {
     );
 }
 
+/// Build a plugin config for the SNI admission tests.
+fn sni_plugin_config(
+    id: &str,
+    plugin_name: &str,
+    scope: PluginScope,
+    config: serde_json::Value,
+) -> PluginConfig {
+    let proxy_id = match scope {
+        PluginScope::Global => None,
+        _ => Some("p1".to_string()),
+    };
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: plugin_name.into(),
+        scope,
+        proxy_id,
+        enabled: true,
+        config,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+/// Proxy-scoped plugin config attached to the SNI test proxy.
+fn sni_proxy_plugin(id: &str, name: &str, config: serde_json::Value) -> PluginConfig {
+    sni_plugin_config(id, name, PluginScope::Proxy, config)
+}
+
+/// A plain-HTTPS proxy with a backend TLS SNI override, with every
+/// non-global plugin config attached to it.
+fn sni_config_with_plugins(plugin_configs: Vec<PluginConfig>) -> GatewayConfig {
+    let mut upstream = make_upstream("sni-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    let mut associations = Vec::new();
+    for pc in &plugin_configs {
+        if pc.scope != PluginScope::Global {
+            associations.push(PluginAssociation {
+                plugin_config_id: pc.id.clone(),
+            });
+        }
+    }
+    proxy.plugins = associations;
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.plugin_configs = plugin_configs;
+    config.normalize_fields();
+    config
+}
+
+/// Only the request-body-buffering leg of the SNI admission errors.
+fn buffering_rejection_ids(config: &GatewayConfig) -> Vec<String> {
+    let Err(errors) = config.validate_upstream_references() else {
+        return Vec::new();
+    };
+    let mut rejections = Vec::new();
+    for msg in errors {
+        if msg.contains("request-body-buffering") {
+            rejections.push(msg);
+        }
+    }
+    rejections
+}
+
+/// The screen follows each plugin's own parsed state instead of a static name
+/// list: `compression` buffers only when request decompression is configured.
+#[test]
+fn backend_tls_sni_buffering_screen_follows_compression_plugin_state() {
+    let pc = sni_proxy_plugin("compression-1", "compression", serde_json::json!({}));
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("response-only compression rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let pc = sni_proxy_plugin("compression-1", "compression", decompress);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let hit = rejections.iter().any(|m| m.contains("compression-1"));
+    let msg = format!("decompressing compression admitted: {rejections:?}");
+    assert!(hit, "{msg}");
+}
+
+/// `hmac_auth` buffers the request body before authenticate but was absent
+/// from the old hardcoded name list; the trait-derived screen catches it.
+#[test]
+fn backend_tls_sni_buffering_screen_covers_plugins_absent_from_old_list() {
+    let pc = sni_proxy_plugin("hmac-1", "hmac_auth", serde_json::json!({}));
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let hit = rejections.iter().any(|m| m.contains("hmac-1"));
+    let msg = format!("hmac_auth buffering not screened: {rejections:?}");
+    assert!(hit, "{msg}");
+}
+
+/// Global-scope inheritance keeps working through the trait-derived screen.
+#[test]
+fn backend_tls_sni_buffering_screen_covers_inherited_global_plugins() {
+    let scope = PluginScope::Global;
+    let empty = serde_json::json!({});
+    let pc = sni_plugin_config("global-web", "grpc_web", scope, empty);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let named = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("global buffering plugin not screened: {rejections:?}");
+    assert!(named && inherited, "{msg}");
+}
+
+/// A disabled plugin config is not effective and must not reject the proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_disabled_plugin_configs() {
+    let empty = serde_json::json!({});
+    let mut pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
+    pc.enabled = false;
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("disabled plugin rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// A disabled local plugin must not shadow an enabled global with the same
+/// name; the global's buffering requirement still rejects the SNI proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_disabled_local_does_not_shadow_enabled_global() {
+    let empty = serde_json::json!({});
+    let global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty.clone());
+    let mut local = sni_proxy_plugin("local-web", "grpc_web", empty);
+    local.enabled = false;
+    let config = sni_config_with_plugins(vec![global, local]);
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("enabled global shadowed by disabled local: {rejections:?}");
+    assert!(global_hit && inherited, "{msg}");
+}
+
+/// An enabled local whose config does not construct must not shadow an
+/// enabled buffering global — PluginCache's construction-`Err` arm leaves the
+/// global in place, and SNI admission must keep seeing that global.
+#[test]
+fn backend_tls_sni_buffering_screen_unconstructable_local_does_not_shadow_enabled_global() {
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let global = sni_plugin_config(
+        "global-compression",
+        "compression",
+        PluginScope::Global,
+        decompress,
+    );
+    let bad = serde_json::json!({"algorithms": ["not-a-codec"]});
+    let local = sni_proxy_plugin("local-compression", "compression", bad);
+    let config = sni_config_with_plugins(vec![global, local]);
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-compression"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let local_hit = rejections.iter().any(|m| m.contains("local-compression"));
+    let msg = format!("enabled buffering global shadowed by unconstructable local: {rejections:?}");
+    assert!(global_hit && inherited && !local_hit, "{msg}");
+}
+
+/// Unknown / custom plugin names stay admitted; the runtime 502 remains the
+/// fail-closed backstop, so admission must not invent a rejection.
+#[test]
+fn backend_tls_sni_buffering_screen_admits_unknown_plugin_names() {
+    let cfg = serde_json::json!({"anything": true});
+    let pc = sni_proxy_plugin("custom-1", "some_custom_plugin", cfg);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("unevaluable plugin rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// A built-in whose config does not construct is rejected by plugin-config
+/// validation, not disguised as a buffering conflict here.
+#[test]
+fn backend_tls_sni_buffering_screen_admits_unconstructable_configs() {
+    let cfg = serde_json::json!({"algorithms": ["not-a-codec"]});
+    let pc = sni_proxy_plugin("compression-1", "compression", cfg);
+    let config = sni_config_with_plugins(vec![pc]);
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("unconstructable config rejected: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Plugin config ids may be reused across namespaces; SNI admission must
+/// resolve proxy associations in the proxy's namespace only.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_reused_plugin_id_in_other_namespace() {
+    let mut local = sni_proxy_plugin("shared-pc-id", "compression", serde_json::json!({}));
+    local.namespace = "tenant-a".to_string();
+    let decompress = serde_json::json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 1024
+    });
+    let mut foreign = sni_proxy_plugin("shared-pc-id", "compression", decompress);
+    foreign.namespace = "tenant-b".to_string();
+    let mut config = sni_config_with_plugins(vec![foreign, local]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("other-namespace plugin id false rejection: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Global buffering plugins in another namespace must not reject this proxy.
+#[test]
+fn backend_tls_sni_buffering_screen_ignores_global_plugins_in_other_namespace() {
+    let empty = serde_json::json!({});
+    let mut foreign = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
+    foreign.namespace = "tenant-b".to_string();
+    let mut config = sni_config_with_plugins(vec![foreign]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("other-namespace global false rejection: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
+/// Same-namespace inherited globals must still reject plain-HTTPS SNI proxies.
+#[test]
+fn backend_tls_sni_buffering_screen_rejects_same_namespace_global_plugins() {
+    let empty = serde_json::json!({});
+    let mut global = sni_plugin_config("global-web", "grpc_web", PluginScope::Global, empty);
+    global.namespace = "tenant-a".to_string();
+    let mut config = sni_config_with_plugins(vec![global]);
+    config.proxies[0].namespace = "tenant-a".to_string();
+    config.upstreams[0].namespace = "tenant-a".to_string();
+    config.normalize_fields();
+    let rejections = buffering_rejection_ids(&config);
+    let global_hit = rejections.iter().any(|m| m.contains("global-web"));
+    let inherited = rejections.iter().any(|m| m.contains("inherits"));
+    let msg = format!("same-namespace global not screened: {rejections:?}");
+    assert!(global_hit && inherited, "{msg}");
+}
+
+/// A proxy without a plain-HTTPS SNI override is never screened at all, so a
+/// buffering plugin on it must stay admitted.
+#[test]
+fn buffering_plugins_are_only_screened_for_sni_proxies() {
+    let empty = serde_json::json!({});
+    let pc = sni_proxy_plugin("grpc-web-1", "grpc_web", empty);
+    let mut config = sni_config_with_plugins(vec![pc]);
+    config.upstreams[0].backend_tls_sni = None;
+    config.proxies[0].resolved_tls.sni = None;
+    let rejections = buffering_rejection_ids(&config);
+    let msg = format!("non-SNI proxy screened: {rejections:?}");
+    assert!(rejections.is_empty(), "{msg}");
+}
+
 #[test]
 fn backend_tls_sni_per_port_overlay_with_http2_disabled_fails_validate() {
     let mut upstream = make_upstream("sni-upstream");
@@ -3266,6 +3577,107 @@ fn retry_proxy_still_rejects_unshadowed_global_dispatch_to_mesh() {
     );
 }
 
+#[test]
+fn retry_proxy_still_rejects_foreign_namespace_global_dispatch() {
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let foreign_dispatch = PluginConfig {
+        id: "global-dispatch".into(),
+        namespace: "tenant-b".into(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![foreign_dispatch];
+
+    // `PluginScope::Global` is gateway-wide at runtime — `PluginCache` merges
+    // the single global list into every proxy in every namespace — so a
+    // tenant-b global dispatch rule DOES run on this proxy and its
+    // retry/mesh-transport conflict must still be reported. Namespace
+    // qualification applies to association and proxy_id resolution, not to
+    // global-scope applicability.
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| msg.contains("enables retry")
+            && msg.contains("mesh-upstream")
+            && msg.contains("mesh.hbone")),
+        "expected cross-namespace global dispatch conflict, got {err:?}"
+    );
+}
+
+#[test]
+fn route_dispatch_association_resolves_same_namespace_plugin_id() {
+    let plain = make_upstream("plain-upstream");
+    let mut mesh = make_upstream("mesh-upstream");
+    mesh.targets[0]
+        .tags
+        .insert("mesh.hbone".to_string(), "true".to_string());
+
+    let foreign_dispatch = PluginConfig {
+        id: "shared-dispatch".into(),
+        namespace: "tenant-b".into(),
+        plugin_name: "mesh_route_dispatch".into(),
+        config: serde_json::json!({
+            "rules": [
+                { "match": {}, "destination": { "upstream_id": "mesh-upstream" } }
+            ]
+        }),
+        scope: PluginScope::ProxyGroup,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut local_dispatch = foreign_dispatch.clone();
+    local_dispatch.namespace = ferrum_edge::config::types::default_namespace();
+    local_dispatch.config = serde_json::json!({
+        "rules": [
+            { "match": {}, "destination": { "upstream_id": "plain-upstream" } }
+        ]
+    });
+
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.upstream_id = Some("plain-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "shared-dispatch".into(),
+    }];
+
+    let mut config = empty_config();
+    config.upstreams = vec![plain, mesh];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![foreign_dispatch, local_dispatch];
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "the association must resolve the local same-id plugin, not tenant-b's"
+    );
+}
+
 // ---- priority_override validation tests ----
 
 #[test]
@@ -3651,6 +4063,58 @@ fn test_validate_resource_ids_invalid_consumer_id() {
     assert!(err[0].contains("Consumer ID"));
 }
 
+#[test]
+fn test_validate_resource_ids_rejects_hostile_reserved_mesh_prefix() {
+    let mut config = empty_config();
+    config.proxies = vec![make_proxy("__mesh_hostile_proxy", "/api")];
+    config.upstreams = vec![make_upstream("__mesh_hostile_upstream")];
+    config.plugin_configs = vec![mtls_plugin(
+        "__mesh_hostile_plugin",
+        PluginScope::Global,
+        None,
+        serde_json::json!({}),
+    )];
+
+    let errors = config.validate_resource_ids().unwrap_err();
+    assert_eq!(errors.len(), 3, "unexpected identity errors: {errors:?}");
+    for resource in ["Proxy ID", "PluginConfig ID", "Upstream ID"] {
+        assert!(
+            errors.iter().any(|error| error.starts_with(resource)),
+            "reserved operator identity must be rejected for {resource}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_validate_resource_ids_rejects_malformed_namespaces_for_every_resource_kind() {
+    let mut proxy = make_proxy("proxy-1", "/api");
+    proxy.namespace = "tenant|prod".to_string();
+    let mut consumer = make_consumer("consumer-1", "alice");
+    consumer.namespace = "tenant/prod".to_string();
+    let mut upstream = make_upstream("upstream-1");
+    upstream.namespace = "tenant prod".to_string();
+    let mut plugin = mtls_plugin("plugin-1", PluginScope::Global, None, serde_json::json!({}));
+    plugin.namespace = String::new();
+
+    let config = GatewayConfig {
+        proxies: vec![proxy],
+        consumers: vec![consumer],
+        upstreams: vec![upstream],
+        plugin_configs: vec![plugin],
+        ..empty_config()
+    };
+    let errors = config.validate_resource_ids().unwrap_err();
+    assert_eq!(errors.len(), 4, "unexpected identity errors: {errors:?}");
+    for resource in ["Proxy", "Consumer", "Upstream", "PluginConfig"] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.starts_with(resource) && error.contains("namespace")),
+            "missing {resource} namespace rejection: {errors:?}"
+        );
+    }
+}
+
 // ---- Resource ID uniqueness tests ----
 
 #[test]
@@ -3668,6 +4132,7 @@ fn test_validate_unique_resource_ids_duplicate_proxy() {
     let err = config.validate_unique_resource_ids().unwrap_err();
     assert_eq!(err.len(), 1);
     assert!(err[0].contains("Duplicate proxy ID 'p1'"));
+    assert!(err[0].contains("namespace"));
 }
 
 #[test]
@@ -3689,6 +4154,99 @@ fn test_validate_unique_resource_ids_allows_consumer_id_in_different_namespaces(
     config.consumers = vec![prod, staging];
 
     assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_unique_resource_ids_allows_proxy_upstream_plugin_id_in_different_namespaces() {
+    // Same resource id may exist in two tenants; uniqueness is per namespace.
+    let mut config = empty_config();
+    let mut prod_proxy = make_proxy("shared", "/api");
+    prod_proxy.namespace = "prod".to_string();
+    let mut staging_proxy = make_proxy("shared", "/api");
+    staging_proxy.namespace = "staging".to_string();
+    let mut prod_upstream = make_upstream("shared");
+    prod_upstream.namespace = "prod".to_string();
+    let mut staging_upstream = make_upstream("shared");
+    staging_upstream.namespace = "staging".to_string();
+    let prod_plugin = PluginConfig {
+        id: "shared".into(),
+        namespace: "prod".into(),
+        plugin_name: "rate_limiting".into(),
+        config: serde_json::json!({}),
+        scope: PluginScope::Global,
+        proxy_id: None,
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let mut staging_plugin = prod_plugin.clone();
+    staging_plugin.namespace = "staging".to_string();
+    config.proxies = vec![prod_proxy, staging_proxy];
+    config.upstreams = vec![prod_upstream, staging_upstream];
+    config.plugin_configs = vec![prod_plugin, staging_plugin];
+
+    assert!(config.validate_unique_resource_ids().is_ok());
+}
+
+#[test]
+fn test_validate_upstream_references_rejects_cross_namespace_same_id() {
+    // A proxy in tenant-a referencing upstream "u1" must not pass admission
+    // just because tenant-b owns an upstream with that id (issue #3094).
+    let mut config = empty_config();
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.namespace = "tenant-a".to_string();
+    proxy.upstream_id = Some("u1".to_string());
+    let mut foreign_upstream = make_upstream("u1");
+    foreign_upstream.namespace = "tenant-b".to_string();
+    config.proxies = vec![proxy];
+    config.upstreams = vec![foreign_upstream];
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter()
+            .any(|e| e.contains("non-existent upstream_id 'u1'")),
+        "expected dangling same-namespace upstream rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn test_resolve_upstream_tls_keeps_same_id_upstreams_in_two_namespaces_independent() {
+    // Bare-id TLS projection would last-win and stamp the wrong tenant's CA onto
+    // every proxy that references a shared upstream id (issue #3094).
+    let mut config = empty_config();
+    let mut tenant_a_upstream = make_upstream("u1");
+    tenant_a_upstream.namespace = "tenant-a".to_string();
+    tenant_a_upstream.backend_tls_server_ca_cert_path = Some("/tenant-a/ca.pem".into());
+    let mut tenant_b_upstream = make_upstream("u1");
+    tenant_b_upstream.namespace = "tenant-b".to_string();
+    tenant_b_upstream.backend_tls_server_ca_cert_path = Some("/tenant-b/ca.pem".into());
+    let mut tenant_a_proxy = make_proxy("p1", "/a");
+    tenant_a_proxy.namespace = "tenant-a".to_string();
+    tenant_a_proxy.upstream_id = Some("u1".to_string());
+    let mut tenant_b_proxy = make_proxy("p1", "/b");
+    tenant_b_proxy.namespace = "tenant-b".to_string();
+    tenant_b_proxy.upstream_id = Some("u1".to_string());
+    config.upstreams = vec![tenant_a_upstream, tenant_b_upstream];
+    config.proxies = vec![tenant_a_proxy, tenant_b_proxy];
+
+    config.resolve_upstream_tls();
+
+    assert_eq!(
+        config.proxies[0]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/tenant-a/ca.pem")
+    );
+    assert_eq!(
+        config.proxies[1]
+            .resolved_tls
+            .server_ca_cert_path
+            .as_deref(),
+        Some("/tenant-b/ca.pem")
+    );
 }
 
 #[test]
@@ -3959,6 +4517,9 @@ fn test_unique_listen_paths_exempts_mesh_outbound_per_port_siblings() {
             vec!["reviews.default.svc.cluster.local"],
         ),
     ];
+    for proxy in &mut config.proxies {
+        proxy.namespace = "default".to_string();
+    }
     assert!(
         config.validate_unique_listen_paths().is_ok(),
         "same-service per-port outbound siblings must not conflict"
@@ -3984,6 +4545,9 @@ fn test_unique_listen_paths_exempts_mesh_inbound_per_port_siblings() {
             vec!["reviews.default.svc.cluster.local"],
         ),
     ];
+    for proxy in &mut config.proxies {
+        proxy.namespace = "default".to_string();
+    }
     assert!(
         config.validate_unique_listen_paths().is_ok(),
         "same-service per-port inbound siblings must not conflict"
@@ -4056,6 +4620,40 @@ fn test_unique_listen_paths_mesh_outbound_different_services_still_conflict() {
         err.len(),
         1,
         "the lossy id-join collision must not be exempted across services"
+    );
+}
+
+#[test]
+fn test_mesh_sibling_exemption_qualifies_lossy_ids_by_namespace() {
+    // ns `a` / service `b-c` and ns `a-b` / service `c` generate the same
+    // port-80 id. The foreign service must not overwrite the owner of only one
+    // sibling and make the valid two-port service fail uniqueness validation.
+    let mut a80 = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-80",
+        "/",
+        vec!["b-c.a.svc.cluster.local"],
+    );
+    a80.namespace = "a".to_string();
+    let mut a90 = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-90",
+        "/",
+        vec!["b-c.a.svc.cluster.local"],
+    );
+    a90.namespace = "a".to_string();
+    let mut foreign = make_proxy_with_hosts(
+        "__mesh-outbound-a-b-c-80",
+        "/",
+        vec!["c.a-b.svc.cluster.local"],
+    );
+    foreign.namespace = "a-b".to_string();
+
+    let mut config = empty_config();
+    config.mesh = mesh_block_for_uniqueness(&[("a", "b-c", &[80, 90]), ("a-b", "c", &[80])]);
+    config.proxies = vec![a80, a90, foreign];
+
+    assert!(
+        config.validate_unique_listen_paths().is_ok(),
+        "foreign lossy-id collisions must not corrupt same-service sibling ownership"
     );
 }
 
@@ -4237,9 +4835,55 @@ fn test_listen_path_encodings_accepts_clean_paths() {
         make_proxy("p1", "/api"),
         make_proxy("p2", "=/exact/path"),
         make_proxy("p3", "~/regex/.*"),
-        make_proxy("p4", "/with-space%20here"),
+        // A regex listen_path is a pattern, so `\` and `.` are regex syntax
+        // there rather than path bytes: `~^/v1\.0/.*` matches the entirely
+        // reachable canonical path `/v1.0/x`.
+        make_proxy("p4", r"~^/v1\.0/.*"),
+        make_proxy("p5", "/v1.0/legacy"),
     ];
     assert!(config.validate_listen_path_encodings().is_ok());
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_literal_dot_segments_and_backslashes() {
+    // No canonical request path can contain a dot segment or a backslash —
+    // both are rejected at the frontend boundary — so a literal listen_path
+    // carrying one is unreachable config.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-dotdot", "/api/../legacy"),
+        make_proxy("bad-dot", "/api/./legacy"),
+        make_proxy("bad-backslash", "/api\\legacy"),
+        make_proxy("bad-exact-dotdot", "=/api/../legacy"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 4);
+    assert!(errs.iter().any(|e| e.contains("bad-dotdot")));
+    assert!(errs.iter().any(|e| e.contains("bad-dot")));
+    assert!(errs.iter().any(|e| e.contains("bad-backslash")));
+    assert!(errs.iter().any(|e| e.contains("bad-exact-dotdot")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_escapes_that_cannot_be_forwarded_literally() {
+    // An escaped space, brace, or non-ASCII byte is outside the `pchar` decode
+    // set, so the runtime refuses any request that spells one — a `listen_path`
+    // carrying such an escape can only ever be dead config.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-space", "/with-space%20here"),
+        make_proxy("bad-brace", "/api/%7Bid%7D"),
+        make_proxy("bad-utf8", "/caf%C3%A9"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 3);
+    assert!(errs.iter().any(|e| e.contains("bad-space")));
+    assert!(errs.iter().any(|e| e.contains("bad-brace")));
+    assert!(errs.iter().any(|e| e.contains("bad-utf8")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 
 #[test]
@@ -4254,7 +4898,28 @@ fn test_listen_path_encodings_rejects_single_encoded_slash() {
     assert_eq!(errs.len(), 2);
     assert!(errs.iter().any(|e| e.contains("bad-upper")));
     assert!(errs.iter().any(|e| e.contains("bad-lower")));
-    assert!(errs.iter().all(|e| e.contains("encoded slashes")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_ordinary_single_encoding() {
+    // The advisory's headline case: `/%61dmin` is not a stricter spelling of
+    // `/admin`, it is an unreachable one, because request paths canonicalize
+    // before route lookup.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/admin"),
+        make_proxy("bad", "/%61dmin"),
+        make_proxy("bad-dot-segment", "/api/%2e%2e/admin"),
+        make_proxy("bad-backslash", "/api%5Cadmin"),
+        make_proxy("bad-truncated-escape", "/api%2"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 4);
+    assert!(errs.iter().any(|e| e.contains("bad-dot-segment")));
+    assert!(errs.iter().any(|e| e.contains("bad-backslash")));
+    assert!(errs.iter().any(|e| e.contains("bad-truncated-escape")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 
 #[test]
@@ -4421,6 +5086,33 @@ fn test_stream_proxy_duplicate_ports() {
     config.proxies = vec![p1, p2];
     let err = config.validate_stream_proxies().unwrap_err();
     assert!(err[0].contains("Duplicate listen_port"));
+}
+
+#[test]
+fn test_stream_proxy_shared_port_validation_keeps_same_id_namespaces_distinct() {
+    let mut prod = make_proxy("shared", "/prod");
+    prod.namespace = "prod".to_string();
+    prod.backend_scheme = Some(BackendScheme::Tcp);
+    prod.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    prod.listen_port = Some(5432);
+    prod.passthrough = true;
+
+    let mut staging = make_proxy("shared", "/staging");
+    staging.namespace = "staging".to_string();
+    staging.backend_scheme = Some(BackendScheme::Tcp);
+    staging.dispatch_kind = DispatchKind::from(BackendScheme::Tcp);
+    staging.listen_port = Some(5432);
+    staging.passthrough = false;
+
+    let mut config = empty_config();
+    config.proxies = vec![prod, staging];
+    let errors = config.validate_stream_proxies().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("all proxies sharing a port must have passthrough: true")),
+        "the non-passthrough staging proxy must not be replaced by prod's same-ID entry"
+    );
 }
 
 #[test]
@@ -5415,10 +6107,9 @@ fn a_proxy_local_mcp_gateway_shadowing_a_global_one_is_still_rejected() {
 }
 
 #[test]
-fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
-    // Globals are namespace-partitioned by the runtime merge (each proxy takes
-    // only the globals of its own namespace), so a global `mcp_gateway` in one
-    // tenant must not refuse deduplication in another.
+fn a_global_mcp_gateway_in_another_namespace_blocks_dedup() {
+    // Globals are gateway-wide at runtime. Namespace qualification controls
+    // scoped associations and identity, not global applicability.
     let mut config = empty_config();
     let mut dedup = dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1"));
     dedup.namespace = "tenant-a".to_string();
@@ -5430,9 +6121,15 @@ fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
     associate(&mut proxy, &["dedup1"]);
     config.proxies = vec![proxy];
 
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("a foreign-namespace global mcp_gateway still runs on this proxy");
     assert!(
-        config.validate_plugin_references().is_ok(),
-        "a global mcp_gateway is never merged into a proxy in a different namespace"
+        errors.iter().any(|error| {
+            error.contains("request_deduplication cannot be composed with mcp_gateway")
+                && error.contains("p1")
+        }),
+        "the gateway-wide composition conflict must be reported: {errors:?}"
     );
 }
 

@@ -1137,6 +1137,13 @@ pub struct EnvConfig {
     /// order. All URLs must use the same `FERRUM_DB_TYPE` and share TLS settings.
     pub db_failover_urls: Vec<String>,
 
+    /// When `false` (default), admin writes are rejected with 503 while the
+    /// active pool points at a `FERRUM_DB_FAILOVER_URLS` entry. Set `true` only
+    /// for synchronously replicated multi-primary topologies where failover
+    /// writes are durable on the configured primary; otherwise failback can
+    /// republish a stale primary snapshot. See issue #3001.
+    pub db_failover_allow_writes: bool,
+
     /// Connection URL for a SQL read replica database. When set, eligible
     /// admin-only reads can use this replica and fall back to primary if the
     /// replica is unreachable. Runtime config polling and Admin API writes
@@ -1360,6 +1367,26 @@ pub struct EnvConfig {
     /// slice builder also narrows `workloads` to SPIFFE identities referenced
     /// by admitted services. Default `false` for a one-release rollout window.
     pub mesh_sidecar_identity_narrowing: bool,
+    /// CP-side: ordering domain this control plane advertises for authoritative
+    /// mesh config revisions (`FERRUM_MESH_CONFIG_AUTHORITY_ID`, issue #2473).
+    ///
+    /// Every CP replica reading the SAME config store must advertise the SAME
+    /// value, because the sequence numbers they publish come from that store's
+    /// shared `config_changes` change log. Bump it after a deliberate source
+    /// reset (restore from backup, migration to a new store) so data planes see
+    /// a new ordering domain rather than a silent sequence rewind. Empty
+    /// disables revision publication entirely. Ignored when the K8s CRD
+    /// controller is enabled (that authority has no shared monotonic sequence).
+    pub mesh_config_authority_id: String,
+    /// DP-side: seconds a foreign config authority must be observed
+    /// continuously before the mesh data plane adopts it
+    /// (`FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS`, issue #2473).
+    ///
+    /// The no-permanent-lockout bound for control-plane state loss and
+    /// deliberate source resets. `0` disables adoption, leaving
+    /// `POST /mesh/config-revision/reset` as the only recovery. A sequence
+    /// rewind INSIDE one authority is never auto-adopted.
+    pub mesh_config_revision_adopt_secs: u64,
     /// Opt-in for stream-family (TCP/UDP) egress proxy materialization in
     /// `EgressGateway` topology. Default `false`. When enabled, the per-port
     /// stream egress listeners terminate SVID-mTLS (reusing the mesh-inbound
@@ -1428,6 +1455,19 @@ pub struct EnvConfig {
     /// per-remote credential cannot authenticate to the wrong cluster. Never
     /// logged. Unset falls back to the shared CP-DP JWT secret.
     pub mesh_remote_discovery_credentials: Option<String>,
+    /// Stable, operator-visible identifier this cluster is known by to its
+    /// multi-cluster peers — the value a peer puts in `RemoteCluster.name` when
+    /// it declares this cluster. Deliberately independent of any endpoint URL,
+    /// which is mutable and must never be what a credential is bound to.
+    ///
+    /// Control-plane side: `MeshConfigSync.MeshSubscribe` requests marked as
+    /// cross-cluster remote discovery must present a JWT whose single `aud` is
+    /// `ferrum-mesh-discovery:<this value>`. Unset means this control plane
+    /// does not serve cross-cluster discovery and refuses every such
+    /// subscription (fail closed); ordinary local mesh subscriptions are
+    /// unaffected either way. Not a secret — it is an identifier, never a
+    /// credential. Issue #2475.
+    pub mesh_cluster_audience: Option<String>,
     /// Strict local-first locality load balancing. Default `false` (fail-open):
     /// when a mesh upstream's source locality is absent/unresolved the
     /// locality-aware LB returns local **and** remote endpoints together so
@@ -1941,9 +1981,10 @@ pub struct EnvConfig {
     pub tls_prefer_server_cipher_order: bool,
     /// Comma-separated ECDH curves/groups: X25519, secp256r1, secp384r1 (default: "X25519,secp256r1")
     pub tls_curves: Option<String>,
-    /// TLS session resumption cache size for TLS 1.2 stateful session IDs.
-    /// TLS 1.3 uses stateless tickets (unlimited). Applies to inbound listeners
-    /// and outbound/backend client configs that opt into rustls session caching.
+    /// TLS stateful session cache size. Applies to inbound TLS 1.2 session IDs,
+    /// outbound/backend client configs that opt into rustls session caching,
+    /// and HTTP/3 server 0-RTT sessions when early data is enabled on a
+    /// non-mTLS listener. Ordinary inbound TLS 1.3 uses stateless tickets.
     /// (default: 4096)
     pub tls_session_cache_size: usize,
     /// Number of days before certificate expiration to emit a warning log.
@@ -2433,6 +2474,7 @@ impl Default for EnvConfig {
             file_config_path: None,
             db_config_backup_path: None,
             db_failover_urls: Vec::new(),
+            db_failover_allow_writes: false,
             db_read_replica_url: None,
             db_slow_query_threshold_ms: None,
             db_full_load_page_size: 10_000,
@@ -2479,6 +2521,10 @@ impl Default for EnvConfig {
             mesh_sidecar_enforced: false,
             mesh_sidecar_enforced_dry_run: false,
             mesh_sidecar_identity_narrowing: false,
+            mesh_config_authority_id: crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID
+                .to_string(),
+            mesh_config_revision_adopt_secs:
+                crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS,
             mesh_egress_stream_enabled: false,
             mesh_egress_stream_allow_plaintext: false,
             mesh_peer_auth_live_reload_enabled: false,
@@ -2491,6 +2537,7 @@ impl Default for EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds: 30,
             mesh_remote_discovery_max_stale_seconds: 300,
             mesh_remote_discovery_credentials: None,
+            mesh_cluster_audience: None,
             mesh_locality_lb_strict: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
@@ -2801,6 +2848,7 @@ impl EnvConfig {
             db_tls_watch_interval_seconds: u64 = "FERRUM_DB_TLS_WATCH_INTERVAL_SECONDS" => 30u64, clamp(1u64, 3600u64);
             file_config_path: Option<String> = "FERRUM_FILE_CONFIG_PATH";
             db_config_backup_path: Option<String> = "FERRUM_DB_CONFIG_BACKUP_PATH";
+            db_failover_allow_writes: bool = "FERRUM_DB_FAILOVER_ALLOW_WRITES" => false;
             db_read_replica_url: Option<String> = "FERRUM_DB_READ_REPLICA_URL";
             db_slow_query_threshold_ms: Option<u64> = "FERRUM_DB_SLOW_QUERY_THRESHOLD_MS";
             db_full_load_page_size: u64 = "FERRUM_DB_FULL_LOAD_PAGE_SIZE" => 10_000u64, clamp(100u64, 100_000u64);
@@ -2901,6 +2949,8 @@ impl EnvConfig {
             mesh_sidecar_enforced: bool = "FERRUM_MESH_SIDECAR_ENFORCED" => false;
             mesh_sidecar_enforced_dry_run: bool = "FERRUM_MESH_SIDECAR_ENFORCED_DRY_RUN" => false;
             mesh_sidecar_identity_narrowing: bool = "FERRUM_MESH_SIDECAR_IDENTITY_NARROWING" => false;
+            mesh_config_authority_id: String = "FERRUM_MESH_CONFIG_AUTHORITY_ID" => crate::modes::mesh::revision::DEFAULT_CONFIG_AUTHORITY_ID.to_string();
+            mesh_config_revision_adopt_secs: u64 = "FERRUM_MESH_CONFIG_REVISION_ADOPT_SECS" => crate::modes::mesh::revision::DEFAULT_FOREIGN_AUTHORITY_ADOPT_SECS;
             mesh_egress_stream_enabled: bool = "FERRUM_MESH_EGRESS_STREAM_ENABLED" => false;
             mesh_egress_stream_allow_plaintext: bool = "FERRUM_MESH_EGRESS_STREAM_ALLOW_PLAINTEXT" => false;
             mesh_peer_auth_live_reload_enabled: bool = "FERRUM_MESH_PEER_AUTH_LIVE_RELOAD_ENABLED" => false;
@@ -2913,6 +2963,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_remote_discovery_max_stale_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS" => 300u64;
             mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
+            mesh_cluster_audience: Option<String> = "FERRUM_MESH_CLUSTER_AUDIENCE";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
@@ -3424,6 +3475,12 @@ impl EnvConfig {
         // secret fallback) rather than an empty-string JSON parse attempt.
         let mesh_remote_discovery_credentials =
             mesh_remote_discovery_credentials.filter(|s| !s.trim().is_empty());
+        // Blank-means-unset: an empty audience identifier must never become
+        // an accepted `aud` value. Unset keeps cross-cluster discovery
+        // serving refused (fail closed).
+        let mesh_cluster_audience = mesh_cluster_audience
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let dtls_cert_path = resolve_tls_source_override(
             conf,
             "FERRUM_DTLS_CERT_SOURCE",
@@ -3513,6 +3570,7 @@ impl EnvConfig {
             file_config_path,
             db_config_backup_path,
             db_failover_urls,
+            db_failover_allow_writes,
             db_read_replica_url,
             db_slow_query_threshold_ms,
             db_full_load_page_size,
@@ -3559,6 +3617,8 @@ impl EnvConfig {
             mesh_sidecar_enforced,
             mesh_sidecar_enforced_dry_run,
             mesh_sidecar_identity_narrowing,
+            mesh_config_authority_id,
+            mesh_config_revision_adopt_secs,
             mesh_egress_stream_enabled,
             mesh_egress_stream_allow_plaintext,
             mesh_peer_auth_live_reload_enabled,
@@ -3571,6 +3631,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds,
             mesh_remote_discovery_max_stale_seconds,
             mesh_remote_discovery_credentials,
+            mesh_cluster_audience,
             mesh_locality_lb_strict,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,
@@ -4526,6 +4587,24 @@ impl EnvConfig {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if matches!(&self.mode, OperatingMode::ControlPlane)
+            && !self.k8s_controller_enabled
+            && !self.mesh_config_authority_id.is_empty()
+        {
+            let authority = crate::modes::mesh::revision::MeshConfigRevision::new(
+                self.mesh_config_authority_id.as_str(),
+                0,
+            );
+            if !authority.is_well_formed() {
+                return Err(format!(
+                    "FERRUM_MESH_CONFIG_AUTHORITY_ID must be empty or a \
+                     printable, control-character-free value with no surrounding \
+                     whitespace and no longer than {} bytes",
+                    crate::modes::mesh::revision::MAX_AUTHORITY_LEN
+                ));
+            }
+        }
+
         match &self.mode {
             OperatingMode::Database | OperatingMode::ControlPlane => {
                 if self.db_type.is_none() {
@@ -4988,7 +5067,7 @@ impl EnvConfig {
                 .map_err(|e| e.to_string())?;
         }
         if let Some(ref path) = self.tls_ca_bundle_path {
-            crate::config::types::validate_pem_cert_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
+            crate::config::types::validate_pem_ca_file("FERRUM_TLS_CA_BUNDLE_PATH", path)
                 .map_err(|e| e.to_string())?;
         }
 
@@ -5007,6 +5086,24 @@ impl EnvConfig {
                 ),
                 i64::MAX
             ));
+        }
+
+        // Admin and CP/DP gRPC JWTs are separate trust domains. Distinct
+        // issuer defaults do not domain-separate identical HMAC keys: a
+        // holder of a shared secret can mint a fresh admin-shaped token.
+        // Reject equality whenever both secrets are configured (CP always
+        // requires both; DP/mesh/database may also carry both).
+        if let (Some(admin_secret), Some(cp_dp_secret)) = (
+            self.admin_jwt_secret.as_deref(),
+            self.cp_dp_grpc_jwt_secret.as_deref(),
+        ) && admin_secret == cp_dp_secret
+        {
+            return Err(
+                "FERRUM_ADMIN_JWT_SECRET and FERRUM_CP_DP_GRPC_JWT_SECRET must be distinct \
+                 secrets when both are configured; identical HMAC keys are rejected because \
+                 issuer claims do not domain-separate shared signing material"
+                    .into(),
+            );
         }
 
         if self.http3_initial_mtu < crate::http3::config::QUIC_INITIAL_MTU_MIN
@@ -5170,6 +5267,41 @@ impl EnvConfig {
         // Bounded pre-authentication admission on the CP gRPC listener.
         self.validate_cp_grpc_connection_limits()?;
 
+        // The forwarding trust boundary is parsed strictly here so a typo fails
+        // `ferrum-edge validate` and fails startup before any listener binds,
+        // rather than quietly shrinking the trust set at runtime.
+        self.validate_trusted_proxies()?;
+
+        Ok(())
+    }
+
+    /// Reject a `FERRUM_TRUSTED_PROXIES` list that is not entirely valid.
+    ///
+    /// This list decides whose `X-Forwarded-For`, `X-Forwarded-Proto`,
+    /// configured real-IP header, and inbound PROXY-protocol header Ferrum
+    /// believes. Retaining only the parseable entries after a typo is not a
+    /// smaller trust set in any useful sense — it silently moves an
+    /// authorization and abuse-control identity boundary: the mistyped hop stops
+    /// being trusted, so every client behind it collapses onto that hop's socket
+    /// address for `ip_restriction`, GeoIP, bot/client attribution, per-IP rate
+    /// and concurrency keys, and logs. Every entry must therefore parse, and
+    /// empty/trailing/doubled comma segments are typos, not empty configuration.
+    /// A wholly empty value stays valid: it is the secure default in which
+    /// forwarded metadata is ignored altogether.
+    ///
+    /// Parses through the shared `CidrSet` so validation and the runtime filter
+    /// agree on canonical IPv4/IPv6/mapped forms; the set is discarded here
+    /// because `ProxyState` builds the enforcing one (strictly, again) at
+    /// construction.
+    fn validate_trusted_proxies(&self) -> Result<(), String> {
+        crate::util::cidr::CidrSet::parse_strict(&self.trusted_proxies).map_err(|e| {
+            format!(
+                "Invalid FERRUM_TRUSTED_PROXIES {}: {e}. Every entry must be a valid IP or CIDR \
+                 and empty comma segments are rejected — a partially parsed forwarding trust \
+                 boundary would silently change which peers may assert a client identity.",
+                crate::secrets::quoted_env_value("FERRUM_TRUSTED_PROXIES", &self.trusted_proxies)
+            )
+        })?;
         Ok(())
     }
 

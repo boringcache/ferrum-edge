@@ -20,12 +20,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 #[cfg(target_os = "linux")]
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::backend_conn_limit::{
     BackendConnectionGuard, BackendConnectionLimitExceeded, BackendConnectionLimiter,
 };
 use crate::circuit_breaker::CircuitBreakerCache;
+use crate::config::db_backend::NamespacedResourceId;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::BackendTlsConfigBuilder;
 
@@ -421,6 +422,12 @@ pub enum StreamIoSide {
 ///
 /// Preserves per-direction byte counts even when one half errors — callers
 /// use these to record metrics accurately regardless of which side failed.
+/// The Linux io_uring and libc-fallback splice workers carry `bytes_so_far`
+/// on their error variants so timeout/I/O endings report delivered totals
+/// the same way the async splice and direction-tracking userspace paths do
+/// via shared counters. (The all-bounds-disabled userspace fast path is the
+/// intentional exception: tokio's `copy_bidirectional_with_sizes` does not
+/// expose partial totals on `Err`.)
 /// `first_failure` is `Some((direction, class, side, message))` when a half
 /// errored before both halves observed a clean EOF; `None` indicates graceful
 /// shutdown. `side` is `Some` when the error could be attributed to the read
@@ -911,6 +918,11 @@ pub struct TcpListenerConfig {
     pub port: u16,
     pub bind_addr: IpAddr,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id`. Supplied by the stream listener manager
+    /// from the desired listener's exact identity — never inferred, because a
+    /// same-ID proxy in another namespace would otherwise capture this
+    /// listener's runtime state (issue #3094).
+    pub proxy_namespace: String,
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
@@ -951,8 +963,12 @@ pub struct TcpListenerConfig {
     pub started: Arc<AtomicBool>,
     /// When set, this listener serves multiple passthrough proxies sharing the port.
     /// SNI from the ClientHello selects which proxy to route to.
-    /// When `None`, uses the single `proxy_id` (existing behavior).
-    pub sni_proxy_ids: Option<Vec<String>>,
+    /// When `None`, uses the single `proxy_id`/`proxy_namespace` (existing behavior).
+    ///
+    /// Candidates are namespace-qualified: one shared passthrough port may host
+    /// same-ID proxies owned by different namespaces, so resolution must select
+    /// on `(namespace, id)` rather than on a bare ID.
+    pub sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     /// Adaptive buffer tracker for dynamic copy buffer sizing.
     pub adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     /// Whether TCP Fast Open is enabled (from `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -996,10 +1012,25 @@ pub struct TcpListenerConfig {
     pub trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+pub(crate) fn find_listener_proxy<'a>(
+    config: &'a GatewayConfig,
+    proxy_namespace: &str,
+    proxy_id: &str,
+) -> Option<&'a Proxy> {
+    config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == proxy_id && proxy.namespace == proxy_namespace)
+}
+
 #[derive(Clone)]
 struct TcpAcceptLoopState {
     port: u16,
     proxy_id: Arc<str>,
+    /// Namespace owning `proxy_id`. Carried from the listener's desired
+    /// identity so every epoch lookup and every piece of proxy-keyed runtime
+    /// state is resolved on the exact `(namespace, id)` pair.
+    proxy_namespace: Arc<str>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     health_checker: Arc<HealthChecker>,
@@ -1013,7 +1044,7 @@ struct TcpAcceptLoopState {
     tcp_half_close_max_wait_seconds: u64,
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
-    sni_proxy_ids: Option<Vec<String>>,
+    sni_proxy_ids: Option<Vec<NamespacedResourceId>>,
     adaptive_buffer: Arc<crate::adaptive_buffer::AdaptiveBufferTracker>,
     tcp_fastopen_enabled: bool,
     overload: Arc<crate::overload::OverloadState>,
@@ -1028,6 +1059,207 @@ struct TcpAcceptLoopState {
     trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
+/// Bound wait for sibling accept loops to observe peer-cancel before abort.
+/// Keeps reconcile/shutdown from hanging if a cancel signal is lost.
+const TCP_ACCEPT_PEER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Which SO_REUSEPORT accept loop a supervised peer represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TcpAcceptLoopClass {
+    Primary,
+    Extra { index: usize },
+}
+
+impl TcpAcceptLoopClass {
+    pub(crate) fn from_loop_id(accept_loop_id: usize) -> Self {
+        if accept_loop_id == 0 {
+            Self::Primary
+        } else {
+            Self::Extra {
+                index: accept_loop_id,
+            }
+        }
+    }
+
+    pub(crate) fn accept_loop_id(self) -> usize {
+        match self {
+            Self::Primary => 0,
+            Self::Extra { index } => index,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Extra { .. } => "extra",
+        }
+    }
+}
+
+impl std::fmt::Display for TcpAcceptLoopClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => write!(f, "primary"),
+            Self::Extra { index } => write!(f, "extra({index})"),
+        }
+    }
+}
+
+enum TcpAcceptPeerExit {
+    /// Ordinary shutdown, peer-cancel teardown, or post-failure abort join.
+    Clean,
+    /// Unexpected operational failure that must tear down the listener.
+    Failed(anyhow::Error),
+}
+
+fn classify_tcp_accept_peer_exit(
+    class: TcpAcceptLoopClass,
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    teardown_started: bool,
+) -> TcpAcceptPeerExit {
+    match join_result {
+        Ok(Ok(())) => TcpAcceptPeerExit::Clean,
+        Ok(Err(err)) => TcpAcceptPeerExit::Failed(err.context(format!(
+            "TCP SO_REUSEPORT accept loop {class} exited with error"
+        ))),
+        Err(join_err) if join_err.is_cancelled() => {
+            if teardown_started {
+                // Sibling abort after an earlier peer failure, or shutdown drain.
+                TcpAcceptPeerExit::Clean
+            } else {
+                TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+                    "TCP SO_REUSEPORT accept loop {class} was cancelled unexpectedly"
+                ))
+            }
+        }
+        Err(join_err) if join_err.is_panic() => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+            "TCP SO_REUSEPORT accept loop {class} panicked: {join_err}"
+        )),
+        Err(join_err) => TcpAcceptPeerExit::Failed(anyhow::anyhow!(
+            "TCP SO_REUSEPORT accept loop {class} failed to join: {join_err}"
+        )),
+    }
+}
+
+/// Supervise primary + extra SO_REUSEPORT accept loops as peer components.
+///
+/// The first unexpected exit cancels siblings, drains (then aborts) remaining
+/// tasks, and returns that failure. Clean shutdown-triggered exits return
+/// `Ok(())` and are not reported as operational failures. Subsequent peer
+/// exits after the first failure are drained without additional error logs.
+pub(crate) async fn supervise_tcp_accept_loop_peers(
+    peers: Vec<(
+        TcpAcceptLoopClass,
+        tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    )>,
+    cancel_siblings: impl FnOnce(),
+) -> Result<(), anyhow::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    let abort_handles: Vec<_> = peers
+        .iter()
+        .map(|(_, handle)| handle.abort_handle())
+        .collect();
+    let mut futures: FuturesUnordered<_> = peers
+        .into_iter()
+        .map(|(class, handle)| async move { (class, handle.await) })
+        .collect();
+
+    let mut first_error: Option<anyhow::Error> = None;
+    let mut cancel_siblings = Some(cancel_siblings);
+    let mut abort_handles = Some(abort_handles);
+
+    while let Some((class, join_result)) = futures.next().await {
+        let teardown_started = first_error.is_some();
+        match classify_tcp_accept_peer_exit(class, join_result, teardown_started) {
+            TcpAcceptPeerExit::Clean => {}
+            TcpAcceptPeerExit::Failed(err) => {
+                if first_error.is_none() {
+                    error!(
+                        accept_loop = class.accept_loop_id(),
+                        loop_class = class.label(),
+                        error = %err,
+                        "TCP SO_REUSEPORT accept loop exited unexpectedly; tearing down sibling accept loops"
+                    );
+                    first_error = Some(err);
+                    if let Some(cancel) = cancel_siblings.take() {
+                        cancel();
+                    }
+                }
+            }
+        }
+
+        if first_error.is_some() && !futures.is_empty() {
+            let drain = async {
+                while let Some((class, join_result)) = futures.next().await {
+                    // Already failing the listener: drain silently so one
+                    // failure is not double-logged and shutdown stays prompt.
+                    let _ = classify_tcp_accept_peer_exit(class, join_result, true);
+                }
+            };
+            if tokio::time::timeout(TCP_ACCEPT_PEER_DRAIN_TIMEOUT, drain)
+                .await
+                .is_err()
+            {
+                warn!(
+                    timeout_ms = TCP_ACCEPT_PEER_DRAIN_TIMEOUT.as_millis() as u64,
+                    "TCP accept-loop siblings did not exit after peer-cancel; aborting remaining loops"
+                );
+                if let Some(handles) = abort_handles.take() {
+                    for handle in handles {
+                        handle.abort();
+                    }
+                }
+                while futures.next().await.is_some() {}
+            }
+            break;
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+async fn run_supervised_tcp_accept_loop(
+    listener: TcpListener,
+    state: TcpAcceptLoopState,
+    shutdown_rx: watch::Receiver<bool>,
+    global_shutdown_rx: Option<watch::Receiver<bool>>,
+    mut peer_cancel_rx: watch::Receiver<bool>,
+    accept_loop_id: usize,
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        result = run_tcp_accept_loop(
+            listener,
+            state,
+            shutdown_rx,
+            global_shutdown_rx,
+            accept_loop_id,
+        ) => result,
+        _ = async {
+            loop {
+                if peer_cancel_rx.changed().await.is_err() {
+                    // Cancel sender dropped during teardown — treat as stop.
+                    break;
+                }
+                if *peer_cancel_rx.borrow() {
+                    break;
+                }
+            }
+        } => {
+            // Sibling failure teardown (or cancel-sender drop). Not an
+            // operational failure of this loop.
+            Ok(())
+        }
+    }
+}
+
 /// Start a TCP proxy listener on the given port.
 ///
 /// This binds a dedicated TCP listener and for each accepted connection:
@@ -1040,6 +1272,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         port,
         bind_addr,
         proxy_id,
+        proxy_namespace,
         config,
         dns_cache,
         request_epoch,
@@ -1099,15 +1332,13 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
 
     // Convert to Arc<str> so per-connection clones are a cheap pointer bump.
     let proxy_id: Arc<str> = Arc::from(proxy_id);
+    let proxy_namespace: Arc<str> = Arc::from(proxy_namespace);
 
     // Pre-build backend TLS config if this proxy uses Tcps (TCP+TLS) backend scheme.
     // This avoids reading certificate files from disk on every connection.
     let backend_tls_cache: Option<Arc<CachedBackendTlsConfig>> = {
         let current_config = config.load();
-        current_config
-            .proxies
-            .iter()
-            .find(|p| *p.id == *proxy_id)
+        find_listener_proxy(&current_config, proxy_namespace.as_ref(), proxy_id.as_ref())
             // Passthrough proxies relay raw bytes without originating backend
             // TLS; their listener must not fail because unrelated TLS material
             // (global CA bundle / upstream-resolved fields) is unreadable.
@@ -1131,6 +1362,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     let loop_state = TcpAcceptLoopState {
         port,
         proxy_id: proxy_id.clone(),
+        proxy_namespace: proxy_namespace.clone(),
         dns_cache,
         request_epoch,
         health_checker,
@@ -1157,35 +1389,12 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
     // Bind all extra sockets before spawning any accept loops. If one bind
     // fails, every already-bound socket is dropped here and startup fails
     // cleanly without leaving orphan listener tasks behind.
-    let mut extra_listeners = Vec::with_capacity(actual_accept_threads.saturating_sub(1));
+    let mut listeners = Vec::with_capacity(actual_accept_threads);
+    listeners.push(first_listener);
     for _ in 1..actual_accept_threads {
-        extra_listeners.push(crate::proxy::create_proxy_socket(
+        listeners.push(crate::proxy::create_proxy_socket(
             addr, backlog, tfo_queue, reuse_port,
         )?);
-    }
-
-    let mut handles = Vec::with_capacity(extra_listeners.len());
-    for (extra_loop_index, listener) in extra_listeners.into_iter().enumerate() {
-        let accept_loop_id = extra_loop_index + 1;
-        let state = loop_state.clone();
-        let shutdown_rx = shutdown.clone();
-        let global_shutdown_rx = global_shutdown.clone();
-        handles.push(tokio::spawn(async move {
-            if let Err(e) = run_tcp_accept_loop(
-                listener,
-                state,
-                shutdown_rx,
-                global_shutdown_rx,
-                accept_loop_id,
-            )
-            .await
-            {
-                warn!(
-                    accept_loop = accept_loop_id,
-                    "TCP proxy accept loop exited with error: {}", e
-                );
-            }
-        }));
     }
 
     started.store(true, Ordering::Release);
@@ -1197,12 +1406,60 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         addr
     );
 
-    run_tcp_accept_loop(first_listener, loop_state, shutdown, global_shutdown, 0).await?;
-    for handle in handles {
-        let _ = handle.await;
+    // Single accept loop: keep the zero-spawn hot path. Multi-loop mode
+    // supervises primary + every SO_REUSEPORT peer concurrently so an
+    // unexpected exit cannot silently reduce capacity while readiness stays
+    // healthy (issue #3216).
+    if listeners.len() == 1 {
+        let listener = listeners
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("TCP listener set unexpectedly empty"))?;
+        let result = run_tcp_accept_loop(listener, loop_state, shutdown, global_shutdown, 0).await;
+        if result.is_err() {
+            started.store(false, Ordering::Release);
+        }
+        return result;
     }
 
-    Ok(())
+    // Peer-cancel is distinct from operator/global shutdown: it only fires when
+    // one accept loop fails so siblings tear down atomically. Operator shutdown
+    // still flows through the existing per-listener / global watch channels and
+    // must remain a clean `Ok` (not an operational failure).
+    let (peer_cancel_tx, peer_cancel_rx) = watch::channel(false);
+    let mut peers = Vec::with_capacity(listeners.len());
+    for (accept_loop_id, listener) in listeners.into_iter().enumerate() {
+        let class = TcpAcceptLoopClass::from_loop_id(accept_loop_id);
+        let state = loop_state.clone();
+        let shutdown_rx = shutdown.clone();
+        let global_shutdown_rx = global_shutdown.clone();
+        let peer_cancel_rx = peer_cancel_rx.clone();
+        peers.push((
+            class,
+            tokio::spawn(async move {
+                run_supervised_tcp_accept_loop(
+                    listener,
+                    state,
+                    shutdown_rx,
+                    global_shutdown_rx,
+                    peer_cancel_rx,
+                    accept_loop_id,
+                )
+                .await
+            }),
+        ));
+    }
+
+    let result = supervise_tcp_accept_loop_peers(peers, move || {
+        let _ = peer_cancel_tx.send(true);
+    })
+    .await;
+    if result.is_err() {
+        // Unexpected peer exit must not leave started/readiness healthy while
+        // accept capacity is gone. Shutdown-triggered Ok leaves started as-is;
+        // the owning StreamListenerManager clears handles on remove/shutdown.
+        started.store(false, Ordering::Release);
+    }
+    result
 }
 
 async fn run_tcp_accept_loop(
@@ -1256,6 +1513,7 @@ async fn run_tcp_accept_loop(
 
                 let port = state.port;
                 let proxy_id = state.proxy_id.clone();
+                let proxy_namespace = state.proxy_namespace.clone();
                 let dns_cache = state.dns_cache.clone();
                 let request_epoch = state.request_epoch.clone();
                 let health_checker = state.health_checker.clone();
@@ -1313,7 +1571,7 @@ async fn run_tcp_accept_loop(
                     // consumption from one snapshot and route with another.
                     let epoch = request_epoch.load();
                     let proxy_protocol_enabled = epoch
-                        .proxy_by_id(proxy_id.as_ref())
+                        .proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref())
                         .and_then(|p| p.stream_proxy_protocol)
                         .unwrap_or(false);
 
@@ -1377,7 +1635,8 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                             &node_waypoint_identity_warn_limiter,
                         );
-                    let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
+                    let base_proxy =
+                        epoch.proxy_by_namespaced_id(proxy_namespace.as_ref(), proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
 
@@ -1396,9 +1655,17 @@ async fn run_tcp_accept_loop(
                             .unwrap_or(BackendScheme::Tcp),
                         consumer_index,
                     );
-                    stream_ctx.proxy_lifecycle_generation = epoch
-                        .plugin_cache
-                        .proxy_lifecycle_generation(proxy_id.as_ref());
+                    // Authoritative owning namespace for this connection. SNI
+                    // resolution on a shared passthrough port may replace both
+                    // `proxy_id` and this field with the matched candidate's
+                    // identity; the disconnect path below reads it back so
+                    // plugin/lifecycle lookups stay on the right tenant.
+                    stream_ctx.proxy_namespace = proxy_namespace.to_string();
+                    stream_ctx.proxy_lifecycle_generation = base_proxy.and_then(|p| {
+                        epoch
+                            .plugin_cache
+                            .proxy_lifecycle_generation(&p.namespace, &p.id)
+                    });
                     // Populated above from the node-waypoint resolver in
                     // NodeWaypoint topology so `mesh_authz` enforces
                     // namespace/selector-scoped policies per source pod
@@ -1428,6 +1695,7 @@ async fn run_tcp_accept_loop(
                         stream,
                         remote_addr,
                         &proxy_id,
+                        &proxy_namespace,
                         &epoch,
                         &health_checker,
                         &dns_cache,
@@ -1460,14 +1728,20 @@ async fn run_tcp_accept_loop(
                     // config reloads; using the connection epoch preserves a
                     // consistent view of SNI-selected proxy metadata and
                     // stream plugins for the full connection lifetime.
-                    let final_proxy = epoch.proxy_by_id(&final_proxy_id);
-                    let plugins = epoch
-                        .plugin_cache
-                        .get_plugins_for_protocol(&final_proxy_id, ProxyProtocol::Tcp);
+                    // `stream_ctx.proxy_namespace` is the exact namespace this
+                    // connection was admitted under (listener identity, or the
+                    // SNI-matched candidate's namespace). Never re-derive it by
+                    // scanning: a same-ID proxy in another namespace would be
+                    // indistinguishable.
+                    let final_proxy_namespace = stream_ctx.proxy_namespace.clone();
+                    let final_proxy =
+                        epoch.proxy_by_namespaced_id(&final_proxy_namespace, &final_proxy_id);
+                    let plugins = epoch.plugin_cache.plugins_for_protocol(
+                        &final_proxy_namespace,
+                        &final_proxy_id,
+                        ProxyProtocol::Tcp,
+                    );
                     let proxy_name = stream_ctx.proxy_name.clone();
-                    let proxy_namespace = final_proxy
-                        .map(|p| p.namespace.clone())
-                        .unwrap_or_else(crate::config::types::default_namespace);
                     let backend_scheme = final_proxy
                         .map(|p| p.effective_scheme())
                         .unwrap_or(stream_ctx.backend_scheme);
@@ -1570,7 +1844,7 @@ async fn run_tcp_accept_loop(
                             None
                         };
                         let summary = StreamTransactionSummary {
-                            namespace: proxy_namespace,
+                            namespace: final_proxy_namespace,
                             proxy_id: final_proxy_id,
                             proxy_lifecycle_generation: stream_ctx.proxy_lifecycle_generation,
                             proxy_name,
@@ -1693,6 +1967,7 @@ struct TcpConnParams {
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
 /// Includes circuit breaker config and target key for circuit breaker checks.
 struct TcpConnCbInfo {
+    namespace: String,
     cb_config: Option<crate::config::types::CircuitBreakerConfig>,
     cb_target_key: Option<String>,
     is_half_open_probe: bool,
@@ -1810,6 +2085,9 @@ async fn handle_tcp_connection(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    // Namespace owning the listener's `proxy_id`. Replaced per connection when
+    // SNI resolves a different namespace-qualified candidate.
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -1820,7 +2098,7 @@ async fn handle_tcp_connection(
     frontend_tls_handshake_timeout_seconds: u64,
     circuit_breaker_cache: &CircuitBreakerCache,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -1852,6 +2130,7 @@ async fn handle_tcp_connection(
         client_stream,
         remote_addr,
         proxy_id,
+        proxy_namespace,
         epoch,
         health_checker,
         dns_cache,
@@ -2092,6 +2371,7 @@ async fn handle_tcp_connection_inner(
     client_stream: TcpStream,
     remote_addr: SocketAddr,
     proxy_id: &str,
+    proxy_namespace: &str,
     epoch: &RequestEpoch,
     health_checker: &HealthChecker,
     dns_cache: &DnsCache,
@@ -2104,7 +2384,7 @@ async fn handle_tcp_connection_inner(
     start: Instant,
     backend_info: &mut TcpBackendInfo,
     stream_ctx: &mut StreamConnectionContext,
-    sni_proxy_ids: Option<&[String]>,
+    sni_proxy_ids: Option<&[NamespacedResourceId]>,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
     tcp_fastopen: bool,
     ktls_enabled: bool,
@@ -2130,8 +2410,11 @@ async fn handle_tcp_connection_inner(
     // --- SNI-based proxy resolution for shared passthrough ports ---
     // When multiple passthrough proxies share a listen_port, we must peek at
     // the ClientHello to extract SNI before looking up the proxy config.
-    let _resolved_proxy_id: Option<String>;
-    let proxy_id = if let Some(sni_ids) = sni_proxy_ids {
+    // A shared passthrough port may host same-ID proxies from different
+    // namespaces, so the match is a full `(namespace, id)` identity and both
+    // halves replace the listener's defaults for the rest of this connection.
+    let listener_namespace = proxy_namespace;
+    let resolved_identity: Option<NamespacedResourceId> = if let Some(sni_ids) = sni_proxy_ids {
         let sni = super::sni::extract_sni_from_tcp_stream(&client_stream, sni_peek_timeout).await;
         stream_ctx.sni_hostname = sni.clone();
 
@@ -2142,21 +2425,43 @@ async fn handle_tcp_connection_inner(
                     sni,
                     stream_ctx.listen_port
                 )
-            })?;
-        _resolved_proxy_id = Some(matched.to_string());
-        // Update stream_ctx to reflect the resolved proxy
-        stream_ctx.proxy_id = matched.to_string();
-        stream_ctx.proxy_name = epoch.proxy_by_id(matched).and_then(|p| p.name.clone());
-        _resolved_proxy_id.as_deref().unwrap_or(proxy_id)
+            })?
+            .clone();
+        // Update stream_ctx to reflect the resolved proxy identity.
+        stream_ctx.proxy_namespace = matched.namespace.clone();
+        stream_ctx.proxy_id = matched.id.clone();
+        stream_ctx.proxy_name = epoch
+            .proxy_by_namespaced_id(&matched.namespace, &matched.id)
+            .and_then(|p| p.name.clone());
+        Some(matched)
     } else {
-        _resolved_proxy_id = None;
-        proxy_id
+        None
+    };
+    let (proxy_namespace, proxy_id) = match &resolved_identity {
+        Some(resolved) => (resolved.namespace.as_str(), resolved.id.as_str()),
+        None => (listener_namespace, proxy_id),
     };
 
     // Look up the proxy config and extract only the fields we need.
     let proxy = epoch
-        .proxy_by_id(proxy_id)
-        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
+        .proxy_by_namespaced_id(proxy_namespace, proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {proxy_namespace}/{proxy_id} not found in config"))?;
+
+    if resolved_identity.is_some() {
+        // The accept loop stamped the generation from the listener's
+        // REPRESENTATIVE identity (the first SNI candidate). SNI has now
+        // selected a different `(namespace, id)`, and the disconnect summary
+        // reports that matched identity — so the generation must be re-read for
+        // it. Leaving the representative's generation attached would hand
+        // `proxy_alerts` an ownership token minted for another tenant's
+        // lifecycle row, which fails the `owns_proxy_generation` check and
+        // silently drops every alert for the matched proxy (issue #3094).
+        // Mirrors the UDP capture path, which re-reads after its own
+        // resolution. Non-SNI listeners keep the accept-loop stamp.
+        stream_ctx.proxy_lifecycle_generation = epoch
+            .plugin_cache
+            .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
+    }
 
     let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();
@@ -2177,6 +2482,7 @@ async fn handle_tcp_connection_inner(
             .map(|_| crate::circuit_breaker::target_key(&backend_host, backend_port));
 
         let cb_info = TcpConnCbInfo {
+            namespace: proxy.namespace.clone(),
             cb_config: proxy.circuit_breaker.clone(),
             cb_target_key,
             is_half_open_probe: false,
@@ -2233,9 +2539,10 @@ async fn handle_tcp_connection_inner(
         remote_addr.ip(),
     )?;
 
-    let plugins = epoch
-        .plugin_cache
-        .get_plugins_for_protocol(proxy_id, ProxyProtocol::Tcp);
+    let plugins =
+        epoch
+            .plugin_cache
+            .plugins_for_protocol(&proxy.namespace, proxy_id, ProxyProtocol::Tcp);
 
     // Whether any plugin (e.g. the WAF) wants the opening client bytes captured
     // into `stream_ctx.first_bytes` before `on_stream_connect` runs. Computed
@@ -2311,6 +2618,7 @@ async fn handle_tcp_connection_inner(
         // half-open probe flag for the matching record_success/failure call.
         if let Some(ref cb_config) = cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2369,18 +2677,19 @@ async fn handle_tcp_connection_inner(
         // half-open probe slot claimed by can_execute above is released —
         // otherwise an unresolvable passthrough hostname wedges HALF_OPEN
         // until reload.
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &params.backend_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2403,9 +2712,6 @@ async fn handle_tcp_connection_inner(
                 ));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, params.backend_port);
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the passthrough path. The cap is checked before connect so we don't
         // count failed handshakes against the cap. The guard's RAII drop
@@ -2431,6 +2737,7 @@ async fn handle_tcp_connection_inner(
                 // traffic cannot wedge HALF_OPEN.
                 if let Some(ref cb_config) = cb_info.cb_config {
                     let cb = circuit_breaker_cache.get_or_create(
+                        &cb_info.namespace,
                         proxy_id,
                         cb_info.cb_target_key.as_deref(),
                         cb_config,
@@ -2451,19 +2758,35 @@ async fn handle_tcp_connection_inner(
 
         // Connect plain TCP to backend (no TLS origination — the client's encrypted
         // stream passes through directly to the backend which terminates TLS).
-        let backend_stream =
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect_err(|_| {
-                    if let Some(ref cb_config) = cb_info.cb_config {
-                        let cb = circuit_breaker_cache.get_or_create(
-                            proxy_id,
-                            cb_info.cb_target_key.as_deref(),
-                            cb_config,
-                        );
-                        cb.record_failure(502, true, cb_info.is_half_open_probe);
-                    }
-                })?;
+        let (backend_stream, addr) = crate::dns::connect_candidates(
+            &candidates,
+            params.backend_port,
+            connect_timeout,
+            |addr| {
+                connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        })
+        .inspect_err(|_| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = circuit_breaker_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        })?;
+        backend_info.backend_resolved_ip = Some(addr.ip().to_string());
 
         // Apply DR `connectionPool.tcp.tcpKeepalive` on the freshly connected
         // backend socket. Best-effort: a `setsockopt` failure logs and
@@ -2475,7 +2798,7 @@ async fn handle_tcp_connection_inner(
         );
 
         let _backend_session_guard = TcpBackendSessionGuard::new(metrics);
-        let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+        let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
 
         // On Linux, use splice(2) for zero-copy relay between raw TCP sockets.
         // Passthrough mode is always plain-to-plain (no TLS termination/origination).
@@ -2526,6 +2849,7 @@ async fn handle_tcp_connection_inner(
         // gate only affects buffer-size adaptation.
         if copy_result.first_failure.is_none() {
             adaptive_buffer.record_connection(
+                &proxy.namespace,
                 proxy_id,
                 copy_result
                     .bytes_client_to_backend
@@ -2536,6 +2860,7 @@ async fn handle_tcp_connection_inner(
         // Record circuit breaker outcome.
         if let Some(ref cb_config) = cb_info.cb_config {
             let cb = circuit_breaker_cache.get_or_create(
+                &cb_info.namespace,
                 proxy_id,
                 cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2710,28 +3035,36 @@ async fn handle_tcp_connection_inner(
     };
 
     // Helper: record circuit breaker failure for the current target.
-    let record_cb_failure = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_failure(502, true, cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_failure =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_failure(502, true, cb_info.is_half_open_probe);
+            }
+        };
 
     // Helper: release a half-open probe slot claimed by `can_execute` without
     // recording success or failure. Used when the gateway rejects the
     // connection locally (DestinationRule maxConnections cap), which is not a
     // backend outcome — `record_neutral` decrements `half_open_in_flight` only
     // when a probe was held and leaves breaker health untouched.
-    let record_cb_neutral = |cb_cache: &CircuitBreakerCache,
-                             proxy_id: &str,
-                             cb_info: &TcpConnCbInfo| {
-        if let Some(ref cb_config) = cb_info.cb_config {
-            let cb = cb_cache.get_or_create(proxy_id, cb_info.cb_target_key.as_deref(), cb_config);
-            cb.record_neutral(cb_info.is_half_open_probe);
-        }
-    };
+    let record_cb_neutral =
+        |cb_cache: &CircuitBreakerCache, proxy_id: &str, cb_info: &TcpConnCbInfo| {
+            if let Some(ref cb_config) = cb_info.cb_config {
+                let cb = cb_cache.get_or_create(
+                    &cb_info.namespace,
+                    proxy_id,
+                    cb_info.cb_target_key.as_deref(),
+                    cb_config,
+                );
+                cb.record_neutral(cb_info.is_half_open_probe);
+            }
+        };
 
     // Connection-phase retry loop. Retries DNS resolution + backend connect
     // with a different load-balanced target on each attempt. Once a backend
@@ -2756,6 +3089,7 @@ async fn handle_tcp_connection_inner(
         // for actual probe requests.
         if let Some(ref cb_config) = current_cb_info.cb_config {
             match circuit_breaker_cache.can_execute(
+                &current_cb_info.namespace,
                 proxy_id,
                 current_cb_info.cb_target_key.as_deref(),
                 cb_config,
@@ -2789,6 +3123,7 @@ async fn handle_tcp_connection_inner(
                             current_port = next.1;
                             current_policy_port = next.2;
                             current_cb_info = TcpConnCbInfo {
+                                namespace: current_cb_info.namespace.clone(),
                                 cb_config: current_cb_info.cb_config.clone(),
                                 cb_target_key: params.upstream_id.as_ref().map(|_| {
                                     crate::circuit_breaker::target_key(&current_host, current_port)
@@ -2814,15 +3149,15 @@ async fn handle_tcp_connection_inner(
         }
 
         // Resolve backend IP via DNS
-        let resolved_ip = match dns_cache
-            .resolve(
+        let candidates = match dns_cache
+            .resolve_candidates(
                 &current_host,
                 params.dns_override.as_deref(),
                 params.dns_cache_ttl_seconds,
             )
             .await
         {
-            Ok(ip) => ip,
+            Ok(addresses) => addresses,
             Err(e) => {
                 // A backend-egress-policy denial means no backend was dialed, so
                 // keep circuit-breaker accounting neutral (a denied literal/rebound
@@ -2864,6 +3199,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -2884,10 +3220,6 @@ async fn handle_tcp_connection_inner(
                 return Err(anyhow::anyhow!(err_msg));
             }
         };
-        let addr = SocketAddr::new(resolved_ip, current_port);
-        // DNS succeeded — record the resolved IP for logging.
-        backend_info.backend_resolved_ip = Some(resolved_ip.to_string());
-
         // DestinationRule `connectionPool.tcp.maxConnections` enforcement on
         // the non-passthrough connect path. Checked once per retry attempt
         // so failed dials don't consume slots; the guard's `Drop` impl
@@ -2942,6 +3274,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -2975,34 +3308,58 @@ async fn handle_tcp_connection_inner(
         };
 
         // Attempt backend TCP connection (with optional TLS origination)
-        let connect_result = if is_backend_tls {
-            connect_backend_tls_cached(
-                addr,
-                &current_host,
-                connect_timeout,
-                cached_backend_tls,
-                params.tcp_fastopen_enabled,
-                overload,
-                current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                proxy_id,
-            )
-            .await
-            .map(|s| BackendStream::Tls(Box::new(s)))
-        } else {
-            connect_backend_plain(addr, connect_timeout, params.tcp_fastopen_enabled, overload)
-                .await
-                .inspect(|stream| {
-                    apply_backend_tcp_keepalive(
-                        proxy_id,
-                        stream,
+        let current_host_ref = current_host.as_str();
+        let params_ref = &params;
+        let connect_result = crate::dns::connect_candidates(
+            &candidates,
+            current_port,
+            connect_timeout,
+            |addr| async move {
+                if is_backend_tls {
+                    connect_backend_tls_cached(
+                        addr,
+                        current_host_ref,
+                        connect_timeout,
+                        cached_backend_tls,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
                         current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
-                    );
-                })
-                .map(BackendStream::Plain)
-        };
+                        proxy_id,
+                    )
+                    .await
+                    .map(|stream| BackendStream::Tls(Box::new(stream)))
+                } else {
+                    connect_backend_plain(
+                        addr,
+                        connect_timeout,
+                        params_ref.tcp_fastopen_enabled,
+                        overload,
+                    )
+                    .await
+                    .inspect(|stream| {
+                        apply_backend_tcp_keepalive(
+                            proxy_id,
+                            stream,
+                            current_port_override.and_then(|o| o.tcp_keepalive.as_ref()),
+                        );
+                    })
+                    .map(BackendStream::Plain)
+                }
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::dns::CandidateConnectError::TimedOut { last_addr } => anyhow::anyhow!(
+                "Backend TCP connect budget exhausted after {}ms (last={})",
+                params.backend_connect_timeout_ms,
+                last_addr
+            ),
+            crate::dns::CandidateConnectError::Failed { source, .. } => source,
+        });
 
         match connect_result {
-            Ok(_stream) => {
+            Ok((_stream, addr)) => {
+                backend_info.backend_resolved_ip = Some(addr.ip().to_string());
                 // Connection succeeded — break out of retry loop with the
                 // address, carrying the inflight guard so the per-target
                 // counter is decremented at relay exit.
@@ -3037,6 +3394,7 @@ async fn handle_tcp_connection_inner(
                     current_port = next.1;
                     current_policy_port = next.2;
                     current_cb_info = TcpConnCbInfo {
+                        namespace: current_cb_info.namespace.clone(),
                         cb_config: current_cb_info.cb_config.clone(),
                         cb_target_key: params.upstream_id.as_ref().map(|_| {
                             crate::circuit_breaker::target_key(&current_host, current_port)
@@ -3087,7 +3445,7 @@ async fn handle_tcp_connection_inner(
     let copy_result = match client_stream {
         ClientRelayStream::Tls(tls_stream) => {
             let tls_stream = *tls_stream;
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     bidirectional_copy(
@@ -3200,7 +3558,7 @@ async fn handle_tcp_connection_inner(
             }
         }
         ClientRelayStream::Plain(client_stream) => {
-            let buf_size = adaptive_buffer.get_buffer_size(proxy_id);
+            let buf_size = adaptive_buffer.get_buffer_size(&proxy.namespace, proxy_id);
             match backend_stream {
                 BackendStream::Tls(bs) => {
                     used_splice = false;
@@ -3274,6 +3632,7 @@ async fn handle_tcp_connection_inner(
     // outage bursts.
     if copy_result.first_failure.is_none() {
         adaptive_buffer.record_connection(
+            &proxy.namespace,
             proxy_id,
             copy_result
                 .bytes_client_to_backend
@@ -3284,6 +3643,7 @@ async fn handle_tcp_connection_inner(
     // Record circuit breaker outcome based on copy result.
     if let Some(ref cb_config) = current_cb_info.cb_config {
         let cb = circuit_breaker_cache.get_or_create(
+            &current_cb_info.namespace,
             proxy_id,
             current_cb_info.cb_target_key.as_deref(),
             cb_config,
@@ -3379,8 +3739,11 @@ fn resolve_backend_target(
     lb_hash_key: &str,
 ) -> Result<TcpResolvedBackendTarget, anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let override_port =
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let override_port = LoadBalancerCache::initial_dispatch_port_override_from(
+            lb_snapshot,
+            &proxy.namespace,
+            upstream_id,
+        );
         let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
             proxy,
             lb_snapshot,
@@ -3406,6 +3769,7 @@ fn resolve_backend_target(
             if let Some(port) = port_lane {
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     lb_hash_key,
                     port,
@@ -3415,6 +3779,7 @@ fn resolve_backend_target(
             } else {
                 LoadBalancerCache::select_target_subset_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     lb_hash_key,
                     subset_name,
@@ -3424,6 +3789,7 @@ fn resolve_backend_target(
         } else if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
@@ -3432,6 +3798,7 @@ fn resolve_backend_target(
         } else {
             LoadBalancerCache::select_target_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 Some(&health_ctx),
@@ -3515,6 +3882,7 @@ fn stream_port_override_affects_selection(
             || (override_config.hash_on.is_some()
                 && LoadBalancerCache::effective_algorithm_from(
                     lb_snapshot,
+                    &proxy.namespace,
                     upstream_id,
                     Some(port),
                     proxy.upstream_subset.as_deref(),
@@ -3537,6 +3905,7 @@ fn validate_stream_hash_on(
 ) -> Result<(), anyhow::Error> {
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         lb_snapshot,
+        &proxy.namespace,
         upstream_id,
         Some(port),
         proxy.upstream_subset.as_deref(),
@@ -3710,7 +4079,7 @@ mod backend_target_selection_tests {
         proxy.upstream_id = Some("orders".to_string());
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -3738,6 +4107,7 @@ mod backend_target_selection_tests {
             ..Default::default()
         };
         health_checker.report_response(
+            &proxy.namespace,
             &proxy.id,
             "tcp-upstream",
             &unhealthy_target,
@@ -3887,7 +4257,7 @@ mod backend_target_selection_tests {
         let proxy = proxy_with_subset(None);
         let health_checker = HealthChecker::new();
         health_checker.active_unhealthy_targets.insert(
-            crate::load_balancer::target_key("orders", &unhealthy_target),
+            crate::load_balancer::target_key("ferrum|orders", &unhealthy_target),
             1,
         );
 
@@ -4020,7 +4390,7 @@ mod backend_target_selection_tests {
             .find_map(|i| {
                 let key = format!("198.51.100.{i}");
                 let initial = LoadBalancerCache::select_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, None,
                 )?;
                 let exclude = UpstreamTarget {
                     host: initial.target.host.clone(),
@@ -4032,10 +4402,11 @@ mod backend_target_selection_tests {
                     locality: None,
                 };
                 let expected = LoadBalancerCache::select_next_target_for_port_from(
-                    &snapshot, "orders", &key, 5432, &exclude, None,
+                    &snapshot, "ferrum", "orders", &key, 5432, &exclude, None,
                 )?;
                 let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
                     &snapshot,
+                    "ferrum",
                     "orders",
                     &initial.target.host,
                     5432,
@@ -4074,7 +4445,7 @@ mod backend_target_selection_tests {
             locality: None,
         };
         let expected = LoadBalancerCache::select_next_target_for_port_from(
-            &snapshot, "orders", &flow_key, 5432, &exclude, None,
+            &snapshot, "ferrum", "orders", &flow_key, 5432, &exclude, None,
         )
         .expect("expected retry target");
         assert_eq!(host, expected.host);
@@ -4598,6 +4969,7 @@ fn try_next_target(
         (Some(subset_name), Some(port)) => {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 lb_snapshot,
+                &proxy.namespace,
                 upstream_id,
                 lb_hash_key,
                 port,
@@ -4608,6 +4980,7 @@ fn try_next_target(
         }
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             subset_name,
@@ -4616,6 +4989,7 @@ fn try_next_target(
         ),
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             port,
@@ -4624,6 +4998,7 @@ fn try_next_target(
         ),
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
+            &proxy.namespace,
             upstream_id,
             lb_hash_key,
             &exclude,
@@ -5381,9 +5756,13 @@ fn poll_ready_watchdog_ticks(
 /// skipping the Phase 1/Phase 2 machinery. This restores the historical
 /// zero-overhead behaviour for deployments that explicitly disable all relay
 /// bounds. The trade-off: on error the fast path loses `first_failure`
-/// direction attribution (reports `Direction::Unknown`) — acceptable because
-/// the user opted out of those observability bounds. Clean completion preserves
-/// per-direction byte counts.
+/// direction attribution (reports `Direction::Unknown`) and reports zero
+/// per-direction byte counts — tokio's bidirectional copy does not expose
+/// partial totals on `Err`. That zero-on-error shape is intentional and
+/// reachable only when the operator sets idle timeout, half-close cap, and
+/// both backend inactivity timeouts to `0`; any non-zero bound opts into
+/// the direction-tracking path which preserves counters. Clean completion
+/// preserves per-direction byte counts.
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
@@ -5400,7 +5779,10 @@ where
     // Fast path: all per-direction bounds disabled → use tokio's optimised
     // bidirectional copy directly. No split (no BiLock overhead), no select
     // loop. On error we classify with `Direction::Unknown` because
-    // `copy_bidirectional_with_sizes` doesn't report which half failed first.
+    // `copy_bidirectional_with_sizes` doesn't report which half failed first,
+    // and we report zero byte counts because that API does not return partial
+    // totals on `Err` (intentional trade-off for the all-bounds-disabled
+    // path; see the function-level doc).
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
     // direction-tracking path — they wrap individual `read`/`write` polls,
     // which tokio's bidirectional copy does not expose. Any non-zero timeout
@@ -6613,7 +6995,7 @@ async fn bidirectional_splice_io_uring(
             c2b_write_wm_worker.as_deref(),
             backend_write_timeout_ms,
         );
-        if let Err((side, ref e)) = res {
+        if let Err((_bytes, side, ref e)) = res {
             let msg = e.to_string();
             let entry = classify_splice_worker_failure(Direction::ClientToBackend, side, &msg, e);
             let _ = ff_c2b.set(entry);
@@ -6633,7 +7015,7 @@ async fn bidirectional_splice_io_uring(
             None,
             0,
         );
-        if let Err((side, ref e)) = res {
+        if let Err((_bytes, side, ref e)) = res {
             let msg = e.to_string();
             let entry = classify_splice_worker_failure(Direction::BackendToClient, side, &msg, e);
             let _ = ff_b2c.set(entry);
@@ -6709,9 +7091,14 @@ async fn bidirectional_splice_io_uring(
         }
     };
 
+    // Extract per-direction byte totals from Ok and Err alike. Workers return
+    // `Err((bytes_so_far, side, err))` so idle/read/write timeouts and I/O
+    // failures still surface successfully delivered bytes — matching the
+    // `StreamCopyResult` contract and the async libc-splice / userspace
+    // direction-tracking paths. JoinError (panic/cancel) has no total.
     let c2b_bytes = match c2b_result {
         Ok(Ok(n)) => n,
-        Ok(Err(_)) => 0, // already recorded from inside the worker
+        Ok(Err((n, _, _))) => n,
         Err(e) => {
             // JoinError (task panicked or was cancelled) — side is not
             // meaningful. Only records if the worker didn't already set it.
@@ -6728,7 +7115,7 @@ async fn bidirectional_splice_io_uring(
     };
     let b2c_bytes = match b2c_result {
         Ok(Ok(n)) => n,
-        Ok(Err(_)) => 0,
+        Ok(Err((n, _, _))) => n,
         Err(e) => {
             let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
             let msg = anyhow_err.to_string();
@@ -6758,6 +7145,10 @@ async fn bidirectional_splice_io_uring(
 /// pressure, resource limits). The idle timeout is checked inline inside
 /// the io_uring loop to prevent indefinite blocking on idle connections.
 ///
+/// Returns `Ok(bytes)` on clean EOF, or `Err((bytes_so_far, side, err))` on
+/// timeout/I/O failure so the parent can preserve delivered bytes without
+/// shared atomics on the splice hot path.
+///
 /// `read_watermark` / `read_timeout_ms` and `write_watermark` /
 /// `write_timeout_ms` enforce `backend_read_timeout_ms` and
 /// `backend_write_timeout_ms` respectively. Pass `None` / `0` on the side
@@ -6776,7 +7167,7 @@ fn io_uring_splice_direction(
     read_timeout_ms: u64,
     write_watermark: Option<&AtomicU64>,
     write_timeout_ms: u64,
-) -> Result<u64, (StreamIoSide, anyhow::Error)> {
+) -> Result<u64, (u64, StreamIoSide, anyhow::Error)> {
     let result = match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
         src_fd,
         pipe_w,
@@ -6793,7 +7184,8 @@ fn io_uring_splice_direction(
         Err(e) if e.source.kind() == std::io::ErrorKind::Unsupported => {
             // io_uring ring creation failed — fall back to libc::splice.
             // This can happen under memlock pressure even though startup
-            // probing succeeded.
+            // probing succeeded. Unsupported is only returned before any
+            // bytes are transferred (`bytes_so_far == 0`).
             tracing::debug!("io_uring ring creation failed, falling back to libc splice");
             libc_splice_loop(
                 src_fd,
@@ -6809,6 +7201,7 @@ fn io_uring_splice_direction(
             )
         }
         Err(e) => {
+            let bytes = e.bytes_so_far;
             let side = if e.is_write_side {
                 StreamIoSide::Write
             } else {
@@ -6824,6 +7217,7 @@ fn io_uring_splice_direction(
                 let body = e.source.to_string();
                 if body.starts_with(STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX) {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!(
                             "{} (io_uring splice)",
@@ -6832,6 +7226,7 @@ fn io_uring_splice_direction(
                     ))
                 } else if body.starts_with(STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX) {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!(
                             "{} (io_uring splice)",
@@ -6840,12 +7235,17 @@ fn io_uring_splice_direction(
                     ))
                 } else {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!("{} (io_uring splice)", STREAM_SPLICE_IDLE_TIMEOUT_PREFIX),
                     ))
                 }
             } else {
-                Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
+                Err((
+                    bytes,
+                    side,
+                    anyhow::anyhow!("io_uring splice error: {}", e.source),
+                ))
             }
         }
     };
@@ -6857,15 +7257,6 @@ fn io_uring_splice_direction(
     result
 }
 
-/// Fallback libc::splice loop for when io_uring ring creation fails.
-/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
-/// on a blocking thread). Errors are tagged with the side (Read for the
-/// src_fd → pipe splice, Write for the pipe → dst_fd splice) so the
-/// caller can attribute the failure to the correct socket.
-///
-/// `read_watermark` / `read_timeout_ms` and `write_watermark` /
-/// `write_timeout_ms` mirror the io_uring path — see
-/// `io_uring_splice_direction` for which worker carries which watermark.
 #[cfg(target_os = "linux")]
 fn splice_once(in_fd: i32, out_fd: i32, len: usize, flags: u32) -> std::io::Result<isize> {
     let n = unsafe {
@@ -6993,6 +7384,18 @@ fn poll_splice_fd(fd: i32, events: libc::c_short, timeout_ms: i32) -> std::io::R
     }
 }
 
+/// Fallback libc::splice loop for when io_uring ring creation fails.
+/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
+/// on a blocking thread). Errors are tagged with the side (Read for the
+/// src_fd → pipe splice, Write for the pipe → dst_fd splice) so the
+/// caller can attribute the failure to the correct socket.
+///
+/// On timeout/I/O failure returns `Err((bytes_so_far, side, err))` so the
+/// parent preserves successfully delivered bytes (issue #2957).
+///
+/// `read_watermark` / `read_timeout_ms` and `write_watermark` /
+/// `write_timeout_ms` mirror the io_uring path — see
+/// `io_uring_splice_direction` for which worker carries which watermark.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn libc_splice_loop(
@@ -7006,7 +7409,7 @@ fn libc_splice_loop(
     read_timeout_ms: u64,
     write_watermark: Option<&AtomicU64>,
     write_timeout_ms: u64,
-) -> Result<u64, (StreamIoSide, anyhow::Error)> {
+) -> Result<u64, (u64, StreamIoSide, anyhow::Error)> {
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let mut total: u64 = 0;
     let read_wm_active = read_watermark.is_some() && read_timeout_ms > 0;
@@ -7017,6 +7420,7 @@ fn libc_splice_loop(
             let last = shared_activity.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Read,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7029,6 +7433,7 @@ fn libc_splice_loop(
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Read,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7047,6 +7452,7 @@ fn libc_splice_loop(
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Write,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7089,7 +7495,7 @@ fn libc_splice_loop(
                 };
                 if written > 0 {
                     remaining -= written as usize;
-                    total += written as u64;
+                    total = total.saturating_add(written as u64);
                     // Refresh shared idle timeout — visible to both directions.
                     let post_write_now = coarse_now_ms();
                     if timeout_ms > 0 {
@@ -7118,6 +7524,7 @@ fn libc_splice_loop(
                             let last = shared_activity.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Write,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback, write phase)",
@@ -7130,6 +7537,7 @@ fn libc_splice_loop(
                             let last = wm.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Write,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback)",
@@ -7147,6 +7555,7 @@ fn libc_splice_loop(
                             let last = wm.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Read,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback)",
@@ -7165,6 +7574,7 @@ fn libc_splice_loop(
                         );
                         if let Err(err) = poll_splice_fd(dst_fd, libc::POLLOUT, wait_ms) {
                             return Err((
+                                total,
                                 StreamIoSide::Write,
                                 anyhow::anyhow!("splice write readiness error: {}", err),
                             ));
@@ -7172,6 +7582,7 @@ fn libc_splice_loop(
                         continue;
                     }
                     return Err((
+                        total,
                         StreamIoSide::Write,
                         anyhow::anyhow!("splice write error: {}", err),
                     ));
@@ -7189,6 +7600,7 @@ fn libc_splice_loop(
                     let last = shared_activity.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Read,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback, read phase)",
@@ -7201,6 +7613,7 @@ fn libc_splice_loop(
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Read,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback)",
@@ -7216,6 +7629,7 @@ fn libc_splice_loop(
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Write,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback)",
@@ -7234,6 +7648,7 @@ fn libc_splice_loop(
                 );
                 if let Err(err) = poll_splice_fd(src_fd, libc::POLLIN, wait_ms) {
                     return Err((
+                        total,
                         StreamIoSide::Read,
                         anyhow::anyhow!("splice read readiness error: {}", err),
                     ));
@@ -7241,6 +7656,7 @@ fn libc_splice_loop(
                 continue;
             }
             return Err((
+                total,
                 StreamIoSide::Read,
                 anyhow::anyhow!("splice read error: {}", err),
             ));

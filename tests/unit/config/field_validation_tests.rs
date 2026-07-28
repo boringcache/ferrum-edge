@@ -11,7 +11,7 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, MeshSdConfig, PassiveHealthCheck,
     PluginConfig, PluginScope, Proxy, RetryConfig, SdProvider, ServiceDiscoveryConfig,
     SubsetDefinition, SubsetTrafficPolicy, Upstream, UpstreamTarget,
-    validate_basic_auth_hmac_secret,
+    validate_basic_auth_hmac_secret, validate_pem_ca_file, validate_pem_cert_file,
 };
 use ferrum_edge::modes::mesh::config::MeshTrafficPolicyTls;
 use std::collections::HashMap;
@@ -274,15 +274,17 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 }
 
 #[test]
-fn test_proxy_listen_path_rejects_encoded_slashes() {
-    // Prefix form, uppercase / lowercase single-encoded.
+fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
+    const MARKER: &str = "canonical policy path";
+
+    // Prefix form, uppercase / lowercase single-encoded separator.
     let mut proxy = make_proxy("test", "/api");
     for path in ["/api%2Fadmin", "/api%2fadmin"] {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected encoded-separator rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -291,8 +293,29 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected double-encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected double-encoding rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Escapes of characters that are legal literally in a path decode during
+    // canonicalization, so `/%61dmin` is a different (unreachable) spelling of
+    // `/admin` rather than a stricter one. Admission must refuse it.
+    proxy.listen_path = Some("/%61dmin".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains(MARKER)),
+        "expected ordinary-single-encoding rejection, got {errs:?}"
+    );
+
+    // Encoded backslash, encoded dot segment, encoded NUL, and a truncated
+    // escape are all refused for the same reason.
+    for path in ["/api%5Cadmin", "/api/%2e%2e/admin", "/api%00", "/api%2"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected non-canonical rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -300,26 +323,72 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
     proxy.listen_path = Some("=/api%2Fadmin".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected exact-form rejection, got {errs:?}"
     );
 
-    // Regex (`~…`) form is also rejected — request paths are normalized
+    // Regex (`~…`) form is also rejected — request paths are canonicalized
     // before regex evaluation, so a pattern with `%2F` could never match.
     proxy.listen_path = Some("~/api%2F.*".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected regex-form rejection, got {errs:?}"
     );
 
-    // Negative: non-slash percent escapes (e.g. `%20` for space) are allowed.
-    proxy.listen_path = Some("/api%20name".into());
-    let result = proxy.validate_fields();
-    if let Err(errs) = &result {
+    // An escape of a byte outside the `pchar` decode set (`%20` for space,
+    // `%7B` for a brace, `%C3%A9` for `é`) can neither be retained nor decoded
+    // into the forwarded target, so the runtime refuses those request paths
+    // outright and such a listen_path is dead config.
+    for path in ["/api%20name", "/api/%7Bid%7D", "/caf%C3%A9"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            !errs.iter().any(|e| e.contains("encoded slashes")),
-            "did not expect encoded-slash rejection for `%20`, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected unrepresentable-escape rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // A literal dot segment or backslash is refused too: every RFC 3986 /
+    // WHATWG normalizer removes dot segments and the `url` parser treats `\`
+    // as a separator, so neither can appear in a canonical request path and
+    // neither is reachable as a literal listen_path.
+    for path in [
+        "/api/../admin",
+        "/api/./admin",
+        "/api/..",
+        "/api\\admin",
+        "=/api/../admin",
+    ] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected literal-structure rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Negative: a `~regex` listen_path is a pattern, not a literal path. `\`
+    // and `.` are regex syntax there, and the canonical path it is matched
+    // against already cannot contain a dot segment or a backslash, so holding
+    // the pattern to the literal rules would kill a working route without
+    // closing anything.
+    for path in [r"~^/v1\.0/.*", "~^/api/v[0-9]+", "~(?i:/Api.*)"] {
+        proxy.listen_path = Some(path.into());
+        if let Err(errs) = proxy.validate_fields() {
+            assert!(
+                !errs.iter().any(|e| e.contains(MARKER)),
+                "did not expect a canonical-path rejection for pattern {path:?}, got {errs:?}"
+            );
+        }
+    }
+
+    // A `.` inside a segment is an ordinary path character and stays valid.
+    proxy.listen_path = Some("/v1.0/reports".into());
+    if let Err(errs) = proxy.validate_fields() {
+        assert!(
+            !errs.iter().any(|e| e.contains(MARKER)),
+            "did not expect a canonical-path rejection for `/v1.0/reports`, got {errs:?}"
         );
     }
 }
@@ -1675,8 +1744,7 @@ fn test_proxy_tls_cert_file_invalid_pem() {
     );
     assert!(
         errs.iter()
-            .any(|e| e.contains("backend_tls_client_key_path")
-                && e.contains("no valid private keys")),
+            .any(|e| e.contains("backend_tls_client_key_path") && e.contains("no PEM private key")),
         "Expected invalid PEM key error, got: {:?}",
         errs
     );
@@ -1707,6 +1775,90 @@ fn test_proxy_tls_key_without_cert_pairing_error() {
             .any(|e| e.contains("backend_tls_client_cert_path is missing")),
         "Expected cert/key pairing error, got: {:?}",
         errs
+    );
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_mixed_bundle_atomically() {
+    let valid = std::fs::read_to_string("tests/certs/server.crt").unwrap();
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), format!("{valid}{malformed}")).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_client_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("a mixed valid/malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_client_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[test]
+fn test_validate_pem_cert_file_rejects_all_malformed_bundle() {
+    let malformed = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+    let cert_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(cert_file.path(), malformed).unwrap();
+
+    let error = validate_pem_cert_file(
+        "backend_tls_server_ca_cert_path",
+        cert_file.path().to_str().unwrap(),
+    )
+    .expect_err("an all-malformed certificate source must fail admission");
+    assert!(
+        error.contains("backend_tls_server_ca_cert_path"),
+        "got: {error}"
+    );
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[test]
+fn test_validate_pem_ca_file_rejects_unusable_root() {
+    let ca_file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        ca_file.path(),
+        "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+
+    let error = validate_pem_ca_file(
+        "backend_tls_server_ca_cert_path",
+        ca_file.path().to_str().unwrap(),
+    )
+    .expect_err("syntactically valid but unusable DER must fail CA admission");
+    assert!(error.contains("record #1"), "got: {error}");
+    assert!(
+        error.contains("certificate failed trust-anchor admission"),
+        "got: {error}"
+    );
+}
+
+#[test]
+fn test_proxy_tls_validation_cache_keeps_cert_and_key_roles_distinct() {
+    let cert_path = std::fs::canonicalize("tests/certs/server.crt")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut proxy = make_proxy("same-source", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    proxy.backend_tls_client_cert_path = Some(cert_path.clone());
+    proxy.backend_tls_client_key_path = Some(cert_path);
+
+    let mut validated_tls_paths = std::collections::HashSet::new();
+    let errors = proxy
+        .validate_fields_with_cache(&mut validated_tls_paths, 30)
+        .expect_err("a certificate-only source must not be cache-reused as a private key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("backend_tls_client_key_path")
+                && error.contains("no PEM private key")),
+        "got: {errors:?}"
     );
 }
 

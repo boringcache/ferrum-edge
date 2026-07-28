@@ -20,6 +20,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
+use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::CpGrpcServer;
 use ferrum_edge::grpc::dp_client::{self, DpCpConnectionState, DpGrpcTlsConfig, GrpcJwtSecret};
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
@@ -40,6 +41,17 @@ const TEST_JWT_SECRET: &str = "test-grpc-secret-key";
 /// Wrap the test secret in `GrpcJwtSecret` for type-safe calls.
 fn test_secret() -> GrpcJwtSecret {
     GrpcJwtSecret::new(TEST_JWT_SECRET.to_string())
+}
+
+fn generate_local_mesh_jwt(node_id: &str) -> String {
+    dp_client::generate_dp_jwt_full(
+        TEST_JWT_SECRET,
+        node_id,
+        TEST_DEFAULT_ISSUER,
+        None,
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
+    )
+    .expect("local mesh JWT should mint")
 }
 
 /// Create a test Proxy entry.
@@ -373,6 +385,93 @@ async fn start_test_cp_server(
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     (addr, update_tx, handle)
+}
+
+/// A CP gRPC server whose transport can actually be severed mid-stream.
+///
+/// `start_test_cp_server` runs tonic on the *test* runtime, and tonic spawns a
+/// detached `tokio::spawn` task per accepted connection (`serve_connection` in
+/// `tonic::transport::server`). Aborting the returned `JoinHandle` therefore
+/// only drops the accept loop and its listener — every already-established
+/// ConfigSync stream keeps being served forever. A DP connected to such a
+/// "killed" CP never observes EOF, never fails over, and every assertion that
+/// depends on failover silently becomes vacuous.
+///
+/// This variant owns a dedicated runtime instead. Shutting that runtime down
+/// drops the accept loop *and* every per-connection task, closing their
+/// sockets, so the DP sees the CP go away exactly as it would in production.
+struct SeverableTestCpServer {
+    addr: SocketAddr,
+    /// Held for parity with `start_test_cp_server` so a future test can push
+    /// deltas from a severable CP. The served `CpGrpcServer` owns its own
+    /// sender, so this clone is not load-bearing for broadcasts.
+    _update_tx: tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl SeverableTestCpServer {
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// Close the listener and every established stream on this CP.
+    ///
+    /// `shutdown_background` is used rather than dropping the runtime so this is
+    /// safe to call from inside the test's async context.
+    fn sever(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl Drop for SeverableTestCpServer {
+    fn drop(&mut self) {
+        self.sever();
+    }
+}
+
+/// Start a CP whose established ConfigSync streams can be severed on demand.
+///
+/// See [`SeverableTestCpServer`] for why `start_test_cp_server` cannot do this.
+async fn start_severable_test_cp_server(config: GatewayConfig) -> SeverableTestCpServer {
+    let config_arc = Arc::new(ArcSwap::new(Arc::new(config)));
+    let (server, update_tx) = CpGrpcServer::new(config_arc.clone(), TEST_JWT_SECRET.to_string());
+    let (mesh_server, _mesh_update_tx) =
+        MeshGrpcServer::new(config_arc, TEST_JWT_SECRET.to_string());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("dedicated CP runtime should build");
+
+    // The listener must be bound on the runtime that will serve it: a socket
+    // registered with one reactor cannot be polled from another.
+    let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+    runtime.spawn(async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        if addr_tx.send(addr).is_err() {
+            return;
+        }
+        // Never `expect` here: the future is dropped by `sever()`, and a
+        // shutdown-time error is the expected outcome, not a test failure.
+        let _ = Server::builder()
+            .add_service(server.into_service())
+            .add_service(mesh_server.into_service())
+            .serve_with_incoming(incoming)
+            .await;
+    });
+
+    let addr = addr_rx.await.expect("CP listener should bind");
+
+    SeverableTestCpServer {
+        addr,
+        _update_tx: update_tx,
+        runtime: Some(runtime),
+    }
 }
 
 /// Start a CP with the supplied correlation/client-attribution ownership value.
@@ -767,7 +866,7 @@ async fn test_dp_clears_gateway_trust_bundles_from_explicit_side_channel_null() 
 async fn test_mesh_subscribe_receives_initial_mesh_slice() {
     let cp_config = create_test_mesh_config();
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
-    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let token = generate_local_mesh_jwt("mesh-node");
     let auth_header = format!("Bearer {token}");
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
@@ -795,6 +894,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -855,7 +955,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
     }));
 
     let (addr, _update_tx, _server_handle) = start_test_cp_server(cp_config).await;
-    let token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "mesh-node").unwrap();
+    let token = generate_local_mesh_jwt("mesh-node");
     let auth_header = format!("Bearer {token}");
     let channel =
         tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{}", addr.port()))
@@ -883,6 +983,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         labels: HashMap::new(),
         waypoint_name: "api-waypoint".to_string(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1541,10 +1642,12 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
     let cp_config = create_test_mesh_config();
     let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
 
-    let token = dp_client::generate_dp_jwt_with_issuer(
+    let token = dp_client::generate_dp_jwt_full(
         TEST_JWT_SECRET,
         "mesh-iss-bad",
         "some-other-service",
+        None,
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )
     .unwrap();
     let mut client = connect_mesh_client_with_token!(addr, token);
@@ -1557,6 +1660,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -2003,16 +2107,26 @@ async fn test_dp_keeps_last_good_snapshot_after_case_ambiguous_mtls_dns_update()
 async fn test_dp_preserves_config_after_cp_shutdown() {
     // This test verifies that when the CP goes down, the DP preserves its cached config
     // and the start_dp_client_with_shutdown loop keeps running (doesn't crash).
+    //
+    // The CP must be *severable*: aborting a `start_test_cp_server` handle only
+    // drops tonic's accept loop, and the established ConfigSync stream keeps
+    // being served by a detached per-connection task. The DP would never see the
+    // CP go away, so "config is preserved after CP shutdown" would hold for the
+    // trivial reason that no shutdown ever happened.
 
     // Start CP server with initial config
     let cp_config = create_test_config(2);
-    let (addr, _update_tx, server_handle) = start_test_cp_server(cp_config).await;
+    let mut cp = start_severable_test_cp_server(cp_config).await;
 
     let proxy_state = create_test_proxy_state();
-    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let cp_url = cp.url();
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
 
     // Use the DP client loop with auto-reconnect logic.
     let ps = proxy_state.clone();
+    let cs = connection_state.clone();
     let url_clone = cp_url.clone();
     let client_handle = tokio::spawn(async move {
         dp_client::start_dp_client_with_shutdown_and_startup_ready(
@@ -2025,7 +2139,7 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
             None,
             "ferrum".to_string(),
             0,
-            None,
+            Some(cs),
             None,
         )
         .await;
@@ -2045,10 +2159,18 @@ async fn test_dp_preserves_config_after_cp_shutdown() {
         received.is_ok(),
         "Should receive initial config with 2 proxies"
     );
+    assert!(
+        wait_for_connected(&connection_state, Duration::from_secs(5)).await,
+        "DP should report an established ConfigSync stream before the CP is severed"
+    );
 
-    // Shut down CP server
-    server_handle.abort();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Shut down CP server — listener and every established stream.
+    cp.sever();
+    assert!(
+        wait_for_disconnected(&connection_state, Duration::from_secs(30)).await,
+        "DP must actually observe the CP going away — otherwise the preservation \
+         assertions below hold vacuously"
+    );
 
     // Verify cached config is preserved (the key behavior)
     assert_eq!(
@@ -3888,7 +4010,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
     let (addr, _update_tx, server_handle) =
         start_test_cp_server_with_namespace(cp_config, "production").await;
 
-    let generated_token = dp_client::generate_dp_jwt(TEST_JWT_SECRET, "test-mesh-dp").unwrap();
+    let generated_token = generate_local_mesh_jwt("test-mesh-dp");
     let mut client = connect_mesh_client_with_token!(addr, generated_token);
 
     let request = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
@@ -3899,6 +4021,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -4615,14 +4738,17 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     // serving the newer active config.
     let mut newer = create_test_config(3);
     newer.loaded_at = Utc::now();
-    let (newer_addr, _newer_tx, newer_handle) = start_test_cp_server(newer).await;
+    // Severable: aborting a `start_test_cp_server` handle leaves the DP's
+    // established stream alive, so the DP would never fail over and every
+    // assertion below would hold vacuously.
+    let mut newer_cp = start_severable_test_cp_server(newer).await;
 
     let mut older = create_test_config(1);
     older.loaded_at = Utc::now() - chrono::Duration::hours(6);
     let (older_addr, older_tx, _older_handle) = start_test_cp_server(older).await;
 
     let proxy_state = create_test_proxy_state();
-    let newer_url = format!("http://127.0.0.1:{}", newer_addr.port());
+    let newer_url = newer_cp.url();
     let older_url = format!("http://127.0.0.1:{}", older_addr.port());
     let connection_state = Arc::new(ArcSwap::new(Arc::new(
         DpCpConnectionState::new_disconnected(&newer_url),
@@ -4630,7 +4756,7 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
 
     let ps = proxy_state.clone();
     let cs = connection_state.clone();
-    let urls = vec![newer_url, older_url];
+    let urls = vec![newer_url, older_url.clone()];
     let client_handle = tokio::spawn(async move {
         dp_client::start_dp_client_with_shutdown_and_startup_ready(
             urls,
@@ -4652,10 +4778,21 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
         wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
         "DP should apply the newer CP's snapshot"
     );
+    // `wait_for_proxy_count` can win the race against `update_state_config_received`,
+    // so wait for the stamp itself before baselining against it.
+    assert!(
+        wait_for_new_accepted_config(&connection_state, None).await,
+        "the primary CP's accepted snapshot must be recorded before failover"
+    );
     let accepted_at = connection_state.load().last_config_received_at;
 
     // Take the newer CP away so the DP fails over to the stale one.
-    newer_handle.abort();
+    newer_cp.sever();
+    assert!(
+        wait_for_cp_url(&connection_state, &older_url, Duration::from_secs(30)).await,
+        "the DP must actually reach the stale fallback CP — otherwise the \
+         assertions below hold vacuously"
+    );
 
     // Give the DP several failover cycles against the stale CP.
     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -4686,6 +4823,366 @@ async fn dp_failover_refuses_older_snapshot_and_preserves_newer_config() {
     assert!(
         !injected,
         "a delta from the fenced stale CP must never apply against newer config"
+    );
+
+    client_handle.abort();
+}
+
+/// A delta that only adds `proxy`, stamped at `poll_timestamp`.
+///
+/// The freshness fence reads the body stamp, so tests that exercise it must be
+/// able to place a delta before or after the applied watermark.
+fn add_proxy_delta_at(proxy: Proxy, poll_timestamp: chrono::DateTime<Utc>) -> IncrementalResult {
+    IncrementalResult {
+        poll_timestamp,
+        ..add_proxy_delta(proxy)
+    }
+}
+
+/// Broadcast `delta` as a DELTA envelope whose version matches its body stamp.
+///
+/// Returns the number of live ConfigSync subscriptions the frame was queued to.
+/// A `0` means the DP was between attempts and the frame was dropped, so a
+/// "the delta never applied" assertion would hold for the wrong reason.
+fn send_delta(
+    tx: &tokio::sync::broadcast::Sender<ferrum_edge::grpc::proto::ConfigUpdate>,
+    delta: &IncrementalResult,
+) -> usize {
+    let version = delta.poll_timestamp.to_rfc3339();
+    let body = serde_json::to_string(delta).unwrap();
+    tx.send(delta_update(body, &version)).unwrap_or(0)
+}
+
+/// True once the DP has recorded a rejected non-empty DELTA.
+///
+/// Sticky divergence is cleared by the FULL_SNAPSHOT recovery that follows the
+/// terminated stream, so the recovery counter must be checked too — otherwise a
+/// fast reconnect can erase the only evidence that the fence fired.
+fn delta_rejection_recorded(connection_state: &Arc<ArcSwap<DpCpConnectionState>>) -> bool {
+    let state = connection_state.load();
+    state.config_diverged || state.config_divergence_recoveries_total > 0
+}
+
+/// Wait until the DP reports an established ConfigSync stream.
+async fn wait_for_connected(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_state.load().connected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until the DP reports that its ConfigSync stream is gone.
+///
+/// Proves a "CP goes away" test actually severed the transport: with tonic's
+/// detached per-connection tasks an aborted accept loop leaves the DP happily
+/// connected, and every post-shutdown assertion becomes vacuous.
+async fn wait_for_disconnected(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !connection_state.load().connected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until the DP's reported CP endpoint is `expected`.
+///
+/// `cp_url` is rewritten on both connect and disconnect, so this proves the DP
+/// actually *attempted* that endpoint. Failover tests need it: without a real
+/// disconnect the DP stays pinned to the first CP and every post-failover
+/// assertion passes vacuously.
+async fn wait_for_cp_url(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    expected: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if connection_state.load().cp_url == expected {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Wait until the DP reports an accepted config other than `previous`.
+///
+/// Only an *accepted* update moves this stamp, so it distinguishes a failover
+/// snapshot that established a delta base from one that was fenced.
+async fn wait_for_new_accepted_config(
+    connection_state: &Arc<ArcSwap<DpCpConnectionState>>,
+    previous: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if connection_state.load().last_config_received_at != previous {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_refuses_stale_delta_after_equivalent_older_failover_snapshot_takes_the_base() {
+    // ABA rollback acceptance, driven through the real DP ConfigSync call path
+    // rather than the lifecycle helper alone:
+    //
+    //   A   primary CP publishes config at T0 with trust bundle X — applied,
+    //       freshness watermark T0
+    //   B   history the fallback CP never caught up with
+    //   A'  fallback CP's snapshot is content-equivalent to the applied payload
+    //       (same GatewayConfig content, same gateway-trust side channel) but
+    //       stamped T0-6h, so the identical-payload exception admits it as a
+    //       safe delta base while the watermark stays at T0
+    //
+    // Establishing that base must not authorize the fallback CP to replay a
+    // DELTA from the B history: applying it would roll the DP back underneath
+    // the config that superseded it. The delta must be refused before
+    // `apply_incremental` and the stream terminated.
+    let mut newer = create_test_config(3);
+    newer.loaded_at = Utc::now();
+    newer.trust_bundles = Some(Box::new(create_test_trust_bundles()));
+    let mut equivalent_older = newer.clone();
+    equivalent_older.loaded_at = newer.loaded_at - chrono::Duration::hours(6);
+    // Severable: the primary must genuinely go away. Aborting a
+    // `start_test_cp_server` handle only drops tonic's accept loop — the
+    // already-established ConfigSync stream is served by a detached
+    // per-connection task and keeps running, so the DP would never fail over
+    // and never evaluate the fallback CP's snapshot at all.
+    let mut newer_cp = start_severable_test_cp_server(newer).await;
+    let (older_addr, older_tx, _older_handle) = start_test_cp_server(equivalent_older).await;
+
+    let proxy_state = create_test_proxy_state();
+    let newer_url = newer_cp.url();
+    let older_url = format!("http://127.0.0.1:{}", older_addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&newer_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![newer_url, older_url.clone()];
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 3, Duration::from_secs(10)).await,
+        "DP should apply the primary CP's snapshot"
+    );
+    let primary_watermark = proxy_state.config.load().loaded_at;
+    // Baseline against a stamp that is actually recorded: `wait_for_proxy_count`
+    // can win the race against `update_state_config_received`, and a `None`
+    // baseline would let the primary's own stamp satisfy `base_taken` below.
+    assert!(
+        wait_for_new_accepted_config(&connection_state, None).await,
+        "the primary CP's accepted snapshot must be recorded before failover"
+    );
+    let accepted_at = connection_state.load().last_config_received_at;
+
+    // Fail over to the equivalent-but-older CP.
+    newer_cp.sever();
+    assert!(
+        wait_for_cp_url(&connection_state, &older_url, Duration::from_secs(30)).await,
+        "the DP must actually fail over to the fallback CP once the primary's \
+         transport is severed"
+    );
+    let base_taken = wait_for_new_accepted_config(&connection_state, accepted_at).await;
+    assert!(
+        base_taken,
+        "the equivalent older cross-source snapshot must be accepted as a delta base — \
+         without that the rest of this test would prove nothing about deltas"
+    );
+    assert!(
+        connection_state.load().cp_url == older_url,
+        "DP must be attached to the fallback CP after failover"
+    );
+    // Equivalent older snapshots keep AppliedSnapshotAuthority monotonic at the
+    // primary watermark, but update_config's Unchanged path still stores the
+    // candidate body — so GatewayConfig.loaded_at may move backwards. Capture
+    // that post-base stamp so the ABA candidate can be placed strictly between
+    // body stamp and authority watermark (only evaluate_delta_authority stops it).
+    let loaded_at_after_base = proxy_state.config.load().loaded_at;
+
+    // The ABA delta: stamped inside the history the applied authority already
+    // superseded, and structurally valid, so only the freshness fence stops it.
+    let rollback = create_test_proxy("aba-rollback", "/aba");
+    let stale = add_proxy_delta_at(rollback, Utc::now() - chrono::Duration::hours(3));
+    assert!(
+        stale.poll_timestamp < primary_watermark,
+        "ABA candidate must predate the monotonic authority watermark"
+    );
+    assert!(
+        stale.poll_timestamp > loaded_at_after_base,
+        "ABA candidate must postdate the older equivalent body stamp so only \
+         evaluate_delta_authority (not GatewayConfig.loaded_at) can refuse it"
+    );
+    // Re-broadcast until the DP demonstrably processed and rejected the frame: a
+    // delta sent while the DP is momentarily between attempts is dropped by the
+    // broadcast channel, which would pass the negative assertions below for the
+    // wrong reason. `delta_rejection_recorded` is the DP-side proof that the
+    // fence actually ran — only a rejected non-empty DELTA raises divergence on
+    // this path.
+    assert!(
+        !delta_rejection_recorded(&connection_state),
+        "no DELTA has been rejected yet — the rejection signal below must come \
+         from the ABA candidate, not from earlier failover activity"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut queued_to_live_subscription = false;
+    let mut fenced = false;
+    while std::time::Instant::now() < deadline {
+        if send_delta(&older_tx, &stale) > 0 {
+            queued_to_live_subscription = true;
+        }
+        if delta_rejection_recorded(&connection_state) {
+            fenced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        queued_to_live_subscription,
+        "the stale DELTA must reach a live ConfigSync subscription — a dropped \
+         broadcast would satisfy the assertions below vacuously"
+    );
+    assert!(
+        fenced,
+        "the DP must record a rejected DELTA — without that the assertions below \
+         would also hold if the frame was never evaluated"
+    );
+
+    assert!(
+        !wait_for_proxy_id(&proxy_state, "aba-rollback", Duration::from_secs(5)).await,
+        "a DELTA older than the applied authority watermark must never apply"
+    );
+    assert_eq!(
+        proxy_state.config.load().loaded_at,
+        loaded_at_after_base,
+        "a refused DELTA must not mutate the applied config's committed stamp"
+    );
+
+    client_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dp_fences_a_stale_delta_then_still_applies_a_fresh_one() {
+    // The freshness fence must be a floor, not a wedge. A stale DELTA is
+    // refused and terminates the stream; the DP then reconnects, re-establishes
+    // an authoritative base, and ordinary forward-progress deltas keep applying.
+    // Without the second half, a fence that rejected everything would pass.
+    let mut base = create_test_config(1);
+    base.loaded_at = Utc::now();
+    let (addr, update_tx, _server_handle) = start_test_cp_server(base).await;
+
+    let proxy_state = create_test_proxy_state();
+    let cp_url = format!("http://127.0.0.1:{}", addr.port());
+    let connection_state = Arc::new(ArcSwap::new(Arc::new(
+        DpCpConnectionState::new_disconnected(&cp_url),
+    )));
+
+    let ps = proxy_state.clone();
+    let cs = connection_state.clone();
+    let urls = vec![cp_url];
+    let client_handle = tokio::spawn(async move {
+        dp_client::start_dp_client_with_shutdown_and_startup_ready(
+            urls,
+            test_secret(),
+            ps,
+            None,
+            None,
+            None,
+            None,
+            "ferrum".to_string(),
+            0,
+            Some(cs),
+            None,
+        )
+        .await;
+    });
+
+    assert!(
+        wait_for_proxy_count(&proxy_state, 1, Duration::from_secs(10)).await,
+        "DP should apply the initial snapshot"
+    );
+    let watermark = proxy_state.config.load().loaded_at;
+
+    let rolled_back = create_test_proxy("stale-delta", "/stale-delta");
+    let stale = add_proxy_delta_at(rolled_back, watermark - chrono::Duration::hours(1));
+    // The accepted snapshot above proves a subscription is live, so this frame
+    // must be queued to it; a dropped broadcast would make the negative
+    // assertion below vacuous.
+    assert!(
+        send_delta(&update_tx, &stale) > 0,
+        "the stale DELTA must reach the DP's established ConfigSync subscription"
+    );
+    assert!(
+        !wait_for_proxy_id(&proxy_state, "stale-delta", Duration::from_secs(5)).await,
+        "a DELTA stamped before the applied watermark must be refused before apply"
+    );
+    assert!(
+        delta_rejection_recorded(&connection_state),
+        "the fence must record a rejected DELTA (sticky divergence or its \
+         FULL_SNAPSHOT recovery), proving the frame was evaluated and refused"
+    );
+    assert!(
+        proxy_state.config.load().loaded_at >= watermark,
+        "a refused DELTA must not roll the committed stamp backwards"
+    );
+
+    // The fence terminated the stream; the DP reconnects to the same CP and
+    // re-establishes a base. Re-broadcast until a subscriber is back on the
+    // stream — a broadcast sent while the DP is between attempts is dropped by
+    // design, which is a reconnect race, not a fence outcome.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut applied = false;
+    while std::time::Instant::now() < deadline {
+        let forward = create_test_proxy("fresh-delta", "/fresh-delta");
+        let fresh = add_proxy_delta_at(forward, Utc::now());
+        let _ = send_delta(&update_tx, &fresh);
+        if wait_for_proxy_id(&proxy_state, "fresh-delta", Duration::from_millis(500)).await {
+            applied = true;
+            break;
+        }
+    }
+    assert!(
+        applied,
+        "a DELTA at or after the watermark must still apply after a stale one was fenced"
     );
 
     client_handle.abort();

@@ -1616,6 +1616,101 @@ fn waf_scoring_weights_reject_unknown_severities() {
 }
 
 #[test]
+fn waf_schema_rejects_unknown_keys_and_keeps_intentional_open_maps() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for schema in [
+        "WafPluginConfig",
+        "WafStreamConfig",
+        "WafStreamSignature",
+        "WafRule",
+        "WafExemptions",
+    ] {
+        assert_eq!(
+            spec["components"]["schemas"][schema]["additionalProperties"],
+            json!(false),
+            "{schema} must reject unknown properties"
+        );
+    }
+
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["scoring"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["additionalProperties"],
+        json!(false)
+    );
+
+    // Intentionally open operator-defined maps.
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_modes"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "rule_modes must remain an open rule-id map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]
+            .get("additionalProperties")
+            .is_some_and(|v| v.is_object()),
+        "rule_overrides must remain an open rule-id map of closed objects"
+    );
+    assert_eq!(
+        spec["components"]["schemas"]["WafPluginConfig"]["properties"]["rule_overrides"]["additionalProperties"]
+            ["additionalProperties"],
+        json!(false),
+        "rule_overrides values must be closed"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafRule"]["properties"]["conditions"]["properties"]
+            ["headers"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "conditions.headers must remain an open header-name map"
+    );
+    assert!(
+        spec["components"]["schemas"]["WafExemptions"]["properties"]["header_present"]
+            .get("additionalProperties")
+            .is_some_and(|v| v != &json!(false)),
+        "global_exemptions.header_present must remain an open header-name map"
+    );
+
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/WafPluginConfig",
+        "components": spec["components"].clone()
+    });
+    let validator = jsonschema::draft202012::options()
+        .build(&root)
+        .expect("WafPluginConfig schema compiles");
+    assert!(
+        validator
+            .validate(&json!({
+                "mode": "enforce",
+                "default_rule_action": "enforce",
+                "rule_modes": { "FE-XSS-001": "enforce" },
+                "global_exemptions": { "header_present": { "x-skip-waf": null } }
+            }))
+            .is_ok()
+    );
+    assert!(
+        validator
+            .validate(&json!({ "default_rule_actoin": "enforce" }))
+            .is_err(),
+        "schema must reject top-level enforcement typo"
+    );
+    assert!(
+        validator
+            .validate(&json!({
+                "stream": { "tcp_require_tsl": true }
+            }))
+            .is_err(),
+        "schema must reject stream guard typo"
+    );
+}
+
+#[test]
 fn access_control_schema_matches_runtime_validation() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -1813,6 +1908,84 @@ fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
     }
 }
 
+/// GHSA-q3p3-94cj-8wh6 / GHSA-q97w-jvf6-q254 /
+/// GHSA-5h4h-3qcv-f3rw / GHSA-jjjw-rqjm-fvf3: rate-limiter components must
+/// expose closed root objects and bounded numeric ranges that match the runtime
+/// allowlists, so a typo or an extreme value is rejected by schema-driven
+/// authoring tools and admission.
+#[test]
+fn rate_limiter_configs_are_closed_and_bounded_in_openapi() {
+    use ferrum_edge::plugins::ai_rate_limiter::AI_RATE_LIMITER_CONFIG_KEYS;
+    use ferrum_edge::plugins::grpc_method_router::GRPC_METHOD_ROUTER_CONFIG_KEYS;
+    use ferrum_edge::plugins::rate_limiting::RATE_LIMITING_CONFIG_KEYS;
+    use ferrum_edge::plugins::udp_rate_limiting::UDP_RATE_LIMITING_CONFIG_KEYS;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        MAX_RATE_LIMIT_MAX_REQUESTS, MAX_RATE_LIMIT_WINDOW_SECONDS,
+    };
+    use ferrum_edge::plugins::ws_rate_limiting::WS_RATE_LIMITING_CONFIG_KEYS;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    for (schema_name, runtime_keys) in [
+        ("RateLimitingConfig", RATE_LIMITING_CONFIG_KEYS),
+        ("GrpcMethodRouterConfig", GRPC_METHOD_ROUTER_CONFIG_KEYS),
+        ("UdpRateLimitingConfig", UDP_RATE_LIMITING_CONFIG_KEYS),
+        ("AiRateLimiterConfig", AI_RATE_LIMITER_CONFIG_KEYS),
+        ("WsRateLimitingConfig", WS_RATE_LIMITING_CONFIG_KEYS),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{schema_name} must be a closed object"
+        );
+        let schema_fields: BTreeSet<_> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{schema_name} properties"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let runtime_fields: BTreeSet<_> = runtime_keys.iter().copied().collect();
+        assert_eq!(
+            schema_fields, runtime_fields,
+            "{schema_name} OpenAPI/runtime key drift"
+        );
+    }
+
+    let window_max = json!(MAX_RATE_LIMIT_WINDOW_SECONDS);
+    let requests_max = json!(MAX_RATE_LIMIT_MAX_REQUESTS);
+    for pointer in [
+        "/components/schemas/RateLimitingRuleConfig/properties/window_seconds/maximum",
+        "/components/schemas/UdpRateLimitingConfig/properties/window_seconds/maximum",
+        "/components/schemas/AiRateLimiterConfig/properties/window_seconds/maximum",
+        "/components/schemas/GraphqlRateSpec/properties/window_seconds/maximum",
+        "/components/schemas/RateSpec/properties/window_seconds/maximum",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer),
+            Some(&window_max),
+            "{pointer} must advertise the runtime window bound"
+        );
+    }
+    for pointer in [
+        "/components/schemas/RateLimitingRuleConfig/properties/max_requests/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_second/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_minute/maximum",
+        "/components/schemas/RateLimitingRuleConfig/properties/requests_per_hour/maximum",
+        "/components/schemas/GraphqlRateSpec/properties/max_requests/maximum",
+        "/components/schemas/RateSpec/properties/max_requests/maximum",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer),
+            Some(&requests_max),
+            "{pointer} must advertise the runtime request-cap bound"
+        );
+    }
+}
+
 #[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
@@ -1833,10 +2006,10 @@ fn graphql_config_schema_matches_runtime_validation() {
         spec.pointer("/components/schemas/GraphqlRateSpec/additionalProperties"),
         Some(&json!(false))
     );
-    assert_ne!(
+    assert_eq!(
         spec.pointer("/components/schemas/RateSpec/additionalProperties"),
         Some(&json!(false)),
-        "GraphQL hardening must not close the shared gRPC RateSpec ahead of its runtime"
+        "the gRPC runtime now rejects unknown per-method spec keys, so RateSpec must be closed too"
     );
     assert_eq!(
         schema["properties"]["type_rate_limits"]["properties"]
@@ -2025,6 +2198,10 @@ fn graphql_config_schema_matches_runtime_validation() {
 #[test]
 fn request_deduplication_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
+    use ferrum_edge::plugins::request_deduplication::{
+        REQUEST_DEDUPLICATION_CONFIG_KEYS, REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS,
+    };
+    use ferrum_edge::plugins::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -2070,6 +2247,67 @@ fn request_deduplication_schema_matches_runtime_validation() {
     assert_eq!(redis_guard["if"]["required"], json!(["sync_mode"]));
     assert_eq!(redis_guard["then"]["required"], json!(["redis_url"]));
 
+    // GHSA-h2c3-j3cm-7ghh: the published schema closes the root object and
+    // refuses Redis-only fields outside Redis mode, matching the runtime
+    // allowlist exactly.
+    assert_eq!(schema["additionalProperties"], json!(false));
+    for redis_only in [
+        "redis_url",
+        "redis_tls",
+        "redis_key_prefix",
+        "redis_pool_size",
+        "redis_connect_timeout_seconds",
+        "redis_health_check_interval_seconds",
+        "redis_username",
+        "redis_password",
+        "on_redis_unavailable",
+    ] {
+        assert_eq!(
+            redis_guard["else"]["properties"][redis_only],
+            json!(false),
+            "{redis_only} must be refused outside sync_mode=redis"
+        );
+    }
+
+    // GHSA-h2c3-j3cm-7ghh: the runtime allowlist, the published schema, and the
+    // documented parameter table must name exactly the same keys.
+    let schema_fields: BTreeSet<_> = schema["properties"]
+        .as_object()
+        .expect("RequestDeduplicationConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let runtime_fields: BTreeSet<_> = REQUEST_DEDUPLICATION_CONFIG_KEYS.iter().copied().collect();
+    assert_eq!(
+        schema_fields, runtime_fields,
+        "request_deduplication OpenAPI/runtime key drift"
+    );
+    for key in REDIS_PLUGIN_CONFIG_KEYS {
+        assert!(
+            REQUEST_DEDUPLICATION_CONFIG_KEYS.contains(key),
+            "REQUEST_DEDUPLICATION_CONFIG_KEYS must include Redis key {key}"
+        );
+    }
+    assert_eq!(
+        REQUEST_DEDUPLICATION_CONFIG_KEYS.len(),
+        REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS.len() + REDIS_PLUGIN_CONFIG_KEYS.len(),
+        "the closed allowlist must be exactly policy keys plus shared Redis keys"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `request_deduplication`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("request_deduplication docs section");
+    for key in REQUEST_DEDUPLICATION_CONFIG_KEYS {
+        assert!(
+            docs.contains(&format!("`{key}`")),
+            "docs/plugins.md request_deduplication section missing `{key}`"
+        );
+    }
+    assert!(docs.contains("Unknown top-level keys are rejected"));
+
     let validator_schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$ref": "#/components/schemas/RequestDeduplicationConfig",
@@ -2097,8 +2335,9 @@ fn request_deduplication_schema_matches_runtime_validation() {
             "redis_url": "rediss://cache.internal:6390"
         }),
         json!({
-            "sync_mode": "local",
-            "redis_url": "redis://cache.internal:6379"
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379",
+            "on_redis_unavailable": "local_only"
         }),
     ];
     for config in &accepted {
@@ -2128,6 +2367,19 @@ fn request_deduplication_schema_matches_runtime_validation() {
         json!({"sync_mode": "redis", "redis_url": null}),
         json!({"sync_mode": "local", "redis_url": "https://example.invalid"}),
         json!({"sync_mode": "local", "redis_url": "redis://"}),
+        // GHSA-h2c3-j3cm-7ghh reproduction shapes: misspelled policy keys and
+        // Redis-only fields outside Redis mode.
+        json!({"enforce_requred": true}),
+        json!({"sync_mod": "redis", "redis_url": "redis://cache.internal:6379"}),
+        json!({"scope_by_consumers": false}),
+        json!({"sync_mode": "local", "redis_url": "redis://cache.internal:6379"}),
+        json!({"redis_key_prefix": "ferrum:dedup"}),
+        json!({"on_redis_unavailable": "local_only"}),
+        json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379",
+            "on_redis_unavailable": "fallback"
+        }),
         json!({
             "sync_mode": "redis",
             "redis_url": "redis://host:6379",
@@ -4821,6 +5073,77 @@ async fn tcp_logging_schema_matches_strict_runtime_config_contract() {
     }
 }
 
+#[test]
+fn request_mirror_schema_matches_strict_runtime_config_contract() {
+    use ferrum_edge::plugins::request_mirror::{REQUEST_MIRROR_CONFIG_KEYS, RequestMirror};
+    use ferrum_edge::plugins::{PluginHttpClient, validate_plugin_config};
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/RequestMirrorConfig")
+        .expect("RequestMirrorConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let documented = schema["properties"]
+        .as_object()
+        .expect("RequestMirrorConfig properties")
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime = REQUEST_MIRROR_CONFIG_KEYS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        documented, runtime,
+        "request_mirror runtime/OpenAPI key drift"
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let mirror_docs = plugin_docs
+        .split("### `request_mirror`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("request_mirror docs section");
+    for key in REQUEST_MIRROR_CONFIG_KEYS {
+        assert!(
+            mirror_docs.contains(&format!("`{key}`")),
+            "docs/plugins.md request_mirror section missing `{key}`"
+        );
+    }
+    assert!(mirror_docs.contains("KeepLastKnownGood"));
+    assert!(mirror_docs.contains("allowed-key"));
+
+    let valid = json!({
+        "mirror_host": "mirror.local",
+        "mirror_protocol": "https",
+        "percentage": 0,
+        "mirror_request_body": false
+    });
+    assert_component_validity(&spec, "RequestMirrorConfig", &valid, true);
+    assert!(
+        RequestMirror::new(&valid, PluginHttpClient::default()).is_ok(),
+        "valid request_mirror config must construct"
+    );
+    assert!(validate_plugin_config("request_mirror", &valid).is_ok());
+
+    let typo = json!({
+        "mirror_host": "mirror.local",
+        "mirror_protcol": "https",
+        "percentage": 0,
+        "mirror_request_body": false
+    });
+    assert_component_validity(&spec, "RequestMirrorConfig", &typo, false);
+    let err = match RequestMirror::new(&typo, PluginHttpClient::default()) {
+        Ok(_) => panic!("misspelled protocol key must fail admission"),
+        Err(err) => err,
+    };
+    assert!(err.contains("mirror_protcol"), "got: {err}");
+    assert!(err.contains("allowed keys"), "got: {err}");
+    validate_plugin_config("request_mirror", &typo).expect_err("shared admission must reject typo");
+}
+
 #[tokio::test]
 async fn load_testing_schema_matches_strict_runtime_config_contract() {
     use ferrum_edge::plugins::PluginHttpClient;
@@ -5860,6 +6183,64 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
             }),
         );
     assert_component_validity(&spec, "OverloadSnapshot", &overload, true);
+}
+
+#[test]
+fn health_failover_topology_and_admin_writes_openapi_parity() {
+    // Issue #3001: authenticated /health exposes failover_topology and
+    // admin_writes_enabled reflects failover write gating.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let topology = json!({
+        "primary_active": false,
+        "allow_writes": false,
+        "opt_in_writes_enabled_during_window": false,
+        "primary_failback_fenced": false,
+        "failover_since_unix_ms": 1_700_000_000_000u64,
+        "active_url_redacted": "sqlite:///tmp/failover.db"
+    });
+    assert_component_validity(&spec, "DatabaseFailoverTopology", &topology, true);
+
+    let health = json!({
+        "status": "degraded",
+        "ready": true,
+        "admin_writes_enabled": false,
+        "database": {
+            "status": "connected",
+            "type": "sqlite",
+            "failover_topology": topology
+        }
+    });
+    assert_component_validity(&spec, "HealthResponse", &health, true);
+
+    let admin_writes = spec["components"]["schemas"]["HealthResponse"]["properties"]
+        ["admin_writes_enabled"]["description"]
+        .as_str()
+        .expect("admin_writes_enabled description");
+    assert!(
+        admin_writes.contains("FERRUM_DB_FAILOVER_ALLOW_WRITES")
+            || admin_writes.contains("failover"),
+        "admin_writes_enabled must document failover write blocking"
+    );
+    assert!(
+        admin_writes.contains("config-database")
+            || admin_writes.contains("config-store")
+            || admin_writes.contains("managed TLS"),
+        "admin_writes_enabled must clarify it is the config-database mutation signal, not managed TLS/ACME"
+    );
+
+    let topology_desc = spec["components"]["schemas"]["DatabaseFailoverTopology"]["description"]
+        .as_str()
+        .expect("DatabaseFailoverTopology description");
+    assert!(
+        topology_desc.contains("divergence-risk") || topology_desc.contains("divergence"),
+        "topology schema must document opt-in divergence-risk contract"
+    );
+    assert!(
+        topology_desc.contains("fences") && topology_desc.contains("restarted after operator"),
+        "topology schema must document the process-local failback fence"
+    );
 }
 
 #[test]
@@ -7129,6 +7510,23 @@ fn namespace_admission_contention_is_documented_as_retryable() {
 }
 
 #[test]
+fn proxy_delete_documents_atomicity_refusal_for_standalone_mongodb() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let response = spec
+        .pointer("/paths/~1proxies~1{id}/delete/responses/501")
+        .expect("proxy DELETE is missing standalone MongoDB atomicity refusal");
+    assert_eq!(
+        response["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ProxyDeleteAtomicityFailureResponse"
+    );
+    let schema = spec
+        .pointer("/components/schemas/ProxyDeleteAtomicityFailureResponse")
+        .expect("proxy delete atomicity refusal schema");
+    assert_eq!(schema["required"], json!(["error", "detail"]));
+}
+
+#[test]
 fn oidc_relying_party_schema_matches_strict_runtime_surface() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -7582,18 +7980,24 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         assert_component_validity(&spec, "AdminMetrics", &instance, true);
     }
 
-    // Conditional semantics: passive requires proxy_id; active forbids it.
+    // Conditional semantics: passive requires proxy_id; active requires upstream_id.
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
-        &serde_json::to_value(AdminMetricsUnhealthyTarget::active("10.0.0.1:80", 1))
-            .expect("active"),
+        &serde_json::to_value(AdminMetricsUnhealthyTarget::active(
+            "ferrum",
+            "upstream-a",
+            "10.0.0.1:80",
+            1,
+        ))
+        .expect("active"),
         true,
     );
     assert_component_validity(
         &spec,
         "AdminMetricsUnhealthyTarget",
         &serde_json::to_value(AdminMetricsUnhealthyTarget::passive(
+            "ferrum",
             "proxy-a",
             "10.0.0.1:80",
             1,
@@ -7605,6 +8009,7 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         &spec,
         "AdminMetricsUnhealthyTarget",
         &json!({
+            "namespace": "ferrum",
             "target": "10.0.0.1:80",
             "type": "passive",
             "since_epoch_ms": 1
@@ -8065,11 +8470,18 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["minimum"],
-        json!(100)
+        json!(200)
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["maximum"],
         json!(599)
+    );
+    // GHSA-v7fj-73gm-h625: 206 and 304 have caching semantics the plugin does
+    // not implement, so the schema must refuse them the same way the runtime
+    // constructor does.
+    assert_eq!(
+        schema["properties"]["cacheable_status_codes"]["items"]["not"]["enum"],
+        json!([206, 304])
     );
     assert_eq!(
         schema["properties"]["vary_by_headers"]["items"]["pattern"],
@@ -8110,8 +8522,8 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"max_entries": 1, "max_entry_size_bytes": 1, "max_total_size_bytes": 1}),
         // Extension-method casing is accepted and uppercased by the runtime.
         json!({"cacheable_methods": ["get"]}),
-        // Status-code boundary values.
-        json!({"cacheable_status_codes": [100, 599]}),
+        // Status-code boundary values (1xx / 206 / 304 are excluded below).
+        json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
         json!({"vary_by_headers": []}),
         json!({
@@ -8168,6 +8580,13 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": []}),
         json!({"cacheable_status_codes": [99]}),
         json!({"cacheable_status_codes": [600]}),
+        // GHSA-v7fj-73gm-h625: interim, partial, and validator-only statuses
+        // must fail admission in both the schema and the runtime constructor.
+        json!({"cacheable_status_codes": [100]}),
+        json!({"cacheable_status_codes": [199]}),
+        json!({"cacheable_status_codes": [206]}),
+        json!({"cacheable_status_codes": [304]}),
+        json!({"cacheable_status_codes": [200, 206]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
     ] {
@@ -8814,5 +9233,68 @@ fn ai_rate_limiter_provider_enum_matches_runtime() {
     assert!(
         section.contains("`bedrock`"),
         "docs must enumerate bedrock as an accepted provider"
+    );
+}
+
+#[test]
+fn body_validator_schema_is_closed_and_matches_the_runtime_key_set() {
+    use ferrum_edge::plugins::body_validator::{
+        BODY_VALIDATOR_CONFIG_KEYS, BODY_VALIDATOR_PROTOBUF_METHOD_KEYS,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/BodyValidatorConfig")
+        .expect("BodyValidatorConfig schema");
+
+    // Unknown keys must be refused by the published schema too, not just the
+    // runtime constructor (GHSA-w7x7-ppx9-5v74).
+    assert_eq!(schema["additionalProperties"], json!(false));
+
+    let method_entry = schema
+        .pointer("/properties/protobuf_method_messages/additionalProperties")
+        .expect("protobuf_method_messages value schema");
+    assert_eq!(method_entry["additionalProperties"], json!(false));
+
+    // Runtime allow-list ↔ OpenAPI property parity, so a typo cannot drift
+    // back in through either side alone.
+    let mut documented: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("BodyValidatorConfig properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_CONFIG_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "BodyValidatorConfig properties must match the runtime allow-list"
+    );
+
+    let mut documented: Vec<String> = method_entry["properties"]
+        .as_object()
+        .expect("protobuf method entry properties")
+        .keys()
+        .cloned()
+        .collect();
+    let mut runtime: Vec<String> = BODY_VALIDATOR_PROTOBUF_METHOD_KEYS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+    documented.sort();
+    runtime.sort();
+    assert_eq!(
+        documented, runtime,
+        "protobuf method entry keys must match the runtime allow-list"
+    );
+
+    assert_eq!(
+        schema["properties"]["json_schema_draft"]["enum"],
+        json!(["draft2020-12", "draft7"])
     );
 }

@@ -65,6 +65,12 @@ The gateway resolves backend CA trust in the following order:
 
 **CA exclusivity**: When a custom CA is configured, it is the sole trust anchor. This prevents a backend pinned to an internal CA from being MITMed via any publicly-trusted certificate. If you need both internal and public CAs trusted, combine them into a single PEM bundle file.
 
+No-verify changes handshake verification only. Ferrum still materializes and
+atomically validates any explicitly declared custom CA for HTTP-family, gRPC
+health-probe, DTLS, LDAP, TCP logging, and WebSocket logging clients. An empty,
+malformed, or unusable selected bundle is therefore a configuration error even
+when verification is disabled.
+
 > **Trust roots — backend proxy path.**
 > The proxy backend path (HTTP/1.1, H2, HTTP/3, gRPC, WebSocket, TCP/TLS) builds its trust store in-house from `webpki-roots`'s `TLS_SERVER_ROOTS` and hands the resulting `rustls::ClientConfig` to reqwest via `use_preconfigured_tls(...)`. That means the "no custom CA" fallback always uses bundled webpki on every platform — Linux, macOS, and Windows — regardless of OS keychain contents. Only the `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE` or per-proxy CA paths can change which roots the gateway trusts for backend traffic.
 
@@ -89,6 +95,15 @@ cat > ca-bundle.pem << EOF
 -----END CERTIFICATE-----
 EOF
 ```
+
+Custom CA and client-certificate bundles are admitted atomically. Every
+declared `CERTIFICATE` record must parse, every custom CA record must be usable
+as a trust root, and a selected custom bundle must contain at least one
+certificate. A failure rejects the complete startup/reload candidate; Ferrum
+never installs only the surviving subset, and existing live pools/health
+clients keep their last-known-good generation. Shared PEM admission limits each
+certificate/key source to 4 MiB and each certificate bundle to 4096 records so
+provider- or file-controlled input cannot drive unbounded parsing work.
 
 ### Per-Proxy Configuration
 
@@ -115,7 +130,8 @@ proxies:
 ## Certificate Requirements
 
 - **Format**: PEM encoded
-- **Certificate**: X.509 certificate chain
+- **Certificate**: X.509 certificate chain in leaf-first order. DTLS 1.2 and
+  1.3 transmit the complete configured client chain.
 - **Private Key**: Unencrypted private key (RSA or ECDSA), or a `pkcs11://` RSA signer URI when Ferrum is built with the `pkcs11` feature
 - **Sources**: File paths and `file://` URIs must be readable by the gateway process; inline PEM must contain the full PEM block
 
@@ -261,7 +277,7 @@ The mTLS implementation uses:
 
 ### Connection Pool Behavior
 
-- **Fail-fast on bad certificates**: All backend TLS certificate sources — both global env vars (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`) and per-proxy fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time when they are file-backed, inline PEM, provider-backed (`vault://`, `aws://`, `azure://`, `gcp://`), Kubernetes Secret-backed (`k8s://namespace/secret#key`), admin-managed (`managed://certificates/id#cert`, `managed://certificates/id#key`, `managed://ca-bundles/id`, `managed://crls/id`), or PKCS#11-backed (`pkcs11://label?...`) for client keys. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes. Kubernetes sources use the default `kube` client environment. Managed sources are stored under `FERRUM_TLS_MANAGED_STORE_PATH`. PKCS#11 key sources require the `pkcs11` Cargo feature and a token RSA key matching the configured selector. If any configured source is missing, unreadable, unsupported by the current build, unreachable, or contains invalid/corrupt material, the gateway **refuses to start** or rejects the config reload. There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA source fails to load. Cert and key sources must always be configured as a pair; setting one without the other is a validation error. CA and CRL sources are independent — you can set just a CA to verify a server without presenting client identity.
+- **Fail-fast on bad certificates**: All backend TLS certificate sources — both global env vars (`FERRUM_BACKEND_TLS_CLIENT_CERT_PATH` / `_SOURCE`, `FERRUM_BACKEND_TLS_CLIENT_KEY_PATH` / `_SOURCE`, `FERRUM_TLS_CA_BUNDLE_PATH` / `_SOURCE`, `FERRUM_TLS_CRL_FILE_PATH` / `_SOURCE`) and per-proxy fields (`backend_tls_client_cert_path`, `backend_tls_client_key_path`, `backend_tls_server_ca_cert_path`) — are validated at startup and config load time when they are file-backed, inline PEM, provider-backed (`vault://`, `aws://`, `azure://`, `gcp://`), Kubernetes Secret-backed (`k8s://namespace/secret#key`), admin-managed (`managed://certificates/id#cert`, `managed://certificates/id#key`, `managed://ca-bundles/id`, `managed://crls/id`), or PKCS#11-backed (`pkcs11://label?...`) for client keys. Provider URI sources require the matching secret-provider Cargo feature and use the same credentials/configuration as the existing `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` env-var suffixes. Kubernetes sources use the default `kube` client environment. Managed sources are stored under `FERRUM_TLS_MANAGED_STORE_PATH`. PKCS#11 key sources require the `pkcs11` Cargo feature and a token RSA key matching the configured selector, and that key must also be proven to pair with the configured client certificate before the backend client identity is published; see [pkcs11_tls.md](pkcs11_tls.md). If any configured source is missing, unreadable, unsupported by the current build, unreachable, or contains invalid/corrupt material, the gateway **refuses to start** or rejects the config reload. There is no silent fallback to unauthenticated connections or to webpki-only verification when a configured CA source fails to load. Cert and key sources must always be configured as a pair; setting one without the other is a validation error. CA and CRL sources are independent — you can set just a CA to verify a server without presenting client identity.
 - **TLS source deduplication**: When multiple proxies share the same cert/key/CA/CRL source values, each unique source is parsed only once during validation. This avoids redundant disk I/O and PEM parsing at config load time.
 - **Pool-per-cert-source**: Each unique combination of `backend_tls_client_cert_path`, `backend_tls_client_key_path`, and `backend_tls_server_ca_cert_path` produces a **separate connection pool entry** per protocol. Inline PEM values are represented by a SHA-256 source component instead of the raw PEM; PKCS#11 values use the URI selector as the non-secret pool key component:
   - **HTTP/1.1 + H2** (`ConnectionPool`): separate `reqwest::Client` instances keyed by `host:port:protocol:dns_override:ca_path`

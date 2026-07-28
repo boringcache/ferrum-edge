@@ -200,7 +200,7 @@ Set `frontend_tls: true` on a UDP proxy to accept DTLS-encrypted connections fro
 
 Like TCP+TLS, frontend DTLS handshakes complete before backend session creation. `on_stream_connect` plugins run after DTLS accept with client certificate context available when DTLS mTLS is enabled; handshake failures and plugin rejections do not create backend UDP or DTLS sessions. Negotiated ClientHello SNI is exposed on `StreamConnectionContext.sni_hostname` at connect and preserved on `StreamTransactionSummary.sni_hostname` at disconnect for logging sinks.
 
-Frontend DTLS uses `dimpl`, which currently surfaces only the client leaf certificate to Ferrum. Stream plugins receive that leaf in `StreamConnectionContext.tls_client_cert_der`; `tls_client_cert_chain_der` remains `None` for DTLS even when the client sent intermediates. Configure `FERRUM_DTLS_CLIENT_CA_CERT_PATH` with the CA/intermediate certificates needed to validate client leaves.
+Frontend DTLS preserves the peer's complete leaf-first certificate chain. Stream plugins receive the leaf in `StreamConnectionContext.tls_client_cert_der` (so certificate fingerprint behavior remains leaf-only) and the presented intermediates in `tls_client_cert_chain_der`, matching TCP/TLS context semantics. Ferrum validates the leaf plus transmitted intermediates against `FERRUM_DTLS_CLIENT_CA_CERT_PATH`.
 
 ```yaml
 proxies:
@@ -218,6 +218,13 @@ FERRUM_DTLS_CERT_PATH=/path/to/dtls-cert.pem
 FERRUM_DTLS_KEY_PATH=/path/to/dtls-key.pem
 ```
 
+The certificate source may contain a leaf-first PEM bundle. Ferrum parses every
+certificate, validates that the first certificate matches the private key, and
+transmits the complete configured chain in order for both DTLS 1.2 and 1.3.
+Peers may therefore trust only the root while the gateway supplies the
+intermediates. The root normally stays in the trust store rather than the
+transmitted bundle.
+
 With `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, file/provider/Kubernetes/managed-backed DTLS cert, key, client-CA, and CRL sources are watched and swapped for new DTLS sessions without rebinding the UDP listener.
 
 **Important:** DTLS requires ECDSA P-256 or P-384 certificates. RSA and Ed25519 keys are not supported by the underlying `dimpl` library.
@@ -227,6 +234,11 @@ With `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`, file/provider/Kubernetes/ma
 Use `backend_scheme: dtls` to encrypt UDP datagrams to the backend using DTLS 1.2/1.3 (auto-negotiated). The gateway accepts plain UDP from clients and establishes a DTLS session per client to the backend.
 
 DTLS uses the same `backend_tls_*` proxy fields as TCP TLS:
+
+When DTLS client authentication is configured, `backend_tls_client_cert_path`
+may likewise be a leaf-first PEM bundle; Ferrum sends the full chain. Backend
+server verification consumes the complete chain presented by the peer, so a
+custom `backend_tls_server_ca_cert_path` can contain only the trust root.
 
 ```yaml
 proxies:
@@ -264,9 +276,13 @@ This provides full encryption: DTLS client → gateway (DTLS termination) → ga
 - Each UDP client session gets its own DTLS connection to the backend
 - Frontend DTLS allocates demux state when the first datagram arrives from a new client, before the session is accepted by the UDP proxy
 - Pre-handshake DTLS demux state is capped by `FERRUM_UDP_MAX_SESSIONS` and released on `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`
-- The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP
+- The `udp_idle_timeout_seconds` setting applies to DTLS sessions the same as plain UDP. Frontend-DTLS idle cleanup uses a shared activity watermark refreshed only after policy-admitted successful forward/delivery (not on rate-rejected decrypted application datagrams)
 - Frontend DTLS uses separate certificates from TLS (set via `FERRUM_DTLS_CERT_PATH` / `FERRUM_DTLS_KEY_PATH`)
 - Frontend DTLS mTLS uses a separate trust store from TCP TLS mTLS (`FERRUM_DTLS_CLIENT_CA_CERT_PATH` vs `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH`)
+- DTLS identity private-key byte owners, including reload-cache clones and
+  auto-negotiation fallback state, are cleared before release. Parsed signing
+  keys remain inside the selected cryptographic provider and follow that
+  provider's secret-memory lifecycle.
 
 ### Trust Store Model
 
@@ -284,6 +300,28 @@ The gateway uses separate trust stores for TCP and UDP encryption:
 The separation of TCP and UDP trust stores allows independent certificate rotation and different CA hierarchies for each protocol.
 
 ## Load Balancing
+
+### Multi-address DNS backends
+
+For a hostname target, TCP, TCP+TLS, DTLS, passthrough, and mesh stream
+connectors consume the shared DNS cache's complete rotated answer set. They try
+alternate IPv4 or IPv6 candidates deterministically through their relevant
+connect or handshake boundary within the proxy's single overall connect budget;
+a stalled candidate receives only its share of the remaining budget. Denied
+addresses are filtered independently and the dial fails closed if no approved
+address remains. TLS and DTLS continue to use `backend_host` (or the configured
+TLS name override) for SNI and certificate verification—the selected IP is only
+the socket peer.
+
+Plain UDP is different: it has no network handshake, and `UdpSocket::connect`
+does not prove that a peer is reachable. Each session deterministically selects
+the first address in its rotated set and advances only on an immediate local
+bind/connect setup error. Ferrum does not replay a datagram after a send error,
+because it cannot know whether the original reached the application and a retry
+could duplicate one-way traffic. Response-observable failover is available to
+DTLS and UDP health probes; generic plain-UDP blackholes require an
+application-level acknowledgement contract to detect. See
+[DNS address selection and failover](dns_resolver.md#address-selection-and-failover).
 
 Stream proxies support load balancing via upstreams, the same as HTTP proxies:
 
@@ -384,17 +422,18 @@ Both default to 30,000 ms. Set to **`0` to disable** per-direction enforcement f
 
 **Watchdog granularity**: The watchdog ticks every 1 second when the shortest active timeout is below 30 seconds, and every 5 seconds when all active timeouts are 30 seconds or longer. A configured 5,000 ms timeout therefore fires within ~6 s; the default 30,000 ms backend timeouts fire within ~35 s. This keeps short test/dev timeouts responsive while reducing per-connection timer churn for production-length TCP sessions.
 
-**Splice/kTLS paths**: The per-direction inactivity timeouts apply to the Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths too. Each direction carries a watermark refreshed on every successful splice syscall (read or write), and the same watchdog cadence (1 s under 30 s timeouts, 5 s otherwise) checks them. For the io_uring path the watermark is polled inline inside the blocking worker; on timeout the worker returns a sentinel error and the parent issues a `shutdown(SHUT_RDWR)` to unblock the other worker if needed.
+**Splice/kTLS paths**: The per-direction inactivity timeouts apply to the Linux `splice(2)`, io_uring splice, and kTLS-accelerated splice paths too. Each direction carries a watermark refreshed on every successful splice syscall (read or write), and the same watchdog cadence (1 s under 30 s timeouts, 5 s otherwise) checks them. For the io_uring path the watermark is polled inline inside the blocking worker; on timeout the worker returns a sentinel error and the parent issues a `shutdown(SHUT_RDWR)` to unblock the other worker if needed. Successfully delivered bytes are preserved on EOF, idle timeout, per-direction read/write timeout, cancellation, and I/O/setup errors — the io_uring and libc-fallback workers return `bytes_so_far` with the error so metrics and `StreamTransactionSummary` still reflect volume transferred before the ending (issue #2957).
 
 ## UDP Session Management
 
 UDP is connectionless, so the gateway tracks sessions by client source address (`SocketAddr`). Each unique client gets a dedicated backend socket for reply routing.
 
 - **Session creation**: First datagram from a new client creates a session
-- **Session cleanup**: Background task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` (default 10s), removing sessions idle longer than `udp_idle_timeout_seconds`. Idle activity and session `duration_ms` use a coarse process-monotonic clock (~100 ms resolution), not UTC/`SystemTime`, so NTP or administrator wall-clock corrections neither freeze nor prematurely expire sessions. Human-readable connect/disconnect timestamps remain civil-clock values and may diverge from `duration_ms` after a clock step.
+- **Session cleanup**: Background task runs every `FERRUM_UDP_CLEANUP_INTERVAL_SECONDS` (default 10s), removing sessions idle longer than `udp_idle_timeout_seconds`. Idle activity and session `duration_ms` use a coarse process-monotonic clock (~100 ms resolution), not UTC/`SystemTime`, so NTP or administrator wall-clock corrections neither freeze nor prematurely expire sessions. Human-readable connect/disconnect timestamps remain civil-clock values and may diverge from `duration_ms` after a clock step. The idle watermark advances only for **policy-admitted** application datagrams that are successfully forwarded client→backend or delivered backend→client (plain UDP and frontend-DTLS, including both plain and DTLS backends). Decrypted receives that `on_udp_datagram` plugins drop (for example `udp_rate_limiting`) do **not** refresh the watermark, so rejected traffic cannot retain sessions, relay tasks, sockets, or `FERRUM_UDP_MAX_SESSIONS` slots indefinitely. DTLS handshake/control remains on the crypto stack before the application relay and is unaffected.
 - **Max sessions**: Limit of `FERRUM_UDP_MAX_SESSIONS` (default 10,000) concurrent sessions per proxy to prevent resource exhaustion
 - **Adaptive batching**: When `FERRUM_ADAPTIVE_BATCH_LIMIT_ENABLED=true` (default), the per-proxy recv drain limit moves across fixed internal tiers (64 / 256 / 2000 / 6000 datagrams) by observed per-proxy traffic via an EWMA — independent of `FERRUM_ADAPTIVE_BATCH_LIMIT_DEFAULT`, which only sets the limit used when adaptation is disabled or before a proxy's first sample. TCP/WebSocket tunnel copy buffers similarly adapt between `FERRUM_ADAPTIVE_BUFFER_MIN_SIZE` (8 KiB) and `FERRUM_ADAPTIVE_BUFFER_MAX_SIZE` (256 KiB) when `FERRUM_ADAPTIVE_BUFFER_ENABLED=true`. See [configuration.md](configuration.md) for the full `FERRUM_ADAPTIVE_*` set.
 - **Reply routing**: Each session spawns a receiver task that forwards backend replies back to the correct client
+- **Datagram hook concurrency / backpressure**: When any plugin opts into `on_udp_datagram`, each established session gets one bounded client→backend ingress worker (not one task per datagram). The shared listener recv/drain loop only enqueues onto that per-session FIFO and never awaits potentially I/O-bound hooks (for example Redis-backed `udp_rate_limiting`). Per-session ordering is preserved. Queue depth is capped at 256 datagrams and 256 KiB retained bytes per session; overload **fails closed** by dropping the datagram (it is never forwarded without running required hooks). Drops increment the listener's `hook_ingress_drops` counter and emit a rate-limited warning (first drop, then every 100th) without per-client label cardinality. Session stop/expiry wakes an idle worker by dropping the ingress sender (and drains any residual queue without running hooks or forwarding); the worker does not share the reply task's `Notify` stop wake. It also re-checks stop/expired after each receive and after the hook await so a late plugin return cannot forward into an expired session. Sessions without datagram hooks keep the inline forward path. Backend→client hooks remain on the existing per-session reply task.
 - **Reply send buffers (Linux)**: Each plain-UDP session keeps a `sendmmsg` fallback batch and an optional GSO accumulator. `sendmmsg` slot buffers are allocated lazily at a 2 KiB preferred size (`SEND_MMSG_SLOT_SIZE`) instead of eagerly reserving `64 × 65535` (~4.2 MiB) per session. Datagrams larger than the slot size — including the full valid UDP maximum — use the existing pktinfo-aware direct-send path; GSO same-size batching and sendmmsg fallback remain unchanged for ordinary traffic.
 - **Response amplification guard**: When `udp_max_response_amplification_factor` is set, each backend datagram is limited to the latest client request payload size multiplied by the factor. A legal zero-length request gets an explicit one-byte reply allowance instead of an unusable zero budget; positive-length requests receive no floor or extra allowance.
 - **Reply-source selection (`FERRUM_UDP_PKTINFO_ENABLED=auto`, Linux)**: On wildcard / multi-homed binds, `IP_PKTINFO` / `IPV6_PKTINFO` captures the per-datagram local destination address (and interface index) on recv and reuses it as the reply source on send. This saves one kernel routing lookup per `sendmsg` flush (combined with `UDP_SEGMENT`/GSO in a single cmsg buffer) and ensures replies exit the same interface the client targeted — important for NAT-sensitive middleboxes, anycast, and scoped IPv6 (link-local `fe80::/10`, where the ifindex is required to disambiguate the source zone). The captured address is stored per-session via `OnceLock` on the first datagram that exposes pktinfo; subsequent datagrams reuse it lock-free. When pktinfo is active, the recv loop uses `readable() + recvmmsg` instead of `recv_from`, so the first datagram of each wakeup also surfaces cmsg — one-shot UDP flows (e.g. DNS) get the correct reply source even when the drain loop never fires.
@@ -422,7 +461,7 @@ See [docs/plugin_execution_order.md](plugin_execution_order.md) for the full per
 
 Notes:
 - `tcp_connection_throttle` is TCP/TCP+TLS-only. Explicit proxy/proxy-group attachment to any other protocol fails configuration admission and plugin-cache validation instead of silently claiming protection. A global policy with a nonempty effective target set must cover at least one TCP/TCP+TLS proxy; mixed global scope is applied only to its TCP-family listeners. In particular, it does not protect UDP/DTLS; use `udp_rate_limiting` for datagram/session admission. Its counters are process-local, so a replicated deployment's aggregate allowance can reach the configured limit per replica.
-- `udp_rate_limiting` runs on every UDP/DTLS datagram (`on_udp_datagram`) in both directions. Steady-path capacity admission uses an atomic resident-entry count coordinated with insert/remove — it does not call `DashMap::len()` or lock every state shard per packet (local and Redis-fallback). See [docs/plugins.md](plugins.md#udp_rate_limiting).
+- `udp_rate_limiting` runs on every UDP/DTLS datagram (`on_udp_datagram`) in both directions. Steady-path capacity admission uses an atomic resident-entry count coordinated with insert/remove — it does not call `DashMap::len()` or lock every state shard per packet (local and Redis-fallback). On the plain-UDP frontend path, client→backend hooks for established sessions run on the per-session ingress worker described under [UDP Session Management](#udp-session-management) so a slow Redis round-trip for one client cannot stall the shared recv loop for every other session. See [docs/plugins.md](plugins.md#udp_rate_limiting).
 - `access_control` applies to both TCP and UDP stream proxies. For TCP+TLS and UDP+DTLS, pair with `mtls_auth` for certificate-based consumer identification → ACL group/username authorization.
 - `mtls_auth` applies to both TCP+TLS and UDP+DTLS stream proxies. It only activates when the listener is configured with `frontend_tls: true` and a client certificate is presented during the TLS/DTLS handshake.
 
@@ -431,7 +470,7 @@ Notes:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FERRUM_STREAM_PROXY_BIND_ADDRESS` | `0.0.0.0` | Bind address for all TCP/UDP listeners |
-| `FERRUM_DTLS_CERT_PATH` | (none) | PEM certificate for frontend DTLS termination (ECDSA P-256 or P-384) |
+| `FERRUM_DTLS_CERT_PATH` | (none) | Leaf-first PEM certificate bundle for frontend DTLS termination (ECDSA P-256 or P-384 leaf) |
 | `FERRUM_DTLS_KEY_PATH` | (none) | PEM private key for frontend DTLS termination |
 | `FERRUM_DTLS_CLIENT_CA_CERT_PATH` | (none) | PEM CA certificate for verifying DTLS client certs (frontend mTLS). Separate from `FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH` used for TCP. |
 | `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED` | `false` | Enables live reload for frontend TCP TLS, admin TLS, and frontend DTLS source changes |
@@ -554,6 +593,15 @@ Stream proxy connections track:
 - Bytes sent/received per connection
 - Connection duration
 - Connection errors
+- UDP `hook_ingress_drops` (listener counter): client→backend datagrams dropped when a session's bounded `on_udp_datagram` ingress queue is full or closed (fail closed; see [UDP Session Management](#udp-session-management))
+
+## TCP SO_REUSEPORT Accept-Loop Supervision
+
+When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds multiple sockets on the same address via `SO_REUSEPORT` and runs one accept loop per socket. Those loops are peer components of a single listener:
+
+- Unexpected exit of any loop (ordinary error, panic, or unexpected cancellation) is observed immediately while the listener is live.
+- Failure policy is atomic: sibling loops are cancelled (and aborted if they ignore cancel), `started` is cleared, and the listener task returns a failure to `StreamListenerManager` so reconcile/readiness owners see the outage via the existing async bind-failure path rather than silently reduced accept capacity.
+- Operator or per-listener shutdown completion remains a clean success and is not reported as an operational failure.
 
 ## Limitations
 

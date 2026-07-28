@@ -42,14 +42,17 @@ Each row is the authoritative tracking record. Keep this table, the
 | `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
 | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite` | 0.29.0 | `WebSocketConfig::auto_pong` opt-out for transparent Ping relay | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy | Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong | [docs/upstream-tungstenite-patches/003-…](upstream-tungstenite-patches/003-optional-auto-pong/README.md) |
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
 > and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
 > docs. Patches carried without an upstream PR, including the tungstenite frame
-> error-origin extension, are governed by the
+> error-origin extension, the tungstenite `auto_pong` opt-out, and the dimpl
+> credential-security patch, are governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
 ### Deliberate fork policy and SLA
@@ -57,10 +60,12 @@ Each row is the authoritative tracking record. Keep this table, the
 Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
 `scripts/check_vendored_patch_status.sh` polls those and goes red when one
-merges. Two patches — **h3 002** (Extended CONNECT `:protocol=websocket`) and
-**h3 003** (`peek_recv_trailers`) — have **no upstream issue or PR filed yet**.
-They are not an untracked TODO; they are carried as a **deliberate, time-boxed
-fork** of `h3` on `jeremyjpj0916/h3` and are governed as follows:
+merges. Fork-only patches currently include **h3 002** (Extended CONNECT
+`:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
+frame-limit origin extension, **tungstenite `auto_pong`** (transparent Ping
+relay), and **dimpl 001** (DTLS certificate chains and private-key
+zeroization). They are not untracked TODOs; they are carried as
+**deliberate, time-boxed forks** and are governed as follows:
 
 - **Owner.** The dependency-governance owner in
   [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
@@ -124,10 +129,18 @@ feature). Each entry documents the confinement and the upstream we are waiting o
 
 ### 3. Vendor drift guard
 
-`tests/integration/vendor_integrity_tests.rs` hashes every file under `vendor/`
-(LF-normalized SHA-256) and compares it to `vendor/VENDOR_INTEGRITY.sha256`. It
-runs in the normal integration suite (the `protocols-data-plane` shard), so a
-PR that changes any vendored byte without regenerating the manifest **fails CI**.
+`tests/integration/vendor_integrity_tests.rs` hashes every governed file under
+`vendor/` and compares it to `vendor/VENDOR_INTEGRITY.sha256`. Known text paths
+(allowlisted source/docs/config extensions and basenames) use LF-normalized
+SHA-256 (`\r` stripped) so CRLF checkouts stay stable; binary artifacts and any
+unrecognized path are hashed byte-for-byte so CR bytes in `.der` / `.bin` (and
+similar) cannot change unnoticed. Incidental crate-local `Cargo.lock` files
+created by documented standalone vendor tests are ignored by default; intentionally
+committed lockfiles that pin a standalone regression graph (currently
+`vendor/dimpl-0.6.1-ferrum-patched/Cargo.lock`) are allowlisted in
+`GOVERNED_VENDOR_LOCKFILES` and must appear in the manifest. The guard runs in
+the normal integration suite (the `protocols-data-plane` shard), so a PR that
+changes any governed vendored byte without regenerating the manifest **fails CI**.
 This keeps the vendored diff reviewable: an unexpected edit to upstream code
 cannot slip in unnoticed.
 
@@ -172,6 +185,17 @@ of the vendor copy and must keep passing after retirement:
 - The tungstenite pre-reservation frame-origin regression lives in the vendored
   crate (`protocol::frame::tests::size_limit_hit`) and runs alongside the
   raw-takeover regression in the vendored-patch job.
+- The tungstenite `auto_pong` opt-out regressions live in the vendored crate
+  (`protocol::tests::auto_pong_*`) and in
+  `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, with end-to-end
+  coverage in `tests/functional/functional_websocket_test.rs`
+  (`test_*websocket_ping_*`).
+- The dimpl credential regressions live in
+  `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
+  cover DTLS 1.2 and 1.3 chain transmission plus deterministic clone,
+  failed-construction, fallback, and shutdown zeroization observations. The
+  Ferrum integration suite separately verifies a root-only client completes a
+  handshake because the configured intermediate is transmitted.
 
 CI gates these vendored-patch contracts in the `Vendored Patch Regressions`
 job in `.github/workflows/ci.yml`. Keep that job in sync with this list when
@@ -339,5 +363,6 @@ a shell as a shortcut.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
 - `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,
-  `docs/upstream-tungstenite-patches/` — per-patch detail and retirement plans.
+  `docs/upstream-tungstenite-patches/`, `docs/upstream-dimpl-patches/` —
+  per-patch detail and retirement plans.
 - `Cargo.toml` `[patch.crates-io]` — the active vendored patches.

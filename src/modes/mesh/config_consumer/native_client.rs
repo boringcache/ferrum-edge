@@ -14,12 +14,14 @@ use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
     validate_update_ferrum_version,
 };
+use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_full,
 };
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
-use crate::modes::mesh::runtime::MeshRuntimeState;
+use crate::modes::mesh::revision::MeshRevisionRejection;
+use crate::modes::mesh::runtime::{MeshRuntimeState, MeshSliceInstall};
 use crate::modes::mesh::slice::MeshSlice;
 
 /// Phase B shell for Ferrum-native MeshSubscribe consumers.
@@ -49,6 +51,11 @@ impl NativeMeshClientConfig {
             labels: self.labels.clone(),
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
+            // Ordinary LOCAL mesh subscription: this data plane talks to its
+            // own control plane and presents the distinct, fixed local-mesh
+            // JWT audience. The CP rejects both missing audiences (legacy
+            // clients) and remote-discovery audiences on this class.
+            remote_discovery: false,
         }
     }
 }
@@ -214,11 +221,12 @@ async fn connect_mesh_subscribe(
     }
 
     let channel = endpoint.connect().await?;
-    let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+    let auth_token = generate_dp_jwt_full(
         jwt_secret.as_str(),
         &config.node_id,
         jwt_secret.issuer(),
         Some(&config.namespace),
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )?;
     let token: MetadataValue<_> = format!("Bearer {auth_token}").parse()?;
 
@@ -255,6 +263,7 @@ async fn connect_mesh_subscribe(
         let applied = if update.heartbeat {
             validate_update_ferrum_version(&update.ferrum_version, MeshUpdateConsumer::Native)
                 .map(|()| None)
+                .map_err(MeshApplyError::Update)
         } else {
             consumer.apply_update(&update).map(Some)
         };
@@ -277,13 +286,17 @@ async fn connect_mesh_subscribe(
                 // either way. A response that is not bound to this subscription
                 // means the whole stream is wrong, so drop it and let multi-CP
                 // failover pick another control plane (the reconnect path logs
-                // the failure with this CP's URL).
+                // the failure with this CP's URL). A config-revision rejection
+                // (issue #2473) does the same for a different reason: this CP's
+                // whole view is behind the accepted revision (or belongs to
+                // another ordering domain), so staying attached would only let
+                // it keep serving stale generations.
                 if rejection.terminates_stream() {
                     return Err(anyhow::Error::new(rejection));
                 }
                 warn!(
                     cp_url = %cp_url,
-                    reason = rejection.reason().as_metric_label(),
+                    reason = rejection.reason_label(),
                     "Ignoring invalid native MeshSubscribe update; keeping last-good slice"
                 );
             }
@@ -320,19 +333,65 @@ impl NativeMeshConfigConsumer {
 
     /// Validate a non-heartbeat update against the subscription and install it.
     ///
-    /// Validation is fail-closed and runs to completion **before** any mutation:
-    /// a rejected response leaves the previously installed slice serving
-    /// untouched.
-    pub fn apply_update(
-        &self,
-        update: &MeshConfigUpdate,
-    ) -> Result<MeshSlice, MeshUpdateRejection> {
+    /// Two fail-closed gates, both completing **before** any mutation, so a
+    /// refused response leaves the previously installed slice serving untouched:
+    ///
+    /// 1. Subscription binding / envelope consistency
+    ///    (`validate_mesh_config_update`, issue #2457).
+    /// 2. Authoritative config-revision freshness
+    ///    ([`MeshRuntimeState::install_slice`], issue #2473) — a slice older
+    ///    than, or from a different ordering domain than, the accepted revision
+    ///    is quarantined instead of installed.
+    pub fn apply_update(&self, update: &MeshConfigUpdate) -> Result<MeshSlice, MeshApplyError> {
         let consumer = MeshUpdateConsumer::Native;
-        let slice = validate_mesh_config_update(update, &self.expected, consumer)?;
-        self.state.install_slice(slice.clone());
-        Ok(slice)
+        let slice = validate_mesh_config_update(update, &self.expected, consumer)
+            .map_err(MeshApplyError::Update)?;
+        match self.state.install_slice(slice.clone()) {
+            MeshSliceInstall::Installed => Ok(slice),
+            MeshSliceInstall::Quarantined(rejection) => Err(MeshApplyError::Revision(rejection)),
+        }
     }
 }
+
+/// Why a native `MeshSubscribe` frame did not become the live slice.
+///
+/// Splits the two fail-closed gates so the stream disposition of each stays
+/// explicit: a binding/content failure follows the issue-#2457 split, while
+/// every revision failure terminates the stream so multi-CP failover leaves the
+/// lagging control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeshApplyError {
+    Update(MeshUpdateRejection),
+    Revision(MeshRevisionRejection),
+}
+
+impl MeshApplyError {
+    /// Bounded, compile-time metric/diagnostic label for the refusal.
+    pub fn reason_label(&self) -> &'static str {
+        match self {
+            Self::Update(rejection) => rejection.reason().as_metric_label(),
+            Self::Revision(rejection) => rejection.reason().as_metric_label(),
+        }
+    }
+
+    pub fn terminates_stream(&self) -> bool {
+        match self {
+            Self::Update(rejection) => rejection.terminates_stream(),
+            Self::Revision(rejection) => rejection.terminates_stream(),
+        }
+    }
+}
+
+impl std::fmt::Display for MeshApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Update(rejection) => write!(f, "{rejection}"),
+            Self::Revision(rejection) => write!(f, "{rejection}"),
+        }
+    }
+}
+
+impl std::error::Error for MeshApplyError {}
 
 #[cfg(test)]
 mod tests {
@@ -365,6 +424,15 @@ mod tests {
             mesh_slice_json: serde_json::to_string(slice).expect("mesh slice serializes"),
             ferrum_version: crate::FERRUM_VERSION.to_string(),
             heartbeat: false,
+            config_authority: slice
+                .revision
+                .as_ref()
+                .map(|revision| revision.authority.clone())
+                .unwrap_or_default(),
+            config_sequence: slice
+                .revision
+                .as_ref()
+                .map_or(0, |revision| revision.sequence),
         }
     }
 
@@ -411,7 +479,10 @@ mod tests {
             .apply_update(&update)
             .expect_err("a slice for another node must be rejected");
 
-        assert_eq!(rejection.reason(), MeshUpdateRejectReason::NodeIdMismatch);
+        assert_eq!(
+            rejection.reason_label(),
+            MeshUpdateRejectReason::NodeIdMismatch.as_metric_label()
+        );
         assert!(rejection.terminates_stream());
         assert!(!state.has_first_slice());
         assert!(state.snapshot().as_ref().is_none());
@@ -474,17 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn mesh_client_self_minted_token_carries_namespace_claim() {
-        let token = generate_dp_jwt_with_issuer_and_namespace(
+    fn mesh_client_self_minted_token_carries_namespace_and_local_audience() {
+        let token = generate_dp_jwt_full(
             "test-secret",
             "node-a",
             "ferrum-edge-cp-dp",
             Some("tenant-a"),
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
         )
         .expect("token should mint");
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
         validation.set_issuer(&["ferrum-edge-cp-dp"]);
+        validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
             &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
@@ -495,6 +568,10 @@ mod tests {
         assert_eq!(
             decoded.claims.get("ns").and_then(|value| value.as_str()),
             Some("tenant-a")
+        );
+        assert_eq!(
+            decoded.claims.get("aud").and_then(|value| value.as_str()),
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
         );
     }
 }

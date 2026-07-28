@@ -43,7 +43,7 @@ use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -56,11 +56,11 @@ pub use crate::config::batch_atomicity::{
 };
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
-    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, FullConfigLoadPurpose,
-    IncrementalResult, MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict,
-    NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts, NamespacedResourceId,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
-    TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
+    ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
+    DbFailoverTopologyState, FullConfigLoadPurpose, IncrementalResult, MtlsDnsAdmissionUnavailable,
+    MtlsDnsIdentityConflict, NamespaceConfigAdmissionLeaseBackend, NamespaceResourceCounts,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, TcpConnectionThrottleAttachmentConflict, extract_db_hostname, redact_url,
 };
 
 const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
@@ -592,6 +592,35 @@ pub(crate) fn statement_timeout_sql(
     }
 }
 
+/// Topology label passed to SQL reconnect transition test hooks (issue #3001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlReconnectTopology {
+    Primary,
+    Failover,
+}
+
+/// Async callback installed by external tests around
+/// [`DatabaseStore::reconnect_for_topology`]'s publication/topology critical
+/// section. Production leaves hooks unset.
+pub type SqlReconnectTransitionHook = Arc<
+    dyn Fn(SqlReconnectTopology) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Optional test seams for proving reconnect transition serialization without
+/// sleeps. Both callbacks are no-ops when unset.
+#[derive(Clone, Default)]
+pub struct SqlReconnectTransitionTestHooks {
+    /// Invoked after a successful connect and immediately before awaiting the
+    /// reconnect transition write lock.
+    pub before_lock: Option<SqlReconnectTransitionHook>,
+    /// Invoked while the reconnect transition write lock is held, after pool
+    /// publication (and after failover gate-before-publish), before deferred
+    /// migrations and primary `mark_primary` finalize the transition.
+    pub while_holding: Option<SqlReconnectTransitionHook>,
+}
+
 /// Database configuration store.
 ///
 /// The inner pool is wrapped in `ArcSwap` so it can be atomically replaced
@@ -607,8 +636,19 @@ pub struct DatabaseStore {
     /// Read replicas belong to the configured primary topology. While the
     /// active write/runtime pool points at a failover URL, admin reads must
     /// stay on that same active pool rather than crossing into a replica of
-    /// the unavailable primary topology.
-    primary_topology_active: Arc<AtomicBool>,
+    /// the unavailable primary topology. Also tracks sticky failover topology
+    /// and the process-local opt-in divergence-risk marker (issue #3001).
+    failover_topology: DbFailoverTopologyState,
+    /// Write-locks serialize SQL reconnect publication + topology transitions
+    /// across concurrent callers (DB polling/failover and DB TLS reload),
+    /// including the deferred-migration await window. Admin mutations take a
+    /// shared read lock via [`DatabaseBackend::acquire_write_topology_permit`]
+    /// so a reconnect cannot redirect an in-flight write. Not taken on ordinary
+    /// read/request hot paths.
+    reconnect_transition: Arc<tokio::sync::RwLock<()>>,
+    /// External-test hooks around [`Self::reconnect_transition`]. Empty in
+    /// production; see [`Self::set_reconnect_transition_hooks_for_test`].
+    reconnect_transition_test_hooks: Arc<std::sync::Mutex<Option<SqlReconnectTransitionTestHooks>>>,
     db_type: String,
     failover_urls: Vec<String>,
     pool_config: DbPoolConfig,
@@ -1031,36 +1071,30 @@ impl DatabaseStore {
         listen_path: Option<&str>,
         hosts: &[String],
         rows: &[AnyRow],
-    ) -> bool {
+    ) -> Result<bool, anyhow::Error> {
         if listen_path.is_none() && hosts.is_empty() {
-            return false;
+            return Ok(false);
         }
         if rows.is_empty() {
-            return true;
+            return Ok(true);
         }
         if listen_path.is_some() && hosts.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         for row in rows {
-            let existing_hosts: Vec<String> = row
-                .try_get::<String, _>("hosts")
-                .ok()
-                .and_then(|s| match serde_json::from_str(&s) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        warn!("Failed to parse hosts JSON during uniqueness check: {}", e);
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            let existing_hosts_raw = required_utf8_text_column(row, "hosts")?;
+            let existing_hosts: Vec<String> =
+                serde_json::from_str(&existing_hosts_raw).map_err(|error| {
+                    anyhow::anyhow!("failed to parse hosts JSON during uniqueness check: {error}")
+                })?;
 
             if crate::config::types::hosts_overlap(hosts, &existing_hosts) {
-                return false;
+                return Ok(false);
             }
         }
 
-        true
+        Ok(true)
     }
 
     async fn lock_proxy_route_bucket_tx(
@@ -1555,7 +1589,7 @@ impl DatabaseStore {
         let rows = self
             .listen_path_candidate_rows_tx(tx, &proxy.namespace, listen_path, exclude_id)
             .await?;
-        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows) {
+        if !Self::listen_path_rows_are_unique(listen_path, &proxy.hosts, &rows)? {
             anyhow::bail!(PROXY_ROUTE_CONFLICT_ERROR);
         }
 
@@ -1743,7 +1777,9 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: Vec::new(),
             pool_config,
@@ -1801,7 +1837,9 @@ impl DatabaseStore {
             pool: Arc::new(ArcSwap::from_pointee(pool)),
             read_replica_url: None,
             read_replica_pool: Arc::new(ArcSwapOption::empty()),
-            primary_topology_active: Arc::new(AtomicBool::new(true)),
+            failover_topology: DbFailoverTopologyState::new(),
+            reconnect_transition: Arc::new(tokio::sync::RwLock::new(())),
+            reconnect_transition_test_hooks: Arc::new(std::sync::Mutex::new(None)),
             db_type: db_type.to_string(),
             failover_urls: failover_urls.to_vec(),
             pool_config,
@@ -3232,6 +3270,9 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
+        // Every selected orphan must decode. Silently dropping a row on
+        // try_get failure would commit the parent mutation while retaining the
+        // orphan and omitting its delete change record (issue #3221).
         let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
             "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' AND pc.namespace = ? \
@@ -3241,13 +3282,20 @@ impl DatabaseStore {
         .fetch_all(&mut **tx)
         .await?
         .iter()
-        .filter_map(|row| {
-            Some((
-                row.try_get::<String, _>("id").ok()?,
-                row.try_get::<String, _>("namespace").ok()?,
-            ))
+        .map(|row| {
+            let id = row.try_get::<String, _>("id").map_err(|e| {
+                anyhow::Error::from(e).context(
+                    "operation=cleanup_orphaned_proxy_group_plugins resource=plugin_configs column=id: failed to decode orphaned proxy_group plugin row",
+                )
+            })?;
+            let namespace = row.try_get::<String, _>("namespace").map_err(|e| {
+                anyhow::Error::from(e).context(
+                    "operation=cleanup_orphaned_proxy_group_plugins resource=plugin_configs column=namespace: failed to decode orphaned proxy_group plugin row",
+                )
+            })?;
+            Ok::<_, anyhow::Error>((id, namespace))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
         for (id, namespace) in &orphaned_configs {
             info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
@@ -3713,6 +3761,10 @@ impl DatabaseStore {
             return Ok(false);
         }
 
+        // Every association row required for proxy invalidation must decode
+        // before destructive mutation. Silently dropping a row on try_get
+        // failure would delete the plugin while omitting proxies.updated_at
+        // bumps and proxy config_change upserts (issue #3209).
         let affected_proxy_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
                 .bind(id)
@@ -3720,8 +3772,14 @@ impl DatabaseStore {
                 .await?;
         let affected_proxy_ids: Vec<String> = affected_proxy_rows
             .iter()
-            .filter_map(|row| row.try_get::<String, _>("proxy_id").ok())
-            .collect();
+            .map(|row| {
+                row.try_get::<String, _>("proxy_id").map_err(|e| {
+                    anyhow::Error::from(e).context(
+                        "operation=delete_plugin_config resource=proxy_plugins column=proxy_id: failed to decode association row required for proxy invalidation",
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE plugin_config_id = ?"))
@@ -4504,7 +4562,7 @@ impl DatabaseStore {
         let rows: Vec<AnyRow> = query.fetch_all(&self.pool()).await?;
 
         self.check_slow_query("check_listen_path_unique", start);
-        Ok(Self::listen_path_rows_are_unique(listen_path, hosts, &rows))
+        Self::listen_path_rows_are_unique(listen_path, hosts, &rows)
     }
 
     /// Check if a proxy name is unique (when present).
@@ -4737,7 +4795,7 @@ impl DatabaseStore {
                     last_id = Some(consumer_id);
                     continue;
                 }
-                let credentials_json: String = row.try_get("credentials")?;
+                let credentials_json = required_utf8_text_column(&row, "credentials")?;
                 let credentials: HashMap<String, serde_json::Value> =
                     serde_json::from_str(&credentials_json).map_err(|error| {
                         anyhow::anyhow!(
@@ -4910,6 +4968,15 @@ impl DatabaseStore {
         .bind(namespace)
         .fetch_one(&self.pool())
         .await?;
+        let max_sequence: i64 = row.try_get("max_sequence")?;
+        Ok(max_sequence.max(0) as u64)
+    }
+
+    pub async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        let row =
+            sqlx::query("SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM config_changes")
+                .fetch_one(&self.pool())
+                .await?;
         let max_sequence: i64 = row.try_get("max_sequence")?;
         Ok(max_sequence.max(0) as u64)
     }
@@ -5359,6 +5426,8 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         // PostgreSQL defaults to READ COMMITTED, where a namespace-wide DELETE
         // can see rows committed after the pre-scan used for change logging.
+        // Callers must invoke this immediately after `begin()` — Postgres
+        // rejects SET TRANSACTION after any other statement in the transaction.
         if self.db_type == "postgres" {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut **tx)
@@ -6387,9 +6456,11 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
+        // PostgreSQL requires SET TRANSACTION before any other statement in the
+        // transaction (including the mTLS DNS admission lock queries below).
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
             .await?;
-        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         let proxy_ids = self
             .select_resource_ids_tx(&mut tx, "proxies", namespace, None, true)
             .await?;
@@ -6482,11 +6553,56 @@ impl DatabaseStore {
     /// Atomically replace the connection pool with a freshly connected one.
     ///
     /// Called by the DB polling loop when DnsCache detects that the database
-    /// FQDN now resolves to a different set of IPs. The old pool is closed
-    /// gracefully in the background — in-flight queries complete normally.
+    /// FQDN now resolves to a different set of IPs, and by DB TLS live reload.
+    /// Callers pass the configured primary URL (`FERRUM_DB_URL` effective form).
+    /// On success this records primary topology — never label an active
+    /// failover URL as primary (failover reconnects use
+    /// [`Self::reconnect_for_topology`] with [`DatabaseTopology::Failover`] or
+    /// [`Self::try_failover_reconnect`]). The old pool is closed gracefully in
+    /// the background — in-flight queries complete normally.
     pub async fn reconnect(&self, db_url: &str) -> Result<(), anyhow::Error> {
         self.reconnect_for_topology(db_url, DatabaseTopology::Primary)
             .await
+    }
+
+    /// Reconnect labeling the URL as sticky failover topology.
+    ///
+    /// Crate-visible so `_test_support` can drive failover publication without
+    /// going through [`Self::try_failover_reconnect`]'s primary-first probe.
+    pub(crate) async fn reconnect_as_failover(&self, db_url: &str) -> Result<(), anyhow::Error> {
+        self.reconnect_for_topology(db_url, DatabaseTopology::Failover)
+            .await
+    }
+
+    /// Install (or clear) async test hooks around the reconnect transition
+    /// write lock. Production leaves this unset.
+    #[allow(dead_code)] // exercised via external unit tests through the lib target
+    pub fn set_reconnect_transition_hooks_for_test(
+        &self,
+        hooks: Option<SqlReconnectTransitionTestHooks>,
+    ) {
+        let mut guard = self
+            .reconnect_transition_test_hooks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = hooks;
+    }
+
+    async fn invoke_reconnect_transition_hook(
+        &self,
+        select: impl Fn(&SqlReconnectTransitionTestHooks) -> Option<&SqlReconnectTransitionHook>,
+        topology: SqlReconnectTopology,
+    ) {
+        let hook = {
+            let guard = self
+                .reconnect_transition_test_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.as_ref().and_then(&select).cloned()
+        };
+        if let Some(hook) = hook {
+            hook(topology).await;
+        }
     }
 
     async fn reconnect_for_topology(
@@ -6496,6 +6612,11 @@ impl DatabaseStore {
     ) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
+        // Connect outside the transition write lock so concurrent reconnect
+        // attempts can open sockets in parallel; only publication/topology
+        // (including deferred migrations) is serialized. Request hot paths
+        // never take this lock; Admin mutations take a shared read pin via
+        // `acquire_write_topology_permit` instead.
         let new_pool = connect_any_pool_with_timeout(
             self.build_pool_options(),
             db_url,
@@ -6504,12 +6625,30 @@ impl DatabaseStore {
         )
         .await?;
 
+        let topology_kind = match topology {
+            DatabaseTopology::Primary => SqlReconnectTopology::Primary,
+            DatabaseTopology::Failover => SqlReconnectTopology::Failover,
+        };
+        self.invoke_reconnect_transition_hook(|hooks| hooks.before_lock.as_ref(), topology_kind)
+            .await;
+        // Exclusive write lock: waits for in-flight mutation topology pins
+        // (shared reads) and serializes concurrent reconnect publishers.
+        let _transition_guard = self.reconnect_transition.write().await;
+
+        if topology == DatabaseTopology::Primary {
+            self.failover_topology.ensure_primary_failback_allowed()?;
+        }
+
         // Disable and close the configured primary-topology replica before
         // exposing a failover pool. Keeping the dormant pool would make it
         // look immediately available on failback and skip the one reconnect
         // that refreshes its connections after the topology transition.
+        // Gate-before-publish: flip the write gate before ArcSwap so
+        // `check_write_allowed()` / `admit_write()` cannot observe a failover
+        // pool while `primary_active` is still true.
         if topology == DatabaseTopology::Failover {
-            self.primary_topology_active.store(false, Ordering::Release);
+            self.failover_topology
+                .mark_failover(&Self::redact_url(db_url));
             self.suppress_read_replica_pool();
         }
 
@@ -6526,6 +6665,12 @@ impl DatabaseStore {
             old_pool.close().await;
         });
 
+        // Test seam: hold the transition across the deferred-migration window
+        // so a later failover/primary cannot interleave and then be overwritten
+        // by a delayed mark_primary / mismatched topology finalization.
+        self.invoke_reconnect_transition_hook(|hooks| hooks.while_holding.as_ref(), topology_kind)
+            .await;
+
         // If this store was bootstrapped via `connect_offline_with_pool_config`
         // (backup-file startup with an unreachable DB), migrations never ran.
         // Now that the pool is reconnected to a live DB, run them before
@@ -6535,8 +6680,11 @@ impl DatabaseStore {
         // doesn't silently skip migrations forever.
         self.maybe_apply_deferred_migrations().await?;
 
+        // Primary failback stays fail-closed for writes until publication and
+        // deferred migrations succeed: mark_primary only after the await.
         if topology == DatabaseTopology::Primary {
-            self.primary_topology_active.store(true, Ordering::Release);
+            self.failover_topology
+                .mark_primary(&Self::redact_url(db_url));
         }
 
         Ok(())
@@ -6594,8 +6742,8 @@ impl DatabaseStore {
                             );
                             store.failover_urls = failover_urls.to_vec();
                             store
-                                .primary_topology_active
-                                .store(false, Ordering::Release);
+                                .failover_topology
+                                .mark_failover(&Self::redact_url(url));
                             return Ok(store);
                         }
                         Err(e) => {
@@ -6637,7 +6785,7 @@ impl DatabaseStore {
         sqlx::any::install_default_drivers();
         self.read_replica_url = Some(replica_url.to_string());
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             info!(
                 "Read replica configured but connection deferred while the database is failed over"
             );
@@ -6669,7 +6817,7 @@ impl DatabaseStore {
     /// scans, and association validation must read from the primary pool so
     /// replica lag cannot hide changes or advance cursors incorrectly.
     fn admin_read_pool(&self) -> AdminReadPool {
-        if self.primary_topology_active.load(Ordering::Acquire)
+        if self.failover_topology.primary_active()
             && self.read_replica_url.is_some()
             && let Some(replica) = self.read_replica_pool.load_full()
         {
@@ -6744,7 +6892,7 @@ impl DatabaseStore {
     pub async fn reconnect_read_replica(&self, replica_url: &str) -> Result<(), anyhow::Error> {
         sqlx::any::install_default_drivers();
 
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             debug!("Read replica reconnect deferred while the database is failed over");
             return Ok(());
         }
@@ -6766,7 +6914,7 @@ impl DatabaseStore {
         // Failover may have started while the connection was opening. Do not
         // publish a replica pool that admin reads must suppress; closing it
         // leaves the post-failback scheduler responsible for one fresh retry.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             new_pool.close().await;
             debug!(
                 "Discarded read replica reconnect because the database failed over while it was opening"
@@ -6779,7 +6927,7 @@ impl DatabaseStore {
         // Close the remaining race between the check above and publication:
         // if failover flipped the topology and ran its first suppression just
         // before this swap, remove the newly-published pool ourselves.
-        if !self.primary_topology_active.load(Ordering::Acquire) {
+        if !self.failover_topology.primary_active() {
             let raced_pool = self.read_replica_pool.swap(None);
             if let Some(pool) = raced_pool {
                 tokio::spawn(async move {
@@ -6815,8 +6963,11 @@ impl DatabaseStore {
     ///
     /// Called by the polling loop when the current connection is failing.
     /// Returns the URL that succeeded, or an error if all failed.
+    ///
+    /// Primary failback is refused after an Admin write was admitted on the
+    /// failover topology, preventing a stale primary snapshot from replacing it.
     pub async fn try_failover_reconnect(&self, primary_url: &str) -> Result<String, anyhow::Error> {
-        // Try primary first
+        // Try primary first.
         match self
             .reconnect_for_topology(primary_url, DatabaseTopology::Primary)
             .await
@@ -6824,6 +6975,11 @@ impl DatabaseStore {
             Ok(()) => {
                 info!("Reconnected to primary database");
                 return Ok(primary_url.to_string());
+            }
+            Err(error) if crate::config::db_backend::primary_failback_fenced(&error) => {
+                warn!(
+                    "Primary database failback remains fenced after an admitted failover-window Admin write; retrying configured failover URLs"
+                );
             }
             Err(error) if !is_transient_failover_error(&error) => {
                 return Err(mark_non_transient(
@@ -6841,10 +6997,7 @@ impl DatabaseStore {
 
         // Try failover URLs in order
         for (i, url) in self.failover_urls.iter().enumerate() {
-            match self
-                .reconnect_for_topology(url, DatabaseTopology::Failover)
-                .await
-            {
+            match self.reconnect_as_failover(url).await {
                 Ok(()) => {
                     info!(
                         "Reconnected to failover database #{} ({})",
@@ -8050,6 +8203,12 @@ impl DatabaseStore {
             );
         }
 
+        // Every selected spec-owned upstream id must decode. Silently dropping
+        // a row on try_get failure shrinks the protected set and can make an
+        // all-failed selection look empty, skipping the mesh_route_dispatch
+        // scan and allowing replace/delete to commit with dangling external
+        // references (issue #3210). The empty-set fast path is only for a
+        // query that truly returned no rows.
         let upstream_rows: Vec<AnyRow> = sqlx::query(
             &self.q("SELECT id FROM upstreams WHERE namespace = ? AND api_spec_id = ?"),
         )
@@ -8057,12 +8216,19 @@ impl DatabaseStore {
         .bind(spec_id)
         .fetch_all(&mut **tx)
         .await?;
-        let spec_upstream_ids: HashSet<String> = upstream_rows
-            .iter()
-            .filter_map(|row| row.try_get::<String, _>("id").ok())
-            .collect();
-        if spec_upstream_ids.is_empty() {
+        if upstream_rows.is_empty() {
             return Ok(());
+        }
+        let mut spec_upstream_ids = HashSet::with_capacity(upstream_rows.len());
+        for row in &upstream_rows {
+            let id = row.try_get::<String, _>("id").map_err(|e| {
+                anyhow::Error::from(e).context(format!(
+                    "operation=ensure_no_external_spec_upstream_refs resource=upstreams \
+                     namespace={namespace} api_spec_id={spec_id} column=id: \
+                     failed to decode spec-owned upstream id required for external reference checks"
+                ))
+            })?;
+            spec_upstream_ids.insert(id);
         }
 
         let plugin_rows: Vec<AnyRow> = sqlx::query(
@@ -8367,11 +8533,13 @@ impl DatabaseStore {
     /// have no FK to proxies, so they are cleaned up manually by api_spec_id.
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
+        // PostgreSQL requires SET TRANSACTION before any other statement in the
+        // transaction (including the mTLS DNS admission lock queries below).
+        self.use_delete_capture_snapshot_tx(&mut tx).await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
         let prior_mtls_dns_conflicts = self
             .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
             .await?;
-        self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
         let row: Option<AnyRow> =
@@ -8984,7 +9152,7 @@ impl DatabaseBackend for DatabaseStore {
     }
 
     fn read_replica_available(&self) -> bool {
-        self.primary_topology_active.load(Ordering::Acquire)
+        self.failover_topology.primary_active()
             && self
                 .read_replica_pool
                 .load_full()
@@ -8995,7 +9163,28 @@ impl DatabaseBackend for DatabaseStore {
         // A configured replica is suppressed (not broken) precisely while the
         // active write/runtime pool points at a failover URL. The scheduler
         // skips reconnects in this state; failback re-enables eligibility.
-        self.read_replica_url.is_some() && !self.primary_topology_active.load(Ordering::Acquire)
+        self.read_replica_url.is_some() && !self.failover_topology.primary_active()
+    }
+
+    fn failover_topology_status(&self) -> crate::config::db_backend::DbFailoverTopologyStatus {
+        self.failover_topology.status()
+    }
+
+    fn set_failover_allow_writes(&mut self, allow: bool) {
+        self.failover_topology.set_allow_writes(allow);
+    }
+
+    fn note_failover_admin_write(&self) {
+        self.failover_topology.note_admin_write();
+    }
+
+    async fn acquire_write_topology_permit(
+        &self,
+    ) -> crate::config::db_backend::DbWriteTopologyPermit {
+        // Shared read pin: blocks reconnect write publication for the
+        // mutation's lifetime without serializing concurrent Admin writes.
+        let guard = self.reconnect_transition.clone().read_owned().await;
+        crate::config::db_backend::DbWriteTopologyPermit::pinned(guard)
     }
 
     fn pool_stats(&self) -> Option<crate::config::db_backend::DbPoolStats> {
@@ -9004,8 +9193,8 @@ impl DatabaseBackend for DatabaseStore {
         let idle = primary.num_idle() as u32;
 
         let replica = self
-            .primary_topology_active
-            .load(Ordering::Acquire)
+            .failover_topology
+            .primary_active()
             .then(|| self.read_replica_pool.load_full())
             .flatten()
             .map(|rp| {
@@ -9077,6 +9266,10 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn latest_change_sequence(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::latest_change_sequence(self, namespace).await
+    }
+
+    async fn latest_global_change_sequence(&self) -> Result<u64, anyhow::Error> {
+        DatabaseStore::latest_global_change_sequence(self).await
     }
 
     async fn load_incremental_config(
@@ -9633,9 +9826,9 @@ fn row_to_proxy_inner(
         .try_get("auth_mode")
         .map_err(|e| anyhow::anyhow!("Proxy {}: failed to read auth_mode: {}", pid, e))?;
 
-    let hosts_str: String = row
-        .try_get::<String, _>("hosts")
-        .unwrap_or_else(|_| "[]".into());
+    let hosts_str = required_utf8_text_column(row, "hosts").map_err(|error| {
+        anyhow::anyhow!("Proxy {}: failed to read hosts column: {}", pid, error)
+    })?;
     let hosts: Vec<String> = serde_json::from_str(&hosts_str).map_err(|e| {
         // Do not embed the raw hosts column — poll/startup rejection logs
         // surface this message (issue #2997 redaction).
@@ -9651,7 +9844,7 @@ fn row_to_proxy_inner(
         // malformed listen_path into a host-only proxy and change routing
         // behavior. `Option<String>` already represents SQL NULL, so `?` is
         // safe for the expected nullable case and fails fast on real errors.
-        listen_path: row.try_get::<Option<String>, _>("listen_path")?,
+        listen_path: optional_utf8_text_column(row, "listen_path")?,
         backend_scheme: Some(backend_scheme),
         // `dispatch_kind` is populated by `GatewayConfig::normalize_fields()`
         // once the full config is loaded. Seed it here from the row values so
@@ -9663,7 +9856,7 @@ fn row_to_proxy_inner(
             .try_get::<i32, _>("backend_port")
             .map(|v| v.clamp(0, 65535) as u16)
             .unwrap_or(80),
-        backend_path: row.try_get("backend_path").ok(),
+        backend_path: optional_utf8_text_column(row, "backend_path")?,
         strip_listen_path: row.try_get::<i32, _>("strip_listen_path").unwrap_or(1) != 0,
         preserve_host_header: row.try_get::<i32, _>("preserve_host_header").unwrap_or(0) != 0,
         backend_connect_timeout_ms: row
@@ -9681,20 +9874,24 @@ fn row_to_proxy_inner(
         // Propagate decode errors — silently defaulting to None would disable
         // backend mTLS (client cert/key) or swap the trust anchor from a custom
         // CA to the global bundle/webpki. `Option<String>` already represents
-        // SQL NULL, so `?` is safe for the expected nullable case.
-        backend_tls_client_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
-        backend_tls_client_key_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
+        // SQL NULL; optional_utf8_text_column keeps that contract while decoding
+        // MySQL MEDIUMTEXT via sqlx-Any's BLOB mapping.
+        backend_tls_client_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_client_cert_path",
+        )?,
+        backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
         backend_tls_verify_server_cert: row
             .try_get::<i32, _>("backend_tls_verify_server_cert")
             .unwrap_or(1)
             != 0,
-        backend_tls_server_ca_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        backend_tls_server_ca_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_server_ca_cert_path",
+        )?,
         // DNS override redirects egress; silently dropping it can send traffic
         // to an unintended resolved address.
-        dns_override: row.try_get::<Option<String>, _>("dns_override")?,
+        dns_override: optional_utf8_text_column(row, "dns_override")?,
         dns_cache_ttl_seconds: row
             .try_get::<i64, _>("dns_cache_ttl_seconds")
             .ok()
@@ -9704,20 +9901,20 @@ fn row_to_proxy_inner(
         // Propagate decode errors — silently defaulting to None would detach
         // the proxy from its load-balanced upstream and fall back to
         // `backend_host`, changing routing behavior.
-        upstream_id: row.try_get::<Option<String>, _>("upstream_id")?,
-        circuit_breaker: match row.try_get::<String, _>("circuit_breaker") {
-            Ok(s) => Some(
+        upstream_id: optional_utf8_text_column(row, "upstream_id")?,
+        circuit_breaker: match optional_utf8_text_column(row, "circuit_breaker")? {
+            Some(s) => Some(
                 serde_json::from_str::<CircuitBreakerConfig>(&s).map_err(|e| {
                     anyhow::anyhow!("Proxy {}: failed to parse circuit_breaker JSON: {}", pid, e)
                 })?,
             ),
-            Err(_) => None,
+            None => None,
         },
-        retry: match row.try_get::<String, _>("retry") {
-            Ok(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
+        retry: match optional_utf8_text_column(row, "retry")? {
+            Some(s) => Some(serde_json::from_str::<RetryConfig>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse retry JSON: {}", pid, e)
             })?),
-            Err(_) => None,
+            None => None,
         },
         response_body_mode: row
             .try_get::<String, _>("response_body_mode")
@@ -9789,7 +9986,7 @@ fn row_to_proxy_inner(
         pool_http1_max_pending_requests: None,
         // Subset selection is routing-sensitive; silently mapping a decode
         // failure to None would broaden traffic across all upstream targets.
-        upstream_subset: row.try_get::<Option<String>, _>("upstream_subset")?,
+        upstream_subset: optional_utf8_text_column(row, "upstream_subset")?,
         listen_port: row
             .try_get::<i32, _>("listen_port")
             .ok()
@@ -9808,21 +10005,21 @@ fn row_to_proxy_inner(
             .try_get::<i64, _>("websocket_idle_timeout_seconds")
             .ok()
             .map(|v| v.max(0) as u64),
-        allowed_methods: match row.try_get::<String, _>("allowed_methods") {
-            Ok(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        allowed_methods: match optional_utf8_text_column(row, "allowed_methods")? {
+            Some(s) => Some(serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!("Proxy {}: failed to parse allowed_methods JSON: {}", pid, e)
             })?),
-            Err(_) => None,
+            None => None,
         },
-        allowed_ws_origins: match row.try_get::<String, _>("allowed_ws_origins") {
-            Ok(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        allowed_ws_origins: match optional_utf8_text_column(row, "allowed_ws_origins")? {
+            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Proxy {}: failed to parse allowed_ws_origins JSON: {}",
                     pid,
                     e
                 )
             })?,
-            Err(_) => Vec::new(),
+            None => Vec::new(),
         },
         udp_max_response_amplification_factor: row
             .try_get::<f64, _>("udp_max_response_amplification_factor")
@@ -9857,7 +10054,8 @@ fn row_to_proxy_inner(
     })
 }
 
-/// Parse a consumer row into a Consumer struct.
+/// Decode a required TEXT/MEDIUMTEXT column, including MySQL's sqlx-Any BLOB
+/// wire form. Reject invalid UTF-8 instead of inventing a default.
 fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyhow::Error> {
     match row.try_get::<String, _>(column) {
         Ok(value) => Ok(value),
@@ -9875,6 +10073,35 @@ fn required_utf8_text_column(row: &AnyRow, column: &str) -> Result<String, anyho
             String::from_utf8(bytes)
                 .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}"))
         }
+    }
+}
+
+/// Decode a nullable TEXT/MEDIUMTEXT column. `Ok(None)` preserves SQL NULL;
+/// non-NULL Blob/text values that are not valid UTF-8 still reject the row so
+/// trust/routing material cannot silently become `None`.
+fn optional_utf8_text_column(row: &AnyRow, column: &str) -> Result<Option<String>, anyhow::Error> {
+    match row.try_get::<Option<String>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(text_error) => match row.try_get::<Option<Vec<u8>>, _>(column) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|error| anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")),
+            Err(blob_opt_error) => {
+                // Some MySQL/sqlx-Any paths surface non-NULL TEXT-family values
+                // as a bare BLOB rather than Option<BLOB>.
+                let bytes: Vec<u8> = row.try_get(column).map_err(|blob_error| {
+                    anyhow::anyhow!(
+                        "column '{column}' could not be decoded as optional SQL text \
+                         ({text_error}), optional bytes ({blob_opt_error}), or bytes \
+                         ({blob_error})"
+                    )
+                })?;
+                String::from_utf8(bytes).map(Some).map_err(|error| {
+                    anyhow::anyhow!("column '{column}' is not valid UTF-8: {error}")
+                })
+            }
+        },
     }
 }
 
@@ -9948,7 +10175,7 @@ fn row_to_plugin_config_inner(
     row: &AnyRow,
     id_preview: &str,
 ) -> Result<PluginConfig, anyhow::Error> {
-    let config_str: String = row.try_get("config").map_err(|e| {
+    let config_str = required_utf8_text_column(row, "config").map_err(|e| {
         anyhow::anyhow!(
             "PluginConfig {}: failed to read config column: {}",
             id_preview,
@@ -10011,7 +10238,7 @@ fn row_to_upstream(row: &AnyRow) -> Result<Upstream, anyhow::Error> {
 }
 
 fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, anyhow::Error> {
-    let targets_str: String = row.try_get("targets").map_err(|e| {
+    let targets_str = required_utf8_text_column(row, "targets").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read targets column: {}",
             id_preview,
@@ -10026,7 +10253,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         )
     })?;
 
-    let algo_str: String = row.try_get("algorithm").map_err(|e| {
+    let algo_str = required_utf8_text_column(row, "algorithm").map_err(|e| {
         anyhow::anyhow!(
             "Upstream {}: failed to read algorithm column: {}",
             id_preview,
@@ -10041,39 +10268,40 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
             anyhow::anyhow!("Upstream {}: failed to parse algorithm", id_preview)
         })?;
 
-    let health_checks: Option<HealthCheckConfig> = match row.try_get::<String, _>("health_checks") {
-        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
-            anyhow::anyhow!(
-                "Upstream {}: failed to parse health_checks JSON: {}",
-                id_preview,
-                e
-            )
-        })?),
-        Err(_) => None,
-    };
+    let health_checks: Option<HealthCheckConfig> =
+        match optional_utf8_text_column(row, "health_checks")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+                anyhow::anyhow!(
+                    "Upstream {}: failed to parse health_checks JSON: {}",
+                    id_preview,
+                    e
+                )
+            })?),
+            None => None,
+        };
 
     let service_discovery: Option<ServiceDiscoveryConfig> =
-        match row.try_get::<String, _>("service_discovery") {
-            Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "service_discovery")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse service_discovery JSON: {}",
                     id_preview,
                     e
                 )
             })?),
-            Err(_) => None,
+            None => None,
         };
 
     let hash_on_cookie_config: Option<crate::config::types::HashOnCookieConfig> =
-        match row.try_get::<Option<String>, _>("hash_on_cookie_config") {
-            Ok(Some(s)) => Some(serde_json::from_str(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "hash_on_cookie_config")? {
+            Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse hash_on_cookie_config JSON: {}",
                     id_preview,
                     e
                 )
             })?),
-            Ok(None) | Err(_) => None,
+            None => None,
         };
 
     // Parse backend TLS fields
@@ -10082,30 +10310,29 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         .map(|v| v != 0)
         .unwrap_or(true);
 
-    let subsets = match row.try_get::<String, _>("subsets") {
-        Ok(s) => Some(serde_json::from_str(&s).map_err(|e| {
+    let subsets = match optional_utf8_text_column(row, "subsets")? {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
             anyhow::anyhow!(
                 "Upstream {}: failed to parse subsets JSON: {}",
                 id_preview,
                 e
             )
         })?),
-        Err(_) => None,
+        None => None,
     };
 
     let backend_tls_san_allow_list =
-        match row.try_get::<Option<String>, _>("backend_tls_san_allow_list") {
-            Ok(Some(s)) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
+        match optional_utf8_text_column(row, "backend_tls_san_allow_list")? {
+            Some(s) => serde_json::from_str::<Vec<String>>(&s).map_err(|e| {
                 anyhow::anyhow!(
                     "Upstream {}: failed to parse backend_tls_san_allow_list JSON: {}",
                     id_preview,
                     e
                 )
             })?,
-            Ok(None) => Vec::new(),
-            Err(e) => return Err(e.into()),
+            None => Vec::new(),
         };
-    let backend_tls_sni: Option<String> = row.try_get("backend_tls_sni")?;
+    let backend_tls_sni = optional_utf8_text_column(row, "backend_tls_sni")?;
 
     Ok(Upstream {
         id: row.try_get("id")?,
@@ -10113,7 +10340,7 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         name: row.try_get("name").ok(),
         targets,
         algorithm,
-        hash_on: row.try_get("hash_on").ok(),
+        hash_on: optional_utf8_text_column(row, "hash_on")?,
         hash_on_cookie_config,
         health_checks,
         service_discovery,
@@ -10134,13 +10361,18 @@ fn row_to_upstream_inner(row: &AnyRow, id_preview: &str) -> Result<Upstream, any
         locality_lb_setting: None,
         // Same trust/mTLS contract as `row_to_proxy`: reject non-NULL decode
         // failures instead of silently disabling custom CA / client identity.
-        backend_tls_client_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_cert_path")?,
-        backend_tls_client_key_path: row
-            .try_get::<Option<String>, _>("backend_tls_client_key_path")?,
+        // MySQL MEDIUMTEXT NULL/BLOB values go through optional_utf8_text_column
+        // so sqlx-Any BLOB mapping cannot fake a missing row.
+        backend_tls_client_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_client_cert_path",
+        )?,
+        backend_tls_client_key_path: optional_utf8_text_column(row, "backend_tls_client_key_path")?,
         backend_tls_verify_server_cert,
-        backend_tls_server_ca_cert_path: row
-            .try_get::<Option<String>, _>("backend_tls_server_ca_cert_path")?,
+        backend_tls_server_ca_cert_path: optional_utf8_text_column(
+            row,
+            "backend_tls_server_ca_cert_path",
+        )?,
         backend_tls_sni,
         backend_tls_san_allow_list,
         // Per-subset TLS overlays are derived state populated by mesh
@@ -10219,16 +10451,12 @@ fn row_to_api_spec_with_content(
     let uncompressed_size: i64 = row.try_get("uncompressed_size")?;
 
     // Wave 5: parse JSON-text arrays for tags / server_urls.
-    let tags: Vec<String> = row
-        .try_get::<String, _>("tags")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let server_urls: Vec<String> = row
-        .try_get::<String, _>("server_urls")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let tags_raw = required_utf8_text_column(row, "tags")?;
+    let tags: Vec<String> = serde_json::from_str(&tags_raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse api_specs.tags JSON: {error}"))?;
+    let server_urls_raw = required_utf8_text_column(row, "server_urls")?;
+    let server_urls: Vec<String> = serde_json::from_str(&server_urls_raw)
+        .map_err(|error| anyhow::anyhow!("failed to parse api_specs.server_urls JSON: {error}"))?;
     let operation_count: u32 = row
         .try_get::<i64, _>("operation_count")
         .map(|v| v.clamp(0, u32::MAX as i64) as u32)
@@ -10249,13 +10477,13 @@ fn row_to_api_spec_with_content(
             .unwrap_or_else(|_| "gzip".to_string()),
         uncompressed_size: uncompressed_size.max(0) as u64,
         content_hash: row.try_get("content_hash")?,
-        title: row.try_get("title").ok().flatten(),
+        title: optional_utf8_text_column(row, "title")?,
         info_version: row.try_get("info_version").ok().flatten(),
-        description: row.try_get("description").ok().flatten(),
-        contact_name: row.try_get("contact_name").ok().flatten(),
-        contact_email: row.try_get("contact_email").ok().flatten(),
-        license_name: row.try_get("license_name").ok().flatten(),
-        license_identifier: row.try_get("license_identifier").ok().flatten(),
+        description: optional_utf8_text_column(row, "description")?,
+        contact_name: optional_utf8_text_column(row, "contact_name")?,
+        contact_email: optional_utf8_text_column(row, "contact_email")?,
+        license_name: optional_utf8_text_column(row, "license_name")?,
+        license_identifier: optional_utf8_text_column(row, "license_identifier")?,
         tags,
         server_urls,
         operation_count,
@@ -10267,7 +10495,7 @@ fn row_to_api_spec_with_content(
 
 fn row_to_audit_event(row: &AnyRow) -> Result<crate::admin::audit::AuditEvent, anyhow::Error> {
     let id: String = row.try_get("id")?;
-    let diff_raw: String = row.try_get("diff")?;
+    let diff_raw = required_utf8_text_column(row, "diff")?;
     let diff = serde_json::from_str(&diff_raw).unwrap_or_else(|e| {
         warn!(
             audit_event_id = %id,

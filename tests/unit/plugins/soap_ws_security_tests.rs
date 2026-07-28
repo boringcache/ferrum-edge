@@ -1,11 +1,14 @@
 use ferrum_edge::_test_support::{
-    soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
-    soap_exclusive_canonicalize_element_for_test,
+    SoapNonceReplayHarness, soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
+    soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::Duration;
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
@@ -299,6 +302,31 @@ fn test_non_object_config_is_error() {
 }
 
 #[test]
+fn test_non_object_config_error_is_redacted_and_bounded() {
+    // A non-object root can still carry credential-like material or be
+    // unbounded. The diagnostic must stay fixed/redacted.
+    let secret = "super-secret-password-material-do-not-echo";
+    let err = SoapWsSecurity::new(&Value::String(format!("username=alice&password={secret}")))
+        .err()
+        .expect("non-object must reject");
+    assert_eq!(err, "soap_ws_security: config must be an object");
+    assert!(!err.contains(secret));
+    assert!(!err.contains("alice"));
+
+    let huge = "X".repeat(200_000);
+    let huge_err = SoapWsSecurity::new(&Value::String(huge.clone()))
+        .err()
+        .expect("huge non-object must reject");
+    assert_eq!(huge_err, "soap_ws_security: config must be an object");
+    assert!(!huge_err.contains(&huge));
+    assert!(
+        huge_err.len() < 128,
+        "non-object diagnostic must stay bounded, got len {}",
+        huge_err.len()
+    );
+}
+
+#[test]
 fn test_no_features_enabled_is_error() {
     let config = json!({
         "timestamp": { "require": false },
@@ -338,17 +366,28 @@ fn test_username_token_no_credentials_is_error() {
 
 #[test]
 fn test_invalid_password_type_is_error() {
+    const SENTINEL: &str = "SOAP_PASSWORD_TYPE_REJECTED_VALUE_CANARY";
     let config = json!({
         "timestamp": { "require": false },
         "username_token": {
             "enabled": true,
-            "password_type": "InvalidType",
+            "password_type": SENTINEL,
             "credentials": [{"username": "a", "password": "b"}]
         }
     });
-    let result = SoapWsSecurity::new(&config);
-    assert!(result.is_err());
-    assert!(result.err().unwrap().contains("invalid password_type"));
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("invalid password_type must reject");
+    assert!(
+        err.contains("config.username_token.password_type")
+            && err.contains("PasswordText")
+            && err.contains("PasswordDigest"),
+        "unexpected diagnostic: {err}"
+    );
+    assert!(
+        !err.contains(SENTINEL),
+        "rejected password_type must be value-redacted: {err}"
+    );
 }
 
 #[test]
@@ -424,7 +463,7 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
             "enabled": true,
             "trusted_issuers": ["urn:test:idp"],
             "trusted_signing_certs": [MALFORMED_INLINE_PEM],
-            "allowed_algorithms": ["rsa-sha256"]
+            "allowed_signature_algorithms": ["rsa-sha256"]
         }
     });
     let err = SoapWsSecurity::new(&config)
@@ -2925,41 +2964,47 @@ async fn test_empty_body_rejects() {
 // ── Nonce cache cap enforcement tests ───────────────────────────────────────
 
 #[test]
-fn test_nonce_cache_enforces_max_size_by_evicting_oldest() {
+fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
     let max_size: usize = 20;
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": max_size, "ttl_seconds": 300 },
+        "nonce": { "max_cache_size": max_size, "cache_ttl_seconds": 300 },
         "reject_missing_security_header": false
     }))
     .unwrap();
 
-    // Insert nonces well past the cap
-    for i in 0..(max_size + 50) {
+    // Fill the cache with live nonces.
+    for i in 0..max_size {
         let nonce = format!("nonce-{}", i);
-        let _ = plugin.check_nonce_replay(&nonce);
+        assert!(
+            plugin.check_nonce_replay(&nonce).is_ok(),
+            "nonce {i} must fill an available slot"
+        );
     }
 
-    // The oldest nonces should have been evicted to enforce the cap.
-    // Verify by checking that the first nonce is no longer tracked as a replay.
-    assert!(
-        plugin.check_nonce_replay("nonce-0").is_ok(),
-        "nonce-0 should have been evicted by cap enforcement"
-    );
+    // Fresh nonces fail closed while every retained entry is still live.
+    for i in max_size..(max_size + 50) {
+        let nonce = format!("nonce-{}", i);
+        let error = plugin
+            .check_nonce_replay(&nonce)
+            .expect_err("capacity must reject instead of evicting a live nonce");
+        assert!(error.contains("at capacity"), "{error}");
+    }
 
-    // But recent nonces should still be detected as replays
-    let last_nonce = format!("nonce-{}", max_size + 49);
-    assert!(
-        plugin.check_nonce_replay(&last_nonce).is_err(),
-        "most recent nonce should still be in cache"
-    );
+    // Oldest and newest retained claims remain protected for their full TTL.
+    for nonce in ["nonce-0", "nonce-19"] {
+        let error = plugin
+            .check_nonce_replay(nonce)
+            .expect_err("live nonce must remain replay-protected");
+        assert!(error.contains("replay detected"), "{error}");
+    }
 }
 
 #[test]
 fn test_nonce_replay_detected_via_direct_api() {
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "ttl_seconds": 300 },
+        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 300 },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -2970,20 +3015,33 @@ fn test_nonce_replay_detected_via_direct_api() {
 
 #[test]
 fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
-    // cache_ttl_seconds=0 means every Occupied hit is already expired, so the
-    // atomic entry path must refresh inserted_at instead of treating reuse as
-    // a live replay. This covers the post-TTL Occupied insert branch used by
-    // successful PasswordDigest authentication.
-    let plugin = SoapWsSecurity::new(&json!({
+    // Once the TTL has elapsed, the atomic entry path must refresh inserted_at
+    // instead of treating reuse as a live replay. This covers the post-TTL
+    // Occupied insert branch used by successful PasswordDigest authentication.
+    // The external harness supplies deterministic monotonic instants, so no
+    // wall-clock sleep is required.
+    let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 0 },
+        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 1 },
         "reject_missing_security_header": false
     }))
     .unwrap();
 
-    assert!(plugin.check_nonce_replay("ttl-expired-nonce").is_ok());
     assert!(
-        plugin.check_nonce_replay("ttl-expired-nonce").is_ok(),
+        harness
+            .claim_at("ttl-expired-nonce", Duration::ZERO)
+            .is_ok()
+    );
+    assert!(
+        harness
+            .claim_at("ttl-expired-nonce", Duration::from_millis(999))
+            .is_err(),
+        "a repeat inside the TTL window is a live replay"
+    );
+    assert!(
+        harness
+            .claim_at("ttl-expired-nonce", Duration::from_secs(1))
+            .is_ok(),
         "expired Occupied nonce must be refreshed, not rejected as a live replay"
     );
 }
@@ -3931,4 +3989,1207 @@ async fn compressed_soap_without_early_normalization_is_rejected_by_ws_security(
         is_reject(&result),
         "gzip bytes without early normalization must fail SOAP validation"
     );
+}
+
+// ── GHSA-xjx6-whgm-8r7r: timestamp / SAML skew bounds cannot panic ──────────
+
+#[test]
+fn test_extreme_timestamp_bounds_are_rejected_at_admission() {
+    // Values that exceed chrono::TimeDelta's representable seconds range used
+    // to be admitted and then panicked the request task inside
+    // Duration::seconds. Admission must refuse them instead.
+    for key in ["max_age_seconds", "clock_skew_seconds"] {
+        let mut timestamp = serde_json::Map::new();
+        timestamp.insert("require".to_string(), Value::Bool(true));
+        timestamp.insert(key.to_string(), json!(10_000_000_000_000_000u64));
+        let config = json!({
+            "timestamp": Value::Object(timestamp),
+            "reject_missing_security_header": false
+        });
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .expect("extreme value must be rejected");
+        assert!(
+            err.contains(key) && err.contains("must be an integer"),
+            "unexpected error for {key}: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_extreme_saml_skew_is_rejected_at_admission() {
+    let config = json!({
+        "timestamp": { "require": true },
+        "saml": {
+            "enabled": false,
+            "clock_skew_seconds": u64::MAX
+        },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("extreme SAML skew must be rejected");
+    assert!(
+        err.contains("clock_skew_seconds"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_timestamp_bound_boundaries() {
+    let ok = json!({
+        "timestamp": {
+            "require": true,
+            "max_age_seconds": 86_400,
+            "clock_skew_seconds": 3_600
+        },
+        "reject_missing_security_header": false
+    });
+    assert!(
+        SoapWsSecurity::new(&ok).is_ok(),
+        "maximum bounds must admit"
+    );
+
+    let too_big = json!({
+        "timestamp": { "require": true, "max_age_seconds": 86_401 },
+        "reject_missing_security_header": false
+    });
+    assert!(
+        SoapWsSecurity::new(&too_big).is_err(),
+        "one past the maximum must be rejected"
+    );
+
+    let zero_age = json!({
+        "timestamp": { "require": true, "max_age_seconds": 0 },
+        "reject_missing_security_header": false
+    });
+    assert!(
+        SoapWsSecurity::new(&zero_age).is_err(),
+        "a zero freshness window must be rejected"
+    );
+
+    let zero_skew = json!({
+        "timestamp": { "require": true, "clock_skew_seconds": 0 },
+        "reject_missing_security_header": false
+    });
+    assert!(
+        SoapWsSecurity::new(&zero_skew).is_ok(),
+        "zero skew is stricter, not weaker, and must be permitted"
+    );
+}
+
+#[tokio::test]
+async fn test_out_of_range_expires_is_rejected_not_panicking() {
+    // An `Expires` far outside the four-digit year window would overflow
+    // `expires + skew` in chrono. It must be rejected as an invalid timestamp.
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let security = format!(
+        r#"<wsu:Timestamp>
+        <wsu:Created>{created}</wsu:Created>
+        <wsu:Expires>262143-12-31T23:59:59Z</wsu:Expires>
+    </wsu:Timestamp>"#
+    );
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 401);
+}
+
+// ── GHSA-gr7f-55c2-rpvw: strict configuration admission ────────────────────
+
+#[test]
+fn test_unknown_root_key_is_rejected() {
+    let config = json!({
+        "timestamp": { "require": true },
+        "nonce_replay_protection": { "max_cache_size": 50 },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("documented alias must be rejected");
+    assert!(
+        err.contains("unknown configuration key") && err.contains("nonce_replay_protection"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_unknown_nested_key_is_rejected_with_suggestion() {
+    let config = json!({
+        "timestamp": { "require": true, "clock_skew_second": 30 },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("misspelling must be rejected");
+    assert!(
+        err.contains("config.timestamp.clock_skew_second")
+            && err.contains("did you mean 'clock_skew_seconds'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_string_valued_enabled_flag_is_rejected() {
+    // Previously read as `false`, silently disabling credential authentication
+    // and leaving the plugin timestamp-only.
+    let config = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": "true",
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("wrong-typed enabled must be rejected");
+    assert!(
+        err.contains("config.username_token.enabled") && err.contains("must be a boolean"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_non_string_saml_audience_is_rejected() {
+    // Previously became `None`, silently removing service binding while SAML
+    // stayed enabled.
+    let config = json!({
+        "timestamp": { "require": true },
+        "saml": { "enabled": false, "audience": 123 },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("wrong-typed audience must be rejected");
+    assert!(
+        err.contains("config.saml.audience") && err.contains("must be a string"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_malformed_credential_entries_are_rejected_not_dropped() {
+    let missing_password = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice"}]
+        }
+    });
+    let err = SoapWsSecurity::new(&missing_password)
+        .err()
+        .expect("missing password must reject");
+    assert!(
+        err.contains("password") && err.contains("is required"),
+        "{err}"
+    );
+
+    let wrong_type = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": 42}]
+        }
+    });
+    let err = SoapWsSecurity::new(&wrong_type)
+        .err()
+        .expect("non-string password must reject");
+    assert!(err.contains("password"), "{err}");
+
+    let unknown_field = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "p", "role": "admin"}]
+        }
+    });
+    let err = SoapWsSecurity::new(&unknown_field)
+        .err()
+        .expect("unknown credential key must reject");
+    assert!(err.contains("role"), "{err}");
+}
+
+#[test]
+fn test_duplicate_credential_username_is_rejected() {
+    let config = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [
+                {"username": "alice", "password": "one"},
+                {"username": "alice", "password": "two"}
+            ]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("duplicate username must reject");
+    assert!(err.contains("duplicates an earlier entry"), "{err}");
+}
+
+#[test]
+fn test_unsupported_algorithm_values_are_rejected_and_value_redacted() {
+    const SENTINEL: &str = "SOAP_ALGORITHM_REJECTED_VALUE_CANARY";
+    let cases = [
+        (
+            json!({
+                "timestamp": { "require": true },
+                "x509_signature": {
+                    "enabled": false,
+                    "allowed_algorithms": ["rsa-sha256", SENTINEL]
+                }
+            }),
+            "config.x509_signature.allowed_algorithms",
+            "rsa-sha256",
+        ),
+        (
+            json!({
+                "timestamp": { "require": true },
+                "x509_signature": {
+                    "enabled": false,
+                    "allowed_digest_algorithms": ["sha256", SENTINEL]
+                }
+            }),
+            "config.x509_signature.allowed_digest_algorithms",
+            "sha256",
+        ),
+        (
+            json!({
+                "timestamp": { "require": true },
+                "saml": {
+                    "enabled": false,
+                    "allowed_signature_algorithms": ["rsa-sha256", SENTINEL]
+                }
+            }),
+            "config.saml.allowed_signature_algorithms",
+            "rsa-sha256",
+        ),
+        (
+            json!({
+                "timestamp": { "require": true },
+                "saml": {
+                    "enabled": false,
+                    "allowed_digest_algorithms": ["sha256", SENTINEL]
+                }
+            }),
+            "config.saml.allowed_digest_algorithms",
+            "sha256",
+        ),
+    ];
+
+    for (config, field, accepted) in cases {
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .expect("unknown algorithm must reject");
+        assert!(
+            err.contains(field) && err.contains(accepted),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains(SENTINEL),
+            "rejected algorithm must be value-redacted: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_non_string_cert_path_entry_is_rejected() {
+    let config = json!({
+        "timestamp": { "require": true },
+        "saml": { "enabled": false, "trusted_issuers": ["https://idp", 7] },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("non-string entry must reject");
+    assert!(
+        err.contains("trusted_issuers[1]"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_zero_nonce_cache_controls_are_rejected() {
+    for key in ["cache_ttl_seconds", "max_cache_size"] {
+        let mut nonce = serde_json::Map::new();
+        nonce.insert(key.to_string(), json!(0));
+        let config = json!({
+            "timestamp": { "require": true },
+            "nonce": Value::Object(nonce),
+            "reject_missing_security_header": false
+        });
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .expect("zero must be rejected");
+        assert!(err.contains(key), "unexpected error for {key}: {err}");
+    }
+}
+
+// ── GHSA-3ffh-5842-8m92: bounded, cache-safe nonce state ───────────────────
+
+#[test]
+fn test_oversized_nonce_is_rejected_before_retention() {
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_encoded_length": 64 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    let oversized = "A".repeat(65);
+    let err = plugin
+        .check_nonce_replay(&oversized)
+        .expect_err("oversized nonce must be rejected");
+    assert!(err.contains("maximum permitted length"), "{err}");
+    assert!(
+        !err.contains(&oversized),
+        "the nonce value must never appear in the diagnostic"
+    );
+
+    // Rejected nonces must not be retained, so the same value is still
+    // rejected for length rather than reported as a replay.
+    let repeat = plugin
+        .check_nonce_replay(&oversized)
+        .expect_err("still rejected");
+    assert!(repeat.contains("maximum permitted length"), "{repeat}");
+}
+
+#[test]
+fn test_nonce_cache_is_bounded_by_total_retained_bytes() {
+    // The byte cap is deliberately far tighter than the entry cap: 4096 bytes
+    // of 64-byte nonces is 64 entries against a 100,000-entry cap. Retention
+    // must be bounded by the byte axis without evicting any live claim.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 100_000,
+            "cache_ttl_seconds": 86_400,
+            "max_encoded_length": 64,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    let first = format!("{:064}", 0);
+    assert!(plugin.check_nonce_replay(&first).is_ok());
+    for index in 1..64 {
+        let nonce = format!("{:064}", index);
+        assert!(
+            plugin.check_nonce_replay(&nonce).is_ok(),
+            "available byte budget must admit nonce at index {index}"
+        );
+    }
+
+    let rejected = format!("{:064}", 64);
+    let error = plugin
+        .check_nonce_replay(&rejected)
+        .expect_err("full byte budget must reject instead of evicting");
+    assert!(error.contains("at capacity"), "{error}");
+
+    for nonce in [first, format!("{:064}", 63)] {
+        let error = plugin
+            .check_nonce_replay(&nonce)
+            .expect_err("retained nonce must remain replay-protected");
+        assert!(error.contains("replay detected"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn test_oversized_wire_nonce_is_rejected_structurally() {
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "max_encoded_length": 64 },
+        "reject_missing_security_header": true
+    }))
+    .unwrap();
+
+    // A near-limit nonce: valid Base64, valid username, invalid digest. It must
+    // be refused on length before any decode or retention.
+    let big_nonce = vec![b'x'; 4_096];
+    let engine = &base64::engine::general_purpose::STANDARD;
+    let encoded = base64::Engine::encode(engine, &big_nonce);
+    let token = password_digest_token("alice", "wrong-password", &big_nonce);
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&token));
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 401);
+    let body = reject_body(&result);
+    assert_eq!(
+        body,
+        r#"{"error":"WS-Security: Nonce exceeds the maximum permitted length"}"#
+    );
+    assert!(
+        !body.contains(&encoded[..32]),
+        "the nonce must never be echoed back to the client"
+    );
+}
+
+// ── Explicit JSON null vs omission (GHSA-gr7f-55c2-rpvw residual) ───────────
+
+#[test]
+fn test_explicit_null_fields_are_rejected_not_defaulted() {
+    // Previously `present()` filtered null to absence, so these inputs silently
+    // applied weaker/default policy despite OpenAPI typing without nullable.
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "username_token.enabled null",
+            json!({
+                "timestamp": { "require": true },
+                "username_token": {
+                    "enabled": null,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": "secret123"}]
+                },
+                "reject_missing_security_header": false
+            }),
+            "config.username_token.enabled",
+        ),
+        (
+            "saml.audience null",
+            json!({
+                "timestamp": { "require": true },
+                "saml": { "enabled": false, "audience": null },
+                "reject_missing_security_header": false
+            }),
+            "config.saml.audience",
+        ),
+        (
+            "nonce object null",
+            json!({
+                "timestamp": { "require": true },
+                "nonce": null,
+                "reject_missing_security_header": false
+            }),
+            "config.nonce",
+        ),
+        (
+            "timestamp.require null",
+            json!({
+                "timestamp": { "require": null },
+                "reject_missing_security_header": false
+            }),
+            "config.timestamp.require",
+        ),
+        (
+            "credentials null",
+            json!({
+                "timestamp": { "require": true },
+                "username_token": {
+                    "enabled": false,
+                    "credentials": null
+                },
+                "reject_missing_security_header": false
+            }),
+            "config.username_token.credentials",
+        ),
+        (
+            "credential.password null",
+            json!({
+                "timestamp": { "require": false },
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [{"username": "alice", "password": null}]
+                },
+                "reject_missing_security_header": false
+            }),
+            "password",
+        ),
+    ];
+
+    for (label, config, path_fragment) in cases {
+        let err = SoapWsSecurity::new(config)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: explicit null must reject"));
+        assert!(
+            err.contains(path_fragment) && err.contains("must not be null"),
+            "{label}: unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_omitted_optional_fields_still_admit_defaults() {
+    // Parity pin: omission (not null) still selects documented defaults.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "reject_missing_security_header": false
+    }))
+    .expect("omitted optional nested objects must remain valid");
+    assert!(plugin.check_nonce_replay("omitted-defaults-nonce").is_ok());
+}
+
+#[test]
+fn test_nonce_age_index_expiry_and_accounting_are_exact() {
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 3,
+            "cache_ttl_seconds": 10,
+            "max_encoded_length": 16,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    for (nonce, seconds) in [
+        ("nonce-a-00000001", 0),
+        ("nonce-b-00000002", 1),
+        ("nonce-c-00000003", 2),
+    ] {
+        harness
+            .claim_at(nonce, Duration::from_secs(seconds))
+            .expect("fresh nonce must admit");
+    }
+    assert!(
+        harness
+            .claim_at("nonce-c-00000003", Duration::from_secs(3))
+            .is_err(),
+        "same-key in-TTL claim must be a replay"
+    );
+
+    let before = harness.snapshot().expect("snapshot");
+    assert_eq!(before.entry_count, 3);
+    assert_eq!(before.age_index_entry_count, 3);
+    assert_eq!(before.retained_key_bytes, 48);
+    assert_eq!(before.recomputed_key_bytes, 48);
+    assert_eq!(before.shared_key_entries, 3);
+    assert_eq!(before.last_expired_removals, 0);
+
+    harness
+        .claim_at("nonce-d-00000004", Duration::from_secs(11))
+        .expect("one exact-oldest expiry must make room");
+    let after_expiry = harness.snapshot().expect("snapshot");
+    assert_eq!(after_expiry.entry_count, 3);
+    assert_eq!(after_expiry.age_index_entry_count, 3);
+    assert_eq!(after_expiry.retained_key_bytes, 48);
+    assert_eq!(after_expiry.recomputed_key_bytes, 48);
+    assert_eq!(after_expiry.shared_key_entries, 3);
+    assert_eq!(after_expiry.last_expired_removals, 1);
+
+    harness
+        .claim_at("nonce-b-00000002", Duration::from_secs(11))
+        .expect("expired same-key claim must refresh in place");
+    let after_refresh = harness.snapshot().expect("snapshot");
+    assert_eq!(after_refresh.entry_count, 3);
+    assert_eq!(after_refresh.age_index_entry_count, 3);
+    assert_eq!(after_refresh.retained_key_bytes, 48);
+    assert_eq!(after_refresh.recomputed_key_bytes, 48);
+    assert_eq!(after_refresh.shared_key_entries, 3);
+    assert_eq!(after_refresh.last_expired_removals, 0);
+}
+
+// ── Live entries are never evicted (GHSA-54mh-v348-j878) ───────────────────
+//
+// The remediation these tests pin is deliberate: replay coverage promised for
+// `cache_ttl_seconds` is honoured for the whole window. Capacity exhaustion is
+// a *rejection*, never a licence to unprotect an already-claimed nonce.
+
+#[test]
+fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 3,
+            "cache_ttl_seconds": 86_400,
+            "max_encoded_length": 16,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    for (nonce, seconds) in [
+        ("nonce-a-00000001", 0),
+        ("nonce-b-00000002", 1),
+        ("nonce-c-00000003", 2),
+    ] {
+        harness
+            .claim_at(nonce, Duration::from_secs(seconds))
+            .expect("fresh nonce must admit");
+    }
+
+    let err = harness
+        .claim_at("nonce-d-00000004", Duration::from_secs(3))
+        .expect_err("entry cap full of live entries must fail closed");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
+
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 3);
+    assert_eq!(snapshot.age_index_entry_count, 3);
+    assert_eq!(snapshot.retained_key_bytes, 48);
+    assert_eq!(snapshot.recomputed_key_bytes, 48);
+    assert_eq!(snapshot.shared_key_entries, 3);
+    assert_eq!(snapshot.last_expired_removals, 0);
+
+    // Every live nonce — including the exact oldest — is still a replay.
+    for nonce in ["nonce-a-00000001", "nonce-b-00000002", "nonce-c-00000003"] {
+        assert_eq!(
+            harness
+                .claim_at(nonce, Duration::from_secs(4))
+                .expect_err("live nonce must remain replay-protected"),
+            "WS-Security: nonce replay detected",
+            "{nonce} lost replay protection to a capacity admission"
+        );
+    }
+    // The rejected nonce was not recorded, so it never became a silent replay.
+    let after = harness.snapshot().expect("snapshot");
+    assert_eq!(after.entry_count, 3);
+    assert_eq!(after.retained_key_bytes, 48);
+}
+
+#[test]
+fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
+    // A single maximum-length nonce pins the whole byte budget. The previous
+    // behaviour evicted it and re-admitted it one second later; that is the
+    // replay this test forbids.
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 100_000,
+            "cache_ttl_seconds": 86_400,
+            "max_encoded_length": 4_096,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("tight byte cap must admit");
+
+    let first = "A".repeat(4_096);
+    let second = "B".repeat(4_096);
+    harness
+        .claim_at(&first, Duration::ZERO)
+        .expect("first maximum-length nonce must admit");
+
+    let err = harness
+        .claim_at(&second, Duration::from_secs(1))
+        .expect_err("byte cap must reject rather than unprotect the live nonce");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
+    assert!(
+        !err.contains(second.as_str()) && !err.contains(first.as_str()),
+        "saturation diagnostic must never include the nonce"
+    );
+
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, 4_096);
+    assert_eq!(snapshot.recomputed_key_bytes, 4_096);
+    assert_eq!(snapshot.last_expired_removals, 0);
+
+    assert_eq!(
+        harness
+            .claim_at(&first, Duration::from_secs(2))
+            .expect_err("the live nonce must still be a replay"),
+        "WS-Security: nonce replay detected"
+    );
+    // The rejected nonce was never recorded, so a retry is still a fresh claim
+    // decision rather than a replay hit.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(3))
+            .expect_err("retry while still saturated must stay rejected"),
+        "WS-Security: replay protection state is at capacity"
+    );
+}
+
+#[test]
+fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
+    const TTL: u64 = 60;
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 100_000,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": 4_096,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("tight byte cap must admit");
+
+    let first = "A".repeat(4_096);
+    let second = "B".repeat(4_096);
+    harness
+        .claim_at(&first, Duration::ZERO)
+        .expect("first maximum-length nonce must admit");
+
+    // Inside the TTL the second nonce is refused and the first stays protected.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(TTL - 1))
+            .expect_err("saturated inside the TTL must reject"),
+        "WS-Security: replay protection state is at capacity"
+    );
+
+    // Once the first entry is provably expired the retry reclaims it and wins.
+    harness
+        .claim_at(&second, Duration::from_secs(TTL))
+        .expect("expired entry must be reclaimed for the retry");
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(snapshot.retained_key_bytes, 4_096);
+    assert_eq!(snapshot.recomputed_key_bytes, 4_096);
+    assert_eq!(snapshot.shared_key_entries, 1);
+    assert_eq!(snapshot.last_expired_removals, 1);
+
+    // The freshly claimed nonce now owns the whole budget and is protected.
+    assert_eq!(
+        harness
+            .claim_at(&second, Duration::from_secs(TTL + 1))
+            .expect_err("the newly claimed nonce must be replay-protected"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[test]
+fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
+    const TTL: u64 = 10;
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 4,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": 16,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    // Two old entries and two recent ones fill the entry cap.
+    for (nonce, seconds) in [
+        ("nonce-a-00000001", 0),
+        ("nonce-b-00000002", 1),
+        ("nonce-c-00000003", 8),
+        ("nonce-d-00000004", 9),
+    ] {
+        harness
+            .claim_at(nonce, Duration::from_secs(seconds))
+            .expect("fresh nonce must admit");
+    }
+
+    // At t=11 only the first two entries are past the 10s TTL. Admitting one
+    // nonce needs exactly one slot, so exactly one expired entry is reclaimed.
+    harness
+        .claim_at("nonce-e-00000005", Duration::from_secs(11))
+        .expect("an expired entry must make room");
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.last_expired_removals, 1);
+    assert_eq!(snapshot.entry_count, 4);
+    assert_eq!(snapshot.age_index_entry_count, 4);
+    assert_eq!(snapshot.retained_key_bytes, 64);
+    assert_eq!(snapshot.recomputed_key_bytes, 64);
+
+    // The still-live entries kept their protection; only the expired head went.
+    for nonce in ["nonce-c-00000003", "nonce-d-00000004", "nonce-e-00000005"] {
+        assert_eq!(
+            harness
+                .claim_at(nonce, Duration::from_secs(12))
+                .expect_err("live nonce must remain replay-protected"),
+            "WS-Security: nonce replay detected",
+            "{nonce} lost replay protection"
+        );
+    }
+}
+
+#[test]
+fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
+    const ENTRY_LEN: usize = 16;
+    const ENTRY_COUNT: usize = 4_096 / ENTRY_LEN;
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 1_000_000,
+            "cache_ttl_seconds": 86_400,
+            "max_encoded_length": 4_096,
+            "max_total_cache_bytes": 4_096
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    for index in 0..ENTRY_COUNT {
+        let nonce = format!("{index:016x}");
+        assert_eq!(nonce.len(), ENTRY_LEN);
+        harness
+            .claim_at(&nonce, Duration::ZERO)
+            .expect("initial fill must admit");
+    }
+    let before = harness.snapshot().expect("snapshot");
+    assert_eq!(before.entry_count, ENTRY_COUNT);
+    assert_eq!(before.age_index_entry_count, ENTRY_COUNT);
+    assert_eq!(before.retained_key_bytes, 4_096);
+    assert_eq!(before.recomputed_key_bytes, 4_096);
+    assert_eq!(before.shared_key_entries, ENTRY_COUNT);
+
+    let large_nonce = "Z".repeat(4_096);
+    let err = harness
+        .claim_at(&large_nonce, Duration::from_secs(1))
+        .expect_err("live entries must not be evicted to seat a 4096-byte nonce");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
+    assert!(
+        !err.contains(large_nonce.as_str()),
+        "saturation diagnostic must never include the nonce"
+    );
+
+    // Nothing was reclaimed: every live entry survived the saturation probe.
+    let after = harness.snapshot().expect("snapshot");
+    assert_eq!(after.entry_count, ENTRY_COUNT);
+    assert_eq!(after.age_index_entry_count, ENTRY_COUNT);
+    assert_eq!(after.retained_key_bytes, 4_096);
+    assert_eq!(after.recomputed_key_bytes, 4_096);
+    assert_eq!(after.shared_key_entries, ENTRY_COUNT);
+    assert_eq!(after.last_expired_removals, 0);
+    assert_eq!(after.max_maintenance_entries, 64);
+    assert_eq!(
+        harness
+            .claim_at("0000000000000000", Duration::from_secs(2))
+            .expect_err("the oldest live entry must still be a replay"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[test]
+fn test_nonce_reclaim_over_bounded_budget_rejects_then_retries_to_success() {
+    // 256 tiny entries saturate the byte cap. Reclaiming all of them for one
+    // maximum-length nonce needs more than the 64-entry per-request budget, so
+    // early attempts fail closed and later retries succeed once enough proven
+    // expired entries have been reclaimed. No live entry is ever discarded.
+    const ENTRY_LEN: usize = 16;
+    const MAX_BYTES: usize = 4_096;
+    const ENTRY_COUNT: usize = MAX_BYTES / ENTRY_LEN;
+    const TTL: u64 = 30;
+
+    let harness = SoapNonceReplayHarness::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 1_000_000,
+            "cache_ttl_seconds": TTL,
+            "max_encoded_length": MAX_BYTES,
+            "max_total_cache_bytes": MAX_BYTES
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("config must admit");
+
+    for index in 0..ENTRY_COUNT {
+        let nonce = format!("{index:016x}");
+        assert_eq!(nonce.len(), ENTRY_LEN);
+        harness
+            .claim_at(&nonce, Duration::ZERO)
+            .expect("initial fill must admit");
+    }
+
+    let large_nonce = "Z".repeat(MAX_BYTES);
+    // Still inside the TTL: nothing is reclaimable and the claim fails closed.
+    assert_eq!(
+        harness
+            .claim_at(&large_nonce, Duration::from_secs(TTL - 1))
+            .expect_err("live entries must not be reclaimed"),
+        "WS-Security: replay protection state is at capacity"
+    );
+    let live = harness.snapshot().expect("snapshot");
+    assert_eq!(live.entry_count, ENTRY_COUNT);
+    assert_eq!(live.last_expired_removals, 0);
+
+    // Past the TTL every entry is provably expired. Each attempt reclaims at
+    // most the maintenance budget, so the claim succeeds only after enough
+    // retries — and never by discarding unexpired state.
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        assert!(attempts <= 16, "reclamation failed to converge");
+        let snapshot_before = harness.snapshot().expect("snapshot");
+        match harness.claim_at(&large_nonce, Duration::from_secs(TTL)) {
+            Ok(()) => break,
+            Err(err) => {
+                assert_eq!(err, "WS-Security: replay protection state is at capacity");
+                let after = harness.snapshot().expect("snapshot");
+                assert_eq!(
+                    after.last_expired_removals, after.max_maintenance_entries,
+                    "a rejected attempt must have spent the whole bounded budget"
+                );
+                assert_eq!(
+                    snapshot_before.entry_count - after.entry_count,
+                    after.max_maintenance_entries,
+                    "only budget-bounded expired reclamation may occur"
+                );
+                assert_eq!(after.retained_key_bytes, after.recomputed_key_bytes);
+            }
+        }
+    }
+    assert!(
+        attempts > 1,
+        "one bounded batch must not free the whole cap"
+    );
+
+    let final_snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(final_snapshot.entry_count, 1);
+    assert_eq!(final_snapshot.retained_key_bytes, MAX_BYTES);
+    assert_eq!(final_snapshot.recomputed_key_bytes, MAX_BYTES);
+    assert_eq!(final_snapshot.shared_key_entries, 1);
+}
+
+#[test]
+fn test_nonce_fail_closed_contract_is_documented_in_openapi_and_docs() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let config = &spec["components"]["schemas"]["SoapWsSecurityConfig"];
+    let nonce = &config["properties"]["nonce"]["properties"];
+    let max_cache_size = nonce["max_cache_size"]["description"]
+        .as_str()
+        .expect("max_cache_size description");
+    let max_total_cache_bytes = nonce["max_total_cache_bytes"]["description"]
+        .as_str()
+        .expect("max_total_cache_bytes description");
+    assert!(
+        max_cache_size.contains("never evicted"),
+        "max_cache_size must advertise that in-TTL nonces are never evicted: {max_cache_size}"
+    );
+    assert!(
+        max_cache_size.contains("401") && max_total_cache_bytes.contains("401"),
+        "both nonce caps must advertise the fail-closed rejection"
+    );
+
+    let plugins_doc = include_str!("../../../docs/plugins.md");
+    let cache_doc = include_str!("../../../docs/cache_management.md");
+    for (label, text) in [("plugins", plugins_doc), ("cache", cache_doc)] {
+        assert!(
+            text.contains("the walk stops at the first still-live entry"),
+            "{label} docs must state that reclamation stops at the first live entry"
+        );
+        assert!(
+            !text.contains("selects exact-oldest live entries"),
+            "{label} docs must not describe forced eviction of live nonces"
+        );
+    }
+}
+
+#[test]
+fn test_nonce_maintenance_source_reclaims_only_expired_entries() {
+    let source = include_str!("../../../src/plugins/soap_ws_security.rs");
+    let start = source
+        .find("fn reclaim_expired_nonce_room_locked(")
+        .expect("maintenance function");
+    let end = source[start..]
+        .find("pub(crate) fn check_nonce_replay_at_for_tests")
+        .map(|offset| start + offset)
+        .expect("maintenance function end");
+    let maintenance = &source[start..end];
+
+    assert!(
+        maintenance.contains("age_index.first_key_value()"),
+        "reclamation must walk the ordered index from its oldest end"
+    );
+    assert!(
+        maintenance.contains("state.last_expired_removals < NONCE_MAX_MAINTENANCE_ENTRIES"),
+        "reclamation must stay inside the per-request maintenance budget"
+    );
+    assert!(
+        maintenance.contains("if Self::nonce_age_seconds(now, age_key.0) < ttl_seconds {")
+            && maintenance.contains("break;"),
+        "reclamation must stop at the first still-live entry"
+    );
+    // No forced eviction of live replay state may return (GHSA-54mh-v348-j878).
+    assert!(!maintenance.contains("amortized_target"));
+    assert!(!maintenance.contains("candidates"));
+    assert!(!maintenance.contains("remaining_budget"));
+    assert!(!maintenance.contains("Vec::with_capacity"));
+    // And no lookup-map scan may creep back in.
+    assert!(!maintenance.contains("state.cache.iter("));
+    assert!(!maintenance.contains("state.cache.retain("));
+    assert!(!maintenance.contains("for (key, entry) in &state.cache"));
+    assert!(!maintenance.contains("collect::<Vec"));
+}
+
+#[test]
+fn test_nonce_inconsistent_age_index_fails_closed() {
+    let err = soap_nonce_inconsistent_state_outcome_for_test(&json!({
+        "timestamp": { "require": true },
+        "nonce": {
+            "max_cache_size": 10,
+            "cache_ttl_seconds": 300
+        },
+        "reject_missing_security_header": false
+    }))
+    .expect("one-shot inconsistency probe");
+    assert_eq!(err, "WS-Security: replay protection state is at capacity");
+}
+
+// ── Concurrent nonce-cap invariants (GHSA-3ffh-5842-8m92 residual) ──────────
+
+#[test]
+fn test_concurrent_nonce_admission_saturates_without_unprotecting_live_claims() {
+    const MAX_ENTRIES: usize = 128;
+    const MAX_BYTES: usize = 4_096; // MIN_NONCE_MAX_TOTAL_CACHE_BYTES
+    const NONCE_LEN: usize = 64;
+    const BYTE_CAP_ENTRIES: usize = MAX_BYTES / NONCE_LEN; // 64, the binding cap
+    const THREADS: usize = 32;
+    const PER_THREAD: usize = 64;
+
+    let harness = Arc::new(
+        SoapNonceReplayHarness::new(&json!({
+            "timestamp": { "require": true },
+            "nonce": {
+                "max_cache_size": MAX_ENTRIES,
+                "cache_ttl_seconds": 86_400,
+                "max_encoded_length": NONCE_LEN,
+                "max_total_cache_bytes": MAX_BYTES
+            },
+            "reject_missing_security_header": false
+        }))
+        .expect("tight caps must admit"),
+    );
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let admitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(THREADS);
+    for thread_id in 0..THREADS {
+        let harness = Arc::clone(&harness);
+        let barrier = Arc::clone(&barrier);
+        let admitted = Arc::clone(&admitted);
+        let rejected = Arc::clone(&rejected);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for index in 0..PER_THREAD {
+                // Fixed-width distinct keys so byte accounting is exact.
+                let nonce = format!("t{thread_id:02}-{index:060}");
+                debug_assert_eq!(nonce.len(), NONCE_LEN);
+                match harness.claim(&nonce) {
+                    Ok(()) => admitted.lock().expect("admitted").push(nonce),
+                    Err(err) if err == "WS-Security: replay protection state is at capacity" => {
+                        rejected.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => panic!("unexpected nonce outcome: {err}"),
+                }
+                // Caps must hold on every observation, not only at the end.
+                let snapshot = harness.snapshot().expect("snapshot");
+                assert!(
+                    snapshot.entry_count <= MAX_ENTRIES,
+                    "entry cap overshot under concurrency"
+                );
+                assert!(
+                    snapshot.entry_count <= BYTE_CAP_ENTRIES,
+                    "byte-derived entry cap overshot under concurrency"
+                );
+                assert!(
+                    snapshot.retained_key_bytes <= MAX_BYTES,
+                    "byte cap overshot under concurrency"
+                );
+                assert_eq!(snapshot.entry_count, snapshot.age_index_entry_count);
+                assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+                assert_eq!(snapshot.entry_count, snapshot.shared_key_entries);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+
+    let admitted = admitted.lock().expect("admitted").clone();
+    let snapshot = harness.snapshot().expect("snapshot");
+    // Nothing expires inside the flood, so exactly the byte-derived cap of
+    // distinct nonces can ever be admitted and every later claim fails closed.
+    assert_eq!(
+        admitted.len(),
+        BYTE_CAP_ENTRIES,
+        "only the byte cap's worth of distinct nonces may be admitted"
+    );
+    assert_eq!(
+        rejected.load(Ordering::Relaxed),
+        THREADS * PER_THREAD - BYTE_CAP_ENTRIES,
+        "every claim past capacity must fail closed"
+    );
+    assert_eq!(snapshot.entry_count, BYTE_CAP_ENTRIES);
+    assert_eq!(snapshot.retained_key_bytes, MAX_BYTES);
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+    assert_eq!(snapshot.entry_count, snapshot.shared_key_entries);
+
+    // The security property: no admitted nonce was ever evicted to seat a
+    // later one, so replaying any of them is still detected.
+    for nonce in &admitted {
+        assert_eq!(
+            harness
+                .claim(nonce)
+                .expect_err("an admitted nonce must stay replay-protected"),
+            "WS-Security: nonce replay detected",
+            "an admitted nonce lost replay protection under a concurrent flood"
+        );
+    }
+}
+
+#[test]
+fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
+    let harness = Arc::new(
+        SoapNonceReplayHarness::new(&json!({
+            "timestamp": { "require": true },
+            "nonce": {
+                "max_cache_size": 8,
+                "cache_ttl_seconds": 86_400,
+                "max_encoded_length": 32,
+                "max_total_cache_bytes": 4_096
+            },
+            "reject_missing_security_header": false
+        }))
+        .expect("config must admit"),
+    );
+
+    const THREADS: usize = 64;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let ok = Arc::new(AtomicUsize::new(0));
+    let replay = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let harness = Arc::clone(&harness);
+        let barrier = Arc::clone(&barrier);
+        let ok = Arc::clone(&ok);
+        let replay = Arc::clone(&replay);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            match harness.claim("same-key-concurrent-nonce!!") {
+                Ok(()) => {
+                    ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) if err.contains("nonce replay detected") => {
+                    replay.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => panic!("unexpected same-key outcome: {err}"),
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("worker");
+    }
+
+    assert_eq!(ok.load(Ordering::Relaxed), 1, "exactly one claim may admit");
+    assert_eq!(
+        replay.load(Ordering::Relaxed),
+        THREADS - 1,
+        "all other claims must be replays"
+    );
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.age_index_entry_count, 1);
+    assert_eq!(
+        snapshot.retained_key_bytes,
+        "same-key-concurrent-nonce!!".len()
+    );
+    assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
+    assert_eq!(snapshot.shared_key_entries, 1);
 }

@@ -1819,6 +1819,103 @@ fn test_env_config_cp_mode_valid() {
     );
 }
 
+#[test]
+fn test_env_config_cp_rejects_control_characters_in_mesh_config_authority() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", "db\nforged"),
+        ],
+        || {
+            let error = EnvConfig::from_env().expect_err("control characters must fail closed");
+            assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+            assert!(error.contains("control-character-free"));
+            assert!(
+                !error.contains("forged"),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_cp_rejects_surrounding_whitespace_in_mesh_config_authority() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", " db"),
+        ],
+        || {
+            let error = EnvConfig::from_env().expect_err("surrounding whitespace must fail closed");
+            assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+            assert!(error.contains("no surrounding whitespace"));
+            assert!(
+                !error.contains("\" db\""),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+}
+
+#[test]
+fn test_env_config_cp_rejects_oversized_mesh_config_authority() {
+    let oversized = "a".repeat(129);
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "cp"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "admin-secret-padding-32-chars!!!",
+            ),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://localhost/ferrum"),
+            ("FERRUM_CP_GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+            (
+                "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                "grpc-secret-padding-32-char-min!",
+            ),
+            ("FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT", "true"),
+            ("FERRUM_K8S_CONTROLLER_ENABLED", "false"),
+            ("FERRUM_MESH_CONFIG_AUTHORITY_ID", oversized.as_str()),
+        ],
+        || {
+            let error = EnvConfig::from_env().expect_err("oversized authority must fail closed");
+            assert!(error.contains("FERRUM_MESH_CONFIG_AUTHORITY_ID"));
+            assert!(error.contains("128 bytes"));
+            assert!(
+                !error.contains(oversized.as_str()),
+                "the rejected value must not be echoed"
+            );
+        },
+    );
+}
+
 // ============================================================================
 // DNS Enhanced Configuration Tests
 // ============================================================================
@@ -3851,6 +3948,7 @@ fn test_db_failover_urls_empty_by_default() {
             let config = EnvConfig::from_env().unwrap();
             assert!(config.db_failover_urls.is_empty());
             assert!(config.effective_db_failover_urls().unwrap().is_empty());
+            assert!(!config.db_failover_allow_writes);
         },
     );
 }
@@ -3876,6 +3974,27 @@ fn test_db_failover_urls_parsed() {
             assert_eq!(config.db_failover_urls.len(), 2);
             assert_eq!(config.db_failover_urls[0], "postgres://secondary1/ferrum");
             assert_eq!(config.db_failover_urls[1], "postgres://secondary2/ferrum");
+            assert!(!config.db_failover_allow_writes);
+        },
+    );
+}
+
+#[test]
+fn test_db_failover_allow_writes_opt_in() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "database"),
+            ("FERRUM_DB_TYPE", "postgres"),
+            ("FERRUM_DB_URL", "postgres://primary/ferrum"),
+            (
+                "FERRUM_ADMIN_JWT_SECRET",
+                "test-secret-padding-for-32-chars!",
+            ),
+            ("FERRUM_DB_FAILOVER_ALLOW_WRITES", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.db_failover_allow_writes);
         },
     );
 }
@@ -5773,4 +5892,63 @@ fn test_k8s_controller_explicit_false_overrides_in_cluster_default() {
             assert!(!config.k8s_pod_discovery_enabled);
         },
     );
+}
+
+// ── FERRUM_TRUSTED_PROXIES strict validation (GHSA-pvj7-hhqj-rpv5) ──────────
+
+/// Parse `FERRUM_TRUSTED_PROXIES` through the full env pipeline so the assertion
+/// covers `EnvConfig::validate()`, which is what `ferrum-edge validate` and every
+/// serving mode run before a listener binds.
+fn trusted_proxies_from_env(raw: &str) -> Result<EnvConfig, String> {
+    let mut result = None;
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_TRUSTED_PROXIES", raw),
+        ],
+        || result = Some(EnvConfig::from_env()),
+    );
+    result.expect("closure ran")
+}
+
+#[test]
+fn test_trusted_proxies_accepts_valid_mixed_list() {
+    let raw = "10.0.0.0/8, 172.16.0.0/12, ::1, ::ffff:192.0.2.0/120";
+    let config = trusted_proxies_from_env(raw).expect("a fully valid list must be accepted");
+    assert_eq!(config.trusted_proxies, raw);
+}
+
+#[test]
+fn test_trusted_proxies_empty_stays_valid_secure_default() {
+    let config = trusted_proxies_from_env("").expect("empty is the secure default");
+    assert!(config.trusted_proxies.is_empty());
+}
+
+/// A mistyped prefix in an otherwise valid list must fail configuration rather
+/// than silently retain the valid entries — the dropped hop is exactly the one
+/// whose forwarded client identity would stop being believed.
+#[test]
+fn test_trusted_proxies_rejects_invalid_prefix_in_mixed_list() {
+    let err = trusted_proxies_from_env("10.0.0.0/8,192.168.0.0/33")
+        .expect_err("a malformed prefix must fail configuration");
+    assert!(err.contains("FERRUM_TRUSTED_PROXIES"), "got: {err}");
+    assert!(err.contains("192.168.0.0/33"), "got: {err}");
+}
+
+#[test]
+fn test_trusted_proxies_rejects_junk_and_empty_segments() {
+    for raw in [
+        "not-an-ip",
+        "10.0.0.0/8,junk",
+        "10.0.0.0/8,",
+        ",10.0.0.0/8",
+        "10.0.0.0/8,,172.16.0.0/12",
+        ",",
+    ] {
+        assert!(
+            trusted_proxies_from_env(raw).is_err(),
+            "FERRUM_TRUSTED_PROXIES={raw:?} must fail configuration"
+        );
+    }
 }

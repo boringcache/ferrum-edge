@@ -92,6 +92,21 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains(".chain(replaced_plugins.iter())"));
     assert!(crud_source.contains("is_enabled_config_graph_participant(resource)"));
     assert!(crud_source.contains("const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;"));
+    // Upstream must take the durable namespace config admission lease like
+    // Proxy/Consumer/PluginConfig — the advisory name precheck alone is
+    // raceable across admin instances (issue #2999).
+    let upstream_impl = crud_source
+        .find("impl AdminResource for Upstream")
+        .expect("Upstream AdminResource impl");
+    let next_impl = crud_source[upstream_impl + 1..]
+        .find("impl AdminResource for ")
+        .map(|offset| upstream_impl + 1 + offset)
+        .unwrap_or(crud_source.len());
+    assert!(
+        crud_source[upstream_impl..next_impl]
+            .contains("const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;"),
+        "Upstream must set SERIALIZE_NAMESPACE_CONFIG_ADMISSION = true"
+    );
     assert!(crud_source.contains("tokio::task::spawn_blocking(move ||"));
     assert!(crud_source.contains("try_acquire_namespace_config_admission_lease("));
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
@@ -138,6 +153,11 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     let restore_handler = batch_source
         .find("async fn handle_restore(")
         .expect("restore handler must exist");
+    assert!(
+        batch_source[restore_validator..restore_handler]
+            .contains(".validate_resource_ids(ValidationAction::Collect)"),
+        "restore must reject malformed resource IDs/namespaces before persistence"
+    );
     assert!(
         batch_source[restore_validator..restore_handler]
             .contains("tokio::task::spawn_blocking(move ||"),

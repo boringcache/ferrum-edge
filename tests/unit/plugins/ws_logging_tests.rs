@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, PluginHttpClient, PluginResult, WsDisconnectContext,
-    ws_logging::WsLogging,
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    WsDisconnectContext, plugin_failure_policy, ws_logging::WsLogging,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -59,6 +59,27 @@ impl<'a> MakeWriter<'a> for SharedWriter {
 
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+fn client_with_ca(ca_path: &str) -> PluginHttpClient {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_path),
+        Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    )
 }
 
 fn test_ws_disconnect_context() -> WsDisconnectContext {
@@ -134,6 +155,75 @@ async fn test_ws_logging_plugin_creation_wss() {
     )
     .unwrap();
     assert_eq!(plugin.name(), "ws_logging");
+}
+
+#[test]
+fn test_ws_logging_keeps_last_known_good_on_invalid_candidates() {
+    assert_eq!(
+        plugin_failure_policy("ws_logging"),
+        Some(PluginFailurePolicy::KeepLastKnownGood)
+    );
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_mixed_ca_bundle_at_construction() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("mixed-ca.pem");
+    let valid = std::fs::read_to_string("tests/certs/server.crt").expect("read valid cert");
+    std::fs::write(
+        &ca_path,
+        format!("{valid}-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+    )
+    .expect("write mixed CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("a malformed later CA record must reject plugin construction");
+    assert!(error.contains("ws_logging CA bundle"), "got: {error}");
+    assert!(error.contains("record #2"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_all_malformed_ca_bundle() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("malformed-ca.pem");
+    std::fs::write(
+        &ca_path,
+        b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write malformed CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("an all-malformed CA bundle must reject plugin construction");
+    assert!(error.contains("record #1"), "got: {error}");
+}
+
+#[tokio::test]
+async fn test_ws_logging_wss_rejects_empty_custom_ca_store() {
+    let _ =
+        rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("empty-ca.pem");
+    std::fs::write(&ca_path, b"").expect("write empty CA");
+
+    let error = WsLogging::new(
+        &json!({"endpoint_url": "wss://localhost:9300/logs"}),
+        client_with_ca(ca_path.to_str().expect("utf8 path")),
+    )
+    .err()
+    .expect("an empty custom CA store must reject plugin construction");
+    assert!(error.contains("no valid PEM certificates"), "got: {error}");
 }
 
 #[tokio::test]
@@ -1356,4 +1446,233 @@ async fn test_ws_logging_accepts_timeout_and_budget_config() {
     )
     .expect("valid timeout/budget config");
     assert_eq!(plugin.name(), "ws_logging");
+}
+
+// ---------------------------------------------------------------------------
+// Backend egress policy enforcement on the direct WebSocket dial path
+// (GHSA-mp2j-gjfp-2vm8). `ws_logging` dials outside the shared reqwest client,
+// so every connection and reconnection must resolve fresh, screen the answer,
+// and dial only screened addresses — while keeping the configured hostname as
+// the TLS SNI / WebSocket `Host` authority.
+// ---------------------------------------------------------------------------
+
+/// A plugin HTTP client whose DNS cache resolves `overrides` to fixed
+/// addresses and which carries `policy` as its backend egress policy. Lets a
+/// test control exactly what a hostname resolves to at dial time.
+fn client_with_dns_overrides(
+    overrides: &[(&str, &str)],
+    policy: ferrum_edge::config::BackendEgressPolicy,
+) -> PluginHttpClient {
+    let dns_cache = ferrum_edge::dns::DnsCache::new(ferrum_edge::dns::DnsConfig {
+        global_overrides: overrides
+            .iter()
+            .map(|(host, ip)| ((*host).to_string(), (*ip).to_string()))
+            .collect(),
+        backend_allow_ips: policy.clone(),
+        ..ferrum_edge::dns::DnsConfig::default()
+    });
+    PluginHttpClient::new(
+        &ferrum_edge::config::PoolConfig::default(),
+        dns_cache,
+        1000,
+        0,
+        100,
+        false,
+        None,
+        Arc::new(Vec::new()),
+        "default",
+        policy,
+        Arc::new(Vec::new()),
+        0,
+    )
+}
+
+fn unrestricted_policy() -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::unrestricted()
+}
+
+/// Production default: `both` + dangerous-range baseline, so link-local /
+/// cloud-metadata addresses are denied while loopback stays reachable.
+fn default_production_policy() -> ferrum_edge::config::BackendEgressPolicy {
+    ferrum_edge::config::BackendEgressPolicy::from_env(
+        ferrum_edge::config::BackendAllowIps::Both,
+        "",
+        "",
+        true,
+    )
+    .expect("valid default egress policy")
+}
+
+// tokio-tungstenite's header callback requires its concrete ErrorResponse;
+// the test cannot box that error without changing the callback contract.
+#[allow(clippy::result_large_err)]
+#[tokio::test]
+async fn ws_logging_hostname_endpoint_keeps_original_authority_over_screened_dial() {
+    // The socket is opened against the screened IPv4 address, but the
+    // WebSocket request must still carry the configured hostname — that is the
+    // value tungstenite also derives TLS SNI from on `wss://`.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let port = addr.port();
+    let endpoint = format!("ws://sink.ferrum.test:{port}/logs");
+    let (host_tx, host_rx) = tokio::sync::oneshot::channel::<String>();
+
+    let server = tokio::spawn(async move {
+        use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+        let (stream, _) = listener.accept().await.expect("accept");
+        let capture = move |req: &Request, res: Response| -> Result<Response, ErrorResponse> {
+            let host = req
+                .headers()
+                .get("host")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let _ = host_tx.send(host);
+            Ok(res)
+        };
+        let ws = tokio_tungstenite::accept_hdr_async(stream, capture)
+            .await
+            .expect("handshake");
+        let (_sink, mut read) = ws.split();
+        let _ = read.next().await;
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 100,
+            "buffer_capacity": 16
+        }),
+        client_with_dns_overrides(&[("sink.ferrum.test", "127.0.0.1")], unrestricted_policy()),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    let host = await_within("captured Host header", host_rx)
+        .await
+        .expect("host channel closed");
+    assert_eq!(
+        host,
+        format!("sink.ferrum.test:{port}"),
+        "the configured hostname must remain the WebSocket authority / TLS SNI identity"
+    );
+
+    drop(plugin);
+    let _ = await_within("authority server shutdown", server).await;
+}
+
+#[tokio::test]
+async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv4() {
+    // The endpoint hostname is allowed at admission (it is not a literal), but
+    // at dial time it resolves to the cloud-metadata address, which the default
+    // production policy denies. No socket may be opened.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_clone = accepted.clone();
+    let server = tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://rebind.ferrum.test:{}/logs", addr.port()),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16
+        }),
+        client_with_dns_overrides(
+            &[("rebind.ferrum.test", "169.254.169.254")],
+            default_production_policy(),
+        ),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    // Long enough for several reconnect cycles; every one must be refused.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a denied resolved address must never be dialed, on the first attempt or any reconnect"
+    );
+
+    drop(plugin);
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_logging_refuses_dial_when_hostname_resolves_to_denied_ipv6() {
+    // IPv6 parity: the AWS IPv6 instance-metadata host is in the dangerous
+    // baseline and must be refused the same way as its IPv4 counterpart.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_clone = accepted.clone();
+    let server = tokio::spawn(async move {
+        while listener.accept().await.is_ok() {
+            accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+
+    let plugin = WsLogging::new(
+        &json!({
+            "endpoint_url": format!("ws://v6rebind.ferrum.test:{}/logs", addr.port()),
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "reconnect_delay_ms": 50,
+            "buffer_capacity": 16
+        }),
+        client_with_dns_overrides(
+            &[("v6rebind.ferrum.test", "fd00:ec2::254")],
+            default_production_policy(),
+        ),
+    )
+    .expect("build plugin");
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    plugin.log(&create_test_transaction_summary()).await;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a denied IPv6 resolved address must never be dialed"
+    );
+
+    drop(plugin);
+    server.abort();
+}
+
+#[tokio::test]
+async fn ws_logging_denied_literal_endpoint_is_rejected_at_config_admission() {
+    // IPv4 and bracketed-IPv6 literals are refused before the plugin can be
+    // registered, so a denied literal never reaches the dial path at all.
+    for endpoint in [
+        "ws://169.254.169.254:9000/logs",
+        "wss://[fd00:ec2::254]:9000/logs",
+    ] {
+        let error = ferrum_edge::plugins::validate_plugin_config_with_policy(
+            "ws_logging",
+            &json!({ "endpoint_url": endpoint }),
+            &default_production_policy(),
+        )
+        .expect_err("denied literal endpoint must be rejected");
+        assert!(
+            error.contains("denied by backend egress policy"),
+            "unexpected error for {endpoint}: {error}"
+        );
+    }
 }

@@ -98,6 +98,13 @@ pub(crate) async fn validate_plugin_file_dependencies_off_thread(
 pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) -> Vec<String> {
     let mut errors = Vec::new();
 
+    // Reject malformed identity before any runtime cache encodes
+    // `(namespace, id)` into a delimiter-separated key. Admin input validates
+    // these fields before persistence, but full loads must also treat database
+    // corruption and file/CP snapshots as hostile boundary input.
+    if let Err(found) = config.validate_resource_ids() {
+        errors.extend(found);
+    }
     if let Err(found) = config.validate_regex_listen_paths() {
         errors.extend(found);
     }
@@ -688,6 +695,20 @@ mod tests {
     }
 
     #[test]
+    fn rejecting_runtime_contract_includes_malformed_resource_namespaces() {
+        let mut proxy = runtime_proxy("hostile-ns", Some("/hostile"), "http");
+        // `|` is the runtime composite-key delimiter; a corrupt DB/file/CP
+        // snapshot must fail closed before any cache encodes the identity.
+        proxy.namespace = "tenant|prod".to_string();
+        let config = GatewayConfig {
+            proxies: vec![proxy],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "namespace");
+    }
+
+    #[test]
     fn rejecting_runtime_contract_includes_regex_listen_paths() {
         let config = GatewayConfig {
             proxies: vec![runtime_proxy("bad-regex", Some("~(invalid[regex"), "http")],
@@ -698,13 +719,13 @@ mod tests {
     }
 
     #[test]
-    fn rejecting_runtime_contract_includes_encoded_slashes() {
+    fn rejecting_runtime_contract_includes_non_canonical_listen_paths() {
         let config = GatewayConfig {
             proxies: vec![runtime_proxy("encoded-slash", Some("/api%2Fadmin"), "http")],
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "encoded slashes");
+        assert_single_rejecting_error(config, "canonical policy path");
     }
 
     #[test]

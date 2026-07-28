@@ -121,6 +121,7 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde::ser::{Serialize, SerializeMap};
 use serde_json::Value;
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
@@ -1754,7 +1755,18 @@ pub struct RequestContext {
     pub direct_client_ip: String,
     canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
+    /// Canonical policy path (`crate::policy_path`). Every security decision —
+    /// routing, WAF, `openapi_validator`, `request_termination`, authorization,
+    /// cache/replay keys, rewrites, and the assembled backend request line —
+    /// must read this field so none of them can act on a different semantic
+    /// path than the backend executes (advisory `GHSA-69xf-42xm-4w4f`).
     pub path: String,
+    /// The client's request target exactly as received, retained only when
+    /// canonicalization changed it. This private field is accessible only to
+    /// the descendant `hmac_auth` module through an opaque, debug-redacted
+    /// wrapper. Its wire signature binds the literal bytes the client signed.
+    /// Never route, authorize, or log this value.
+    raw_path: Option<hmac_auth::HmacWirePath>,
     /// Canonical client-request authority for authentication mechanisms that
     /// bind signatures to the selected virtual host. Hostnames are
     /// ASCII-lowercased with a trailing DNS dot removed; an explicit
@@ -2442,6 +2454,7 @@ impl RequestContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
+            raw_path: None,
             request_authority: None,
             request_is_secure: false,
             frontend_listen_port: None,
@@ -2722,6 +2735,21 @@ impl RequestContext {
     /// into `ctx.metadata` from `on_response_stream_terminated`.
     pub fn response_stream_id(&self) -> Option<u64> {
         self.response_stream_id
+    }
+
+    /// Request-owned handoff used by inspector tasks to publish terminal state
+    /// before the completion signal wakes [`Plugin::on_response_stream_terminated`].
+    ///
+    /// State placed here is bounded by this response's configured inspector
+    /// chain plus a hard per-request ceiling, and drops with the request
+    /// context if terminal processing itself is cancelled; it is never a
+    /// process-global tombstone.
+    pub fn response_stream_handoff(&self) -> Option<ResponseStreamHandoff> {
+        self.response_stream_completion
+            .as_ref()
+            .map(|completion| ResponseStreamHandoff {
+                completion: Arc::clone(completion),
+            })
     }
 
     /// Return the authoritative client IP as a canonical typed address.
@@ -3207,6 +3235,7 @@ impl RequestContext {
             canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
+            raw_path: self.raw_path.clone(),
             request_authority: self.request_authority.clone(),
             request_is_secure: self.request_is_secure,
             frontend_listen_port: self.frontend_listen_port,
@@ -3881,6 +3910,32 @@ impl RequestContext {
             .map(|value| value.as_bytes())
     }
 
+    /// Iterate every field-line of `name` for a trust-boundary decision,
+    /// regardless of whether headers have been materialized.
+    ///
+    /// While the pristine wire map is held this is exactly
+    /// [`Self::raw_header_value_bytes`]: every field-line, including non-UTF-8
+    /// ones, so multiplicity is observable. If a caller ever reaches this
+    /// without raw headers, it degrades to the single folded value from the
+    /// materialized map — which joins repeated field-lines with `, ` and is
+    /// therefore rejected as a comma list by the single-value contract in
+    /// `client_ip::resolve_real_ip_header_field_lines`. Both states fail closed;
+    /// neither can silently surface one of several competing values.
+    ///
+    /// Allocation-free: the returned iterator borrows in place.
+    #[inline]
+    pub fn header_field_lines<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let raw = self.raw_headers.as_ref();
+        let folded = match raw {
+            Some(_) => None,
+            None => self.headers.get(name).map(|value| value.as_bytes()),
+        };
+        raw.into_iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
+            .chain(folded)
+    }
+
     /// Whether a header name is reserved for gateway-asserted metadata and
     /// must not be trusted from client-supplied wire headers.
     #[inline]
@@ -3948,6 +4003,14 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Record the client's original request target after canonicalization
+    /// changed it. Frontends call this once, at the boundary, immediately
+    /// before overwriting [`Self::path`] with the canonical form.
+    #[inline]
+    pub(crate) fn set_raw_path_for_hmac(&mut self, raw_path: String) {
+        self.raw_path = Some(hmac_auth::HmacWirePath::new(raw_path));
     }
 
     /// Parse the raw query string into `self.query_params`. Keys and values are
@@ -4322,6 +4385,15 @@ pub trait ResponseStreamInspector: Send {
     /// the chain. Earlier inspectors can use this to discard pre-cut state that
     /// no longer represents the client-visible stream.
     fn on_downstream_terminated(&mut self) {}
+
+    /// Called immediately before the owning stream task publishes inspector
+    /// completion to terminal hooks.
+    ///
+    /// Inspectors that use a drop-time ownership handoff can publish it here so
+    /// [`Plugin::on_response_stream_terminated`] cannot race the inspector's
+    /// ordinary field drop. The default is a no-op; this is not a per-chunk
+    /// hook.
+    fn on_before_drop(&mut self) {}
 }
 
 /// Compose the stream inspectors of several plugins into one, so a response with
@@ -4347,11 +4419,22 @@ pub fn chain_response_stream_inspectors(
 }
 
 static NEXT_RESPONSE_STREAM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_RESPONSE_STREAM_HANDOFF_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+const MAX_RESPONSE_STREAM_HANDOFFS_PER_REQUEST: usize = 256;
 
-#[derive(Debug)]
+/// Allocate a process-unique key for one plugin instance's typed response
+/// stream handoff.
+pub fn allocate_response_stream_handoff_id() -> u64 {
+    NEXT_RESPONSE_STREAM_HANDOFF_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+type ResponseStreamHandoffEntries = Vec<(u64, Arc<dyn Any + Send + Sync>)>;
+
 struct ResponseStreamCompletion {
     completed: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
+    handoffs: std::sync::Mutex<ResponseStreamHandoffEntries>,
 }
 
 impl ResponseStreamCompletion {
@@ -4359,7 +4442,30 @@ impl ResponseStreamCompletion {
         Self {
             completed: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            handoffs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn publish<T: Any + Send + Sync>(&self, key: u64, value: Arc<T>) {
+        let Ok(mut handoffs) = self.handoffs.lock() else {
+            return;
+        };
+        if handoffs.iter().any(|(existing, _)| *existing == key) {
+            return;
+        }
+        if handoffs.len() >= MAX_RESPONSE_STREAM_HANDOFFS_PER_REQUEST {
+            return;
+        }
+        handoffs.push((key, value));
+    }
+
+    fn take<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        let value = {
+            let mut handoffs = self.handoffs.lock().ok()?;
+            let index = handoffs.iter().position(|(existing, _)| *existing == key)?;
+            handoffs.swap_remove(index).1
+        };
+        Arc::downcast::<T>(value).ok()
     }
 
     fn complete(&self) {
@@ -4382,6 +4488,34 @@ impl ResponseStreamCompletion {
             }
             notified.await;
         }
+    }
+}
+
+impl std::fmt::Debug for ResponseStreamCompletion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResponseStreamCompletion")
+            .field(
+                "completed",
+                &self.completed.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Cloneable, request-owned terminal-state handoff for response inspectors.
+#[derive(Clone)]
+pub struct ResponseStreamHandoff {
+    completion: Arc<ResponseStreamCompletion>,
+}
+
+impl ResponseStreamHandoff {
+    pub fn publish<T: Any + Send + Sync>(&self, key: u64, value: Arc<T>) {
+        self.completion.publish(key, value);
+    }
+
+    pub fn take<T: Any + Send + Sync>(&self, key: u64) -> Option<Arc<T>> {
+        self.completion.take(key)
     }
 }
 
@@ -4411,6 +4545,11 @@ impl ResponseStreamInspector for CompletionNotifyingInspector {
 
 impl Drop for CompletionNotifyingInspector {
     fn drop(&mut self) {
+        // Publish inspector-owned terminal handoffs before waking terminal
+        // hooks. Rust drops fields only after this Drop implementation returns,
+        // which is too late for inspectors whose fallback correlation is
+        // intentionally created at task termination.
+        self.inner.on_before_drop();
         self.completion.complete();
     }
 }
@@ -4468,14 +4607,17 @@ pub(crate) fn create_response_stream_inspector_for_enabled_plugins(
 
     ctx.response_stream_id =
         Some(NEXT_RESPONSE_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let completion = Arc::new(ResponseStreamCompletion::new());
+    // Factories receive `&RequestContext`, so publish the request-owned handoff
+    // before invoking them. It is cleared again below when every factory
+    // declines the concrete response.
+    ctx.response_stream_completion = Some(Arc::clone(&completion));
     let inspectors: Vec<_> = plugins
         .iter()
         .filter_map(|plugin| plugin.response_stream_inspector(ctx, response_status, content_type))
         .collect();
     let inspector = chain_response_stream_inspectors(inspectors);
     if let Some(inspector) = inspector {
-        let completion = Arc::new(ResponseStreamCompletion::new());
-        ctx.response_stream_completion = Some(Arc::clone(&completion));
         Some(Box::new(CompletionNotifyingInspector {
             inner: inspector,
             completion,
@@ -4667,6 +4809,12 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
             carry = released.freeze();
         }
         ResponseStreamAction::Forward(carry)
+    }
+
+    fn on_before_drop(&mut self) {
+        for inspector in &mut self.inspectors {
+            inspector.on_before_drop();
+        }
     }
 }
 
@@ -5519,6 +5667,15 @@ pub struct StreamConnectionContext {
     /// metadata is only a compatibility projection of this lifecycle state.
     correlation_ids: CorrelationIdState,
     pub proxy_id: String,
+    /// Namespace owning `proxy_id` for this connection/session.
+    ///
+    /// Proxy IDs are unique only within a namespace, so every proxy-keyed
+    /// runtime lookup (plugin cache, lifecycle generation, adaptive buffer)
+    /// must be qualified by this. Stamped by the TCP/UDP accept paths from the
+    /// listener's exact identity, and replaced with the matched candidate's
+    /// namespace when SNI resolves a shared passthrough port. Defaults to the
+    /// gateway default namespace for externally constructed contexts.
+    pub proxy_namespace: String,
     pub proxy_name: Option<String>,
     /// Ownership generation captured at stream admission. Carried into
     /// [`StreamTransactionSummary`] so `proxy_alerts` can reject disconnect
@@ -5609,6 +5766,7 @@ impl StreamConnectionContext {
             canonical_client_ip: CanonicalClientIpCache::default(),
             correlation_ids: CorrelationIdState::default(),
             proxy_id,
+            proxy_namespace: crate::config::types::default_namespace(),
             proxy_name,
             proxy_lifecycle_generation: None,
             listen_port,
@@ -6739,6 +6897,23 @@ pub trait Plugin: Send + Sync {
         self.requires_response_body_buffering()
     }
 
+    /// Returns `true` when this plugin must run the buffered response-body
+    /// pipeline for a zero-byte synthetic response.
+    ///
+    /// Gateway-generated short-circuits normally skip body hooks when their
+    /// body is empty. Validators whose contract distinguishes an absent/empty
+    /// representation from a valid one can opt in here so the same final-body
+    /// policy runs as on an empty buffered backend response. The synthetic
+    /// gate calls this only after the plugin's config-time and per-request
+    /// buffering predicates both return `true`.
+    fn should_process_empty_synthetic_response_body(
+        &self,
+        _ctx: &RequestContext,
+        _response_status: u16,
+    ) -> bool {
+        false
+    }
+
     /// Returns `true` when this active buffering plugin may release an
     /// inherently streaming response after headers arrive even though retries
     /// are configured.
@@ -7630,6 +7805,12 @@ pub fn create_plugin_with_http_client_and_config_id(
     // LDAP repeats this screen at every dial; config admission remains useful for
     // rejecting an invalid literal before the plugin can enter the runtime cache.
     screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
+    // Rate limiters partition their default Redis key space by this id so two
+    // independent policies of one plugin type in a namespace never share
+    // counters (GHSA-gr3x-g777-hm78). Validation/direct construction has no
+    // resource id and uses the standalone placeholder.
+    let rate_limit_config_id =
+        plugin_config_id.unwrap_or(utils::rate_limit::STANDALONE_RATE_LIMIT_CONFIG_ID);
     match name {
         "stdout_logging" => Ok(Some(Arc::new(stdout_logging::StdoutLogging::new(config)?))),
         "transaction_log_schema" => Ok(Some(Arc::new(
@@ -7745,20 +7926,32 @@ pub fn create_plugin_with_http_client_and_config_id(
             response_transformer::ResponseTransformer::new(config)?,
         ))),
         "sse" => Ok(Some(Arc::new(sse::SsePlugin::new(config)?))),
-        "graphql" => Ok(Some(Arc::new(graphql::GraphqlPlugin::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "grpc_method_router" => Ok(Some(Arc::new(grpc_method_router::GrpcMethodRouter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "graphql" => {
+            let plugin = graphql::GraphqlPlugin::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "grpc_method_router" => {
+            let plugin = grpc_method_router::GrpcMethodRouter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "grpc_deadline" => Ok(Some(Arc::new(grpc_deadline::GrpcDeadline::new(config)?))),
         "grpc_web" => Ok(Some(Arc::new(grpc_web::GrpcWebPlugin::new(config)?))),
-        "rate_limiting" => Ok(Some(Arc::new(rate_limiting::RateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "rate_limiting" => {
+            let plugin = rate_limiting::RateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "request_mirror" => Ok(Some(Arc::new(
             request_mirror::RequestMirror::new_with_config_id(
                 config,
@@ -7826,10 +8019,13 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "api_chargeback" => Ok(Some(Arc::new(api_chargeback::ApiChargeback::new(
-            config,
-            http_client.namespace(),
-        )?))),
+        "api_chargeback" => Ok(Some(Arc::new(
+            api_chargeback::ApiChargeback::new_with_shard_amount(
+                config,
+                http_client.namespace(),
+                http_client.pool_shard_amount(),
+            )?,
+        ))),
         "api_chargeback_sink" => Ok(Some(Arc::new(
             api_chargeback_sink::ApiChargebackSink::new_with_config_id(
                 config,
@@ -7847,10 +8043,14 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ai_request_guard" => Ok(Some(Arc::new(ai_request_guard::AiRequestGuard::new(
             config,
         )?))),
-        "ai_rate_limiter" => Ok(Some(Arc::new(ai_rate_limiter::AiRateLimiter::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "ai_rate_limiter" => {
+            let plugin = ai_rate_limiter::AiRateLimiter::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
@@ -7894,13 +8094,22 @@ pub fn create_plugin_with_http_client_and_config_id(
         "ws_frame_logging" => Ok(Some(Arc::new(ws_frame_logging::WsFrameLogging::new(
             config,
         )?))),
-        "ws_rate_limiting" => Ok(Some(Arc::new(ws_rate_limiting::WsRateLimiting::new(
-            config,
-            http_client.clone(),
-        )?))),
-        "udp_rate_limiting" => Ok(Some(Arc::new(
-            udp_rate_limiting::UdpRateLimiting::new_with_http_client(config, http_client.clone())?,
-        ))),
+        "ws_rate_limiting" => {
+            let plugin = ws_rate_limiting::WsRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
+        "udp_rate_limiting" => {
+            let plugin = udp_rate_limiting::UdpRateLimiting::new_with_config_id(
+                config,
+                http_client.clone(),
+                rate_limit_config_id,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "spec_expose" => Ok(Some(Arc::new(spec_expose::SpecExpose::new(
             config,
             http_client,
@@ -7941,6 +8150,200 @@ pub fn create_plugin_with_http_client_and_config_id(
                 tracing::warn!("Unknown plugin: {}", name);
             }
             Ok(result)
+        }
+    }
+}
+
+/// Built-in plugins that the request-body-buffering screen must never
+/// construct, because their constructors reach node-local state that a
+/// config-admission screen has no business touching:
+///
+/// - `geo_restriction` opens the configured MaxMind `.mmdb` database,
+/// - `udp_logging` opens node-local DTLS key material,
+/// - `oidc_relying_party` performs OIDC discovery / JWKS work and retains
+///   background refresh state,
+/// - `transaction_log_schema` registers schemas in the process-wide reload
+///   staging map when another thread owns an active reload bracket.
+///
+/// None of them can ever require request-body buffering, so the screen answers
+/// [`RequestBodyBufferingScreen::Streams`] for them without construction. That
+/// claim is not free-floating: the drift coverage in
+/// `tests/unit/plugins/request_body_buffering_screen_tests.rs` fails if any
+/// entry here ever gains a buffering-related `Plugin` override, and fails if a
+/// new shape-only carve-out appears in
+/// [`validate_plugin_config_with_http_client`] without being classified here or
+/// in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`].
+pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
+    "geo_restriction",
+    "oidc_relying_party",
+    "transaction_log_schema",
+    "udp_logging",
+];
+
+/// Built-in plugins the screen constructs through a shape-only path instead of
+/// the ordinary factory.
+///
+/// `body_validator`'s runtime constructor reads the configured protobuf
+/// `FileDescriptorSet` off local disk. Its shape-only constructor parses the
+/// same config and derives the identical `has_request_validation` flag (the
+/// protobuf request/response *targets* come from the config shape, not from the
+/// descriptor file), so `Plugin::requires_request_body_buffering()` on the
+/// shape-only instance is the authoritative runtime answer.
+pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] = &["body_validator"];
+
+/// Why the request-body-buffering screen could not evaluate a plugin config.
+///
+/// Deliberately value-free: the variants classify the gap without echoing any
+/// configuration value back into logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyBufferingScreenGap {
+    /// Not a built-in plugin — a `custom_plugins/` build-time plugin, or an
+    /// unknown / retired name. The screen refuses to instantiate third-party
+    /// constructors during config admission.
+    NotBuiltin,
+    /// A built-in plugin whose configuration did not construct. The
+    /// configuration is rejected on its own merits by plugin-config validation;
+    /// the buffering question is simply unanswerable here.
+    ConstructionFailed,
+}
+
+impl RequestBodyBufferingScreenGap {
+    /// Stable, value-redacted reason token for structured diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotBuiltin => "plugin is not a built-in plugin",
+            Self::ConstructionFailed => "plugin configuration did not construct",
+        }
+    }
+}
+
+/// Result of the config-time request-body-buffering screen for one plugin
+/// config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestBodyBufferingScreen {
+    /// The constructed plugin reports
+    /// `Plugin::requires_request_body_buffering() == true`.
+    Buffers,
+    /// The constructed plugin reports
+    /// `Plugin::requires_request_body_buffering() == false`.
+    Streams,
+    /// The screen could not evaluate this plugin config.
+    Indeterminate(RequestBodyBufferingScreenGap),
+}
+
+impl RequestBodyBufferingScreen {
+    fn from_trait_answer(buffers: bool) -> Self {
+        if buffers {
+            Self::Buffers
+        } else {
+            Self::Streams
+        }
+    }
+}
+
+/// Side-effect-free screen for "does this plugin config force request-body
+/// buffering", derived from the authoritative
+/// [`Plugin::requires_request_body_buffering`] implementation.
+///
+/// Backend-TLS SNI admission uses this: plain HTTPS SNI overrides require the
+/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
+/// The screen builds a plugin instance from the SAME parsed configuration the
+/// runtime `PluginCache` builds and asks the same trait method, so there is no
+/// second implementation of "which plugins buffer" to drift out of sync.
+///
+/// Construction here is deliberately inert:
+///
+/// - the plugin is dropped immediately and never enters a cache, so no
+///   candidate state is published,
+/// - `Plugin::start_background_tasks()` is never called, which is where
+///   built-ins normally defer workers, timers, spool files, and registry
+///   publication,
+/// - side-effectful constructors are carved out entirely
+///   ([`REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT`]) or routed through their
+///   existing shape-only constructor
+///   ([`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]),
+/// - custom (`custom_plugins/`) and unknown names are never instantiated.
+///
+/// The HTTP client carries a default-open egress policy on purpose: the screen
+/// asks a buffering question, and endpoint egress admission is owned by
+/// [`validate_plugin_config_with_policy`]. Screening must not invent a
+/// rejection for an unrelated policy reason.
+pub struct RequestBodyBufferingScreener {
+    http_client: PluginHttpClient,
+}
+
+impl Default for RequestBodyBufferingScreener {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RequestBodyBufferingScreener {
+    /// Build a screener. The client construction is the same one
+    /// [`create_plugin`] uses, so a plugin whose construction depends on
+    /// process-wide compression admission resolves identically here and at
+    /// config-load validation.
+    pub fn new() -> Self {
+        Self {
+            http_client: PluginHttpClient::default().with_process_compression_admission_policy(),
+        }
+    }
+
+    /// Screen one plugin config.
+    pub fn screen(&self, plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
+        if REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT.contains(&plugin_name) {
+            return RequestBodyBufferingScreen::Streams;
+        }
+        if REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY.contains(&plugin_name) {
+            return Self::screen_shape_only(plugin_name, config);
+        }
+        if !is_builtin_plugin_name(plugin_name) {
+            return RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::NotBuiltin,
+            );
+        }
+        let client = self.http_client.clone();
+        match create_plugin_with_http_client(plugin_name, config, client) {
+            // The instance is dropped right here: nothing is published and
+            // `Plugin::start_background_tasks()` is never called.
+            Ok(Some(plugin)) => {
+                let buffers = plugin.requires_request_body_buffering();
+                RequestBodyBufferingScreen::from_trait_answer(buffers)
+            }
+            // A registered built-in that yields `None` is a retired/fail-closed
+            // alias; treat it like any other unanswerable name.
+            Ok(None) => {
+                RequestBodyBufferingScreen::Indeterminate(RequestBodyBufferingScreenGap::NotBuiltin)
+            }
+            // The constructor message can echo configured values, so it is
+            // deliberately dropped here — plugin-config validation surfaces the
+            // detailed error on its own path.
+            Err(_) => RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::ConstructionFailed,
+            ),
+        }
+    }
+
+    /// Screen a plugin listed in [`REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY`]
+    /// through its shape-only constructor.
+    fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
+        let answer = match plugin_name {
+            "body_validator" => body_validator::BodyValidator::new_shape_only(config)
+                .map(|plugin| plugin.requires_request_body_buffering()),
+            // Unreachable today. A name added to the shape-only list without a
+            // branch here must fail unanswerable rather than be silently
+            // mis-screened as non-buffering; the drift test also fails.
+            _ => {
+                return RequestBodyBufferingScreen::Indeterminate(
+                    RequestBodyBufferingScreenGap::ConstructionFailed,
+                );
+            }
+        };
+        match answer {
+            Ok(buffers) => RequestBodyBufferingScreen::from_trait_answer(buffers),
+            Err(_) => RequestBodyBufferingScreen::Indeterminate(
+                RequestBodyBufferingScreenGap::ConstructionFailed,
+            ),
         }
     }
 }
@@ -7996,6 +8399,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
     if name == "oidc_relying_party" {
         screen_direct_client_endpoint_egress(name, config, http_client.backend_allow_ips())?;
         return oidc_relying_party::OidcRelyingParty::validate_config(config, http_client);
+    }
+    if name == "transaction_log_schema" {
+        // Shape-only: shared Admin / CP validation and the buffering screen must
+        // not stage schemas in the process-wide reload map. Graph validation and
+        // cache reloads construct explicitly inside an open reload bracket.
+        return transaction_log_schema::TransactionLogSchema::validate_config(config);
     }
     match create_plugin_with_http_client(name, config, http_client)? {
         Some(_) => Ok(()),
@@ -8099,10 +8508,12 @@ pub(crate) fn screen_redis_endpoint_egress(
 /// the shared resolver. A denied literal endpoint must still be rejected at
 /// config-load so file/admin/DB/CP-DP admission is consistent with runtime.
 ///
-/// LDAP hostnames are freshly resolved and screened immediately before every
-/// connection/reconnection. Other clients outside `DnsCache` retain their
-/// documented hostname limitations; JWKS hostname resolution keeps the shared
-/// client's runtime policy backstop.
+/// LDAP and `ws_logging` hostnames are freshly resolved and screened
+/// immediately before every connection/reconnection, and only screened
+/// addresses are dialed. `kafka_logging` cannot reach that bar with the pinned
+/// librdkafka client and is therefore refused outright under any policy that
+/// can deny an address (see `kafka_logging::screen_kafka_broker_list_egress`).
+/// JWKS hostname resolution keeps the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
@@ -8146,25 +8557,14 @@ pub(crate) fn screen_direct_client_endpoint_egress(
                 ));
             }
         }
-        // broker_list is a comma-separated list of `host:port` (or `[v6]:port`,
-        // or a bare host/IP) entries with no scheme.
+        // broker_list is parsed with the pinned librdkafka grammar
+        // (`[proto://]host[:port]`, comma separated) so protocol-prefixed
+        // literals are screened too, and kafka_logging is refused outright when
+        // the policy can deny addresses librdkafka would dial without Ferrum
+        // ever seeing them (bootstrap hostname resolution, metadata-advertised
+        // brokers). See `kafka_logging::screen_kafka_broker_list_egress`.
         "kafka_logging" => {
-            if let Some(brokers) = config.get("broker_list").and_then(|v| v.as_str()) {
-                for entry in brokers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    let literal = entry
-                        .parse::<std::net::SocketAddr>()
-                        .map(|sa| sa.ip())
-                        .ok()
-                        .or_else(|| crate::config::types::egress_literal_ip(entry));
-                    if let Some(ip) = literal
-                        && let Some(reason) = backend_allow_ips.deny_reason(&ip)
-                    {
-                        return Err(format!(
-                            "broker_list IP {ip} denied by backend egress policy: {reason}"
-                        ));
-                    }
-                }
-            }
+            kafka_logging::screen_kafka_broker_list_egress(config, backend_allow_ips)?;
         }
         // endpoint_url is a single ws:// / wss:// URL; ws_logging dials it via
         // tokio_tungstenite outside the shared client + DnsCache.
@@ -8234,7 +8634,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("http_logging", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("tcp_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("kafka_logging", PluginFailurePolicy::KeepLastKnownGood),
-    builtin_plugin("ws_logging", PluginFailurePolicy::OptionalFailOpen),
+    builtin_plugin("ws_logging", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin(
         "transaction_debugger",
         PluginFailurePolicy::OptionalFailOpen,

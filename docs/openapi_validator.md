@@ -49,6 +49,17 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
+### Schema Object `$ref` siblings
+
+A keyword adjacent to `$ref` inside a Schema Object never replaces the referenced keyword.
+
+- **OpenAPI 3.1+** inherits JSON Schema 2020-12, where `$ref` is an applicator and adjacent keywords are independent assertions that must *also* hold. The importer emits `{allOf: [<referenced schema>, {<adjacent assertions>}]}`, which is exactly that conjunction. Identifier and annotation keywords (`$id`, `$anchor`, `$defs`, `$schema`, `description`, `title`, `example`, `default`, `xml`, `x-*`, …) stay on the referring wrapper, so neither the target's identifiers/annotations nor the wrapper's base-URI scope are overwritten. Annotation-only siblings use `allOf: [<referenced schema>]`, including when the target is a boolean schema. Note that an adjacent `$id` also rebases the sibling `$ref` itself, per JSON Schema — see [api_specs.md](api_specs.md) for the resolution rule and the failure mode.
+- **Swagger 2.0 / OpenAPI 3.0** Schema Object `$ref` is a JSON Reference with no defined sibling semantics. An adjacent assertion keyword (including the common `nullable: true` idiom) is rejected with HTTP 422 rather than being silently applied under 3.1 rules or silently dropped. Wrap the reference in an explicit `allOf` instead.
+- `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, and legacy `$recursiveRef` adjacent to `$ref` are rejected in every version: their evaluation depends on annotations or dynamic scope that a materialized composition branch cannot reproduce.
+- OpenAPI **Reference Objects** — Path Item, `requestBody`, response, parameter, and header `$ref` positions — are not Schema Objects and keep the documented deterministic sibling overlay.
+
+Previously each adjacent key was inserted into the materialized target, so `{$ref: <string schema>, type: integer}` produced `type: integer` and accepted integers the contract forbids.
+
 ### Server base paths
 
 OpenAPI path keys are relative to the applicable Server Object; Swagger 2.0 path keys are relative to `basePath`. The importer prepends the effective server pathname when generating each operation's `path_template` and `path_regex`, so runtime matching against the full inbound URI path stays consistent across HTTP/1.x, HTTP/2, and HTTP/3:
@@ -72,7 +83,7 @@ Schema annotation payloads are opaque during reference expansion: `$id`, `id`,
 `$anchor`, and `$ref`-shaped data in `default`, `examples`, `const`, or `enum`
 is preserved as instance data rather than interpreted as schema control keywords.
 
-Missing or duplicate anchors, duplicate resource `$id`s, malformed fragment encodings, and refs whose URI is not declared in the document fail closed. See [api_specs.md](api_specs.md) for the full importer contract.
+Missing or duplicate anchors, duplicate resource `$id`s, malformed fragment encodings, and refs whose URI is not declared in the document fail closed. One schema expansion is also capped at 500,000 materialized values and the generated-config byte budget; accumulated generated operations are checked against that byte budget as they are built. Shallow repeated-reference fan-out therefore returns HTTP 422 `SchemaTooLarge` before it can grow exponentially. See [api_specs.md](api_specs.md) for the full importer contract.
 
 ### `readOnly` / `writeOnly` required direction
 
@@ -111,6 +122,8 @@ x-ferrum-validate:
 ```
 
 `mode` maps to plugin `enforcement_mode`. Supported modes are `block`, `log_only`, and `disabled`.
+
+`x-ferrum-validate` is a closed object. Accepted keys are exactly `mode`, `request`, `response`, `validate_request`, `validate_response`, `bypass`, `fail_on_unknown_operation`, `fail_on_missing_response_schema`, `max_body_bytes`, `error_response`, and `error_truncate_chars`; `request` / `response` accept only `enabled` and `content_types`. Anything else — including `operations`, which is always regenerated from the document — is rejected with HTTP 400 and a spelling suggestion instead of being copied into the generated plugin config. A typo used to be carried through silently, leaving the weaker default in force.
 
 ## Plugin Config
 
@@ -170,23 +183,37 @@ The generated plugin config has this shape:
 | `request_content_types` | common JSON/XML/form/text/binary types | Request media types in scope. Parameters such as `; charset=utf-8` are stripped before matching. `application/json` also matches `+json`, XML types match `+xml`, `text/plain` matches `text/*`, and `application/octet-stream` covers common binary `application/*`, `image/*`, `audio/*`, and `video/*` payloads. |
 | `response_content_types` | common JSON/XML/form/text/binary types | Response media types in scope. |
 | `fail_on_unknown_operation` | `true` | Reject requests that do not match any generated operation. |
-| `fail_on_missing_response_schema` | `false` | Reject responses whose status/content type has no schema and no `default` schema. |
+| `fail_on_missing_response_schema` | `false` | Reject a response whose selected response object yields no schema. Applied **after** status selection to a missing `Content-Type`, a content type outside `response_content_types`, an unmatched declared media type, a body returned for a status declared with no content, and a status covered by no response object. An empty body for an explicitly empty response declaration remains valid. Strict enforcement stays scheduled even when every declared response media map is empty. Statuses with no body semantics (HEAD, 1xx, 204, 205, 304) are always skipped. |
 | `max_body_bytes` | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains. |
 | `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
 | `operations` | required | Generated per-operation schema table. Each entry's `path_template` / `path_regex` include the effective server/`basePath` pathname (one entry per distinct server pathname). Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). Form-urlencoded and multipart request entries with encoding metadata use the strict Media Type Object `{schema, encoding}`; both fields are required, extra wrapper fields are rejected, and a bare schema remains canonical when encoding is absent. |
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |
-| `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. |
+| `bypass.header_present` | `{}` | Header-name map. `null` means any value; a string requires an exact value match. Case-equivalent duplicate keys are rejected at construction. |
 | `error_response.request_status_code` | `400` | Status for blocked request validation errors. |
 | `error_response.response_status_code` | `502` | Status for blocked response validation errors. |
 | `error_response.content_type` | `application/problem+json` | Content type for generated error bodies. |
 
+### Strict config admission
+
+Every fixed-field object in the plugin config is closed. Unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, `request_body`, and multipart Encoding Header Objects are rejected at construction with a path-qualified error and a spelling suggestion. Presence is also distinct from omission: an explicit `null` for a published non-null field is a type error rather than a request to select that field's default (the `null` values in `bypass.header_present` remain intentional and mean “match any value”). The `x-ferrum-validate.bypass` importer object is closed by the same key set. Because the plugin is registered `FailClosed`, a rejected config never becomes the running policy: direct Admin writes return HTTP 400, file mode fails startup, and a DP keeps its last known-good generation.
+
+Intentionally free-form maps stay open but are shape-validated instead of key-enumerated:
+
+- Media-type map keys (`request_body.content`, each `responses[status]` entry) must be a media type or media range: `type/subtype`, `type/*`, or `*/*` built from RFC 9110 tokens.
+- Response status keys must be a three-digit `1xx`–`5xx` status, an OpenAPI wildcard range `1XX`–`5XX`, or `default`; case variants that normalize to the same range/default are rejected as duplicates.
+- `bypass.header_present` keys are header names; encoding maps are keyed by schema property name. Case-equivalent duplicate header names in `bypass.header_present` and in multipart Encoding Header Objects are rejected as canonical duplicates before either policy can overwrite the other.
+
+`request_body` must use exactly one of the two documented forms — `{"content": {…}}` or `{"content_type": …, "schema": …, "encoding"?: …}`. The object is never treated as its own media map, which is what previously made a misspelled fixed field indistinguishable from a media type.
+
+Removed aliases: `json_schema_draft` (use `schema_draft`) and `operations[].request_body_required` (use `request_required`) are unknown keys. The undocumented `schema_draft` value spellings `draft-7`, `draft202012`, and `2020-12` are also rejected; use the published `draft7` or `draft2020-12` value. None of these aliases was part of the `openapi.yaml` contract.
+
 ## Runtime Behavior
 
 - Only plain HTTP proxy traffic is in scope. WebSocket frames, raw TCP/UDP, and gRPC protobuf validation are not handled by this plugin.
-- Request validation buffers only body-capable methods with a matching operation, request schema, and content type.
-- Response validation buffers only matching operations with response schemas. Request `Accept` and internal streaming markers do not waive the contract. A pristine backend `text/event-stream` response is treated as uninspectable before header commit: `block` returns the configured response error (502 by default), while `log_only` records the response mismatch and permits the stream. Missing, ambiguous, or later-relabeled types remain on the ordinary validation path.
+- Request validation buffers only body-capable methods with a matching operation and request schema. Optional bodies require an in-scope content type; a required body is buffered regardless of Content-Type so an absent body cannot evade the presence check.
+- Response validation buffers matching operations with response schemas, and also matching operations governed by `fail_on_missing_response_schema` even when their declared response maps contain no schema. Request `Accept` and internal streaming markers do not waive the contract. A pristine backend `text/event-stream` response is treated as uninspectable before header commit: `block` returns the configured response error (502 by default), while `log_only` records the response mismatch and permits the stream. Missing, ambiguous, or later-relabeled types remain on the ordinary validation path.
 - JSON and `+json` bodies are parsed as JSON.
 - XML and `+xml` bodies are parsed into schema-shaped objects. OpenAPI XML Object fields `xml.name`, `xml.namespace`, `xml.prefix`, `xml.attribute`, and `xml.wrapped` are honored when mapping elements and attributes. Matching uses expanded names (`namespace URI` + local name): a declared `xml.namespace` must match the document URI exactly (prefix text is serialization metadata only and is not trusted). A member that collides with a modeled property, attribute, array wrapper, or array item (by JSON key or local name) but does not match its modeled XML construct or namespace is rejected fail-closed during conversion: an attribute where an element is modeled (or vice versa) and a non-matching namespace URI both qualify, and such a member is neither dropped nor rematerialized as an additional member, so it cannot fill an unfilled modeled slot and pass validation the backend would reject. Undeclared XML attributes and elements that do not collide with reserved expanded names are preserved for JSON Schema evaluation (`additionalProperties`, `maxProperties`, `patternProperties`, `propertyNames`, and related keywords). Leaf elements that carry attributes materialize as objects (attributes plus optional `#text`) rather than discarding attributes. Repeated elements are accepted only for array schemas; scalar properties and wrapped-array wrappers reject duplicates fail-closed.
 - `application/x-www-form-urlencoded` bodies are parsed into object fields. Default serialization is `style=form, explode=true` (repeated keys). When the generated config preserves Encoding Objects, runtime honors `style` / `explode` / `allowReserved` for each property: `explode=false` splits arrays and alternating object key/value pairs with the declared delimiter, `form` + `explode=true` rebuilds declared and free-form object children from their emitted key/value parameters, and `deepObject` rebuilds objects from `name[key]=value` pairs. Root sibling properties take precedence over unprefixed free-form child keys; exploded object configurations whose emitted keys are ambiguous are rejected at admission so one wire occurrence can populate at most one logical property — two exploded free-form object properties, an exploded child that collides with a root sibling or with another exploded object's child, or a free-form object coexisting with any other exploded object. Delimiters are identified before percent-decoding so an encoded data character such as `%2C` remains part of one value. Unsupported Encoding Object combinations are rejected when the plugin config is admitted.
@@ -194,8 +221,11 @@ The generated plugin config has this shape:
 - Form, multipart, and XML scalar/array conversion is composition-aware: `oneOf` / `anyOf` / `allOf` do not preselect the first branch. Compatible scalar coercions are attempted in a fixed order (integer, number, boolean, string) independent of branch order; composed array item schemas are retained through nested alternations; and `allOf` object properties are merged so later branches keep their declared types. Ambiguous values that coerce to more than one JSON type prefer the more specific numeric/boolean form when that form still satisfies the schema after validation. A repeated field name is preserved only for array schemas (every value, in order); a scalar (non-array) property that occurs more than once is rejected fail-closed for both form-urlencoded and multipart bodies.
 - `text/*` bodies validate as UTF-8 strings. UTF-8 binary bodies validate as strings, so `pattern` and `enum` can apply. Non-UTF-8 binary bodies enforce `minLength` and `maxLength` directly against byte length and skip string-only JSON Schema keywords.
 - Request and response bodies may carry a complete HTTP `Content-Encoding` list (`gzip`, `br`, and `identity`). Supported coding chains such as `gzip, br` and `br, gzip` are decoded in reverse application order before schema validation. Empty, malformed, parameterized, or unsupported list members fail validation. `max_body_bytes` bounds the raw body and every decoded layer so chained expansion fails closed.
-- Response status lookup uses the exact status first, then OpenAPI wildcard ranges such as `4XX`, then the OpenAPI `default` response if present.
+- Response selection is **status-first**. The exact status wins; otherwise the narrowest matching OpenAPI wildcard range such as `4XX`; otherwise `default`. The selected response object is final: a media-type miss inside it never falls through to a range or `default` object, because those cover status codes that are *not otherwise declared*. Media entries are matched most-specific-first (exact media type, then Ferrum's `+json` / `+xml` / `text/*` family fallback, then a declared `type/*` range, then `*/*`). The importer emits declared statuses even when they carry no schema-bearing content, so an empty media map means "this status is declared to carry no body".
+- An empty response body is **not** an automatic pass, including for gateway-generated synthetic responses. Except for statuses and methods with no body semantics (HEAD, 1xx, 204, 205, 304, which are skipped with `skip_reason = no_body_expected`), a zero-byte body is fed to the media parser for the selected schema, so an empty payload under `Content-Type: application/json` fails JSON parsing instead of silently continuing.
+- Response validation errors are redacted. Schema failures retain only a fixed generic message plus the operator/schema-controlled schema location (JSON Pointer object-key segments in the instance path are backend-derived and are never emitted); response conversion failures use a generic message; missing-schema errors report only whether Content-Type was present. Backend body values, backend JSON property names, and raw backend Content-Type values therefore do not cross the client boundary or land in transaction logs. Request validation errors keep the full message because the instance is the caller's own submitted body.
 - Path templates are generated as full-match regexes. Path parameter constraints are not interpreted; `{id}` becomes `[^/]+`.
+- Operation matching runs on the [canonical policy path](request_path_canonicalization.md), which is derived once at the frontend boundary and is the same value routing, WAF, and the backend request line use. Two consequences matter for operation selection: a client cannot pick a spelling that lands on a different operation than the backend dispatches (`/%61dmin` selects the `/admin` operation, not `/{slug}`), and an encoded separator can never hide inside a `[^/]+` parameter segment — such a target is rejected with `400` before the plugin runs, as are dot segments and backslashes in either spelling (`/a/../b`, `/a/%2e%2e/b`, `/a\b`, `/a%5Cb`), which a URL parser would otherwise resolve into a different operation than the one matched. Within a method, operations are ordered by literal-segment count, so a concrete path template always wins over an overlapping templated one regardless of document order.
 
 ## Metadata
 
@@ -205,7 +235,7 @@ Validation outcomes are written to transaction metadata for all logging plugins:
 |---|---|
 | `openapi_validator.mode` | `block`, `log_only`, or `disabled` |
 | `openapi_validator.matched_operation` | Example: `POST /orders/{id}` |
-| `openapi_validator.skip_reason` | `no_match`, `bypass_path`, `bypass_consumer`, `bypass_header`, `bypass_method`, `content_type`, or `no_schema` |
+| `openapi_validator.skip_reason` | `no_match`, `bypass_path`, `bypass_consumer`, `bypass_header`, `bypass_method`, `content_type`, `no_schema`, `no_response_content`, or `no_body_expected` |
 | `openapi_validator.request_error` | Truncated request validation error |
 | `openapi_validator.response_error` | Truncated response validation error |
 | `openapi_validator.action` | `rejected_request`, `rejected_response`, `logged_request_mismatch`, or `logged_response_mismatch` |

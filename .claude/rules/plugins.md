@@ -31,7 +31,23 @@ paths:
 - Multiple scoped instances of the same type may coexist.
 - Exception: `api_chargeback` admits at most one effective instance per proxy
   after merge (shared `/charges` registry is exactly-once) and requires every
-  enabled instance to agree on the process-global render/cleanup tunables.
+  enabled instance to agree on the process-global render/cleanup/budget
+  tunables (`max_entries` / `max_retained_bytes` included). The registry admits
+  at most `max_entries` retained billing rows (complete entry keys — one
+  principal can occupy many slots across proxy/status/family/currency/
+  namespace/price dimensions); a refused new row folds into the
+  fixed-cardinality internal overflow row
+  (`__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1`)
+  rather than being dropped (per-identity attribution lost). That sentinel is
+  in the digest-form identity class, so a real principal can never share its
+  registry key. Authenticated `GET /charges` before the plugin is configured
+  must not claim the process-global registry (empty response; later accepted
+  generation sizes the hot map with its configured pool shard count).
+- Billing identities are never prefix-truncated. External identity claims above
+  512 bytes are rejected at the authentication boundary
+  (`commit_authentication_attempt`); anything still needing a bound inside
+  chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
+  digest of the complete value; marker-bearing values always digested).
 - Exception: `request_deduplication` and `mcp_gateway` may not be effective on
   the same proxy. A dedup replay is a finalized representation served before
   `mcp_gateway` runs, and MCP's public-URI rewrite comes from live upstream
@@ -132,7 +148,20 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is `{FERRUM_NAMESPACE}:{plugin_name}`.
+- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is
+  `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
+  isolates independent policies of one plugin type inside a namespace while
+  replicas of the same policy keep sharing a budget. An explicit
+  `redis_key_prefix` is the shared-budget opt-in.
+- Every rate-limit window is bounded by `MAX_RATE_LIMIT_WINDOW_SECONDS`
+  (2678400), and ordinary HTTP/GraphQL/gRPC request caps are bounded by
+  `MAX_RATE_LIMIT_MAX_REQUESTS` (1000000);
+  TTL/retention math uses the saturating helpers in
+  `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
+  `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
+  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
+  rate-limit plugin roots are closed key sets; the AI rate-limit root remains
+  intentionally open and must stay in parity with OpenAPI.
 - Redis outage falls back to in-memory and reconnects in the background.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.

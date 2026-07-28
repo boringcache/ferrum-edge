@@ -15,19 +15,59 @@ use tracing::{debug, warn};
 
 use super::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitOutcome,
-    RateLimitWindowSpec, apply_rate_limit_cleanup,
+    RateLimitWindowSpec, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, validate_max_requests, validate_window_seconds,
 };
+use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{
     GRPC_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, ProxyProtocol, RequestContext,
 };
+use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
-/// enforcement skips this cooldown so a sampled observation of pressure
-/// still force-reclaims without waiting for the next cool-down window.
+/// reclaim skips this cooldown so a sampled observation of pressure can
+/// drop idle keys without waiting for the next cool-down window. Live
+/// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
+const CAPACITY_REJECT_BODY: &str = r#"{"error":"Rate limit state capacity exceeded"}"#;
+
+/// `grpc_method_router`-specific top-level config keys (excludes Redis fields).
+const GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS: &[&str] = &[
+    "allow_methods",
+    "deny_methods",
+    "method_rate_limits",
+    "limit_by",
+];
+
+/// Closed top-level key set for `grpc_method_router` plugin config.
+///
+/// Must stay aligned with OpenAPI `GrpcMethodRouterConfig`,
+/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. Unknown root keys fail
+/// closed: a valid method rule previously masked a misspelled `sync_mdoe`,
+/// `limit_byy`, or `redis_key_prefx`, so the plugin loaded with local, IP-keyed,
+/// or shared-prefix enforcement instead of the intended policy.
+pub const GRPC_METHOD_ROUTER_CONFIG_KEYS: &[&str] = &[
+    "allow_methods",
+    "deny_methods",
+    "method_rate_limits",
+    "limit_by",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
+/// Closed key set for one `method_rate_limits` entry.
+const RATE_SPEC_KEYS: &[&str] = &["max_requests", "window_seconds"];
 
 /// A rate window spec parsed from config.
 #[derive(Debug, Clone)]
@@ -48,7 +88,37 @@ pub struct GrpcMethodRouter {
 }
 
 impl GrpcMethodRouter {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, STANDALONE_RATE_LIMIT_CONFIG_ID)
+    }
+
+    /// Construct with the stable plugin-config resource id that isolates this
+    /// policy's default Redis counters from sibling `grpc_method_router`
+    /// instances in the same namespace. See
+    /// [`super::utils::rate_limit::RedisLimiter::new_with_config_id`].
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        config_id: &str,
+    ) -> Result<Self, String> {
+        let object = config.as_object().ok_or_else(|| {
+            format!("grpc_method_router: config must be an object, got: {config}")
+        })?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity.
+        debug_assert_closed_root_keys(
+            GRPC_METHOD_ROUTER_CONFIG_KEYS,
+            GRPC_METHOD_ROUTER_POLICY_CONFIG_KEYS,
+            REDIS_PLUGIN_CONFIG_KEYS,
+        );
+        reject_unknown_keys(
+            object,
+            "config",
+            GRPC_METHOD_ROUTER_CONFIG_KEYS,
+            "grpc_method_router: ",
+        )?;
+
         let allow_methods = parse_optional_method_set(config, "allow_methods")?;
         let deny_methods = parse_optional_method_set(config, "deny_methods")?.unwrap_or_default();
 
@@ -83,6 +153,13 @@ impl GrpcMethodRouter {
                 let spec_obj = spec.as_object().ok_or_else(|| {
                     format!("grpc_method_router: method_rate_limits['{method}'] must be an object")
                 })?;
+                let label = format!("grpc_method_router: method_rate_limits['{method}']");
+                reject_unknown_keys(
+                    spec_obj,
+                    &format!("config.method_rate_limits[{method}]"),
+                    RATE_SPEC_KEYS,
+                    "grpc_method_router: ",
+                )?;
                 let max_requests = spec_obj
                     .get("max_requests")
                     .and_then(Value::as_u64)
@@ -99,16 +176,9 @@ impl GrpcMethodRouter {
                             "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' is required and must be a positive integer"
                         )
                     })?;
-                if max_requests == 0 {
-                    return Err(format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'max_requests' must be greater than zero"
-                    ));
-                }
-                if window_seconds == 0 {
-                    return Err(format!(
-                        "grpc_method_router: method_rate_limits['{method}']: 'window_seconds' must be greater than zero"
-                    ));
-                }
+                let max_requests = validate_max_requests(&label, "max_requests", max_requests)?;
+                let window_seconds =
+                    validate_window_seconds(&label, "window_seconds", window_seconds)?;
                 let normalized = normalize_config_method_path(method, "method_rate_limits")?;
                 let window = Duration::from_secs(window_seconds);
                 if method_rate_limits
@@ -147,8 +217,9 @@ impl GrpcMethodRouter {
             deny_methods,
             method_rate_limits,
             limit_by,
-            limiter: RateLimitBackend::from_plugin_config(
+            limiter: RateLimitBackend::from_plugin_config_with_config_id(
                 "grpc_method_router",
+                config_id,
                 config,
                 &http_client,
                 DynamicHttpRateLimitAlgorithm::new(),
@@ -165,6 +236,13 @@ impl GrpcMethodRouter {
         self.limiter.local_map_shard_amount()
     }
 
+    /// Effective Redis key prefix for policy-isolation coverage. Not a
+    /// production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_key_prefix_for_test(&self) -> Option<String> {
+        self.limiter.redis_key_prefix().map(str::to_string)
+    }
+
     /// Controllable-time seed for external cleanup tests. Not a production API.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn seed_key_at_for_test(&self, key: String, now: Instant) {
@@ -173,6 +251,24 @@ impl GrpcMethodRouter {
             duration: Duration::from_secs(1),
         }]);
         let _ = self.limiter.check_local_at(key, &op, now);
+    }
+
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_key_at_with_cap_for_test(
+        &self,
+        key: String,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+            limit: 100,
+            duration: Duration::from_secs(1),
+        }]);
+        self.limiter
+            .check_local_at_with_capacity(key, &op, now, max_entries)
+            .is_some()
     }
 
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
@@ -225,9 +321,10 @@ impl GrpcMethodRouter {
         }
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Sampled over-cap observation force-enforces after pruning idle keys.
-        // The below-cap cooldown must not suppress this branch once pressure
-        // is seen on a sampled pass.
+        // Sampled over-cap observation reclaims idle keys after prune. Live
+        // budgets are never force-evicted; hard cardinality is enforced by
+        // atomic admission reservation. The below-cap cooldown must not
+        // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             self.last_periodic_sweep_secs
@@ -253,9 +350,19 @@ impl GrpcMethodRouter {
     }
 
     /// Check a rate limit by key, creating a bucket if needed.
-    async fn check_rate(&self, key: &str, spec: &RateSpec) -> RateLimitOutcome {
+    ///
+    /// Returns `None` when a previously unseen local/fallback key is denied at
+    /// the hard cardinality cap (Redis-healthy admission is unaffected).
+    async fn check_rate(&self, key: &str, spec: &RateSpec) -> Option<RateLimitOutcome> {
         self.evict_stale_entries();
-        self.limiter.check(key.to_string(), key, &spec.op).await
+        self.limiter
+            .check_with_redis_key_and_local_capacity(
+                key.to_string(),
+                || key.to_string(),
+                &spec.op,
+                MAX_STATE_ENTRIES,
+            )
+            .await
     }
 
     /// Build the rate limit key based on `limit_by` config.
@@ -502,34 +609,44 @@ impl Plugin for GrpcMethodRouter {
         // Check per-method rate limits on the pinned selected method.
         if let Some(spec) = self.method_rate_limits.get(full_method) {
             let key = self.rate_key(ctx, full_method);
-            let outcome = self.check_rate(&key, spec).await;
-            if !outcome.allowed {
-                warn!(
-                    method = %full_method,
-                    plugin = "grpc_method_router",
-                    "gRPC method rate limit exceeded"
-                );
-                let remaining = outcome.remaining.unwrap_or(0);
-                let mut headers = grpc_content_type_header();
-                headers.insert(
-                    "x-grpc-ratelimit-limit".to_string(),
-                    spec.max_requests.to_string(),
-                );
-                headers.insert(
-                    "x-grpc-ratelimit-remaining".to_string(),
-                    remaining.to_string(),
-                );
-                headers.insert(
-                    "x-grpc-ratelimit-method".to_string(),
-                    full_method.to_string(),
-                );
-                return PluginResult::Reject {
-                    status_code: 429,
-                    body: grpc_json_error_body(format!(
-                        "Rate limit exceeded for gRPC method '{full_method}'"
-                    )),
-                    headers,
-                };
+            match self.check_rate(&key, spec).await {
+                None => {
+                    super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: CAPACITY_REJECT_BODY.to_string(),
+                        headers: grpc_content_type_header(),
+                    };
+                }
+                Some(outcome) if !outcome.allowed => {
+                    warn!(
+                        method = %full_method,
+                        plugin = "grpc_method_router",
+                        "gRPC method rate limit exceeded"
+                    );
+                    let remaining = outcome.remaining.unwrap_or(0);
+                    let mut headers = grpc_content_type_header();
+                    headers.insert(
+                        "x-grpc-ratelimit-limit".to_string(),
+                        spec.max_requests.to_string(),
+                    );
+                    headers.insert(
+                        "x-grpc-ratelimit-remaining".to_string(),
+                        remaining.to_string(),
+                    );
+                    headers.insert(
+                        "x-grpc-ratelimit-method".to_string(),
+                        full_method.to_string(),
+                    );
+                    return PluginResult::Reject {
+                        status_code: 429,
+                        body: grpc_json_error_body(format!(
+                            "Rate limit exceeded for gRPC method '{full_method}'"
+                        )),
+                        headers,
+                    };
+                }
+                Some(_) => {}
             }
         }
 

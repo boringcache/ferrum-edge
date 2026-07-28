@@ -175,7 +175,7 @@ Any plugin can short-circuit the pipeline by returning a `Reject` result. For ex
 route/header-shaping `before_proxy` hooks and load balancing, but before
 circuit-breaker or backend dispatch. The gateway assembles the same path
 segments used by the backend URL builder, including regex/exact/prefix match
-length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
+length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
 backend wire. The selected target remains pinned across deferred external hooks,
@@ -238,6 +238,8 @@ policy.
 
 When a plugin returns a replacement body from `transform_response_body`, the core first removes representation metadata that can no longer describe the client-visible bytes: range fields, ETag/Last-Modified validators, content digests/checksums, and content-bound signatures. It then calls that plugin's `on_response_body_transformed` callback before the next transform, allowing the plugin to attach metadata it recomputed for the replacement representation. Neither step runs when the transform returns `None`, so unmodified responses retain their original semantics — with one exception: a body the representation gate **decoded** has already had its client-visible bytes changed (encoded in, identity out), so that same metadata invalidation is applied at the decode itself, whether or not a later rule matches. Otherwise a decoded body no rule happened to change would be served as identity bytes carrying the origin's validator for the encoded ones. `206 Partial Content` and `226 IM Used` responses that no configured body policy claims skip provider normalization and presentation transforms entirely: the buffered bytes are only a selected range or delta, so Ferrum cannot rewrite them into a truthful full representation merely by changing headers or status. When a configured body policy *does* claim such a response, skipping the transform would silently forward protected bytes, so the representation gate described below rejects it instead — see [Buffered response representation gate](#buffered-response-representation-gate). Transform-dependent header hooks also decline these statuses: compression does not attach `Content-Encoding`, gRPC-Web does not relabel native gRPC bytes or expose transformed trailers, and SSE does not force a non-SSE representation into event-stream headers when wrapping cannot run. Inspection hooks still run. If an enforcing policy detects content whose safe disposition requires redaction, it rejects the response instead of forwarding the original bytes with false redaction telemetry. This lifecycle rule is shared by buffered H1, H2, H3, gRPC, and synthetic/rejection response paths rather than delegated to individual transformer implementations.
 
+Gateway-generated synthetic responses normally skip the body pipeline when they contain zero bytes. A validator whose contract distinguishes an empty representation from a valid one can opt into zero-byte processing; `openapi_validator` does so for matching response contracts, keeping empty synthetic and buffered backend responses under the same final-schema rule. HEAD and 1xx/204/205/304 responses retain their no-body semantics and do not enter this path.
+
 ### Buffered response representation gate
 
 Before any buffered body transform runs, one shared gate decides whether a configured body policy — a plugin returning `true` from `enforces_response_body_policy`, such as a `response_transformer` with `body_rules` — can genuinely be applied to the representation the backend produced. The same gate runs on every path that publishes a buffered response: H1/H2, buffered gRPC, native H3, both H3 cross-protocol bridges, and the synthetic/replay short-circuit.
@@ -296,7 +298,48 @@ Post-routing method-filter responses and native-gRPC gateway errors also apply t
 
 If `on_response_body`, the shared representation gate, or a body-transform deadline has already selected a gateway-authored terminal response, the remaining presentation/protocol transforms may still run to preserve the client's wire shape, but `on_final_response_body` is skipped. A final validator or storage hook must never reinterpret the gateway's error payload and replace the first fail-closed decision. `on_response_committed` still observes the response that will actually be sent.
 
-`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), or when a terminate-mode `serverless_function` may already have executed before `on_error: continue` fell through to the stream. In either uncertain-side-effect case, a same-key retry cannot immediately re-execute an operation that has no replayable response or tombstone.
+`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release an ordinary non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error). When the stream sits behind a declared completed external operation — a terminate-mode `serverless_function` that may already have executed before `on_error: continue` fell through to the stream, or a plugin that marked `ferrum:external_operation_completed` — the hook instead publishes a durable non-replayable 409 completion tombstone (locally, and in Redis through the fenced ownership transition) on both clean and interrupted terminations. That closes the gap where an already-charged operation became re-executable the moment the raw in-flight lease expired: a same-key retry is refused for `max(ttl_seconds, inflight_ttl_seconds)`, never merely for `inflight_ttl_seconds` and never for less.
+
+### Synthetic-response completion contract
+
+A plugin that short-circuits the chain with `Reject`/`RejectBinary` produces a
+*synthetic* response. Ownership plugins such as `request_deduplication` cannot
+tell from the response bytes whether that short-circuit merely fabricated a
+representation or actually performed the protected operation, so the producing
+plugin must declare it:
+
+| Provenance | Declared by | Ownership outcome |
+|---|---|---|
+| Harmless synthetic response (`response_mock`, `fault_injection`, `request_termination`, `ai_semantic_cache` / `response_caching` hit) | nothing to declare; the shared reject finalizer records `ferrum:finalized_synthetic_response` for successful shapes | token-matched release on commit; the synthetic body is never stored under the idempotency key |
+| Committed before any external operation could start (payload validation, unsupported-protocol refusal, DNS/egress denial, proven pre-wire transport failure) | `ferrum:release_dedup_inflight_on_commit`, or `serverless_function`'s pre-invocation rejection owners | token-matched release on commit, so a corrected retry proceeds immediately |
+| The short-circuit performed the protected billable/side-effecting operation | `ferrum:external_operation_completed` (`ai_federation`), or `serverless_function` terminate-mode side-effect owners | ownership is **not** released; a durable non-replayable 409 completion tombstone is published for `max(ttl_seconds, inflight_ttl_seconds)`, fenced in Redis mode |
+
+For the last row, a terminate-mode `serverless_function` response that *can* be
+retained is published as an ordinary replayable completion for `ttl_seconds`, so
+an identical retry receives the real function response instead of a conflict. The
+non-replayable tombstone is what the key falls back to whenever that response
+cannot be persisted as a replay — no safe representation exists, storage capacity
+or the Redis payload cap rejects it, or its replay provenance is unusable because
+the request straddled a response-presentation-policy publication or that policy
+is incomplete/`Dynamic`. The completion barrier is never downgraded to the bare
+in-flight lease in those cases: the same fenced ownership transition publishes the
+409 barrier for `max(ttl_seconds, inflight_ttl_seconds)`. If response-byte
+admission fails locally, the exact owner is atomically replaced by a fixed-size
+execution barrier with that same retention. If later capacity pressure evicts a
+protected completion, its barrier inherits the completion's original insertion
+time and retention rather than starting a fresh `inflight_ttl_seconds` lease.
+Redis publication remains compare-and-set fenced, and a stale hook cannot clear
+either the barrier or a successor owner. Per-key barriers are hard-capped at
+`max_entries`; overflow is collapsed into one fixed process-global deadline
+that returns 503 for applicable idempotency-key requests until the longest
+displaced completion deadline, rather than allocating unbounded key state or
+failing open.
+
+These markers are internal (`ferrum:`-prefixed) and cannot be set from public
+request metadata or from a backend response header. A new plugin that spends
+money or mutates remote state behind a short-circuit and declares nothing will
+be treated as harmless, and identical idempotency-key retries will repeat the
+operation — declare the provenance or define an equivalent completion contract.
 
 The absolute gRPC response-deadline wrapper sits outside the response-inspector chain. Its partial-DATA decision therefore counts only bytes emitted by the final inspected body, not backend chunks an inspector consumed and buffered. If an inspector has emitted zero bytes when the deadline fires, the client still receives the clean status-4 terminal representation.
 

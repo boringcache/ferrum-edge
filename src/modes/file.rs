@@ -48,9 +48,10 @@ use crate::config::EnvConfig;
 use crate::config::file_loader;
 use crate::config::types::GatewayConfig;
 use crate::dns::{DnsCache, DnsConfig};
+use crate::modes::startup_security;
 use crate::proxy::{self, ProxyState};
 use crate::startup::wait_for_start_signals;
-use crate::tls::{self, TlsPolicy};
+use crate::tls;
 
 /// Pre-bound TCP listeners + admin overrides that callers of [`serve`] can
 /// hand to the gateway instead of letting it bind ports / read env itself.
@@ -814,15 +815,12 @@ pub async fn serve(
         }
     }
 
-    let tls_policy = TlsPolicy::from_env_config(&env_config)?;
-    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())?;
-    let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|e| anyhow::anyhow!("FERRUM_ADMIN_ALLOWED_CIDRS: {}", e))?,
-    );
-    let metrics_auth = Arc::new(
-        crate::admin::MetricsAuthPolicy::from_env(&env_config).map_err(|e| anyhow::anyhow!(e))?,
-    );
+    // Shared with `ferrum-edge validate` so env TLS/security surfaces cannot
+    // drift between the two commands (issue #2976).
+    let tls_policy = startup_security::load_tls_policy(&env_config)?;
+    let crls = startup_security::load_crls_from_env(&env_config)?;
+    let admin_allowed_cidrs = Arc::new(startup_security::load_admin_allowed_cidrs(&env_config)?);
+    let metrics_auth = Arc::new(startup_security::load_metrics_auth(&env_config)?);
 
     let (proxy_state, health_check_handles) = ProxyState::new_with_reserved_gateway_ports(
         config,
@@ -901,8 +899,11 @@ pub async fn serve(
         env_config.runtime_metrics_window_5m_seconds,
         shutdown_tx.subscribe(),
     );
-    let acme_renewal_handle =
-        crate::modes::start_acme_renewal_scheduler(&env_config, shutdown_tx.subscribe());
+    let acme_renewal_handle = crate::modes::start_acme_renewal_scheduler(
+        &env_config,
+        dns_cache.clone(),
+        shutdown_tx.subscribe(),
+    );
 
     let mut background_handles: Vec<JoinHandle<()>> = vec![
         dns_handle,
@@ -923,43 +924,24 @@ pub async fn serve(
     background_handles.extend(health_check_handles);
 
     // Validate frontend TLS config if provided (paths, expiry, key match).
-    let tls_config = if let (Some(cert_path), Some(key_path)) = (
-        &env_config.frontend_tls_cert_path,
-        &env_config.frontend_tls_key_path,
-    ) {
-        info!("Loading TLS configuration with client certificate verification...");
-        let client_ca_bundle_path = env_config.frontend_tls_client_ca_bundle_path.as_deref();
-        match tls::load_tls_config_with_client_auth_and_ocsp(
-            cert_path,
-            key_path,
-            client_ca_bundle_path,
-            env_config.frontend_tls_ocsp_response_source.as_deref(),
-            false,
-            &tls_policy,
-            env_config.tls_cert_expiry_warning_days,
-            &crls,
-        ) {
-            Ok(mut config) => {
-                tls::enable_early_data(&mut config, &tls_policy);
-                if env_config.ktls_enabled.could_be_enabled() {
-                    tls::enable_secret_extraction_for_ktls(&mut config);
-                }
-                Some(config)
+    // Shared loader with `ferrum-edge validate` (issue #2976).
+    let tls_config = match startup_security::try_load_frontend_tls(&env_config, &tls_policy, &crls)
+    {
+        Ok(Some(mut config)) => {
+            info!("Loading TLS configuration with client certificate verification...");
+            tls::enable_early_data(&mut config, &tls_policy);
+            if env_config.ktls_enabled.could_be_enabled() {
+                tls::enable_secret_extraction_for_ktls(&mut config);
             }
-            Err(e) => {
-                let startup_err = anyhow::anyhow!("Invalid TLS configuration: {}", e);
-                error!("TLS configuration validation failed: {}", e);
-                shutdown_file_background_startup_tasks(
-                    &shutdown_tx,
-                    &proxy_state,
-                    background_handles,
-                )
-                .await;
-                return Err(startup_err);
-            }
+            Some(config)
         }
-    } else {
-        None
+        Ok(None) => None,
+        Err(e) => {
+            error!("TLS configuration validation failed: {:#}", e);
+            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
+                .await;
+            return Err(e);
+        }
     };
 
     // Wire opt-in frontend TLS live reload (see modes/database.rs for full
@@ -999,27 +981,11 @@ pub async fn serve(
     if let (Some(cert_path), Some(key_path)) =
         (&env_config.dtls_cert_path, &env_config.dtls_key_path)
     {
-        if let Err(e) = tls::check_cert_expiry(
-            cert_path,
-            "DTLS frontend cert",
-            env_config.tls_cert_expiry_warning_days,
-        ) {
-            let startup_err = e.context("Invalid DTLS frontend cert");
+        // Shared DTLS expiry gate with `ferrum-edge validate` (issue #2976).
+        if let Err(e) = startup_security::validate_dtls_material(&env_config) {
             shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
                 .await;
-            return Err(startup_err);
-        }
-        if let Some(ref ca_path) = env_config.dtls_client_ca_cert_path
-            && let Err(e) = tls::check_cert_expiry(
-                ca_path,
-                "DTLS client CA cert",
-                env_config.tls_cert_expiry_warning_days,
-            )
-        {
-            let startup_err = e.context("Invalid DTLS client CA cert");
-            shutdown_file_background_startup_tasks(&shutdown_tx, &proxy_state, background_handles)
-                .await;
-            return Err(startup_err);
+            return Err(e);
         }
         proxy_state
             .stream_listener_manager
@@ -1118,40 +1084,35 @@ pub async fn serve(
     // "`FERRUM_ADMIN_HTTPS_PORT != 0`". Documented in `ferrum.conf` and
     // `docs/configuration.md` alongside the sentinel.
     let admin_https_enabled = prebound.admin_https.is_some() || env_config.admin_https_port != 0;
+    // Shared with `ferrum-edge validate` (issue #2976). A pre-bound admin
+    // HTTPS socket with `FERRUM_ADMIN_HTTPS_PORT=0` still loads material when
+    // both paths are set — use the path-gated loader, not the port gate.
     let admin_tls_runtime = if admin_https_enabled
-        && let (Some(admin_cert), Some(admin_key)) = (
-            &env_config.admin_tls_cert_path,
-            &env_config.admin_tls_key_path,
-        ) {
-        let admin_tls_policy = TlsPolicy::from_env_config(&env_config)?;
-        let admin_client_ca = env_config.admin_tls_client_ca_bundle_path.as_deref();
-        let admin_tls_config = match tls::load_tls_config_with_client_auth_and_ocsp(
-            admin_cert,
-            admin_key,
-            admin_client_ca,
-            env_config.admin_tls_ocsp_response_source.as_deref(),
-            env_config.admin_tls_no_verify,
-            &admin_tls_policy,
-            env_config.tls_cert_expiry_warning_days,
+        && env_config.admin_tls_cert_path.is_some()
+        && env_config.admin_tls_key_path.is_some()
+    {
+        let admin_tls_config = match startup_security::load_admin_tls_material(
+            &env_config,
+            &tls_policy,
             &crls,
+            "Invalid admin TLS configuration",
         ) {
             Ok(config) => config,
             Err(e) => {
-                let startup_err = anyhow::anyhow!("Invalid admin TLS configuration: {}", e);
-                error!("Admin TLS configuration failed: {}", e);
+                error!("Admin TLS configuration failed: {:#}", e);
                 shutdown_file_background_startup_tasks(
                     &shutdown_tx,
                     &proxy_state,
                     background_handles,
                 )
                 .await;
-                return Err(startup_err);
+                return Err(e);
             }
         };
         let mut admin_reload_handles = crate::modes::tls_reload::prepare_admin_frontend_tls(
             admin_tls_config.clone(),
             &env_config,
-            &admin_tls_policy,
+            &tls_policy,
             &crls,
             Some(shutdown_tx.subscribe()),
         );

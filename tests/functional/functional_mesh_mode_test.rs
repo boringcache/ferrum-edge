@@ -39,6 +39,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
@@ -106,6 +107,7 @@ fn verify_mesh_grpc_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(), 
         .map(str::to_string)
         .collect();
     validation.set_issuer(&[DEFAULT_CP_DP_JWT_ISSUER]);
+    validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
     decode::<Value>(token, &key, &validation)
         .map(|_| ())
         .map_err(|err| Status::unauthenticated(format!("invalid authorization token: {err}")))
@@ -144,6 +146,18 @@ impl MeshConfigSync for StaticMeshControlPlane {
                 .map_err(|e| Status::internal(format!("serialize mesh slice: {e}")))?,
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: false,
+            // The stub echoes the slice's own revision onto the envelope, the
+            // same duplicate-stamp contract the real CP honours; a mismatch is
+            // a consumer-side rejection (issue #2473).
+            config_authority: slice
+                .revision
+                .as_ref()
+                .map(|revision| revision.authority.clone())
+                .unwrap_or_default(),
+            config_sequence: slice
+                .revision
+                .as_ref()
+                .map_or(0, |revision| revision.sequence),
         };
         let heartbeat = MeshConfigUpdate {
             version: self.slice.version.clone(),
@@ -151,6 +165,8 @@ impl MeshConfigSync for StaticMeshControlPlane {
             mesh_slice_json: String::new(),
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: true,
+            config_authority: String::new(),
+            config_sequence: 0,
         };
         let heartbeats = IntervalStream::new(tokio::time::interval(Duration::from_secs(60)))
             .map(move |_| Ok(heartbeat.clone()));

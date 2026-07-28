@@ -29,6 +29,7 @@ pub mod mesh;
 pub mod migrate;
 pub mod node_agent;
 pub mod node_agent_cni_server;
+pub mod startup_security;
 pub mod tls_reload;
 pub(crate) mod tls_source_util;
 
@@ -206,6 +207,7 @@ pub(crate) async fn handle_recovery_plugin_migrations(
 
 pub(crate) fn start_acme_renewal_scheduler(
     env_config: &EnvConfig,
+    dns_cache: crate::dns::DnsCache,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Option<JoinHandle<()>> {
     if !env_config.acme_auto_renew_enabled {
@@ -214,7 +216,7 @@ pub(crate) fn start_acme_renewal_scheduler(
 
     #[cfg(not(feature = "acme"))]
     {
-        let _ = shutdown_rx;
+        let _ = (dns_cache, shutdown_rx);
         warn!(
             "FERRUM_ACME_AUTO_RENEW_ENABLED=true but this binary was built without the 'acme' feature"
         );
@@ -241,6 +243,7 @@ pub(crate) fn start_acme_renewal_scheduler(
                 challenge_type,
                 dns01_hook_command: env_config.acme_dns01_hook_command.clone(),
                 dns01_propagation: Duration::from_secs(env_config.acme_dns01_propagation_seconds),
+                dns_cache,
             },
             shutdown_rx,
         )

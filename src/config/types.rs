@@ -6,15 +6,15 @@
 //! - **Stream proxy routing**: TCP/UDP proxies are matched by `listen_port`,
 //!   not `listen_path`, so path validation and router invalidation skip them.
 //! - **Validation deduplication**: TLS cert/key paths are validated via a
-//!   `validated_tls_paths` cache so each unique file is parsed only once.
+//!   `validated_tls_paths` cache so each unique source/role is parsed only once.
 //! - **Control character rejection**: Resource IDs, hostnames, and paths reject
 //!   control characters to prevent log injection attacks.
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 use std::time::SystemTime;
@@ -2521,6 +2521,21 @@ pub struct GatewayConfig {
     pub trust_bundles: Option<Box<crate::modes::mesh::config::TrustBundleSet>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<Box<crate::modes::mesh::config::MeshConfig>>,
+    /// Authoritative mesh config revision for this snapshot (issue #2473).
+    ///
+    /// DERIVED, CP-in-memory only: `#[serde(skip)]`, so it never rides the
+    /// ConfigSync `config_json` wire (which is `deny_unknown_fields` on both
+    /// peers) and cannot break a mixed-patch CP/DP rollout. The mesh CP stamps
+    /// it from the durable `config_changes` sequence on every accepted full
+    /// load and delta, and `MeshSlice::from_gateway_config` copies it onto the
+    /// slice, which IS the wire contract the mesh data plane orders by.
+    ///
+    /// `None` means "this snapshot came from an authority with no shared
+    /// monotonic sequence" (K8s CRD controller, file source, tests); slices
+    /// built from it carry no revision and the DP gate stays inert unless it
+    /// has already accepted a revisioned slice.
+    #[serde(skip)]
+    pub mesh_revision: Option<crate::modes::mesh::revision::MeshConfigRevision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2725,38 +2740,38 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
     escaping_backslashes % 2 == 0
 }
 
-/// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)
-/// slash escapes anywhere in a `listen_path` value.
+/// Why a configured `listen_path` is not already a canonical policy path, or
+/// `None` when it is usable as written.
 ///
-/// Must stay in lockstep with `normalize_encoded_slashes` in
-/// `src/router_cache.rs`: the runtime normalizes the same set of encodings
-/// on every inbound request path before route lookup, so admission has to
-/// reject the matching set to keep routing/auth lookups symmetric. If the
-/// runtime normalizer is ever taught to recognise additional encodings
-/// (triple-encoded slashes, encoded backslashes, etc.) this helper must be
-/// extended in the same change.
-fn contains_encoded_slash(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
-                return true;
-            }
-            if i + 4 < bytes.len()
-                && bytes[i + 1] == b'2'
-                && bytes[i + 2] == b'5'
-                && bytes[i + 3] == b'2'
-                && matches!(bytes[i + 4], b'F' | b'f')
-            {
-                return true;
-            }
-        }
-        i += 1;
+/// Route lookup runs on the canonical request path
+/// (`crate::policy_path::canonicalize_policy_path`), so a `listen_path` that
+/// is not itself canonical can never match: either the runtime would reject
+/// every request that spelled it that way (`/api%2Fadmin`, an encoded
+/// separator) or the runtime path would canonicalize to different bytes
+/// (`/%61dmin` -> `/admin`). Both are silently unreachable routes, which is
+/// exactly the routing/auth asymmetry the canonical representation exists to
+/// remove — so admission rejects them instead. Delegating to the runtime
+/// canonicalizer keeps admission and request handling on one model rather
+/// than two hand-maintained encoding tables.
+///
+/// The value is checked exactly as written, markers included, matching the
+/// previous encoded-slash admission. `~` and `=` are ordinary path characters
+/// to the canonicalizer, and a regex or exact literal carrying an escape the
+/// runtime would refuse is unreachable for the same reason.
+///
+/// A `~regex` value is a *pattern*, not a literal path, so only the escape
+/// half of the contract applies to it: `\` and `.` are regex syntax there
+/// (`~^/v1\.0/.*` matches the reachable canonical path `/v1.0/x`), while the
+/// canonical request path the pattern is evaluated against already cannot
+/// contain a backslash or a dot segment. Exact (`=/…`) and prefix values are
+/// compared byte-for-byte against that canonical path, so they are held to the
+/// full contract.
+fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
+    if path.starts_with('~') {
+        crate::policy_path::non_canonical_policy_path_pattern_reason(path)
+    } else {
+        crate::policy_path::non_canonical_policy_path_reason(path)
     }
-
-    false
 }
 
 /// Whether a proxy's retry policy can actually trigger for at least one request
@@ -3082,72 +3097,81 @@ pub(crate) fn mesh_transport_retry_conflict_message(
     )
 }
 
-/// Whether a plugin config is known to force request-body buffering for at
-/// least some requests when enabled.
+/// Outcome of screening one enabled plugin config for backend-TLS SNI
+/// request-body-buffering admission.
 ///
-/// Used by backend-TLS SNI admission: plain HTTPS SNI overrides require the
-/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
-/// Config-dependent plugins are screened from their JSON config; unknown /
-/// custom plugins are left to the runtime fail-closed 502 path.
-fn plugin_config_forces_request_body_buffering(pc: &PluginConfig) -> bool {
+/// `shadows_same_named_global` mirrors `PluginCache` merge rules: a disabled
+/// config never shadows; a successfully constructed local (or a
+/// custom/unknown/`Ok(None)` name) does; a built-in whose configuration fails
+/// to construct does not — the cache's `Err` arm leaves the global in place.
+struct SniBufferingScreenEffect {
+    forces_buffering: bool,
+    shadows_same_named_global: bool,
+}
+
+/// Screen one plugin config for SNI buffering admission.
+///
+/// The buffering answer comes from the authoritative
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] implementation
+/// on an instance built from the SAME parsed configuration the runtime
+/// `PluginCache` builds — there is no second, config-shaped re-implementation
+/// of the predicate to drift out of sync. See
+/// [`crate::plugins::RequestBodyBufferingScreener`] for the side-effect
+/// guarantees of that construction.
+///
+/// A plugin the screen cannot evaluate (custom / unknown plugin, or a
+/// configuration that does not construct) is admitted with a value-redacted
+/// warning, preserving the documented residual: those requests still fail
+/// closed at runtime with a `502` and
+/// `gateway-error-reason: backend_tls_sni_requires_direct_h2`.
+fn screen_plugin_config_for_sni_buffering(
+    proxy_id: &str,
+    pc: &PluginConfig,
+    screener: &OnceCell<crate::plugins::RequestBodyBufferingScreener>,
+) -> SniBufferingScreenEffect {
     if !pc.enabled {
-        return false;
+        return SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: false,
+        };
     }
-    match pc.plugin_name.as_str() {
-        "grpc_web"
-        | "ai_prompt_compressor"
-        | "ai_stream_router"
-        | "ai_federation"
-        | "ai_transcript_audit"
-        | "ai_tool_governor"
-        | "ai_rate_limiter"
-        | "openapi_validator"
-        | "opa"
-        | "mcp_gateway" => true,
-        "request_transformer" => {
-            pc.config
-                .get("body")
-                .is_some_and(|body| !body.is_null() && body != &serde_json::Value::Null)
-                || pc
-                    .config
-                    .get("body_rules")
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|rules| !rules.is_empty())
-                || pc
-                    .config
-                    .get("request")
-                    .and_then(|v| v.get("body"))
-                    .is_some_and(|body| !body.is_null())
+    // Built on first use: a proxy whose effective plugin configs are all
+    // disabled (or absent) never constructs the screener's HTTP client.
+    let screener = screener.get_or_init(crate::plugins::RequestBodyBufferingScreener::new);
+    match screener.screen(&pc.plugin_name, &pc.config) {
+        crate::plugins::RequestBodyBufferingScreen::Buffers => SniBufferingScreenEffect {
+            forces_buffering: true,
+            shadows_same_named_global: true,
+        },
+        crate::plugins::RequestBodyBufferingScreen::Streams => SniBufferingScreenEffect {
+            forces_buffering: false,
+            shadows_same_named_global: true,
+        },
+        crate::plugins::RequestBodyBufferingScreen::Indeterminate(gap) => {
+            tracing::warn!(
+                proxy_id = %proxy_id,
+                plugin_config_id = %pc.id,
+                plugin_name = %pc.plugin_name,
+                reason = gap.as_str(),
+                "Backend TLS SNI admission could not evaluate request-body buffering for this \
+                 plugin; admitting the proxy. Direct HTTP/2 SNI dispatch still fails closed at \
+                 runtime (502, gateway-error-reason: backend_tls_sni_requires_direct_h2) if the \
+                 plugin buffers request bodies"
+            );
+            // `NotBuiltin` covers custom/unknown names and retired aliases
+            // (`Ok(None)`): PluginCache still removes the same-named global in
+            // those arms. Prefer shadowing (and the documented admit residual)
+            // over a false SNI rejection. `ConstructionFailed` mirrors the
+            // cache's `Err` arm and must not shadow.
+            let shadows_same_named_global = matches!(
+                gap,
+                crate::plugins::RequestBodyBufferingScreenGap::NotBuiltin
+            );
+            SniBufferingScreenEffect {
+                forces_buffering: false,
+                shadows_same_named_global,
+            }
         }
-        "compression" => pc
-            .config
-            .get("decompress_request")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "waf" => pc
-            .config
-            .get("request_body_inspection")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "body_validator" => {
-            // Any non-empty request schema / validation config forces buffering.
-            pc.config.get("request").is_some()
-                || pc.config.get("json_schema").is_some()
-                || pc.config.get("xml_schema").is_some()
-                || pc
-                    .config
-                    .get("content_types")
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|m| !m.is_empty())
-        }
-        "ai_request_guard" | "ai_prompt_shield" => {
-            // These buffer when body transforms are configured; treat any
-            // non-empty config beyond enable flags as potentially buffering.
-            pc.config
-                .as_object()
-                .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
-        }
-        _ => false,
     }
 }
 
@@ -3193,6 +3217,14 @@ fn proxy_plain_https_sni_sources<'a>(
 /// on the direct-H2 pool (retry body replay, request-body buffering plugins,
 /// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
 /// per-port TLS overlays so `validate` catches guaranteed total outages.
+///
+/// The buffering leg is derived from the runtime
+/// [`crate::plugins::Plugin::requires_request_body_buffering`] answer of a
+/// plugin built from the same parsed config (see
+/// [`screen_plugin_config_for_sni_buffering`]), so it tracks every
+/// conditional buffering plugin exactly and needs no per-plugin maintenance.
+/// Plugin construction happens only for proxies that actually carry a plain
+/// HTTPS SNI override, and only for that proxy's effective plugin configs.
 pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
     proxy: &Proxy,
     upstream: Option<&Upstream>,
@@ -3229,33 +3261,53 @@ pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
         ));
     }
 
-    // Effective plugins for this proxy: associations + globals (unless a
-    // local instance shadows that plugin name — mirror PluginCache merging
-    // for the buffering screen only).
+    // Effective plugins for this proxy: associations + globals in the proxy's
+    // namespace (unless a local instance shadows that plugin name — mirror
+    // PluginCache tenancy and merge rules for the buffering screen only).
+    // Associations resolve by `(namespace, id)` so reused plugin ids in other
+    // tenants cannot false-reject this proxy.
+    //
+    // The screener owns an HTTP client, so build it lazily: proxies without an
+    // effective plugin config never pay for one, and non-SNI proxies already
+    // returned above.
+    let screener: OnceCell<crate::plugins::RequestBodyBufferingScreener> = OnceCell::new();
     let mut local_names: HashSet<&str> = HashSet::new();
     for assoc in &proxy.plugins {
-        if let Some(pc) = plugin_configs
+        let Some(pc) = plugin_configs
             .iter()
-            .find(|pc| pc.id == assoc.plugin_config_id)
-        {
+            .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
+        else {
+            continue;
+        };
+        match pc.scope {
+            PluginScope::Global => continue,
+            PluginScope::Proxy if pc.proxy_id.as_deref() != Some(proxy.id.as_str()) => continue,
+            PluginScope::Proxy | PluginScope::ProxyGroup => {}
+        }
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        // Mirror PluginCache: only locals that would enter (or deliberately
+        // clear) the merge list shadow a same-named global. Disabled
+        // configs and construction failures do not.
+        if effect.shadows_same_named_global {
             local_names.insert(pc.plugin_name.as_str());
-            if plugin_config_forces_request_body_buffering(pc) {
-                errors.push(format!(
-                    "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
-                     request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
-                    proxy.id, pc.id
-                ));
-            }
+        }
+        if effect.forces_buffering {
+            errors.push(format!(
+                "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
+                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
+                proxy.id, pc.id
+            ));
         }
     }
     for pc in plugin_configs {
-        if pc.scope != PluginScope::Global {
+        if pc.scope != PluginScope::Global || pc.namespace != proxy.namespace {
             continue;
         }
         if local_names.contains(pc.plugin_name.as_str()) {
             continue;
         }
-        if plugin_config_forces_request_body_buffering(pc) {
+        let effect = screen_plugin_config_for_sni_buffering(&proxy.id, pc, &screener);
+        if effect.forces_buffering {
             errors.push(format!(
                 "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
                  request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
@@ -3324,44 +3376,21 @@ impl GatewayConfig {
         // `_`, so `__mesh-*` ids exist only via mesh materialization. Different
         // services' routes still conflict normally. Empty (and zero-cost)
         // outside mesh mode.
-        let mesh_sibling_owner: HashMap<String, (u8, usize)> = self
-            .mesh
-            .as_deref()
-            .map(|mesh| {
-                crate::modes::mesh::mesh_outbound_service_groups(mesh)
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(service_index, group)| {
-                        group
-                            .siblings
-                            .into_iter()
-                            .map(move |(_, id)| (id, (0u8, service_index)))
-                    })
-                    .chain(
-                        crate::modes::mesh::mesh_inbound_service_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (1u8, service_index)))
-                            }),
-                    )
-                    .chain(
-                        crate::modes::mesh::mesh_ingress_listener_groups(mesh)
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(service_index, group)| {
-                                group
-                                    .siblings
-                                    .into_iter()
-                                    .map(move |(_, id)| (id, (2u8, service_index)))
-                            }),
-                    )
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut mesh_sibling_owner: HashMap<String, HashMap<String, (u8, usize)>> = HashMap::new();
+        if let Some(mesh) = self.mesh.as_deref() {
+            let mut add_groups =
+                |direction, groups: Vec<crate::modes::mesh::MeshOutboundServiceGroup>| {
+                    for (service_index, group) in groups.into_iter().enumerate() {
+                        let by_id = mesh_sibling_owner.entry(group.namespace).or_default();
+                        for (_, id) in group.siblings {
+                            by_id.insert(id, (direction, service_index));
+                        }
+                    }
+                };
+            add_groups(0, crate::modes::mesh::mesh_outbound_service_groups(mesh));
+            add_groups(1, crate::modes::mesh::mesh_inbound_service_groups(mesh));
+            add_groups(2, crate::modes::mesh::mesh_ingress_listener_groups(mesh));
+        }
 
         for ((_, path), group) in &by_path {
             if group.len() < 2 {
@@ -3370,8 +3399,12 @@ impl GatewayConfig {
             for (i, proxy_a) in group.iter().enumerate() {
                 for proxy_b in group.iter().skip(i + 1) {
                     if let (Some(owner_a), Some(owner_b)) = (
-                        mesh_sibling_owner.get(proxy_a.id.as_str()),
-                        mesh_sibling_owner.get(proxy_b.id.as_str()),
+                        mesh_sibling_owner
+                            .get(proxy_a.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_a.id.as_str())),
+                        mesh_sibling_owner
+                            .get(proxy_b.namespace.as_str())
+                            .and_then(|by_id| by_id.get(proxy_b.id.as_str())),
                     ) && owner_a == owner_b
                     {
                         continue;
@@ -3428,10 +3461,13 @@ impl GatewayConfig {
     /// would install for each proxy. Any local proxy/proxy-group instance
     /// shadows all global instances of the same plugin type on that proxy.
     fn effective_mtls_auth_plugins_by_proxy(&self) -> Vec<(&Proxy, Vec<&PluginConfig>)> {
-        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+        // Association plugin_config_id values are namespace-local to the
+        // proxy. A bare-id index would bind a proxy to another tenant's
+        // same-id mtls_auth config.
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
             .plugin_configs
             .iter()
-            .map(|plugin| (plugin.id.as_str(), plugin))
+            .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
             .collect();
         let global_mtls: Vec<&PluginConfig> = self
             .plugin_configs
@@ -3450,12 +3486,18 @@ impl GatewayConfig {
                     .plugins
                     .iter()
                     .filter_map(|association| {
-                        let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                        let plugin = *plugin_by_key.get(&(
+                            proxy.namespace.as_str(),
+                            association.plugin_config_id.as_str(),
+                        ))?;
                         let scope_applies = match plugin.scope {
                             PluginScope::Proxy => {
-                                plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                                plugin.namespace == proxy.namespace
+                                    && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
                             }
-                            PluginScope::ProxyGroup => plugin.proxy_id.is_none(),
+                            PluginScope::ProxyGroup => {
+                                plugin.namespace == proxy.namespace && plugin.proxy_id.is_none()
+                            }
                             PluginScope::Global => false,
                         };
                         (plugin.enabled && plugin.plugin_name == "mtls_auth" && scope_applies)
@@ -3463,6 +3505,10 @@ impl GatewayConfig {
                     })
                     .collect();
                 let effective = if local_mtls.is_empty() {
+                    // Globals are gateway-wide at runtime (`PluginCache` merges
+                    // the single global list into every proxy in every
+                    // namespace), so this must NOT be namespace-filtered —
+                    // only the association lookup above is namespace-local.
                     global_mtls.clone()
                 } else {
                     local_mtls
@@ -3493,17 +3539,6 @@ impl GatewayConfig {
                 if !proxy.frontend_tls || proxy.passthrough {
                     errors.push(format!(
                         "Proxy '{}' cannot use mtls_auth PluginConfig '{}': stream mTLS authentication requires frontend_tls=true with TLS/DTLS termination (passthrough=false)",
-                        proxy.id, plugin.id
-                    ));
-                }
-                if scheme.is_udp()
-                    && plugin
-                        .config
-                        .get("allowed_ca_fingerprints_sha256")
-                        .is_some()
-                {
-                    errors.push(format!(
-                        "Proxy '{}' cannot use allowed_ca_fingerprints_sha256 from mtls_auth PluginConfig '{}': UDP/DTLS does not expose the verified certificate chain; use allowed_issuers with a pinned ca_certificate_pem",
                         proxy.id, plugin.id
                     ));
                 }
@@ -3573,8 +3608,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Reject any proxy whose `listen_path` contains a percent-encoded slash
-    /// (`%2F`/`%2f` or `%252F`/`%252f`).
+    /// Reject any proxy whose `listen_path` is not already a canonical policy
+    /// path (`crate::policy_path`).
     ///
     /// Runs as a dedicated rejecting validator on every load/reload path
     /// because the catch-all `validate_all_fields_with_ip_policy()` is wired
@@ -3584,8 +3619,8 @@ impl GatewayConfig {
     /// returned by a Mongo backend would still be served and silently
     /// unreachable — the routing/auth bypass the admission rejection in
     /// `Proxy::validate_fields()` is meant to eliminate. Paired with
-    /// `contains_encoded_slash()` in this module and
-    /// `normalize_encoded_slashes()` in `src/router_cache.rs`.
+    /// `non_canonical_listen_path_reason()` in this module and
+    /// `canonicalize_policy_path()` in `src/policy_path.rs`.
     pub fn validate_listen_path_encodings(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
@@ -3595,10 +3630,10 @@ impl GatewayConfig {
             let Some(path) = proxy.listen_path.as_deref() else {
                 continue;
             };
-            if contains_encoded_slash(path) {
+            if let Some(reason) = non_canonical_listen_path_reason(path) {
                 errors.push(format!(
-                    "Proxy '{}': listen_path '{}' contains encoded slashes (%2F or %252F); request paths are normalized before route lookup, so an encoded-slash listen_path is unreachable and creates a routing/auth bypass",
-                    proxy.id, path
+                    "Proxy '{}': listen_path '{}' is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
+                    proxy.id, path, reason
                 ));
             }
         }
@@ -3679,41 +3714,51 @@ impl GatewayConfig {
     /// the upstream-level TLS — same behaviour as a proxy with no
     /// `upstream_subset` at all.
     pub fn resolve_upstream_tls(&mut self) {
-        // Build a map of upstream_id → TLS config for O(1) lookups.
-        let upstream_tls: HashMap<&str, BackendTlsConfig> = self
+        // Build a map of (namespace, upstream_id) → TLS config for O(1)
+        // lookups. Bare-id maps would last-win across tenants that share an
+        // upstream id and project the wrong TLS onto every referencing proxy.
+        let upstream_tls: HashMap<(&str, &str), BackendTlsConfig> = self
             .upstreams
             .iter()
-            .map(|u| (u.id.as_str(), BackendTlsConfig::from_upstream(u)))
+            .map(|u| {
+                (
+                    (u.namespace.as_str(), u.id.as_str()),
+                    BackendTlsConfig::from_upstream(u),
+                )
+            })
             .collect();
 
-        // Parallel map of (upstream_id, subset_name) → subset-resolved TLS,
-        // populated only for subsets that produced a non-empty TLS overlay at
-        // mesh apply time. Empty in the non-mesh / no-per-subset-TLS common
-        // case, so the per-proxy projection below pays at most one HashMap
-        // miss when `upstream_subset` is set.
-        let subset_tls: HashMap<(&str, &str), &BackendTlsConfig> = self
+        // Parallel map of (namespace, upstream_id, subset_name) → subset-
+        // resolved TLS, populated only for subsets that produced a non-empty
+        // TLS overlay at mesh apply time. Empty in the non-mesh /
+        // no-per-subset-TLS common case, so the per-proxy projection below
+        // pays at most one HashMap miss when `upstream_subset` is set.
+        let subset_tls: HashMap<(&str, &str, &str), &BackendTlsConfig> = self
             .upstreams
             .iter()
             .flat_map(|u| {
                 u.resolved_subset_tls
                     .iter()
                     .filter_map(move |(subset_name, resolved)| {
-                        resolved
-                            .tls
-                            .as_ref()
-                            .map(|tls| ((u.id.as_str(), subset_name.as_str()), tls))
+                        resolved.tls.as_ref().map(|tls| {
+                            (
+                                (u.namespace.as_str(), u.id.as_str(), subset_name.as_str()),
+                                tls,
+                            )
+                        })
                     })
             })
             .collect();
 
         for proxy in &mut self.proxies {
             proxy.resolved_tls = if let Some(ref uid) = proxy.upstream_id {
+                let ns = proxy.namespace.as_str();
                 let subset_override = proxy
                     .upstream_subset
                     .as_deref()
-                    .and_then(|name| subset_tls.get(&(uid.as_str(), name)).copied().cloned());
+                    .and_then(|name| subset_tls.get(&(ns, uid.as_str(), name)).copied().cloned());
                 subset_override
-                    .or_else(|| upstream_tls.get(uid.as_str()).cloned())
+                    .or_else(|| upstream_tls.get(&(ns, uid.as_str())).cloned())
                     .unwrap_or_else(BackendTlsConfig::default_verify)
             } else {
                 BackendTlsConfig::from_proxy(proxy)
@@ -3732,7 +3777,7 @@ impl GatewayConfig {
     /// Same pattern as `resolve_upstream_tls` — derived projection cached on
     /// the proxy so the request path never re-derives it.
     pub fn resolve_dispatch_port_overrides(&mut self) {
-        let by_upstream: HashMap<&str, HashMap<u16, ResolvedPortOverride>> = self
+        let by_upstream: HashMap<(&str, &str), HashMap<u16, ResolvedPortOverride>> = self
             .upstreams
             .iter()
             .filter(|u| !u.port_overrides.is_empty())
@@ -3745,29 +3790,33 @@ impl GatewayConfig {
                             .map(|resolved| (*port, resolved))
                     })
                     .collect();
-                (u.id.as_str(), ports)
+                ((u.namespace.as_str(), u.id.as_str()), ports)
             })
             .filter(|(_, m)| !m.is_empty())
             .collect();
 
         // Service-discovery top-level `connectionPool.http` fallback, applied by
         // the LB-selected port at dispatch when that port has no explicit
-        // per-port override. Keyed by upstream id, separate from the per-port
-        // map above so an explicit `portLevelSettings` entry still wins.
-        let fallback_by_upstream: HashMap<&str, ResolvedPortOverride> = self
+        // per-port override. Keyed by (namespace, upstream id), separate from
+        // the per-port map above so an explicit `portLevelSettings` entry
+        // still wins.
+        let fallback_by_upstream: HashMap<(&str, &str), ResolvedPortOverride> = self
             .upstreams
             .iter()
             .filter_map(|u| {
                 dispatch_port_override_fallback_from_upstream(u)
-                    .map(|resolved| (u.id.as_str(), resolved))
+                    .map(|resolved| ((u.namespace.as_str(), u.id.as_str()), resolved))
             })
             .collect();
 
         for proxy in &mut self.proxies {
-            let uid = proxy.upstream_id.as_deref();
-            proxy.dispatch_port_overrides = uid.and_then(|uid| by_upstream.get(uid)).cloned();
+            let key = proxy
+                .upstream_id
+                .as_deref()
+                .map(|uid| (proxy.namespace.as_str(), uid));
+            proxy.dispatch_port_overrides = key.and_then(|key| by_upstream.get(&key)).cloned();
             proxy.dispatch_port_override_fallback =
-                uid.and_then(|uid| fallback_by_upstream.get(uid)).cloned();
+                key.and_then(|key| fallback_by_upstream.get(&key)).cloned();
         }
     }
 
@@ -4255,13 +4304,20 @@ impl GatewayConfig {
     /// request-body-buffering plugins, `pool_enable_http2: false`), including
     /// DestinationRule per-port TLS overlays (issue #2954).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
-        let upstreams_by_id: HashMap<&str, &Upstream> =
-            self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
+        // Upstream references are namespace-local. A bare-id index would accept
+        // a dangling same-namespace reference whenever another tenant owns
+        // that id, and would run mesh-transport / subset checks against the
+        // wrong upstream.
+        let upstreams_by_key: HashMap<(&str, &str), &Upstream> = self
+            .upstreams
+            .iter()
+            .map(|u| ((u.namespace.as_str(), u.id.as_str()), u))
+            .collect();
         let mut errors = Vec::new();
 
         for proxy in &self.proxies {
             if let Some(ref uid) = proxy.upstream_id {
-                match upstreams_by_id.get(uid.as_str()) {
+                match upstreams_by_key.get(&(proxy.namespace.as_str(), uid.as_str())) {
                     Some(upstream) => {
                         if let Some(subset_name) = proxy.upstream_subset.as_deref() {
                             let subset_exists = upstream.subsets.as_ref().is_some_and(|subsets| {
@@ -4305,7 +4361,8 @@ impl GatewayConfig {
             // EFFECTIVE retry (the rule can add/replace/disable retry, which the
             // runtime applies via `route_override_retry` before dispatch).
             for override_dest in self.mesh_route_dispatch_override_destinations(proxy) {
-                if let Some(upstream) = upstreams_by_id.get(override_dest.upstream_id.as_str())
+                if let Some(upstream) = upstreams_by_key
+                    .get(&(proxy.namespace.as_str(), override_dest.upstream_id.as_str()))
                     && let Some(required) = first_effective_mesh_transport_conflict_with_mesh(
                         // The runtime recomputes `dispatch_port_overrides` from the
                         // OVERRIDE destination upstream when a rule swaps the
@@ -4332,10 +4389,11 @@ impl GatewayConfig {
             // combinations that cannot dispatch (retry / body-buffering /
             // pool_enable_http2=false), including DestinationRule per-port
             // TLS overlays projected onto this proxy.
-            let upstream = proxy
-                .upstream_id
-                .as_deref()
-                .and_then(|uid| upstreams_by_id.get(uid).copied());
+            let upstream = proxy.upstream_id.as_deref().and_then(|uid| {
+                upstreams_by_key
+                    .get(&(proxy.namespace.as_str(), uid))
+                    .copied()
+            });
             errors.extend(backend_tls_sni_direct_h2_conflict_messages(
                 proxy,
                 upstream,
@@ -4471,7 +4529,7 @@ impl GatewayConfig {
             if let Some(plugin) = self
                 .plugin_configs
                 .iter()
-                .find(|pc| pc.id == assoc.plugin_config_id)
+                .find(|pc| pc.namespace == proxy.namespace && pc.id == assoc.plugin_config_id)
             {
                 if plugin.enabled && plugin.plugin_name == "mesh_route_dispatch" {
                     shadows_global_dispatch = true;
@@ -4481,6 +4539,11 @@ impl GatewayConfig {
         }
         if !shadows_global_dispatch {
             for plugin in &self.plugin_configs {
+                // Deliberately NOT namespace-filtered: the association lookup
+                // above is namespace-local, but globals run on every proxy in
+                // every namespace at runtime. Skipping other tenants' globals
+                // here would hide their override destinations from
+                // `validate_upstream_references`' mesh-transport screen.
                 if plugin.scope == PluginScope::Global {
                     collect(plugin);
                 }
@@ -4491,11 +4554,19 @@ impl GatewayConfig {
 
     /// Validate plugin resource invariants and proxy/plugin associations.
     pub fn validate_plugin_references(&self) -> Result<(), Vec<String>> {
-        let proxy_ids: HashSet<&str> = self.proxies.iter().map(|p| p.id.as_str()).collect();
-        let plugin_by_id: HashMap<&str, &PluginConfig> = self
+        // Proxy and plugin identities are namespace-local. Bare-id indexes
+        // would accept a dangling same-namespace proxy_id whenever another
+        // tenant owns that id, and would resolve associations onto the wrong
+        // tenant's PluginConfig.
+        let proxy_keys: HashSet<(&str, &str)> = self
+            .proxies
+            .iter()
+            .map(|p| (p.namespace.as_str(), p.id.as_str()))
+            .collect();
+        let plugin_by_key: HashMap<(&str, &str), &PluginConfig> = self
             .plugin_configs
             .iter()
-            .map(|pc| (pc.id.as_str(), pc))
+            .map(|pc| ((pc.namespace.as_str(), pc.id.as_str()), pc))
             .collect();
         let mut errors = Vec::new();
 
@@ -4549,7 +4620,7 @@ impl GatewayConfig {
                 }
                 PluginScope::Proxy => match plugin.proxy_id.as_deref() {
                     Some(proxy_id) => {
-                        if !proxy_ids.contains(proxy_id) {
+                        if !proxy_keys.contains(&(plugin.namespace.as_str(), proxy_id)) {
                             errors.push(format!(
                                 "PluginConfig '{}' references non-existent proxy_id '{}'",
                                 plugin.id, proxy_id
@@ -4582,7 +4653,9 @@ impl GatewayConfig {
                     ));
                 }
 
-                match plugin_by_id.get(assoc.plugin_config_id.as_str()) {
+                match plugin_by_key
+                    .get(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                {
                     Some(plugin) => match plugin.scope {
                         PluginScope::Global => {
                             errors.push(format!(
@@ -4622,10 +4695,12 @@ impl GatewayConfig {
         }
     }
 
-    /// Validate that all resource IDs are well-formed.
+    /// Validate that all resource IDs and namespaces are well-formed.
     ///
-    /// Checks every proxy, consumer, plugin_config, and upstream ID against
-    /// the `validate_resource_id` format rules.
+    /// Composite runtime keys use a delimiter that is excluded by the shared
+    /// ID/namespace grammar. Validate both halves at the config boundary so a
+    /// corrupt database row or untrusted file cannot make two tenant
+    /// identities collide after encoding.
     pub fn validate_resource_ids(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
@@ -4633,20 +4708,32 @@ impl GatewayConfig {
             if let Err(msg) = validate_resource_id(&proxy.id) {
                 errors.push(format!("Proxy ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&proxy.namespace) {
+                errors.push(format!("Proxy '{}': {}", proxy.id, msg));
+            }
         }
         for consumer in &self.consumers {
             if let Err(msg) = validate_resource_id(&consumer.id) {
                 errors.push(format!("Consumer ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&consumer.namespace) {
+                errors.push(format!("Consumer '{}': {}", consumer.id, msg));
             }
         }
         for pc in &self.plugin_configs {
             if let Err(msg) = validate_resource_id(&pc.id) {
                 errors.push(format!("PluginConfig ID: {}", msg));
             }
+            if let Err(msg) = validate_namespace(&pc.namespace) {
+                errors.push(format!("PluginConfig '{}': {}", pc.id, msg));
+            }
         }
         for upstream in &self.upstreams {
             if let Err(msg) = validate_resource_id(&upstream.id) {
                 errors.push(format!("Upstream ID: {}", msg));
+            }
+            if let Err(msg) = validate_namespace(&upstream.namespace) {
+                errors.push(format!("Upstream '{}': {}", upstream.id, msg));
             }
         }
 
@@ -4659,16 +4746,21 @@ impl GatewayConfig {
 
     /// Validate that all resource IDs are unique within their type.
     ///
-    /// In database mode the DB PRIMARY KEY constraint enforces this.
-    /// In file mode there's no DB, so this catches duplicate IDs at
-    /// config load time.
+    /// In database mode the DB PRIMARY KEY / UNIQUE `(namespace, id)`
+    /// constraint enforces this. In file mode there's no DB, so this catches
+    /// duplicate IDs at config load time. Proxies, consumers, plugin configs,
+    /// and upstreams are all unique within a namespace — the same id may exist
+    /// in two tenants.
     pub fn validate_unique_resource_ids(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        let mut seen_proxy_ids: HashSet<&str> = HashSet::new();
+        let mut seen_proxy_ids: HashSet<(&str, &str)> = HashSet::new();
         for proxy in &self.proxies {
-            if !seen_proxy_ids.insert(&proxy.id) {
-                errors.push(format!("Duplicate proxy ID '{}'", proxy.id));
+            if !seen_proxy_ids.insert((&proxy.namespace, &proxy.id)) {
+                errors.push(format!(
+                    "Duplicate proxy ID '{}' in namespace '{}'",
+                    proxy.id, proxy.namespace
+                ));
             }
         }
 
@@ -4682,17 +4774,23 @@ impl GatewayConfig {
             }
         }
 
-        let mut seen_plugin_ids: HashSet<&str> = HashSet::new();
+        let mut seen_plugin_ids: HashSet<(&str, &str)> = HashSet::new();
         for pc in &self.plugin_configs {
-            if !seen_plugin_ids.insert(&pc.id) {
-                errors.push(format!("Duplicate plugin_config ID '{}'", pc.id));
+            if !seen_plugin_ids.insert((&pc.namespace, &pc.id)) {
+                errors.push(format!(
+                    "Duplicate plugin_config ID '{}' in namespace '{}'",
+                    pc.id, pc.namespace
+                ));
             }
         }
 
-        let mut seen_upstream_ids: HashSet<&str> = HashSet::new();
+        let mut seen_upstream_ids: HashSet<(&str, &str)> = HashSet::new();
         for upstream in &self.upstreams {
-            if !seen_upstream_ids.insert(&upstream.id) {
-                errors.push(format!("Duplicate upstream ID '{}'", upstream.id));
+            if !seen_upstream_ids.insert((&upstream.namespace, &upstream.id)) {
+                errors.push(format!(
+                    "Duplicate upstream ID '{}' in namespace '{}'",
+                    upstream.id, upstream.namespace
+                ));
             }
         }
 
@@ -4713,8 +4811,11 @@ impl GatewayConfig {
     ///   and at most one may have empty `hosts` (catch-all/default).
     pub fn validate_stream_proxies(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
-        // Map port -> list of proxy IDs that use it
-        let mut port_proxies: HashMap<u16, Vec<&str>> = HashMap::new();
+        // Retain the exact proxy entries for each shared port. Proxy IDs are
+        // unique only within a namespace, so resolving these entries later by
+        // bare ID can select the wrong tenant and let an invalid mixed
+        // passthrough/PROXY-protocol/host configuration pass validation.
+        let mut port_proxies: HashMap<u16, Vec<&Proxy>> = HashMap::new();
 
         for proxy in &self.proxies {
             if proxy.dispatch_kind.is_stream() {
@@ -4733,7 +4834,7 @@ impl GatewayConfig {
                         ));
                     }
                     Some(port) => {
-                        port_proxies.entry(port).or_default().push(&proxy.id);
+                        port_proxies.entry(port).or_default().push(proxy);
                     }
                 }
             } else if proxy.listen_port.is_some() {
@@ -4763,17 +4864,12 @@ impl GatewayConfig {
         }
 
         // Validate port sharing rules
-        for (port, proxy_ids) in &port_proxies {
-            if proxy_ids.len() <= 1 {
+        for (port, proxies_on_port) in &port_proxies {
+            if proxies_on_port.len() <= 1 {
                 continue; // No conflict for single-proxy ports
             }
 
             // All proxies sharing a port must have passthrough: true
-            let proxies_on_port: Vec<&Proxy> = proxy_ids
-                .iter()
-                .filter_map(|id| self.proxies.iter().find(|p| p.id == *id))
-                .collect();
-
             let all_passthrough = proxies_on_port.iter().all(|p| p.passthrough);
             if !all_passthrough {
                 let non_pt: Vec<&str> = proxies_on_port
@@ -5102,7 +5198,8 @@ fn validate_tls_material_source_field(
     }
 }
 
-/// Validate that a PEM certificate file exists, is readable, and contains at least one valid certificate.
+/// Validate that a PEM certificate source is readable and every declared
+/// certificate record parses successfully.
 pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String> {
     let source =
         crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::Cert);
@@ -5121,15 +5218,42 @@ pub fn validate_pem_cert_file(field_name: &str, path: &str) -> Result<(), String
             ));
         }
     };
-    let certs: Vec<_> = rustls_pemfile::certs(&mut Cursor::new(material.bytes.expose_secret()))
-        .filter_map(|r| r.ok())
-        .collect();
-    if certs.is_empty() {
-        return Err(format!(
-            "{}: no valid PEM certificates found in '{}'",
-            field_name, material.display_source_id
-        ));
-    }
+    crate::tls::parse_pem_certificate_bundle(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Validate that a PEM CA source is readable and every declared certificate is
+/// admissible as a trust anchor. Syntax-only success is insufficient for a
+/// selected exclusive custom store.
+pub fn validate_pem_ca_file(field_name: &str, path: &str) -> Result<(), String> {
+    let source =
+        crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::CaBundle);
+    let material = match crate::tls::source::load_material_blocking(
+        &source,
+        crate::tls::source::MaterialKind::CaBundle,
+    ) {
+        Ok(material) => material,
+        Err(crate::tls::source::MaterialError::UnsupportedScheme { .. }) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "{}: failed to load CA source '{}': {}",
+                field_name,
+                source.redacted_source_id(),
+                e
+            ));
+        }
+    };
+    crate::tls::root_cert_store_from_pem_bundle(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -5159,20 +5283,17 @@ pub fn validate_pem_key_file(field_name: &str, path: &str) -> Result<(), String>
             ));
         }
     };
-    let key = rustls_pemfile::private_key(&mut Cursor::new(material.bytes.expose_secret()))
-        .map_err(|e| {
-            format!(
-                "{}: failed to parse private key from '{}': {}",
-                field_name, material.display_source_id, e
-            )
-        })?;
-    if key.is_none() {
-        return Err(format!(
-            "{}: no valid private keys found in '{}'",
-            field_name, material.display_source_id
-        ));
-    }
+    crate::tls::parse_pem_private_key(
+        material.bytes.expose_secret(),
+        field_name,
+        &material.display_source_id,
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn tls_validation_cache_key(kind: crate::tls::source::MaterialKind, path: &str) -> String {
+    format!("{}:{path}", kind.as_str())
 }
 
 #[cfg(feature = "pkcs11")]
@@ -6702,11 +6823,12 @@ impl Proxy {
                                 .to_string(),
                         );
                     }
-                    if contains_encoded_slash(path) {
-                        errors.push(
-                            "listen_path must not contain encoded slashes (%2F or %252F)"
-                                .to_string(),
-                        );
+                    if let Some(reason) = non_canonical_listen_path_reason(path) {
+                        errors.push(format!(
+                            "listen_path must already be a canonical policy path ({reason}); \
+                             request paths are canonicalized before route lookup, so a \
+                             non-canonical listen_path is unreachable and creates a routing/auth bypass"
+                        ));
                     }
                 }
             }
@@ -7020,9 +7142,10 @@ impl Proxy {
         // Also checks certificate expiration: expired certs are rejected,
         // near-expiry certs emit a warning log.
         if let Some(ref path) = self.backend_tls_client_cert_path {
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
@@ -7033,28 +7156,31 @@ impl Proxy {
                 ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path {
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::CaBundle, path);
             let already_validated = validated_tls_paths
                 .as_ref()
-                .is_some_and(|s| s.contains(path.as_str()));
+                .is_some_and(|s| s.contains(&cache_key));
             if !already_validated {
-                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
@@ -7063,7 +7189,7 @@ impl Proxy {
                 ) {
                     errors.push(e);
                 } else if let Some(ref mut cache) = validated_tls_paths {
-                    cache.insert(path.clone());
+                    cache.insert(cache_key);
                 }
             }
         }
@@ -8324,7 +8450,8 @@ impl Upstream {
 
         // TLS file content validation with deduplication.
         if let Some(ref path) = self.backend_tls_client_cert_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_cert_file("backend_tls_client_cert_path", path) {
                     errors.push(e);
@@ -8335,24 +8462,27 @@ impl Upstream {
                 ) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_client_key_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key = tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
                 if let Err(e) = validate_pem_key_file("backend_tls_client_key_path", path) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
         if let Some(ref path) = self.backend_tls_server_ca_cert_path {
-            let already_validated = validated_tls_paths.contains(path.as_str());
+            let cache_key =
+                tls_validation_cache_key(crate::tls::source::MaterialKind::CaBundle, path);
+            let already_validated = validated_tls_paths.contains(&cache_key);
             if !already_validated {
-                if let Err(e) = validate_pem_cert_file("backend_tls_server_ca_cert_path", path) {
+                if let Err(e) = validate_pem_ca_file("backend_tls_server_ca_cert_path", path) {
                     errors.push(e);
                 } else if let Err(e) = crate::tls::check_cert_expiry_for_validation(
                     path,
@@ -8361,7 +8491,7 @@ impl Upstream {
                 ) {
                     errors.push(e);
                 } else {
-                    validated_tls_paths.insert(path.clone());
+                    validated_tls_paths.insert(cache_key);
                 }
             }
         }
@@ -9314,32 +9444,43 @@ impl GatewayConfig {
                         )),
                         _ => {}
                     }
-                    if let Some(path) = client_cert
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_cert_file(
-                            "mesh_route_dispatch.backend_tls.client_cert_path",
-                            path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    if let Some(path) = client_cert {
+                        let cache_key =
+                            tls_validation_cache_key(crate::tls::source::MaterialKind::Cert, path);
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_cert_file(
+                                "mesh_route_dispatch.backend_tls.client_cert_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
-                    if let Some(path) = client_key
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_key_file(
-                            "mesh_route_dispatch.backend_tls.client_key_path",
-                            path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                    if let Some(path) = client_key {
+                        let cache_key =
+                            tls_validation_cache_key(crate::tls::source::MaterialKind::Key, path);
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_key_file(
+                                "mesh_route_dispatch.backend_tls.client_key_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
-                    if let Some(path) = server_ca.filter(|path| !path.is_empty())
-                        && validated_paths.insert(path.to_string())
-                        && let Err(e) = validate_pem_cert_file(
-                            "mesh_route_dispatch.backend_tls.server_ca_cert_path",
+                    if let Some(path) = server_ca.filter(|path| !path.is_empty()) {
+                        let cache_key = tls_validation_cache_key(
+                            crate::tls::source::MaterialKind::CaBundle,
                             path,
-                        )
-                    {
-                        errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        );
+                        if validated_paths.insert(cache_key)
+                            && let Err(e) = validate_pem_ca_file(
+                                "mesh_route_dispatch.backend_tls.server_ca_cert_path",
+                                path,
+                            )
+                        {
+                            errors.push(format!("PluginConfig '{}': {}", pc.id, e));
+                        }
                     }
                 }
             }
