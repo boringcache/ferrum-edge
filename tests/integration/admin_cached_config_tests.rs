@@ -2996,13 +2996,13 @@ async fn test_admin_create_rejects_unknown_ai_prompt_compressor_policy_keys() {
 }
 
 #[tokio::test]
-async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
+async fn test_admin_create_rejects_invalid_ai_stream_router_policy_config() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    for (id, config, needle) in [
+    for (id, config, expected) in [
         (
             "stream-router-enabled-typo",
             json!({
@@ -3015,7 +3015,7 @@ async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
                     "model_patterns": ["gpt-*"]
                 }]
             }),
-            "config.enabeld",
+            &["unknown configuration key", "config.enabeld"][..],
         ),
         (
             "stream-router-provider-typo",
@@ -3029,10 +3029,13 @@ async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
                     "inherit_backend_tl": true
                 }]
             }),
-            "config.providers[0].inherit_backend_tl",
+            &[
+                "unknown configuration key",
+                "config.providers[0].inherit_backend_tl",
+            ][..],
         ),
         (
-            "stream-router-fallback-typo",
+            "stream-router-fallback-block",
             json!({
                 "providers": [{
                     "name": "openai",
@@ -3041,9 +3044,12 @@ async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
                     "api_key": "sk-test",
                     "model_patterns": ["gpt-*"]
                 }],
-                "fallback": {"max_attemps": 3}
+                "fallback": {"max_attempts": 3}
             }),
-            "config.fallback.max_attemps",
+            &[
+                "unsupported field 'fallback'",
+                "provider fallback is not implemented",
+            ][..],
         ),
     ] {
         let plugin = json!({
@@ -3061,12 +3067,8 @@ async fn test_admin_create_rejects_unknown_ai_stream_router_policy_keys() {
         );
         let body_text = body.to_string();
         assert!(
-            body_text.contains("unknown configuration key"),
+            expected.iter().all(|needle| body_text.contains(needle)),
             "unexpected admin validation response: {body_text}"
-        );
-        assert!(
-            body_text.contains(needle),
-            "admin response missing {needle}: {body_text}"
         );
     }
 }
