@@ -223,22 +223,35 @@ impl MongoTestHarness {
     }
 
     /// Start against a replica set with the `config_changes` change-stream
-    /// watcher enabled and the periodic poll interval pushed far out, so any
-    /// prompt reload can only have come from a stream wake-up (issue #3330).
+    /// watcher enabled (issue #3330).
+    ///
+    /// `poll_interval_secs` and `max_backoff_secs` are caller-controlled so a
+    /// single suite can prove prompt stream wake-ups (huge interval), reconnect
+    /// recovery, and periodic-poll fallback (short interval + held-down watcher).
+    /// `mongo_database` is overridden last so disruption can target an isolated
+    /// database without touching the shared `ferrum_test` collections.
     async fn start_gateway_replica_set_change_stream(
         &mut self,
         mongo_url: &str,
         replica_set: &str,
         poll_interval_secs: u32,
+        mongo_database: &str,
+        max_backoff_secs: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         const MAX_ATTEMPTS: u32 = 3;
         let poll_interval = poll_interval_secs.to_string();
+        let max_backoff = max_backoff_secs.to_string();
         let mut last_err = String::new();
         for attempt in 1..=MAX_ATTEMPTS {
             let extra_env = [
                 ("FERRUM_DB_POLL_INTERVAL", poll_interval.as_str()),
+                ("FERRUM_MONGO_DATABASE", mongo_database),
                 ("FERRUM_MONGO_CHANGE_STREAM_ENABLED", "true"),
                 ("FERRUM_MONGO_CHANGE_STREAM_DEBOUNCE_MS", "50"),
+                (
+                    "FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS",
+                    max_backoff.as_str(),
+                ),
             ];
             match self
                 .try_start_gateway_plaintext_with_env(mongo_url, Some(replica_set), &extra_env)
@@ -1810,15 +1823,19 @@ async fn test_mongodb_replica_set_owned_proxy_delete_commits_complete_graph() {
     }
 }
 
-/// Issue #3330: a committed Admin API mutation wakes the existing incremental
-/// apply path promptly on a replica set, without changing accepted-sequence
-/// semantics.
+/// Issue #3330 acceptance: real replica-set coverage for prompt wake-up,
+/// watcher disruption/reconnect with durable recovery across the gap, and
+/// authoritative poll fallback while the watcher cannot deliver events.
 ///
-/// The gateway runs with a deliberately huge `FERRUM_DB_POLL_INTERVAL`, so a
-/// reload observed within seconds can only have come from the change-stream
-/// wake-up. The reload itself is still the ordinary cursor-based path: the test
-/// asserts `database_polling.status` stays `ok` and that the watcher surface
-/// stays bounded (no ids, namespaces, tokens, or URLs).
+/// Disruption uses a server-side `config_changes` collection drop in an
+/// isolated per-run database (not a primary step-down). That raises a real
+/// change-stream invalidation and exercises the production
+/// `Invalidated → mark_degraded → wake authoritative poll → reconnect` path
+/// without touching the shared `ferrum_test` database or other CI services.
+/// Sustained unavailability uses the same appName-scoped `failCommand` pattern
+/// already used by the replica-set delete-rollback cells, failing only
+/// `aggregate` (what `watch()` sends) so Admin CRUD and cursor polls keep
+/// working.
 ///
 /// Requires a replica set. Set `FERRUM_TEST_MONGO_REPLICA_SET` (and optionally
 /// `FERRUM_TEST_MONGO_REPLICA_SET_URL`) to run it; skipped otherwise, because a
@@ -1826,7 +1843,7 @@ async fn test_mongodb_replica_set_owned_proxy_delete_commits_complete_graph() {
 #[tokio::test]
 #[ignore]
 async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
-    println!("\n=== MongoDB Change-Stream Reload Wake-Up Test ===\n");
+    println!("\n=== MongoDB Change-Stream Wake / Reconnect / Fallback Test ===\n");
 
     let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
         println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set — no replica set available");
@@ -1844,18 +1861,43 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         return;
     }
 
-    // 15 minutes: far longer than this test runs, so no periodic tick can fire.
-    const POLL_INTERVAL_SECS: u32 = 900;
-
-    let mut harness = MongoTestHarness::new().await.expect("Create harness");
-    harness
-        .start_gateway_replica_set_change_stream(&mongo_url, &replica_set, POLL_INTERVAL_SECS)
-        .await
-        .expect("Start gateway with MongoDB change-stream reloads");
-
-    let client = reqwest::Client::new();
-    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    // Isolated DB so dropping `config_changes` cannot disturb other cells that
+    // share the replica-set mongod (data-plane nextest is serialized, but the
+    // shared `ferrum_test` database still holds durable state across tests).
     let run_id = Uuid::new_v4().to_string()[..8].to_string();
+    let mongo_database = format!("ferrum_cs_{run_id}");
+    let mongo_client = MongoClient::with_uri_str(&mongo_url)
+        .await
+        .expect("connect MongoDB change-stream test controller");
+
+    struct IsolatedMongoDbGuard {
+        client: MongoClient,
+        database: String,
+    }
+    impl Drop for IsolatedMongoDbGuard {
+        fn drop(&mut self) {
+            let client = self.client.clone();
+            let database = self.database.clone();
+            // Best-effort cleanup; never panic from Drop.
+            let _ = std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                rt.block_on(async {
+                    let _ = client.database(&database).drop().await;
+                });
+            })
+            .join();
+        }
+    }
+    let _db_guard = IsolatedMongoDbGuard {
+        client: mongo_client.clone(),
+        database: mongo_database.clone(),
+    };
 
     async fn authenticated_health(
         client: &reqwest::Client,
@@ -1871,119 +1913,458 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         resp.json().await.unwrap_or_else(|_| json!({}))
     }
 
-    // 1. The watcher connects and advertises itself on authenticated /health.
-    let mut connected = false;
-    for _ in 0..40 {
-        let health = authenticated_health(&client, &harness, &auth_header).await;
-        let watcher = &health["database_polling"]["change_stream"];
-        if watcher["enabled"] == json!(true) && watcher["connected"] == json!(true) {
-            connected = true;
-            break;
+    async fn wait_for_watcher_connected(
+        client: &reqwest::Client,
+        harness: &MongoTestHarness,
+        auth_header: &str,
+    ) -> serde_json::Value {
+        let deadline = SystemTime::now() + Duration::from_secs(20);
+        let mut last = json!({});
+        while SystemTime::now() < deadline {
+            last = authenticated_health(client, harness, auth_header).await;
+            let watcher = &last["database_polling"]["change_stream"];
+            if watcher["enabled"] == json!(true) && watcher["connected"] == json!(true) {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        panic!("watcher did not report enabled+connected: {last:?}");
     }
-    assert!(
-        connected,
-        "the replica-set change-stream watcher must connect and report itself on /health"
-    );
-    println!("  OK: watcher reports enabled + connected");
 
-    let before = authenticated_health(&client, &harness, &auth_header).await;
-    let proxies_before = before["cached_config"]["proxy_count"]
-        .as_u64()
-        .expect("cached_config.proxy_count");
-
-    // 2. A committed mutation wakes the existing incremental apply path well
-    //    inside one poll interval.
-    let proxy_id = format!("change-stream-proxy-{run_id}");
-    let resp = client
-        .post(format!("{}/proxies", harness.admin_base_url))
-        .header("Authorization", &auth_header)
-        .json(&json!({
-            "id": &proxy_id,
-            "name": &proxy_id,
-            "listen_path": format!("/change-stream-{run_id}"),
-            "backend_scheme": "http",
-            "backend_host": "127.0.0.1",
-            "backend_port": 18080,
-            "strip_listen_path": true,
-        }))
-        .send()
-        .await
-        .expect("create proxy");
-    assert!(
-        resp.status().is_success(),
-        "create proxy: {}",
-        resp.status()
-    );
-
-    let deadline = SystemTime::now() + Duration::from_secs(30);
-    let mut applied = false;
-    let mut last_health = json!({});
-    while SystemTime::now() < deadline {
-        last_health = authenticated_health(&client, &harness, &auth_header).await;
-        if last_health["cached_config"]["proxy_count"]
-            .as_u64()
-            .unwrap_or(0)
-            > proxies_before
-        {
-            applied = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    assert!(
-        applied,
-        "a committed mutation must wake the poll loop far inside the {POLL_INTERVAL_SECS}s \
-         periodic interval: {last_health:?}"
-    );
-    println!("  OK: committed mutation reloaded without waiting for the poll interval");
-
-    // 3. Accepted-sequence semantics are unchanged: the reload ran through the
-    //    ordinary cursor path, so polling health stays ok and the watcher
-    //    recorded events without ever becoming the source of truth.
-    assert_eq!(
-        last_health["database_polling"]["status"], "ok",
-        "a stream-triggered reload must not degrade polling: {last_health:?}"
-    );
-    let watcher = last_health["database_polling"]["change_stream"].clone();
-    assert!(
-        watcher["events_total"].as_u64().unwrap_or(0) >= 1,
-        "the watcher must have observed the committed change: {watcher:?}"
-    );
-    assert_eq!(watcher["degraded_reason"], "none", "watcher: {watcher:?}");
-
-    // 4. The watcher surface stays bounded — no resource ids, namespaces,
-    //    resume tokens, or connection strings.
-    let watcher_keys: Vec<String> = watcher
-        .as_object()
-        .expect("watcher object")
-        .keys()
-        .cloned()
-        .collect();
-    for key in &watcher_keys {
+    async fn create_proxy(
+        client: &reqwest::Client,
+        harness: &MongoTestHarness,
+        auth_header: &str,
+        proxy_id: &str,
+        listen_path: &str,
+    ) {
+        let resp = client
+            .post(format!("{}/proxies", harness.admin_base_url))
+            .header("Authorization", auth_header)
+            .json(&json!({
+                "id": proxy_id,
+                "name": proxy_id,
+                "listen_path": listen_path,
+                "backend_scheme": "http",
+                "backend_host": "127.0.0.1",
+                "backend_port": 18080,
+                "strip_listen_path": true,
+            }))
+            .send()
+            .await
+            .expect("create proxy");
         assert!(
-            [
-                "enabled",
-                "connected",
-                "degraded_reason",
-                "events_total",
-                "reconnects_total",
-                "invalidations_total",
-                "history_losses_total",
-                "resume_token_retained",
-                "last_event_at",
-            ]
-            .contains(&key.as_str()),
-            "unexpected watcher field '{key}' — the surface must stay bounded"
+            resp.status().is_success(),
+            "create proxy {proxy_id}: {}",
+            resp.status()
         );
     }
-    let watcher_text = watcher.to_string();
-    assert!(
-        !watcher_text.contains("mongodb://") && !watcher_text.contains(&proxy_id),
-        "the watcher surface must not leak connection strings or resource ids: {watcher_text}"
-    );
-    println!("  OK: watcher surface is bounded and leak-free");
 
-    println!("\n=== MongoDB Change-Stream Reload Wake-Up Test PASSED ===\n");
+    async fn wait_for_proxy_count_above(
+        client: &reqwest::Client,
+        harness: &MongoTestHarness,
+        auth_header: &str,
+        proxies_before: u64,
+        timeout: Duration,
+        context: &str,
+    ) -> serde_json::Value {
+        let deadline = SystemTime::now() + timeout;
+        let mut last = json!({});
+        while SystemTime::now() < deadline {
+            last = authenticated_health(client, harness, auth_header).await;
+            if last["cached_config"]["proxy_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > proxies_before
+            {
+                return last;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        panic!("{context}: proxy_count did not advance above {proxies_before}: {last:?}");
+    }
+
+    fn assert_watcher_surface_bounded(watcher: &serde_json::Value, proxy_id: &str) {
+        let watcher_keys: Vec<String> = watcher
+            .as_object()
+            .expect("watcher object")
+            .keys()
+            .cloned()
+            .collect();
+        for key in &watcher_keys {
+            assert!(
+                [
+                    "enabled",
+                    "connected",
+                    "degraded_reason",
+                    "events_total",
+                    "reconnects_total",
+                    "invalidations_total",
+                    "history_losses_total",
+                    "resume_token_retained",
+                    "last_event_at",
+                ]
+                .contains(&key.as_str()),
+                "unexpected watcher field '{key}' — the surface must stay bounded"
+            );
+        }
+        let watcher_text = watcher.to_string();
+        assert!(
+            !watcher_text.contains("mongodb://") && !watcher_text.contains(proxy_id),
+            "the watcher surface must not leak connection strings or resource ids: {watcher_text}"
+        );
+    }
+
+    /// Fail only `aggregate` for this gateway's appName. Change-stream
+    /// `watch()` opens via aggregate; Admin CRUD and authoritative
+    /// `config_changes` finds stay available, so this holds the watcher down
+    /// without blocking the poll loop under test.
+    async fn enable_change_stream_open_failpoint(
+        client: &MongoClient,
+        app_name: &str,
+    ) -> i64 {
+        let result = client
+            .database("admin")
+            .run_command(doc! {
+                "configureFailPoint": "failCommand",
+                "mode": "alwaysOn",
+                "data": {
+                    "errorCode": 6, // HostUnreachable — classified as stream/connect fault
+                    "failCommands": ["aggregate"],
+                    "appName": app_name,
+                }
+            })
+            .await
+            .expect("enable appName-scoped aggregate failpoint for change-stream opens");
+        failpoint_count(&result)
+    }
+
+    async fn clear_fail_command_failpoint(client: &MongoClient) {
+        let _ = client
+            .database("admin")
+            .run_command(doc! {
+                "configureFailPoint": "failCommand",
+                "mode": "off",
+            })
+            .await;
+    }
+
+    struct FailCommandFailpointGuard {
+        client: MongoClient,
+    }
+    impl Drop for FailCommandFailpointGuard {
+        fn drop(&mut self) {
+            let client = self.client.clone();
+            let _ = std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                rt.block_on(async {
+                    let _ = client
+                        .database("admin")
+                        .run_command(doc! {
+                            "configureFailPoint": "failCommand",
+                            "mode": "off",
+                        })
+                        .await;
+                });
+            })
+            .join();
+        }
+    }
+
+    // ── Phase 1: prompt change-stream wake-up (huge poll interval) ──────────
+    // 15 minutes: far longer than this phase runs, so a prompt reload can only
+    // have come from a stream wake-up.
+    const WAKE_POLL_INTERVAL_SECS: u32 = 900;
+    const FAST_RECONNECT_BACKOFF_SECS: u32 = 1;
+
+    let mut harness = MongoTestHarness::new().await.expect("Create harness");
+    harness
+        .start_gateway_replica_set_change_stream(
+            &mongo_url,
+            &replica_set,
+            WAKE_POLL_INTERVAL_SECS,
+            &mongo_database,
+            FAST_RECONNECT_BACKOFF_SECS,
+        )
+        .await
+        .expect("Start gateway with MongoDB change-stream reloads");
+
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+
+    let connected_health = wait_for_watcher_connected(&client, &harness, &auth_header).await;
+    println!("  OK: watcher reports enabled + connected");
+    let proxies_before = connected_health["cached_config"]["proxy_count"]
+        .as_u64()
+        .expect("cached_config.proxy_count");
+    let reconnects_before = connected_health["database_polling"]["change_stream"]["reconnects_total"]
+        .as_u64()
+        .unwrap_or(0);
+    let invalidations_before = connected_health["database_polling"]["change_stream"]
+        ["invalidations_total"]
+        .as_u64()
+        .unwrap_or(0);
+
+    let wake_proxy_id = format!("change-stream-wake-{run_id}");
+    create_proxy(
+        &client,
+        &harness,
+        &auth_header,
+        &wake_proxy_id,
+        &format!("/change-stream-wake-{run_id}"),
+    )
+    .await;
+
+    let wake_health = wait_for_proxy_count_above(
+        &client,
+        &harness,
+        &auth_header,
+        proxies_before,
+        Duration::from_secs(30),
+        &format!(
+            "phase1 wake-up: committed mutation must reload inside {WAKE_POLL_INTERVAL_SECS}s"
+        ),
+    )
+    .await;
+    assert_eq!(
+        wake_health["database_polling"]["status"], "ok",
+        "a stream-triggered reload must not degrade polling: {wake_health:?}"
+    );
+    let wake_watcher = wake_health["database_polling"]["change_stream"].clone();
+    assert!(
+        wake_watcher["events_total"].as_u64().unwrap_or(0) >= 1,
+        "the watcher must have observed the committed change: {wake_watcher:?}"
+    );
+    assert_eq!(
+        wake_watcher["degraded_reason"], "none",
+        "watcher: {wake_watcher:?}"
+    );
+    assert_watcher_surface_bounded(&wake_watcher, &wake_proxy_id);
+    println!("  OK: phase1 prompt change-stream wake-up");
+
+    // ── Phase 2: real invalidation → reconnect + recover commit across gap ──
+    // Dropping `config_changes` in this isolated DB invalidates the live stream
+    // (production `OperationType::Invalidate`/`Drop` path). The huge poll
+    // interval remains armed, so recovery of a commit made during the gap must
+    // come from the invalidation/reconnect wake into the authoritative cursor
+    // poll — not from a periodic tick.
+    let proxies_before_gap = wake_health["cached_config"]["proxy_count"]
+        .as_u64()
+        .expect("proxy_count after wake");
+
+    mongo_client
+        .database(&mongo_database)
+        .collection::<Document>("config_changes")
+        .drop()
+        .await
+        .expect("drop isolated config_changes to invalidate the live change stream");
+
+    let mut saw_invalidation = false;
+    let invalidate_deadline = SystemTime::now() + Duration::from_secs(30);
+    let mut last_after_drop = json!({});
+    while SystemTime::now() < invalidate_deadline {
+        last_after_drop = authenticated_health(&client, &harness, &auth_header).await;
+        let watcher = &last_after_drop["database_polling"]["change_stream"];
+        let invalidations = watcher["invalidations_total"].as_u64().unwrap_or(0);
+        if invalidations > invalidations_before {
+            saw_invalidation = true;
+            break;
+        }
+        // connected=false with a non-none degraded reason also proves disruption
+        // even if the health scrape missed the counter transition.
+        if watcher["connected"] == json!(false)
+            && watcher["degraded_reason"] != json!("none")
+            && watcher["degraded_reason"] != json!(null)
+        {
+            saw_invalidation = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        saw_invalidation,
+        "dropping config_changes must disrupt the live watcher: {last_after_drop:?}"
+    );
+    println!("  OK: phase2 watcher disrupted by real collection invalidation/drop");
+
+    let gap_proxy_id = format!("change-stream-gap-{run_id}");
+    create_proxy(
+        &client,
+        &harness,
+        &auth_header,
+        &gap_proxy_id,
+        &format!("/change-stream-gap-{run_id}"),
+    )
+    .await;
+
+    let gap_health = wait_for_proxy_count_above(
+        &client,
+        &harness,
+        &auth_header,
+        proxies_before_gap,
+        Duration::from_secs(45),
+        "phase2 reconnect: committed config must be recovered across the invalidation gap \
+         via the authoritative poll woken by disruption/reconnect",
+    )
+    .await;
+    assert_eq!(
+        gap_health["database_polling"]["status"], "ok",
+        "reconnect recovery must keep polling healthy: {gap_health:?}"
+    );
+
+    let mut reconnected = false;
+    let reconnect_deadline = SystemTime::now() + Duration::from_secs(30);
+    let mut last_reconnect = gap_health.clone();
+    while SystemTime::now() < reconnect_deadline {
+        last_reconnect = authenticated_health(&client, &harness, &auth_header).await;
+        let watcher = &last_reconnect["database_polling"]["change_stream"];
+        let reconnects = watcher["reconnects_total"].as_u64().unwrap_or(0);
+        if watcher["connected"] == json!(true)
+            && (reconnects > reconnects_before
+                || watcher["invalidations_total"].as_u64().unwrap_or(0) > invalidations_before)
+        {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        reconnected,
+        "watcher must reconnect on the real replica set after invalidation: {last_reconnect:?}"
+    );
+    assert_watcher_surface_bounded(
+        &last_reconnect["database_polling"]["change_stream"],
+        &gap_proxy_id,
+    );
+    println!(
+        "  OK: phase2 reconnect recovered committed config across the gap \
+         (invalidations/reconnects advanced; polling stayed ok)"
+    );
+
+    // Stop the phase-1/2 gateway before the fallback phase so ports and the
+    // watcher task release cleanly.
+    drop(harness);
+
+    // ── Phase 3: periodic poll remains correctness fallback while unavailable ─
+    // Short poll interval + appName-scoped aggregate failpoint keeps the
+    // watcher from delivering events. A committed mutation must still appear
+    // through the durable sequence-cursor poll. We assert events_total does
+    // not advance for that commit so the stream is proven non-authoritative.
+    const FALLBACK_POLL_INTERVAL_SECS: u32 = 2;
+    const FALLBACK_MAX_BACKOFF_SECS: u32 = 30;
+
+    let mut harness = MongoTestHarness::new().await.expect("Create fallback harness");
+    harness
+        .start_gateway_replica_set_change_stream(
+            &mongo_url,
+            &replica_set,
+            FALLBACK_POLL_INTERVAL_SECS,
+            &mongo_database,
+            FALLBACK_MAX_BACKOFF_SECS,
+        )
+        .await
+        .expect("Start gateway for change-stream fallback phase");
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let connected = wait_for_watcher_connected(&client, &harness, &auth_header).await;
+    let proxies_before_fallback = connected["cached_config"]["proxy_count"]
+        .as_u64()
+        .expect("proxy_count before fallback");
+    let events_before_fallback = connected["database_polling"]["change_stream"]["events_total"]
+        .as_u64()
+        .unwrap_or(0);
+    let last_poll_before = connected["database_polling"]["last_poll_completed_at"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    let _failpoint_count_before =
+        enable_change_stream_open_failpoint(&mongo_client, &harness.mongo_app_name).await;
+    let _failpoint_guard = FailCommandFailpointGuard {
+        client: mongo_client.clone(),
+    };
+    // Drop again so the live stream dies and reopen attempts hit the failpoint.
+    let _ = mongo_client
+        .database(&mongo_database)
+        .collection::<Document>("config_changes")
+        .drop()
+        .await;
+
+    let mut watcher_held_down = false;
+    let hold_deadline = SystemTime::now() + Duration::from_secs(30);
+    let mut last_held = json!({});
+    while SystemTime::now() < hold_deadline {
+        last_held = authenticated_health(&client, &harness, &auth_header).await;
+        let watcher = &last_held["database_polling"]["change_stream"];
+        if watcher["connected"] == json!(false) {
+            watcher_held_down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        watcher_held_down,
+        "aggregate failpoint + collection drop must keep the watcher unavailable: {last_held:?}"
+    );
+    println!("  OK: phase3 watcher held unavailable (connected=false)");
+
+    let fallback_proxy_id = format!("change-stream-fallback-{run_id}");
+    create_proxy(
+        &client,
+        &harness,
+        &auth_header,
+        &fallback_proxy_id,
+        &format!("/change-stream-fallback-{run_id}"),
+    )
+    .await;
+
+    let fallback_health = wait_for_proxy_count_above(
+        &client,
+        &harness,
+        &auth_header,
+        proxies_before_fallback,
+        Duration::from_secs(20),
+        "phase3 fallback: committed config must apply via authoritative polling while \
+         the watcher cannot deliver stream events",
+    )
+    .await;
+
+    assert_eq!(
+        fallback_health["database_polling"]["status"], "ok",
+        "fallback polling must keep database_polling healthy: {fallback_health:?}"
+    );
+    let fallback_watcher = &fallback_health["database_polling"]["change_stream"];
+    assert_eq!(
+        fallback_watcher["connected"],
+        json!(false),
+        "fallback proof requires the watcher to still be unavailable when the \
+         commit is observed: {fallback_health:?}"
+    );
+    assert_eq!(
+        fallback_watcher["events_total"].as_u64().unwrap_or(0),
+        events_before_fallback,
+        "the stream must not have delivered the fallback commit (events_total \
+         would advance only on observed inserts): {fallback_health:?}"
+    );
+    let last_poll_after = fallback_health["database_polling"]["last_poll_completed_at"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !last_poll_after.is_empty() && last_poll_after != last_poll_before,
+        "authoritative poll freshness must advance while the watcher is down: \
+         before={last_poll_before:?} after={last_poll_after:?} health={fallback_health:?}"
+    );
+    assert_watcher_surface_bounded(fallback_watcher, &fallback_proxy_id);
+    clear_fail_command_failpoint(&mongo_client).await;
+    println!(
+        "  OK: phase3 periodic/authoritative poll applied committed config while \
+         watcher stayed unavailable (events_total unchanged)"
+    );
+
+    println!("\n=== MongoDB Change-Stream Wake / Reconnect / Fallback Test PASSED ===\n");
 }
