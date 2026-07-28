@@ -747,9 +747,7 @@ impl DnsCache {
                 occupied.insert(build_entry(shortest));
             }
             Entry::Vacant(vacant) => {
-                let shortest = Arc::new(AtomicU64::new(
-                    per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL),
-                ));
+                let shortest = Arc::new(AtomicU64::new(per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL)));
                 vacant.insert(build_entry(shortest));
             }
         }
@@ -1095,9 +1093,9 @@ impl DnsCache {
         match self.cache.entry(cache_hostname.to_string()) {
             Entry::Occupied(mut occupied) if !occupied.get().is_error => {
                 occupied.get().note_per_proxy_ttl(per_proxy_ttl);
-                if expired_success_generation.is_some_and(|generation| {
-                    Arc::ptr_eq(generation, &occupied.get().next_start)
-                }) {
+                if expired_success_generation
+                    .is_some_and(|generation| Arc::ptr_eq(generation, &occupied.get().next_start))
+                {
                     // A short-TTL caller may be expired while a long-TTL peer
                     // still owns a fresh view of this shared answer. Preserve
                     // the answer and cache only a bounded refresh-error
@@ -3768,7 +3766,10 @@ mod tests {
         cache.cache_error("shared.example", Some(5), Some(&generation));
 
         let entry = cache.cache.get("shared.example").expect("shared answer");
-        assert!(!entry.is_error, "refresh failure must preserve the answer row");
+        assert!(
+            !entry.is_error,
+            "refresh failure must preserve the answer row"
+        );
         assert_eq!(
             entry.addresses.as_ref(),
             &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 44))]
