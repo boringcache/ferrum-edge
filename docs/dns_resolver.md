@@ -14,6 +14,19 @@ By default, the DNS cache respects each record's **native TTL** from the DNS res
 
 The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
 
+### Shared hostnames and per-proxy TTL isolation
+
+The DNS cache stores **one shared answer row per hostname** (addresses, native TTL, publish time) so concurrent proxies, upstreams, and plugins deduplicate lookups and background refreshes. **Freshness is evaluated per caller**: each `resolve` computes `resolved_at + effective_ttl(native_ttl, caller_dns_cache_ttl_seconds)` and does not inherit another proxy's TTL from insertion or warmup order.
+
+**Stale-while-revalidate with mixed TTLs:**
+
+1. A caller is **fresh** until its own effective TTL elapses from the shared `resolved_at`.
+2. After that, the caller is **stale** until `caller_effective_ttl + FERRUM_DNS_STALE_TTL`; the shared addresses are served and **one** background refresh is scheduled for the hostname.
+3. Past the caller's stale window, that caller performs a synchronous lookup. Longer-TTL peers may still treat the same row as fresh.
+4. Proactive background refresh schedules against the **shortest observed** per-proxy TTL for the hostname (tracked atomically on hits) so short-TTL service-discovery peers stay warm without a DNS-query storm per consumer.
+
+**Intentional sharing tradeoff:** a short-TTL peer can trigger an earlier shared refresh than a long-TTL peer alone would need. Addresses stay coherent across consumers; only freshness windows differ. Warmup still coalesces to one lookup per hostname (preferring the shortest advertised per-proxy TTL for initial refresh scheduling) but no longer first-writer-wins for freshness.
+
 ## Environment Variables
 
 ### Core DNS Settings
@@ -81,9 +94,11 @@ This means: first try the record type that worked last time (for speed), then tr
 
 When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:
 
-1. **Fresh** (within TTL): Return cached result immediately.
-2. **Stale** (past TTL, within `stale_ttl`): Return the stale cached result immediately and trigger a **background refresh** task. The next request will get the fresh result.
-3. **Expired** (past both TTL and `stale_ttl`): Perform a synchronous DNS lookup (blocking the request).
+1. **Fresh** (within the **caller's** effective TTL from the shared publish time): Return cached result immediately.
+2. **Stale** (past the caller's TTL, within that caller's `stale_ttl` window): Return the stale cached result immediately and trigger a **background refresh** task. The next request will get the fresh result.
+3. **Expired** (past both the caller's TTL and `stale_ttl`): Perform a synchronous DNS lookup (blocking the request).
+
+When multiple proxies share a hostname with different `dns_cache_ttl_seconds`, each caller's fresh/stale/expired decision is independent. A 5s peer can be refreshing while a 600s peer still treats the same addresses as fresh. See [Shared hostnames and per-proxy TTL isolation](#shared-hostnames-and-per-proxy-ttl-isolation).
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
 
@@ -129,7 +144,7 @@ On successful retry, the entry is promoted from error to a healthy cached entry 
 
 A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly.
 
-Since each record has its own native TTL, the background refresh task uses each entry's individual applied TTL for threshold computation — not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
+Since each record has its own native TTL, the background refresh task uses each entry's refresh TTL — `effective_ttl(native_ttl, shortest_observed_per_proxy_ttl)` — for threshold computation, not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
 
 ## DNS Warmup
 
@@ -139,7 +154,7 @@ On startup, Ferrum Edge resolves all configured hostnames asynchronously before 
 - **Upstream target hostnames** (`host` on each upstream target, when [load balancing](load_balancing.md) is configured)
 - **Plugin endpoint hostnames** — extracted from plugin configurations (e.g., `http_logging` endpoint URLs, `tcp_logging` host, `jwks_auth` JWKS URIs)
 
-Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed. Warmup remains parallel, but concurrency is bounded by `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid unbounded task bursts on very large configs. This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend, a load-balanced upstream pool, or a plugin with an outbound endpoint.
+Hostnames are **deduplicated** before resolution — if multiple proxies or plugins share the same hostname, only one DNS lookup is performed. When those peers advertise different `dns_cache_ttl_seconds`, warmup keeps the **shortest** TTL for initial refresh scheduling; each peer still evaluates freshness with its own TTL on later resolves (no first-writer-wins). Warmup remains parallel, but concurrency is bounded by `FERRUM_DNS_WARMUP_CONCURRENCY` to avoid unbounded task bursts on very large configs. This ensures no cold-cache DNS lookups on the first request, whether the proxy uses a single backend, a load-balanced upstream pool, or a plugin with an outbound endpoint.
 
 After DNS warmup completes, the gateway optionally **warms connection pools** for all HTTP-family backends (HTTP, HTTPS, gRPC, HTTP/2, HTTP/3) — pre-establishing TCP/TLS/QUIC connections so the first request to each backend avoids handshake latency. This is controlled by `FERRUM_POOL_WARMUP_ENABLED` (default: `true`). See [connection_pooling.md](connection_pooling.md#connection-pool-warmup) for details.
 
@@ -306,6 +321,6 @@ In addition to global DNS settings, each proxy can override DNS behavior:
 | Proxy Field | Description |
 |-------------|-------------|
 | `dns_override` | Static IP address override for this proxy's backend. Bypasses all DNS resolution. |
-| `dns_cache_ttl_seconds` | Per-proxy TTL override for cache entries. Takes precedence over both the native record TTL and `FERRUM_DNS_TTL_OVERRIDE_SECONDS`. |
+| `dns_cache_ttl_seconds` | Per-proxy TTL override for **this proxy's** freshness window on the shared hostname row. Takes precedence over both the native record TTL and `FERRUM_DNS_TTL_OVERRIDE_SECONDS` for that caller. Does not rewrite other proxies' TTLs when hostnames are shared. |
 
 These are configured in the proxy definition (YAML/JSON config file or database).
