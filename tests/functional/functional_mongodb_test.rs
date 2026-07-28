@@ -1972,11 +1972,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         let mut last = json!({});
         while SystemTime::now() < deadline {
             last = authenticated_health(client, harness, auth_header).await;
-            if last["cached_config"]["proxy_count"]
-                .as_u64()
-                .unwrap_or(0)
-                > proxies_before
-            {
+            if last["cached_config"]["proxy_count"].as_u64().unwrap_or(0) > proxies_before {
                 return last;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2019,10 +2015,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     /// `watch()` opens via aggregate; Admin CRUD and authoritative
     /// `config_changes` finds stay available, so this holds the watcher down
     /// without blocking the poll loop under test.
-    async fn enable_change_stream_open_failpoint(
-        client: &MongoClient,
-        app_name: &str,
-    ) -> i64 {
+    async fn enable_change_stream_open_failpoint(client: &MongoClient, app_name: &str) -> i64 {
         let result = client
             .database("admin")
             .run_command(doc! {
@@ -2103,13 +2096,14 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     let proxies_before = connected_health["cached_config"]["proxy_count"]
         .as_u64()
         .expect("cached_config.proxy_count");
-    let reconnects_before = connected_health["database_polling"]["change_stream"]["reconnects_total"]
-        .as_u64()
-        .unwrap_or(0);
-    let invalidations_before = connected_health["database_polling"]["change_stream"]
-        ["invalidations_total"]
-        .as_u64()
-        .unwrap_or(0);
+    let reconnects_before =
+        connected_health["database_polling"]["change_stream"]["reconnects_total"]
+            .as_u64()
+            .unwrap_or(0);
+    let invalidations_before =
+        connected_health["database_polling"]["change_stream"]["invalidations_total"]
+            .as_u64()
+            .unwrap_or(0);
 
     let wake_proxy_id = format!("change-stream-wake-{run_id}");
     create_proxy(
@@ -2259,7 +2253,9 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     const FALLBACK_POLL_INTERVAL_SECS: u32 = 2;
     const FALLBACK_MAX_BACKOFF_SECS: u32 = 30;
 
-    let mut harness = MongoTestHarness::new().await.expect("Create fallback harness");
+    let mut harness = MongoTestHarness::new()
+        .await
+        .expect("Create fallback harness");
     harness
         .start_gateway_replica_set_change_stream(
             &mongo_url,
