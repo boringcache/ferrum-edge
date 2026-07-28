@@ -486,7 +486,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         name: "request_mirror",
         classification: BuiltinPluginClassification::Public,
         priority: 3075,
-        active_phases: "before_proxy",
+        active_phases: "authorize (pre-buffer mirror admission; never rejects), before_proxy",
         matrix_protocols: HTTP_GRPC_PROTOCOLS,
         protocol_rationale: "Duplicates traffic to a shadow destination for validation",
     },

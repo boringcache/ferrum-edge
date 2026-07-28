@@ -2235,6 +2235,24 @@ pub struct RequestContext {
     /// Collected by detached mirror logging so each destination emits its own
     /// `mirror: true` summary.
     pub mirror_result_rxs: Vec<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// Per-instance `request_mirror` body admission decided during the
+    /// `authorize` phase — before any request body is collected.
+    ///
+    /// Advisory `GHSA-jv66-mq44-m9v3`: sampling and bounded mirror admission
+    /// must run ahead of body collection so a percentage-zero, sampled-out, or
+    /// saturated request keeps streaming instead of buffering an attacker-sized
+    /// body that no shadow request will ever use. An admitted entry owns the
+    /// instance's concurrency permit and its reserved slice of the aggregate
+    /// retained-byte budget for the whole pre-`before_proxy` buffering window,
+    /// and releases both when the context is dropped on any early-return,
+    /// cancellation, or body-error path. `before_proxy` takes the entry exactly
+    /// once, so the lease is never released twice.
+    ///
+    /// Private (with `pub(crate)` accessors) so no plugin can forge, clear, or
+    /// observe another instance's admission. Its custom `Clone` intentionally
+    /// clears the staged value: response-side context clones must not release a
+    /// lease the live request still owns.
+    request_mirror_admissions: Vec<request_mirror::RequestMirrorAdmission>,
     /// One-shot HMAC work staged before request-body collection and consumed
     /// at authentication. This is private rather than transaction metadata so
     /// credential/signature/Consumer secret data cannot be forwarded or
@@ -2548,6 +2566,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rxs: Vec::new(),
+            request_mirror_admissions: Vec::new(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3373,6 +3392,10 @@ impl RequestContext {
             // context before spawning cleanup) still emits every dispatched
             // mirror result.
             mirror_result_rxs: self.mirror_result_rxs.clone(),
+            // Mirror admission leases are owned by the live request context.
+            // Copying them here would double-release a permit / byte
+            // reservation when the clone is dropped.
+            request_mirror_admissions: Vec::new(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -4101,6 +4124,54 @@ impl RequestContext {
         rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
     ) {
         self.mirror_result_rxs.push(rx);
+    }
+
+    /// Stage one `request_mirror` instance's pre-buffer admission decision.
+    ///
+    /// Called once per instance from the `authorize` phase. Replaces any
+    /// earlier entry for the same instance so a repeated evaluation cannot
+    /// accumulate two leases for one request.
+    pub(crate) fn stage_request_mirror_admission(
+        &mut self,
+        admission: request_mirror::RequestMirrorAdmission,
+    ) {
+        let instance_id = admission.instance_id();
+        if let Some(slot) = self
+            .request_mirror_admissions
+            .iter_mut()
+            .find(|staged| staged.instance_id() == instance_id)
+        {
+            *slot = admission;
+            return;
+        }
+        self.request_mirror_admissions.push(admission);
+    }
+
+    /// Whether the given `request_mirror` instance was admitted for this
+    /// request and therefore needs the request body buffered.
+    ///
+    /// Read-only and idempotent: `should_buffer_request_body` is evaluated
+    /// several times per request and must never advance the sampler or acquire
+    /// capacity itself.
+    pub(crate) fn request_mirror_body_admitted(&self, instance_id: u64) -> bool {
+        self.request_mirror_admissions
+            .iter()
+            .any(|staged| staged.instance_id() == instance_id && staged.is_admitted())
+    }
+
+    /// Take one instance's staged admission, transferring ownership of its
+    /// permit and retained-byte lease to the caller. Returns `None` when the
+    /// `authorize` phase never ran for this instance (direct plugin invocation
+    /// in tests), which keeps `before_proxy` self-sufficient.
+    pub(crate) fn take_request_mirror_admission(
+        &mut self,
+        instance_id: u64,
+    ) -> Option<request_mirror::RequestMirrorAdmission> {
+        let index = self
+            .request_mirror_admissions
+            .iter()
+            .position(|staged| staged.instance_id() == instance_id)?;
+        Some(self.request_mirror_admissions.swap_remove(index))
     }
 
     /// Return the stable authenticated identity for downstream policy and
