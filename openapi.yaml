@@ -16108,8 +16108,8 @@ components:
             per shared immutable key allocation. An exact ordered age index
             provides O(log n) expiry operations without a lookup-map scan or
             stale queue. Capacity maintenance reclaims only entries already
-            past cache_ttl_seconds and at most 64 of them per request; a nonce
-            inside its TTL is never evicted. If that bounded reclamation cannot
+            past the scope's retention and at most 64 of them per request; a
+            nonce inside it is never evicted. If that bounded reclamation cannot
             make room the request fails closed (HTTP 401) rather than accepting
             a nonce whose replay window cannot be recorded or unprotecting one
             that was already claimed. This is the only canonical shape; there
@@ -16123,6 +16123,17 @@ components:
             that apply are Redis's own memory policy plus the cache_ttl_seconds
             expiry on each claim key, and max_cache_size / max_total_cache_bytes
             are inert. The encoded-length ceiling applies on both paths.
+
+            cache_ttl_seconds is coupled to the UsernameToken Created window:
+            whenever PasswordDigest replay state is reachable it must be at
+            least username_token.created_max_age_seconds + 2 ×
+            username_token.created_clock_skew_seconds + 1, and omitting it
+            selects exactly that value. A shorter retention is a replay window,
+            not a memory tradeoff — the same unchanged token stays acceptable
+            after its claim expires. Under replay_scope=process the retention
+            actually applied is the highest value any plugin generation sharing
+            the scope declared, so a reload can only ever extend a recorded
+            claim, never shorten or refresh it.
           additionalProperties: false
           properties:
             replay_scope:
@@ -16150,17 +16161,16 @@ components:
             cache_ttl_seconds:
               type: integer
               format: uint64
-              default: 300
               minimum: 1
-              maximum: 86400
-              description: How long to remember nonces for replay detection (seconds). Zero is rejected because it would make replay detection inert.
+              maximum: 93601
+              description: "How long a claimed nonce is remembered (seconds). Default and enforced minimum for a PasswordDigest policy: username_token.created_max_age_seconds + 2 × username_token.created_clock_skew_seconds + 1 (901 with the defaults). That is the shortest retention that provably outlives the token — an unchanged UsernameToken is accepted from a full clock skew before its own Created until created_max_age_seconds + skew after it, so a shorter claim expires while the same request is still acceptable. A shorter explicit value is rejected at admission; a longer one is allowed and only over-protects. Zero is rejected because it would make replay detection inert. The maximum is the widest admissible Created window (86400 + 2 × 3600 + 1), so the maximum acceptance settings stay configurable. Under replay_scope=shared this is the TTL of each Redis claim key and is the keyspace's declared retention: SET NX never rewrites an existing key's TTL, so tune the Created window underneath an unchanged value, and when the value itself must grow, let it drain for one old TTL before widening the window past it."
             max_cache_size:
               type: integer
               format: uint64
               default: 10000
               minimum: 1
               maximum: 1000000
-              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past cache_ttl_seconds. A nonce inside its TTL is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce.
+              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past the scope's retention. A nonce inside its retention window is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce. Size this (and max_total_cache_bytes) for peak authenticated PasswordDigest rate × cache_ttl_seconds.
             max_encoded_length:
               type: integer
               format: uint64
@@ -16174,7 +16184,7 @@ components:
               default: 8388608
               minimum: 4096
               maximum: 1073741824
-              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside cache_ttl_seconds."
+              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside its retention window."
 
     CorsExactOrigin:
       oneOf:

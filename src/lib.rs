@@ -1263,6 +1263,10 @@ pub mod _test_support {
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
         pub max_maintenance_entries: usize,
+        /// The scope's monotone retention high-water mark in seconds — what
+        /// entries are actually expired against, which is not necessarily the
+        /// calling generation's configured `nonce.cache_ttl_seconds`.
+        pub retention_seconds: u64,
     }
 
     /// Controllable-time harness for the PasswordDigest nonce replay state.
@@ -1280,6 +1284,23 @@ pub mod _test_support {
                 plugin: crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?,
                 epoch: std::time::Instant::now(),
             })
+        }
+
+        /// A harness bound to a registered process replay scope, sharing an
+        /// explicit epoch so two generations of the same scope can be driven
+        /// against one deterministic timeline.
+        pub fn with_scope(
+            config: &serde_json::Value,
+            plugin_config_id: &str,
+            epoch: std::time::Instant,
+        ) -> Result<Self, String> {
+            use crate::plugins::soap_ws_security::SoapWsSecurity;
+            let plugin = SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+            Ok(Self { plugin, epoch })
         }
 
         pub fn claim(&self, nonce: &str) -> Result<(), String> {
@@ -1304,8 +1325,30 @@ pub mod _test_support {
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
+                retention_seconds: snapshot.retention_seconds,
             })
         }
+    }
+
+    /// The UsernameToken `Created` admission decision at an explicit instant.
+    /// The outer `Result` is construction, the inner one is the decision.
+    pub fn soap_username_token_created_outcome_for_test(
+        config: &serde_json::Value,
+        security_block: &str,
+        created: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Result<(), String>, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        Ok(plugin.username_token_created_outcome_for_tests(security_block, created, now))
+    }
+
+    /// The TTL a `replay_scope: shared` claim writes with its atomic
+    /// `SET NX EX`, observed without a live Redis server.
+    pub fn soap_shared_claim_retention_seconds_for_test(
+        config: &serde_json::Value,
+    ) -> Result<u64, String> {
+        crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+            .shared_claim_retention_seconds_for_tests()
     }
 
     /// One-shot proof that map/index drift cannot be recovered as a fresh

@@ -47,12 +47,14 @@
 //! map. Each index handle shares the lookup map's one immutable nonce-string
 //! allocation.
 //!
-//! **A claimed nonce is never evicted while it is still inside its TTL.** The
-//! only entries capacity maintenance may reclaim are ones proven expired by the
-//! configured `cache_ttl_seconds`, so the replay window a client was promised is
-//! always honoured. When entry or byte capacity is still exhausted after that
-//! bounded reclamation, the claim is rejected and the nonce is *not* admitted;
-//! replay protection degrades into refusal, never into silent unprotection.
+//! **A claimed nonce is never evicted while it is still inside its retention
+//! window.** The only entries capacity maintenance may reclaim are ones proven
+//! expired against the scope's monotone retention mark (see below), so the
+//! replay window a client was promised is always honoured — including across a
+//! reload to a generation configured with a shorter one. When entry or byte
+//! capacity is still exhausted after that bounded reclamation, the claim is
+//! rejected and the nonce is *not* admitted; replay protection degrades into
+//! refusal, never into silent unprotection.
 //! Maintenance examines at most `NONCE_MAX_MAINTENANCE_ENTRIES` oldest entries
 //! per request, which keeps the work per request constant while the two hard
 //! caps keep memory bounded.
@@ -82,21 +84,50 @@
 //! `username_token.require_timestamp_binding` (default) the outer element
 //! cannot simply be omitted to drop the binding.
 //!
+//! ## The claim must outlive the token
+//!
+//! Binding the two instants is necessary but not sufficient. The inner window
+//! accepts an unchanged token at any server instant in
+//! `[Created - skew, Created + max_age + skew]`, so from the *earliest* moment
+//! it can be claimed (submitted `skew` early, which the future tolerance
+//! admits) the same bytes stay acceptable for `max_age + 2 * skew` seconds.
+//! While `nonce.cache_ttl_seconds` was an independent knob it could be — and by
+//! default was — shorter than that: a token claimed at the earliest moment lost
+//! its claim after 300s and stayed acceptable for another 600s, which is the
+//! "acceptance again after replay TTL" the advisory describes. Binding the
+//! outer Timestamp does not help, because a captured token needs no forged
+//! element at all once its claim is gone.
+//!
+//! `cache_ttl_seconds` is therefore coupled to that window at admission:
+//! whenever PasswordDigest replay state is reachable it must be at least
+//! [`minimum_replay_retention_seconds`], and omitting it selects exactly that
+//! value. The claim strictly outlives the token from any admissible claim
+//! instant, and the ceiling is derived from the widest admissible window so the
+//! maximum acceptance settings stay configurable.
+//!
 //! Replay state itself is scoped by an explicit operator declaration,
 //! `nonce.replay_scope`, which has no default because a gateway cannot observe
 //! its own replica count:
 //!
 //! - `process` registers state under a stable `{namespace}|{plugin-config-id}`
 //!   key in a process-global registry, so a reload generation inherits the
-//!   previous generation's claims instead of starting empty. It is explicitly
-//!   **not** cross-replica protection, and declaring it asserts a single-replica
-//!   deployment.
+//!   previous generation's claims instead of starting empty. Because that state
+//!   outlives the generation that created it, retention is a property of the
+//!   scope: entries expire against a monotone high-water mark over every
+//!   generation registered there, so a retired or newly narrowed generation can
+//!   neither expire nor refresh another's claim, and a widened acceptance window
+//!   extends the claims already recorded. It is explicitly **not** cross-replica
+//!   protection, and declaring it asserts a single-replica deployment.
 //! - `shared` requires `sync_mode: "redis"` and claims each nonce with one
 //!   atomic Redis `SET NX EX`, so exactly one request across all replicas wins a
-//!   nonce inside its TTL. The Redis key is `SHA-256(nonce)` in hex — never the
-//!   nonce, which is a digest input bound to the shared secret and would
-//!   otherwise reach `MONITOR`, `SLOWLOG`, and the Redis client's error logs —
-//!   and the stored value is a fixed non-secret marker.
+//!   nonce inside its TTL. `SET NX` leaves an existing key's TTL untouched, so a
+//!   shorter-retention generation cannot shorten another's claim either; the
+//!   declared `cache_ttl_seconds` is the keyspace's stable retention, which lets
+//!   the acceptance window be tuned underneath it with no gap. The Redis key is
+//!   `SHA-256(nonce)` in hex — never the nonce, which is a digest input bound
+//!   to the shared secret and would otherwise reach `MONITOR`, `SLOWLOG`, and
+//!   the Redis client's error logs — and the stored value is a fixed non-secret
+//!   marker.
 //!
 //! A shared-backend outage fails closed exactly like local exhaustion. There is
 //! no fallback to process-local state: a per-replica fallback would silently
@@ -210,7 +241,17 @@ const MAX_TIMESTAMP_MAX_AGE_SECONDS: u64 = 86_400;
 const MIN_CLOCK_SKEW_SECONDS: u64 = 0;
 const MAX_CLOCK_SKEW_SECONDS: u64 = 3_600;
 const MIN_NONCE_CACHE_TTL_SECONDS: u64 = 1;
-const MAX_NONCE_CACHE_TTL_SECONDS: u64 = 86_400;
+/// Ceiling for `nonce.cache_ttl_seconds`.
+///
+/// Retention has to be able to outlive the *widest admissible* PasswordDigest
+/// acceptance window, so this ceiling is derived from that window rather than
+/// picked independently. Picking it independently is exactly how the two knobs
+/// drifted apart before: a 24h `created_max_age_seconds` with a 1h skew is an
+/// admitted configuration, and a retention ceiling below
+/// [`minimum_replay_retention_seconds`] for it would make the maximum
+/// acceptance window impossible to configure coherently.
+const MAX_NONCE_CACHE_TTL_SECONDS: u64 =
+    MAX_UT_CREATED_MAX_AGE_SECONDS + 2 * MAX_CLOCK_SKEW_SECONDS + 1;
 const MIN_NONCE_MAX_CACHE_SIZE: u64 = 1;
 const MAX_NONCE_MAX_CACHE_SIZE: u64 = 1_000_000;
 
@@ -675,22 +716,43 @@ struct NonceEntry {
 /// so concurrent admissions cannot overshoot either documented hard cap.
 /// Checked arithmetic and structural cross-checks turn impossible drift into a
 /// fail-closed outcome rather than hiding it with saturating repair.
+///
+/// `retention_seconds` belongs to the *scope*, not to the plugin instance that
+/// happens to be calling. Replay state is process-global and shared across
+/// reload generations, so expiring entries with the calling generation's
+/// configured value would let a retired or freshly narrowed generation expire —
+/// or refresh, which is worse — a claim another generation made under a longer
+/// window. It is therefore a monotone high-water mark over every generation
+/// registered in the scope: it only ever grows, so an entry's protection
+/// lifetime can only ever be extended by another generation, never shortened,
+/// and a widened acceptance window extends the claims already in the map.
 struct NonceReplayState {
     cache: HashMap<Arc<str>, NonceEntry>,
     age_index: BTreeMap<NonceAgeKey, Arc<str>>,
     retained_key_bytes: usize,
     next_sequence: u64,
     last_expired_removals: usize,
+    retention_seconds: u64,
 }
 
 impl NonceReplayState {
-    fn new() -> Self {
+    fn new(retention_seconds: u64) -> Self {
         Self {
             cache: HashMap::new(),
             age_index: BTreeMap::new(),
             retained_key_bytes: 0,
             next_sequence: 0,
             last_expired_removals: 0,
+            retention_seconds,
+        }
+    }
+
+    /// Raise the scope's retention high-water mark. Deliberately monotone: a
+    /// generation with a shorter window is admitted, but it inherits the longer
+    /// protection rather than imposing its own on existing claims.
+    fn raise_retention(&mut self, retention_seconds: u64) {
+        if retention_seconds > self.retention_seconds {
+            self.retention_seconds = retention_seconds;
         }
     }
 
@@ -743,6 +805,48 @@ impl NonceReplayState {
     }
 }
 
+// ── Replay retention contract ───────────────────────────────────────────────
+
+/// Shortest replay retention that provably outlives an accepted PasswordDigest
+/// token, in seconds, for a `created_max_age_seconds` / `created_clock_skew_seconds`
+/// pair.
+///
+/// A PasswordDigest token's only self-contained instant is its own `wsu:Created`
+/// (`C`), which is bound into the digest. `validate_username_token_created`
+/// accepts the token at server time `t` exactly while
+///
+/// ```text
+/// C - skew  <=  t  <=  C + max_age + skew
+/// ```
+///
+/// The *earliest* moment a claim can be made is therefore `t0 = C - skew`
+/// (future-skew acceptance — the token is submitted before its own `Created`
+/// instant), and the *latest* moment the same unchanged token is still accepted
+/// is `C + max_age + skew`. The longest span a claim must cover is the
+/// difference:
+///
+/// ```text
+/// (C + max_age + skew) - (C - skew) = max_age + 2 * skew
+/// ```
+///
+/// Retaining for `max_age + 2 * skew + 1` seconds makes the claim strictly
+/// outlive the token from *any* admissible claim instant, not only from the
+/// earliest one: a claim at `t0` covers `[t0, t0 + max_age + 2*skew + 1)`, and
+/// every later claim only shifts that interval forward while the token's
+/// remaining life shrinks by the same amount. The `+ 1` absorbs the whole-second
+/// truncation used by the process-local age comparison, so the exact boundary
+/// instant is still inside the claim and boundary + 1 is outside acceptance.
+///
+/// Returns `None` on arithmetic overflow, which fails admission closed. Admitted
+/// inputs are bounded well below that, so `None` is unreachable for any admitted
+/// configuration; it is not assumed.
+fn minimum_replay_retention_seconds(created_max_age: u64, created_clock_skew: u64) -> Option<u64> {
+    created_clock_skew
+        .checked_mul(2)
+        .and_then(|skew_span| created_max_age.checked_add(skew_span))
+        .and_then(|span| span.checked_add(1))
+}
+
 // ── Replay-state scope and backend ──────────────────────────────────────────
 
 /// Operator-declared deployment scope for PasswordDigest replay state.
@@ -787,15 +891,33 @@ static NONCE_REPLAY_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<Mutex<NonceRepl
 /// construction. Those get private state so a validation call can neither read,
 /// mutate, nor consume a live proxy's replay history, and cannot consume a
 /// registry slot.
-fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplayState>>, String> {
+///
+/// `retention_seconds` is this generation's required retention. Joining an
+/// existing scope raises that scope's monotone high-water mark, so a widened
+/// acceptance window extends the claims already recorded there and a narrowed
+/// one leaves them alone. The scope state lock is taken *after* the registry
+/// lock is released; nothing else ever holds both.
+fn process_replay_state(
+    scope_key: Option<&str>,
+    retention_seconds: u64,
+) -> Result<Arc<Mutex<NonceReplayState>>, String> {
     let Some(scope_key) = scope_key else {
-        return Ok(Arc::new(Mutex::new(NonceReplayState::new())));
+        return Ok(Arc::new(Mutex::new(NonceReplayState::new(retention_seconds))));
     };
     let Ok(mut registry) = NONCE_REPLAY_REGISTRY.lock() else {
         return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
     };
-    if let Some(existing) = registry.get(scope_key) {
-        return Ok(Arc::clone(existing));
+    let existing_scope = registry.get(scope_key).cloned();
+    if let Some(existing) = existing_scope {
+        drop(registry);
+        let Ok(mut state) = existing.lock() else {
+            // A poisoned scope must not be reused: it would silently answer
+            // from state whose accounting invariants were never re-proved.
+            return Err("soap_ws_security: replay scope state is unavailable".to_string());
+        };
+        state.raise_retention(retention_seconds);
+        drop(state);
+        return Ok(existing);
     }
     if registry.len() >= MAX_NONCE_REPLAY_SCOPES {
         // Fixed diagnostic: the scope key embeds an operator resource id, which
@@ -805,7 +927,7 @@ fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplay
              PasswordDigest replay scopes in one process"
         ));
     }
-    let state = Arc::new(Mutex::new(NonceReplayState::new()));
+    let state = Arc::new(Mutex::new(NonceReplayState::new(retention_seconds)));
     registry.insert(scope_key.to_string(), Arc::clone(&state));
     Ok(state)
 }
@@ -847,6 +969,9 @@ pub(crate) struct NonceReplayObservationForTests {
     pub(crate) shared_key_entries: usize,
     pub(crate) last_expired_removals: usize,
     pub(crate) max_maintenance_entries: usize,
+    /// The scope's monotone retention high-water mark, in seconds — the value
+    /// entries are actually expired against, not the caller's configured one.
+    pub(crate) retention_seconds: u64,
 }
 
 // ── Plugin struct ───────────────────────────────────────────────────────────
@@ -904,6 +1029,13 @@ pub struct SoapWsSecurity {
     /// shared state is claimed atomically in Redis so replicas cannot each
     /// accept the same captured token.
     nonce_backend: NonceReplayBackend,
+    /// Declared claim retention for this generation, in seconds. Admission
+    /// requires it to be at least
+    /// `created_max_age_seconds + 2 * created_clock_skew_seconds + 1` whenever
+    /// PasswordDigest replay state is reachable, which is what makes a claim
+    /// outlive the token it protects. It is the TTL of a shared (Redis) claim
+    /// and the value a process scope's monotone retention mark is raised to;
+    /// process-local expiry reads that mark, never this field.
     nonce_cache_ttl_seconds: u64,
     max_nonce_cache_size: usize,
     /// Encoded-nonce ceiling, enforced before Base64 decoding and before any
@@ -1351,11 +1483,26 @@ impl SoapWsSecurity {
         // have enforced lower bounds.
         let nonce_cfg = soap_object(root, "config", "nonce")?;
         reject_unknown(nonce_cfg, "config.nonce", NONCE_CONFIG_KEYS)?;
+        // The retention floor is derived from the UsernameToken `Created`
+        // window, because that window — not this key — decides how long a
+        // captured PasswordDigest token stays acceptable. Omitting
+        // `cache_ttl_seconds` selects exactly that minimum, so the default
+        // configuration is coherent instead of leaving a 600s hole between a
+        // 900s acceptance window and a 300s claim.
+        let minimum_retention_seconds = minimum_replay_retention_seconds(
+            ut_created_max_age_seconds,
+            ut_created_clock_skew_seconds,
+        )
+        .ok_or_else(|| {
+            "soap_ws_security: 'config.username_token' Created window overflows the replay \
+             retention it requires"
+                .to_string()
+        })?;
         let nonce_cache_ttl_seconds = soap_u64_bounded(
             nonce_cfg,
             "config.nonce",
             "cache_ttl_seconds",
-            300,
+            minimum_retention_seconds,
             MIN_NONCE_CACHE_TTL_SECONDS,
             MAX_NONCE_CACHE_TTL_SECONDS,
         )?;
@@ -1419,6 +1566,24 @@ impl SoapWsSecurity {
 
         let digest_replay_active =
             username_token_enabled && password_type == PasswordType::PasswordDigest;
+
+        // The replay window must outlive the token it protects. A shorter
+        // retention is not a memory/coverage tradeoff — it is a replay window:
+        // the same unchanged UsernameToken, whose digest commits to its own
+        // `Created`, is still accepted after its claim has expired. Coupled
+        // only when PasswordDigest replay state is actually reachable, so a
+        // PasswordText or timestamp-only policy is not forced to size a cache
+        // it never populates.
+        if digest_replay_active && nonce_cache_ttl_seconds < minimum_retention_seconds {
+            return Err(format!(
+                "soap_ws_security: 'config.nonce.cache_ttl_seconds' must be at least \
+                 {minimum_retention_seconds} for this policy \
+                 (username_token.created_max_age_seconds + 2 × \
+                 username_token.created_clock_skew_seconds + 1) — a shorter retention lets a \
+                 claimed nonce expire while the same PasswordDigest token is still accepted"
+            ));
+        }
+
         if digest_replay_active && replay_scope.is_none() {
             return Err(
                 "soap_ws_security: 'config.nonce.replay_scope' is required when \
@@ -1473,7 +1638,10 @@ impl SoapWsSecurity {
             None => {
                 let scope_key =
                     plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id));
-                NonceReplayBackend::Process(process_replay_state(scope_key.as_deref())?)
+                NonceReplayBackend::Process(process_replay_state(
+                    scope_key.as_deref(),
+                    nonce_cache_ttl_seconds,
+                )?)
             }
         };
 
@@ -1896,6 +2064,35 @@ impl SoapWsSecurity {
     /// secret. The stored value is a fixed non-secret marker — the claim is
     /// proven by the key existing, so nothing derived from credentials is
     /// written.
+    /// TTL written with a shared claim.
+    ///
+    /// This is the admitted `nonce.cache_ttl_seconds`, which admission has
+    /// already proved to be at least
+    /// `created_max_age_seconds + 2 * created_clock_skew_seconds + 1` for a
+    /// PasswordDigest policy, so the Redis key outlives every instant at which
+    /// the claimed token is still accepted.
+    ///
+    /// **Across generations.** `SET NX` never touches an existing key's TTL, so
+    /// a generation configured with a shorter retention cannot shorten (or
+    /// refresh) a claim another generation already made — the shared analogue of
+    /// the process scope's monotone high-water mark. The asymmetry is the other
+    /// direction: Redis owns each key's expiry from the moment it is written,
+    /// and one atomic `SET NX EX` cannot extend a key it did not create, so
+    /// *widening* the acceptance window cannot reach back into claims already
+    /// written. Admission closes that as far as it can be closed locally by
+    /// making `cache_ttl_seconds` the declared, stable retention of the keyspace
+    /// rather than a value derived per request: an operator may tune
+    /// `created_max_age_seconds` / `created_clock_skew_seconds` freely underneath
+    /// an unchanged `cache_ttl_seconds` with no gap at all, and any change that
+    /// needs *more* retention than the keyspace was declared with is rejected at
+    /// admission instead of silently under-protecting. Raising
+    /// `cache_ttl_seconds` past the widened window must therefore land, and be
+    /// given one old-TTL period to drain, before the window itself is widened;
+    /// this is documented in `docs/plugins.md`.
+    fn shared_claim_retention_seconds(&self) -> u64 {
+        self.nonce_cache_ttl_seconds
+    }
+
     async fn claim_nonce_shared(
         &self,
         client: &RedisRateLimitClient,
@@ -1908,7 +2105,7 @@ impl SoapWsSecurity {
             return Err(Self::shared_backend_unavailable());
         }
         let key = client.make_key(&[sha256_hex_lower(nonce.as_bytes()).as_str()]);
-        let ttl_seconds = self.nonce_cache_ttl_seconds;
+        let ttl_seconds = self.shared_claim_retention_seconds();
         let claimed = client
             .set_bytes_nx_with_expire(&key, SHARED_NONCE_CLAIM_RECORD, ttl_seconds)
             .await;
@@ -1950,9 +2147,11 @@ impl SoapWsSecurity {
     /// is no lookup-map scan and no stale FIFO that can grow beyond the entry
     /// cap.
     ///
-    /// **Live entries are never evicted.** Only entries older than the
-    /// configured TTL can be reclaimed, so every nonce claimed inside its TTL
-    /// stays replay-protected for the whole window. If bounded expiry
+    /// **Live entries are never evicted.** Only entries older than the *scope's*
+    /// monotone retention mark can be reclaimed, so every nonce claimed inside
+    /// its window stays replay-protected for the whole window — including
+    /// against a reload generation that configured a shorter one, whose calls
+    /// read the same mark. If bounded expiry
     /// reclamation cannot free entry *and* byte room, this returns the fixed
     /// saturation rejection without admitting the nonce — the cache never
     /// unprotects an already-claimed nonce in order to accept a new one.
@@ -1967,6 +2166,14 @@ impl SoapWsSecurity {
     /// Lock poison, checked-arithmetic failure, or map/index drift all fail
     /// closed with the fixed saturation class and never recover through the
     /// poisoned state.
+    ///
+    /// **Retention.** The window an entry is measured against is the scope's
+    /// `retention_seconds` high-water mark, not `self.nonce_cache_ttl_seconds`.
+    /// Admission proved every generation's own value covers
+    /// `created_max_age_seconds + 2 * created_clock_skew_seconds + 1`, and the
+    /// mark is the maximum over the generations that registered in the scope, so
+    /// a claim outlives its token under the claiming generation *and* under any
+    /// other generation sharing the scope.
     ///
     /// **Scope.** This is the `nonce.replay_scope = "process"` path. The state
     /// it consults is registered under a stable `{namespace}|{plugin-config-id}`
@@ -1994,6 +2201,11 @@ impl SoapWsSecurity {
             Ok(state) => state,
             Err(_) => return Err(Self::nonce_state_saturated()),
         };
+        // Retention belongs to the scope, never to this instance: the state is
+        // shared across reload generations, and a retired or newly narrowed
+        // generation must not be able to expire (or refresh, which re-admits)
+        // a claim made under a longer-lived one.
+        let retention_seconds = state.retention_seconds;
         state.last_expired_removals = 0;
 
         if !state.structurally_consistent() {
@@ -2012,7 +2224,7 @@ impl SoapWsSecurity {
             if !indexed_nonce_matches {
                 return Err(Self::nonce_state_saturated_after_unlock(state));
             }
-            if Self::nonce_age_seconds(now, age_key.0) < self.nonce_cache_ttl_seconds {
+            if Self::nonce_age_seconds(now, age_key.0) < retention_seconds {
                 return Err("WS-Security: nonce replay detected".to_string());
             }
 
@@ -2048,7 +2260,7 @@ impl SoapWsSecurity {
                 incoming_bytes,
                 self.max_nonce_cache_size,
                 self.max_nonce_cache_bytes,
-                self.nonce_cache_ttl_seconds,
+                retention_seconds,
                 now,
             ) {
                 Ok(made_room) => made_room,
@@ -2192,7 +2404,33 @@ impl SoapWsSecurity {
             shared_key_entries,
             last_expired_removals: state.last_expired_removals,
             max_maintenance_entries: NONCE_MAX_MAINTENANCE_ENTRIES,
+            retention_seconds: state.retention_seconds,
         })
+    }
+
+    /// The inner-`Created` admission decision at an explicit instant, so the
+    /// exact endpoints of the acceptance interval can be pinned without a
+    /// wall-clock race.
+    #[allow(dead_code)]
+    pub(crate) fn username_token_created_outcome_for_tests(
+        &self,
+        security_block: &str,
+        created_raw: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.validate_username_token_created(security_block, created_raw, now)
+    }
+
+    /// The TTL a shared (Redis) claim is written with, without needing a live
+    /// server. Same value `claim_nonce_shared` passes to `SET NX EX`.
+    #[allow(dead_code)]
+    pub(crate) fn shared_claim_retention_seconds_for_tests(&self) -> Result<u64, String> {
+        match &self.nonce_backend {
+            NonceReplayBackend::Shared(_) => Ok(self.shared_claim_retention_seconds()),
+            NonceReplayBackend::Process(_) => {
+                Err("soap_ws_security: shared claim retention is shared-scope only".to_string())
+            }
+        }
     }
 
     #[allow(dead_code)]

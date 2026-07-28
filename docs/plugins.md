@@ -2207,7 +2207,7 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
 | `nonce.replay_scope` | String | *(required for PasswordDigest)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
-| `nonce.cache_ttl_seconds` | u64 | `300` | How long to remember nonces for replay detection (`1`–`86400`) |
+| `nonce.cache_ttl_seconds` | u64 | `created_max_age_seconds + 2 × created_clock_skew_seconds + 1` (`901` with defaults) | How long a claimed nonce is remembered (`1`–`93601`). For a PasswordDigest policy this is also the enforced **minimum** — see [The claim must outlive the token](#the-claim-must-outlive-the-token) |
 | `nonce.max_cache_size` | u64 | `10000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `8388608` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
@@ -2234,7 +2234,7 @@ The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per
 
 #### PasswordDigest `Created` freshness and Timestamp binding
 
-A PasswordDigest request carries **two** independent instants: the UsernameToken's own `wsu:Created` (which is hashed into the digest) and the outer `wsu:Timestamp/wsu:Created`. Validating only the outer one leaves the token itself digest-valid forever, so an attacker who captures one valid request and waits out `nonce.cache_ttl_seconds` can resubmit the unchanged UsernameToken beside a freshly minted outer Timestamp. Both are validated, and they are bound together:
+A PasswordDigest request carries **two** independent instants: the UsernameToken's own `wsu:Created` (which is hashed into the digest) and the outer `wsu:Timestamp/wsu:Created`. Validating only the outer one leaves the token itself digest-valid forever, so an attacker who captures one valid request and waits out its replay claim can resubmit the unchanged UsernameToken beside a freshly minted outer Timestamp. Both are validated, and they are bound together (and the claim is separately made to outlive the token — see [below](#the-claim-must-outlive-the-token)):
 
 - The UsernameToken `Created` must parse as an `xsd:dateTime` inside the representable four-digit-year window, must not be in the future beyond `username_token.created_clock_skew_seconds`, and must not be older than `username_token.created_max_age_seconds` + that skew. The value validated is byte-for-byte the value fed to the digest, so there is no second parse that could disagree.
 - The outer `wsu:Timestamp` is validated on **every** request in which it appears, not only when `timestamp.require: true`. `timestamp.require: false` means "a Timestamp may be absent", never "an out-of-policy Timestamp is ignored" — binding to an unvalidated instant would be no binding at all.
@@ -2242,6 +2242,32 @@ A PasswordDigest request carries **two** independent instants: the UsernameToken
 - With `username_token.require_timestamp_binding: true` (the default) a PasswordDigest request with no outer `Timestamp/Created` is rejected, so the binding cannot be dropped by simply omitting the element.
 
 Rejections are structural HTTP `401`s and never echo the `Created` value, which is a digest input bound to the shared secret.
+
+#### The claim must outlive the token
+
+Binding the two instants stops a captured UsernameToken from being paired with a *freshly minted* Timestamp. It does nothing once the nonce claim itself has expired: at that point the captured request replays unchanged, with both of its original instants still inside their windows. The claim therefore has to outlive the token.
+
+The inner window accepts an unchanged token at any server instant in
+
+```text
+[ Created − created_clock_skew_seconds , Created + created_max_age_seconds + created_clock_skew_seconds ]
+```
+
+The earliest moment its nonce can be claimed is the left endpoint — a client may legitimately submit a token a full skew *before* its own `Created`, and the future tolerance admits it. Measured from there, the same bytes stay acceptable for `created_max_age_seconds + 2 × created_clock_skew_seconds` seconds. With the defaults that is 900 s, while the old default `cache_ttl_seconds` was 300 s: a 600-second window in which the exact captured request was accepted again with no live claim protecting it.
+
+`nonce.cache_ttl_seconds` is therefore coupled to that window at admission:
+
+- Whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, `nonce.cache_ttl_seconds` must be **at least** `created_max_age_seconds + 2 × created_clock_skew_seconds + 1`. A shorter value is rejected with the required minimum named. A longer value is always allowed — it can only over-protect.
+- **Omitting it selects exactly that minimum** (`901` with the defaults), so the default configuration is coherent rather than leaving a hole.
+- The `+ 1` makes the claim *strictly* outlive the token — the last acceptable instant is still inside the claim, and the claim expires only after acceptance has ended — and absorbs the whole-second truncation the process-local age comparison uses.
+- The ceiling (`93601`) is derived from the widest admissible window (`86400 + 2 × 3600 + 1`), so the maximum acceptance settings remain configurable rather than becoming impossible to pair with a legal retention.
+- A `PasswordText` or timestamp-only policy never populates replay state, so it is not forced to size a cache it does not use.
+
+Because retention now scales with the acceptance window, size `nonce.max_cache_size` / `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × `nonce.cache_ttl_seconds`. Under-provisioning surfaces as `401` rejections, never as a silent replay window.
+
+**Across reload generations.** Process replay state is process-global and outlives the generation that created it, so retention is a property of the *scope*, not of the instance answering a request: entries expire against a monotone high-water mark over every generation registered in that scope. A retired or newly narrowed generation therefore cannot expire — or refresh, which re-admits — a claim made under a longer window, and widening the acceptance window extends the claims already recorded.
+
+Under `replay_scope: shared` the same asymmetry resolves through Redis's own semantics. `SET NX` never rewrites an existing key's TTL, so a shorter-retention generation cannot shorten another's claim either. What one atomic `SET NX EX` *cannot* do is extend a key it did not create, so `cache_ttl_seconds` is the keyspace's declared, stable retention: tune `created_max_age_seconds` / `created_clock_skew_seconds` freely underneath an unchanged value and there is no gap at all, and any change needing more retention than the keyspace was declared with is refused at admission rather than silently under-protecting. When the declared value itself must grow, raise `cache_ttl_seconds` first, give it one *old* TTL to drain so every live key carries the new retention, and only then widen the window past the old value.
 
 #### PasswordDigest replay scope
 
@@ -2267,7 +2293,7 @@ Replay state is bounded and only ever populated by a caller that has already pro
 - One canonical (trimmed) form feeds both the digest input and the replay-cache key, so the two derivations cannot drift apart.
 - A nonce is inserted only *after* its PasswordDigest verifies, so an unknown user or a wrong password cannot poison or evict a victim's replay entry.
 - The cache is capped on entries (`nonce.max_cache_size`) and on retained key UTF-8 payload bytes (`nonce.max_total_cache_bytes`). Each logical nonce has one immutable string allocation shared by the expected-O(1) lookup map and an exact `BTreeMap` age index; the byte cap counts that payload once, while hash/tree node and reference-count control-block overhead is bounded by the entry cap.
-- **A claimed nonce is never evicted while it is still inside `nonce.cache_ttl_seconds`.** At either cap the age index is walked from its oldest end and only entries *proven expired* are reclaimed; the walk stops at the first still-live entry, because everything newer is live too. There is no forced eviction of live entries, no lookup-map scan, and no stale FIFO. Reclamation is charged against an explicit 64-entry maintenance budget per request (independent of `max_cache_size`), which keeps per-request work constant while the two hard caps keep memory bounded.
+- **A claimed nonce is never evicted while it is still inside its retention window.** At either cap the age index is walked from its oldest end and only entries *proven expired* are reclaimed; the walk stops at the first still-live entry, because everything newer is live too. There is no forced eviction of live entries, no lookup-map scan, and no stale FIFO. Reclamation is charged against an explicit 64-entry maintenance budget per request (independent of `max_cache_size`), which keeps per-request work constant while the two hard caps keep memory bounded.
 - **Capacity exhaustion fails closed.** When bounded expiry reclamation cannot free both entry and byte room — or the maintenance budget runs out, or state is poisoned/inconsistent, or checked accounting fails — the request is rejected with HTTP `401` and the nonce is *not* recorded. Replay protection degrades into refusal, never into silently unprotecting an already-claimed nonce. A rejected claim never removes a live entry; any expired entries already reclaimed within the bounded budget stay removed, allowing safe retries to converge after enough state has expired. Size `nonce.max_cache_size` and `nonce.max_total_cache_bytes` for peak authenticated PasswordDigest rate × `nonce.cache_ttl_seconds`; under-provisioning them now surfaces as `401` rejections rather than as a quiet replay window.
 - Entry/byte admission, expiry reclamation, and accounting share one narrow mutex held only for those security-state updates (encoded-length checks and all credential/XML/base64/crypto work stay outside), so concurrent PasswordDigest claims cannot overshoot either hard cap and exactly one concurrent claim of the same nonce can win — including same-key races, where an in-TTL hit is a replay without a new reservation.
 - Length, saturation, and shared-backend-outage rejections log fixed-cardinality failure classes (`nonce_too_long`, `nonce_state_saturated`, `nonce_shared_backend_unavailable`) and never include the nonce value.
@@ -2309,7 +2335,10 @@ config:
     max_age_seconds: 300
   nonce:
     replay_scope: shared
-    cache_ttl_seconds: 300
+    # Declared keyspace retention. Must be at least
+    # created_max_age_seconds + 2 x created_clock_skew_seconds + 1 (901 here);
+    # a larger declared value leaves room to widen the window later.
+    cache_ttl_seconds: 1800
 sync_mode: redis
 redis_url: "redis://redis.internal:6379"
 ```
@@ -2410,7 +2439,9 @@ config:
     require_signed_timestamp: true
   nonce:
     replay_scope: process
-    cache_ttl_seconds: 600
+    # >= created_max_age_seconds + 2 x created_clock_skew_seconds + 1 (901
+    # with the defaults used here); omit the key to select exactly that.
+    cache_ttl_seconds: 1200
     max_cache_size: 50000
   reject_missing_security_header: true
 ```
