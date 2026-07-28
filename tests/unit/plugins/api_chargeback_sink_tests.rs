@@ -11,12 +11,15 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, probe_charge_body_materialization_for_tests, render_prometheus, render_status_json,
-    replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
-    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    encode_spool_bytes_without_content_size_for_tests, new_ulid,
+    probe_charge_body_materialization_for_tests, probe_compact_recovery_retry_for_tests,
+    render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
+    serialize_json_each_row, set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
-    write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
+    spool_index_entry_bytes_for_tests, spool_replay_peak_bytes_for_tests,
+    spool_split_worklist_max_entries_for_tests, write_private_file_atomically_for_tests,
+    write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
 use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
@@ -6001,5 +6004,448 @@ async fn spool_replay_failure_does_not_leak_insert_url() {
         &captured,
         "chargeback spool replay",
         &[CH_VALUE_SENTINEL],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spool-write, snapshot, and dead-letter retained-byte ownership —
+// GHSA-83h5-52mw-f33p residuals.
+//
+// The advertised process ceiling only holds if *every* attacker-shaped
+// representation is reserved before it exists: the durable spool artifact's
+// JSON and compressed forms, the snapshot accumulator's identities and staged
+// overflow, the Full -> Compact recovery payload, the replay worklist, and the
+// dead-letter accumulation. These tests assert exact reservation and release on
+// success, refusal, retry, transfer, and drop.
+// ---------------------------------------------------------------------------
+
+fn ceiling_spool(temp: &tempfile::TempDir, ceiling: &'static RetainedByteCeiling) -> SpoolManager {
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap()
+}
+
+fn compressing_ceiling_spool(
+    temp: &tempfile::TempDir,
+    ceiling: &'static RetainedByteCeiling,
+) -> SpoolManager {
+    let mut settings = spool_settings(temp.path(), 1024 * 1024);
+    settings.compression = SpoolCompression::Zstd;
+    SpoolManager::for_tests_with_ceiling(settings, "node-a", ceiling).unwrap()
+}
+
+#[test]
+fn spool_write_charges_its_json_and_compressed_representations_and_releases_them() {
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = compressing_ceiling_spool(&temp, ceiling);
+    let events = spool_replay_events(16);
+    let json_len = serialize_json_each_row(&events).unwrap().len();
+
+    let (encoded_len, held, after) = spool
+        .probe_spool_artifact_materialization_for_tests(&events)
+        .expect("artifact materializes");
+
+    assert!(encoded_len > 0);
+    assert!(
+        held >= encoded_len,
+        "the encoded artifact stays charged for its whole life: held={held} encoded={encoded_len}"
+    );
+    assert!(
+        ceiling.high_water() >= json_len + encoded_len,
+        "the JSON and compressed representations coexist and must both be charged: \
+         high_water={} json={json_len} encoded={encoded_len}",
+        ceiling.high_water()
+    );
+    assert_eq!(
+        after, 0,
+        "every spool-write reservation releases exactly once, with no underflow"
+    );
+    assert_eq!(ceiling.rejections(), 0);
+}
+
+#[test]
+fn spool_write_is_refused_rather_than_materialized_under_a_saturated_ceiling() {
+    // Far below one serialized row: the JSON reservation must be refused before
+    // a single byte is serialized.
+    let ceiling = leaked_chargeback_test_ceiling(512);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, ceiling);
+
+    let error = spool
+        .write_events(&spool_replay_events(8))
+        .expect_err("a saturated ceiling must refuse the spool artifact");
+
+    assert!(
+        error.contains("ceiling"),
+        "the refusal must name the ceiling: {error}"
+    );
+    assert!(
+        !error.contains("evt-ceiling-"),
+        "refusal diagnostics must not carry charge-record fields: {error}"
+    );
+    assert_eq!(ceiling.used(), 0, "a refused write leaks no reservation");
+    assert!(ceiling.rejections() > 0);
+    assert_eq!(
+        spool.list_owned_spool_files_for_tests().unwrap().len(),
+        0,
+        "a refused write must not publish a partial artifact"
+    );
+}
+
+#[test]
+fn every_writable_artifact_is_structurally_replayable_under_the_same_ceiling() {
+    // The liveness contract: if a ceiling admitted the write, it must also admit
+    // the replay. The write reserves `charge_body_byte_bound`; replay's peak is
+    // `spool_replay_peak_bytes`. Proving the second never exceeds the first, for
+    // every artifact shape this build can produce, is what rules out an artifact
+    // that is deterministically impossible to read back.
+    let roomy = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    for count in [1usize, 2, 8, 64, 512, 4_096] {
+        let events = spool_replay_events(count);
+        let (write_bound, _held, _after) =
+            probe_charge_body_materialization_for_tests(roomy, &events)
+                .expect("the write reservation must be representable");
+        let json_len = serialize_json_each_row(&events).unwrap().len() as u64;
+        let replay_peak = spool_replay_peak_bytes_for_tests(json_len, count)
+            .expect("the replay peak must be representable");
+        assert!(
+            replay_peak <= write_bound as u64,
+            "a {count}-row artifact would need {replay_peak} replay bytes but only \
+             {write_bound} were required to write it"
+        );
+    }
+    assert_eq!(roomy.used(), 0);
+}
+
+#[tokio::test]
+async fn spool_replay_of_a_written_artifact_fits_under_the_proven_liveness_bound() {
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[200]).await;
+
+    let events = spool_replay_events(256);
+    let json_len = serialize_json_each_row(&events).unwrap().len() as u64;
+    let peak = spool_replay_peak_bytes_for_tests(json_len, events.len()).unwrap();
+
+    let write_ceiling = leaked_chargeback_test_ceiling(64 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, write_ceiling);
+    let path = spool.write_events(&events).expect("artifact is admitted");
+
+    // Replay against exactly the proven bound — no slack. A file this build
+    // spooled must replay under it rather than becoming permanently
+    // unreplayable.
+    let ceiling = leaked_chargeback_test_ceiling(usize::try_from(peak).unwrap());
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 128, ceiling)
+        .await
+        .expect("a written artifact must be replayable under the same ceiling");
+
+    assert!(!path.exists(), "a delivered artifact is removed");
+    assert_eq!(ceiling.used(), 0, "replay releases every reservation");
+    assert_eq!(
+        ceiling.rejections(),
+        0,
+        "the proven bound must leave no room for a structural refusal"
+    );
+    assert!(
+        ceiling.high_water() <= peak as usize,
+        "observed peak {} exceeded the proven bound {peak}",
+        ceiling.high_water()
+    );
+}
+
+#[test]
+fn spool_replay_worklist_reservation_is_independent_of_row_count() {
+    let entries = spool_split_worklist_max_entries_for_tests();
+    let entry_bytes = spool_index_entry_bytes_for_tests();
+    assert!(
+        entries >= usize::BITS as usize,
+        "the bound must cover every halving level"
+    );
+
+    // The worklist charge is the same for one row and for a million: the old
+    // O(lines) reservation is what could strand a healthy artifact.
+    let small = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
+    let large = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
+    assert_eq!(small, large);
+    let worklist = (entries * entry_bytes) as u64;
+    assert!(
+        small >= worklist,
+        "the peak accounting must include the fixed worklist reservation"
+    );
+
+    // Row-count growth costs only the line index, never a per-line worklist slot.
+    let one_row = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
+    let many_rows = spool_replay_peak_bytes_for_tests(1_024, 1_001).unwrap();
+    assert_eq!(
+        many_rows - one_row,
+        1_000 * (entry_bytes as u64 + 1),
+        "each extra row costs exactly one index entry plus its row separator"
+    );
+}
+
+#[tokio::test]
+async fn spool_replay_dead_letter_accounting_is_aggregated_not_per_row() {
+    let server = MockServer::start().await;
+    // Whole file rejected permanently: one aggregate outcome, not one per row.
+    mount_status_sequence(&server, &[400]).await;
+
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, ceiling);
+    let events = spool_replay_events(64);
+    let path = spool.write_events(&events).unwrap();
+
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 128, ceiling)
+        .await
+        .expect("a permanent rejection is not a replay error");
+
+    let meta_path = dead_letter_meta_path(&path);
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["rejected_rows"].as_u64().unwrap(),
+        64,
+        "every rejected row must still be counted"
+    );
+    let outcomes = meta["outcomes"].as_array().unwrap();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "64 rejected rows must aggregate into one outcome: {outcomes:?}"
+    );
+    assert_eq!(outcomes[0]["http_status"], 400);
+    assert_eq!(outcomes[0]["reason"], "permanent_http");
+    assert_eq!(outcomes[0]["row_count"].as_u64().unwrap(), 64);
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[tokio::test]
+async fn spool_replay_dead_letter_tally_preserves_distinct_statuses() {
+    let server = MockServer::start().await;
+    // 403 is retryable here, so distinct *permanent* statuses come from 400/404:
+    // (0,4) 413 -> (0,1) 413 (single-row dead letter), (1,4) 413 -> (1,2) 400,
+    // (2,4) 413 -> (2,3) 404, (3,4) 200.
+    mount_status_sequence(&server, &[413, 413, 413, 400, 413, 404, 200]).await;
+
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, ceiling);
+    let path = spool.write_events(&spool_replay_events(4)).unwrap();
+
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 1, ceiling)
+        .await
+        .expect("permanent rejections are not replay errors");
+
+    let meta_path = dead_letter_meta_path(&path);
+    let meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let outcomes = meta["outcomes"].as_array().unwrap();
+    let statuses: Vec<u64> = outcomes
+        .iter()
+        .filter_map(|outcome| outcome["http_status"].as_u64())
+        .collect();
+    assert!(
+        statuses.contains(&400) && statuses.contains(&404),
+        "distinct permanent statuses must survive aggregation: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().any(|outcome| {
+            outcome["reason"] == "payload_too_large" && outcome["http_status"] == 413
+        }),
+        "a single-row 413 must still be recorded as its own reason: {outcomes:?}"
+    );
+    let total: u64 = outcomes
+        .iter()
+        .map(|outcome| outcome["row_count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, meta["rejected_rows"].as_u64().unwrap());
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn snapshot_accumulators_share_one_process_ceiling_across_instances() {
+    // Below the sum of the two per-instance budgets, so the shared ceiling —
+    // not the private one — is what stops the second instance.
+    let ceiling = leaked_chargeback_test_ceiling(48 * 1024);
+    let charge = unit_call_charge(0.01);
+
+    let first = SnapshotAccumulator::with_limits_shards_and_ceiling(4_096, 32 * 1024, 8, ceiling);
+    let second = SnapshotAccumulator::with_limits_shards_and_ceiling(4_096, 32 * 1024, 8, ceiling);
+
+    let mut first_accumulated = 0usize;
+    for index in 0..4_096 {
+        if !first.record_accumulated_for_test(
+            "ns",
+            &format!("first-{index}"),
+            "proxy",
+            "proxy-name",
+            200,
+            "http",
+            charge,
+        ) {
+            break;
+        }
+        first_accumulated += 1;
+    }
+    assert!(first_accumulated > 0, "the first instance must admit work");
+    assert_eq!(
+        first.process_retained_bytes_for_tests(),
+        first.retained_bytes_for_tests(),
+        "the process charge must track the per-instance counter exactly"
+    );
+
+    let mut second_accumulated = 0usize;
+    for index in 0..4_096 {
+        if !second.record_accumulated_for_test(
+            "ns",
+            &format!("second-{index}"),
+            "proxy",
+            "proxy-name",
+            200,
+            "http",
+            charge,
+        ) {
+            break;
+        }
+        second_accumulated += 1;
+    }
+
+    assert!(
+        ceiling.used() <= ceiling.max(),
+        "N instances must not multiply past the shared ceiling: used={} max={}",
+        ceiling.used(),
+        ceiling.max()
+    );
+    assert!(
+        second_accumulated < first_accumulated,
+        "the second instance must be squeezed by the shared ceiling, not get its own \
+         private budget: first={first_accumulated} second={second_accumulated}"
+    );
+    assert!(
+        ceiling.rejections() > 0,
+        "shared-ceiling refusals must be counted"
+    );
+
+    // Clear and drop both release exactly what they took, with no underflow.
+    first.clear_for_compaction_for_tests();
+    assert_eq!(first.process_retained_bytes_for_tests(), 0);
+    let after_first = ceiling.used();
+    assert_eq!(after_first, second.process_retained_bytes_for_tests());
+    drop(second);
+    assert_eq!(ceiling.used(), 0, "drop releases the remaining charge");
+    drop(first);
+    assert_eq!(ceiling.used(), 0, "a cleared accumulator cannot double-release");
+}
+
+#[test]
+fn snapshot_accumulator_releases_its_process_charge_when_overflow_is_drained() {
+    let ceiling = leaked_chargeback_test_ceiling(1024 * 1024);
+    let accumulator =
+        SnapshotAccumulator::with_limits_shards_and_ceiling(4, 512 * 1024, 4, ceiling);
+
+    for index in 0..8 {
+        assert!(
+            accumulator.stage_overflow_event_for_tests(sample_event(&format!("overflow-{index}"))),
+            "staging must be admitted below the ceiling"
+        );
+    }
+    let staged = accumulator.process_retained_bytes_for_tests();
+    assert!(staged > 0, "staged overflow must charge the process ceiling");
+    assert_eq!(staged, ceiling.used());
+
+    accumulator.clear_for_compaction_for_tests();
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "draining staged overflow releases exactly the staged bytes"
+    );
+    assert_eq!(accumulator.retained_bytes_for_tests(), 0);
+}
+
+#[test]
+fn compact_snapshot_recovery_owns_its_reservation_and_restores_deltas_on_a_failed_retry() {
+    let ceiling = leaked_chargeback_test_ceiling(1024 * 1024);
+    let events: Vec<ChargeEvent> = (0..12)
+        .map(|index| sample_event(&format!("compact-{index}")))
+        .collect();
+
+    let (reserved, held_after_retry, pending, after_drop) =
+        probe_compact_recovery_retry_for_tests(ceiling, events)
+            .expect("the probe must observe a failed handoff");
+
+    assert!(reserved > 0);
+    assert_eq!(
+        held_after_retry, reserved,
+        "a failed retry must neither release the reservation nor take a second one \
+         for a clone of the pending set"
+    );
+    assert_eq!(
+        pending, 12,
+        "a failed handoff must restore every pending billing delta"
+    );
+    assert_eq!(
+        after_drop, 0,
+        "dropping the recovery releases its reservation exactly once"
+    );
+}
+
+#[test]
+fn compact_snapshot_recovery_is_refused_rather_than_built_under_a_saturated_ceiling() {
+    let ceiling = leaked_chargeback_test_ceiling(256);
+    let events: Vec<ChargeEvent> = (0..12)
+        .map(|index| sample_event(&format!("compact-refused-{index}")))
+        .collect();
+
+    let error = probe_compact_recovery_retry_for_tests(ceiling, events)
+        .expect_err("a saturated ceiling must refuse the recovery payload");
+    assert!(error.contains("ceiling"), "{error}");
+    assert_eq!(ceiling.used(), 0);
+    assert!(ceiling.rejections() > 0);
+}
+
+#[test]
+fn a_zstd_artifact_without_a_frame_content_size_still_decodes_via_the_ratio_clamp() {
+    // Legacy and foreign archives carry no decompressed size in the frame
+    // header. Replay must fall back to the ratio clamp rather than refusing
+    // them, and the clamp must still fail closed on a high-ratio bomb.
+    let temp = tempfile::tempdir().unwrap();
+
+    let plain = vec![b'\n'; 512 * 1024];
+    let legacy =
+        encode_spool_bytes_without_content_size_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let legacy_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC1.ndjson.zst");
+    fs::write(&legacy_path, &legacy).unwrap();
+    let decoded = decode_spool_file_for_tests(&legacy_path)
+        .expect("a frame without a content size must still decode");
+    assert_eq!(decoded.len(), plain.len());
+
+    let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
+    let bomb =
+        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
+            .unwrap();
+    let bomb_path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC2.ndjson.zst");
+    fs::write(&bomb_path, &bomb).unwrap();
+    let err = decode_spool_file_for_tests(&bomb_path)
+        .expect_err("the ratio clamp must still bound a header-less high-ratio archive");
+    assert!(err.contains("decompression bound"), "unexpected error: {err}");
+}
+
+#[test]
+fn a_zstd_artifact_this_build_writes_declares_its_decompressed_size() {
+    // The declared size is what replay reserves instead of the 200x heuristic,
+    // so an ordinary compressible batch no longer reserves two orders of
+    // magnitude more than it needs.
+    let plain = vec![b'\n'; 512 * 1024];
+    let one_shot = encode_spool_bytes_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let streamed =
+        encode_spool_bytes_without_content_size_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    assert_ne!(
+        one_shot, streamed,
+        "the production encoder must record the decompressed size the streaming one omits"
+    );
+    let ratio_bound = spool_decompression_limit_for_tests(one_shot.len() as u64);
+    assert!(
+        ratio_bound > plain.len() as u64,
+        "the heuristic must really over-reserve for this fixture: ratio={ratio_bound} \
+         actual={}",
+        plain.len()
     );
 }

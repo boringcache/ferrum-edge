@@ -135,6 +135,23 @@ only):
   inserter releases its reservation and refreshes the winner exactly once, so a
   new-key/refresh race can never pin state above the configured ceilings or
   double-charge a slot.
+- The same reservation is taken a second time against the **process-wide**
+  retained-byte ceiling (`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES`), in lockstep
+  with the per-instance counter. `max_retained_bytes` bounds one accumulator;
+  the process ceiling bounds the sum across every configured instance and every
+  pending snapshot generation, so N instances cannot multiply past the
+  advertised process total. Eviction, overflow drain, compaction clear, and drop
+  each release exactly what they took; releases are saturating, so a double
+  release cannot underflow the shared counter.
+- Every projection built from the accumulator — the periodic delta emission, the
+  final emission, and the Full→Compact compaction payload — reserves its own
+  process-wide charge **before** it is allocated, because it coexists with the
+  still-charged accumulator. A refusal is retryable: no baseline is advanced and
+  no pending delta is discarded. Compaction transfers that reservation to the
+  compact recovery entry, which holds it until the pending deltas are durably
+  spooled or the entry is dropped. A compact retry takes ownership of the
+  pending set rather than cloning it, and restores it unconditionally if the
+  handoff fails; the recovery mutex is never held across filesystem work.
 - Each accumulator slot has a stable **generation** (assigned at insert) and a
   **revision** that bumps on every refresh. Stale cleanup may scan candidates
   first, but eviction is a single conditional `remove_if`: the entry is removed
@@ -526,11 +543,29 @@ fields are never logged.
   files can continue to replay.
 - Every encoded and decoded spool artifact is hard-capped at 256 MiB, matching
   the sink's maximum accepted retained-byte budget. The writer refuses a larger
-  artifact, so it cannot publish a record this build will not replay. Within
-  that ceiling, a `zstd` record may expand to at most 200x its encoded size
-  (floor 1 MiB). A planted large raw file or high-ratio archive inside the
-  managed tree is quarantined as `.corrupt` without first being read or expanded
-  without limit inside the billing process.
+  artifact, so it cannot publish a record this build will not replay. A `zstd`
+  record written by this build records its decompressed size in the frame
+  header, and that is the (tight) bound replay reserves before reading it; a
+  foreign or hand-planted archive with no such header falls back to at most 200x
+  its encoded size (floor 1 MiB). A planted large raw file or high-ratio archive
+  inside the managed tree is quarantined as `.corrupt` without first being read
+  or expanded without limit inside the billing process.
+- Building a spool artifact is charged to the process-wide retained-byte
+  ceiling. The JSONEachRow serialization and, under `zstd`, its compressed form
+  are each reserved **before** they are allocated — the queued charge events
+  still hold their export leases at that point — and the compressed artifact's
+  reservation is held across the blocking write, fsync, and rename. A ceiling
+  refusal is reported through the existing spool-write failure accounting and
+  publishes nothing.
+- The writer additionally refuses any artifact whose *replay* would not fit
+  under the same configured process ceiling. Replay retains, at its peak, one
+  decoded text buffer, one `(start, end)` line index entry per row, a
+  fixed-capacity 413-split worklist, and one request body for the chunk in
+  flight. Because that peak is always below what writing the same artifact
+  required, a file this build successfully spooled is never structurally
+  unreplayable. Transient ceiling *pressure* is different and stays retryable:
+  the claim is released and the artifact replays in order on a later tick — a
+  busy ceiling never quarantines a healthy file.
 - `spool.meta.json` is bounded separately at 64 KiB. It is the one managed file
   read *before* ownership is established — on every prepare and every replay
   listing — so it is reachable without first deriving this owner's tag. An
@@ -540,8 +575,12 @@ fields are never logged.
   after one deterministic sibling `.rejected.meta` JSON document has been
   durably written for the source file. The document contains the aggregate
   `rejected_rows`, safe `outcomes` (`reason`, optional `http_status`, and
-  `row_count`), and `quarantined_at_unix`. It never retains the rejected
-  payload, response bodies, credentials, or charge-record PII. If the metadata
+  `row_count`), and `quarantined_at_unix`. Rejections are accumulated into a
+  fixed-size per-status tally whose footprint is independent of the artifact's
+  row count, so a hostile row count cannot grow an uncharged accumulator while
+  the decoded artifact is still retained; per-status row counts stay exact. The
+  document never retains the rejected payload, response bodies, credentials, or
+  charge-record PII. If the metadata
   write fails, the original file remains replayable; successfully inserted
   rows may be retried with their unchanged `event_id` idempotency identity.
 - Temps left by an interrupted atomic write are reconciled only when this process

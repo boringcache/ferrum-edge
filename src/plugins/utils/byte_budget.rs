@@ -295,6 +295,120 @@ impl Drop for ProcessByteReservation {
     }
 }
 
+/// A reservation against a [`RetainedByteCeiling`] whose size changes over the
+/// life of the state it charges.
+///
+/// [`ProcessByteReservation`] fits a payload that is sized once and then held.
+/// Long-lived, incrementally mutated retained state — a snapshot accumulator
+/// that admits and evicts identities, a recovery payload whose exact size is
+/// only known after it is built — needs to grow and shrink instead. Growth
+/// fails closed when the ceiling is exhausted; shrinking is saturating, so a
+/// double release can never underflow the shared counter. Drop releases
+/// whatever is still held, which covers cancellation, panic unwinding, and
+/// ordinary teardown alike.
+#[derive(Debug)]
+pub struct GrowableProcessReservation {
+    ceiling: &'static RetainedByteCeiling,
+    held: AtomicUsize,
+}
+
+impl GrowableProcessReservation {
+    pub fn new(ceiling: &'static RetainedByteCeiling) -> Self {
+        Self {
+            ceiling,
+            held: AtomicUsize::new(0),
+        }
+    }
+
+    /// Charge `bytes` in addition to what is already held. Returns `false` when
+    /// the ceiling refused, in which case nothing was charged and the caller
+    /// must not allocate.
+    pub fn try_grow(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let Some(reservation) = self.ceiling.try_acquire(bytes) else {
+            return false;
+        };
+        // Take ownership of the accepted bytes: zeroing the handle disarms its
+        // `Drop`, so the charge moves to `held` rather than being released.
+        let accepted = reservation.bytes.swap(0, Ordering::AcqRel);
+        self.held.fetch_add(accepted, Ordering::AcqRel);
+        true
+    }
+
+    /// Release up to `bytes` of the held charge. Saturating: releasing more
+    /// than is held releases exactly what is held.
+    pub fn shrink_by(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut released = 0usize;
+        let _ = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                released = held.min(bytes);
+                Some(held - released)
+            });
+        if released != 0 {
+            self.ceiling.used.fetch_sub(released, Ordering::AcqRel);
+        }
+    }
+
+    /// Release the entire held charge (idempotent).
+    pub fn release_all(&self) {
+        let released = self.held.swap(0, Ordering::AcqRel);
+        if released != 0 {
+            self.ceiling.used.fetch_sub(released, Ordering::AcqRel);
+        }
+    }
+
+    /// Bytes currently charged by this reservation.
+    // Read by external unit tests only; the binary target cannot observe them.
+    #[allow(dead_code)]
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for GrowableProcessReservation {
+    fn drop(&mut self) {
+        self.release_all();
+    }
+}
+
+/// Reserve `bound` bytes against `ceiling` **before** the buffer exists, hand
+/// the zeroed buffer to `fill`, and wrap however many bytes `fill` reports into
+/// an owned payload that keeps holding the reservation.
+///
+/// This is the companion of [`materialize_reserved_payload`] for producers that
+/// need a contiguous `&mut [u8]` rather than a [`Write`] sink — notably
+/// one-shot compressors. `fill` must return the number of leading bytes it
+/// wrote; a larger value is rejected as [`PayloadMaterializationError::BoundExceeded`]
+/// rather than trusted.
+pub fn materialize_reserved_buffer<F>(
+    ceiling: &'static RetainedByteCeiling,
+    bound: usize,
+    fill: F,
+) -> Result<ReservedPayload, PayloadMaterializationError>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, String>,
+{
+    let reservation = ceiling
+        .try_acquire(bound)
+        .ok_or(PayloadMaterializationError::CeilingExhausted)?;
+    let mut buffer = vec![0u8; bound];
+    let written = fill(&mut buffer).map_err(|_| PayloadMaterializationError::WriteFailed)?;
+    if written > bound {
+        return Err(PayloadMaterializationError::BoundExceeded);
+    }
+    buffer.truncate(written);
+    Ok(ReservedPayload {
+        bytes: Bytes::from(buffer),
+        _reservation: reservation,
+    })
+}
+
 /// Default per-entry retained-byte ceiling for summary log sinks.
 pub const DEFAULT_MAX_ENTRY_BYTES: usize = 65_536;
 /// Hard maximum for a single admitted observability record.
