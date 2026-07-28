@@ -11,7 +11,7 @@ use ferrum_edge::plugins::utils::metadata_redaction::{
     is_sensitive_metadata_key_with_extras, parse_extras_list, strip_internal_only_metadata,
 };
 use ferrum_edge::plugins::{RequestContext, TransactionSummary};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 const LEGACY_DEDUP_FIELDS: &[&str] = &[
@@ -99,9 +99,11 @@ fn assert_no_lifecycle_leak(json: &str, parsed: &Value) {
     }
 }
 
-fn assert_api_credentials_redacted(json: &str, lookup: impl Fn(&str) -> Option<&Value>) {
+fn assert_api_credentials_redacted(json: &str, md: &Map<String, Value>) {
     for (idx, key) in API_CREDENTIAL_KEYS.iter().enumerate() {
-        let value = lookup(key).unwrap_or_else(|| panic!("missing projected key {key}: {json}"));
+        let value = md
+            .get(*key)
+            .unwrap_or_else(|| panic!("missing projected key {key}: {json}"));
         assert_eq!(
             value.as_str(),
             Some(REDACTED_PLACEHOLDER),
@@ -115,10 +117,12 @@ fn assert_api_credentials_redacted(json: &str, lookup: impl Fn(&str) -> Option<&
     }
 }
 
-fn assert_counters_visible(lookup: impl Fn(&str) -> Option<&Value>) {
+fn assert_counters_visible(md: &Map<String, Value>) {
     for (idx, key) in NON_SECRET_COUNTERS.iter().enumerate() {
         let expected = format!("counter-{idx}");
-        let value = lookup(key).unwrap_or_else(|| panic!("missing counter key {key}"));
+        let value = md
+            .get(*key)
+            .unwrap_or_else(|| panic!("missing counter key {key}"));
         assert_eq!(value.as_str(), Some(expected.as_str()));
     }
 }
@@ -196,8 +200,8 @@ fn native_summary_omits_dedup_fields_and_redacts_api_credentials() {
         .expect("native metadata object");
 
     assert_no_lifecycle_leak(&json, &parsed);
-    assert_api_credentials_redacted(&json, |key| md.get(key));
-    assert_counters_visible(|key| md.get(key));
+    assert_api_credentials_redacted(&json, md);
+    assert_counters_visible(md);
     assert_eq!(
         md.get("trace_id").and_then(Value::as_str),
         Some("trace-visible")
@@ -215,8 +219,8 @@ fn nested_schema_view_matches_native_redaction_contract() {
         .expect("nested metadata");
 
     assert_no_lifecycle_leak(&json, &parsed);
-    assert_api_credentials_redacted(&json, |key| md.get(key));
-    assert_counters_visible(|key| md.get(key));
+    assert_api_credentials_redacted(&json, md);
+    assert_counters_visible(md);
 }
 
 #[test]
@@ -278,8 +282,8 @@ fn renamed_metadata_outer_field_still_redacts_inner_keys() {
     for key in LEGACY_DEDUP_FIELDS {
         assert!(attrs.get(*key).is_none(), "{key} leaked under rename");
     }
-    assert_api_credentials_redacted(&json, |key| attrs.get(key));
-    assert_counters_visible(|key| attrs.get(key));
+    assert_api_credentials_redacted(&json, attrs);
+    assert_counters_visible(attrs);
 }
 
 #[test]
