@@ -125,6 +125,8 @@ The standalone `gateway-api-conformance.yml` workflow is the single owner that d
 
 Direct black-box checks cover hostname, path, method, headers, weighted backend selection, zero-weight-only HTTP 500 behavior, cross-namespace references, invalid references, backend failure, TLS, route updates, and route deletion for HTTP, plus TCPRoute parent/listener attachment, ReferenceGrant backend resolution, tagged echo traffic, fail-closed empty/missing/unpermitted backends, status, update, and deletion. Diagnostics and the upstream conformance report are uploaded from `conformance-results/` as retained CI artifacts.
 
+Lab bootstrap uses `scripts/gateway_api_conformance_lab_setup.sh` (kind ports, experimental CRDs, TCP listener Service ports). HTTP/GRPC upstream and black-box phases stay in `scripts/gateway_api_data_plane_conformance.sh`; TCPRoute black-box and supplemental diagnostics run via `scripts/gateway_api_tcproute_conformance.sh` so the Trusted Cross Build Policy frozen `gateway_api_data_plane_conformance.sh` surface on `main` stays untouched.
+
 The standalone Gateway API conformance workflow triggers on every PR, but a lightweight `changes` job gates the heavy lab job internally: it runs the conformance suite only when the PR diff touches routing, Kubernetes translation/status, CP/DP sync, data-plane startup, plugins, charts, the conformance script, or related CI files, and otherwise skips it. Artifacts are retained for 90 days so the standard upstream report can be reproduced from the workflow inputs and preserved as release evidence.
 
 ## Status emission scope
@@ -194,7 +196,9 @@ condition **status**, not custom reason strings.
 
 Each run uploads a `gateway-api-conformance-<version>` bundle from
 `conformance-results/` (90-day retention), produced by
-`scripts/gateway_api_data_plane_conformance.sh diagnostics`:
+`scripts/gateway_api_data_plane_conformance.sh diagnostics` (plus
+`scripts/gateway_api_tcproute_conformance.sh diagnostics` for TCPRoute log
+snapshots and the extended `gateway-api-resources.yaml`):
 
 | File | What it is |
 | --- | --- |

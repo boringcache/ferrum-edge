@@ -162,7 +162,7 @@ jobs:
       - name: Set up Ferrum Gateway API lab
         env:
           GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
-        run: bash scripts/gateway_api_data_plane_conformance.sh setup
+        run: bash scripts/gateway_api_conformance_lab_setup.sh setup
 
       - name: Run upstream Gateway API conformance
         id: conformance
@@ -183,6 +183,11 @@ jobs:
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: bash scripts/gateway_api_data_plane_conformance.sh blackbox
 
+      - name: Run Ferrum Gateway API TCPRoute black-box checks
+        env:
+          GATEWAY_API_VERSION: ${{ steps.inputs.outputs.gateway_api_version }}
+        run: bash scripts/gateway_api_tcproute_conformance.sh blackbox
+
       - name: Collect diagnostics
         if: always()
         env:
@@ -190,6 +195,10 @@ jobs:
           GATEWAY_API_PROFILE: ${{ steps.inputs.outputs.conformance_profile }}
           GATEWAY_API_SUPPORTED_FEATURES: ${{ steps.inputs.outputs.supported_features }}
         run: bash scripts/gateway_api_data_plane_conformance.sh diagnostics
+
+      - name: Collect TCPRoute diagnostics
+        if: always()
+        run: bash scripts/gateway_api_tcproute_conformance.sh diagnostics
 
       - name: Upload conformance artifacts
         if: always()
