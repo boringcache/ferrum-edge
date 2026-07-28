@@ -2080,8 +2080,8 @@ fn validate_header_content_media_type_key(
     };
     if type_ == "*"
         || subtype == "*"
-        || !is_header_content_mime_token(type_)
-        || !is_header_content_mime_token(subtype)
+        || !is_header_content_http_media_token(type_)
+        || !is_header_content_http_media_token(subtype)
     {
         return Err(ExtractError::MalformedExtension {
             which: "requestBody.content.encoding",
@@ -2091,7 +2091,10 @@ fn validate_header_content_media_type_key(
     Ok(())
 }
 
-fn is_header_content_mime_token(value: &str) -> bool {
+/// HTTP media-type type/subtype token (RFC 9110 §5.6.2). Matches the published
+/// Header Object `content` propertyNames regex and rejects `{`/`}` that older
+/// RFC 2045 MIME tokens allowed.
+fn is_header_content_http_media_token(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
             matches!(
@@ -2112,9 +2115,7 @@ fn is_header_content_mime_token(value: &str) -> bool {
                     | b'^'
                     | b'_'
                     | b'`'
-                    | b'{'
                     | b'|'
-                    | b'}'
                     | b'~'
             )
         })

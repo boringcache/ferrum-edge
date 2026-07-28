@@ -558,6 +558,14 @@ fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_para
             "concrete media type",
         ),
         (
+            r#"{ "content": { "application/{json}": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "text/pl{ain}": { "schema": { "type": "string" } } } }"#,
+            "concrete media type",
+        ),
+        (
             "{ \"content\": { \"application/json;\\u0001charset=utf-8\": { \"schema\": { \"type\": \"object\" } } } }",
             "valid HTTP header value",
         ),
@@ -744,6 +752,16 @@ fn published_schema_rejects_encoding_header_content_wildcards_and_inert_fields()
             }
         }),
         json!({
+            "content": {
+                "application/{json}": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "content": {
+                "text/pl{ain}": {"schema": {"type": "string"}}
+            }
+        }),
+        json!({
             "style": "simple",
             "content": {
                 "application/json": {"schema": {"type": "object"}}
@@ -787,7 +805,7 @@ fn published_schema_rejects_encoding_header_content_wildcards_and_inert_fields()
         });
         assert!(
             validator.validate(&config).is_err(),
-            "published schema must reject wildcards and inert Header Object fields: {config}"
+            "published schema must reject wildcards, brace-bearing media types, and inert Header Object fields: {config}"
         );
     }
 }

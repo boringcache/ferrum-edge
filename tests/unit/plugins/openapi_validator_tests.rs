@@ -4855,6 +4855,14 @@ fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_s
             "concrete media type",
         ),
         (
+            json!({"content": {"application/{json}": {"schema": {"type": "object"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"text/pl{ain}": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
             json!({
                 "content": {
                     "application/json;\u{0001}charset=utf-8": {

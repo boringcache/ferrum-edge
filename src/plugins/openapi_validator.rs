@@ -4472,7 +4472,11 @@ fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
             "{ERROR_PREFIX}'{path}' must be a concrete media type"
         ));
     };
-    if type_ == "*" || subtype == "*" || !is_mime_token(type_) || !is_mime_token(subtype) {
+    if type_ == "*"
+        || subtype == "*"
+        || !is_http_media_type_token(type_)
+        || !is_http_media_type_token(subtype)
+    {
         return Err(format!(
             "{ERROR_PREFIX}'{path}' must be a concrete media type"
         ));
@@ -4926,7 +4930,42 @@ fn reject_filename_injection(filename: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// HTTP media-type type/subtype token (RFC 9110 §5.6.2). Used by concrete
+/// media-type admission (Header Object `content`, error_response content_type)
+/// so braces fail closed in parity with the published OpenAPI regex. Kept
+/// separate from [`is_mime_token`], which retains the older RFC 2045 set for
+/// multipart parameter/boundary parsing.
+fn is_http_media_type_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_http_media_type_token_char)
+}
+
+fn is_http_media_type_token_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
 /// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.
+/// Retained for multipart Content-Type parameter names/values (including
+/// boundary) where the historical MIME token grammar still applies.
 fn is_mime_token(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_mime_token_char)
 }
