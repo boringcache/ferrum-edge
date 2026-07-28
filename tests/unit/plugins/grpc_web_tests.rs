@@ -1133,7 +1133,10 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
     let long_name = format!("{}: v\r\n", "a".repeat(129));
 
     let mut cases: Vec<(&str, Vec<u8>)> = vec![
-        ("trailer before any message frame", request_frame(0x80, valid_block)),
+        (
+            "trailer before any message frame",
+            request_frame(0x80, valid_block),
+        ),
         ("data after trailer", trailer_then_data),
         ("two trailer frames", two_trailers),
         ("compressed trailer frame", compressed),
@@ -1155,8 +1158,14 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
         ("forbidden initial-only name", b"grpc-timeout: 1S\r\n"),
         ("forbidden terminal status", b"grpc-status: 0\r\n"),
         ("forbidden credential", b"authorization: Bearer x\r\n"),
-        ("forbidden gateway assertion", b"x-consumer-username: root\r\n"),
-        ("forbidden internal bridge", b"x-ferrum-grpc-web-trailer-names: a\r\n"),
+        (
+            "forbidden gateway assertion",
+            b"x-consumer-username: root\r\n",
+        ),
+        (
+            "forbidden internal bridge",
+            b"x-ferrum-grpc-web-trailer-names: a\r\n",
+        ),
         ("forbidden mode marker", b"x-grpc-web-mode: text\r\n"),
         ("non-printable value", b"x-app-id: \x07\r\n"),
         ("non-base64 binary value", b"x-trace-bin: not base64!\r\n"),
@@ -1182,7 +1191,10 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
 async fn request_trailer_frame_is_staged_and_stripped_in_binary_and_text_modes() {
     let mut body = request_frame(0x00, b"hello");
     let message_only = body.clone();
-    body.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n"));
+    body.extend_from_slice(&request_frame(
+        0x80,
+        b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n",
+    ));
 
     for (content_type, wire) in [
         ("application/grpc-web+proto", body.clone()),

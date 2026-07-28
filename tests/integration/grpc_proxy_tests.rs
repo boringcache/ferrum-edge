@@ -1121,8 +1121,8 @@ async fn grpc_web_request_envelopes_are_validated_on_h1_and_h2_binary_and_text()
 /// gRPC DATA message. That is the only way to prove the gateway converted a
 /// gRPC-Web body trailer frame into native HTTP/2 request trailers rather than
 /// forwarding it as message bytes or dropping it.
-async fn start_grpc_backend_echoing_request_trailers()
--> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_grpc_backend_echoing_request_trailers() -> (SocketAddr, tokio::task::JoinHandle<()>)
+{
     use http_body::Frame;
     use http_body_util::StreamBody;
 
@@ -1210,8 +1210,10 @@ async fn send_grpc_web_request_in_chunks(
     stream.set_nodelay(true)?;
     let io = TokioIo::new(stream);
 
-    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> =
-        chunks.into_iter().map(|chunk| Ok(Frame::data(chunk))).collect();
+    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = chunks
+        .into_iter()
+        .map(|chunk| Ok(Frame::data(chunk)))
+        .collect();
     let request = Request::builder()
         .method(Method::POST)
         .uri(path)
