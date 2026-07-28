@@ -3826,7 +3826,7 @@ async fn h3_reject_committed_deadline_preserves_direct_gateway_error_headers() {
             HttpFlavor::Grpc,
             None,
             StatusCode::BAD_GATEWAY,
-            b"dispatch required",
+            bytes::Bytes::from_static(b"dispatch required"),
             &headers,
         )
         .await,

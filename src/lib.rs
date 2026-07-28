@@ -3253,7 +3253,7 @@ pub mod _test_support {
         flavor: crate::config::types::HttpFlavor,
         grpc_web_response_content_type: Option<&str>,
         http_status: StatusCode,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
     ) -> bool {
         // No provenance seeding here: the production delegate seeds it, so this

@@ -28,6 +28,7 @@ mod forwarded_ownership_parity_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;
 mod h3_cross_protocol_bytes_share_tests;
+mod h3_native_reject_bytes_share_tests;
 mod health_check_tests;
 mod http3_config_tests;
 mod http3_peer_identity_tests;
