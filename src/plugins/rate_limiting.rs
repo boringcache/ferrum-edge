@@ -169,10 +169,23 @@ impl RateLimiting {
         if let Some(client) = self.limiter.redis_client_arc_for_test() {
             client.mark_unavailable_for_test();
         }
-        let outcome = self
+        let Some(outcome) = self
             .limiter
-            .check(key.to_string(), key, &self.default_limit)
-            .await;
+            .check_with_redis_key_and_local_capacity(
+                key.to_string(),
+                || key.to_string(),
+                &self.default_limit,
+                MAX_STATE_ENTRIES,
+            )
+            .await
+        else {
+            return match self.reject_capacity() {
+                PluginResult::Reject {
+                    status_code, body, ..
+                } => Some((status_code, body)),
+                _ => None,
+            };
+        };
         if outcome.allowed {
             return None;
         }

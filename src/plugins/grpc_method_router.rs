@@ -641,9 +641,7 @@ impl Plugin for GrpcMethodRouter {
                     if outcome.enforcement_unavailable {
                         return PluginResult::Reject {
                             status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
-                            body: grpc_json_error_body(
-                                ENFORCEMENT_UNAVAILABLE_MESSAGE.to_string(),
-                            ),
+                            body: grpc_json_error_body(ENFORCEMENT_UNAVAILABLE_MESSAGE.to_string()),
                             headers: grpc_content_type_header(),
                         };
                     }
