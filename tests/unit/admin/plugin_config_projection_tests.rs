@@ -801,6 +801,104 @@ fn redis_url_keeps_its_documented_projection_shape() {
     );
 }
 
+/// `workload_metrics` accepts the same tracing-provider endpoint families as
+/// the standalone tracing path. Their path/query components can carry
+/// collector credentials, so both its singleton compatibility shape and its
+/// canonical provider list must be covered by the schema.
+#[test]
+fn workload_metrics_tracing_provider_endpoints_are_projected_in_both_shapes() {
+    let singleton = project(
+        "workload_metrics",
+        json!({
+            "tracing_provider": {
+                "kind": "zipkin",
+                "config": {
+                    "url": "https://zipkin.example.com/api/v2/workload-singleton-canary?token=singleton-query-canary"
+                }
+            },
+            "service_name": "checkout"
+        }),
+    );
+    assert_eq!(
+        singleton["tracing_provider"]["config"]["url"],
+        "https://zipkin.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(singleton["tracing_provider"]["kind"], "zipkin");
+    assert_eq!(singleton["service_name"], "checkout");
+    assert_no_canaries(
+        &singleton,
+        &["workload-singleton-canary", "singleton-query-canary"],
+    );
+
+    let providers = project(
+        "workload_metrics",
+        json!({
+            "tracing_providers": [
+                {
+                    "kind": "zipkin",
+                    "config": {
+                        "url": "https://zipkin.example.com/api/v2/list-zipkin-canary"
+                    }
+                },
+                {
+                    "kind": "datadog",
+                    "config": {
+                        "agent_url": "https://datadog.example.com/list-datadog-canary?key=datadog-query-canary",
+                        "service": "payments"
+                    }
+                },
+                {
+                    "kind": "lightstep",
+                    "config": {
+                        "collector_url": "https://lightstep.example.com/list-lightstep-canary?token=lightstep-query-canary"
+                    }
+                },
+                {
+                    "kind": "opentelemetry",
+                    "config": {
+                        "endpoint": "https://otel.example.com/v1/list-otel-canary?key=otel-query-canary"
+                    }
+                }
+            ],
+            "span_reporting_disabled": false
+        }),
+    );
+    for (idx, expected) in [
+        "https://zipkin.example.com/[REDACTED_PATH]",
+        "https://datadog.example.com/[REDACTED_PATH]?[REDACTED_QUERY]",
+        "https://lightstep.example.com/[REDACTED_PATH]?[REDACTED_QUERY]",
+        "https://otel.example.com/[REDACTED_PATH]?[REDACTED_QUERY]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = match idx {
+            0 => "url",
+            1 => "agent_url",
+            2 => "collector_url",
+            _ => "endpoint",
+        };
+        assert_eq!(providers["tracing_providers"][idx]["config"][key], expected);
+    }
+    assert_eq!(
+        providers["tracing_providers"][1]["config"]["service"],
+        "payments"
+    );
+    assert_eq!(providers["span_reporting_disabled"], false);
+    assert_no_canaries(
+        &providers,
+        &[
+            "list-zipkin-canary",
+            "list-datadog-canary",
+            "datadog-query-canary",
+            "list-lightstep-canary",
+            "lightstep-query-canary",
+            "list-otel-canary",
+            "otel-query-canary",
+        ],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Wildcard entry semantics over array-shaped containers
 // ---------------------------------------------------------------------------

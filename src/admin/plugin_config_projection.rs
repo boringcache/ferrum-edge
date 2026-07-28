@@ -366,7 +366,24 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
             secret(&["clickhouse", "insert_query_params", "*"]),
         ],
     ),
-    ("workload_metrics", NONE),
+    (
+        "workload_metrics",
+        &[
+            // Mesh tracing providers are serialized as a tagged `kind` plus a
+            // provider-specific `config` object. Collector credentials may be
+            // carried in the accepted path/query components, just as they can
+            // for the standalone logging/tracing sinks. Cover both the
+            // singleton compatibility shape and the canonical provider list.
+            endpoint_url(&["tracing_provider", "config", "url"]),
+            endpoint_url(&["tracing_provider", "config", "agent_url"]),
+            endpoint_url(&["tracing_provider", "config", "collector_url"]),
+            endpoint_url(&["tracing_provider", "config", "endpoint"]),
+            endpoint_url(&["tracing_providers", "*", "config", "url"]),
+            endpoint_url(&["tracing_providers", "*", "config", "agent_url"]),
+            endpoint_url(&["tracing_providers", "*", "config", "collector_url"]),
+            endpoint_url(&["tracing_providers", "*", "config", "endpoint"]),
+        ],
+    ),
     ("__mesh_bpf_metrics", NONE),
     ("transaction_log_schema", NONE),
 ];
