@@ -474,10 +474,12 @@ Fields covered by the schema include:
 | `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
 | `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
 | `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
-| `proxy_alerts` | `channels.*.url`, `channels.*.webhook_url` | structural URL |
+| `proxy_alerts` | `channels.*.url` | structural URL (`channels.*.webhook_url` is caught wholesale by the name heuristic and projects as `[REDACTED]`) |
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
-| `jwks_auth`, `oauth2_introspection`, `oidc_relying_party`, `ldap_auth`, `spec_expose`, `mcp_gateway`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/token/JWKS/base/endpoint URLs | structural URL |
+| `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,token_endpoint,authorization_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
+| `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
 
 Header **values** are secret by default wherever a plugin accepts an arbitrary header map, because vendor authentication header names (`x-honeycomb-team`, `dd-api-key`, `lightstep-access-token`) match no substring pattern. Header **names** stay visible as routing diagnostics. Configuration keys that hold header *name lists* rather than values (`expose_headers`, `claim_headers`, `vary_by_headers`, `forward_headers`, `redact_headers`, …) are deliberately not redacted — distinguishing them from value maps is exactly what the schema exists to do.

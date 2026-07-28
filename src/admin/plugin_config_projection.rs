@@ -174,6 +174,14 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     (
         "jwks_auth",
         &[
+            // The identity plugins (`jwks_auth`, `oauth2_introspection`,
+            // `oidc_relying_party`) put every endpoint under the required
+            // `providers` array and `reject_unknown_fields` the config root, so
+            // the nested path is the one a stored config actually carries. The
+            // flat spellings below are kept as a floor, the same way
+            // `ai_transcript_audit` keeps its legacy shape.
+            endpoint_url(&["providers", "*", "discovery_url"]),
+            endpoint_url(&["providers", "*", "jwks_uri"]),
             endpoint_url(&["discovery_url"]),
             endpoint_url(&["jwks_uri"]),
         ],
@@ -181,6 +189,8 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     (
         "oauth2_introspection",
         &[
+            endpoint_url(&["providers", "*", "discovery_url"]),
+            endpoint_url(&["providers", "*", "introspection_endpoint"]),
             endpoint_url(&["discovery_url"]),
             endpoint_url(&["introspection_endpoint"]),
         ],
@@ -188,6 +198,12 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     (
         "oidc_relying_party",
         &[
+            endpoint_url(&["providers", "*", "discovery_url"]),
+            endpoint_url(&["providers", "*", "jwks_uri"]),
+            endpoint_url(&["providers", "*", "token_endpoint"]),
+            endpoint_url(&["providers", "*", "authorization_endpoint"]),
+            endpoint_url(&["providers", "*", "userinfo_endpoint"]),
+            endpoint_url(&["providers", "*", "end_session_endpoint"]),
             endpoint_url(&["discovery_url"]),
             endpoint_url(&["jwks_uri"]),
             endpoint_url(&["token_endpoint"]),
@@ -260,7 +276,18 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
         "ai_stream_router",
         &[endpoint_url(&["providers", "*", "endpoint"])],
     ),
-    ("mcp_gateway", &[endpoint_url(&["upstream_url"])]),
+    (
+        "mcp_gateway",
+        &[
+            // `servers` is an object keyed by server ID; each entry carries the
+            // upstream URL, and there is no top-level spelling. Construction
+            // refuses userinfo/query/fragment, but a hosted MCP server's ingest
+            // token still rides the path — and an `enabled: false` config is
+            // stored without construction, so nothing has screened it at all.
+            endpoint_url(&["servers", "*", "upstream_url"]),
+            endpoint_url(&["upstream_url"]),
+        ],
+    ),
     ("a2a_gateway", NONE),
     ("mesh_route_dispatch", NONE),
     (

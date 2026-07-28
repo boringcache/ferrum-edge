@@ -1015,6 +1015,128 @@ fn ai_transcript_audit_sink_endpoint_and_header_values_are_projected() {
     );
 }
 
+/// The identity plugins reject a top-level endpoint spelling at admission —
+/// `jwks_auth`, `oauth2_introspection`, and `oidc_relying_party` all require a
+/// `providers` array and `reject_unknown_fields` the rest. A rule anchored at
+/// the config root therefore matches nothing a stored config can ever hold, so
+/// the schema must address the nested path that admission actually produces.
+#[test]
+fn identity_provider_endpoints_are_projected_in_the_admitted_nested_shape() {
+    let projected = project(
+        "jwks_auth",
+        json!({
+            "providers": [{
+                "issuer": "https://auth.example.com/",
+                "jwks_uri": "https://auth.example.com/jwks/jwks-path-canary?tenant=jwks-query-canary",
+                "audience": "edge"
+            }]
+        }),
+    );
+    let provider = &projected["providers"][0];
+    assert_eq!(
+        provider["jwks_uri"],
+        "https://auth.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    // Safe-value controls: the identifiers an operator reads a provider back by.
+    assert_eq!(provider["issuer"], "https://auth.example.com/");
+    assert_eq!(provider["audience"], "edge");
+    assert_no_canaries(&projected, &["jwks-path-canary", "jwks-query-canary"]);
+
+    let projected = project(
+        "oauth2_introspection",
+        json!({
+            "providers": [{
+                "introspection_endpoint": "https://idp.example.com/introspect/oauth-path-canary",
+                "issuer": "https://idp.example.com/",
+                "client_auth": {"client_id": "edge", "client_secret": "oauth-secret-canary"}
+            }]
+        }),
+    );
+    let provider = &projected["providers"][0];
+    assert_eq!(
+        provider["introspection_endpoint"],
+        "https://idp.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(provider["client_auth"]["client_secret"], REDACTED);
+    assert_eq!(provider["client_auth"]["client_id"], "edge");
+    assert_no_canaries(&projected, &["oauth-path-canary", "oauth-secret-canary"]);
+
+    let projected = project(
+        "oidc_relying_party",
+        json!({
+            "providers": [{
+                "issuer": "https://idp.example.com/",
+                "discovery_url": "https://idp.example.com/.well-known/oidc-discovery-canary",
+                "token_endpoint": "https://idp.example.com/token/oidc-token-canary",
+                "authorization_endpoint": "https://idp.example.com/authorize/oidc-authz-canary",
+                "userinfo_endpoint": "https://idp.example.com/userinfo/oidc-userinfo-canary",
+                "end_session_endpoint": "https://idp.example.com/logout/oidc-logout-canary",
+                "jwks_uri": "https://idp.example.com/jwks/oidc-jwks-canary",
+                "client_id": "edge"
+            }],
+            "session": {"ttl_secs": 3600}
+        }),
+    );
+    let provider = &projected["providers"][0];
+    for field in [
+        "discovery_url",
+        "token_endpoint",
+        "authorization_endpoint",
+        "userinfo_endpoint",
+        "end_session_endpoint",
+        "jwks_uri",
+    ] {
+        assert_eq!(
+            provider[field], "https://idp.example.com/[REDACTED_PATH]",
+            "provider field {field} was not projected"
+        );
+    }
+    assert_eq!(provider["client_id"], "edge");
+    assert_eq!(projected["session"]["ttl_secs"], 3600);
+    assert_no_canaries(
+        &projected,
+        &[
+            "oidc-discovery-canary",
+            "oidc-token-canary",
+            "oidc-authz-canary",
+            "oidc-userinfo-canary",
+            "oidc-logout-canary",
+            "oidc-jwks-canary",
+        ],
+    );
+}
+
+/// `mcp_gateway` carries its upstream URLs under `servers.<id>.upstream_url`;
+/// there is no top-level spelling. Construction refuses userinfo, query, and
+/// fragment, but a hosted MCP server's ingest token still rides the path — and
+/// a config stored `enabled: false` skips construction entirely.
+#[test]
+fn mcp_gateway_per_server_upstream_urls_are_projected() {
+    let projected = project(
+        "mcp_gateway",
+        json!({
+            "servers": {
+                "github": {
+                    "upstream_url": "https://mcp.example.com/v1/mcp-token-canary/sse",
+                    "namespace": "gh",
+                    "enabled": true
+                }
+            },
+            "endpoint": {"path": "/mcp"}
+        }),
+    );
+    let server = &projected["servers"]["github"];
+    assert_eq!(
+        server["upstream_url"],
+        "https://mcp.example.com/[REDACTED_PATH]"
+    );
+    // Safe-value controls: routing metadata an operator needs stays readable.
+    assert_eq!(server["namespace"], "gh");
+    assert_eq!(server["enabled"], true);
+    assert_eq!(projected["endpoint"]["path"], "/mcp");
+    assert_no_canaries(&projected, &["mcp-token-canary"]);
+}
+
 #[test]
 fn chargeback_clickhouse_endpoint_and_insert_params_are_projected() {
     let projected = project(
