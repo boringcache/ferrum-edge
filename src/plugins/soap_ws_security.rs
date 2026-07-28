@@ -1467,8 +1467,8 @@ impl SoapWsSecurity {
                 )))
             }
             None => {
-                let scope_key = plugin_config_id
-                    .map(|config_id| nonce_replay_scope_key(namespace, config_id));
+                let scope_key =
+                    plugin_config_id.map(|config_id| nonce_replay_scope_key(namespace, config_id));
                 NonceReplayBackend::Process(process_replay_state(scope_key.as_deref())?)
             }
         };
@@ -1541,7 +1541,7 @@ impl SoapWsSecurity {
             .ok_or_else(|| "WS-Security: Timestamp missing Created element".to_string())?;
 
         let created = parse_ws_datetime(&created_str)
-            .ok_or_else(|| format!("WS-Security: invalid Created timestamp '{}'", created_str))?;
+            .ok_or_else(|| "WS-Security: invalid Created timestamp".to_string())?;
 
         // Durations are pre-converted at config admission and `parse_ws_datetime`
         // clamps parsed instants to `MIN_PARSED_YEAR..=MAX_PARSED_YEAR`, so
@@ -1565,9 +1565,8 @@ impl SoapWsSecurity {
 
         // Expires check
         if let Some(expires_str) = find_element_text(&ts_block, "Expires") {
-            let expires = parse_ws_datetime(&expires_str).ok_or_else(|| {
-                format!("WS-Security: invalid Expires timestamp '{}'", expires_str)
-            })?;
+            let expires = parse_ws_datetime(&expires_str)
+                .ok_or_else(|| "WS-Security: invalid Expires timestamp".to_string())?;
 
             if now > expires + skew {
                 return Err("WS-Security: Timestamp has expired".to_string());
@@ -1632,14 +1631,13 @@ impl SoapWsSecurity {
             ));
         }
 
-        let outer_created = find_element_block(security_block, "Timestamp")
-            .and_then(|ts_block| {
-                let outer_created = find_element_text(&ts_block, "Created")
-                    .and_then(|value| parse_ws_datetime(value.trim()))?;
-                let outer_expires = find_element_text(&ts_block, "Expires")
-                    .and_then(|value| parse_ws_datetime(value.trim()));
-                Some((outer_created, outer_expires))
-            });
+        let outer_created = find_element_block(security_block, "Timestamp").and_then(|ts_block| {
+            let outer_created = find_element_text(&ts_block, "Created")
+                .and_then(|value| parse_ws_datetime(value.trim()))?;
+            let outer_expires = find_element_text(&ts_block, "Expires")
+                .and_then(|value| parse_ws_datetime(value.trim()));
+            Some((outer_created, outer_expires))
+        });
 
         let Some((outer_created, outer_expires)) = outer_created else {
             return if self.require_timestamp_binding {

@@ -5223,7 +5223,11 @@ async fn digest_created_in_the_future_is_rejected() {
     let block =
         password_digest_security_block("alice", "secret123", b"future-created-1", &future, None);
     let result = digest_outcome(&plugin, &block).await;
-    assert_username_token_structural(&result, "UsernameToken Created is in the future", &["alice"]);
+    assert_username_token_structural(
+        &result,
+        "UsernameToken Created is in the future",
+        &["alice"],
+    );
 }
 
 #[tokio::test]
@@ -5236,7 +5240,10 @@ async fn digest_created_that_is_malformed_is_rejected_without_echoing_it() {
         let nonce = b"bad-created-01!!";
         let block = password_digest_security_block("alice", "secret123", nonce, created, None);
         let result = digest_outcome(&plugin, &block).await;
-        assert!(is_reject(&result), "malformed Created {created:?} must reject");
+        assert!(
+            is_reject(&result),
+            "malformed Created {created:?} must reject"
+        );
         assert_eq!(reject_status(&result), 401);
         assert!(
             !reject_body(&result).contains(MALFORMED),
@@ -5374,6 +5381,39 @@ async fn a_present_timestamp_is_validated_even_when_not_required() {
     );
 }
 
+#[tokio::test]
+async fn malformed_outer_timestamp_values_are_not_echoed() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = fresh_created();
+    let marker = "credential-like-outer-timestamp-value";
+
+    let invalid_created = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"bad-outer-created",
+        &created,
+        Some(marker),
+    );
+    let created_result = digest_outcome(&plugin, &invalid_created).await;
+    assert!(is_reject(&created_result));
+    assert!(!reject_body(&created_result).contains(marker));
+
+    let token = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"bad-outer-expiry!",
+        &created,
+        None,
+    );
+    let invalid_timestamp = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{created}</wsu:Created><wsu:Expires>{marker}</wsu:Expires></wsu:Timestamp>"#
+    );
+    let invalid_expires = format!("{invalid_timestamp}{token}");
+    let expires_result = digest_outcome(&plugin, &invalid_expires).await;
+    assert!(is_reject(&expires_result));
+    assert!(!reject_body(&expires_result).contains(marker));
+}
+
 // ── Replay scope admission ──────────────────────────────────────────────────
 
 #[test]
@@ -5410,7 +5450,10 @@ fn invalid_replay_scope_value_is_rejected() {
         .err()
         .expect("an unknown replay scope must reject");
     assert!(err.contains("'process' or 'shared'"), "{err}");
-    assert!(!err.contains("cluster"), "the rejected value must not be echoed: {err}");
+    assert!(
+        !err.contains("cluster"),
+        "the rejected value must not be echoed: {err}"
+    );
 }
 
 #[test]
@@ -5476,7 +5519,11 @@ async fn replay_state_survives_a_reload_generation_swap() {
     // replaying a captured token across a reload always succeeded.
     let scope = "soap-reload-scope-a";
     let generation_one = digest_plugin_with_config_id(Some(scope));
-    assert!(generation_one.check_nonce_replay("reload-scope-nonce").is_ok());
+    assert!(
+        generation_one
+            .check_nonce_replay("reload-scope-nonce")
+            .is_ok()
+    );
 
     let generation_two = digest_plugin_with_config_id(Some(scope));
     let replay = generation_two
@@ -5614,7 +5661,10 @@ async fn an_invalid_digest_flood_cannot_displace_a_captured_live_nonce() {
 
     let victim = password_digest_token("alice", "secret123", b"victim-nonce-01!");
     assert!(
-        matches!(digest_outcome(&plugin, &victim).await, PluginResult::Continue),
+        matches!(
+            digest_outcome(&plugin, &victim).await,
+            PluginResult::Continue
+        ),
         "the legitimate claim must be admitted first"
     );
 
