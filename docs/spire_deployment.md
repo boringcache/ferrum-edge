@@ -659,9 +659,11 @@ Before declaring a cluster ready for production mesh traffic:
 - [ ] **Monitoring alerts wired**: Prometheus is scraping Ferrum, the
       `PrometheusRule` is loaded, and Alertmanager has a route for the
       `severity: warning` / `severity: critical` Ferrum mesh labels.
-- [ ] **Dashboards imported**: once the Grafana dashboards land under
-      `charts/ferrum-mesh/dashboards/`, the `certificate-posture` dashboard
-      shows data for the new cluster. Until then, plot
+- [ ] **Dashboards imported**: import the Grafana JSON under
+      `charts/ferrum-mesh/dashboards/` (including
+      `certificate-posture.json`, plus `mesh-overview`, `gateway-overview`,
+      `egress-scope`, and `policy-deny`). Confirm the certificate-posture
+      dashboard shows data for the new cluster, or plot
       `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`,
       `ferrum_mesh_ca_health`, and `ferrum_mesh_federation_bundle_age_seconds`
       in your existing Grafana / Prometheus UI.

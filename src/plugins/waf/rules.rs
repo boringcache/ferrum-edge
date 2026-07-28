@@ -5,6 +5,41 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::plugins::RequestContext;
+use crate::util::unknown_keys::reject_unknown_keys;
+
+/// Fixed-shape custom-rule object keys.
+const CUSTOM_RULE_KEYS: &[&str] = &[
+    "id",
+    "name",
+    "category",
+    "severity",
+    "target",
+    "match_kind",
+    "pattern",
+    "action",
+    "fp_filters",
+    "paranoia_min",
+    "score",
+    "conditions",
+];
+
+/// Fixed-shape rule-target object keys (`type` plus optional `names`/`path`).
+const TARGET_OBJECT_KEYS: &[&str] = &["type", "names", "path"];
+
+/// Fixed-shape rule/override condition keys. `headers` values remain an
+/// intentionally open map of operator-defined header names.
+const CONDITIONS_KEYS: &[&str] = &["paths", "methods", "headers", "consumers"];
+
+/// Fixed-shape per-rule override object keys. The surrounding `rule_overrides`
+/// map stays open because keys are operator-defined rule ids.
+const RULE_OVERRIDE_KEYS: &[&str] = &[
+    "action",
+    "paranoia_min",
+    "severity",
+    "fp_filters",
+    "conditions",
+    "score",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Severity {
@@ -846,21 +881,8 @@ pub(super) fn parse_rule_overrides(
                 let object = raw
                     .as_object()
                     .ok_or_else(|| format!("waf: rule_overrides['{id}'] must be an object"))?;
-                for key in object.keys() {
-                    if !matches!(
-                        key.as_str(),
-                        "action"
-                            | "paranoia_min"
-                            | "severity"
-                            | "fp_filters"
-                            | "conditions"
-                            | "score"
-                    ) {
-                        return Err(format!(
-                            "waf: rule_overrides['{id}'] contains unsupported field '{key}'"
-                        ));
-                    }
-                }
+                let path = format!("config.rule_overrides['{id}']");
+                reject_unknown_keys(object, &path, RULE_OVERRIDE_KEYS, "waf: ")?;
                 let action = optional_string(object, "action")?
                     .map(|raw| parse_rule_action(&raw, "rule_overrides.action"))
                     .transpose()?;
@@ -876,7 +898,10 @@ pub(super) fn parse_rule_overrides(
                     .map(|raw| parse_severity(&raw))
                     .transpose()?;
                 let fp_filters = optional_string_vec(object, "fp_filters")?;
-                let conditions = object.get("conditions").map(parse_conditions).transpose()?;
+                let conditions = object
+                    .get("conditions")
+                    .map(|value| parse_conditions(value, &format!("{path}.conditions")))
+                    .transpose()?;
                 let score = optional_u32(object, "score")?;
                 out.insert(
                     id.clone(),
@@ -901,10 +926,12 @@ pub(super) fn parse_rule_overrides(
 pub(super) fn parse_custom_rule(
     value: &Value,
     default_action: RuleAction,
+    path: &str,
 ) -> Result<WafRule, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "waf: custom_rules entries must be objects".to_string())?;
+    reject_unknown_keys(object, path, CUSTOM_RULE_KEYS, "waf: ")?;
     let id = required_string(object, "id")?;
     let name = optional_string(object, "name")?.unwrap_or_else(|| id.clone());
     let category = required_string(object, "category")?;
@@ -917,6 +944,7 @@ pub(super) fn parse_custom_rule(
         object
             .get("target")
             .ok_or_else(|| format!("waf: custom rule '{id}' requires 'target'"))?,
+        &format!("{path}.target"),
     )?;
     let match_kind = parse_match_kind(
         optional_string(object, "match_kind")?
@@ -931,7 +959,10 @@ pub(super) fn parse_custom_rule(
     let fp_filters = optional_string_vec(object, "fp_filters")?.unwrap_or_default();
     let paranoia_min = optional_u8(object, "paranoia_min")?.unwrap_or(1);
     let score = optional_u32(object, "score")?;
-    let conditions = object.get("conditions").map(parse_conditions).transpose()?;
+    let conditions = object
+        .get("conditions")
+        .map(|value| parse_conditions(value, &format!("{path}.conditions")))
+        .transpose()?;
 
     Ok(WafRule {
         id,
@@ -976,17 +1007,18 @@ fn parse_match_kind(raw: &str) -> Result<MatchKind, String> {
     }
 }
 
-fn parse_target(value: &Value) -> Result<RuleTarget, String> {
+fn parse_target(value: &Value, path: &str) -> Result<RuleTarget, String> {
     if let Some(raw) = value.as_str() {
         return parse_target_string(raw, None, None);
     }
     let object = value
         .as_object()
         .ok_or_else(|| "waf: rule target must be a string or object".to_string())?;
+    reject_unknown_keys(object, path, TARGET_OBJECT_KEYS, "waf: ")?;
     let raw = required_string(object, "type")?;
     let names = optional_string_vec(object, "names")?;
-    let path = optional_string(object, "path")?;
-    parse_target_string(&raw, names, path)
+    let path_field = optional_string(object, "path")?;
+    parse_target_string(&raw, names, path_field)
 }
 
 fn parse_target_string(
@@ -1030,13 +1062,15 @@ fn parse_target_string(
     }
 }
 
-fn parse_conditions(value: &Value) -> Result<Conditions, String> {
+fn parse_conditions(value: &Value, path: &str) -> Result<Conditions, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "waf: conditions must be an object".to_string())?;
+    reject_unknown_keys(object, path, CONDITIONS_KEYS, "waf: ")?;
     let headers = match object.get("headers") {
         None | Some(Value::Null) => HashMap::new(),
         Some(Value::Object(map)) => {
+            // Intentionally open: keys are operator-defined header names.
             let mut parsed = HashMap::new();
             for (key, value) in map {
                 let expected = if value.is_null() {

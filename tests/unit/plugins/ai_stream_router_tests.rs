@@ -885,6 +885,502 @@ async fn test_anthropic_tools_translation() {
     assert_eq!(parsed["tool_choice"], json!({"type": "auto"}));
 }
 
+fn weather_tools() -> Value {
+    json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+        }
+    }])
+}
+
+async fn translate_anthropic_body(body: &Value) -> Option<Value> {
+    let plugin = build(openai_and_anthropic_config());
+    let mut ctx = post_ctx(body);
+    let mut headers = json_headers();
+    if reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await).is_some() {
+        return None;
+    }
+    let raw = serde_json::to_vec(body).unwrap();
+    let out = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await?;
+    Some(serde_json::from_slice(&out).unwrap())
+}
+
+#[tokio::test]
+async fn test_anthropic_tool_choice_none_keeps_tools_and_emits_type_none() {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "none"
+    });
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("none must translate");
+    assert_eq!(parsed["tools"][0]["name"], json!("get_weather"));
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
+}
+
+#[tokio::test]
+async fn test_anthropic_tool_choice_required_and_named_preserve_semantics() {
+    let required = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "required"
+    });
+    let parsed = translate_anthropic_body(&required)
+        .await
+        .expect("required must translate");
+    assert_eq!(parsed["tool_choice"], json!({"type": "any"}));
+
+    let named = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "get_weather"}
+        }
+    });
+    let parsed = translate_anthropic_body(&named)
+        .await
+        .expect("named must translate");
+    assert_eq!(
+        parsed["tool_choice"],
+        json!({"type": "tool", "name": "get_weather"})
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_rejects_malformed_and_unsupported_tool_choice() {
+    let plugin = build(openai_and_anthropic_config());
+    let invalid = vec![
+        json!("maybe"),
+        json!("any"),
+        json!(42),
+        json!(true),
+        json!(["none"]),
+        json!({}),
+        json!({"type": "none"}),
+        json!({"type": "auto"}),
+        json!({"type": "any"}),
+        json!({"type": "tool", "name": "get_weather"}),
+        json!({"type": "function", "function": {"name": "not valid!"}}),
+        json!({"type": "function", "function": {}}),
+        json!({"type": "function"}),
+        json!({
+            "type": "function",
+            "function": {"name": "get_weather"},
+            "extra": true
+        }),
+        json!({
+            "type": "function",
+            "function": {"name": "get_weather", "description": "nope"}
+        }),
+    ];
+
+    for tool_choice in invalid {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools(),
+            "tool_choice": tool_choice
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            reject_status(&result),
+            Some(400),
+            "must reject unsupported tool_choice without claiming the request"
+        );
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(
+                !body.contains("maybe")
+                    && !body.contains("get_weather")
+                    && !body.contains("not valid"),
+                "client error must not reflect untrusted tool_choice values: {body}"
+            );
+        }
+    }
+
+    // auto/required/named without tools are rejected rather than weakened.
+    for tool_choice in [
+        json!("auto"),
+        json!("required"),
+        json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": tool_choice
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400)
+        );
+    }
+
+    // Named choice that does not match a declared tool.
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "other_tool"}
+        }
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), Some(400));
+    if let PluginResult::Reject { body, .. } = result {
+        assert!(
+            !body.contains("other_tool"),
+            "client error must not echo the unmatched tool name: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_extended_thinking_tool_choice_combinations() {
+    let plugin = build(openai_and_anthropic_config());
+
+    // Manual enabled thinking + none/auto are admitted and forwarded.
+    for (tool_choice, expected) in [
+        (json!("none"), json!({"type": "none"})),
+        (json!("auto"), json!({"type": "auto"})),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools(),
+            "tool_choice": tool_choice,
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        });
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("thinking with none/auto must translate");
+        assert_eq!(parsed["tool_choice"], expected);
+        assert_eq!(
+            parsed["thinking"],
+            json!({"type": "enabled", "budget_tokens": 1024})
+        );
+        assert_eq!(parsed["max_tokens"], json!(4096));
+    }
+
+    let adaptive = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "auto",
+        "thinking": {"type": "adaptive"}
+    });
+    let parsed = translate_anthropic_body(&adaptive)
+        .await
+        .expect("adaptive thinking with auto must translate");
+    assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+
+    // Adaptive thinking supports forced tool use (required / named).
+    for (tool_choice, expected) in [
+        (json!("required"), json!({"type": "any"})),
+        (
+            json!({"type": "function", "function": {"name": "get_weather"}}),
+            json!({"type": "tool", "name": "get_weather"}),
+        ),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools(),
+            "tool_choice": tool_choice,
+            "thinking": {"type": "adaptive"}
+        });
+        let parsed = translate_anthropic_body(&body)
+            .await
+            .expect("adaptive thinking with forced tool_choice must translate");
+        assert_eq!(parsed["tool_choice"], expected);
+        assert_eq!(parsed["thinking"], json!({"type": "adaptive"}));
+    }
+
+    // Forced tool use with manual enabled thinking is rejected at admission.
+    for tool_choice in [
+        json!("required"),
+        json!({"type": "function", "function": {"name": "get_weather"}}),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": weather_tools(),
+            "tool_choice": tool_choice,
+            "thinking": {"type": "enabled", "budget_tokens": 1024}
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400)
+        );
+    }
+
+    // Disabled thinking does not block forced tool use.
+    let disabled = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "required",
+        "thinking": {"type": "disabled"}
+    });
+    let parsed = translate_anthropic_body(&disabled)
+        .await
+        .expect("disabled thinking with required must translate");
+    assert_eq!(parsed["tool_choice"], json!({"type": "any"}));
+    assert_eq!(parsed["thinking"], json!({"type": "disabled"}));
+
+    // Manual budget must be >= 1024 and strictly less than forwarded max_tokens.
+    let ok_budget = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+    let parsed = translate_anthropic_body(&ok_budget)
+        .await
+        .expect("budget_tokens 1024 with sufficient max_tokens must translate");
+    assert_eq!(
+        parsed["thinking"],
+        json!({"type": "enabled", "budget_tokens": 1024})
+    );
+
+    for (max_tokens, budget) in [
+        (4096u64, 0u64),
+        (4096, 1),
+        (4096, 1023),
+        (1024, 1024),
+        (2048, 2048),
+        (2048, 3000),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": max_tokens,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": budget}
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            reject_status(&result),
+            Some(400),
+            "must reject invalid thinking budget without claiming the request"
+        );
+        if let PluginResult::Reject { body, .. } = result {
+            assert!(
+                !body.contains(&budget.to_string()) && !body.contains(&max_tokens.to_string()),
+                "client error must not echo untrusted budget/max_tokens values: {body}"
+            );
+        }
+    }
+
+    // Malformed / open-ended thinking shapes are rejected.
+    for thinking in [
+        json!("enabled"),
+        json!({"type": "enabled"}),
+        json!({"type": "enabled", "budget_tokens": 0}),
+        json!({"type": "enabled", "budget_tokens": 1024, "effort": "high"}),
+        json!({"type": "adaptive", "budget_tokens": 1024}),
+        json!({"type": "disabled", "budget_tokens": 1}),
+        json!({"type": "mystery"}),
+        json!({"type": "enabled", "budget_tokens": 1024.5}),
+        json!({"type": "enabled", "budget_tokens": "1024"}),
+    ] {
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "stream": true,
+            "max_tokens": 4096,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": thinking
+        });
+        let mut ctx = post_ctx(&body);
+        let mut headers = json_headers();
+        assert_eq!(
+            reject_status(&plugin.before_proxy(&mut ctx, &mut headers).await),
+            Some(400)
+        );
+    }
+}
+
+const ANTHROPIC_TOOL_USE_SSE: &str = concat!(
+    "event: message_start\n",
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+    "event: content_block_start\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_secret\",\"name\":\"get_weather\",\"input\":{}}}\n\n",
+    "event: content_block_delta\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"location\\\":\\\"secret\\\"}\"}}\n\n",
+    "event: content_block_stop\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "event: message_delta\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
+    "event: message_stop\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+async fn claim_and_translate_tool_choice_none(
+    plugin: &AiStreamRouter,
+) -> (RequestContext, HashMap<String, String>) {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "none"
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let raw = serde_json::to_vec(&body).unwrap();
+    let translated = plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("none must translate");
+    let parsed: Value = serde_json::from_slice(&translated).unwrap();
+    assert_eq!(parsed["tool_choice"], json!({"type": "none"}));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router.tool_choice_none")
+            .map(String::as_str),
+        Some("true")
+    );
+    (ctx, headers)
+}
+
+#[tokio::test]
+async fn test_normalizer_fails_closed_when_provider_emits_tool_use_under_none() {
+    let plugin = build(openai_and_anthropic_config());
+    let (ctx, _) = claim_and_translate_tool_choice_none(&plugin).await;
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut collected = Vec::new();
+    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+        ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+            collected.extend_from_slice(&b)
+        }
+        ResponseStreamAction::Terminate(None) => {}
+    }
+    let out = String::from_utf8(collected).unwrap();
+    assert!(
+        out.contains("upstream_error"),
+        "must fail closed instead of emitting tool_calls: {out}"
+    );
+    assert!(
+        !out.contains("tool_calls"),
+        "must not normalize forbidden tool_use into OpenAI tool_calls: {out}"
+    );
+    assert!(
+        !out.contains("call_secret") && !out.contains("get_weather") && !out.contains("secret"),
+        "error path must not reflect provider tool payload: {out}"
+    );
+    assert!(out.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn test_buffered_normalizer_fails_closed_when_provider_emits_tool_use_under_none() {
+    let plugin = build(openai_and_anthropic_config());
+    let (mut ctx, _) = claim_and_translate_tool_choice_none(&plugin).await;
+
+    let buffered = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            ANTHROPIC_TOOL_USE_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered path should produce a fail-closed SSE body");
+    let out = String::from_utf8(buffered).unwrap();
+    assert!(out.contains("upstream_error"));
+    assert!(!out.contains("tool_calls"));
+    assert!(out.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn test_normalizer_still_emits_tool_calls_when_tool_choice_allows() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": weather_tools(),
+        "tool_choice": "auto"
+    });
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let raw = serde_json::to_vec(&body).unwrap();
+    plugin
+        .transform_request_body_with_context(&mut ctx, &raw, Some("application/json"), &headers)
+        .await
+        .expect("auto must translate");
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_stream_router.tool_choice_none")
+    );
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let mut collected = Vec::new();
+    match inspector.on_chunk(ANTHROPIC_TOOL_USE_SSE.as_bytes()).await {
+        ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+            collected.extend_from_slice(&b)
+        }
+        ResponseStreamAction::Terminate(None) => {}
+    }
+    if !String::from_utf8_lossy(&collected).contains("[DONE]") {
+        match inspector.on_end().await {
+            ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+                collected.extend_from_slice(&b)
+            }
+            ResponseStreamAction::Terminate(None) => {}
+        }
+    }
+    let out = String::from_utf8(collected).unwrap();
+    assert!(
+        out.contains("tool_calls"),
+        "auto must still normalize tool_use: {out}"
+    );
+    assert!(!out.contains("upstream_error"));
+}
+
 #[tokio::test]
 async fn test_transform_skips_unclaimed_request() {
     let plugin = build(openai_and_anthropic_config());

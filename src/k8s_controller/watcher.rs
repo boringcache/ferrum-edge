@@ -11,6 +11,7 @@ use kube::{Api, Client};
 use tracing::{debug, error, info, warn};
 
 use super::resource_store::{CrdResourceStore, ResourceStoreSet};
+use super::{ControllerTaskRegistry, REPROBE_WATCHER_LABEL};
 
 pub struct CrdSpec {
     pub group: &'static str,
@@ -419,8 +420,19 @@ fn find_crd_resource(api_group: &discovery::ApiGroup, crd: &CrdSpec) -> Option<A
         .find(|ar| ar.kind == crd.kind && ar.plural == crd.plural)
 }
 
+/// Start every selected CRD and core-resource watcher, registering each one
+/// with `registry` so the control plane owns it (#3220).
+///
+/// Returns the number of watchers started. Watcher tasks are never handed back
+/// as bare `JoinHandle`s: a dropped handle detaches the task, and the CRD
+/// reprobe loop calls this function too, so its replacement watchers must land
+/// in the same owned set as the startup ones.
+///
+/// `task_label` is the registry label prefix (`crd-watcher` at startup,
+/// `crd-watcher-reprobe` from the reprobe loop); the per-watcher suffix is the
+/// static Kubernetes kind, never cluster object data.
 #[allow(clippy::too_many_arguments)]
-pub async fn start_crd_watchers(
+pub(crate) async fn start_crd_watchers(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
@@ -429,8 +441,10 @@ pub async fn start_crd_watchers(
     istio_root_namespace: String,
     gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let mut handles = Vec::new();
+    registry: &ControllerTaskRegistry,
+    task_label: &str,
+) -> usize {
+    let mut started = 0usize;
 
     let mut crd_specs: Vec<&CrdSpec> = Vec::new();
     if selection.watch_istio {
@@ -531,7 +545,7 @@ pub async fn start_crd_watchers(
             let task_store_set = store_set.clone();
             let watcher_config = watcher::Config::default();
 
-            let handle = tokio::spawn(async move {
+            let watcher_task = async move {
                 let stream = reflector::reflector(writer, watcher(api, watcher_config));
 
                 tokio::pin!(stream);
@@ -588,9 +602,15 @@ pub async fn start_crd_watchers(
                         }
                     }
                 }
-            });
+            };
 
-            handles.push(handle);
+            let name = format!("{task_label}/{}", crd.kind);
+            if !registry.spawn_named(&name, watcher_task, shutdown.clone()) {
+                abandon_watcher_start(&store_set, &api_version, &kind, &scope).await;
+                return started;
+            }
+
+            started += 1;
             info!(
                 kind = crd.kind,
                 group = crd.group,
@@ -714,7 +734,7 @@ pub async fn start_crd_watchers(
                     None => watcher::Config::default(),
                 };
 
-                let handle = tokio::spawn(async move {
+                let watcher_task = async move {
                     let stream = reflector::reflector(writer, watcher(api, watcher_config));
 
                     tokio::pin!(stream);
@@ -771,9 +791,15 @@ pub async fn start_crd_watchers(
                             }
                         }
                     }
-                });
+                };
 
-                handles.push(handle);
+                let name = format!("{task_label}/{}", resource.kind);
+                if !registry.spawn_named(&name, watcher_task, shutdown.clone()) {
+                    abandon_watcher_start(&store_set, &api_version, &kind, &scope).await;
+                    return started;
+                }
+
+                started += 1;
                 info!(
                     kind = resource.kind,
                     group = resource.group,
@@ -784,11 +810,42 @@ pub async fn start_crd_watchers(
         }
     }
 
-    handles
+    started
 }
 
+/// Roll back the half-finished registration of one watcher.
+///
+/// Reached only when the controller task registry was closed by shutdown
+/// between adding this watcher's store and registering its task. The task was
+/// never spawned, so nothing is detached; the store it would have fed is
+/// removed so it cannot linger as a source no watcher updates. The caller stops
+/// starting further watchers.
+async fn abandon_watcher_start(
+    store_set: &Arc<tokio::sync::Mutex<ResourceStoreSet>>,
+    api_version: &str,
+    kind: &str,
+    scope: &str,
+) {
+    store_set
+        .lock()
+        .await
+        .remove_store_for_scope(api_version, kind, scope);
+    debug!(
+        kind = %kind,
+        api_version = %api_version,
+        scope = %scope,
+        "Controller shutdown closed the task registry; stopping watcher startup"
+    );
+}
+
+/// Register the CRD reprobe loop with `registry`, returning whether it was
+/// accepted (it is refused only if shutdown already closed the registry).
+///
+/// The loop is itself an owned controller task, and every watcher it creates is
+/// registered with the same registry, so a CRD group that appears after startup
+/// no longer produces watchers outside structured ownership (#3220).
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_crd_reprobe_task(
+pub(crate) fn spawn_crd_reprobe_task(
     client: Client,
     store_set: Arc<tokio::sync::Mutex<ResourceStoreSet>>,
     selection: WatcherSelection,
@@ -798,9 +855,17 @@ pub fn spawn_crd_reprobe_task(
     gateway_api_data_plane_service_namespace: Option<String>,
     shutdown: tokio::sync::watch::Receiver<bool>,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
+    registry: &Arc<ControllerTaskRegistry>,
+) -> bool {
     let mut reprobe_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    let watcher_shutdown = shutdown.clone();
+    // Weak on purpose: the registry owns this task's `JoinHandle`, so holding a
+    // strong reference back would make a cycle that keeps every handle alive.
+    // A failed upgrade means the controller handle is gone, which is a reason
+    // to stop — never a reason to spawn a watcher nobody owns.
+    let registry_ref = Arc::downgrade(registry);
+
+    let reprobe_task = async move {
         let mut timer = tokio::time::interval(interval);
         timer.tick().await; // skip first
 
@@ -813,8 +878,12 @@ pub fn spawn_crd_reprobe_task(
                     }
                 }
                 _ = timer.tick() => {
+                    let Some(registry) = registry_ref.upgrade() else {
+                        debug!("Controller task registry released; stopping CRD reprobe");
+                        return;
+                    };
                     debug!("Re-probing CRD group availability");
-                    let new_handles = start_crd_watchers(
+                    let new_watchers = start_crd_watchers(
                         client.clone(),
                         store_set.clone(),
                         selection,
@@ -822,15 +891,26 @@ pub fn spawn_crd_reprobe_task(
                         node_waypoint_namespace.clone(),
                         istio_root_namespace.clone(),
                         gateway_api_data_plane_service_namespace.clone(),
-                        shutdown.clone(),
+                        watcher_shutdown.clone(),
+                        &registry,
+                        REPROBE_WATCHER_LABEL,
                     ).await;
-                    // New handles run independently; we don't need to track
-                    // them here since they self-manage via shutdown.
-                    drop(new_handles);
+                    if new_watchers > 0 {
+                        info!(watchers = new_watchers, "CRD reprobe started additional watchers");
+                    }
+                    if registry.is_closed() {
+                        // Shutdown began while this probe was in flight; the
+                        // watchers above (if any) were handed over, and further
+                        // registrations would be refused.
+                        debug!("Controller shutdown closed the task registry; stopping reprobe");
+                        return;
+                    }
                 }
             }
         }
-    })
+    };
+
+    registry.spawn_named("crd-reprobe", reprobe_task, shutdown)
 }
 
 #[cfg(test)]
