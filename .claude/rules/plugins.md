@@ -100,10 +100,7 @@ authorizes exactly that byte-identical frame to be emitted as HEADERS + one unco
 unary DATA frame + plugin-authored terminal trailers. Reject body shape and reject
 `content-type`/`grpc-status` headers are never provenance, and the terminate contract is
 entered only for the request-scoped native-gRPC flavor the frontend stamps at intake —
-never for a mutable effective `content-type`. Any component that persists a finalized
-representation (today `request_deduplication`) must retain the terminal trailers with it,
-charge them to its capacity accounting, re-validate persisted copies against the contract
-bounds on read, and restore the provenance only from that private retained form.
+never for a mutable effective `content-type`.
 
 ## Request Context And Body Rules
 

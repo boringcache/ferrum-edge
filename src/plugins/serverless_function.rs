@@ -2049,58 +2049,6 @@ fn decode_bounded_base64_field(
     Ok(decoded)
 }
 
-/// Re-validate a framed native-gRPC terminate representation that was persisted
-/// outside this process (a `request_deduplication` Redis replay record) before
-/// it is allowed to re-mint `RequestContext::serverless_grpc_terminate_frame`.
-///
-/// A persisted record outlives the process that wrote it and lives in shared
-/// infrastructure, so it is treated as untrusted input on read: nothing about
-/// its provenance can be re-derived from the store. Every bound the live
-/// contract enforces is re-applied here — the body must still be exactly one
-/// uncompressed unary frame, the terminal metadata must still carry a parseable
-/// `grpc-status`, and the trailer count and per-value wire lengths must still
-/// be within the advertised ceilings — and anything else fails closed to
-/// `None`, which the caller turns into a refused replay rather than a
-/// trailers-only response with a dropped body.
-///
-/// `MAX_GRPC_TERMINATE_CUSTOM_TRAILERS` counts operator trailers only; the
-/// three dedicated protocol-owned fields (`grpc-status`, `grpc-message`,
-/// `grpc-status-details-bin`) are admitted on top of it.
-pub(crate) fn validated_persisted_grpc_terminate_trailers(
-    body: &[u8],
-    trailers: HashMap<String, String>,
-) -> Option<HashMap<String, String>> {
-    if !crate::proxy::bytes_are_single_uncompressed_unary_grpc_frame(body) {
-        return None;
-    }
-    if trailers.is_empty() || trailers.len() > MAX_GRPC_TERMINATE_CUSTOM_TRAILERS + 3 {
-        return None;
-    }
-    trailers.get("grpc-status")?.parse::<u32>().ok()?;
-    for (name, value) in &trailers {
-        // Persisted names must already be the lowercase wire form the emitter
-        // writes; a record whose names drifted cannot be shown to be the one
-        // this gateway authored.
-        let header_name = HeaderName::from_bytes(name.as_bytes()).ok()?;
-        if header_name.as_str() != name {
-            return None;
-        }
-        // The three dedicated protocol-owned fields are the only reserved names
-        // that legitimately appear here; every other reserved/hop-by-hop name
-        // the live contract refuses must stay refused on read.
-        if is_reserved_grpc_terminate_trailer_name(name)
-            && !crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(name)
-        {
-            return None;
-        }
-        if value.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
-            return None;
-        }
-        HeaderValue::from_str(value).ok()?;
-    }
-    Some(trailers)
-}
-
 fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
     crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(name)
         || name.eq_ignore_ascii_case("content-type")

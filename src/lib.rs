@@ -1206,15 +1206,8 @@ pub mod _test_support {
         headers: HashMap<String, String>,
         body: &[u8],
         presentation_digest: Option<[u8; 32]>,
-        grpc_terminate_trailers: Option<HashMap<String, String>>,
     ) -> Option<Vec<u8>> {
-        plugin.redis_payload_for_tests(
-            status_code,
-            headers,
-            body,
-            presentation_digest,
-            grpc_terminate_trailers,
-        )
+        plugin.redis_payload_for_tests(status_code, headers, body, presentation_digest)
     }
 
     // ── plugins/kafka_logging ───────────────────────────────────────────────

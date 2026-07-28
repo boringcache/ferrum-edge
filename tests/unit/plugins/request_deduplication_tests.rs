@@ -1563,7 +1563,6 @@ fn redis_persistence_is_refused_without_complete_provenance() {
             HashMap::new(),
             b"{\"ok\":true}",
             None,
-            None,
         )
         .is_none(),
         "incomplete replay provenance must never be persisted for cross-process replay"
@@ -4697,7 +4696,6 @@ async fn test_total_retained_bytes_cap_skips_new_completion() {
             HashMap::new(),
             &body,
             TEST_PRESENTATION_DIGEST,
-            None,
         )
         .is_some(),
         "a local total-cap skip must still be small enough for Redis publication"
@@ -5666,18 +5664,18 @@ fn redis_operation_record_rejects_malformed_current_version_shapes() {
 
     for valid in [
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "inflight",
             "fingerprint": fingerprint,
             "owner_token": "owner-a"
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "completed",
             "fingerprint": fingerprint
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "completed",
             "fingerprint": fingerprint,
             "replay": valid_replay.clone()
@@ -5692,31 +5690,31 @@ fn redis_operation_record_rejects_malformed_current_version_shapes() {
 
     for malformed in [
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "inflight",
             "fingerprint": fingerprint
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "inflight",
             "fingerprint": fingerprint,
             "owner_token": ""
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "inflight",
             "fingerprint": fingerprint,
             "owner_token": "owner-a",
             "replay": valid_replay.clone()
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "completed",
             "fingerprint": fingerprint,
             "owner_token": "stale-owner"
         }),
         json!({
-            "record_version": 2,
+            "record_version": 1,
             "state": "completed",
             "fingerprint": fingerprint,
             "replay": {
@@ -5753,7 +5751,6 @@ fn test_redis_payload_admission_respects_entry_size_limit() {
         headers.clone(),
         b"{\"ok\":true}",
         TEST_PRESENTATION_DIGEST,
-        None,
     )
     .expect("small Redis payload should be admitted");
     assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
@@ -5768,7 +5765,6 @@ fn test_redis_payload_admission_respects_entry_size_limit() {
             headers,
             b"{\"ok\":true}",
             TEST_PRESENTATION_DIGEST,
-            None,
         )
         .is_none(),
         "oversized responses must not be serialized for Redis storage"
@@ -5794,7 +5790,6 @@ fn test_redis_payload_uses_compact_body_encoding_before_size_check() {
         headers,
         &body,
         TEST_PRESENTATION_DIGEST,
-        None,
     )
     .expect("compact Redis payload should be admitted under the entry limit");
     let payload_json: serde_json::Value =
@@ -5832,7 +5827,6 @@ fn test_redis_payload_admission_rejects_serialized_payload_over_entry_limit() {
             headers,
             &body,
             TEST_PRESENTATION_DIGEST,
-            None,
         )
         .is_none(),
         "Redis payloads must be rejected when serialized storage exceeds the entry cap"
@@ -6033,384 +6027,5 @@ async fn test_local_and_redis_modes_compute_identical_request_identity() {
     assert_eq!(
         request_identity(&local_plugin, &local_ctx).map(|identity| identity.1),
         request_identity(&redis_plugin, &redis_ctx).map(|identity| identity.1)
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Framed native-gRPC terminate replay
-//
-// The committed-hook view of a `serverless_function` native-gRPC terminate
-// response is HTTP 200 + `application/grpc` initial headers + one uncompressed
-// unary DATA frame; the terminal metadata lives in trailers and is therefore
-// absent from the header map deduplication persists. Caching status/headers/
-// body alone would replay a 200 with a framed body and no `grpc-status`, which
-// native-gRPC reject normalization collapses to a trailers-only INTERNAL error
-// with the DATA frame dropped — a successful unary response destroyed by its
-// own replay.
-//
-// Reachability today: `request_deduplication` declares `HTTP_ONLY_PROTOCOLS`
-// while a native-gRPC request selects the `ProxyProtocol::Grpc` plugin view, so
-// the plugin-cache protocol filter keeps the two off the same request in
-// production. These tests drive `before_proxy` directly and therefore lock the
-// retention invariant itself: whichever way the protocol matrix moves, a
-// replayed framed terminate response must reproduce the first response exactly,
-// and an unauthorized response must never acquire the authorization.
-// ---------------------------------------------------------------------------
-
-/// One uncompressed unary gRPC DATA frame: flag(0) + big-endian length + bytes.
-fn grpc_unary_frame(message: &[u8]) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(5 + message.len());
-    framed.push(0);
-    framed.extend_from_slice(&(message.len() as u32).to_be_bytes());
-    framed.extend_from_slice(message);
-    framed
-}
-
-fn grpc_terminate_trailers() -> HashMap<String, String> {
-    let mut trailers = HashMap::new();
-    trailers.insert("grpc-status".to_string(), "0".to_string());
-    trailers.insert("grpc-message".to_string(), "ok".to_string());
-    trailers.insert("grpc-status-details-bin".to_string(), "AAEC".to_string());
-    trailers.insert("x-function".to_string(), "terminate".to_string());
-    trailers
-}
-
-fn grpc_terminate_response_headers() -> HashMap<String, String> {
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/grpc".to_string());
-    headers
-}
-
-fn native_grpc_ctx(path: &str) -> RequestContext {
-    let mut ctx = new_ctx("POST", path);
-    ferrum_edge::_test_support::set_request_http_flavor_for_test(
-        &mut ctx,
-        ferrum_edge::config::types::HttpFlavor::Grpc,
-    );
-    ctx
-}
-
-/// Both the first response and its local replay must reach the client as
-/// HEADERS + the exact DATA frame + the exact terminal trailers.
-#[tokio::test]
-async fn test_framed_grpc_terminate_response_survives_local_replay() {
-    use ferrum_edge::_test_support::{
-        framed_unary_reject_trailers, normalize_reject_response_with_context,
-        set_serverless_grpc_terminate_frame_for_test,
-    };
-
-    let plugin = make_plugin(json!({}));
-    let frame = grpc_unary_frame(b"\x08\x01");
-    let trailers = grpc_terminate_trailers();
-    let response_headers = grpc_terminate_response_headers();
-
-    let mut ctx1 = native_grpc_ctx("/pkg.Svc/Method");
-    let mut headers1 = HashMap::new();
-    headers1.insert("idempotency-key".to_string(), "grpc-terminate-1".to_string());
-    assert!(matches!(
-        plugin.before_proxy(&mut ctx1, &mut headers1).await,
-        PluginResult::Continue
-    ));
-
-    // `serverless_function` stamps this after its validated contract produced
-    // the frame; deduplication observes the response through the committed hook.
-    set_serverless_grpc_terminate_frame_for_test(&mut ctx1, &frame, trailers.clone());
-    let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, &frame)
-        .await;
-
-    // The first response is the baseline the replay has to reproduce.
-    let first = normalize_reject_response_with_context(
-        &ctx1,
-        http::StatusCode::OK,
-        &frame,
-        &response_headers,
-        true,
-    );
-    assert_eq!(first.body, frame);
-    let first_trailers = framed_unary_reject_trailers(&first)
-        .expect("the authored contract emits DATA plus terminal trailers");
-
-    let mut ctx2 = native_grpc_ctx("/pkg.Svc/Method");
-    let mut headers2 = HashMap::new();
-    headers2.insert("idempotency-key".to_string(), "grpc-terminate-1".to_string());
-    let (replay_status, replay_body, replay_headers) =
-        match plugin.before_proxy(&mut ctx2, &mut headers2).await {
-            PluginResult::RejectBinary {
-                status_code,
-                body,
-                headers,
-            } => (status_code, body, headers),
-            other => panic!("Expected RejectBinary replay, got {other:?}"),
-        };
-    assert_eq!(replay_status, 200);
-    assert_eq!(&replay_body[..], frame.as_slice());
-
-    let replayed = normalize_reject_response_with_context(
-        &ctx2,
-        http::StatusCode::from_u16(replay_status).unwrap(),
-        &replay_body,
-        &replay_headers,
-        true,
-    );
-    assert_eq!(
-        replayed.body, frame,
-        "the replay must keep the exact DATA frame instead of collapsing to trailers-only"
-    );
-    assert_eq!(replayed.grpc_status, Some(0));
-    let replayed_trailers = framed_unary_reject_trailers(&replayed)
-        .expect("the replay must re-mint the framed-unary authorization");
-    assert_eq!(
-        replayed_trailers, first_trailers,
-        "replayed terminal metadata must be identical to the first response's"
-    );
-    assert_eq!(
-        replayed_trailers.get("grpc-status").map(String::as_str),
-        Some("0")
-    );
-    assert_eq!(
-        replayed_trailers.get("grpc-message").map(String::as_str),
-        Some("ok")
-    );
-    assert_eq!(
-        replayed_trailers
-            .get("grpc-status-details-bin")
-            .map(String::as_str),
-        Some("AAEC")
-    );
-    assert_eq!(
-        replayed_trailers.get("x-function").map(String::as_str),
-        Some("terminate")
-    );
-    assert!(
-        !replayed.headers.contains_key("x-function"),
-        "custom terminal metadata belongs in trailers, not the HEADERS block"
-    );
-    assert_eq!(
-        replayed
-            .headers
-            .get("x-idempotent-replayed")
-            .map(String::as_str),
-        Some("true"),
-        "the replay marker still reaches the client in the initial HEADERS block"
-    );
-}
-
-/// Provenance is retained, never inferred. An ordinary cached response whose
-/// bytes happen to form a well-formed unary frame under an `application/grpc`
-/// content type must not acquire the one authorization that lets a rejection
-/// keep a body on a gRPC stream.
-#[tokio::test]
-async fn test_framed_looking_cached_response_cannot_mint_terminate_provenance() {
-    use ferrum_edge::_test_support::{
-        framed_unary_reject_trailers, normalize_reject_response_with_context,
-    };
-
-    let plugin = make_plugin(json!({}));
-    let frame = grpc_unary_frame(b"\x08\x01");
-    let mut response_headers = grpc_terminate_response_headers();
-    // Even a reject-shaped `grpc-status` header is not provenance.
-    response_headers.insert("grpc-status".to_string(), "0".to_string());
-
-    let mut ctx1 = native_grpc_ctx("/pkg.Svc/Method");
-    let mut headers1 = HashMap::new();
-    headers1.insert("idempotency-key".to_string(), "grpc-unowned-1".to_string());
-    assert!(matches!(
-        plugin.before_proxy(&mut ctx1, &mut headers1).await,
-        PluginResult::Continue
-    ));
-    // No `serverless_function` stamp: nothing authorized this body.
-    let _ = plugin
-        .on_final_response_body(&mut ctx1, 200, &response_headers, &frame)
-        .await;
-
-    let mut ctx2 = native_grpc_ctx("/pkg.Svc/Method");
-    let mut headers2 = HashMap::new();
-    headers2.insert("idempotency-key".to_string(), "grpc-unowned-1".to_string());
-    let (replay_body, replay_headers) = match plugin.before_proxy(&mut ctx2, &mut headers2).await {
-        PluginResult::RejectBinary { body, headers, .. } => (body, headers),
-        other => panic!("Expected RejectBinary replay, got {other:?}"),
-    };
-
-    let minted = ferrum_edge::_test_support::serverless_grpc_terminate_frame_for_test(&ctx2);
-    assert!(
-        minted.is_none(),
-        "an unauthorized cached response must not mint framed-unary provenance"
-    );
-    let replayed = normalize_reject_response_with_context(
-        &ctx2,
-        http::StatusCode::OK,
-        &replay_body,
-        &replay_headers,
-        true,
-    );
-    assert!(
-        replayed.body.is_empty(),
-        "an unauthorized framed-looking body stays on the trailers-only contract"
-    );
-    assert!(framed_unary_reject_trailers(&replayed).is_none());
-}
-
-/// Retained provenance is a serialized part of the Redis replay payload and is
-/// charged against the configured capacity like any other retained bytes.
-#[test]
-fn test_redis_payload_round_trips_and_charges_framed_terminate_provenance() {
-    let frame = grpc_unary_frame(b"\x08\x01");
-    let headers = grpc_terminate_response_headers();
-
-    let plugin = make_plugin(json!({ "max_entry_size_bytes": 65536 }));
-    let payload = request_deduplication_redis_payload_for_test(
-        &plugin,
-        200,
-        headers.clone(),
-        &frame,
-        TEST_PRESENTATION_DIGEST,
-        Some(grpc_terminate_trailers()),
-    )
-    .expect("a framed terminate representation is admitted under a generous cap");
-    assert!(request_deduplication_redis_cached_response_payload_is_valid(&payload));
-
-    let payload_json: serde_json::Value =
-        serde_json::from_slice(&payload).expect("payload should be JSON");
-    let persisted = payload_json
-        .get("grpc_terminate_trailers")
-        .expect("terminal trailers must survive serialization");
-    assert_eq!(persisted["grpc-status"], "0");
-    assert_eq!(persisted["grpc-message"], "ok");
-    assert_eq!(persisted["x-function"], "terminate");
-    assert!(
-        payload_json.get("headers").is_some_and(|value| {
-            value.get("grpc-status").is_none() && value.get("x-function").is_none()
-        }),
-        "terminal metadata is retained as trailers, not folded into the header map"
-    );
-
-    // Size accounting: the same status/headers/body is admitted without
-    // provenance and refused with it, so the trailers are genuinely charged.
-    let tight = make_plugin(json!({ "max_entry_size_bytes": 3000 }));
-    assert!(
-        request_deduplication_redis_payload_for_test(
-            &tight,
-            200,
-            headers.clone(),
-            &frame,
-            TEST_PRESENTATION_DIGEST,
-            None,
-        )
-        .is_some(),
-        "the bare representation fits the configured entry cap"
-    );
-    let mut heavy_trailers = grpc_terminate_trailers();
-    heavy_trailers.insert("x-detail".to_string(), "d".repeat(4000));
-    assert!(
-        request_deduplication_redis_payload_for_test(
-            &tight,
-            200,
-            headers,
-            &frame,
-            TEST_PRESENTATION_DIGEST,
-            Some(heavy_trailers),
-        )
-        .is_none(),
-        "retained terminal trailers must count against the entry size cap"
-    );
-}
-
-/// A persisted framed representation is untrusted input on read: it re-mints a
-/// security-relevant authorization, so every live contract bound is re-applied
-/// and anything malformed fails closed rather than replaying a DATA frame with
-/// fabricated terminal metadata.
-#[test]
-fn test_redis_record_rejects_malformed_framed_terminate_provenance() {
-    let fingerprint = "sha256-grpc-terminate";
-    let frame_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        grpc_unary_frame(b"\x08\x01"),
-    );
-
-    let record = |body_b64: &str, trailers: serde_json::Value| {
-        json!({
-            "record_version": 2,
-            "state": "completed",
-            "fingerprint": fingerprint,
-            "replay": {
-                "fingerprint": fingerprint,
-                "response_policy": {
-                    "gate": "00".repeat(32),
-                    "presentation": "11".repeat(32)
-                },
-                "status_code": 200,
-                "headers": { "content-type": "application/grpc" },
-                "body": body_b64,
-                "grpc_terminate_trailers": trailers
-            }
-        })
-    };
-
-    let valid = record(&frame_b64, json!({ "grpc-status": "0", "x-function": "t" }));
-    assert!(
-        request_deduplication_redis_record_payload_is_valid(
-            &serde_json::to_vec(&valid).expect("record JSON")
-        ),
-        "a well-formed persisted framed representation is replayable"
-    );
-
-    for malformed in [
-        // No `grpc-status`: the emitter would have to invent the status.
-        record(&frame_b64, json!({ "x-function": "t" })),
-        // Non-numeric `grpc-status`.
-        record(&frame_b64, json!({ "grpc-status": "ok" })),
-        // Empty terminal metadata is not a framed representation.
-        record(&frame_b64, json!({})),
-        // Trailer value beyond the advertised 8 KiB wire ceiling.
-        record(
-            &frame_b64,
-            json!({ "grpc-status": "0", "x-detail": "d".repeat(8 * 1024 + 1) }),
-        ),
-        // Hop-by-hop / protocol-owned names the live contract refuses.
-        record(
-            &frame_b64,
-            json!({ "grpc-status": "0", "content-type": "application/grpc" }),
-        ),
-        // Uppercase name: not the lowercase wire form this gateway writes.
-        record(&frame_b64, json!({ "grpc-status": "0", "X-Function": "t" })),
-        // Invalid HTTP field value.
-        record(&frame_b64, json!({ "grpc-status": "0", "x-function": "a\nb" })),
-        // Body is not a single uncompressed unary frame.
-        record("e30=", json!({ "grpc-status": "0" })),
-    ] {
-        let bytes = serde_json::to_vec(&malformed).expect("record JSON");
-        assert!(
-            !request_deduplication_redis_record_payload_is_valid(&bytes),
-            "malformed framed terminate provenance accepted: {malformed}"
-        );
-    }
-}
-
-/// The record-version fence, not a serde default, is what keeps a replay
-/// payload written before framed terminate provenance existed from being
-/// replayed as a 200 whose gRPC status normalization would fabricate.
-#[test]
-fn test_redis_record_refuses_previous_record_version() {
-    let fingerprint = "sha256-legacy";
-    let legacy = json!({
-        "record_version": 1,
-        "state": "completed",
-        "fingerprint": fingerprint,
-        "replay": {
-            "fingerprint": fingerprint,
-            "response_policy": {
-                "gate": "00".repeat(32),
-                "presentation": "11".repeat(32)
-            },
-            "status_code": 200,
-            "headers": {},
-            "body": "e30="
-        }
-    });
-    let bytes = serde_json::to_vec(&legacy).expect("record JSON");
-    assert!(
-        !request_deduplication_redis_record_payload_is_valid(&bytes),
-        "a previous-version record must be refused wholesale, not defaulted into the current shape"
     );
 }

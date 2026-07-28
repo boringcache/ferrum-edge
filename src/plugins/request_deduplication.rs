@@ -133,16 +133,7 @@ const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
 /// or newer record format is treated as a conflict rather than being parsed
 /// optimistically, so a rolling upgrade can never publish through a fence the
 /// other side does not implement.
-///
-/// Bumped to 2 when the replay payload gained the private framed native-gRPC
-/// terminate provenance (`grpc_terminate_trailers`). A v1 record for such a
-/// response carries a framed body with no terminal metadata anywhere, so
-/// replaying it would emit a 200 whose gRPC status is fabricated by
-/// normalization. Rather than adding a serde default that would silently accept
-/// those records, the version fence rejects them wholesale — consistent with the
-/// build-out policy of not carrying compatibility shims for old persisted
-/// shapes. Existing v1 keys simply behave as absent and expire on their TTL.
-const DEDUP_REDIS_RECORD_VERSION: u32 = 2;
+const DEDUP_REDIS_RECORD_VERSION: u32 = 1;
 const DEDUP_RECORD_STATE_INFLIGHT: &str = "inflight";
 const DEDUP_RECORD_STATE_COMPLETED: &str = "completed";
 /// Deterministic body for a fail-closed refusal when the centralized
@@ -460,68 +451,23 @@ struct CachedResponse {
     /// Response-side presentation policy this representation was produced
     /// under. Replay is admitted only while it still equals the live policy.
     response_policy: ResponsePolicyProvenance,
-    /// Private terminal trailers of a `serverless_function` native-gRPC
-    /// terminate response whose framed body is exactly `body`.
-    ///
-    /// The committed-hook view a native-gRPC terminate response produces is
-    /// HTTP 200 + `application/grpc` initial headers + the unary DATA frame;
-    /// the terminal metadata lives in trailers and is therefore absent from
-    /// `headers`. Caching status/headers/body alone would replay a 200 with a
-    /// framed body and no `grpc-status`, which native-gRPC reject normalization
-    /// then collapses to a trailers-only INTERNAL error with the body dropped —
-    /// a successful unary response destroyed by its own replay.
-    ///
-    /// This field is the retained provenance that prevents that. It is private
-    /// to the plugin, is captured only when the response body is byte-identical
-    /// to `RequestContext::serverless_grpc_terminate_frame`, and is the only
-    /// thing that re-mints that request-scoped authorization on replay. Body
-    /// shape and public headers are never provenance, so an ordinary cached
-    /// HTTP response — even one whose bytes happen to form a well-formed unary
-    /// frame under an `application/grpc` content type — cannot acquire it.
-    grpc_terminate_trailers: Option<Arc<HashMap<String, String>>>,
 }
 
 impl CachedResponse {
     fn retained_size(&self) -> usize {
-        cached_response_retained_size(
-            self.body.len(),
-            &self.headers,
-            self.grpc_terminate_trailers.as_deref(),
-        )
+        cached_response_retained_size(self.body.len(), &self.headers)
     }
 }
 
-fn cached_response_retained_size(
-    body_len: usize,
-    headers: &HashMap<String, String>,
-    grpc_terminate_trailers: Option<&HashMap<String, String>>,
-) -> usize {
+fn cached_response_retained_size(body_len: usize, headers: &HashMap<String, String>) -> usize {
     mem::size_of::<CachedResponse>()
         .saturating_add(body_len)
-        .saturating_add(map_retained_size(headers))
-        // Terminal trailers are retained bytes like any other: up to 35 entries
-        // of up to 8 KiB each. Leaving them out of the accounting would let a
-        // framed terminate replay exceed both the per-entry and total local
-        // capacity an operator configured.
-        .saturating_add(grpc_terminate_trailers.map_or(0, map_retained_size))
-}
-
-fn map_retained_size(map: &HashMap<String, String>) -> usize {
-    map.iter()
-        .map(|(name, value)| name.len().saturating_add(value.len()))
-        .sum::<usize>()
-}
-
-/// Fail-closed re-validation of a persisted framed native-gRPC terminate
-/// representation, at the bounds `serverless_function`'s live contract enforces.
-///
-/// Local alias so the read paths stay readable; see
-/// `serverless_function::validated_persisted_grpc_terminate_trailers`.
-fn validated_terminate_provenance(
-    body: &[u8],
-    trailers: HashMap<String, String>,
-) -> Option<HashMap<String, String>> {
-    crate::plugins::serverless_function::validated_persisted_grpc_terminate_trailers(body, trailers)
+        .saturating_add(
+            headers
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
 }
 
 /// In-flight marker to handle concurrent duplicate requests.
@@ -717,8 +663,6 @@ struct LocalCompletionCandidate<'a> {
     /// See [`CachedResponse::retention`].
     retention: Duration,
     response_policy: ResponsePolicyProvenance,
-    /// See [`CachedResponse::grpc_terminate_trailers`].
-    grpc_terminate_trailers: Option<Arc<HashMap<String, String>>>,
 }
 
 enum CompletionSkipReason {
@@ -1255,23 +1199,6 @@ impl RequestDeduplication {
         );
         let mut response_headers = sanitize_cached_headers(&cached.headers);
         response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
-        // Restore the request-scoped framed native-gRPC terminate authorization
-        // immediately before returning the replay, and ONLY from the private
-        // representation this plugin captured (or re-validated on Redis read).
-        // Without it, native-gRPC reject normalization sees a 200 with a framed
-        // body and no terminal metadata, drops the DATA frame, and maps the
-        // status to a trailers-only INTERNAL error — destroying a successful
-        // unary response by replaying it. The frame is the cached body itself,
-        // so the byte-exactness the normalizer checks holds by construction. An
-        // empty frame needs no guard here: the normalizer refuses an empty body
-        // and empty trailers on its own, so restoring them authorizes nothing.
-        if let Some(trailers) = cached.grpc_terminate_trailers.as_deref() {
-            let authored = super::ServerlessGrpcTerminateFrame {
-                frame: cached.body.clone(),
-                trailers: trailers.clone(),
-            };
-            ctx.serverless_grpc_terminate_frame = Some(Arc::new(authored));
-        }
         PluginResult::RejectBinary {
             status_code: cached.status_code,
             body: cached.body.clone(),
@@ -1559,42 +1486,10 @@ impl RequestDeduplication {
                             );
                             return RedisRecordState::Unprovable;
                         };
-                        // A persisted framed native-gRPC terminate
-                        // representation re-mints the request-scoped
-                        // authorization that lets a rejection keep a body on a
-                        // gRPC stream, so it is re-validated against the live
-                        // contract bounds before it is trusted. Failing closed
-                        // to `Unprovable` refuses the replay outright; silently
-                        // dropping the trailers instead would replay the DATA
-                        // frame with fabricated terminal metadata.
-                        let SerializableCachedResponse {
-                            status_code,
-                            headers,
-                            body,
-                            grpc_terminate_trailers,
-                            ..
-                        } = replay;
-                        let grpc_terminate_trailers = match grpc_terminate_trailers {
-                            None => None,
-                            Some(trailers) => {
-                                match validated_terminate_provenance(&body, trailers) {
-                                    Some(validated) => Some(Arc::new(validated)),
-                                    None => {
-                                        debug!(
-                                            "request_deduplication: Redis idempotency record \
-                                             carries malformed framed gRPC terminate provenance; \
-                                             refusing replay"
-                                        );
-                                        return RedisRecordState::Unprovable;
-                                    }
-                                }
-                            }
-                        };
                         Some(CachedResponse {
-                            status_code,
-                            headers,
-                            body: Bytes::from(body),
-                            grpc_terminate_trailers,
+                            status_code: replay.status_code,
+                            headers: replay.headers,
+                            body: Bytes::from(replay.body),
                             // Neither field is meaningful for a Redis-sourced
                             // record: expiry is enforced by the key TTL, and
                             // this value is only ever replayed, never inserted
@@ -1750,7 +1645,6 @@ impl RequestDeduplication {
                     status_code: response.status_code,
                     headers: response.headers.clone(),
                     body: response.body.to_vec(),
-                    grpc_terminate_trailers: response.grpc_terminate_trailers.as_deref().cloned(),
                 }),
                 RedisPayloadAdmission::Rejected => None,
             }
@@ -1961,7 +1855,6 @@ impl RequestDeduplication {
             status_code: response.status_code,
             headers: response.headers.clone(),
             body: response.body.to_vec(),
-            grpc_terminate_trailers: response.grpc_terminate_trailers.as_deref().cloned(),
         };
 
         let data = match serde_json::to_vec(&serializable) {
@@ -2033,10 +1926,6 @@ impl RequestDeduplication {
     /// policy digest a real request would have copied from its plugin-cache
     /// view; `None` reproduces a request that never observed one, which must
     /// refuse to persist.
-    ///
-    /// `grpc_terminate_trailers` reproduces a captured framed native-gRPC
-    /// terminate representation so its serialization and size accounting are
-    /// exercisable from outside the crate.
     #[allow(dead_code)]
     pub(crate) fn redis_payload_for_tests(
         &self,
@@ -2044,7 +1933,6 @@ impl RequestDeduplication {
         headers: HashMap<String, String>,
         body: &[u8],
         presentation_digest: Option<[u8; 32]>,
-        grpc_terminate_trailers: Option<HashMap<String, String>>,
     ) -> Option<Vec<u8>> {
         let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
@@ -2059,7 +1947,6 @@ impl RequestDeduplication {
             inserted_at: Instant::now(),
             retention: self.ttl,
             response_policy: ctx.response_policy_provenance(),
-            grpc_terminate_trailers: grpc_terminate_trailers.map(Arc::new),
         };
         match self.redis_payload_for_response("test-fingerprint", &response) {
             RedisPayloadAdmission::Admitted(payload) => Some(payload),
@@ -2082,10 +1969,8 @@ impl RequestDeduplication {
             retain_barrier_on_eviction,
             retention,
             response_policy,
-            grpc_terminate_trailers,
         } = candidate;
-        let entry_size =
-            cached_response_retained_size(body.len(), &headers, grpc_terminate_trailers.as_deref());
+        let entry_size = cached_response_retained_size(body.len(), &headers);
         // A size-admission failure replaces the in-flight owner with a
         // non-replayable execution barrier. Never let that replacement expire
         // before the lease it supersedes, even when the replayable response
@@ -2160,7 +2045,6 @@ impl RequestDeduplication {
                     inserted_at: Instant::now(),
                     retention,
                     response_policy,
-                    grpc_terminate_trailers,
                 })
             } else {
                 if !publish_execution_barrier_on_skip {
@@ -2193,7 +2077,6 @@ impl RequestDeduplication {
             inserted_at: Instant::now(),
             retention,
             response_policy,
-            grpc_terminate_trailers,
         };
         let redis_copy = cached.clone();
         entry.insert(DeduplicationEntry::Completed {
@@ -2607,15 +2490,6 @@ struct SerializableCachedResponse {
         deserialize_with = "deserialize_cached_response_body"
     )]
     body: Vec<u8>,
-    /// Private framed native-gRPC terminate provenance; see
-    /// [`CachedResponse::grpc_terminate_trailers`]. Absent for every ordinary
-    /// response, which is why it carries a serde default: within record version
-    /// [`DEDUP_REDIS_RECORD_VERSION`] "absent" unambiguously means "this
-    /// representation is not a framed terminate response". Records written
-    /// before the field existed are refused by the version fence, not defaulted
-    /// into this state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    grpc_terminate_trailers: Option<HashMap<String, String>>,
 }
 
 /// Wire form of `ResponsePolicyProvenance`.
@@ -2936,24 +2810,11 @@ fn request_body_digest(
 #[allow(dead_code)]
 pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bool {
     // Mirrors the admission `redis_get` performs: a payload counts as valid
-    // only when it deserializes, carries decodable replay provenance, and — for
-    // a framed native-gRPC terminate representation — still satisfies the live
-    // contract bounds.
-    let Ok(stored) = serde_json::from_slice::<SerializableCachedResponse>(data) else {
-        return false;
-    };
-    if stored.response_policy.decode().is_none() {
-        return false;
-    }
-    let SerializableCachedResponse {
-        body,
-        grpc_terminate_trailers,
-        ..
-    } = stored;
-    match grpc_terminate_trailers {
-        None => true,
-        Some(trailers) => validated_terminate_provenance(&body, trailers).is_some(),
-    }
+    // only when it both deserializes and carries decodable replay provenance.
+    serde_json::from_slice::<SerializableCachedResponse>(data)
+        .ok()
+        .and_then(|stored| stored.response_policy.decode())
+        .is_some()
 }
 
 // External tests reach this through `crate::_test_support`; the binary target
@@ -2966,23 +2827,10 @@ pub(crate) fn redis_record_payload_is_valid_for_test(data: &[u8]) -> bool {
     if !record.has_valid_current_shape() {
         return false;
     }
-    match record.replay {
-        None => true,
-        Some(replay) => {
-            if replay.response_policy.decode().is_none() {
-                return false;
-            }
-            let SerializableCachedResponse {
-                body,
-                grpc_terminate_trailers,
-                ..
-            } = replay;
-            match grpc_terminate_trailers {
-                None => true,
-                Some(trailers) => validated_terminate_provenance(&body, trailers).is_some(),
-            }
-        }
-    }
+    record
+        .replay
+        .as_ref()
+        .is_none_or(|replay| replay.response_policy.decode().is_some())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -3629,21 +3477,6 @@ impl Plugin for RequestDeduplication {
             self.ttl
         };
 
-        // Capture the framed native-gRPC terminate representation, if this
-        // response is one. The committed-hook view of such a response carries
-        // the DATA frame and the initial headers but not the terminal trailers,
-        // so status/headers/body alone are not a replayable representation of
-        // it. Authorization is byte-exact against the frame
-        // `serverless_function` authored — the same test the reject normalizer
-        // applies — so an ordinary response, or a terminate response a later
-        // `after_proxy` decorator rewrote, retains nothing and replays on the
-        // ordinary path.
-        let grpc_terminate_trailers = ctx
-            .serverless_grpc_terminate_frame
-            .as_ref()
-            .filter(|authored| !authored.trailers.is_empty() && authored.frame.as_ref() == body)
-            .map(|authored| Arc::new(authored.trailers.clone()));
-
         let (cached, sequence, completed, inflight) = match self.local_publish_completed(
             &key,
             &fingerprint,
@@ -3657,7 +3490,6 @@ impl Plugin for RequestDeduplication {
                     || redis_lock_token.is_some(),
                 retention,
                 response_policy,
-                grpc_terminate_trailers,
             },
         ) {
             LocalCompletionAction::Published {
