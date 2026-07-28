@@ -4499,7 +4499,12 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
     let token = generate_test_token(&tc);
 
     let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
-    assert_eq!(status, reqwest::StatusCode::OK, "backup failed: {:?}", backup);
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "backup failed: {:?}",
+        backup
+    );
     assert_eq!(backup["counts"]["api_specs"], 2);
     assert_eq!(backup["api_specs"]["section_version"], "1");
     assert_eq!(backup["api_specs"]["items"].as_array().unwrap().len(), 2);
@@ -4523,7 +4528,12 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
     let (status, specs, _) = admin_get(&base_url, "/api-specs?limit=50", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);
     let items = specs["items"].as_array().expect("api-specs items array");
-    assert_eq!(items.len(), 2, "both specs must survive round-trip: {:?}", specs);
+    assert_eq!(
+        items.len(),
+        2,
+        "both specs must survive round-trip: {:?}",
+        specs
+    );
 
     let (status, proxy, _) = admin_get(&base_url, "/proxies/proxy-json", &token).await;
     assert_eq!(status, reqwest::StatusCode::OK);

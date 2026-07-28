@@ -2,7 +2,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::config::types::{ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, SpecFormat, Upstream};
+use crate::config::types::{
+    ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, SpecFormat, Upstream,
+};
 
 /// Version of the `api_specs` backup section contract.
 ///
@@ -168,7 +170,8 @@ impl ApiSpecBackupItem {
             proxy_id: spec.proxy_id.clone(),
             spec_version: spec.spec_version.clone(),
             spec_format: spec.spec_format,
-            spec_content_base64: base64::engine::general_purpose::STANDARD.encode(&spec.spec_content),
+            spec_content_base64: base64::engine::general_purpose::STANDARD
+                .encode(&spec.spec_content),
             content_encoding: spec.content_encoding.clone(),
             uncompressed_size: spec.uncompressed_size,
             content_hash: spec.content_hash.clone(),
@@ -191,7 +194,12 @@ impl ApiSpecBackupItem {
     pub(crate) fn to_api_spec(&self) -> Result<ApiSpec, String> {
         let spec_content = base64::engine::general_purpose::STANDARD
             .decode(self.spec_content_base64.as_bytes())
-            .map_err(|error| format!("api_spec '{}': invalid spec_content_base64: {error}", self.id))?;
+            .map_err(|error| {
+                format!(
+                    "api_spec '{}': invalid spec_content_base64: {error}",
+                    self.id
+                )
+            })?;
         Ok(ApiSpec {
             id: self.id.clone(),
             namespace: self.namespace.clone(),
@@ -292,8 +300,10 @@ pub(crate) fn validate_restore_api_specs_section(
     let max_compressed = max_uncompressed.saturating_mul(2).max(1024 * 1024);
     let mut seen_ids = HashSet::new();
     let mut seen_proxy_ids = HashSet::new();
-    let proxy_by_id: HashMap<&str, &Proxy> =
-        proxies.iter().map(|proxy| (proxy.id.as_str(), proxy)).collect();
+    let proxy_by_id: HashMap<&str, &Proxy> = proxies
+        .iter()
+        .map(|proxy| (proxy.id.as_str(), proxy))
+        .collect();
 
     let mut specs = Vec::with_capacity(section.items.len());
     for item in &section.items {
@@ -677,15 +687,12 @@ mod tests {
         let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
-            items: vec![
-                sample_spec_item("spec-json", "proxy-json", json_raw),
-                {
-                    let mut item = sample_spec_item("spec-yaml", "proxy-yaml", yaml_raw);
-                    item.spec_format = SpecFormat::Yaml;
-                    item.spec_version = "3.0.3".to_string();
-                    item
-                },
-            ],
+            items: vec![sample_spec_item("spec-json", "proxy-json", json_raw), {
+                let mut item = sample_spec_item("spec-yaml", "proxy-yaml", yaml_raw);
+                item.spec_format = SpecFormat::Yaml;
+                item.spec_version = "3.0.3".to_string();
+                item
+            }],
         };
         let proxies = vec![
             sample_owned_proxy("spec-json", "proxy-json"),
@@ -710,7 +717,10 @@ mod tests {
         let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
         let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
             .expect_err("bad base64");
-        assert!(err.iter().any(|e| e.contains("invalid spec_content_base64")));
+        assert!(
+            err.iter()
+                .any(|e| e.contains("invalid spec_content_base64"))
+        );
 
         let mut oversized = sample_spec_item("spec-2", "proxy-2", raw);
         oversized.uncompressed_size = 50 * 1024 * 1024;
@@ -735,7 +745,10 @@ mod tests {
         let proxies = vec![sample_owned_proxy("spec-3", "proxy-3")];
         let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
             .expect_err("hash mismatch");
-        assert!(err.iter().any(|e| e.contains("content_hash does not match")));
+        assert!(
+            err.iter()
+                .any(|e| e.contains("content_hash does not match"))
+        );
 
         let section = ApiSpecsBackupSection {
             section_version: "99".to_string(),
@@ -743,7 +756,10 @@ mod tests {
         };
         let err = validate_restore_api_specs_section(&section, &[], &[], &[], 25)
             .expect_err("bad version");
-        assert!(err.iter().any(|e| e.contains("Unsupported api_specs.section_version")));
+        assert!(
+            err.iter()
+                .any(|e| e.contains("Unsupported api_specs.section_version"))
+        );
     }
 
     #[test]
@@ -762,8 +778,9 @@ mod tests {
             "api_spec_id": "missing-spec"
         }))
         .expect("upstream");
-        let err = validate_restore_api_specs_section(&section, &proxies, &[upstream.clone()], &[], 25)
-            .expect_err("orphan upstream tag");
+        let err =
+            validate_restore_api_specs_section(&section, &proxies, &[upstream.clone()], &[], 25)
+                .expect_err("orphan upstream tag");
         assert!(err.iter().any(|e| e.contains("upstream 'up-1'")));
 
         upstream.api_spec_id = Some("spec-1".to_string());

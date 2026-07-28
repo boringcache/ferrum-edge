@@ -6613,7 +6613,9 @@ async fn handle_backup(
         None
     };
     let api_specs_section = api_specs_owned.as_ref();
-    let api_specs_count = api_specs_section.map(|section| section.items.len()).unwrap_or(0);
+    let api_specs_count = api_specs_section
+        .map(|section| section.items.len())
+        .unwrap_or(0);
 
     let backup = BackupPayload {
         version: &config.version,

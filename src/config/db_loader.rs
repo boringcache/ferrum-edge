@@ -2541,13 +2541,12 @@ impl DatabaseStore {
             // Defense in depth: the owning proxy must already exist. Ownership
             // tags are stamped separately because ordinary batch inserts omit
             // `api_spec_id` so direct admin writes cannot forge managed state.
-            let proxy_row: Option<AnyRow> = sqlx::query(&self.q(
-                "SELECT id FROM proxies WHERE namespace = ? AND id = ?",
-            ))
-            .bind(&spec.namespace)
-            .bind(&spec.proxy_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let proxy_row: Option<AnyRow> =
+                sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND id = ?"))
+                    .bind(&spec.namespace)
+                    .bind(&spec.proxy_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
             if proxy_row.is_none() {
                 anyhow::bail!(
                     "cannot restore api_spec '{}': owning proxy '{}' is missing",
@@ -2586,9 +2585,9 @@ impl DatabaseStore {
         }
         for proxy in proxies {
             if let Some(spec_id) = proxy.api_spec_id.as_deref() {
-                sqlx::query(&self.q(
-                    "UPDATE proxies SET api_spec_id = ? WHERE namespace = ? AND id = ?",
-                ))
+                sqlx::query(
+                    &self.q("UPDATE proxies SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                )
                 .bind(spec_id)
                 .bind(&proxy.namespace)
                 .bind(&proxy.id)
@@ -2598,9 +2597,9 @@ impl DatabaseStore {
         }
         for upstream in upstreams {
             if let Some(spec_id) = upstream.api_spec_id.as_deref() {
-                sqlx::query(&self.q(
-                    "UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?",
-                ))
+                sqlx::query(
+                    &self.q("UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                )
                 .bind(spec_id)
                 .bind(&upstream.namespace)
                 .bind(&upstream.id)
@@ -2610,9 +2609,11 @@ impl DatabaseStore {
         }
         for plugin in plugin_configs {
             if let Some(spec_id) = plugin.api_spec_id.as_deref() {
-                sqlx::query(&self.q(
-                    "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
-                ))
+                sqlx::query(
+                    &self.q(
+                        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
+                    ),
+                )
                 .bind(spec_id)
                 .bind(&plugin.namespace)
                 .bind(&plugin.id)

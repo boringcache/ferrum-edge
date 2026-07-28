@@ -542,17 +542,9 @@ async fn test_admin_backup_restore_api_specs_roundtrip_mongodb() {
     assert_eq!(backup["api_specs"]["section_version"], "1");
     assert_eq!(backup["api_specs"]["items"][0]["id"], spec_id);
 
-    let restore = admin_post_json(
-        &client,
-        &gateway,
-        "/restore?confirm=true",
-        &auth,
-        backup,
-    )
-    .await;
+    let restore = admin_post_json(&client, &gateway, "/restore?confirm=true", &auth, backup).await;
     assert_eq!(
-        restore["restored"]["api_specs"],
-        1,
+        restore["restored"]["api_specs"], 1,
         "mongodb restore must recreate api_specs: {restore}"
     );
 

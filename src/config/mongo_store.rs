@@ -11463,9 +11463,7 @@ mod inner {
             namespace: &str,
         ) -> Result<Vec<ApiSpec>, anyhow::Error> {
             let start = std::time::Instant::now();
-            let options = FindOptions::builder()
-                .sort(doc! { "_id": 1 })
-                .build();
+            let options = FindOptions::builder().sort(doc! { "_id": 1 }).build();
             let mut cursor = self
                 .api_specs()
                 .find(doc! { "namespace": namespace })
