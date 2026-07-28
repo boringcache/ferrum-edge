@@ -301,6 +301,11 @@ pub fn snapshot() -> NodeWaypointObservabilitySnapshot {
 /// Always emits HELP/TYPE when the feature is enabled so scrapes expose a
 /// stable zero baseline; when disabled, emits nothing (non-NodeWaypoint
 /// processes must not advertise the series).
+///
+/// Callers that serve `/metrics` through [`crate::plugins::prometheus_metrics::MetricsRegistry::render`]
+/// append this **outside** the registry render cache so process-static
+/// increments remain visible on the next scrape without waiting for
+/// `render_cache_ttl_seconds`.
 pub fn render_prometheus(output: &mut String, gateway_ns_label: &str) {
     if !is_enabled() {
         return;

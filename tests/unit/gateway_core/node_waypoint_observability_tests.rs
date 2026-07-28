@@ -128,7 +128,7 @@ fn enabled_producers_increment_and_render_bounded_labels() {
     );
 
     let registry = MetricsRegistry::new();
-    let output = registry.render_uncached();
+    let output = registry.render();
     assert!(output.contains("# TYPE ferrum_mesh_node_waypoint_hbone_handshakes_total counter"));
     assert!(output.contains(
         "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}"
@@ -172,6 +172,55 @@ fn enabled_producers_increment_and_render_bounded_labels() {
 
     // Leave enabled for other tests that may race in parallel; producers are
     // additive and snapshots compare deltas.
+}
+
+/// `/metrics` must observe NodeWaypoint ADR counter movement even when the
+/// MetricsRegistry render cache would otherwise serve a body generated before
+/// the increment (default TTL is 5s; the live harness scrapes before/after
+/// within that window).
+#[test]
+fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
+    node_waypoint_observability::set_enabled(true);
+    let registry = MetricsRegistry::new();
+    // Keep the registry body cached across the producer increment.
+    registry.configure(5, 3600, 60_000, "ferrum");
+
+    let before_output = registry.render();
+    let before_failure = prometheus_counter_value(
+        &before_output,
+        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}",
+    );
+
+    node_waypoint_observability::record_hbone_handshake(
+        NodeWaypointHboneHandshakePhase::InboundTls,
+        false,
+    );
+
+    let after_output = registry.render();
+    let after_failure = prometheus_counter_value(
+        &after_output,
+        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}",
+    );
+    assert_eq!(
+        after_failure,
+        before_failure + 1,
+        "cached /metrics render must still reflect a fresh inbound_tls failure"
+    );
+}
+
+fn prometheus_counter_value(output: &str, series_prefix: &str) -> u64 {
+    for line in output.lines() {
+        if line.starts_with('#') || !line.starts_with(series_prefix) {
+            continue;
+        }
+        let Some(value) = line.rsplit_once(' ').map(|(_, v)| v) else {
+            continue;
+        };
+        if let Ok(parsed) = value.parse::<u64>() {
+            return parsed;
+        }
+    }
+    0
 }
 
 #[test]
