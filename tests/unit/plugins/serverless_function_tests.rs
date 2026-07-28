@@ -1085,7 +1085,7 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    match plugin.before_proxy(&mut ctx, &mut headers).await {
+    let (reject_body, reject_headers) = match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::RejectBinary {
             status_code,
             body,
@@ -1102,18 +1102,42 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
                 headers.get("x-function").map(String::as_str),
                 Some("terminate")
             );
-            let framed =
-                ferrum_edge::plugins::serverless_function::test_helpers::frame_uncompressed_unary_grpc_message_test(
-                    protobuf,
-                )
-                .unwrap();
+            let framed = frame_terminate_message(protobuf);
             assert_eq!(body, framed);
+            (body, headers)
         }
-        other => panic!(
-            "Expected RejectBinary framed gRPC response, got {:?}",
-            other
-        ),
-    }
+        other => panic!("Expected RejectBinary framed gRPC response, got {:?}", other),
+    };
+
+    // End-to-end state transition: the provenance the plugin stamped is what
+    // authorizes the shared normalizer to emit DATA + terminal trailers, and the
+    // emitter-side predicate every gRPC writer reads agrees.
+    let normalized = ferrum_edge::_test_support::normalize_reject_response_with_context(
+        &ctx,
+        http::StatusCode::OK,
+        &reject_body,
+        &reject_headers,
+        true,
+    );
+    assert_eq!(normalized.body, reject_body.as_ref());
+    let emitted_trailers = ferrum_edge::_test_support::framed_unary_reject_trailers(&normalized)
+        .expect("plugin-stamped provenance must authorize DATA + trailers");
+    assert_eq!(
+        emitted_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        emitted_trailers.get("grpc-message").map(String::as_str),
+        Some("ok")
+    );
+    assert_eq!(
+        emitted_trailers.get("x-function").map(String::as_str),
+        Some("terminate")
+    );
+    assert!(
+        !normalized.headers.contains_key("x-function"),
+        "custom terminal metadata belongs in trailers, not the HEADERS block"
+    );
 }
 
 #[tokio::test]
@@ -1179,23 +1203,48 @@ fn test_native_grpc_terminate_contract_rejects_streaming_and_reserved_trailers()
     assert!(reserved_err.contains("protocol-owned"));
 }
 
-#[test]
-fn test_normalize_reject_preserves_framed_unary_grpc_body() {
-    use ferrum_edge::_test_support::normalize_reject_response;
-    use http::StatusCode;
-
-    let protobuf = b"hello";
-    let framed =
-        ferrum_edge::plugins::serverless_function::test_helpers::frame_uncompressed_unary_grpc_message_test(
-            protobuf,
-        )
-        .unwrap();
+fn framed_grpc_terminate_reject_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     headers.insert("grpc-status".to_string(), "0".to_string());
     headers.insert("x-custom".to_string(), "trail".to_string());
+    headers
+}
 
-    let normalized = normalize_reject_response(StatusCode::OK, &framed, &headers, true);
+fn framed_grpc_terminate_trailers() -> HashMap<String, String> {
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("x-custom".to_string(), "trail".to_string());
+    trailers
+}
+
+fn frame_terminate_message(message: &[u8]) -> Bytes {
+    ferrum_edge::plugins::serverless_function::test_helpers::frame_uncompressed_unary_grpc_message_test(
+        message,
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_normalize_reject_preserves_framed_unary_grpc_body() {
+    use ferrum_edge::_test_support::{
+        framed_unary_reject_trailers, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let framed = frame_terminate_message(b"hello");
+    let headers = framed_grpc_terminate_reject_headers();
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &framed,
+        framed_grpc_terminate_trailers(),
+    );
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &framed, &headers, true);
     assert_eq!(normalized.http_status, StatusCode::OK);
     assert_eq!(normalized.body, framed.as_ref());
     assert_eq!(normalized.grpc_status, Some(0));
@@ -1215,6 +1264,160 @@ fn test_normalize_reject_preserves_framed_unary_grpc_body() {
         normalized.grpc_trailers.get("x-custom").map(String::as_str),
         Some("trail")
     );
+
+    // The emitter-side decision every gRPC reject writer shares — the H1/H2
+    // body builder, the direct-H3 writer, and both H3 cross-protocol writers.
+    // `Some` is what makes DATA + terminal trailers legal to write; a writer
+    // that emitted DATA while dropping these would produce a stream with no
+    // terminal metadata.
+    let emitted_trailers =
+        framed_unary_reject_trailers(&normalized).expect("framed unary reject must carry trailers");
+    assert_eq!(emitted_trailers, normalized.grpc_trailers);
+    assert_eq!(
+        emitted_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+}
+
+/// Provenance, not shape, authorizes a body on a native gRPC rejection. An
+/// unrelated plugin can produce a reject whose body is a byte-perfect
+/// uncompressed unary frame and whose headers claim `application/grpc` +
+/// `grpc-status`; it must still normalize to trailers-only so an untrusted body
+/// is never reflected onto the wire.
+#[test]
+fn test_normalize_reject_without_provenance_stays_trailers_only() {
+    use ferrum_edge::_test_support::{
+        framed_unary_reject_trailers, normalize_reject_response_with_context,
+    };
+    use http::StatusCode;
+
+    let framed = frame_terminate_message(b"hello");
+    let headers = framed_grpc_terminate_reject_headers();
+    let ctx = create_test_context();
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &framed, &headers, true);
+    assert!(
+        normalized.body.is_empty(),
+        "an unauthorized reject must not reflect a body onto a native gRPC stream"
+    );
+    assert!(normalized.grpc_trailers.is_empty());
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "trailers-only rejects keep terminal metadata in the HEADERS block"
+    );
+    assert!(framed_unary_reject_trailers(&normalized).is_none());
+}
+
+/// Byte-exact provenance: a decorator that rewrites the reject body after
+/// `serverless_function` stamped its frame — and any later unrelated rejection
+/// on the same request — falls back to trailers-only.
+#[test]
+fn test_normalize_reject_provenance_is_byte_exact() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let authored = frame_terminate_message(b"hello");
+    let rewritten = frame_terminate_message(b"tampered");
+    let headers = framed_grpc_terminate_reject_headers();
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &authored,
+        framed_grpc_terminate_trailers(),
+    );
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &rewritten, &headers, true);
+    assert!(
+        normalized.body.is_empty(),
+        "a body that is not the authored frame must not be preserved"
+    );
+    assert!(normalized.grpc_trailers.is_empty());
+}
+
+/// The authorization is native-gRPC only. A non-gRPC request keeps the ordinary
+/// HTTP representation rather than being reinterpreted as a framed unary reply.
+#[test]
+fn test_normalize_reject_provenance_does_not_apply_to_non_grpc() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let framed = frame_terminate_message(b"hello");
+    let headers = framed_grpc_terminate_reject_headers();
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &framed,
+        framed_grpc_terminate_trailers(),
+    );
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &framed, &headers, false);
+    assert_eq!(normalized.body, framed.as_ref());
+    assert!(normalized.grpc_trailers.is_empty());
+    assert_eq!(normalized.grpc_status, None);
+}
+
+/// A terminate contract that asks for a status-only reply frames nothing, so no
+/// provenance is minted and the rejection stays on the trailers-only contract.
+#[tokio::test]
+async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grpc_status": 5,
+            "grpc_message": "not found"
+        })))
+        .mount(&server)
+        .await;
+
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::RejectBinary { body, headers, .. } => {
+            assert!(body.is_empty(), "status-only contract frames no DATA");
+            assert_eq!(headers.get("grpc-status").map(String::as_str), Some("5"));
+        }
+        other => panic!("Expected RejectBinary, got {:?}", other),
+    }
+
+    let normalized = ferrum_edge::_test_support::normalize_reject_response_with_context(
+        &ctx,
+        http::StatusCode::OK,
+        b"",
+        &framed_grpc_terminate_reject_headers(),
+        true,
+    );
+    assert!(normalized.body.is_empty());
+    assert!(normalized.grpc_trailers.is_empty());
 }
 
 #[tokio::test]

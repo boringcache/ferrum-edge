@@ -10059,3 +10059,97 @@ fn priority_override_preserves_dynamic_replay_provenance() {
          to unprovable; otherwise the runtime backstop for the dedup composition is defeated"
     );
 }
+
+// ---------------------------------------------------------------------------
+// serverless_function terminate config lifecycle (issue #3292 acceptance)
+//
+// Whether a native gRPC request gets the framed unary terminate contract is
+// decided entirely by this plugin config, so the acceptance evidence is that
+// create / read / update / reload / delete all reach the resolved gRPC request
+// view — not only first-start construction.
+// ---------------------------------------------------------------------------
+
+const SERVERLESS_GRPC_PROXY: &str = "grpc-terminate-proxy";
+
+fn serverless_terminate_plugin_config(id: &str, mode: &str) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "mode": mode,
+            "timeout_ms": 5000
+        }),
+        PluginScope::Proxy,
+        Some(SERVERLESS_GRPC_PROXY),
+    )
+}
+
+fn resolved_plugin_names(cache: &PluginCache, protocol: ProxyProtocol) -> Vec<String> {
+    plugins_for_protocol_for_test(
+        cache,
+        &ferrum_edge::config::types::default_namespace(),
+        SERVERLESS_GRPC_PROXY,
+        protocol,
+    )
+    .iter()
+    .map(|plugin| plugin.name().to_string())
+    .collect()
+}
+
+#[test]
+fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete() {
+    let proxy = || make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec!["sls-terminate"]);
+
+    // Create.
+    let created = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config("sls-terminate", "terminate")],
+    );
+    let cache = PluginCache::new(&created).expect("terminate config builds");
+
+    // Read: resolved for native gRPC and for HTTP, matching the documented
+    // HTTP_GRPC_PROTOCOLS matrix row.
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "terminate-mode serverless_function must resolve for native gRPC requests"
+    );
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Http)
+            .contains(&"serverless_function".to_string())
+    );
+
+    // Update + reload: flipping the mode republishes in place, so a live mode
+    // change cannot leave the previous instance resolved.
+    let updated = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config("sls-terminate", "pre_proxy")],
+    );
+    cache.rebuild(&updated).expect("pre_proxy config reloads");
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string())
+    );
+
+    // An invalid mode is fail-closed at reload rather than silently accepted or
+    // partially published.
+    let invalid = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config("sls-terminate", "shortcircuit")],
+    );
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("an unknown serverless_function mode must reject reload");
+    assert!(error.contains("mode"), "unexpected reload error: {error}");
+
+    // Delete.
+    let deleted = make_config(vec![make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec![])], vec![]);
+    cache.rebuild(&deleted).expect("cache reloads without the plugin");
+    assert!(
+        !resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "deleting the plugin config must remove it from the resolved gRPC view"
+    );
+}

@@ -6001,10 +6001,19 @@ async fn apply_buffered_grpc_plugin_reject(
         &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
+    // A trailers-only rejection replaces the backend response wholesale, so the
+    // backend's trailers must not survive. A framed unary rejection instead
+    // carries its own sanitized terminal metadata, and clearing it would emit
+    // DATA with no terminal trailers at all.
+    let framed_unary_trailers = crate::proxy::framed_unary_reject_parts(&normalized)
+        .map(|(_, trailers)| trailers.clone());
     *response_status = normalized.http_status.as_u16();
     *response_headers = normalized.headers;
     *response_body = normalized.body;
-    response_trailers.clear();
+    match framed_unary_trailers {
+        Some(trailers) => *response_trailers = trailers,
+        None => response_trailers.clear(),
+    }
 }
 
 fn normalized_h3_grpc_deadline() -> crate::proxy::NormalizedRejectResponse {
@@ -6831,8 +6840,21 @@ fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
-    let normalized =
-        crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
+    // A framed unary body is a NATIVE gRPC wire contract only. A gRPC-Web client
+    // reads body-framed trailers, so provenance is withheld there and the
+    // rejection stays on the translated trailers-only path (the plugin also
+    // refuses gRPC-Web terminate before invocation).
+    let normalized = crate::proxy::normalize_reject_response_with_provenance(
+        status,
+        body,
+        headers,
+        native_grpc || grpc_web,
+        if native_grpc && !grpc_web {
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx)
+        } else {
+            crate::proxy::FramedGrpcUnaryProvenance::NONE
+        },
+    );
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
@@ -7368,7 +7390,7 @@ async fn write_normalized_grpc_reject_send<S>(
 where
     S: SendStream<Bytes>,
 {
-    let framed_unary = !reject.body.is_empty() && !reject.grpc_trailers.is_empty();
+    let framed_unary = crate::proxy::framed_unary_reject_parts(reject).is_some();
     debug_assert!(
         framed_unary || reject.body.is_empty(),
         "normalized gRPC rejects should be trailers-only or framed unary with trailers"

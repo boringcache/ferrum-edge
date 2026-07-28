@@ -16294,7 +16294,16 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let normalized = normalize_reject_response(status_code, body, headers, is_grpc_request);
+        // Committed observers must see the response that is actually emitted,
+        // including a serverless terminate framed unary body — otherwise the
+        // hook view and the wire diverge on exactly this path.
+        let normalized = normalize_reject_response_with_provenance(
+            status_code,
+            body,
+            headers,
+            is_grpc_request,
+            FramedGrpcUnaryProvenance::from_context(ctx),
+        );
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -16620,11 +16629,75 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     grpc_proxy::http_reject_status_to_grpc_status(status)
 }
 
+/// Provenance authorizing a native-gRPC rejection to keep a framed unary DATA
+/// body instead of collapsing to the trailers-only error contract.
+///
+/// The only holder of this authorization is a `serverless_function` terminate
+/// invocation whose function output already passed the plugin's fail-closed
+/// contract validation. Body shape and reject headers are deliberately NOT
+/// provenance: they are reachable by any plugin (including custom plugins) and
+/// partly derived from function/backend input, so trusting them would let an
+/// ordinary rejection reflect an untrusted body onto a native gRPC stream.
+///
+/// Authorization is byte-exact against the frame the plugin authored, so a
+/// replaceable `after_proxy` decorator that rewrites the reject body, and any
+/// later unrelated rejection on the same request, both fall back to
+/// trailers-only.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FramedGrpcUnaryProvenance<'a> {
+    authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+}
+
+impl<'a> FramedGrpcUnaryProvenance<'a> {
+    /// No authorization: framed unary DATA is never preserved.
+    pub(crate) const NONE: Self = Self { authored: None };
+
+    /// Read the request-scoped authorization stamped by `serverless_function`.
+    pub(crate) fn from_context(ctx: &'a RequestContext) -> Self {
+        Self::from_authored_frame(ctx.serverless_grpc_terminate_frame.as_deref())
+    }
+
+    /// Same authorization from a snapshot of the stamped frame, for call sites
+    /// that must release their `ctx` borrow before the write.
+    pub(crate) fn from_authored_frame(
+        authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+    ) -> Self {
+        Self { authored }
+    }
+
+    /// The terminal metadata this rejection may emit as trailers, or `None`
+    /// when `body` is not the authored frame and the rejection must stay
+    /// trailers-only.
+    fn authorized_trailers(&self, body: &[u8]) -> Option<&'a HashMap<String, String>> {
+        let authored = self.authored?;
+        if authored.frame.is_empty() || authored.trailers.is_empty() {
+            return None;
+        }
+        (authored.frame.as_ref() == body).then_some(&authored.trailers)
+    }
+}
+
 pub(crate) fn normalize_reject_response(
     status: StatusCode,
     body: &[u8],
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    normalize_reject_response_with_provenance(
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::NONE,
+    )
+}
+
+pub(crate) fn normalize_reject_response_with_provenance(
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    is_grpc_request: bool,
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
 ) -> NormalizedRejectResponse {
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
@@ -16647,10 +16720,15 @@ pub(crate) fn normalize_reject_response(
         };
     }
 
-    // Preserve plugin-authored uncompressed unary DATA + terminal metadata
-    // (serverless_function terminate). Ordinary rejects fall through to
-    // trailers-only so untrusted bodies are never reflected onto the wire.
-    if let Some(framed) = try_normalize_framed_grpc_unary_reject(body, headers) {
+    // Preserve uncompressed unary DATA + terminal metadata ONLY for the
+    // explicitly authorized `serverless_function` terminate result. Every other
+    // rejection — including one whose body happens to look like a gRPC frame and
+    // whose headers claim `application/grpc` + `grpc-status` — falls through to
+    // trailers-only, so an untrusted body is never reflected onto the wire.
+    let authorized_framed = framed_unary_provenance
+        .authorized_trailers(body)
+        .and_then(|trailers| try_normalize_framed_grpc_unary_reject(body, headers, trailers));
+    if let Some(framed) = authorized_framed {
         return framed;
     }
 
@@ -16691,13 +16769,21 @@ pub(crate) fn normalize_reject_response(
     }
 }
 
-/// Accept a plugin reject that already carries an uncompressed unary native
-/// gRPC DATA frame plus `grpc-status` signalling. Used by serverless terminate
-/// so the framed protobuf message is not discarded by trailers-only
-/// normalization.
+/// Build the client representation for a rejection that already carries the
+/// authorized `serverless_function` terminate frame: HTTP 200 +
+/// `application/grpc` HEADERS, one uncompressed unary DATA frame, and the
+/// plugin-authored terminal trailers.
+///
+/// `authored_trailers` is the ONLY source of client-visible trailers. Terminal
+/// metadata is deliberately not promoted out of `headers`: that map has been
+/// through `after_proxy` decorators and initial-response-header policy, so it
+/// can hold CORS fields, gateway-managed values, and internal bridge fields
+/// that belong in the HEADERS block (or nowhere) rather than in trailers. Those
+/// headers are preserved in the initial block minus terminal/hop-by-hop names.
 fn try_normalize_framed_grpc_unary_reject(
     body: &[u8],
     headers: &HashMap<String, String>,
+    authored_trailers: &HashMap<String, String>,
 ) -> Option<NormalizedRejectResponse> {
     if body.is_empty() {
         return None;
@@ -16706,49 +16792,56 @@ fn try_normalize_framed_grpc_unary_reject(
     if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
         return None;
     }
-    let grpc_status = headers.get("grpc-status")?.parse::<u32>().ok()?;
     if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
         return None;
     }
-
-    let grpc_message = headers
+    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    let grpc_message = authored_trailers
         .get("grpc-message")
         .map(|message| sanitize_grpc_message(message))
         .filter(|message| !message.is_empty());
 
-    let mut initial_headers = HashMap::with_capacity(1);
+    let mut initial_headers = HashMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let lower = key.to_ascii_lowercase();
+        // Terminal metadata belongs in the trailers block only; emitting it in
+        // HEADERS too would make the response look Trailers-Only to a client.
+        if lower == "content-type" || authored_trailers.contains_key(&lower) {
+            continue;
+        }
+        if lower == "grpc-status" || lower == "grpc-message" {
+            continue;
+        }
+        // Ferrum-owned gRPC-Web bridge fields must never reach a client.
+        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(&lower) {
+            continue;
+        }
+        if lower == "connection"
+            || lower == "keep-alive"
+            || lower == "proxy-connection"
+            || lower == "transfer-encoding"
+            || lower == "te"
+            || lower == "trailer"
+            || lower == "upgrade"
+            || lower == "content-length"
+        {
+            continue;
+        }
+        initial_headers.insert(lower, value.clone());
+    }
     initial_headers.insert("content-type".to_string(), "application/grpc".to_string());
 
-    let mut trailers = HashMap::with_capacity(headers.len());
-    trailers.insert("grpc-status".to_string(), grpc_status.to_string());
-    if let Some(ref message) = grpc_message {
-        trailers.insert("grpc-message".to_string(), message.clone());
-    }
-
-    for (key, value) in headers {
-        if key.eq_ignore_ascii_case("content-type")
-            || key.eq_ignore_ascii_case("grpc-status")
-            || key.eq_ignore_ascii_case("grpc-message")
-        {
-            continue;
+    // Emit the same `grpc-message` shape every other gRPC error path emits, so
+    // the terminate contract cannot be the one place an unsanitized status
+    // message reaches the wire.
+    let mut trailers = authored_trailers.clone();
+    match grpc_message {
+        Some(ref message) => {
+            trailers.insert("grpc-message".to_string(), message.clone());
         }
-        // Ferrum-owned gRPC-Web bridge fields must never reach a client, and
-        // this path promotes headers into client-visible trailers.
-        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(key) {
-            continue;
+        None => {
+            trailers.remove("grpc-message");
         }
-        if key.eq_ignore_ascii_case("connection")
-            || key.eq_ignore_ascii_case("keep-alive")
-            || key.eq_ignore_ascii_case("proxy-connection")
-            || key.eq_ignore_ascii_case("transfer-encoding")
-            || key.eq_ignore_ascii_case("te")
-            || key.eq_ignore_ascii_case("trailer")
-            || key.eq_ignore_ascii_case("upgrade")
-            || key.eq_ignore_ascii_case("content-length")
-        {
-            continue;
-        }
-        trailers.insert(key.clone(), value.clone());
     }
 
     Some(NormalizedRejectResponse {
@@ -16759,6 +16852,20 @@ fn try_normalize_framed_grpc_unary_reject(
         grpc_message,
         grpc_trailers: trailers,
     })
+}
+
+/// Shared predicate for "this normalized rejection is a framed unary gRPC
+/// response rather than a trailers-only error", plus the terminal trailers that
+/// MUST accompany the DATA frame.
+///
+/// Every emitter (the H1/H2 body builder, the direct-H3 writer, and both H3
+/// cross-protocol writers) reads this one helper so no protocol path can emit
+/// DATA while dropping the mandatory terminal metadata.
+pub(crate) fn framed_unary_reject_parts(
+    reject: &NormalizedRejectResponse,
+) -> Option<(&[u8], &HashMap<String, String>)> {
+    (!reject.body.is_empty() && !reject.grpc_trailers.is_empty())
+        .then(|| (reject.body.as_slice(), &reject.grpc_trailers))
 }
 
 fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
@@ -16847,7 +16954,7 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
         &reject.headers,
     );
 
-    let body = if !reject.body.is_empty() && !reject.grpc_trailers.is_empty() {
+    let body = if framed_unary_reject_parts(&reject).is_some() {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(Bytes::from(reject.body), trailers)
     } else if reject.body.is_empty() {
@@ -17975,7 +18082,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
         std::sync::atomic::Ordering::Relaxed,
     );
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
-    normalize_reject_response(status, &response_body, &headers, is_grpc_request)
+    normalize_reject_response_with_provenance(
+        status,
+        &response_body,
+        &headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::from_context(ctx),
+    )
 }
 
 /// Finalize a terminal request-body read failure before any external operation

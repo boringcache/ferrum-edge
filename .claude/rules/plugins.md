@@ -93,7 +93,12 @@ with configured plugin order preserved within each stage. Do not hard-code
 plugin names or change request-side priorities to obtain response representation
 ordering.
 
-Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
+Plugin rejects for `application/grpc` must become trailers-only gRPC errors. The single
+exception is the `serverless_function` terminate contract: a validated function response
+stamps request-scoped provenance (`RequestContext.serverless_grpc_terminate_frame`) that
+authorizes exactly that byte-identical frame to be emitted as HEADERS + one uncompressed
+unary DATA frame + plugin-authored terminal trailers. Reject body shape and reject
+`content-type`/`grpc-status` headers are never provenance.
 
 ## Request Context And Body Rules
 
@@ -107,7 +112,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - gRPC uses `GrpcBody::Streaming(Incoming)` when there are no body plugins and no retries; otherwise `Buffered(Full<Bytes>)`.
 - In `before_proxy(ctx, headers)`, read headers from the `headers` parameter, never `ctx.headers`. The handler may have moved headers out of `ctx.headers` when no plugin modifies request headers.
 - `ctx.authenticated_identity` is first-class for rate-limit/cache keys, log summaries, and backend identity header injection.
-- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `Reject` normalizes to trailers-only errors that discard configured bodies.
+- `response_mock` strips a proxy prefix `listen_path` before rule matching, except for root, regex, exact (`=`), and host-only scopes. It supports HTTP and WebSocket upgrade handshakes only (not native gRPC): a match short-circuits the HTTP handshake response and does not mock upgraded frame streams. Native gRPC is excluded because `response_mock` has no provenance-authorized framed unary `Reject` contract; only `serverless_function` terminate does.
 
 ## Mesh Authz Plugin
 

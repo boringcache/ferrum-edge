@@ -1761,6 +1761,23 @@ impl std::fmt::Debug for PeerConnectionSignal {
     }
 }
 
+/// The complete native-gRPC unary representation a validated
+/// `serverless_function` terminate invocation authored.
+///
+/// `frame` is the exact uncompressed unary DATA frame and `trailers` is the
+/// terminal metadata the plugin's fail-closed contract validation produced
+/// (`grpc-status`, optional `grpc-message` / `grpc-status-details-bin`, and the
+/// operator's custom trailers). Terminal trailers are taken from here rather
+/// than promoted out of the reject header map, so gateway-managed response
+/// headers a decorator added — CORS, header policy, internal bridge fields —
+/// stay in the initial HEADERS block and can never surface as client-visible
+/// custom trailers.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerlessGrpcTerminateFrame {
+    pub(crate) frame: bytes::Bytes,
+    pub(crate) trailers: HashMap<String, String>,
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -2091,6 +2108,19 @@ pub struct RequestContext {
     /// of public metadata so a custom plugin cannot opt an unrelated rejection
     /// into that contract.
     pub(crate) serverless_terminate_response: bool,
+    /// The framed unary DATA payload and terminal trailers a validated
+    /// `serverless_function` terminate invocation authored for this request.
+    ///
+    /// This is the ONLY provenance that authorizes native-gRPC reject
+    /// normalization to emit DATA + terminal trailers instead of the
+    /// trailers-only error contract. Reject body shape and reject
+    /// `content-type`/`grpc-status` headers are reachable by any plugin, so they
+    /// are never treated as provenance. Authorization is byte-exact
+    /// (`FramedGrpcUnaryProvenance`), which keeps an `after_proxy` decorator
+    /// that rewrites the reject body — and any later unrelated rejection on the
+    /// same request — on the trailers-only path. Kept out of public metadata so
+    /// a custom plugin cannot mint it.
+    pub(crate) serverless_grpc_terminate_frame: Option<Arc<ServerlessGrpcTerminateFrame>>,
     /// Deduplication instance currently publishing an owned terminal response
     /// from the observe-only committed hook. This transient private marker lets
     /// the ordinary publication path retain in-flight protection when no replay
@@ -2554,6 +2584,7 @@ impl RequestContext {
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
+            serverless_grpc_terminate_frame: None,
             serverless_owned_dedup_publication: None,
             ai_prompt_compressor_staged: HashMap::new(),
             ai_prompt_compressor_classification_path: None,
@@ -3357,6 +3388,7 @@ impl RequestContext {
                 .serverless_external_side_effect_owners
                 .clone(),
             serverless_terminate_response: self.serverless_terminate_response,
+            serverless_grpc_terminate_frame: self.serverless_grpc_terminate_frame.clone(),
             serverless_owned_dedup_publication: self.serverless_owned_dedup_publication,
             // Transfer rather than clone the potentially body-sized compressor
             // stage. The final wire hook consumes it from this compatibility

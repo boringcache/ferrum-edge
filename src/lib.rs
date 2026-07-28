@@ -3123,17 +3123,6 @@ pub mod _test_support {
         crate::plugins::grpc_web::is_grpc_web_text(ct)
     }
 
-    /// Stamp the retained gRPC-Web client representation the way
-    /// `on_request_received` does, so tests can build a request whose live
-    /// `content-type` has already been rewritten to `application/grpc` while
-    /// the client is still a gRPC-Web browser.
-    pub fn retain_grpc_web_client_content_type_for_test(
-        ctx: &mut crate::plugins::RequestContext,
-        content_type: &str,
-    ) {
-        crate::plugins::grpc_web::retain_client_content_type_for_errors(ctx, content_type);
-    }
-
     pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
         crate::plugins::grpc_web::build_trailer_frame(response_headers, None)
     }
@@ -3484,6 +3473,10 @@ pub mod _test_support {
         crate::proxy::stamp_original_request_metadata(ctx);
     }
 
+    /// Stamp the retained gRPC-Web client representation the way
+    /// `on_request_received` does, so tests can build a request whose live
+    /// `content-type` has already been rewritten to `application/grpc` while
+    /// the client is still a gRPC-Web browser.
     pub fn retain_grpc_web_client_content_type_for_test(
         ctx: &mut crate::plugins::RequestContext,
         content_type: &str,
@@ -3958,6 +3951,66 @@ pub mod _test_support {
             grpc_message: normalized.grpc_message,
             grpc_trailers: normalized.grpc_trailers,
         }
+    }
+
+    /// Stamp the request-scoped provenance that `serverless_function` sets when
+    /// a validated native-gRPC terminate contract produced `frame` plus
+    /// `trailers`.
+    pub fn set_serverless_grpc_terminate_frame_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        frame: &[u8],
+        trailers: HashMap<String, String>,
+    ) {
+        let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+            frame: bytes::Bytes::copy_from_slice(frame),
+            trailers,
+        };
+        ctx.serverless_grpc_terminate_frame = Some(Arc::new(authored));
+    }
+
+    /// Normalize a rejection under the request's real framed-unary provenance —
+    /// the same authorization the H1/H2 finalizer, the direct-H3 writer, and the
+    /// H3 cross-protocol writer read.
+    pub fn normalize_reject_response_with_context(
+        ctx: &crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+        is_grpc_request: bool,
+    ) -> NormalizedRejectResponse {
+        let normalized = crate::proxy::normalize_reject_response_with_provenance(
+            status,
+            body,
+            headers,
+            is_grpc_request,
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
+        );
+        NormalizedRejectResponse {
+            http_status: normalized.http_status,
+            headers: normalized.headers,
+            body: normalized.body,
+            grpc_status: normalized.grpc_status,
+            grpc_message: normalized.grpc_message,
+            grpc_trailers: normalized.grpc_trailers,
+        }
+    }
+
+    /// The emitter-side decision every gRPC reject writer shares: `Some` means
+    /// "write DATA and then these terminal trailers", `None` means
+    /// "trailers-only". Exercises the production predicate, so a writer that
+    /// diverges from it cannot pass this boundary.
+    pub fn framed_unary_reject_trailers(
+        normalized: &NormalizedRejectResponse,
+    ) -> Option<HashMap<String, String>> {
+        let production = crate::proxy::NormalizedRejectResponse {
+            http_status: normalized.http_status,
+            headers: normalized.headers.clone(),
+            body: normalized.body.clone(),
+            grpc_status: normalized.grpc_status,
+            grpc_message: normalized.grpc_message.clone(),
+            grpc_trailers: normalized.grpc_trailers.clone(),
+        };
+        crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())
     }
 
     pub fn set_websocket_response_boundary_for_test(

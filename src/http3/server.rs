@@ -11325,11 +11325,15 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 (StatusCode::OK, translated.headers, translated.body)
             }
         } else {
-            let normalized = crate::proxy::normalize_reject_response(
+            // Committed observers must see what the sender writes, so the
+            // framed unary terminate representation is authorized here on
+            // exactly the same provenance the writer uses.
+            let normalized = crate::proxy::normalize_reject_response_with_provenance(
                 http_status,
                 body,
                 headers,
                 matches!(flavor, HttpFlavor::Grpc),
+                crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
             );
             (normalized.http_status, normalized.headers, normalized.body)
         };
@@ -11546,6 +11550,8 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                 )
                 .await
             } else {
+                // The gateway deadline response replaced the plugin rejection
+                // wholesale; no terminate provenance survives it.
                 send_h3_reject_flavor_aware_with_recv_halt(
                     stream,
                     flavor,
@@ -11553,6 +11559,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                     &deadline_body,
                     &deadline_headers,
                     false,
+                    crate::proxy::FramedGrpcUnaryProvenance::NONE,
                 )
                 .await
             }
@@ -11569,6 +11576,10 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
         };
     }
 
+    // Snapshot the `serverless_function` terminate provenance before the write
+    // future borrows `ctx` mutably. A gRPC-Web client never receives a native
+    // framed unary body, so that branch is deliberately not authorized.
+    let authored_grpc_terminate_frame = ctx.serverless_grpc_terminate_frame.clone();
     let write = async {
         if let Some(content_type) = grpc_web_response_content_type {
             return send_h3_grpc_web_reject_with_recv_halt(
@@ -11591,6 +11602,9 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             body,
             headers,
             halt_recv,
+            crate::proxy::FramedGrpcUnaryProvenance::from_authored_frame(
+                authored_grpc_terminate_frame.as_deref(),
+            ),
         )
         .await
     };
@@ -11944,6 +11958,7 @@ async fn send_h3_reject_flavor_aware(
         http_body,
         headers,
         true,
+        crate::proxy::FramedGrpcUnaryProvenance::NONE,
     )
     .await
 }
@@ -11955,6 +11970,7 @@ async fn send_h3_reject_flavor_aware_with_recv_halt(
     http_body: &[u8],
     headers: &HashMap<String, String>,
     halt_recv: bool,
+    framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
 ) -> Result<(), anyhow::Error> {
     send_h3_reject_flavor_aware_with_header_state(
         stream,
@@ -11964,6 +11980,7 @@ async fn send_h3_reject_flavor_aware_with_recv_halt(
         headers,
         false,
         halt_recv,
+        framed_unary_provenance,
     )
     .await
 }
@@ -11986,10 +12003,12 @@ async fn send_h3_finalized_reject_flavor_aware(
         headers,
         true,
         true,
+        crate::proxy::FramedGrpcUnaryProvenance::NONE,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_h3_reject_flavor_aware_with_header_state(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
@@ -11998,6 +12017,7 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     headers: &HashMap<String, String>,
     headers_finalized: bool,
     halt_recv: bool,
+    framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
 ) -> Result<(), anyhow::Error> {
     if !matches!(flavor, HttpFlavor::Grpc) {
         if matches!(flavor, HttpFlavor::WebSocket) {
@@ -12054,11 +12074,20 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
     let headers = &sanitized_headers;
 
-    // Serverless native-gRPC terminate (and any other plugin that already
-    // authored an uncompressed unary DATA frame with grpc-status) must preserve
-    // the body. Ordinary rejects remain trailers-only.
-    let normalized = crate::proxy::normalize_reject_response(http_status, http_body, headers, true);
-    if !normalized.body.is_empty() && !normalized.grpc_trailers.is_empty() {
+    // A rejection that carries byte-exact `serverless_function` terminate
+    // provenance is emitted as HEADERS + one uncompressed unary DATA frame +
+    // terminal trailers. Everything else — including a body that merely looks
+    // like a gRPC frame — normalizes to trailers-only below.
+    let normalized = crate::proxy::normalize_reject_response_with_provenance(
+        http_status,
+        http_body,
+        headers,
+        true,
+        framed_unary_provenance,
+    );
+    if let Some((framed_body, framed_trailers)) =
+        crate::proxy::framed_unary_reject_parts(&normalized)
+    {
         let mut builder = Response::builder().status(StatusCode::OK);
         for (k, v) in &normalized.headers {
             if let (Ok(name), Ok(val)) = (
@@ -12072,12 +12101,9 @@ async fn send_h3_reject_flavor_aware_with_header_state(
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
         stream.send_response(resp).await?;
-        stream
-            .send_data(Bytes::copy_from_slice(&normalized.body))
-            .await?;
-        let trailers = crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(
-            &normalized.grpc_trailers,
-        );
+        stream.send_data(Bytes::copy_from_slice(framed_body)).await?;
+        let trailers =
+            crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(framed_trailers);
         stream.send_trailers(trailers).await?;
         stream.finish().await?;
         if halt_recv {

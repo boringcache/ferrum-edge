@@ -2515,6 +2515,27 @@ impl Plugin for ServerlessFunction {
                                 "serverless_function: terminate mode — returning framed unary gRPC response"
                             );
                             ctx.serverless_terminate_response = true;
+                            // Byte-exact provenance for the ONE rejection that
+                            // may keep a body on a native gRPC stream, together
+                            // with the terminal metadata that is allowed to
+                            // reach the client as trailers. An empty framed body
+                            // means the contract asked for a trailers-only
+                            // status, which needs no authorization and must not
+                            // mint one.
+                            if !framed_body.is_empty() {
+                                let trailers = grpc_headers
+                                    .iter()
+                                    .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
+                                    .map(|(name, value)| (name.clone(), value.clone()))
+                                    .collect();
+                                let authored =
+                                    crate::plugins::ServerlessGrpcTerminateFrame {
+                                        frame: framed_body.clone(),
+                                        trailers,
+                                    };
+                                ctx.serverless_grpc_terminate_frame =
+                                    Some(std::sync::Arc::new(authored));
+                            }
                             return PluginResult::RejectBinary {
                                 status_code,
                                 body: framed_body,
