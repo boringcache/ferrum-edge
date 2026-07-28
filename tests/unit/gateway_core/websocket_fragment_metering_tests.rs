@@ -359,6 +359,69 @@ fn incomplete_message_duration_bound_fails_closed() {
     assert_eq!(limit_kind, "fragment_duration");
 }
 
+/// A peer cannot bypass the duration bound by completing with only the final
+/// continuation after stalling.
+#[test]
+fn incomplete_message_duration_rejects_final_continuation_bypass() {
+    let bytes = vec![0x01, 0x00, 0x80, 0x00];
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(bytes),
+        Role::Client,
+        None,
+    );
+    socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+    let error = socket
+        .read()
+        .expect_err("final continuation must not bypass duration bound");
+    assert!(matches!(
+        error,
+        WsError::Protocol(ProtocolError::IncompleteMessageTimeout)
+    ));
+}
+
+/// Interleaved Ping/Pong keepalives cannot extend an incomplete message past
+/// the duration bound.
+#[test]
+fn incomplete_message_duration_rejects_interleaved_ping_pong() {
+    for bytes in [
+        vec![0x01, 0x00, 0x89, 0x00],
+        vec![0x01, 0x00, 0x8a, 0x00],
+    ] {
+        let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+            std::io::Cursor::new(bytes),
+            Role::Client,
+            None,
+        );
+        socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+        let error = socket
+            .read()
+            .expect_err("interleaved control frame must not bypass duration bound");
+        assert!(matches!(
+            error,
+            WsError::Protocol(ProtocolError::IncompleteMessageTimeout)
+        ));
+    }
+}
+
+/// Peer Close remains exempt from the incomplete-message duration bound.
+#[test]
+fn incomplete_message_close_bypasses_duration_bound() {
+    let bytes = vec![0x01, 0x00, 0x88, 0x02, 0x03, 0xe8];
+    let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
+        std::io::Cursor::new(bytes),
+        Role::Client,
+        None,
+    );
+    socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+    assert!(matches!(
+        socket.read().expect("peer Close must surface"),
+        Message::Close(_)
+    ));
+}
+
 /// Ordinary capacity errors keep their own close selection; the fragment
 /// mapper must not claim them.
 #[test]

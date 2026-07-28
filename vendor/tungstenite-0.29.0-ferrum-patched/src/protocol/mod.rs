@@ -168,9 +168,11 @@ pub struct WebSocketConfig {
     /// `None` (the default) means unbounded, matching upstream behavior.
     pub max_incomplete_message_frames: Option<usize>,
     /// Maximum wall-clock time a message may stay incomplete, measured from
-    /// the first fragment. Checked when a further fragment arrives, so it
-    /// bounds an actively fed but never-finished message; a fully idle
-    /// connection is the caller's idle-timeout concern.
+    /// the first fragment. Checked on every subsequent non-Close frame while
+    /// the message is still incomplete — including the completing continuation
+    /// and interleaved Ping/Pong — so it bounds an actively fed but never-
+    /// finished message; a fully idle connection is the caller's idle-timeout
+    /// concern. Peer Close is exempt and ends the session normally.
     ///
     /// `None` (the default) means unbounded, matching upstream behavior.
     pub max_incomplete_message_duration: Option<Duration>,
@@ -607,6 +609,23 @@ impl WebSocketContext {
         self.config.max_incomplete_message_duration = max_duration;
     }
 
+    /// Enforce the incomplete-message duration bound whenever a message is
+    /// still in flight. Called for every subsequent non-Close frame without
+    /// incrementing the frame counter.
+    fn enforce_incomplete_message_duration(&self) -> Result<()> {
+        if self.incomplete.is_none() {
+            return Ok(());
+        }
+        if let Some(max_duration) = self.config.max_incomplete_message_duration {
+            if let Some(started) = self.incomplete_started_at {
+                if started.elapsed() > max_duration {
+                    return Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Record one physical data frame consumed by the in-flight reassembly and
     /// enforce the independent count/duration bounds.
     fn account_reassembly_frame(&mut self) -> Result<()> {
@@ -619,11 +638,9 @@ impl WebSocketContext {
                 return Err(Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded));
             }
         }
-        if let Some(max_duration) = self.config.max_incomplete_message_duration {
-            let started = *self.incomplete_started_at.get_or_insert_with(Instant::now);
-            if started.elapsed() > max_duration {
-                return Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout));
-            }
+        if self.config.max_incomplete_message_duration.is_some() {
+            self.incomplete_started_at.get_or_insert_with(Instant::now);
+            self.enforce_incomplete_message_duration()?;
         }
         Ok(())
     }
@@ -891,6 +908,9 @@ impl WebSocketContext {
                         Err(Error::Protocol(ProtocolError::UnknownControlFrameType(i)))
                     }
                     OpCtl::Ping => {
+                        if self.incomplete.is_some() {
+                            self.enforce_incomplete_message_duration()?;
+                        }
                         let data = frame.into_payload();
                         // No ping processing after we sent a close frame.
                         // `auto_pong` defaults to true (ordinary endpoints);
@@ -901,7 +921,12 @@ impl WebSocketContext {
                         }
                         Ok(Some(Message::Ping(data)))
                     }
-                    OpCtl::Pong => Ok(Some(Message::Pong(frame.into_payload()))),
+                    OpCtl::Pong => {
+                        if self.incomplete.is_some() {
+                            self.enforce_incomplete_message_duration()?;
+                        }
+                        Ok(Some(Message::Pong(frame.into_payload())))
+                    }
                 }
             }
 
@@ -924,6 +949,7 @@ impl WebSocketContext {
                     (None, true) => {
                         // Final continuation: the logical message is complete
                         // and is returned to the reader, which charges it once.
+                        self.enforce_incomplete_message_duration()?;
                         self.reset_reassembly_accounting();
                         Ok(Some(self.incomplete.take().unwrap().complete()?))
                     }
@@ -1258,6 +1284,55 @@ mod tests {
             socket.read(),
             Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout))
         ));
+    }
+
+    /// A peer cannot complete a stalled message by sending only the final
+    /// continuation after the duration budget expires.
+    #[test]
+    fn incomplete_message_duration_rejects_final_continuation_bypass() {
+        let incoming = vec![0x01, 0x00, 0x80, 0x00];
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+        assert!(matches!(
+            socket.read(),
+            Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout))
+        ));
+    }
+
+    /// Interleaved Ping/Pong keepalives cannot extend an incomplete message
+    /// past the duration bound.
+    #[test]
+    fn incomplete_message_duration_rejects_interleaved_ping_pong() {
+        for bytes in [
+            vec![0x01, 0x00, 0x89, 0x00],
+            vec![0x01, 0x00, 0x8a, 0x00],
+        ] {
+            let mut socket =
+                WebSocket::from_raw_socket(WriteMoc(Cursor::new(bytes)), Role::Client, None);
+            socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+            assert!(
+                matches!(
+                    socket.read(),
+                    Err(Error::Protocol(ProtocolError::IncompleteMessageTimeout))
+                ),
+                "interleaved control frame must not bypass the duration bound"
+            );
+        }
+    }
+
+    /// Peer Close remains exempt: it ends the session even when the incomplete-
+    /// message timer has expired.
+    #[test]
+    fn incomplete_message_close_bypasses_duration_bound() {
+        let incoming = vec![0x01, 0x00, 0x88, 0x02, 0x03, 0xe8];
+        let mut socket =
+            WebSocket::from_raw_socket(WriteMoc(Cursor::new(incoming)), Role::Client, None);
+        socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
+
+        assert!(matches!(socket.read(), Ok(Message::Close(_))));
     }
 
     /// Accounting is per message: a completed message resets both bounds so a

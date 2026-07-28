@@ -85,10 +85,14 @@ dependency-policy SLA.
   `fragment_meter_ignores_unfragmented_messages`,
   `incomplete_message_frame_limit_fails_closed`,
   `incomplete_message_duration_limit_fails_closed`,
+  `incomplete_message_duration_rejects_final_continuation_bypass`,
+  `incomplete_message_duration_rejects_interleaved_ping_pong`,
+  `incomplete_message_close_bypasses_duration_bound`,
   `fragment_accounting_resets_between_messages`, and
   `fragment_bounds_default_to_unbounded` in
   `vendor/tungstenite-0.29.0-ferrum-patched` (`--lib fragment` /
   `--lib incomplete_message`).
 - External unit: `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`
   (metering, no-double-charge, both directions, observer exclusion, parser
-  bound → policy Close mapping).
+  bound → policy Close mapping, duration bound on final continuation and
+  interleaved Ping/Pong, peer Close exemption).
