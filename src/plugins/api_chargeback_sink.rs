@@ -1831,7 +1831,13 @@ struct SinkMetrics {
     events_exported_total: AtomicU64,
     failures_total: AtomicU64,
     failure_reasons: FailureReasonCounters,
+    /// Observed queue depth at/above the high-water mark (telemetry only).
     queue_high_water_hits_total: AtomicU64,
+    /// Events diverted from the in-memory channel to durable spool at high water.
+    queue_high_water_diversions_total: AtomicU64,
+    /// Events lost because the bounded channel was actually full and no durable
+    /// overflow path took ownership.
+    queue_full_drops_total: AtomicU64,
     queue_byte_budget_exhausted_total: AtomicU64,
     spool_drops_total: AtomicU64,
     spool_available: AtomicBool,
@@ -1865,6 +1871,8 @@ impl Default for SinkMetrics {
             failures_total: AtomicU64::new(0),
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
+            queue_high_water_diversions_total: AtomicU64::new(0),
+            queue_full_drops_total: AtomicU64::new(0),
             queue_byte_budget_exhausted_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
             spool_available: AtomicBool::new(false),
@@ -2214,7 +2222,7 @@ impl ApiChargebackSink {
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
-        let overflow_metrics = Arc::clone(&metrics);
+        let high_water_metrics = Arc::clone(&metrics);
         let (commit_tx, commit_rx) = watch::channel(false);
         let spool_enqueue = spool.as_ref().map(|spool_manager| {
             start_spool_delivery(
@@ -2225,7 +2233,27 @@ impl ApiChargebackSink {
             )
         });
         let failed_enqueue = spool_enqueue.clone();
-        let overflow_enqueue = spool_enqueue.clone();
+        // Install diversion only when a durable owner exists. Without spool,
+        // high water is telemetry-only and the bounded channel remains usable
+        // until it is actually full (issue #3038).
+        let on_overflow: Option<Arc<dyn Fn(QueuedChargeEvent, &'static str) + Send + Sync>> =
+            spool_enqueue.as_ref().map(|overflow_enqueue| {
+                let overflow_metrics = Arc::clone(&metrics);
+                let overflow_enqueue = Arc::clone(overflow_enqueue);
+                Arc::new(move |queued: QueuedChargeEvent, reason: &'static str| {
+                    if snapshot_events_are_pre_spooled {
+                        invalidate_status_cache();
+                        return;
+                    }
+                    if reason == "queue high water" {
+                        overflow_metrics
+                            .queue_high_water_diversions_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = overflow_enqueue.try_enqueue(vec![queued], reason);
+                    invalidate_status_cache();
+                })
+            });
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
                 if snapshot_events_are_pre_spooled {
@@ -2241,26 +2269,11 @@ impl ApiChargebackSink {
                     );
                 }
             })),
-            on_overflow: Some(Arc::new(move |queued: QueuedChargeEvent, reason| {
-                overflow_metrics
+            on_overflow,
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_metrics
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
-                if snapshot_events_are_pre_spooled {
-                    invalidate_status_cache();
-                    return;
-                }
-                if let Some(enqueue) = overflow_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(vec![queued], reason);
-                } else {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        overflow_reason = reason,
-                        "Chargeback sink queue overflowed and spool is disabled; event was lost"
-                    );
-                }
-                invalidate_status_cache();
-            })),
-            on_high_water: Some(Arc::new(|_, _| {
                 invalidate_status_cache();
             })),
             high_watermark_percent: 80,
@@ -2957,7 +2970,7 @@ fn disabled_status_snapshot() -> Value {
         "snapshot_finalizations_oldest_age_secs": oldest_age,
         "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
+            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0, "high_water_diversions_total": 0, "full_drops_total": 0},
             "spool": {
                 "files": 0,
                 "bytes": 0,
@@ -2988,6 +3001,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut queue_depth = 0u64;
     let mut queue_capacity = 0u64;
     let mut high_water = 0u64;
+    let mut high_water_diversions = 0u64;
+    let mut full_drops = 0u64;
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
     let mut spool_drops = 0u64;
@@ -3007,6 +3022,18 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             runtime
                 .metrics
                 .queue_high_water_hits_total
+                .load(Ordering::Relaxed),
+        );
+        high_water_diversions = high_water_diversions.saturating_add(
+            runtime
+                .metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        full_drops = full_drops.saturating_add(
+            runtime
+                .metrics
+                .queue_full_drops_total
                 .load(Ordering::Relaxed),
         );
         events_enqueued = events_enqueued.saturating_add(
@@ -3061,7 +3088,9 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             "queue": {
                 "depth": queue_depth,
                 "capacity": queue_capacity,
-                "high_water_hits_total": high_water
+                "high_water_hits_total": high_water,
+                "high_water_diversions_total": high_water_diversions,
+                "full_drops_total": full_drops
             },
             "spool": {
                 "files": spool_files,
@@ -3122,6 +3151,11 @@ impl SinkRuntime {
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
+                "high_water_diversions_total": self
+                    .metrics
+                    .queue_high_water_diversions_total
+                    .load(Ordering::Relaxed),
+                "full_drops_total": self.metrics.queue_full_drops_total.load(Ordering::Relaxed),
                 "retained_bytes": self.byte_budget.used(),
                 "buffer_max_bytes": self.byte_budget.max_bytes(),
                 "byte_budget_exhausted_total": self
@@ -3252,6 +3286,9 @@ fn render_prometheus_for_sinks(
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
     let mut queue_byte_budget_exhausted = 0u64;
+    let mut queue_high_water_hits = 0u64;
+    let mut queue_high_water_diversions = 0u64;
+    let mut queue_full_drops = 0u64;
     let mut snapshot_emits = 0u64;
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
@@ -3304,6 +3341,19 @@ fn render_prometheus_for_sinks(
             metrics
                 .queue_byte_budget_exhausted_total
                 .load(Ordering::Relaxed),
+        );
+        queue_high_water_hits = queue_high_water_hits.saturating_add(
+            metrics
+                .queue_high_water_hits_total
+                .load(Ordering::Relaxed),
+        );
+        queue_high_water_diversions = queue_high_water_diversions.saturating_add(
+            metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        queue_full_drops = queue_full_drops.saturating_add(
+            metrics.queue_full_drops_total.load(Ordering::Relaxed),
         );
         let spool_stats = runtime
             .spool
@@ -3383,6 +3433,30 @@ fn render_prometheus_for_sinks(
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_hits_total Chargeback sink enqueue attempts observed at or above the queue high-water mark (telemetry only).\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_hits_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_hits_total {}\n",
+        queue_high_water_hits
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_diversions_total Chargeback sink events diverted from the in-memory queue to durable spool at high water.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_diversions_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_diversions_total {}\n",
+        queue_high_water_diversions
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_full_drops_total Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path took ownership.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_full_drops_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_full_drops_total {}\n",
+        queue_full_drops
+    ));
     output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending Snapshot generations retaining unspooled terminal deltas after admission closed.\n");
     output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending gauge\n");
     output.push_str(&format!(
@@ -9172,11 +9246,26 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    runtime
-        .metrics
-        .events_enqueued_total
-        .fetch_add(1, Ordering::Relaxed);
-    runtime.logger.try_send(QueuedChargeEvent { event, lease });
+    if runtime.logger.try_send(QueuedChargeEvent { event, lease }) {
+        runtime
+            .metrics
+            .events_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+    } else if runtime.spool_delivery.is_some() {
+        // Durable overflow diversion (or spool-delivery loss accounting) took
+        // ownership inside try_send; count admission the same as a channel hit.
+        runtime
+            .metrics
+            .events_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        // No durable overflow hook: the bounded channel was full/closed and the
+        // event was lost. Do not count it as enqueued.
+        runtime
+            .metrics
+            .queue_full_drops_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     invalidate_status_cache();
 }
 

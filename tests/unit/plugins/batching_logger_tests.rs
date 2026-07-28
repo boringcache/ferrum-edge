@@ -724,6 +724,68 @@ async fn high_water_hook_fires_without_overflow_hook() {
     assert_eq!(high_water_hits.load(Ordering::Relaxed), 1);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn without_overflow_hook_high_water_still_uses_full_capacity() {
+    let high_water_hits = Arc::new(AtomicUsize::new(0));
+    let high_water_hits_clone = Arc::clone(&high_water_hits);
+    let logger = BatchingLogger::spawn_with_hooks(
+        BatchConfig {
+            // batch_size=1 so the first item parks the flush worker and the
+            // remaining configured slots stay in the bounded mpsc channel.
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            buffer_capacity: 10,
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            plugin_name: "batching_logger_full_capacity",
+        },
+        LoggerHooks {
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_hits_clone.fetch_add(1, Ordering::Relaxed);
+            })),
+            // No on_overflow: high water must not discard remaining slots.
+            high_watermark_percent: 80,
+            ..LoggerHooks::default()
+        },
+        move |_batch: Vec<u32>| async move {
+            // Hold the flush worker so the bounded channel stays occupied.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        },
+    );
+
+    logger.commit();
+
+    // Park the flush worker on the first item.
+    assert!(logger.try_send(0));
+    for _ in 0..10_000 {
+        if logger.queue_depth() == 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        logger.queue_depth(),
+        0,
+        "flush worker must take the parking item before the capacity fill"
+    );
+
+    for value in 1..=10 {
+        assert!(
+            logger.try_send(value),
+            "slot {value} of configured capacity 10 must remain usable without an overflow hook"
+        );
+    }
+    assert_eq!(logger.queue_depth(), 10, "all configured slots must be occupied");
+    assert!(
+        high_water_hits.load(Ordering::Relaxed) > 0,
+        "crossing 80% must still emit high-water telemetry"
+    );
+    assert!(
+        !logger.try_send(11),
+        "the item past configured capacity must follow the full-buffer drop path"
+    );
+}
+
 struct CloneTracked {
     value: u32,
     clone_count: Arc<AtomicUsize>,

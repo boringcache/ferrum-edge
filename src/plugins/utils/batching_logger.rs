@@ -187,9 +187,16 @@ type HighWaterHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
 pub struct LoggerHooks<T: Send + 'static> {
     pub on_failed_batch: Option<FailedBatchHook<T>>,
+    /// Diverts an item away from the bounded channel. When the observed depth
+    /// is at/above the high-water mark, presence of this hook **consumes** the
+    /// item without attempting `try_send`. Install only when the hook can
+    /// durably accept ownership (or intentionally shed load). Use
+    /// [`Self::on_high_water`] for telemetry-only notification that must not
+    /// discard remaining channel capacity.
     pub on_overflow: Option<OverflowHook<T>>,
     /// Called whenever the observed queue depth is above the configured
-    /// high-water mark. This hook is independent of `on_overflow`.
+    /// high-water mark. This hook is independent of `on_overflow` and never
+    /// takes ownership of the item.
     pub on_high_water: Option<HighWaterHook>,
     pub high_watermark_percent: u8,
 }

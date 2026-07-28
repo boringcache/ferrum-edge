@@ -401,9 +401,19 @@ per-file `owner_tag` binds each record individually, so a record moved between
 directories is still attributable and is never replayed by a different owner.
 
 The sink writes failed batches and queue high-water overflow to an async spool
-delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
-terminal hooks only enqueue to that worker; compression, directory scans, writes,
-and fsync never run inline on those hooks. Saturation of the delivery queue is
+delivery worker (bounded by `spool.delivery_queue_capacity`) **only when
+`spool.enabled=true`**. That durable diversion hook is installed only when spool
+delivery can take ownership of the event. With `spool.enabled=false`, the 80%
+high-water mark is telemetry only (`high_water_hits_total` /
+`chargeback_sink_queue_high_water_hits_total`); every configured
+`batch.buffer_capacity` slot remains usable until the channel is actually full,
+and true full-buffer losses increment `full_drops_total` /
+`chargeback_sink_queue_full_drops_total`. High-water durable diversions
+increment `high_water_diversions_total` /
+`chargeback_sink_queue_high_water_diversions_total` separately from drops.
+Request and body terminal hooks only enqueue to that worker; compression,
+directory scans, writes, and fsync never run inline on those hooks. Saturation
+of the delivery queue is
 counted (`chargeback_sink_spool_jobs_lost_total` /
 `chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
 created with private permissions, written as process/generation-attributed
@@ -689,7 +699,8 @@ Response contract:
 - `instance_count` is the number of published instances.
 - `snapshot_finalizations_pending` is the number of retired snapshot
   generations retaining an unspooled terminal delta for bounded retry.
-- `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
+- `totals` aggregates queue depth/capacity/high-water hits/high-water
+  diversions/full-buffer drops, spool files/bytes/
   drops/prepare failures, and export counters across every current accepted
   instance.
   `totals.spool.available` is `true` only when every spool-enabled live instance
@@ -711,6 +722,9 @@ across the current accepted sink generation for every stable plugin-config ID:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_queue_high_water_hits_total`
+- `chargeback_sink_queue_high_water_diversions_total`
+- `chargeback_sink_queue_full_drops_total`
 - `chargeback_sink_snapshot_finalizations_pending`
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, in-flight claim, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
