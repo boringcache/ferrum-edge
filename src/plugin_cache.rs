@@ -2933,6 +2933,11 @@ impl PluginCapabilities {
     /// buffered and streaming paths that forward backend trailers must fail
     /// closed and drop the whole trailer section rather than reconcile field by
     /// field.
+    ///
+    /// Bit 15 is the LAST bit of the `u16` backing store. A sixteenth flag must
+    /// widen `PluginCapabilities` (to `u32`) rather than shift further; `1 << 16`
+    /// would be a const-eval overflow, so the failure is a compile error, not a
+    /// silently dropped capability.
     pub const UNBOUNDED_RESPONSE_TRAILER_POLICY: u16 = 1 << 15;
 
     #[inline(always)]
