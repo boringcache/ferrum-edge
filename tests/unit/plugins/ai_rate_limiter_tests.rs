@@ -1024,8 +1024,8 @@ async fn observed_usage(plugin: &AiRateLimiter) -> u64 {
 
 #[tokio::test]
 async fn test_sse_with_usage_block_still_recorded() {
-    // Non-regression for #54: the saw_usage gating must NOT break extraction
-    // when a usage block IS present. A streamed OpenAI-style response that
+    // Non-regression for #54: absent selected counters must not be coerced to
+    // zero when a usage block IS present. A streamed OpenAI-style response that
     // reports prompt_tokens must still be charged in prompt_tokens mode.
     let plugin = AiRateLimiter::new(
         &json!({
@@ -2196,6 +2196,310 @@ async fn federation_unmetered_reject_returns_502_from_after_proxy_in_isolation()
     // Federation marker set, but no ai_total_tokens metadata.
     ctx.metadata
         .insert("ai_federation_provider".to_string(), "primary".to_string());
+
+    let mut response_headers = HashMap::new();
+    let result = plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+// ─── Absent-vs-zero usage contract (GHSA-h8m9-8vrh-m626) ───────────────
+
+fn openai_response_without_usage() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{"message": {"content": "hello"}}]
+    }))
+    .unwrap()
+}
+
+async fn assert_fixed_provider_unmetered_rejects(count_mode: &str, body: Vec<u8>, provider: &str) {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": count_mode,
+            "provider": provider,
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "fixed-provider absent usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 0, "request should reserve tokens");
+
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn fixed_openai_completion_mode_rejects_absent_usage() {
+    assert_fixed_provider_unmetered_rejects(
+        "completion_tokens",
+        openai_response_without_usage(),
+        "openai",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fixed_openai_prompt_mode_rejects_absent_usage() {
+    assert_fixed_provider_unmetered_rejects(
+        "prompt_tokens",
+        openai_response_without_usage(),
+        "openai",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fixed_openai_completion_mode_rejects_empty_usage_object() {
+    let body = serde_json::to_vec(&json!({
+        "usage": {},
+        "choices": [{"message": {"content": "hello"}}]
+    }))
+    .unwrap();
+    assert_fixed_provider_unmetered_rejects("completion_tokens", body, "openai").await;
+}
+
+#[tokio::test]
+async fn fixed_openai_completion_mode_rejects_missing_selected_counter() {
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 40},
+        "choices": [{"message": {"content": "hello"}}]
+    }))
+    .unwrap();
+    assert_fixed_provider_unmetered_rejects("completion_tokens", body, "openai").await;
+}
+
+#[tokio::test]
+async fn fixed_openai_completion_mode_honors_explicit_zero() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "provider": "openai",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "explicit zero completion");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "request should reserve tokens");
+
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 40, "completion_tokens": 0}
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "explicit zero completion must be treated as metered usage, not unmetered"
+    );
+}
+
+#[tokio::test]
+async fn auto_provider_completion_mode_rejects_absent_usage() {
+    assert_fixed_provider_unmetered_rejects(
+        "completion_tokens",
+        openai_response_without_usage(),
+        "auto",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn auto_provider_rejects_missing_selected_counter_after_detection() {
+    let body = serde_json::to_vec(&json!({
+        "usage": {"prompt_tokens": 40},
+        "choices": [{"message": {"content": "hello"}}]
+    }))
+    .unwrap();
+    assert_fixed_provider_unmetered_rejects("completion_tokens", body, "auto").await;
+}
+
+#[tokio::test]
+async fn fixed_provider_warn_mode_releases_absent_usage() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "provider": "openai",
+            "on_unmetered_response": "warn",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "warn absent usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(reserved_tokens(&ctx) > 0);
+
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                &openai_response_without_usage(),
+            )
+            .await,
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        0,
+        "warn mode must release the reservation when the selected counter is absent"
+    );
+}
+
+#[tokio::test]
+async fn fixed_provider_charge_estimate_keeps_absent_usage_reservation() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "provider": "openai",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "charge estimate absent usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0);
+
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut json_headers(),
+                &openai_response_without_usage(),
+            )
+            .await,
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        reserved,
+        "charge_estimate must keep the reservation when the selected counter is absent"
+    );
+}
+
+#[tokio::test]
+async fn fixed_provider_total_mode_still_charges_explicit_total_usage() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "total_tokens",
+            "provider": "openai",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "explicit total usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let body = serde_json::to_vec(&json!({
+        "usage": {"total_tokens": 88}
+    }))
+    .unwrap();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        observed_usage(&plugin).await,
+        88,
+        "total_tokens mode must still charge an explicit provider total"
+    );
+}
+
+#[tokio::test]
+async fn fixed_provider_sse_completion_mode_rejects_absent_usage() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "provider": "openai",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "sse absent usage");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+               data: [DONE]\n\n";
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut sse_headers(), sse.as_bytes())
+        .await;
+    assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn federation_metadata_missing_selected_counter_is_unmetered() {
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "count_mode": "completion_tokens",
+            "on_unmetered_response": "reject",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(200, "federated missing completion");
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    ctx.metadata
+        .insert("ai_federation_provider".to_string(), "primary".to_string());
+    ctx.metadata
+        .insert("ai_prompt_tokens".to_string(), "30".to_string());
 
     let mut response_headers = HashMap::new();
     let result = plugin

@@ -85,7 +85,7 @@ use tokio::sync::{Semaphore, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{FragmentMeter, Message, WebSocketConfig};
 use tokio_tungstenite::{
     WebSocketStream, client_async_tls_with_config, client_async_with_config,
     tungstenite::handshake::derive_accept_key,
@@ -409,12 +409,10 @@ pub(crate) const NO_TRANSFORM_REQUEST_METADATA_KEY: &str = "ferrum:no_transform_
 pub(crate) const ORIGIN_ENCODED_REQUEST_METADATA_KEY: &str = "ferrum:origin_encoded_request";
 
 /// Marker recorded in `ctx.metadata` when a `request_transformer` query rule
-/// actually mutated `ctx.query_params` (add/remove/update/rename). Query
-/// transformations operate on the decoded parameter map, which cannot be
-/// reconciled with `serverless_function`'s raw-query payload without losing the
-/// raw plus/duplicate/decode/auth-strip invariants the raw path exists to
-/// preserve, so the serverless egress fails closed on the composition rather than
-/// emitting a payload that silently ignores the operator's query transform.
+/// actually mutated the ordered outbound query (add/remove/update/rename).
+/// Downstream consumers that previously failed closed on this marker can now
+/// read [`RequestContext::outbound_query_string`] / the auth-composed effective
+/// query instead of rebuilding from the untransformed raw string.
 pub(crate) const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
 
 /// True when a `Content-Encoding` field-line declares a coding other than
@@ -3218,6 +3216,10 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
     crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
+    // Fail-closed shared contract: request-deduplication lifecycle keys under
+    // `_dedup_*` never enter any transaction-log projection. Ownership lives in
+    // typed request state; this strips any residual public-metadata copies.
+    crate::plugins::utils::metadata_redaction::strip_internal_only_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -10666,6 +10668,7 @@ async fn handle_websocket_request_authenticated(
     let ws_tunnel = state.websocket_tunnel_mode;
     let ws_tunnel_idle_disabled_safety_cap =
         websocket_tunnel_idle_disabled_safety_cap(state.env_config.tcp_half_close_max_wait_seconds);
+    let ws_fragment_policy = WsFragmentPolicy::from_env(&state.env_config);
     let adaptive_buf = state.adaptive_buffer.clone();
     // Track the upgraded WebSocket session in `OverloadState.active_connections`
     // so graceful drain waits for in-flight WS sessions before exiting.
@@ -10774,6 +10777,7 @@ async fn handle_websocket_request_authenticated(
                             // RFC 9220 §5 compliance.
                             false,
                             ws_idle_tracker,
+                            ws_fragment_policy,
                             &adaptive_buf,
                         )
                         .await
@@ -10796,6 +10800,7 @@ async fn handle_websocket_request_authenticated(
                             ws_tunnel_idle_disabled_safety_cap,
                             false,
                             ws_idle_tracker,
+                            ws_fragment_policy,
                             &adaptive_buf,
                         )
                         .await
@@ -12214,6 +12219,103 @@ struct WsSizeLimitRule {
     close_reason: Arc<str>,
 }
 
+/// Parser-level bounds on a WebSocket message that is still being reassembled.
+///
+/// Tungstenite yields only complete messages, so the initial non-final frame
+/// and every intermediate continuation frame are invisible to the relay and to
+/// `on_ws_frame`. Byte ceilings (`max_message_size`) do not bound them either:
+/// a zero-length continuation carries no payload but still costs a frame parse.
+/// These two bounds are therefore independent of `ws_message_size_limiting` and
+/// of each other — one on physical frame count, one on wall-clock duration —
+/// and fail the connection closed while the message is still incomplete
+/// (GHSA-qq94-2gv2-phh6).
+///
+/// `0` on either env var disables that bound.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WsFragmentPolicy {
+    max_incomplete_message_frames: Option<usize>,
+    max_incomplete_message_duration: Option<Duration>,
+}
+
+impl WsFragmentPolicy {
+    pub(crate) fn from_env(env_config: &EnvConfig) -> Self {
+        let max_frames = env_config.websocket_max_incomplete_message_frames;
+        let max_seconds = env_config.websocket_max_incomplete_message_seconds;
+        Self {
+            max_incomplete_message_frames: (max_frames > 0).then_some(max_frames),
+            max_incomplete_message_duration: (max_seconds > 0)
+                .then(|| Duration::from_secs(max_seconds)),
+        }
+    }
+
+    /// `(max_frames, max_duration)` as installed into both framers.
+    pub(crate) fn bounds(&self) -> (Option<usize>, Option<Duration>) {
+        (
+            self.max_incomplete_message_frames,
+            self.max_incomplete_message_duration,
+        )
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1008 for an incomplete-message bound.
+///
+/// The reason is a fixed literal: it never echoes peer-controlled bytes and
+/// stays well inside the 123-byte control-frame budget.
+pub(crate) fn ws_fragment_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Policy,
+        reason: "fragmented message limit".into(),
+    }
+}
+
+/// Map a parser fragment-bound failure to its policy Close and log label.
+pub(crate) fn ws_fragment_policy_close_for_error(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> Option<(CloseFrame, &'static str)> {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+
+    let limit_kind = match error {
+        Error::Protocol(ProtocolError::IncompleteMessageFrameLimitExceeded) => "fragment_frames",
+        Error::Protocol(ProtocolError::IncompleteMessageTimeout) => "fragment_duration",
+        _ => return None,
+    };
+    Some((ws_fragment_policy_close_frame(), limit_kind))
+}
+
+/// Charge the physical fragments a peer spent on message reassembly.
+///
+/// Returns `Some(close)` when a plugin refuses the batch, in which case the
+/// caller must publish that Close and tear the session down without running
+/// the ordinary message chain — the fragments have already been charged, and
+/// the completing message must not be admitted on an exhausted budget.
+///
+/// Only `Message::Close` is honored: there is no message to mutate here.
+/// Observational plugins are skipped so they cannot see a partial decision.
+pub(crate) async fn apply_ws_fragment_plugins(
+    plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    connection_id: u64,
+    direction: WebSocketFrameDirection,
+    fragment_frames: u64,
+) -> Option<Option<CloseFrame>> {
+    if plugins.is_empty() || fragment_frames == 0 {
+        return None;
+    }
+    for plugin in plugins {
+        if plugin.observes_ws_frame_decisions() {
+            continue;
+        }
+        if let Some(Message::Close(close)) = plugin
+            .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
+            .await
+        {
+            return Some(close);
+        }
+    }
+    None
+}
+
 pub(crate) type WebSocketRelayPluginLists = (Vec<Arc<dyn Plugin>>, Vec<Arc<dyn Plugin>>);
 
 pub(crate) struct EffectiveWsSizeLimits {
@@ -12809,7 +12911,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_websocket_proxy<C, B>(
     mut client_io: C,
-    backend_ws_stream: WebSocketStream<B>,
+    mut backend_ws_stream: WebSocketStream<B>,
     proxy_id: &str,
     connection_id: u64,
     ws_framing_plugins: Vec<Arc<dyn Plugin>>,
@@ -12823,6 +12925,7 @@ pub(crate) async fn run_websocket_proxy<C, B>(
     websocket_tunnel_idle_disabled_safety_cap: Duration,
     accept_unmasked_client_frames: bool,
     ws_idle_tracker: Option<Arc<WsIdleTracker>>,
+    fragment_policy: WsFragmentPolicy,
     adaptive_buffer: &crate::adaptive_buffer::AdaptiveBufferTracker,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -13022,12 +13125,37 @@ where
     // the wrap applied beneath the backend stream at connect time: read
     // progress on a partially received (fragmented/large) client message
     // refreshes the shared watermark before a complete `Message` is yielded.
-    let ws_stream = WebSocketStream::from_raw_socket(
+    let mut ws_stream = WebSocketStream::from_raw_socket(
         WsActivityIo::new(client_io, ws_idle_tracker.clone()),
         tokio_tungstenite::tungstenite::protocol::Role::Server,
         Some(ws_config),
     )
     .await;
+
+    // Physical-fragment accounting, installed on BOTH framers before any read
+    // and before `split()` hides the codec behind a `SplitStream`.
+    //
+    // Each meter counts the initial non-final frame and every intermediate
+    // continuation frame of a fragmented message — the frames that produce no
+    // `Message` and are therefore invisible to `on_ws_frame`. The relay drains
+    // its own direction's meter after each successful read and charges the
+    // batch through `on_ws_reassembly_frames`; the completing message is then
+    // charged exactly once by the ordinary frame chain, so no wire frame is
+    // counted twice. The independent count/duration bounds fail the connection
+    // closed for a message that never completes (GHSA-qq94-2gv2-phh6).
+    let client_fragment_meter = Arc::new(FragmentMeter::new());
+    let backend_fragment_meter = Arc::new(FragmentMeter::new());
+    let (max_frames, max_duration) = fragment_policy.bounds();
+    ws_stream.set_fragment_accounting(
+        Some(Arc::clone(&client_fragment_meter)),
+        max_frames,
+        max_duration,
+    );
+    backend_ws_stream.set_fragment_accounting(
+        Some(Arc::clone(&backend_fragment_meter)),
+        max_frames,
+        max_duration,
+    );
 
     // Split streams for bidirectional communication
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
@@ -13144,6 +13272,31 @@ where
                             break;
                         }
                     };
+                    // Charge the physical fragments this read consumed before
+                    // the reassembled message (or an interleaved control frame)
+                    // is admitted. Skipped on the error path (already tearing
+                    // down) and on a peer Close, which bypasses mutating
+                    // admission hooks so no plugin can replace the peer's
+                    // code/reason.
+                    if !matches!(msg, Err(_) | Ok(Message::Close(_)))
+                        && let Some(close_frame) = apply_ws_fragment_plugins(
+                            &ctb_plugins,
+                            &proxy_id_ctb,
+                            connection_id,
+                            WebSocketFrameDirection::ClientToBackend,
+                            client_fragment_meter.take_reassembly_frames(),
+                        )
+                        .await
+                    {
+                        debug!("Fragment budget rejected client->backend reassembly frames");
+                        let close = publish_ws_policy_close(
+                            &policy_close_ctb,
+                            &cancel_ctb,
+                            close_frame,
+                        );
+                        send_bounded_ws_close(&mut backend_sink, close).await;
+                        break;
+                    }
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -13327,6 +13480,23 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind)) =
+                                ws_fragment_policy_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -13407,6 +13577,27 @@ where
                             break;
                         }
                     };
+                    // Mirror of the client->backend half: a hostile backend can
+                    // fragment-flood the gateway just as a hostile client can.
+                    if !matches!(msg, Err(_) | Ok(Message::Close(_)))
+                        && let Some(close_frame) = apply_ws_fragment_plugins(
+                            &btc_plugins,
+                            &proxy_id_btc,
+                            connection_id,
+                            WebSocketFrameDirection::BackendToClient,
+                            backend_fragment_meter.take_reassembly_frames(),
+                        )
+                        .await
+                    {
+                        debug!("Fragment budget rejected backend->client reassembly frames");
+                        let close = publish_ws_policy_close(
+                            &policy_close_btc,
+                            &cancel_btc,
+                            close_frame,
+                        );
+                        send_bounded_ws_close(&mut ws_sink, close).await;
+                        break;
+                    }
                     match msg {
                         Ok(raw @ (Message::Text(_) | Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {
                             // Apply frame hooks when any plugin opted in (zero overhead when empty)
@@ -13571,6 +13762,23 @@ where
                                 );
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind)) =
+                                ws_fragment_policy_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    "WebSocket incomplete-message policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ProtocolError
                             } else {
                                 error!("Error receiving from backend: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -20910,7 +21118,7 @@ async fn handle_proxy_request_inner(
     // finalized request body. The config-time bit above avoids extra work when
     // none are configured; the request-time value is true only when that same
     // terminal plugin's `should_buffer_request_body` matched this request.
-    let effective_query_string = query_string_after_plugin_strips(&ctx, &query_string);
+    let effective_query_string = effective_backend_query_string_with_raw(&ctx, &query_string);
 
     // Apply plugin-set route overrides (e.g., `mesh_route_dispatch` from an
     // Istio VirtualService header/method match). When no overrides are set,
@@ -29911,6 +30119,37 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
         Cow::Owned(stripped)
     } else {
         Cow::Borrowed(query_string)
+    }
+}
+
+/// Canonical backend-visible query: transformer-published outbound query when
+/// present (including empty), otherwise the retained raw wire query, then
+/// authentication-owned credential strips. Transformers already strip marked
+/// credentials from their input before query rules run; this final pass is
+/// defense in depth for the no-transform path and any residual marked names.
+/// Ordinary no-transform / no-strip requests borrow the raw string with no
+/// allocation.
+pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
+    let base = match ctx.outbound_query_string() {
+        Some(q) => q,
+        None => ctx.raw_query_string().unwrap_or(""),
+    };
+    query_string_after_plugin_strips(ctx, base)
+}
+
+/// Same as [`effective_backend_query_string`], but prefer a caller-held raw
+/// query borrow when no outbound transform was published. An outbound
+/// transform is copied into the returned value so callers may continue
+/// mutating the request context while they retain the canonical query. The
+/// ordinary no-transform / no-strip hot path still borrows `raw_query`
+/// without allocating.
+pub(crate) fn effective_backend_query_string_with_raw<'a>(
+    ctx: &RequestContext,
+    raw_query: &'a str,
+) -> Cow<'a, str> {
+    match ctx.outbound_query_string() {
+        Some(query) => Cow::Owned(query_string_after_plugin_strips(ctx, query).into_owned()),
+        None => query_string_after_plugin_strips(ctx, raw_query),
     }
 }
 
