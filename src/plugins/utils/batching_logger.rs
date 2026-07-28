@@ -215,12 +215,6 @@ impl TrySendOutcome {
     pub fn as_bool(self) -> bool {
         matches!(self, Self::ChannelAccepted)
     }
-
-    /// True when the item remains owned by the logger channel or an accepting overflow hook.
-    #[inline]
-    pub fn ownership_accepted(self) -> bool {
-        matches!(self, Self::ChannelAccepted | Self::DiversionAccepted)
-    }
 }
 
 pub struct LoggerHooks<T: Send + 'static> {
@@ -453,6 +447,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// Non-blocking send. Compatibility wrapper: `true` only when the item was
     /// admitted to the bounded channel. Prefer [`Self::try_send_outcome`] when
     /// diversion, full-buffer drops, and shutdown must be distinguished.
+    #[allow(dead_code)] // Retained compatibility API exercised by the external unit-test crate.
     pub fn try_send(&self, item: T) -> bool {
         self.try_send_outcome(item).as_bool()
     }
