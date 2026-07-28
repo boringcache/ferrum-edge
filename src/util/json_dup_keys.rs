@@ -36,6 +36,9 @@
 //! `serde_json` accepts are reported as ambiguous (fail closed), and bytes both
 //! reject keep their existing "malformed body" handling. The confirmation parse
 //! runs only on the rejection path, so the success path stays a single pass.
+//! It uses the same `deserialize_any` acceptance path as `serde_json::Value`
+//! (not `serde::de::IgnoredAny`, whose `ignore_value` shortcut skips UTF-8 /
+//! surrogate validation and the recursion limit).
 //!
 //! Reasons are fixed-cardinality `&'static str` values and never echo any byte
 //! of the inspected document, so they are safe to surface in warn/audit
@@ -43,7 +46,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt;
 
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest as _, Sha256};
 
 /// Why the bounded scanner refused to vouch for a document.
@@ -270,16 +275,95 @@ pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'s
     match scan(bytes, limits) {
         Ok(()) => None,
         Err(reject) => {
-            // Confirmation parse, rejection path only: `IgnoredAny` walks the
-            // whole document (and rejects trailing data) without materializing
-            // it, so this costs one extra bounded pass on inputs that were
-            // going to be rejected or re-parsed anyway.
-            if serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok() {
+            // Confirmation parse, rejection path only. `SerdeJsonAccept` matches
+            // governed `serde_json::Value` acceptance (UTF-8, paired surrogates,
+            // trailing data, default recursion limit) without building a value
+            // tree. Input on non-TooLarge paths is already <= `limits.max_bytes`;
+            // TooLarge skips content inspection and confirmation stays
+            // non-materializing so it cannot allocate a `Value` past that budget.
+            if serde_json_accepts(bytes) {
                 Some(reject.reason())
             } else {
                 None
             }
         }
+    }
+}
+
+/// Whether `serde_json` would accept `bytes` as a whole document under the
+/// same contract governed call sites use for `serde_json::Value`.
+///
+/// Uses a discard visitor over `deserialize_any` so confirmation stays
+/// non-materializing while still enforcing UTF-8 string content, paired
+/// surrogates, trailing-data rejection, and the default recursion limit.
+/// `IgnoredAny` is intentionally not used: its `ignore_value` path accepts
+/// lone surrogates / non-UTF-8 bytes and does not apply the recursion limit.
+fn serde_json_accepts(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<SerdeJsonAccept>(bytes).is_ok()
+}
+
+/// Rejection-path confirmation sink. Accepts exactly when a `Value` parse
+/// would, then discards every visited node.
+struct SerdeJsonAccept;
+
+impl<'de> serde::Deserialize<'de> for SerdeJsonAccept {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SerdeJsonAcceptVisitor)
+    }
+}
+
+struct SerdeJsonAcceptVisitor;
+
+impl<'de> Visitor<'de> for SerdeJsonAcceptVisitor {
+    type Value = SerdeJsonAccept;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element::<SerdeJsonAccept>()?.is_some() {}
+        Ok(SerdeJsonAccept)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_key::<SerdeJsonAccept>()?.is_some() {
+            let _: SerdeJsonAccept = map.next_value()?;
+        }
+        Ok(SerdeJsonAccept)
     }
 }
 

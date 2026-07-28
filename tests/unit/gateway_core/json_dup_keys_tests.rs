@@ -272,6 +272,70 @@ fn rejects_non_utf8_bytes() {
     let body = b"{\"\xff\xfe\":1}";
     assert!(scan(body, &GOVERNED_JSON_LIMITS).is_err());
     assert!(slice_ambiguity(body).is_none());
+    assert!(serde_json::from_slice::<serde_json::Value>(body).is_err());
+}
+
+/// Confirmation must track governed `serde_json::Value` acceptance, not the
+/// looser `IgnoredAny` ignore-path: valid documents and syntactically valid
+/// duplicates are distinguished from UTF-8 / surrogate / nesting / trailing
+/// failures that `Value` also rejects.
+#[test]
+fn confirmation_matches_serde_json_value_acceptance() {
+    let backslash = '\\';
+
+    // Ordinary valid document: scanner accepts, no ambiguity.
+    let clean = r#"{"a":1,"b":[true,null,"x"]}"#;
+    assert!(serde_json::from_str::<serde_json::Value>(clean).is_ok());
+    assert_eq!(scan_governed(clean), Ok(()));
+    assert!(str_ambiguity(clean).is_none());
+
+    // Syntactically valid duplicate keys: serde accepts, screen reports
+    // ambiguity (never weakens to a pass).
+    let duplicate = r#"{"role":"admin","role":"safe"}"#;
+    assert!(serde_json::from_str::<serde_json::Value>(duplicate).is_ok());
+    assert_eq!(
+        str_ambiguity(duplicate),
+        Some(JsonScanReject::DuplicateKey.reason())
+    );
+
+    // Trailing data: both parsers reject; not an ambiguity.
+    let trailing = r#"{"a":1}{"b":2}"#;
+    assert!(serde_json::from_str::<serde_json::Value>(trailing).is_err());
+    assert!(str_ambiguity(trailing).is_none());
+
+    // Lone / mispaired surrogates: `Value` rejects; must not be ambiguity.
+    for body in [
+        format!("{{\"{backslash}ud83d\":1}}"),
+        format!("{{\"{backslash}ude00\":1}}"),
+        format!("{{\"{backslash}ud83d{backslash}u0061\":1}}"),
+    ] {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).is_err(),
+            "serde Value unexpectedly accepted {body:?}"
+        );
+        assert!(
+            slice_ambiguity(body.as_bytes()).is_none(),
+            "{body:?} was reported as ambiguity rather than malformed"
+        );
+    }
+
+    // Malformed UTF-8 in a member name.
+    let non_utf8 = b"{\"\xff\xfe\":1}";
+    assert!(serde_json::from_slice::<serde_json::Value>(non_utf8).is_err());
+    assert!(slice_ambiguity(non_utf8).is_none());
+
+    // Deep nesting past serde's recursion limit: not an ambiguity, and must
+    // not stack-overflow on confirmation.
+    let depth = 100_000usize;
+    let mut deep = String::with_capacity(depth * 2);
+    for _ in 0..depth {
+        deep.push('[');
+    }
+    for _ in 0..depth {
+        deep.push(']');
+    }
+    assert!(serde_json::from_str::<serde_json::Value>(&deep).is_err());
+    assert!(slice_ambiguity(deep.as_bytes()).is_none());
 }
 
 /// A leading BOM is not stripped by the screen: callers must pass exactly the
@@ -373,6 +437,24 @@ fn explicit_budgets_are_enforced() {
     assert_eq!(
         scan(br#"{"abc":1}"#, &short_keys),
         Err(JsonScanReject::KeyTooLong)
+    );
+}
+
+/// Size-budget exhaustion on a document `serde_json` accepts is ambiguity,
+/// matching other budget failures. Confirmation is non-materializing so it
+/// cannot build a `Value` tree larger than the scan budget.
+#[test]
+fn oversize_parseable_body_is_reported_as_size_budget_ambiguity() {
+    let tight = JsonScanLimits {
+        max_bytes: 8,
+        ..GOVERNED_JSON_LIMITS
+    };
+    let body = br#"{"aaaa":1}"#;
+    assert_eq!(scan(body, &tight), Err(JsonScanReject::TooLarge));
+    assert!(serde_json::from_slice::<serde_json::Value>(body).is_ok());
+    assert_eq!(
+        slice_ambiguity_with(body, &tight),
+        Some(JsonScanReject::TooLarge.reason())
     );
 }
 
