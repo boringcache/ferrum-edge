@@ -92,16 +92,34 @@ never dropped for being pathless.
 |---|---|
 | `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}`; no request-time predicate |
 | `method.type: Exact` with `service` only | Listen path prefix `/{service}/` — a gRPC `:path` always carries a trailing method segment, so this selects exactly that service |
-| `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` |
-| `method.type: RegularExpression` | `/` listener plus a `mesh_route_dispatch` URI regex `/(?:{service})/(?:{method})`; an omitted component becomes the single-segment wildcard `[^/]+`, and each operand is wrapped in its own non-capturing group so a top-level alternation cannot escape its segment |
+| `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` (the method literal is regex-escaped) |
+| `method.type: RegularExpression` | **Not supported** — dropped fail closed (see below) |
 | Header-only match (no `method`) | `/` listener plus the "any gRPC call" URI regex `/[^/]+/[^/]+` and the exact header predicates |
 | Rule with `matches` omitted or empty | `/` listener plus the "any gRPC call" URI regex — the Gateway API defines this as every **gRPC** call on the route's hostnames, not every HTTP request |
 
-Every predicate that has to materialize on the `/` listener additionally
-carries a `content-type` prefix predicate of `application/grpc`, so a pathless
-gRPC rule can never capture ordinary HTTP traffic sharing the same hostname. A
-route-authored `content-type` header match replaces that gate (it is the more
-specific operator intent). The generated `mesh_route_dispatch` instance sets
+`method.type: RegularExpression` is an implementation-specific Gateway API
+extension that Ferrum does not implement. A gRPC `:path` is
+`/{service}/{method}`, and an operator-supplied pattern can consume the `/`
+delimiter through `.*`, a character class, or an encoded escape (`\x2F`,
+`\u{2F}`) — wrapping the operand in a non-capturing group does not constrain it
+to one path segment. Rather than emit a matcher that could silently widen a
+route across service and method boundaries, the predicate is refused and the
+match is dropped with a field-specific warning. Use `Exact` `service` /
+`method` matches (including the service-only and method-only forms) instead.
+
+**Every** emitted GRPCRoute match — including one whose predicate is carried
+entirely by an exact `=/{service}/{method}` listen path or a `/{service}/`
+prefix — additionally carries a `content-type` predicate matching the gRPC
+media types (`application/grpc`, `application/grpc+proto`,
+`application/grpc-web`, `application/grpc-web-text`, and parameterized forms,
+compared case-insensitively). A GRPCRoute therefore only ever selects gRPC
+calls: neither a pathless rule nor an exact gRPC path can capture ordinary HTTP
+traffic sharing the same hostname and path. A route-authored `content-type`
+header match replaces that gate (it is the more specific operator intent), but
+it is validated to be a gRPC media type itself, so an operator header can only
+narrow the protocol boundary and never widen it; a `content-type` predicate
+such as `text/plain` drops the match fail closed. The generated
+`mesh_route_dispatch` instance sets
 `reject_unmatched: true` unless a coexisting route contributes an
 unconditional match for the same `(hostname, listen path)` — for example an
 HTTPRoute catch-all on the same host, in which case plain HTTP still falls
@@ -120,13 +138,12 @@ Shapes Ferrum still cannot represent exactly are **dropped fail closed** with a
 field-specific translator warning (`GRPCRoute {ns}/{name}
 rules[i].matches[j] dropped fail-closed: …`) rather than widened:
 
-- `method.type` other than `Exact` / `RegularExpression`.
+- `method.type: RegularExpression`, and any `method.type` other than `Exact`.
 - A `method` block with neither `service` nor `method`.
 - An `Exact` `service` / `method` literal that is empty, longer than 512
   characters, or contains anything outside ASCII alphanumerics, `.`, `_`, `-`.
-- A `RegularExpression` operand that is empty, longer than 512 characters,
-  contains `/` (a service or method name is a single path segment), or does not
-  compile.
+- A `content-type` header match whose value is not a gRPC media type — it would
+  replace the protocol gate and widen the route onto plain HTTP.
 - `headers[].type: RegularExpression`, or a header match missing `name` or
   `value` — only `Exact` header matches are translated, matching the HTTPRoute
   translator.

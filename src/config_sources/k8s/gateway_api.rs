@@ -1394,9 +1394,10 @@ fn route_match_descriptor_for_entry(
         // gRPC predicates are represented independently from HTTP paths: a
         // fully-qualified `service`+`method` becomes an exact listen path, a
         // service-only match becomes a `/{service}/` prefix, and everything
-        // else (method-only, regex, header-only, empty) materializes on `/`
-        // behind a `mesh_route_dispatch` URI + content-type predicate. Nothing
-        // is dropped for being pathless, and nothing widens into a catch-all.
+        // else (method-only, header-only, empty) materializes on `/` behind a
+        // `mesh_route_dispatch` URI predicate. Every shape additionally
+        // carries the gRPC content-type gate. Nothing is dropped for being
+        // pathless, and nothing widens into a catch-all or onto plain HTTP.
         let parsed = grpc_route_match(entry).ok()?;
         return Some(RouteMatchDescriptor {
             listen_path: match &parsed.plan {
@@ -1493,16 +1494,42 @@ fn json_string(value: &str) -> String {
 /// component may contain `/`, so a wildcard segment never crosses a separator.
 const GRPC_PATH_SEGMENT_PATTERN: &str = "[^/]+";
 
-/// Content-type prefix every gRPC request carries (`application/grpc`,
-/// `application/grpc+proto`, `application/grpc-web`, …). Pathless GRPCRoute
-/// predicates have to materialize on the `/` listener, so this gate is what
-/// keeps them from capturing ordinary HTTP traffic on the same hostname.
-const GRPC_CONTENT_TYPE_PREFIX: &str = "application/grpc";
+/// Media-type essence every gRPC content type starts with. The full set is
+/// `application/grpc` plus a `+`/`-` suffixed variant (`application/grpc+proto`,
+/// `application/grpc-web`, `application/grpc-web-text+proto`, …), optionally
+/// followed by media-type parameters.
+const GRPC_CONTENT_TYPE_ESSENCE: &str = "application/grpc";
 
-/// Upper bound on a GRPCRoute `method.service` / `method.method` operand
-/// (exact literal or regex source). gRPC service and method names are short
-/// identifiers; anything longer is a malformed or hostile predicate and is
-/// refused rather than compiled into a request-path matcher.
+/// Full-match `content-type` predicate gating every emitted GRPCRoute match on
+/// the gRPC protocol.
+///
+/// HTTP media types are case-insensitive, but `mesh_route_dispatch` header
+/// `exact` / `prefix` operands are case-sensitive byte compares, so the gate is
+/// expressed as a case-insensitive regex operand instead. It is deliberately
+/// the same shape as [`GRPC_CONTENT_TYPE_ESSENCE`] plus an open tail, so every
+/// gRPC variant (`+proto`, `-web`, `-web-text`, `; charset=…`) is admitted
+/// while ordinary HTTP media types are not. `(?s)` only affects `.`; header
+/// values never carry newlines, and the operand is anchored `\A(?:…)\z` by the
+/// plugin at compile time.
+const GRPC_CONTENT_TYPE_GATE_REGEX: &str = "(?is)application/grpc.*";
+
+/// Diagnostic for a refused `method.type: RegularExpression` predicate.
+const GRPC_REGEX_METHOD_UNSUPPORTED: &str =
+    "matches[].method.type 'RegularExpression' is not supported; Ferrum cannot constrain a regex \
+     operand to a single gRPC path segment, so the match is dropped fail-closed (use Exact \
+     service / method matches)";
+
+/// Diagnostic for a route-authored `content-type` predicate that is not itself
+/// a gRPC media type. The operator-supplied value is deliberately not echoed.
+const GRPC_CONTENT_TYPE_MUST_NARROW: &str =
+    "matches[].headers[] 'content-type' must be a gRPC media type (application/grpc, \
+     application/grpc+proto, application/grpc-web, ...); a GRPCRoute header predicate may only \
+     narrow the gRPC protocol gate, never widen it";
+
+/// Upper bound on an `Exact` GRPCRoute `method.service` / `method.method`
+/// literal. gRPC service and method names are short identifiers; anything
+/// longer is a malformed or hostile predicate and is refused rather than
+/// compiled into a request-path matcher.
 const MAX_GRPC_METHOD_OPERAND_LENGTH: usize = 512;
 
 /// How one GRPCRoute `matches[]` entry projects onto Ferrum routing.
@@ -1511,13 +1538,14 @@ enum GrpcRouteMatchPlan {
     /// The gRPC method predicate is expressed losslessly by the proxy's
     /// `listen_path` — an exact `={service}/{method}` path for a fully
     /// qualified method, or a `/{service}/` prefix for a service-only match.
-    /// No request-time URI evaluation is needed.
+    /// No request-time URI evaluation is needed; the gRPC content-type gate
+    /// still applies so the listener cannot capture plain HTTP.
     PathOnly { listen_path: String },
     /// The predicate cannot be expressed as a listen path (method-only,
-    /// `RegularExpression`, header-only, or an empty match). The route
-    /// materializes on the `/` listener and the predicate rides a
-    /// `mesh_route_dispatch` URI regex plus the gRPC content-type gate, with
-    /// `reject_unmatched` keeping unrelated traffic off the backend.
+    /// header-only, or an empty match). The route materializes on the `/`
+    /// listener and the predicate rides a `mesh_route_dispatch` URI regex plus
+    /// the gRPC content-type gate, with `reject_unmatched` keeping unrelated
+    /// traffic off the backend.
     UriRegex { pattern: String },
 }
 
@@ -1587,6 +1615,15 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
                 .ok_or_else(|| "matches[].headers[].value is required".to_string())?;
             let name = name.to_ascii_lowercase();
             if !headers.iter().any(|(existing, _)| existing == &name) {
+                // A route-authored `content-type` predicate replaces the
+                // canonical gRPC gate (see `grpc_dispatch_match_criteria_for`),
+                // so it must itself be a gRPC media type. Otherwise a
+                // `text/plain` header match would widen the GRPCRoute onto
+                // plain HTTP. The value is not echoed into the warning — it is
+                // unbounded operator input.
+                if name == "content-type" && !is_grpc_media_type(value) {
+                    return Err(GRPC_CONTENT_TYPE_MUST_NARROW.to_string());
+                }
                 headers.push((name, value.to_string()));
             }
         }
@@ -1625,10 +1662,19 @@ fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> 
                     listen_path: format!("/{service}/"),
                 }),
                 // A method-only match has no path prefix: the service segment
-                // is a wildcard, so it can only be a URI predicate.
-                (None, Some(name)) => Ok(GrpcRouteMatchPlan::UriRegex {
-                    pattern: format!("/{GRPC_PATH_SEGMENT_PATTERN}/{}", regex::escape(name)),
-                }),
+                // is a wildcard, so it can only be a URI predicate. The
+                // literal is regex-escaped and the service segment is the
+                // single-segment wildcard, so the pattern cannot cross a `/`.
+                (None, Some(name)) => {
+                    let pattern = format!("/{GRPC_PATH_SEGMENT_PATTERN}/{}", regex::escape(name));
+                    // Compile exactly the way `mesh_route_dispatch` will, so an
+                    // unusable pattern is refused during translation rather
+                    // than failing the plugin build on the data plane.
+                    compile_grpc_uri_regex(&pattern).map_err(|error| {
+                        format!("matches[].method.method is not usable as a URI predicate: {error}")
+                    })?;
+                    Ok(GrpcRouteMatchPlan::UriRegex { pattern })
+                }
                 // Already rejected above; re-checked rather than panicking so
                 // the production path has no unreachable assertion.
                 (None, None) => {
@@ -1636,27 +1682,18 @@ fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> 
                 }
             }
         }
-        "RegularExpression" => {
-            let service = service
-                .map(|service| validate_grpc_method_regex("service", service))
-                .transpose()?
-                .unwrap_or(GRPC_PATH_SEGMENT_PATTERN);
-            let name = name
-                .map(|name| validate_grpc_method_regex("method", name))
-                .transpose()?
-                .unwrap_or(GRPC_PATH_SEGMENT_PATTERN);
-            // Each operand is wrapped in its own non-capturing group so a
-            // top-level alternation in the operator's pattern cannot escape
-            // its path segment and swallow the rest of the expression.
-            let pattern = format!("/(?:{service})/(?:{name})");
-            compile_grpc_uri_regex(&pattern).map_err(|error| {
-                format!("matches[].method regex is not usable as a URI predicate: {error}")
-            })?;
-            Ok(GrpcRouteMatchPlan::UriRegex { pattern })
-        }
+        // `RegularExpression` is an implementation-specific Gateway API
+        // extension, and Ferrum cannot honor it soundly: a gRPC `:path` is
+        // `/{service}/{method}`, but an operator-supplied pattern can consume
+        // the `/` delimiter through `.*`, a character class, or an encoded
+        // escape (`\x2F`, `\u{2F}`), and wrapping the operand in a
+        // non-capturing group does not constrain it to one path segment. A
+        // regex predicate could therefore widen a route across service and
+        // method boundaries, so it is refused instead of compiled into a
+        // request-path matcher.
+        "RegularExpression" => Err(GRPC_REGEX_METHOD_UNSUPPORTED.to_string()),
         other => Err(format!(
-            "matches[].method.type '{other}' is not supported; expected Exact or \
-             RegularExpression"
+            "matches[].method.type '{other}' is not supported; expected Exact"
         )),
     }
 }
@@ -1683,27 +1720,6 @@ fn validate_grpc_method_literal<'a>(field: &str, value: &'a str) -> Result<&'a s
             "matches[].method.{field} must contain only ASCII alphanumerics, '.', '_' or '-'"
         ));
     }
-    Ok(value)
-}
-
-fn validate_grpc_method_regex<'a>(field: &str, value: &'a str) -> Result<&'a str, String> {
-    if value.is_empty() {
-        return Err(format!("matches[].method.{field} regex must not be empty"));
-    }
-    if value.len() > MAX_GRPC_METHOD_OPERAND_LENGTH {
-        return Err(format!(
-            "matches[].method.{field} regex must not exceed \
-             {MAX_GRPC_METHOD_OPERAND_LENGTH} characters"
-        ));
-    }
-    if value.contains('/') {
-        return Err(format!(
-            "matches[].method.{field} regex must not contain '/'; a gRPC service or method name \
-             is a single path segment"
-        ));
-    }
-    regex::Regex::new(value)
-        .map_err(|error| format!("matches[].method.{field} regex is invalid: {error}"))?;
     Ok(value)
 }
 
@@ -1751,24 +1767,48 @@ fn grpc_dispatch_match_criteria_for(parsed: &GrpcRouteMatch) -> serde_json::Map<
 
     if let GrpcRouteMatchPlan::UriRegex { pattern } = &parsed.plan {
         criteria.insert("uri".to_string(), serde_json::json!({ "regex": pattern }));
-        // The URI shape alone would still admit a plain HTTP request whose
-        // path happens to have two segments. Gate on the gRPC content type so
-        // a pathless gRPC predicate can only ever match a gRPC call.
-        headers.insert(
-            "content-type".to_string(),
-            serde_json::json!({ "prefix": GRPC_CONTENT_TYPE_PREFIX }),
-        );
     }
+    // Every GRPCRoute match is gated on the gRPC content type, including one
+    // whose predicate is carried entirely by the proxy's `listen_path`. A
+    // GRPCRoute selects gRPC calls, so neither an exact `=/{service}/{method}`
+    // listener nor a `/{service}/` prefix may capture a plain HTTP request
+    // that happens to use the same path, and a URI shape alone would still
+    // admit any two-segment HTTP path.
+    headers.insert(
+        "content-type".to_string(),
+        serde_json::json!({ "regex": GRPC_CONTENT_TYPE_GATE_REGEX }),
+    );
     // A route-authored `content-type` predicate is more specific than the
-    // gate, so it deliberately replaces it.
+    // gate, so it deliberately replaces it. `grpc_route_match` has already
+    // validated it is itself a gRPC media type, so the replacement can only
+    // narrow the protocol boundary.
     for (name, value) in &parsed.headers {
         headers.insert(name.clone(), Value::String(value.clone()));
     }
-    if !headers.is_empty() {
-        criteria.insert("headers".to_string(), Value::Object(headers));
-    }
+    criteria.insert("headers".to_string(), Value::Object(headers));
 
     criteria
+}
+
+/// Is `value` a gRPC media type?
+///
+/// The essence (everything before the first `;` parameter) must be
+/// `application/grpc`, or `application/grpc` followed by a non-empty `+`/`-`
+/// suffix — `application/grpc+proto`, `application/grpc-web`,
+/// `application/grpc-web-text`. Comparison is ASCII case-insensitive, matching
+/// HTTP media-type semantics. `application/grpcfoo`, `text/plain`, and
+/// `application/json` are not gRPC media types.
+fn is_grpc_media_type(value: &str) -> bool {
+    let essence = value.split(';').next().unwrap_or(value).trim();
+    let Some(head) = essence.get(..GRPC_CONTENT_TYPE_ESSENCE.len()) else {
+        return false;
+    };
+    if !head.eq_ignore_ascii_case(GRPC_CONTENT_TYPE_ESSENCE) {
+        return false;
+    }
+    let suffix = &essence[GRPC_CONTENT_TYPE_ESSENCE.len()..];
+    suffix.is_empty()
+        || (suffix.len() > 1 && matches!(suffix.as_bytes().first(), Some(b'+' | b'-')))
 }
 
 fn route_hostnames(object: &K8sObject) -> Vec<String> {
@@ -7449,14 +7489,67 @@ mod tests {
             ],
             "fully-qualified gRPC methods must become exact listen paths, not a catch-all"
         );
-        assert!(
-            !result
-                .config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
-            "an exact gRPC path needs no request-time predicate"
-        );
+        // The path predicate is exact, but a GRPCRoute still selects gRPC
+        // calls only: each exact listener carries the content-type gate and
+        // rejects unmatched (i.e. non-gRPC) traffic.
+        for proxy in &result.config.proxies {
+            let plugin = grpc_dispatch_plugin(&result, proxy);
+            assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+            let matcher = &plugin.config["rules"][0]["match"];
+            assert!(
+                matcher.get("uri").is_none(),
+                "an exact gRPC path needs no request-time URI predicate"
+            );
+            assert_eq!(
+                matcher["headers"]["content-type"]["regex"].as_str(),
+                Some(GRPC_CONTENT_TYPE_GATE_REGEX),
+                "an exact gRPC listener must not capture plain HTTP on the same path"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_content_type_gate_admits_grpc_variants_and_rejects_plain_http() {
+        // `mesh_route_dispatch` anchors every regex header operand with
+        // `\A(?:…)\z` at plugin-construction time; mirror that exactly so the
+        // gate is evaluated the way the data plane will evaluate it.
+        let gate = regex::Regex::new(&format!(r"\A(?:{GRPC_CONTENT_TYPE_GATE_REGEX})\z"))
+            .expect("the emitted content-type gate compiles");
+        for admitted in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc+json",
+            "application/grpc-web",
+            "application/grpc-web-text",
+            "application/grpc; charset=utf-8",
+            "Application/GRPC",
+            "APPLICATION/GRPC+PROTO",
+        ] {
+            assert!(gate.is_match(admitted), "gate must admit {admitted}");
+            assert!(
+                is_grpc_media_type(admitted),
+                "an authored {admitted} predicate must be accepted"
+            );
+        }
+        for refused in [
+            "text/plain",
+            "application/json",
+            "application/x-www-form-urlencoded",
+            "text/html; charset=utf-8",
+            "",
+        ] {
+            assert!(!gate.is_match(refused), "gate must refuse {refused}");
+            assert!(
+                !is_grpc_media_type(refused),
+                "an authored {refused} predicate must be refused"
+            );
+        }
+        // Not a gRPC media type even though it shares the gate's open prefix —
+        // an authored predicate is held to the stricter essence check.
+        assert!(!is_grpc_media_type("application/grpcfoo"));
+        assert!(!is_grpc_media_type("application/grpc+"));
+        // Non-ASCII input must not panic on a byte-slice boundary.
+        assert!(!is_grpc_media_type("applicati\u{00f3}n/grpc"));
     }
 
     #[test]
@@ -7482,6 +7575,91 @@ mod tests {
             Some("/helloworld.Greeter/"),
             "a service-only match is a single-service prefix, never `/`"
         );
+        let plugin = grpc_dispatch_plugin(&result, &result.config.proxies[0]);
+        assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
+        assert_eq!(
+            plugin.config["rules"][0]["match"]["headers"]["content-type"]["regex"].as_str(),
+            Some(GRPC_CONTENT_TYPE_GATE_REGEX),
+            "a service-prefix listener must not capture plain HTTP under the same prefix"
+        );
+    }
+
+    #[test]
+    fn grpc_route_authored_content_type_must_narrow_the_grpc_gate() {
+        // A valid gRPC media type replaces the canonical gate (more specific
+        // operator intent) and the route still materializes.
+        let result = translate_k8s_objects(
+            &[object(
+                "GRPCRoute",
+                serde_json::json!({
+                    "hostnames": ["grpc.example.com"],
+                    "rules": [{
+                        "matches": [{
+                            "method": {"method": "SayHello"},
+                            "headers": [{"name": "Content-Type", "value": "application/grpc+proto"}]
+                        }],
+                        "backendRefs": [{"name": "grpc-api"}]
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+        let proxy = grpc_catch_all_proxy(&result);
+        let plugin = grpc_dispatch_plugin(&result, proxy);
+        assert_eq!(
+            plugin.config["rules"][0]["match"]["headers"]["content-type"].as_str(),
+            Some("application/grpc+proto"),
+            "an authored gRPC media type narrows the gate"
+        );
+
+        // A non-gRPC media type would widen the route onto plain HTTP, so the
+        // whole match is refused and no route materializes.
+        for widening in ["text/plain", "application/json", "application/grpcfoo"] {
+            let entry = serde_json::json!({
+                "method": {"service": "helloworld.Greeter", "method": "SayHello"},
+                "headers": [{"name": "content-type", "value": widening}]
+            });
+            let reason = grpc_route_match(&entry)
+                .expect_err("a non-gRPC content-type predicate must fail closed")
+                .to_string();
+            assert!(
+                reason.contains("must be a gRPC media type"),
+                "expected a content-type diagnostic, got `{reason}`"
+            );
+            assert!(
+                !reason.contains(widening),
+                "the operator-supplied value must not be echoed into the warning: {reason}"
+            );
+
+            let result = translate_k8s_objects(
+                &[object(
+                    "GRPCRoute",
+                    serde_json::json!({
+                        "hostnames": ["grpc.example.com"],
+                        "rules": [{
+                            "matches": [entry],
+                            "backendRefs": [{"name": "grpc-api"}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect("translation succeeds");
+            assert!(
+                result.config.proxies.is_empty(),
+                "a widening content-type predicate must not materialize a route"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("dropped fail-closed")
+                        && warning.contains("must be a gRPC media type")),
+                "expected a field-specific drop warning in {:?}",
+                result.warnings
+            );
+        }
     }
 
     #[test]
@@ -7514,8 +7692,8 @@ mod tests {
             .expect("method-only match carries a URI regex");
         assert_eq!(pattern, "/[^/]+/SayHello");
         assert_eq!(
-            matcher["headers"]["content-type"]["prefix"].as_str(),
-            Some("application/grpc"),
+            matcher["headers"]["content-type"]["regex"].as_str(),
+            Some(GRPC_CONTENT_TYPE_GATE_REGEX),
             "a pathless gRPC predicate must be gated on the gRPC content type"
         );
 
@@ -7550,14 +7728,48 @@ mod tests {
         assert_eq!(matcher["uri"]["regex"].as_str(), Some("/[^/]+/[^/]+"));
         assert_eq!(matcher["headers"]["x-tenant"].as_str(), Some("a"));
         assert_eq!(
-            matcher["headers"]["content-type"]["prefix"].as_str(),
-            Some("application/grpc")
+            matcher["headers"]["content-type"]["regex"].as_str(),
+            Some(GRPC_CONTENT_TYPE_GATE_REGEX)
         );
         assert_eq!(plugin.config["reject_unmatched"].as_bool(), Some(true));
     }
 
     #[test]
-    fn grpc_route_regex_method_match_stays_inside_its_path_segment() {
+    fn grpc_route_regular_expression_matches_are_refused_fail_closed() {
+        // Ferrum cannot constrain an operator regex to one gRPC path segment:
+        // every operand below can consume the `/` delimiter and widen the
+        // route across service/method boundaries, and wrapping it in a
+        // non-capturing group does not change that. The predicate is refused
+        // rather than compiled into a request-path matcher.
+        for operand in [
+            ".*",
+            "[\\s\\S]*",
+            "a\\x2Fb",
+            "a\\u{2F}b",
+            "a[/]b",
+            "a|.*",
+            "helloworld\\..*",
+            "[^x]+",
+        ] {
+            for method in [
+                serde_json::json!({"type": "RegularExpression", "service": operand}),
+                serde_json::json!({"type": "RegularExpression", "method": operand}),
+                serde_json::json!({
+                    "type": "RegularExpression",
+                    "service": "helloworld.Greeter",
+                    "method": operand
+                }),
+            ] {
+                let reason = grpc_route_method_plan(&method)
+                    .expect_err("a RegularExpression gRPC predicate must fail closed")
+                    .to_string();
+                assert!(
+                    reason.contains("'RegularExpression' is not supported"),
+                    "expected a RegularExpression diagnostic, got `{reason}`"
+                );
+            }
+        }
+
         let result = translate_k8s_objects(
             &[object(
                 "GRPCRoute",
@@ -7576,37 +7788,27 @@ mod tests {
             options(),
         )
         .expect("translation succeeds");
-
-        let proxy = grpc_catch_all_proxy(&result);
-        let plugin = grpc_dispatch_plugin(&result, proxy);
-        let pattern = plugin.config["rules"][0]["match"]["uri"]["regex"]
-            .as_str()
-            .expect("regex method match carries a URI regex");
-        assert_eq!(pattern, "/(?:helloworld\\..*)/(?:Say.*)");
-        let compiled = compile_grpc_uri_regex(pattern).expect("emitted pattern compiles");
-        assert!(compiled.is_match("/helloworld.Greeter/SayHello"));
-        assert!(!compiled.is_match("/other.Greeter/SayHello"));
-        assert!(!compiled.is_match("/helloworld.Greeter/Ping"));
-    }
-
-    #[test]
-    fn grpc_route_regex_operand_alternation_cannot_escape_its_segment() {
-        // A top-level alternation must stay grouped, otherwise
-        // `svc|.*` would widen the whole expression to "any path".
-        let plan = grpc_route_method_plan(&serde_json::json!({
-            "type": "RegularExpression",
-            "service": "a|b"
-        }))
-        .expect("alternation operand is accepted");
-        let GrpcRouteMatchPlan::UriRegex { pattern } = plan else {
-            panic!("regex method match must be a URI predicate");
-        };
-        assert_eq!(pattern, "/(?:a|b)/(?:[^/]+)");
-        let compiled = compile_grpc_uri_regex(&pattern).expect("compiles");
-        assert!(compiled.is_match("/a/Ping"));
-        assert!(compiled.is_match("/b/Ping"));
-        assert!(!compiled.is_match("/c/Ping"));
-        assert!(!compiled.is_match("/anything/else/here"));
+        assert!(
+            result.config.proxies.is_empty(),
+            "a RegularExpression GRPCRoute match must not materialize a route"
+        );
+        assert!(
+            !result
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+            "a refused predicate must not leave a dispatch rule behind"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("dropped fail-closed")
+                    && warning.contains("'RegularExpression' is not supported")),
+            "expected a field-specific drop warning in {:?}",
+            result.warnings
+        );
     }
 
     #[test]
@@ -7630,15 +7832,16 @@ mod tests {
             ),
             (
                 serde_json::json!({
-                    "method": {"type": "RegularExpression", "service": "a("}
+                    "method": {"type": "RegularExpression", "service": "a.*"}
                 }),
-                "matches[].method.service regex is invalid",
+                "matches[].method.type 'RegularExpression' is not supported",
             ),
             (
                 serde_json::json!({
-                    "method": {"type": "RegularExpression", "service": "a/b"}
+                    "method": {"service": "a.B", "method": "C"},
+                    "headers": [{"name": "content-type", "value": "text/plain"}]
                 }),
-                "matches[].method.service regex must not contain '/'",
+                "matches[].headers[] 'content-type' must be a gRPC media type",
             ),
             (
                 serde_json::json!({
@@ -7714,8 +7917,8 @@ mod tests {
             "a match-less GRPCRoute matches every gRPC call, not every HTTP request"
         );
         assert_eq!(
-            plugin.config["rules"][0]["match"]["headers"]["content-type"]["prefix"].as_str(),
-            Some("application/grpc")
+            plugin.config["rules"][0]["match"]["headers"]["content-type"]["regex"].as_str(),
+            Some(GRPC_CONTENT_TYPE_GATE_REGEX)
         );
     }
 
@@ -7815,8 +8018,8 @@ mod tests {
             .expect("ordered dispatch rules");
         assert_eq!(rules.len(), 1);
         assert_eq!(
-            rules[0]["match"]["headers"]["content-type"]["prefix"].as_str(),
-            Some("application/grpc")
+            rules[0]["match"]["headers"]["content-type"]["regex"].as_str(),
+            Some(GRPC_CONTENT_TYPE_GATE_REGEX)
         );
         assert_eq!(
             rules[0]["destination"]["backend_port"].as_u64(),

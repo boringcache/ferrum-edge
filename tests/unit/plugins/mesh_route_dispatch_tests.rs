@@ -1283,16 +1283,16 @@ mod grpc_route_predicate_dispatch {
     }
 
     /// Build the live plugin from the dispatch config the translator emitted
-    /// for the `/` listener, failing loudly if no such listener exists.
-    fn dispatch_plugin_for_catch_all(objects: &[K8sObject]) -> MeshRouteDispatch {
+    /// for `listen_path`, failing loudly if no such listener exists.
+    fn dispatch_plugin_for_path(objects: &[K8sObject], listen_path: &str) -> MeshRouteDispatch {
         let translation =
             translate_k8s_objects(objects, options()).expect("translation should succeed");
         let proxy = translation
             .config
             .proxies
             .iter()
-            .find(|proxy| proxy.listen_path.as_deref() == Some("/"))
-            .expect("pathless gRPC predicate materializes a `/` listener");
+            .find(|proxy| proxy.listen_path.as_deref() == Some(listen_path))
+            .unwrap_or_else(|| panic!("expected a `{listen_path}` listener"));
         let plugin = translation
             .config
             .plugin_configs
@@ -1301,8 +1301,16 @@ mod grpc_route_predicate_dispatch {
                 plugin.plugin_name == "mesh_route_dispatch"
                     && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
             })
-            .expect("the `/` listener carries a mesh_route_dispatch instance");
+            .unwrap_or_else(|| {
+                panic!("the `{listen_path}` listener carries a mesh_route_dispatch instance")
+            });
         MeshRouteDispatch::new(&plugin.config).expect("translated dispatch config is valid")
+    }
+
+    /// Build the live plugin from the dispatch config the translator emitted
+    /// for the `/` listener, failing loudly if no such listener exists.
+    fn dispatch_plugin_for_catch_all(objects: &[K8sObject]) -> MeshRouteDispatch {
+        dispatch_plugin_for_path(objects, "/")
     }
 
     fn grpc_headers() -> HashMap<String, String> {
@@ -1375,6 +1383,169 @@ mod grpc_route_predicate_dispatch {
         // Negative: a gRPC call whose path is not the two-segment shape.
         let (_, _, rejected) = resolved_backend(&plugin, "/SayHello", &mut grpc_headers()).await;
         assert!(rejected);
+    }
+
+    #[tokio::test]
+    async fn exact_service_and_method_route_rejects_plain_http_on_the_same_path() {
+        // The predicate is carried by the proxy's exact listen path, but a
+        // GRPCRoute still selects gRPC calls only — a plain HTTP request to
+        // `/helloworld.Greeter/SayHello` must not reach the gRPC backend.
+        let objects = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{
+                    "method": {"service": "helloworld.Greeter", "method": "SayHello"}
+                }],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_path(&objects, "=/helloworld.Greeter/SayHello");
+
+        for content_type in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc-web-text",
+            "application/grpc; charset=utf-8",
+            // HTTP media types are case-insensitive; a gRPC client that
+            // capitalizes must still be routed.
+            "Application/GRPC",
+        ] {
+            let mut headers =
+                HashMap::from([("content-type".to_string(), content_type.to_string())]);
+            let (_, port, rejected) =
+                resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut headers).await;
+            assert!(!rejected, "{content_type} is a gRPC call");
+            assert_eq!(port, Some(50051), "{content_type} must reach the backend");
+        }
+
+        for content_type in ["text/plain", "application/json", "text/html"] {
+            let mut headers =
+                HashMap::from([("content-type".to_string(), content_type.to_string())]);
+            let (_, _, rejected) =
+                resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut headers).await;
+            assert!(
+                rejected,
+                "plain HTTP ({content_type}) must not match an exact GRPCRoute path"
+            );
+        }
+
+        // No content-type at all is not a gRPC call either.
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut HashMap::new()).await;
+        assert!(rejected, "a request without a content-type is not gRPC");
+    }
+
+    #[tokio::test]
+    async fn service_only_route_rejects_plain_http_under_the_service_prefix() {
+        let objects = [grpc_route(
+            "greeter",
+            json!([{
+                "matches": [{"method": {"service": "helloworld.Greeter"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_path(&objects, "/helloworld.Greeter/");
+
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051));
+
+        let mut html = HashMap::from([("content-type".to_string(), "text/html".to_string())]);
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut html).await;
+        assert!(
+            rejected,
+            "plain HTTP under the service prefix must not reach the gRPC backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn authored_content_type_narrows_the_gate_and_text_plain_is_refused() {
+        // A gRPC media type authored on the route replaces the canonical gate
+        // and only narrows it: `+proto` matches, bare `application/grpc` does
+        // not.
+        let objects = [grpc_route(
+            "hello",
+            json!([{
+                "matches": [{
+                    "method": {"method": "SayHello"},
+                    "headers": [{"name": "content-type", "value": "application/grpc+proto"}]
+                }],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]),
+        )];
+        let plugin = dispatch_plugin_for_catch_all(&objects);
+        let (_, port, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut grpc_headers()).await;
+        assert!(!rejected);
+        assert_eq!(port, Some(50051));
+
+        let mut bare = HashMap::from([(
+            "content-type".to_string(),
+            "application/grpc".to_string(),
+        )]);
+        let (_, _, rejected) =
+            resolved_backend(&plugin, "/helloworld.Greeter/SayHello", &mut bare).await;
+        assert!(rejected, "the authored predicate narrows the gate");
+
+        // A non-gRPC authored content-type would widen the route onto plain
+        // HTTP, so the match is refused during translation and nothing
+        // materializes at all.
+        let widening = translate_k8s_objects(
+            &[grpc_route(
+                "widen",
+                json!([{
+                    "matches": [{
+                        "method": {"service": "helloworld.Greeter", "method": "SayHello"},
+                        "headers": [{"name": "content-type", "value": "text/plain"}]
+                    }],
+                    "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                }]),
+            )],
+            options(),
+        )
+        .expect("translation should succeed");
+        assert!(
+            widening.config.proxies.is_empty(),
+            "a text/plain content-type predicate must not materialize a GRPCRoute"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_expression_method_matches_never_materialize() {
+        // Ferrum cannot constrain a regex operand to one gRPC path segment,
+        // so `RegularExpression` predicates are refused rather than compiled
+        // into a matcher that could widen across service/method boundaries.
+        for operand in [".*", "a\\x2Fb", "a[/]b", "helloworld\\..*"] {
+            let translation = translate_k8s_objects(
+                &[grpc_route(
+                    "regex",
+                    json!([{
+                        "matches": [{"method": {
+                            "type": "RegularExpression",
+                            "service": operand,
+                            "method": operand
+                        }}],
+                        "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                    }]),
+                )],
+                options(),
+            )
+            .expect("translation should succeed");
+            assert!(
+                translation.config.proxies.is_empty(),
+                "`{operand}` must not materialize a route"
+            );
+            assert!(
+                !translation
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                "`{operand}` must not leave a dispatch rule behind"
+            );
+        }
     }
 
     #[tokio::test]
