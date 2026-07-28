@@ -5,6 +5,15 @@ use ferrum_edge::modes::mesh::node_waypoint_observability::{
     NodeWaypointHboneHandshakePhase,
 };
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
+use std::sync::{Mutex, MutexGuard};
+
+static OBSERVABILITY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn observability_test_guard() -> MutexGuard<'static, ()> {
+    OBSERVABILITY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[test]
 fn reason_enums_expose_stable_label_strings() {
@@ -32,6 +41,7 @@ fn reason_enums_expose_stable_label_strings() {
 
 #[test]
 fn disabled_producers_do_not_increment() {
+    let _guard = observability_test_guard();
     node_waypoint_observability::set_enabled(false);
     let before = node_waypoint_observability::snapshot();
 
@@ -59,6 +69,7 @@ fn disabled_producers_do_not_increment() {
 
 #[test]
 fn enabled_producers_increment_and_render_bounded_labels() {
+    let _guard = observability_test_guard();
     node_waypoint_observability::set_enabled(true);
     let before = node_waypoint_observability::snapshot();
 
@@ -180,6 +191,7 @@ fn enabled_producers_increment_and_render_bounded_labels() {
 /// within that window).
 #[test]
 fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
+    let _guard = observability_test_guard();
     node_waypoint_observability::set_enabled(true);
     let registry = MetricsRegistry::new();
     // Keep the registry body cached across the producer increment. A non-empty
@@ -252,6 +264,7 @@ fn prometheus_counter_value(output: &str, series_prefix: &str) -> u64 {
 
 #[test]
 fn handshake_phase_ownership_is_independent() {
+    let _guard = observability_test_guard();
     node_waypoint_observability::set_enabled(true);
     let before = node_waypoint_observability::snapshot();
 
