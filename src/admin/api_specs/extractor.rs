@@ -1507,19 +1507,19 @@ fn normalize_request_body_encoding(
     resolver: &LocalSchemaResolver,
     budget: &mut GeneratedOperationBudget,
 ) -> Result<Value, ExtractError> {
-    const HEADER_OBJECT_KEYS: &[&str] = &[
+    const HEADER_OBJECT_SCHEMA_KEYS: &[&str] = &[
         "description",
         "required",
         "deprecated",
-        "allowEmptyValue",
         "style",
         "explode",
-        "allowReserved",
         "schema",
-        "content",
         "example",
         "examples",
     ];
+    const HEADER_OBJECT_CONTENT_KEYS: &[&str] =
+        &["description", "required", "deprecated", "content"];
+    const HEADER_OBJECT_INVALID_KEYS: &[&str] = &["allowEmptyValue", "allowReserved"];
     let base = media_type
         .split(';')
         .next()
@@ -1753,8 +1753,53 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 };
+                let has_schema = header_object.contains_key("schema");
+                let has_content = header_object.contains_key("content");
+                if has_schema && has_content {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must not declare both schema and content"
+                        ),
+                    });
+                }
+                if !has_schema && !has_content {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must contain schema or content"
+                        ),
+                    });
+                }
+                for key in HEADER_OBJECT_INVALID_KEYS {
+                    if header_object.contains_key(*key) {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].{key} is not valid for Header Objects"
+                            ),
+                        });
+                    }
+                }
+                if has_content {
+                    for key in ["style", "explode", "example", "examples", "schema"] {
+                        if header_object.contains_key(key) {
+                            return Err(ExtractError::MalformedExtension {
+                                which: "requestBody.content.encoding",
+                                error: format!(
+                                    "encoding['{property}'].headers['{header_name}'].{key} is a schema-form Header Object field and is not valid with content"
+                                ),
+                            });
+                        }
+                    }
+                }
+                let allowed_keys = if has_content {
+                    HEADER_OBJECT_CONTENT_KEYS
+                } else {
+                    HEADER_OBJECT_SCHEMA_KEYS
+                };
                 for key in header_object.keys() {
-                    if !HEADER_OBJECT_KEYS.contains(&key.as_str()) {
+                    if !allowed_keys.contains(&key.as_str()) {
                         return Err(ExtractError::MalformedExtension {
                             which: "requestBody.content.encoding",
                             error: format!(
@@ -1774,43 +1819,13 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 }
-                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
-                    if let Some(value) = header_object.get(key)
-                        && !value.is_boolean()
-                    {
-                        return Err(ExtractError::MalformedExtension {
-                            which: "requestBody.content.encoding",
-                            error: format!(
-                                "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
-                            ),
-                        });
-                    }
-                }
-                if let Some(examples) = header_object.get("examples")
-                    && !examples.is_object()
+                if let Some(deprecated) = header_object.get("deprecated")
+                    && !deprecated.is_boolean()
                 {
                     return Err(ExtractError::MalformedExtension {
                         which: "requestBody.content.encoding",
                         error: format!(
-                            "encoding['{property}'].headers['{header_name}'].examples must be an object"
-                        ),
-                    });
-                }
-                let has_schema = header_object.contains_key("schema");
-                let has_content = header_object.contains_key("content");
-                if has_schema && has_content {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'] must not declare both schema and content"
-                        ),
-                    });
-                }
-                if !has_schema && !has_content {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'] must contain schema or content"
+                            "encoding['{property}'].headers['{header_name}'].deprecated must be a boolean"
                         ),
                     });
                 }
@@ -1824,25 +1839,37 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 }
-                if let Some(style) = header_object.get("style")
-                    && style.as_str() != Some("simple")
-                {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
-                        ),
-                    });
-                }
-                if let Some(explode) = header_object.get("explode")
-                    && !explode.is_boolean()
-                {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
-                        ),
-                    });
+                if !has_content {
+                    if let Some(style) = header_object.get("style")
+                        && style.as_str() != Some("simple")
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
+                            ),
+                        });
+                    }
+                    if let Some(explode) = header_object.get("explode")
+                        && !explode.is_boolean()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
+                            ),
+                        });
+                    }
+                    if let Some(examples) = header_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                            ),
+                        });
+                    }
                 }
                 let mut normalized_header = header_object.clone();
                 if has_content {
@@ -1871,14 +1898,19 @@ fn normalize_request_body_encoding(
                             ),
                         },
                     )?;
+                    let content_media_location = format!("{location}.content['{content_media_type}']");
+                    validate_header_content_media_type_key(
+                        content_media_type,
+                        property,
+                        header_name,
+                    )?;
                     let content_media_base = content_media_type
                         .split(';')
                         .next()
                         .unwrap_or(content_media_type)
                         .trim()
                         .to_ascii_lowercase();
-                    if content_media_base.is_empty() || content_media_base == "multipart/form-data"
-                    {
+                    if content_media_base == "multipart/form-data" {
                         return Err(ExtractError::MalformedExtension {
                             which: "requestBody.content.encoding",
                             error: format!(
@@ -1886,7 +1918,6 @@ fn normalize_request_body_encoding(
                             ),
                         });
                     }
-                    let content_media_location = format!("{location}.content['{content_media_type}']");
                     budget.consume_key(content_media_type, &content_media_location)?;
                     let media_object =
                         media_value
@@ -1990,6 +2021,73 @@ fn normalize_request_body_encoding(
         out.insert(property.clone(), Value::Object(property_object));
     }
     Ok(Value::Object(out))
+}
+
+/// Fail closed on Header Object `content` map keys using the same concrete
+/// media-type + HTTP header-value gate as plugin admission. Validates the full
+/// key (including parameters) so control-bearing or otherwise non-header
+/// suffixes cannot be silently discarded after a `;` split.
+fn validate_header_content_media_type_key(
+    value: &str,
+    property: &str,
+    header_name: &str,
+) -> Result<(), ExtractError> {
+    let path = format!(
+        "encoding['{property}'].headers['{header_name}'].content['{value}']"
+    );
+    if value.parse::<http::HeaderValue>().is_err() {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("{path} must be a valid HTTP header value"),
+        });
+    }
+    let base = value.split(';').next().unwrap_or("").trim();
+    let Some((type_, subtype)) = base.split_once('/') else {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("{path} must be a concrete media type"),
+        });
+    };
+    if type_ == "*"
+        || subtype == "*"
+        || !is_header_content_mime_token(type_)
+        || !is_header_content_mime_token(subtype)
+    {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("{path} must be a concrete media type"),
+        });
+    }
+    Ok(())
+}
+
+fn is_header_content_mime_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'!'
+                    | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+                    | b'~'
+            )
+        })
 }
 
 fn request_body_property_schema<'a>(schema: &'a Value, property: &str) -> Option<&'a Value> {

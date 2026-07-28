@@ -18580,8 +18580,12 @@ components:
         Multipart Encoding Object header entry. A bare JSON Schema preserves
         Ferrum's historical required-header form. A Header Object is selected
         by exactly one of `schema` or `content` and is closed so misspelled
-        presence controls cannot weaken validation. The `content` form requires
-        exactly one media type whose Media Type Object carries `schema`.
+        presence controls cannot weaken validation. Schema form accepts the
+        OAS schema-form fields (`style`/`explode`/`example`/`examples`); content
+        form accepts only the common fields plus `content`. Header-location
+        `allowEmptyValue` and `allowReserved` are rejected. The `content` form
+        requires exactly one concrete media type whose Media Type Object
+        carries `schema`.
       oneOf:
         - allOf:
             - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
@@ -18603,14 +18607,10 @@ components:
               default: false
             deprecated:
               type: boolean
-            allowEmptyValue:
-              type: boolean
             style:
               type: string
               enum: [simple]
             explode:
-              type: boolean
-            allowReserved:
               type: boolean
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
@@ -18630,30 +18630,20 @@ components:
               default: false
             deprecated:
               type: boolean
-            allowEmptyValue:
-              type: boolean
-            style:
-              type: string
-              enum: [simple]
-            explode:
-              type: boolean
-            allowReserved:
-              type: boolean
             content:
               type: object
               minProperties: 1
               maxProperties: 1
               propertyNames:
-                pattern: "^(?:\\*/\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+/(?:\\*|[!#$%&'*+.^_`|~0-9A-Za-z-]+))(?:;.*)?$"
+                pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+/[!#$%&'*+.^_`|~0-9A-Za-z-]+(?:;.*)?$"
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
               description: >
-                OpenAPI Header Object content map. Exactly one media type is
-                required. The header value is decoded as that media type under
-                multipart header-size limits before schema validation.
-            example: true
-            examples:
-              type: object
+                OpenAPI Header Object content map. Exactly one concrete media
+                type is required (no `type/*` or `*/*`). The full key, including
+                any parameters, must be a valid HTTP header value. The header
+                value is decoded as that media type under multipart header-size
+                limits before schema validation.
 
     OpenapiValidatorEncodingHeaderContentMedia:
       type: object

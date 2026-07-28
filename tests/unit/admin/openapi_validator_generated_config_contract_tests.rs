@@ -543,6 +543,73 @@ fn importer_rejects_multipart_encoding_header_content_media_encoding_field() {
 }
 
 #[test]
+fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_parameters() {
+    for (header_object, expected) in [
+        (
+            r#"{ "content": { "application/*": { "schema": { "type": "string" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "*/*": { "schema": { "type": "string" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            "{ \"content\": { \"application/json;\\u0001charset=utf-8\": { \"schema\": { \"type\": \"object\" } } } }",
+            "valid HTTP header value",
+        ),
+        (
+            r#"{
+              "style": "simple",
+              "content": { "application/json": { "schema": { "type": "object" } } }
+            }"#,
+            "schema-form Header Object field",
+        ),
+        (
+            r#"{
+              "allowEmptyValue": true,
+              "content": { "application/json": { "schema": { "type": "object" } } }
+            }"#,
+            "not valid for Header Objects",
+        ),
+        (
+            r#"{
+              "allowReserved": false,
+              "schema": { "type": "string" }
+            }"#,
+            "not valid for Header Objects",
+        ),
+    ] {
+        let spec = multipart_encoding_header_content_spec(header_object);
+        let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+            .expect_err("header content must fail closed for wildcards and inert fields");
+        let message = error.to_string();
+        assert!(
+            message.contains(expected),
+            "expected '{expected}' in error: {message}"
+        );
+    }
+}
+
+#[test]
+fn importer_preserves_multipart_encoding_header_content_with_valid_parameters() {
+    let spec = multipart_encoding_header_content_spec(
+        r#"{
+          "required": true,
+          "content": {
+            "application/json; charset=utf-8": {
+              "schema": {"$ref": "#/components/schemas/PartMeta"}
+            }
+          }
+        }"#,
+    );
+    let config = extract_validator_config(&spec);
+    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
+        ["encoding"]["file"]["headers"]["X-Part-Meta"];
+    assert!(header["content"]["application/json; charset=utf-8"]["schema"].is_object());
+    assert_valid_against_admin_schema(&config, "multipart header content with parameters");
+}
+
+#[test]
 fn importer_header_content_replacement_drops_prior_content_contract() {
     let with_content = multipart_encoding_header_content_spec(
         r#"{
@@ -656,6 +723,69 @@ fn published_schema_rejects_encoding_header_schema_and_content_together() {
         validator.validate(&config).is_err(),
         "schema+content Header Object must fail the published schema: {config}"
     );
+}
+
+#[test]
+fn published_schema_rejects_encoding_header_content_wildcards_and_inert_fields() {
+    let validator = openapi_validator_config_validator();
+    for header in [
+        json!({
+            "content": {
+                "application/*": {"schema": {"type": "string"}}
+            }
+        }),
+        json!({
+            "content": {
+                "*/*": {"schema": {"type": "string"}}
+            }
+        }),
+        json!({
+            "style": "simple",
+            "content": {
+                "application/json": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "allowEmptyValue": true,
+            "content": {
+                "application/json": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "allowReserved": true,
+            "schema": {"type": "string"}
+        }),
+    ] {
+        let config = json!({
+            "schema_draft": "draft2020-12",
+            "operations": [{
+                "method": "POST",
+                "path_template": "/upload",
+                "path_regex": "^/upload$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"file": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "file": {
+                                    "headers": {
+                                        "X-Part-Meta": header
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        assert!(
+            validator.validate(&config).is_err(),
+            "published schema must reject wildcards and inert Header Object fields: {config}"
+        );
+    }
 }
 
 #[test]
