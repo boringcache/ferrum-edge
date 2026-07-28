@@ -2423,9 +2423,7 @@ mod tests {
         let allowed = AllowedNamespaces::resolved(false, Some(set));
         let server = cp_with_scope(CpScope::Single("prod".to_string()), false);
         assert!(server.authorise_namespace(&allowed, "prod").is_ok());
-        let err = server
-            .authorise_namespace(&allowed, "staging")
-            .unwrap_err();
+        let err = server.authorise_namespace(&allowed, "staging").unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("staging"));
     }
@@ -2438,12 +2436,8 @@ mod tests {
         let mut set = HashSet::new();
         set.insert("tenant-a".to_string());
         let allowed = AllowedNamespaces::resolved(false, Some(set));
-        let err = CpGrpcServer::resolve_stream_namespace_for_scope(
-            &CpScope::All,
-            false,
-            &allowed,
-        )
-        .expect_err("missing claim must not be satisfied by a server-derived sole namespace");
+        let err = CpGrpcServer::resolve_stream_namespace_for_scope(&CpScope::All, false, &allowed)
+            .expect_err("missing claim must not be satisfied by a server-derived sole namespace");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("ns"));
     }
