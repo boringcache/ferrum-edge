@@ -71,7 +71,12 @@ cat ferrum-backup.json | jq '.counts'
 }
 ```
 
-The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). Database-backed exports always include the section (possibly with an empty `items` array). Cached fallbacks that cannot reach the primary may omit the section; see restore preflight below.
+The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). Database-backed exports always include the section (possibly with an empty `items` array).
+
+An export that cannot carry spec documents also clears the `api_spec_id` tags on the resources it does export, so the payload never references specs it does not contain (restore rejects that shape). Two cases:
+
+- **Cached fallback** (`X-Data-Source: cached`): the in-memory runtime config has already been stripped of ownership tags, so ownership cannot be proven. The section is omitted entirely and the file restores as a legacy backup — see restore preflight below.
+- **`?resources=` excluding `api_specs`**: the section is emitted empty (an intentional wipe) and exported proxies/upstreams/plugin configs restore as hand-managed.
 
 ## Restore — `POST /restore?confirm=true`
 

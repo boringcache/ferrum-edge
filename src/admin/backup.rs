@@ -70,8 +70,9 @@ pub(crate) struct BackupPayload<'a> {
     pub(crate) plugin_configs: &'a [PluginConfig],
     pub(crate) upstreams: &'a [Upstream],
     /// Versioned admin-only API spec section. Always present on database-backed
-    /// full exports (possibly with an empty `items` array). Omitted only when
-    /// specs could not be loaded (cached fallback without a reachable primary).
+    /// full exports (possibly with an empty `items` array). Omitted on
+    /// cached-fallback exports, whose resources carry no ownership tags and so
+    /// cannot describe managed relationships.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) api_specs: Option<&'a ApiSpecsBackupSection>,
 }

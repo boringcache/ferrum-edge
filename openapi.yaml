@@ -12171,8 +12171,9 @@ components:
       type: object
       description: |
         Versioned backup/restore section for raw API specification documents
-        and ownership metadata. Omitted entirely only on cached backups that
-        could not reach the primary; database-backed exports always include it
+        and ownership metadata. Omitted entirely on cached-fallback exports
+        (`X-Data-Source: cached`), which cannot prove spec ownership and so
+        restore as legacy backups; database-backed exports always include it
         (possibly with an empty `items` array).
       required: [section_version, items]
       properties:

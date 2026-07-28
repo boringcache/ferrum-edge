@@ -11630,7 +11630,7 @@ mod inner {
                         .start_transaction()
                         .and_run((self, proxies, upstreams, plugin_configs), |s, (this, proxies, upstreams, plugin_configs)| {
                             Box::pin(async move {
-                                for proxy in proxies {
+                                for proxy in proxies.iter() {
                                     if let Some(spec_id) = proxy.api_spec_id.as_deref() {
                                         this.proxies()
                                             .update_one(
@@ -11641,7 +11641,7 @@ mod inner {
                                             .await?;
                                     }
                                 }
-                                for upstream in upstreams {
+                                for upstream in upstreams.iter() {
                                     if let Some(spec_id) = upstream.api_spec_id.as_deref() {
                                         this.upstreams()
                                             .update_one(
@@ -11652,7 +11652,7 @@ mod inner {
                                             .await?;
                                     }
                                 }
-                                for plugin in plugin_configs {
+                                for plugin in plugin_configs.iter() {
                                     if let Some(spec_id) = plugin.api_spec_id.as_deref() {
                                         this.plugin_configs()
                                             .update_one(

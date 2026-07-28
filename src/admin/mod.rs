@@ -21,7 +21,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -6497,7 +6497,7 @@ async fn handle_backup(
     let resource_filter = parse_backup_resources(query);
 
     // Try database first, then cached config
-    let (config, source) = if let Some(ref db) = state.db {
+    let (mut config, source) = if let Some(ref db) = state.db {
         match db
             .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
             .await
@@ -6545,6 +6545,18 @@ async fn handle_backup(
         .as_ref()
         .is_none_or(|f| f.contains("api_specs"));
 
+    // Backups must stay self-consistent: restore refuses a payload whose
+    // resources carry an `api_spec_id` that the payload's `api_specs` section
+    // does not contain. Two exports cannot carry spec documents — a
+    // resource-filtered export that deliberately drops them, and a cached
+    // fallback whose runtime snapshot has already been stripped of ownership
+    // tags. Strip the tags in both cases so the exported resources restore as
+    // hand-managed instead of producing a file that only fails at restore time.
+    let export_carries_api_specs = include_api_specs && source == "database";
+    if !export_carries_api_specs {
+        crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
+    }
+
     // Backups must stay restorable. Exactly-one-field Consumer credential
     // entries stored before that contract was enforced can carry ignored extra
     // fields, and legacy single-object credential values are not the array
@@ -6588,19 +6600,19 @@ async fn handle_backup(
         empty_upstreams.as_slice()
     };
 
-    // Load raw API specs from the primary when possible. Filtered-out exports
-    // still emit an empty versioned section so restore treats them as
-    // intentional omissions rather than legacy backups. Cached fallback without
-    // a reachable primary omits the section entirely.
+    // Load raw API specs from the primary. Filtered-out exports still emit an
+    // empty versioned section so restore treats them as an intentional wipe
+    // rather than a legacy backup. A cached fallback cannot prove ownership
+    // (its resources were stripped above), so it omits the section entirely and
+    // restores through the legacy `confirm_api_spec_deletion` gate.
     let api_specs_owned: Option<ApiSpecsBackupSection> = if !include_api_specs {
         Some(ApiSpecsBackupSection::empty())
+    } else if source == "cached" {
+        warn!("Backup: cached fallback omits api_specs (ownership tags unavailable)");
+        None
     } else if let Some(ref db) = state.db {
         match db.list_api_specs_with_content(namespace).await {
             Ok(specs) => Some(ApiSpecsBackupSection::from_specs(&specs)),
-            Err(_error) if source == "cached" => {
-                warn_persistence_failure_redacted("backup_api_specs_load_cached_fallback");
-                None
-            }
             Err(_error) => {
                 warn_persistence_failure_redacted("backup_api_specs_load");
                 return Ok(json_response(
@@ -6936,7 +6948,7 @@ async fn handle_restore(
     // Validate or prepare the versioned api_specs section before any durable
     // mutation. Legacy backups that omit the section entirely require an
     // explicit confirmation when the target namespace currently holds specs.
-    let _restored_api_specs: Vec<ApiSpec> = match payload.api_specs.as_ref() {
+    match payload.api_specs.as_ref() {
         Some(section) => {
             match validate_restore_api_specs_section(
                 section,
@@ -6951,8 +6963,10 @@ async fn handle_restore(
                     }
                     // Persist the namespace-stamped section so insert uses the
                     // request namespace, not a hostile payload namespace.
+                    // `persist_payload_resources` decodes it again at write
+                    // time, so the validated copy is dropped here rather than
+                    // held alongside it for the rest of the restore.
                     payload.api_specs = Some(ApiSpecsBackupSection::from_specs(&specs));
-                    specs
                 }
                 Err(api_spec_errors) => {
                     return Ok(json_response(
@@ -6994,9 +7008,8 @@ async fn handle_restore(
             // Legacy backup: strip ownership tags so restored resources become
             // hand-managed rather than pointing at deleted specs.
             clear_api_spec_ownership_tags(&mut payload);
-            Vec::new()
         }
-    };
+    }
 
     // Complete all fallible payload preparation before changing durable state.
     let mut preparation_errors = Vec::new();
