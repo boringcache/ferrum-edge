@@ -6019,6 +6019,17 @@ async fn aggregate_batch_same_host_different_path_does_not_host_dispatch() {
             )
             .mount(&server)
             .await;
+        // Lazy upstream initialization completes with notifications/initialized;
+        // without this mock the catalog refresh fails closed with -32006 and the
+        // batch member would never reach the routing decision under test.
+        Mock::given(method("POST"))
+            .and(path(path_suffix))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path(path_suffix))
             .and(body_partial_json(json!({"method": "tools/call"})))
@@ -6074,7 +6085,7 @@ async fn aggregate_batch_same_host_different_path_does_not_host_dispatch() {
         responses[0]
     );
     assert!(ctx.route_override_backend_host.is_none());
-    assert!(ctx.metadata.get("mcp.server_id").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.server_id"));
 }
 
 #[tokio::test]
@@ -6127,7 +6138,7 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
         ctx.route_override_backend_host.is_none(),
         "batch completion must clear sibling routing overrides"
     );
-    assert!(ctx.metadata.get("mcp.server_id").is_none());
+    assert!(!ctx.metadata.contains_key("mcp.server_id"));
     assert!(
         ferrum_edge::_test_support::mcp_trusted_tool_name_rewrite_is_none_for_test(&ctx),
         "batch completion must clear private trusted tool-name rewrites"
