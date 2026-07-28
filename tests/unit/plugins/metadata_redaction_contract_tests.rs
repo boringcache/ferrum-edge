@@ -31,6 +31,8 @@ const API_CREDENTIAL_KEYS: &[&str] = &[
     "apikey",
     "APIKey",
     "APIToken",
+    "openaiToken",
+    "vendor_token",
 ];
 
 const NON_SECRET_COUNTERS: &[&str] = &[

@@ -70,37 +70,6 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
 /// request state; this prefix is the fail-closed observability contract.
 pub const INTERNAL_ONLY_METADATA_KEY_PREFIX: &str = "_dedup_";
 
-/// Key segments that make a singular `token` metadata key credential-shaped.
-const SENSITIVE_TOKEN_CONTEXT_SEGMENTS: &[&str] = &[
-    "access",
-    "api",
-    "auth",
-    "authorization",
-    "bearer",
-    "client",
-    "csrf",
-    "github",
-    "gitlab",
-    "id",
-    "identity",
-    "jwt",
-    "oauth",
-    "oidc",
-    "pat",
-    "personal",
-    "refresh",
-    "request",
-    "saml",
-    "security",
-    "session",
-    "slack",
-    "webhook",
-    "xsrf",
-];
-
-/// Generic descriptors that commonly wrap a raw token key.
-const TOKEN_VALUE_SEGMENTS: &[&str] = &["digest", "hash", "hashed", "raw", "sha256", "value"];
-
 /// Placeholder string written in place of sensitive metadata values.
 pub const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
 
@@ -221,45 +190,21 @@ fn visit_ascii_metadata_key_segments(key: &str, visit: &mut impl FnMut(&str)) {
     }
 }
 
-fn segment_is_any(segment: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| segment.eq_ignore_ascii_case(candidate))
-}
-
 fn is_sensitive_token_metadata_key(key: &str) -> bool {
-    let mut segment_count = 0usize;
     let mut has_token_segment = false;
-    let mut has_sensitive_context = false;
-    let mut all_non_token_segments_are_value_descriptors = true;
 
     for_each_metadata_key_segment(key, |segment| {
-        segment_count += 1;
         if segment.eq_ignore_ascii_case("token") {
             has_token_segment = true;
-            return;
-        }
-        if segment_is_any(segment, SENSITIVE_TOKEN_CONTEXT_SEGMENTS) {
-            has_sensitive_context = true;
-        }
-        if !segment_is_any(segment, TOKEN_VALUE_SEGMENTS) {
-            all_non_token_segments_are_value_descriptors = false;
         }
     });
 
-    if !has_token_segment {
-        return false;
-    }
-
-    if segment_count == 1 {
-        return true;
-    }
-
-    if has_sensitive_context {
-        return true;
-    }
-
-    all_non_token_segments_are_value_descriptors
+    // Singular `token` is credential-shaped regardless of its producer or
+    // provider prefix. An allowlist of known contexts fails open for custom
+    // plugins (`vendor_token`) and new providers (`openaiToken`). Usage
+    // counters conventionally use the distinct plural segment `tokens`, so
+    // `ai_total_tokens` and peers remain observable.
+    has_token_segment
 }
 
 /// `api` + `key` / concatenated `apikey` credential spellings.
@@ -852,11 +797,15 @@ mod tests {
     }
 
     #[test]
-    fn token_with_context_segment_is_sensitive() {
-        for ctx in SENSITIVE_TOKEN_CONTEXT_SEGMENTS {
-            let key = format!("{ctx}_token");
+    fn token_with_any_context_segment_is_sensitive() {
+        for key in [
+            "access_token",
+            "vendor_token",
+            "openaiToken",
+            "deployment.token",
+        ] {
             assert!(
-                is_sensitive_token_metadata_key(&key),
+                is_sensitive_token_metadata_key(key),
                 "{key} should be sensitive"
             );
         }
