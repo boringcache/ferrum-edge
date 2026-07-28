@@ -1,7 +1,8 @@
 //! Notification channel implementations.
 //!
 //! Each channel takes a generic [`Notification`] and projects it into its own
-//! payload shape. The [`NotificationChannel`] enum provides a uniform
+//! payload shape (or, for the email channel, an RFC 5322 message). The
+//! [`NotificationChannel`] enum provides a uniform
 //! `dispatch` surface so callers can hand a list of `Arc<NotificationChannel>`
 //! to [`crate::notifications::dispatch::dispatch`] without caring which
 //! transport each one uses.
@@ -19,6 +20,7 @@ use crate::util::unknown_keys::{near_miss_for_missing_key, reject_unknown_keys};
 use super::notification::Notification;
 
 pub mod discord;
+pub mod email;
 pub mod slack;
 pub mod teams;
 pub mod webhook;
@@ -57,6 +59,8 @@ const WEBHOOK_CHANNEL_KEYS: &[&str] = &[
 #[allow(unused_imports)]
 pub use discord::DiscordChannel;
 #[allow(unused_imports)]
+pub use email::{EMAIL_CHANNEL_KEYS, EMAIL_TEMPLATE_VARS, EmailChannel, TlsMode};
+#[allow(unused_imports)]
 pub use slack::SlackChannel;
 #[allow(unused_imports)]
 pub use teams::TeamsChannel;
@@ -69,6 +73,11 @@ pub enum NotificationChannel {
     Teams(TeamsChannel),
     Discord(DiscordChannel),
     Webhook(WebhookChannel),
+    /// Boxed: the SMTP channel carries substantially more state (TLS identity,
+    /// credentials, templates, timeouts, session semaphore) than the
+    /// webhook-shaped variants, and every channel is already handled behind an
+    /// `Arc`, so the indirection costs nothing on the dispatch path.
+    Email(Box<EmailChannel>),
 }
 
 #[allow(dead_code)] // Public dispatch surface for non-plugin callers + tests.
@@ -79,6 +88,7 @@ impl NotificationChannel {
             Self::Teams(c) => c.name(),
             Self::Discord(c) => c.name(),
             Self::Webhook(c) => c.name(),
+            Self::Email(c) => c.name(),
         }
     }
 
@@ -88,6 +98,7 @@ impl NotificationChannel {
             Self::Teams(_) => "teams",
             Self::Discord(_) => "discord",
             Self::Webhook(_) => "webhook",
+            Self::Email(_) => "email",
         }
     }
 
@@ -97,6 +108,9 @@ impl NotificationChannel {
             Self::Teams(c) => hostname_from_url(c.webhook_url()),
             Self::Discord(c) => hostname_from_url(c.webhook_url()),
             Self::Webhook(c) => hostname_from_url(c.url()),
+            // The SMTP endpoint is a bare host, not a credential-bearing URL,
+            // so warmup exposes the hostname without any redaction concern.
+            Self::Email(c) => c.warmup_hostnames(),
         }
     }
 
@@ -112,8 +126,9 @@ impl NotificationChannel {
         self.dispatch_with_vars(notification, &extras, http).await
     }
 
-    /// Dispatch with an extra template-variable map. Variables are only
-    /// consumed by the [`WebhookChannel`] (other channels ignore them).
+    /// Dispatch with an extra template-variable map. Variables are consumed by
+    /// the operator-templated channels ([`WebhookChannel`], [`EmailChannel`]);
+    /// the fixed-payload channels (Slack/Teams/Discord) ignore them.
     pub async fn dispatch_with_vars(
         &self,
         notification: &Notification,
@@ -125,6 +140,7 @@ impl NotificationChannel {
             Self::Teams(c) => c.dispatch(notification, http).await,
             Self::Discord(c) => c.dispatch(notification, http).await,
             Self::Webhook(c) => c.dispatch_with_vars(notification, extras, http).await,
+            Self::Email(c) => c.dispatch_with_vars(notification, extras, http).await,
         }
     }
 }
@@ -206,8 +222,14 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
                 name, def,
             )?))
         }
+        "email" => {
+            reject_unknown_keys(obj, &path, EMAIL_CHANNEL_KEYS, "")?;
+            Ok(NotificationChannel::Email(Box::new(EmailChannel::new(
+                name, def,
+            )?)))
+        }
         other => Err(format!(
-            "channel '{name}': unknown 'type' '{other}' (expected one of: slack, teams, discord, webhook)"
+            "channel '{name}': unknown 'type' '{other}' (expected one of: slack, teams, discord, webhook, email)"
         )),
     }
 }

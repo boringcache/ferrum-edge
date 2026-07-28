@@ -1,0 +1,1297 @@
+//! Tests for the native SMTP/email notification channel (`type: email`).
+//!
+//! Covers construction/admission (closed key set, TLS posture, addresses,
+//! bounds), message construction (templating, header-injection defense,
+//! truncation, encoding), and live delivery against a scripted local SMTP
+//! fixture over both STARTTLS and implicit TLS.
+//!
+//! Every credential used here is a fixture-local literal; the redaction
+//! assertions check that it never escapes into an error string.
+
+use std::collections::HashMap;
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine as _;
+use chrono::{TimeZone, Utc};
+use ferrum_edge::notifications::channels::{EmailChannel, NotificationChannel, parse_channels};
+use ferrum_edge::notifications::{EventAction, Notification, NotificationField, Severity};
+use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+use serde_json::{Value, json};
+use tempfile::NamedTempFile;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
+
+const SMTP_USERNAME: &str = "alerts@example.com";
+/// Fixture-local literal, never a real secret. Used to prove that credentials
+/// do not leak into dispatch errors.
+const SMTP_PASSWORD: &str = "fixture-only-smtp-secret";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+fn notification(event_action: EventAction) -> Notification {
+    Notification {
+        title: "[ALERT] proxy_5xx on api-gateway".to_string(),
+        body: "5/100 requests matched [503] over 60s".to_string(),
+        severity: Severity::High,
+        event_action,
+        source: Some("proxy_alerts:proxy_5xx".into()),
+        subject_id: Some("api-gateway".into()),
+        namespace: Some("ferrum".into()),
+        fired_at: Utc.with_ymd_and_hms(2026, 5, 14, 10, 0, 0).unwrap(),
+        fields: vec![
+            NotificationField::new("Rule", "proxy_5xx"),
+            NotificationField::new("Observed", "5.00%"),
+        ],
+    }
+}
+
+fn parse_one(def: Value) -> NotificationChannel {
+    let map = parse_channels(&json!({ "ops_email": def })).expect("channel parses");
+    (*map.get("ops_email").expect("channel present").clone()).clone()
+}
+
+fn parse_email(def: Value) -> EmailChannel {
+    match parse_one(def) {
+        NotificationChannel::Email(channel) => *channel,
+        other => panic!("expected an email channel, got {}", other.kind()),
+    }
+}
+
+fn parse_error(def: Value) -> String {
+    parse_channels(&json!({ "ops_email": def })).expect_err("channel must be rejected")
+}
+
+fn minimal_def(port: u16) -> Value {
+    json!({
+        "type": "email",
+        "smtp_host": "127.0.0.1",
+        "smtp_port": port,
+        "tls_server_name": "localhost",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "connect_timeout_ms": 5000,
+        "command_timeout_ms": 5000
+    })
+}
+
+fn no_extras() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+/// `PluginHttpClient` that trusts `ca_path` and nothing else — the email
+/// channel always verifies, so the fixture CA has to be reachable this way.
+fn client_with_ca(ca_path: &str) -> PluginHttpClient {
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::config::PoolConfig;
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    PluginHttpClient::new(
+        &PoolConfig::default(),
+        DnsCache::new(DnsConfig::default()),
+        1000,
+        0,
+        100,
+        false,
+        Some(ca_path),
+        Arc::new(Vec::new()),
+        DEFAULT_NAMESPACE,
+        BackendEgressPolicy::unrestricted(),
+        Arc::new(Vec::new()),
+        0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Construction / admission
+// ---------------------------------------------------------------------------
+
+#[test]
+fn email_channel_parses_through_the_common_channel_map_with_defaults() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com", "sre@example.com"]
+    }));
+
+    assert_eq!(channel.name(), "ops_email");
+    assert_eq!(channel.smtp_host(), "smtp.example.com");
+    assert_eq!(channel.smtp_port(), 587, "starttls default port");
+    assert_eq!(channel.tls_mode().as_str(), "starttls");
+    assert_eq!(channel.tls_server_name(), "smtp.example.com");
+    assert_eq!(channel.from(), "ferrum@example.com");
+    assert_eq!(channel.recipients().len(), 2);
+    assert_eq!(channel.helo_name(), "example.com", "defaults to from-domain");
+    assert!(!channel.has_credentials());
+    assert_eq!(channel.subject_template(), "[${severity}] ${title}");
+    assert_eq!(channel.body_template(), "${body}\n\n${fields}");
+}
+
+#[test]
+fn email_channel_kind_and_warmup_hostnames_are_wired_into_the_enum() {
+    let dns_channel = parse_one(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert_eq!(dns_channel.kind(), "email");
+    assert_eq!(dns_channel.name(), "ops_email");
+    assert_eq!(
+        dns_channel.warmup_hostnames(),
+        vec!["smtp.example.com".to_string()]
+    );
+
+    let ip_channel = parse_one(json!({
+        "type": "email",
+        "smtp_host": "10.1.2.3",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(
+        ip_channel.warmup_hostnames().is_empty(),
+        "IP literals have nothing to pre-resolve"
+    );
+}
+
+#[test]
+fn implicit_tls_defaults_to_port_465() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "tls_mode": "implicit_tls",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert_eq!(channel.smtp_port(), 465);
+    assert_eq!(channel.tls_mode().as_str(), "implicit_tls");
+}
+
+#[test]
+fn email_channel_rejects_unknown_keys() {
+    let error = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "smtp_hostt": "typo.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(
+        error.contains("smtp_hostt"),
+        "unknown key must be named: {error}"
+    );
+}
+
+#[test]
+fn email_channel_rejects_channel_type_fields_from_other_variants() {
+    let error = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "webhook_url": "https://hooks.slack.com/services/T/B/X",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(error.contains("webhook_url"), "{error}");
+}
+
+#[test]
+fn plaintext_smtp_is_refused_at_admission() {
+    for mode in ["none", "plaintext", "disabled", "insecure"] {
+        let error = parse_error(json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "tls_mode": mode,
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }));
+        assert!(
+            error.contains("plaintext SMTP is not supported"),
+            "mode={mode} error={error}"
+        );
+    }
+
+    let error = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "tls_mode": "ssl",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(error.contains("unknown 'tls_mode'"), "{error}");
+}
+
+#[test]
+fn half_configured_credentials_are_refused() {
+    let missing_password = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "username": SMTP_USERNAME,
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(
+        missing_password.contains("without a password"),
+        "{missing_password}"
+    );
+
+    let missing_username = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "password": SMTP_PASSWORD,
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(
+        missing_username.contains("without 'username'"),
+        "{missing_username}"
+    );
+    assert!(
+        !missing_username.contains(SMTP_PASSWORD),
+        "admission errors must not echo the password"
+    );
+}
+
+#[test]
+fn credentials_resolve_through_the_env_convention() {
+    // SAFETY: single-threaded test-local env mutation, immediately consumed.
+    unsafe {
+        std::env::set_var("FERRUM_TEST_SMTP_USERNAME_3329", SMTP_USERNAME);
+        std::env::set_var("FERRUM_TEST_SMTP_PASSWORD_3329", SMTP_PASSWORD);
+    }
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
+        "password_env": "FERRUM_TEST_SMTP_PASSWORD_3329",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(channel.has_credentials());
+
+    let debug = format!("{channel:?}");
+    assert!(
+        !debug.contains(SMTP_PASSWORD) && !debug.contains(SMTP_USERNAME),
+        "Debug output must not carry credentials: {debug}"
+    );
+    assert!(debug.contains("authenticated: true"), "{debug}");
+
+    let missing = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
+        "password_env": "FERRUM_TEST_SMTP_ABSENT_3329",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    assert!(missing.contains("is not set"), "{missing}");
+
+    unsafe {
+        std::env::remove_var("FERRUM_TEST_SMTP_USERNAME_3329");
+        std::env::remove_var("FERRUM_TEST_SMTP_PASSWORD_3329");
+    }
+}
+
+#[test]
+fn invalid_addresses_are_refused() {
+    let long_local = format!("{}@example.com", "a".repeat(65));
+    let long_address = format!("{}@example.com", "a".repeat(250));
+    for address in [
+        "not-an-address",
+        "two@at@example.com",
+        "@example.com",
+        "user@",
+        "user@.example.com",
+        "user@example..com",
+        "user@-example.com",
+        ".user@example.com",
+        "user.@example.com",
+        "us..er@example.com",
+        "user name@example.com",
+        "user@example.com\r\nRCPT TO:<evil@example.com>",
+        "üser@example.com",
+        "user<@example.com",
+        long_local.as_str(),
+        long_address.as_str(),
+    ] {
+        let error = parse_error(json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "from": "ferrum@example.com",
+            "to": [address]
+        }));
+        assert!(
+            error.contains("invalid 'to' address"),
+            "address={address} error={error}"
+        );
+
+        let from_error = parse_error(json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "from": address,
+            "to": ["oncall@example.com"]
+        }));
+        assert!(
+            from_error.contains("invalid 'from' address"),
+            "address={address} error={from_error}"
+        );
+    }
+}
+
+#[test]
+fn recipient_bounds_are_explicit() {
+    let empty = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": []
+    }));
+    assert!(empty.contains("at least one recipient"), "{empty}");
+
+    let too_many: Vec<String> = (0..33).map(|i| format!("oncall{i}@example.com")).collect();
+    let overflow = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": too_many
+    }));
+    assert!(overflow.contains("at most 32 recipients"), "{overflow}");
+
+    let duplicates = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com", "oncall@example.com", "sre@example.com"]
+    }));
+    assert_eq!(duplicates.recipients().len(), 2, "duplicates collapse");
+}
+
+#[test]
+fn host_port_timeout_and_template_bounds_are_explicit() {
+    for (def, needle) in [
+        (
+            json!({"smtp_host": "https://smtp.example.com"}),
+            "without scheme",
+        ),
+        (json!({"smtp_host": "smtp.example.com:587"}), "must not include brackets or a port"),
+        (json!({"smtp_port": 0}), "between 1 and 65535"),
+        (json!({"smtp_port": 70000}), "between 1 and 65535"),
+        (json!({"connect_timeout_ms": 10}), "must be between 100 and 60000 ms"),
+        (json!({"connect_timeout_ms": 60001}), "must be between 100 and 60000 ms"),
+        (json!({"command_timeout_ms": 0}), "must be between 100 and 120000 ms"),
+        (json!({"command_timeout_ms": 120001}), "must be between 100 and 120000 ms"),
+        (json!({"subject_template": "${unbalanced"}), "unbalanced"),
+        (json!({"body_template": "${unbalanced"}), "unbalanced"),
+        (json!({"subject_template": ""}), "must not be empty"),
+        (json!({"helo_name": "not a hostname"}), "invalid 'helo_name'"),
+        (json!({"tls_server_name": ""}), "'tls_server_name' must not be empty"),
+        (json!({"tls_server_name": "not a name"}), "invalid TLS server name"),
+    ] {
+        let mut base = json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        });
+        for (key, value) in def.as_object().expect("override object") {
+            base[key] = value.clone();
+        }
+        let error = parse_error(base);
+        assert!(error.contains(needle), "needle={needle} error={error}");
+    }
+
+    let long_subject_template = format!("${{title}}{}", "x".repeat(2000));
+    let subject_error = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": long_subject_template
+    }));
+    assert!(
+        subject_error.contains("at most 1024 bytes"),
+        "{subject_error}"
+    );
+
+    let long_body_template = "y".repeat(70_000);
+    let body_error = parse_error(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "body_template": long_body_template
+    }));
+    assert!(body_error.contains("at most 65536 bytes"), "{body_error}");
+}
+
+// ---------------------------------------------------------------------------
+// Message construction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn templates_reuse_notification_variables_and_caller_extras() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "[${severity}] ${rule_name} on ${subject_id}",
+        "body_template": "${body}\nns=${namespace} action=${event_action}\n${fields}"
+    }));
+    let mut extras = HashMap::new();
+    extras.insert("rule_name".to_string(), "proxy_5xx".to_string());
+    // A caller must not be able to shadow a generic notification variable.
+    extras.insert("severity".to_string(), "info".to_string());
+
+    let subject = channel
+        .render_subject(&notification(EventAction::Trigger), &extras)
+        .expect("subject renders");
+    assert_eq!(subject, "[high] proxy_5xx on api-gateway");
+
+    let body = channel
+        .render_body(&notification(EventAction::Trigger), &extras)
+        .expect("body renders");
+    assert!(body.contains("5/100 requests matched [503] over 60s"), "{body}");
+    assert!(body.contains("ns=ferrum action=trigger"), "{body}");
+    assert!(body.contains("Rule: proxy_5xx"), "{body}");
+    assert!(body.contains("Observed: 5.00%"), "{body}");
+}
+
+#[test]
+fn header_injection_through_template_values_is_neutralized() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"]
+    }));
+    let mut hostile = notification(EventAction::Trigger);
+    hostile.title = "pwn\r\nBcc: attacker@evil.test\r\n\r\ninjected".to_string();
+    hostile.body = "line one\r\n.\r\nnot-the-end".to_string();
+
+    let subject = channel
+        .render_subject(&hostile, &no_extras())
+        .expect("subject renders");
+    assert!(
+        !subject.contains('\r') && !subject.contains('\n'),
+        "control characters must not survive into a header: {subject}"
+    );
+
+    let message = channel
+        .build_message(&hostile, &no_extras())
+        .expect("message builds");
+    let rendered = String::from_utf8(message).expect("message is utf-8");
+    let header_block = rendered.split("\r\n\r\n").next().expect("headers present");
+    assert!(
+        !header_block.to_ascii_lowercase().contains("bcc:"),
+        "injected header survived: {header_block}"
+    );
+    // The base64 transfer encoding means the body can never contain the
+    // data-phase terminator.
+    assert!(
+        !rendered.contains("\r\n.\r\n"),
+        "body must not embed the DATA terminator"
+    );
+}
+
+#[test]
+fn message_carries_the_expected_headers_and_a_decodable_body() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com", "sre@example.com"]
+    }));
+
+    for (action, expected) in [
+        (EventAction::Trigger, "trigger"),
+        (EventAction::Resolve, "resolve"),
+    ] {
+        let note = notification(action);
+        let message = channel
+            .build_message(&note, &no_extras())
+            .expect("message builds");
+        let rendered = String::from_utf8(message).expect("message is utf-8");
+        let (headers, body) = rendered
+            .split_once("\r\n\r\n")
+            .expect("header/body separator");
+
+        assert!(headers.contains("From: <ferrum@example.com>"), "{headers}");
+        assert!(
+            headers.contains("To: <oncall@example.com>, <sre@example.com>"),
+            "{headers}"
+        );
+        assert!(headers.contains("MIME-Version: 1.0"), "{headers}");
+        assert!(
+            headers.contains("Content-Transfer-Encoding: base64"),
+            "{headers}"
+        );
+        assert!(headers.contains("Auto-Submitted: auto-generated"), "{headers}");
+        assert!(
+            headers.contains("X-Ferrum-Notification-Severity: high"),
+            "{headers}"
+        );
+        assert!(
+            headers.contains(&format!("X-Ferrum-Notification-Event-Action: {expected}")),
+            "{headers}"
+        );
+        assert!(headers.contains("Subject: [high] [ALERT] proxy_5xx"), "{headers}");
+        assert!(
+            !rendered.contains('\n') || rendered.matches('\n').count() == rendered.matches("\r\n").count(),
+            "every LF must be part of a CRLF pair"
+        );
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body.replace("\r\n", ""))
+            .expect("body is base64");
+        let decoded = String::from_utf8(decoded).expect("decoded body is utf-8");
+        assert!(
+            decoded.contains("5/100 requests matched [503] over 60s"),
+            "{decoded}"
+        );
+        assert!(decoded.contains("Rule: proxy_5xx"), "{decoded}");
+    }
+}
+
+#[test]
+fn non_ascii_subjects_are_rfc2047_encoded() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "${title}"
+    }));
+    let mut note = notification(EventAction::Trigger);
+    note.title = "üpstream ausgefallen — 503".to_string();
+
+    let message = channel
+        .build_message(&note, &no_extras())
+        .expect("message builds");
+    let rendered = String::from_utf8(message).expect("message is utf-8");
+    assert!(rendered.contains("Subject: =?UTF-8?B?"), "{rendered}");
+    for line in rendered.split("\r\n") {
+        assert!(
+            line.len() <= 998,
+            "header/body lines must stay within the RFC 5322 limit: {line}"
+        );
+    }
+}
+
+#[test]
+fn oversized_rendered_output_is_truncated_with_a_visible_marker() {
+    let channel = parse_email(json!({
+        "type": "email",
+        "smtp_host": "smtp.example.com",
+        "from": "ferrum@example.com",
+        "to": ["oncall@example.com"],
+        "subject_template": "${title}",
+        "body_template": "${body}"
+    }));
+    let mut note = notification(EventAction::Trigger);
+    note.title = "s".repeat(4000);
+    note.body = "b".repeat(200_000);
+
+    let subject = channel
+        .render_subject(&note, &no_extras())
+        .expect("subject renders");
+    assert_eq!(subject.len(), 512, "subject is capped at 512 bytes");
+    assert!(subject.ends_with("..."), "{subject}");
+
+    let body = channel
+        .render_body(&note, &no_extras())
+        .expect("body renders");
+    assert!(body.len() <= 32 * 1024, "body is capped at 32 KiB");
+    assert!(body.ends_with("[truncated]"), "truncation must be visible");
+}
+
+// ---------------------------------------------------------------------------
+// Live SMTP fixture
+// ---------------------------------------------------------------------------
+
+/// Scripted replies for the fixture relay. Each field is written verbatim
+/// (CRLF appended per line), so a test can inject multiline, malformed, or
+/// oversized replies.
+#[derive(Clone)]
+struct SmtpScript {
+    greeting: Vec<String>,
+    ehlo_plain: Vec<String>,
+    ehlo_tls: Vec<String>,
+    starttls: Vec<String>,
+    auth: Vec<String>,
+    mail_from: Vec<String>,
+    rcpt_to: Vec<String>,
+    data: Vec<String>,
+    data_end: Vec<String>,
+}
+
+impl SmtpScript {
+    fn starttls_default() -> Self {
+        Self {
+            greeting: vec!["220 fixture ESMTP ready".to_string()],
+            ehlo_plain: vec![
+                "250-fixture".to_string(),
+                "250-STARTTLS".to_string(),
+                "250 8BITMIME".to_string(),
+            ],
+            ehlo_tls: vec![
+                "250-fixture".to_string(),
+                "250-SIZE 10485760".to_string(),
+                "250 AUTH PLAIN LOGIN".to_string(),
+            ],
+            starttls: vec!["220 ready to start TLS".to_string()],
+            auth: vec!["235 2.7.0 authentication succeeded".to_string()],
+            mail_from: vec!["250 2.1.0 sender ok".to_string()],
+            rcpt_to: vec!["250 2.1.5 recipient ok".to_string()],
+            data: vec!["354 end data with <CRLF>.<CRLF>".to_string()],
+            data_end: vec!["250 2.0.0 queued as ABC123".to_string()],
+        }
+    }
+
+    fn implicit_default() -> Self {
+        let mut script = Self::starttls_default();
+        script.ehlo_plain = script.ehlo_tls.clone();
+        script
+    }
+}
+
+/// One line the fixture received, tagged with whether TLS was already active.
+type Transcript = Arc<Mutex<Vec<(bool, String)>>>;
+
+struct SmtpFixture {
+    addr: SocketAddr,
+    ca_path: NamedTempFile,
+    transcript: Transcript,
+    body: Arc<Mutex<String>>,
+    handle: JoinHandle<()>,
+}
+
+impl SmtpFixture {
+    fn received(&self) -> Vec<(bool, String)> {
+        self.transcript.lock().expect("transcript lock").clone()
+    }
+
+    fn cleartext_commands(&self) -> Vec<String> {
+        self.received()
+            .into_iter()
+            .filter(|(tls, _)| !tls)
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    fn saw(&self, prefix: &str) -> bool {
+        self.received()
+            .iter()
+            .any(|(_, line)| line.to_ascii_uppercase().starts_with(prefix))
+    }
+
+    fn ca_path(&self) -> &str {
+        self.ca_path.path().to_str().expect("ca path is utf-8")
+    }
+
+    fn channel_def(&self, extra: Value) -> Value {
+        let mut def = minimal_def(self.addr.port());
+        for (key, value) in extra.as_object().expect("override object") {
+            def[key] = value.clone();
+        }
+        def
+    }
+}
+
+/// Generate a CA plus a leaf certificate for `san`, returning the CA bundle
+/// file and a ready `TlsAcceptor`.
+fn tls_materials(san: &str) -> (NamedTempFile, TlsAcceptor) {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+
+    let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("ca key");
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed ca");
+    let issuer = Issuer::new(ca_params, ca_key);
+
+    let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
+    let leaf_params = CertificateParams::new(vec![san.to_string()]).expect("leaf params");
+    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).expect("signed leaf");
+
+    let mut ca_file = NamedTempFile::new().expect("ca bundle file");
+    ca_file
+        .write_all(ca_cert.pem().as_bytes())
+        .expect("write ca bundle");
+    ca_file.flush().expect("flush ca bundle");
+
+    let certs = rustls_pemfile::certs(&mut leaf_cert.pem().as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse leaf certificate");
+    let key = rustls_pemfile::private_key(&mut leaf_key.serialize_pem().as_bytes())
+        .expect("parse leaf key")
+        .expect("leaf key present");
+    let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("server protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .expect("server config");
+
+    (ca_file, TlsAcceptor::from(Arc::new(server_config)))
+}
+
+async fn write_lines<S>(stream: &mut S, lines: &[String])
+where
+    S: AsyncWrite + Unpin,
+{
+    let mut payload = String::new();
+    for line in lines {
+        payload.push_str(line);
+        payload.push_str("\r\n");
+    }
+    let _ = stream.write_all(payload.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+/// Serve one SMTP phase. Returns the unwrapped transport when the client asked
+/// for STARTTLS and the script accepted it.
+async fn serve_phase<S>(
+    stream: S,
+    script: Arc<SmtpScript>,
+    transcript: Transcript,
+    body: Arc<Mutex<String>>,
+    tls_active: bool,
+    send_greeting: bool,
+) -> Option<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut reader = BufReader::new(stream);
+    if send_greeting {
+        write_lines(&mut reader, &script.greeting).await;
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        let received = line.trim_end_matches(['\r', '\n']).to_string();
+        let upper = received.to_ascii_uppercase();
+        // Record the command, but never the SASL payload — the transcript is
+        // read back by assertions and printed on failure.
+        let logged = if upper.starts_with("AUTH PLAIN") {
+            "AUTH PLAIN <redacted>".to_string()
+        } else {
+            received.clone()
+        };
+        transcript
+            .lock()
+            .expect("transcript lock")
+            .push((tls_active, logged));
+
+        if upper.starts_with("EHLO") {
+            let lines = if tls_active {
+                &script.ehlo_tls
+            } else {
+                &script.ehlo_plain
+            };
+            write_lines(&mut reader, lines).await;
+        } else if upper == "STARTTLS" {
+            write_lines(&mut reader, &script.starttls).await;
+            if script
+                .starttls
+                .last()
+                .is_some_and(|line| line.starts_with("220"))
+            {
+                return Some(reader.into_inner());
+            }
+        } else if upper == "AUTH LOGIN" {
+            write_lines(&mut reader, &["334 VXNlcm5hbWU6".to_string()]).await;
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return None;
+            }
+            transcript
+                .lock()
+                .expect("transcript lock")
+                .push((tls_active, "<auth-login-username>".to_string()));
+            write_lines(&mut reader, &["334 UGFzc3dvcmQ6".to_string()]).await;
+            line.clear();
+            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return None;
+            }
+            transcript
+                .lock()
+                .expect("transcript lock")
+                .push((tls_active, "<auth-login-password>".to_string()));
+            write_lines(&mut reader, &script.auth).await;
+        } else if upper.starts_with("AUTH") {
+            write_lines(&mut reader, &script.auth).await;
+        } else if upper.starts_with("MAIL FROM") {
+            write_lines(&mut reader, &script.mail_from).await;
+        } else if upper.starts_with("RCPT TO") {
+            write_lines(&mut reader, &script.rcpt_to).await;
+        } else if upper == "DATA" {
+            write_lines(&mut reader, &script.data).await;
+            if script.data.last().is_some_and(|l| l.starts_with("354")) {
+                let mut collected = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => return None,
+                        Ok(_) => {}
+                    }
+                    if line.trim_end_matches(['\r', '\n']) == "." {
+                        break;
+                    }
+                    collected.push_str(&line);
+                }
+                *body.lock().expect("body lock") = collected;
+                write_lines(&mut reader, &script.data_end).await;
+            }
+        } else if upper == "QUIT" {
+            write_lines(&mut reader, &["221 2.0.0 bye".to_string()]).await;
+            return None;
+        } else {
+            write_lines(&mut reader, &["500 5.5.2 unrecognized".to_string()]).await;
+        }
+    }
+}
+
+/// Spawn a one-shot scripted SMTP relay.
+///
+/// `implicit` selects SMTPS (handshake before the greeting); otherwise the
+/// relay starts in cleartext and upgrades on STARTTLS.
+async fn spawn_smtp_fixture(script: SmtpScript, implicit: bool, san: &str) -> SmtpFixture {
+    let (ca_path, acceptor) = tls_materials(san);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fixture");
+    let addr = listener.local_addr().expect("fixture addr");
+    let transcript: Transcript = Arc::new(Mutex::new(Vec::new()));
+    let body = Arc::new(Mutex::new(String::new()));
+
+    let script = Arc::new(script);
+    let task_transcript = Arc::clone(&transcript);
+    let task_body = Arc::clone(&body);
+    let handle = tokio::spawn(async move {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        if implicit {
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let _ = serve_phase(tls, script, task_transcript, task_body, true, true).await;
+            return;
+        }
+        let Some(upgraded) = serve_phase(
+            tcp,
+            Arc::clone(&script),
+            Arc::clone(&task_transcript),
+            Arc::clone(&task_body),
+            false,
+            true,
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(tls) = acceptor.accept(upgraded).await else {
+            return;
+        };
+        let _ = serve_phase(tls, script, task_transcript, task_body, true, false).await;
+    });
+
+    SmtpFixture {
+        addr,
+        ca_path,
+        transcript,
+        body,
+        handle,
+    }
+}
+
+#[tokio::test]
+async fn starttls_delivery_authenticates_only_inside_tls() {
+    let fixture = spawn_smtp_fixture(SmtpScript::starttls_default(), false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+
+    channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect("STARTTLS delivery succeeds");
+
+    let cleartext = fixture.cleartext_commands();
+    assert!(
+        cleartext
+            .iter()
+            .all(|line| line.to_ascii_uppercase().starts_with("EHLO")
+                || line.eq_ignore_ascii_case("STARTTLS")),
+        "only EHLO/STARTTLS may precede TLS: {cleartext:?}"
+    );
+    assert!(fixture.saw("AUTH"), "AUTH must be attempted");
+    assert!(fixture.saw("MAIL FROM"), "envelope must be sent");
+    assert!(fixture.saw("RCPT TO"));
+    assert!(fixture.saw("DATA"));
+
+    // A second EHLO is mandatory after the upgrade (RFC 3207 §4.2).
+    let ehlo_after_tls = fixture
+        .received()
+        .iter()
+        .filter(|(tls, line)| *tls && line.to_ascii_uppercase().starts_with("EHLO"))
+        .count();
+    assert_eq!(ehlo_after_tls, 1, "must re-EHLO inside TLS");
+
+    let body = fixture.body.lock().expect("body lock").clone();
+    assert!(body.contains("Subject: [high]"), "{body}");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn implicit_tls_delivery_succeeds_with_auth_login() {
+    let mut script = SmtpScript::implicit_default();
+    script.ehlo_plain = vec!["250-fixture".to_string(), "250 AUTH LOGIN".to_string()];
+    script.ehlo_tls = script.ehlo_plain.clone();
+    let fixture = spawn_smtp_fixture(script, true, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "tls_mode": "implicit_tls",
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+
+    channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect("implicit TLS delivery succeeds");
+
+    assert!(
+        fixture.cleartext_commands().is_empty(),
+        "SMTPS carries nothing in the clear"
+    );
+    assert!(fixture.saw("AUTH LOGIN"));
+    assert!(fixture.saw("DATA"));
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn trigger_and_resolve_both_dispatch_through_the_channel_enum() {
+    for action in [EventAction::Trigger, EventAction::Resolve] {
+        let fixture = spawn_smtp_fixture(SmtpScript::starttls_default(), false, "localhost").await;
+        let channel =
+            NotificationChannel::Email(Box::new(parse_email(fixture.channel_def(json!({})))));
+        let mut extras = HashMap::new();
+        extras.insert("rule_name".to_string(), "proxy_5xx".to_string());
+
+        channel
+            .dispatch_with_vars(
+                &notification(action),
+                &extras,
+                &client_with_ca(fixture.ca_path()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{action:?} dispatch failed: {e}"));
+
+        let body = fixture.body.lock().expect("body lock").clone();
+        assert!(
+            body.contains(&format!(
+                "X-Ferrum-Notification-Event-Action: {}",
+                match action {
+                    EventAction::Trigger => "trigger",
+                    EventAction::Resolve => "resolve",
+                    EventAction::Info => "info",
+                }
+            )),
+            "{body}"
+        );
+        assert!(!fixture.saw("AUTH"), "no credentials configured");
+        fixture.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn missing_starttls_advertisement_fails_closed() {
+    let mut script = SmtpScript::starttls_default();
+    script.ehlo_plain = vec!["250-fixture".to_string(), "250 AUTH PLAIN".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("must refuse to continue in cleartext");
+
+    assert!(error.contains("did not advertise STARTTLS"), "{error}");
+    assert!(!fixture.saw("AUTH"), "credentials must not leave the process");
+    assert!(!fixture.saw("MAIL FROM"), "no cleartext envelope");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn tls_handshake_failure_is_reported_without_downgrading() {
+    // Leaf certificate is issued for a name the channel does not expect.
+    let fixture = spawn_smtp_fixture(SmtpScript::starttls_default(), false, "other.test").await;
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("verification must fail");
+
+    assert!(error.contains("TLS handshake failed"), "{error}");
+    assert!(!fixture.saw("AUTH"));
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn untrusted_certificate_is_rejected_even_though_the_host_answers() {
+    // A CA bundle that does not contain the fixture's issuer.
+    let (unrelated_ca, _acceptor) = tls_materials("localhost");
+    let fixture = spawn_smtp_fixture(SmtpScript::starttls_default(), false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+
+    let error = channel
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(unrelated_ca.path().to_str().expect("ca path")),
+        )
+        .await
+        .expect_err("unknown issuer must fail");
+    assert!(error.contains("TLS handshake failed"), "{error}");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn authentication_failure_is_sanitized() {
+    let mut script = SmtpScript::starttls_default();
+    script.auth = vec!["535 5.7.8 authentication credentials invalid".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("auth failure must surface");
+
+    assert!(error.contains("535"), "{error}");
+    assert!(error.contains("authentication"), "{error}");
+    assert!(error.contains("reply text withheld"), "{error}");
+    assert!(!error.contains(SMTP_PASSWORD), "password leaked: {error}");
+    assert!(!error.contains(SMTP_USERNAME), "username leaked: {error}");
+    assert!(
+        !error.contains("credentials invalid"),
+        "server text leaked: {error}"
+    );
+    assert!(!fixture.saw("MAIL FROM"), "envelope must not follow a failed AUTH");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn missing_auth_mechanism_fails_closed_when_credentials_are_configured() {
+    let mut script = SmtpScript::starttls_default();
+    script.ehlo_tls = vec!["250-fixture".to_string(), "250 SIZE 1000".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("no mechanism must fail");
+
+    assert!(error.contains("no supported AUTH mechanism"), "{error}");
+    assert!(!fixture.saw("MAIL FROM"));
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn rejected_recipient_and_rejected_message_are_reported_by_code_only() {
+    let mut script = SmtpScript::starttls_default();
+    script.rcpt_to = vec!["550 5.1.1 no such user <oncall@example.com>".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("rejected recipient must fail the send");
+    assert!(error.contains("550"), "{error}");
+    assert!(error.contains("RCPT TO"), "{error}");
+    assert!(!error.contains("no such user"), "server text leaked: {error}");
+    fixture.handle.abort();
+
+    let mut script = SmtpScript::starttls_default();
+    script.data_end = vec!["554 5.3.0 message content rejected".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("rejected message must fail the send");
+    assert!(error.contains("554"), "{error}");
+    assert!(!error.contains("content rejected"), "{error}");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn oversized_and_malformed_replies_fail_closed() {
+    // Oversized single reply line.
+    let mut script = SmtpScript::starttls_default();
+    script.greeting = vec![format!("220 {}", "A".repeat(4096))];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("oversized reply must fail");
+    assert!(error.contains("response bounds"), "{error}");
+    fixture.handle.abort();
+
+    // Too many continuation lines.
+    let mut script = SmtpScript::starttls_default();
+    let mut flood: Vec<String> = (0..80).map(|i| format!("250-EXT{i}")).collect();
+    flood.push("250 STARTTLS".to_string());
+    script.ehlo_plain = flood;
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("reply-line flood must fail");
+    assert!(error.contains("response bounds"), "{error}");
+    fixture.handle.abort();
+
+    // Non-numeric reply code.
+    let mut script = SmtpScript::starttls_default();
+    script.greeting = vec!["OK fixture ready".to_string()];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("malformed reply must fail");
+    assert!(error.contains("malformed SMTP reply"), "{error}");
+    fixture.handle.abort();
+
+    // Continuation lines that change the reply code mid-reply.
+    let mut script = SmtpScript::starttls_default();
+    script.ehlo_plain = vec![
+        "250-fixture".to_string(),
+        "500-STARTTLS".to_string(),
+        "250 8BITMIME".to_string(),
+    ];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("inconsistent codes must fail");
+    assert!(error.contains("malformed SMTP reply"), "{error}");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn multiline_greeting_and_ehlo_are_accepted() {
+    let mut script = SmtpScript::starttls_default();
+    script.greeting = vec![
+        "220-fixture ESMTP ready".to_string(),
+        "220-this relay is monitored".to_string(),
+        "220 proceed".to_string(),
+    ];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+    let channel = parse_email(fixture.channel_def(json!({})));
+
+    channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect("multiline replies are legal SMTP");
+    assert!(fixture.saw("DATA"));
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn a_reply_that_echoes_credential_material_aborts_the_session() {
+    let mut script = SmtpScript::starttls_default();
+    script.auth = vec![format!("535 5.7.8 rejected password {SMTP_PASSWORD}")];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+    let error = channel
+        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .await
+        .expect_err("credential-reflecting reply must abort");
+
+    assert!(error.contains("echoed configured credential material"), "{error}");
+    assert!(!error.contains(SMTP_PASSWORD), "{error}");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
+async fn command_timeout_bounds_a_silent_relay() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        // Accept and then never speak: the greeting read must time out.
+        let _accepted = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let (ca_file, _acceptor) = tls_materials("localhost");
+
+    let mut def = minimal_def(addr.port());
+    def["command_timeout_ms"] = json!(200);
+    let channel = parse_email(def);
+    let error = channel
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(ca_file.path().to_str().expect("ca path")),
+        )
+        .await
+        .expect_err("a silent relay must time out");
+    assert!(error.contains("timed out during server greeting"), "{error}");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn a_relay_that_hangs_up_early_is_reported() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    let (ca_file, _acceptor) = tls_materials("localhost");
+
+    let channel = parse_email(minimal_def(addr.port()));
+    let error = channel
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(ca_file.path().to_str().expect("ca path")),
+        )
+        .await
+        .expect_err("an early close must fail the send");
+    assert!(error.contains("closed the connection"), "{error}");
+    handle.abort();
+}

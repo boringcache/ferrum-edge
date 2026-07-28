@@ -13485,6 +13485,7 @@ components:
         - $ref: "#/components/schemas/ProxyAlertsTeamsChannel"
         - $ref: "#/components/schemas/ProxyAlertsDiscordChannel"
         - $ref: "#/components/schemas/ProxyAlertsWebhookChannel"
+        - $ref: "#/components/schemas/ProxyAlertsEmailChannel"
       discriminator:
         propertyName: type
         mapping:
@@ -13492,6 +13493,7 @@ components:
           teams: "#/components/schemas/ProxyAlertsTeamsChannel"
           discord: "#/components/schemas/ProxyAlertsDiscordChannel"
           webhook: "#/components/schemas/ProxyAlertsWebhookChannel"
+          email: "#/components/schemas/ProxyAlertsEmailChannel"
 
     ProxyAlertsSlackChannel:
       type: object
@@ -13594,6 +13596,87 @@ components:
         body_template:
           type: string
           description: Template body. Supports generic notification variables plus proxy_alerts variables such as `${rule_name}`, `${proxy_name}`, `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`, and `${reason}`.
+
+    ProxyAlertsEmailChannel:
+      type: object
+      additionalProperties: false
+      required: [type, smtp_host, from, to]
+      description: |
+        Native SMTP delivery. TLS is mandatory: `starttls` upgrades the session
+        and fails closed when the relay does not advertise STARTTLS, and
+        `implicit_tls` handshakes immediately (SMTPS). Plaintext SMTP is not
+        offered, `AUTH` is never sent before the handshake completes, and
+        certificate verification is always enforced (this channel does not honor
+        `FERRUM_TLS_NO_VERIFY`; use `FERRUM_TLS_CA_BUNDLE_PATH` for private CAs).
+      properties:
+        type:
+          type: string
+          enum: [email]
+        smtp_host:
+          type: string
+          description: SMTP relay hostname or IP literal. No scheme, port, path, or credentials.
+        smtp_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: SMTP port. Defaults to 587 for `starttls` and 465 for `implicit_tls`.
+        tls_mode:
+          type: string
+          enum: [starttls, implicit_tls]
+          default: starttls
+          description: TLS posture for the session. Both values complete a verified handshake before any credential or message data is written.
+        tls_server_name:
+          type: string
+          description: Verified TLS identity override. Defaults to `smtp_host`.
+        username:
+          type: string
+          description: SMTP AUTH username. Prefer `username_env`.
+        username_env:
+          type: string
+          description: Environment variable containing the SMTP AUTH username.
+        password:
+          type: string
+          description: SMTP AUTH password. Prefer `password_env`. Redacted on admin reads.
+        password_env:
+          type: string
+          description: Environment variable containing the SMTP AUTH password.
+        from:
+          type: string
+          format: email
+          description: Envelope and header sender address (max 254 bytes, ASCII addr-spec).
+        to:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            format: email
+          description: Recipient addresses. Duplicates are collapsed.
+        subject_template:
+          type: string
+          maxLength: 1024
+          default: "[${severity}] ${title}"
+          description: Subject template. Supports the generic notification variables plus the proxy_alerts variables; control characters in substituted values are folded to spaces.
+        body_template:
+          type: string
+          maxLength: 65536
+          default: "${body}\n\n${fields}"
+          description: Plain-text body template. Adds `${fields}`, the notification's key/value rows rendered as `Name: value` lines.
+        helo_name:
+          type: string
+          description: EHLO identity. Defaults to the domain of `from`.
+        connect_timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+          default: 5000
+          description: Bounds DNS resolution, TCP connect, and the TLS handshake.
+        command_timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 120000
+          default: 10000
+          description: Bounds each SMTP command/reply exchange, including DATA.
 
     ProxyAlertsRule:
       description: |
