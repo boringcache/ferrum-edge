@@ -4463,13 +4463,12 @@ fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_s
 }
 
 #[tokio::test]
-async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_deletes_live_contract() {
+async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_deletes_live_contract()
+{
     use chrono::Utc;
-    use ferrum_edge::config::types::{
-        GatewayConfig, PluginAssociation, PluginConfig, PluginScope,
-    };
-    use ferrum_edge::plugins::ProxyProtocol;
     use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
+    use ferrum_edge::plugins::ProxyProtocol;
 
     fn header_content_config(header_object: Value) -> Value {
         json!({
@@ -4623,10 +4622,7 @@ async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_del
         .rebuild(&gateway_with_validator(schema_config))
         .expect("schema-form replacement must rebuild");
     assert_continue(run(&cache, &headers, scalar_body.as_bytes()).await);
-    assert_reject(
-        run(&cache, &headers, json_body.as_bytes()).await,
-        Some(400),
-    );
+    assert_reject(run(&cache, &headers, json_body.as_bytes()).await, Some(400));
 
     cache
         .rebuild(&gateway_with_validator(deleted_config))

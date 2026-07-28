@@ -462,11 +462,15 @@ fn importer_preserves_multipart_encoding_header_content_form() {
         }"##,
     );
     let config = extract_validator_config(&spec);
-    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
-        ["encoding"]["file"]["headers"]["X-Part-Meta"];
+    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]["encoding"]
+        ["file"]["headers"]["X-Part-Meta"];
     assert!(header.get("schema").is_none());
     assert_eq!(header["required"], true);
-    assert!(header["content"]["application/json"]["schema"].get("$ref").is_none());
+    assert!(
+        header["content"]["application/json"]["schema"]
+            .get("$ref")
+            .is_none()
+    );
     assert_eq!(
         header["content"]["application/json"]["schema"]["type"],
         "object"
@@ -603,8 +607,8 @@ fn importer_preserves_multipart_encoding_header_content_with_valid_parameters() 
         }"##,
     );
     let config = extract_validator_config(&spec);
-    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
-        ["encoding"]["file"]["headers"]["X-Part-Meta"];
+    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]["encoding"]
+        ["file"]["headers"]["X-Part-Meta"];
     assert!(header["content"]["application/json; charset=utf-8"]["schema"].is_object());
     assert_valid_against_admin_schema(&config, "multipart header content with parameters");
 }
@@ -633,10 +637,10 @@ fn importer_header_content_replacement_drops_prior_content_contract() {
     );
     let content_config = extract_validator_config(&with_content);
     let schema_config = extract_validator_config(&with_schema);
-    let content_header = &content_config["operations"][0]["request_body"]["content"]
-        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Meta"];
-    let schema_header = &schema_config["operations"][0]["request_body"]["content"]
-        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Meta"];
+    let content_header = &content_config["operations"][0]["request_body"]["content"]["multipart/form-data"]
+        ["encoding"]["file"]["headers"]["X-Part-Meta"];
+    let schema_header = &schema_config["operations"][0]["request_body"]["content"]["multipart/form-data"]
+        ["encoding"]["file"]["headers"]["X-Part-Meta"];
     assert!(content_header.get("content").is_some());
     assert!(schema_header.get("content").is_none());
     assert_eq!(schema_header["schema"]["type"], "string");

@@ -2009,20 +2009,19 @@ fn parse_property_encoding(
                             "{header_path}.content must contain exactly one media type"
                         ));
                     }
-                    let (media_type, media_value) = content_object.iter().next().ok_or_else(|| {
-                        format!("{header_path}.content must contain exactly one media type")
-                    })?;
+                    let (media_type, media_value) =
+                        content_object.iter().next().ok_or_else(|| {
+                            format!("{header_path}.content must contain exactly one media type")
+                        })?;
                     let media_path = format!("{header_path}.content['{media_type}']");
                     validate_concrete_media_type(media_type, &media_path)?;
                     let media_base = normalize_media_type(media_type);
                     if media_base == "multipart/form-data" {
-                        return Err(format!(
-                            "{media_path} does not support multipart/form-data"
-                        ));
+                        return Err(format!("{media_path} does not support multipart/form-data"));
                     }
-                    let media_object = media_value.as_object().ok_or_else(|| {
-                        format!("{media_path} must be a Media Type Object")
-                    })?;
+                    let media_object = media_value
+                        .as_object()
+                        .ok_or_else(|| format!("{media_path} must be a Media Type Object"))?;
                     reject_unknown_keys(
                         media_object,
                         &media_path,
@@ -2034,9 +2033,9 @@ fn parse_property_encoding(
                     {
                         return Err(format!("{media_path}.examples must be an object"));
                     }
-                    let schema = media_object.get("schema").ok_or_else(|| {
-                        format!("{media_path} must contain schema")
-                    })?;
+                    let schema = media_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{media_path} must contain schema"))?;
                     (schema, Some(media_base), required)
                 } else {
                     if let Some(style) = header_object.get("style")
@@ -2054,9 +2053,9 @@ fn parse_property_encoding(
                     {
                         return Err(format!("{header_path}.examples must be an object"));
                     }
-                    let schema = header_object.get("schema").ok_or_else(|| {
-                        format!("{header_path} must contain schema or content")
-                    })?;
+                    let schema = header_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{header_path} must contain schema or content"))?;
                     (schema, None, required)
                 }
             } else {
@@ -2068,11 +2067,12 @@ fn parse_property_encoding(
                 )
             })?;
             let schema_types = collect_schema_types(schema_value);
-            let conversion = ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
-                format!(
-                    "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
-                )
-            })?;
+            let conversion =
+                ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                    )
+                })?;
             headers.insert(
                 name,
                 EncodingHeaderValidator {

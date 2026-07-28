@@ -1926,7 +1926,8 @@ fn normalize_request_body_encoding(
                             ),
                         },
                     )?;
-                    let content_media_location = format!("{location}.content['{content_media_type}']");
+                    let content_media_location =
+                        format!("{location}.content['{content_media_type}']");
                     validate_header_content_media_type_key(
                         content_media_type,
                         property,
@@ -2010,7 +2011,8 @@ fn normalize_request_body_encoding(
                     normalized_content
                         .insert(content_media_type.clone(), Value::Object(normalized_media));
                     normalized_header.remove("schema");
-                    normalized_header.insert("content".to_string(), Value::Object(normalized_content));
+                    normalized_header
+                        .insert("content".to_string(), Value::Object(normalized_content));
                 } else {
                     let header_schema =
                         header_object
@@ -2062,9 +2064,7 @@ fn validate_header_content_media_type_key(
     property: &str,
     header_name: &str,
 ) -> Result<(), ExtractError> {
-    let path = format!(
-        "encoding['{property}'].headers['{header_name}'].content['{value}']"
-    );
+    let path = format!("encoding['{property}'].headers['{header_name}'].content['{value}']");
     if value.parse::<http::HeaderValue>().is_err() {
         return Err(ExtractError::MalformedExtension {
             which: "requestBody.content.encoding",
