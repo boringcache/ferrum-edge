@@ -3545,9 +3545,15 @@ paths:
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
         redacted before it is written to the audit log. Sensitive plugin
-        configuration is redacted as well; Loki endpoint paths/queries,
-        authorization, and all custom-header values are never persisted in
-        the diff, Redis envelope signing keys (`redis_integrity_key` and any
+        configuration is redacted as well, through the same schema-aware
+        sensitivity contract used for non-admin plugin reads: credential-bearing
+        endpoint URLs keep only scheme/host/port with structural
+        `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers and
+        never userinfo, all values of arbitrary header maps and webhook body
+        templates are replaced by `[REDACTED]`, as are
+        `serverless_function.azure_function_key` and every
+        `kafka_logging.producer_config` property outside the safe-tuning
+        allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
         userinfo/query/fragment data is stripped while its
         scheme/host/port/database are kept.
@@ -6747,12 +6753,24 @@ components:
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so
             their unmodeled values cannot be disclosed.
-            Sensitive plugin configuration is also redacted; loki_logging
-            endpoint paths/queries, authorization, and custom-header values
-            are never persisted, `redis_integrity_key` (and any other
+            Sensitive plugin configuration is also redacted through one
+            schema-aware sensitivity contract shared with non-admin plugin
+            reads. Every built-in plugin declares its credential-bearing
+            config paths; credential-bearing endpoint URLs keep only
+            `scheme://host[:port]` with `[REDACTED_PATH]` /
+            `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers and never
+            userinfo, every value of an arbitrary header map (otel_tracing
+            `headers`, loki_logging/http_logging `custom_headers`, opa
+            `headers`, proxy_alerts channel `headers`) is replaced by
+            `[REDACTED]`, as are `serverless_function.azure_function_key`,
+            proxy_alerts channel `body_template`, and every
+            `kafka_logging.producer_config` property outside the safe-tuning
+            allow-list. `redis_integrity_key` (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
             `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept.
+            scheme/host/port/database are kept. Any remaining URL-shaped
+            string carrying userinfo has that userinfo replaced. A plugin
+            config that is not an object is replaced wholesale.
 
     AuditEventListResponse:
       type: object
