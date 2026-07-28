@@ -2285,8 +2285,8 @@ max created_max_age_seconds (86400) + 2 × max created_clock_skew_seconds (3600)
 
 | Value | Guarantee | Requirements |
 |---|---|---|
-| `process` | Replay state lives in this process, registered under a stable `{namespace}\|{plugin-config-id}` scope so a **reload generation inherits the previous generation's claims** instead of starting from an empty cache. **Not cross-replica.** | none — declaring it asserts a single-replica deployment |
-| `shared` | Every nonce is claimed with one atomic Redis `SET NX EX`, so exactly one request **across all replicas** wins a given nonce inside its TTL. | `sync_mode: "redis"` and a `redis_url` |
+| `process` | Replay state lives in this process, registered under a stable `{namespace}\|{plugin-config-id}` scope so a **reload generation inherits the previous generation's claims** instead of starting from an empty cache. **Not cross-replica.** Process-scope claims are **not** durable across process restart, crash, or reschedule: the in-memory maps are gone with the process, so a captured PasswordDigest token that is still inside its `Created` acceptance window can be accepted again after the process comes back. Reload survival is not restart survival. | none — declaring it asserts a single-replica deployment |
+| `shared` | Every nonce is claimed with one atomic Redis `SET NX EX`, so exactly one request **across all replicas** wins a given nonce inside its TTL. Shared-scope durability inherits Redis (see claim-durability note below). | `sync_mode: "redis"` and a `redis_url` |
 
 Admission enforces the pairing in both directions: `replay_scope: shared` without `sync_mode: "redis"` is rejected, and `sync_mode: "redis"` without `replay_scope: shared` is rejected (a backend nothing claims against is a misconfiguration, not a no-op). The full shared Redis field set (`sync_mode`, `redis_url`, `redis_tls`, `redis_key_prefix`, `redis_pool_size`, `redis_connect_timeout_seconds`, `redis_health_check_interval_seconds`, `redis_username`, `redis_password`) is the shared set documented for [`rate_limiting`](#rate_limiting) and behaves identically here; the default key prefix is `{FERRUM_NAMESPACE}:soap_ws_security:{plugin-config-id}`, which isolates independent policies while keeping every replica of one policy on the same keyspace. Redis fields are shape-validated even when inactive, and a misspelled Redis key fails admission rather than silently selecting process-local state.
 
@@ -2294,7 +2294,7 @@ Shared-scope keys are `SHA-256(nonce)` in lowercase hex — never the nonce itse
 
 **A shared-backend outage fails closed** (HTTP `401`, failure class `nonce_shared_backend_unavailable`), exactly like local capacity exhaustion. There is deliberately no "degrade to process-local" option: a per-replica fallback would silently reinstate the cross-replica bypass the shared backend exists to close. Size the Redis deployment for the authenticated PasswordDigest request rate accordingly.
 
-**Recovery is automatic.** Because this path rejects rather than degrades, an outage must not outlive itself. Any error that marks the shared client unavailable — a connect failure, a DNS failure, or a transient command error — also arms the client's background recovery checker, which re-screens and pings the endpoint every `redis_health_check_interval_seconds` (default 5) and restores enforcement as soon as Redis answers. No reload is required. The one exception is an endpoint **denied by the backend egress policy**: that is a configuration error rather than an outage, re-screening would stay denied forever, and it is cleared by fixing `redis_url` (which is also screened at config-admission time, so a denied literal IP is normally rejected before the plugin is ever admitted). The recovery task is owned by the plugin generation that created it and is aborted when that generation is dropped, so retired generations never keep dialing an obsolete endpoint.
+**Recovery is automatic.** Because this path rejects rather than degrades, an outage must not outlive itself. Any error that marks the shared client unavailable — a connect failure, a DNS failure, a hostname that currently resolves to an egress-denied address, or a transient command error — also arms the client's background recovery checker, which re-screens and pings the endpoint every `redis_health_check_interval_seconds` (default 5) and restores enforcement as soon as Redis answers. No reload is required. The one exception is a **literal-IP** endpoint **denied by the backend egress policy**: that address is static configuration rather than a transient answer, re-screening would stay denied forever, and it is cleared by fixing `redis_url` (which is also screened at config-admission time, so a denied literal IP is normally rejected before the plugin is ever admitted). A hostname denial is deliberately *not* that exception — DNS answers can change, so the checker keeps re-screening. The recovery task is owned by the plugin generation that created it and is aborted when that generation is dropped, so retired generations never keep dialing an obsolete endpoint.
 
 **Claim durability is Redis's.** A `SET NX EX` claim is only as durable as the server holding it. If a claim key is lost — failover to a replica that had not yet received it, or eviction under `maxmemory` with a non-`noeviction` policy — the nonce becomes claimable again and the captured token is replayable within its remaining acceptance window. Run the replay keyspace with `maxmemory-policy noeviction` and durable, consistent failover, and provision for the fixed 93 601-second key lifetime. This is a property of the backend, not something the gateway can detect: a key that is gone is indistinguishable from a nonce never seen.
 
@@ -2352,8 +2352,10 @@ config:
     # there is no cache_ttl_seconds key. Under `shared` that is the TTL of every
     # Redis claim key, so the acceptance window can be widened later with no gap.
     replay_scope: shared
-sync_mode: redis
-redis_url: "redis://redis.internal:6379"
+  # The shared Redis fields live inside `config`, exactly as they do for
+  # `rate_limiting` / `request_deduplication`.
+  sync_mode: redis
+  redis_url: "redis://redis.internal:6379"
 ```
 
 #### UsernameToken — PasswordText

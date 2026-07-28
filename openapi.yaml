@@ -15829,6 +15829,34 @@ components:
       type: object
       description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              username_token:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  - not:
+                      properties:
+                        password_type:
+                          const: PasswordText
+                      required: [password_type]
+            required: [username_token]
+          then:
+            required: [nonce]
+            properties:
+              nonce:
+                type: object
+                required: [replay_scope]
+        - if:
+            required: [sync_mode]
+            properties:
+              sync_mode:
+                const: redis
+          then:
+            required: [redis_url]
       properties:
         reject_missing_security_header:
           type: boolean
@@ -16162,6 +16190,10 @@ components:
                 generation inherits the previous generation's claims instead of
                 starting from an empty cache — it is explicitly NOT cross-replica
                 protection, and selecting it asserts a single-replica deployment.
+                Process-scope claims are lost on process restart, crash, or
+                reschedule; a captured PasswordDigest token still inside its
+                Created window can then be accepted again. Reload survival is
+                not restart survival.
                 "shared" claims each nonce with one atomic Redis SET NX EX so
                 exactly one request across all replicas wins a nonce inside its
                 TTL; it requires sync_mode=redis and a redis_url, and the key is
@@ -16171,12 +16203,15 @@ components:
                 nonce_shared_backend_unavailable); there is no degrade-to-local
                 option because a per-replica fallback would reinstate the
                 cross-replica bypass. Recovery is automatic: any error that
-                marks the shared client unavailable — connect, DNS, or a
+                marks the shared client unavailable — connect, DNS, a hostname
+                that currently resolves to an egress-denied address, or a
                 transient command error — also arms the background recovery
                 checker, which restores enforcement within
-                redis_health_check_interval_seconds without a reload (an
-                egress-policy denial is the exception and is a configuration
-                fix). Claim durability is Redis's own: run the replay keyspace
+                redis_health_check_interval_seconds without a reload (a
+                literal-IP egress-policy denial is the exception and is a
+                configuration fix; hostname denials re-screen because DNS
+                answers can change). Claim durability is Redis's own: run the
+                replay keyspace
                 with maxmemory-policy noeviction and consistent failover, since
                 a lost claim key makes its nonce claimable again. Admission
                 enforces the pairing in both directions: shared without

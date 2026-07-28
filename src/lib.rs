@@ -1392,6 +1392,61 @@ pub mod _test_support {
         }
     }
 
+    pub use crate::plugins::soap_ws_security::{
+        MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS,
+    };
+
+    pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
+    }
+
+    pub fn soap_nonce_replay_registry_contains_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_contains_for_tests(scope_key)
+    }
+
+    /// Process-global registry key for `plugin_config_id` under the default
+    /// namespace used by `PluginHttpClient::default()`.
+    pub fn soap_nonce_replay_scope_key_for_test(plugin_config_id: &str) -> String {
+        format!(
+            "{}|{plugin_config_id}",
+            crate::config::types::DEFAULT_NAMESPACE
+        )
+    }
+
+    /// Build a scoped process-replay plugin and poison its registry mutex.
+    pub fn soap_poison_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+            config,
+            crate::plugins::PluginHttpClient::default(),
+            Some(plugin_config_id),
+        )?;
+        plugin.poison_nonce_replay_state_for_tests()?;
+        // Drop the plugin so the registry is the sole strong owner; prune must
+        // still refuse to replace poisoned state.
+        drop(plugin);
+        Ok(())
+    }
+
+    /// Build a scoped process-replay plugin, seed one claim, then corrupt the
+    /// age index and drop the holder so the registry is the sole owner.
+    pub fn soap_retire_inconsistent_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+            config,
+            crate::plugins::PluginHttpClient::default(),
+            Some(plugin_config_id),
+        )?;
+        plugin.check_nonce_replay("inconsistent-retired-seed")?;
+        plugin.corrupt_nonce_age_index_for_tests()?;
+        drop(plugin);
+        Ok(())
+    }
+
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
     /// request-time fallback computes)`. Cached nodes are filled once per
     /// registered schema during ConversionPlan compile (#3024).

@@ -935,13 +935,61 @@ enum NonceReplayBackend {
 
 /// Process-global replay scopes, keyed by `{namespace}|{plugin-config-id}`.
 ///
-/// Held by strong reference for the life of the process: a plugin generation
-/// swap constructs the new instance *before* dropping the old one, but replay
-/// history is a security invariant that must not depend on that ordering. The
-/// key space is bounded by [`MAX_NONCE_REPLAY_SCOPES`] and admission fails
-/// closed at the cap.
+/// Held by strong reference for the life of any live plugin generation that
+/// joined the scope. Deleted or renamed configs leave their map entry behind
+/// until cold-path pruning in [`process_replay_state`] reclaims it: a scope is
+/// removed only when the registry is its sole strong owner, its state is
+/// unpoisoned and structurally consistent, and every retained claim is expired
+/// (or the map is empty). The key space is bounded by
+/// [`MAX_NONCE_REPLAY_SCOPES`] and admission fails closed at the cap.
 static NONCE_REPLAY_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<Mutex<NonceReplayState>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether a retired process replay scope may be removed from the registry.
+///
+/// Fail-closed: poisoned or structurally inconsistent state is never reclaimed
+/// (silently replacing it would reopen a replay window). Live claims are
+/// detected from the age index's **newest** entry — if the newest is still
+/// inside [`NONCE_CLAIM_RETENTION_SECONDS`], every older entry is live too.
+fn retired_replay_scope_is_reclaimable(
+    state: &Arc<Mutex<NonceReplayState>>,
+    now: Instant,
+) -> bool {
+    if Arc::strong_count(state) != 1 {
+        return false;
+    }
+    let Ok(guard) = state.lock() else {
+        return false;
+    };
+    if !guard.structurally_consistent() {
+        return false;
+    }
+    let Some((&(inserted_at, _), _)) = guard.age_index.last_key_value() else {
+        // Consistently empty: reclaimable.
+        return true;
+    };
+    SoapWsSecurity::nonce_age_seconds(now, inserted_at) >= NONCE_CLAIM_RETENTION_SECONDS
+}
+
+/// Cold-path prune of retired process replay scopes.
+///
+/// Walks the bounded registry (≤ [`MAX_NONCE_REPLAY_SCOPES`]) once. Never runs
+/// on the request hot path; only when resolving/creating a scope during plugin
+/// construction. Does not scan nonce maps — only the ordered age index's newest
+/// key is consulted per candidate.
+fn prune_retired_nonce_replay_scopes(
+    registry: &mut HashMap<String, Arc<Mutex<NonceReplayState>>>,
+    now: Instant,
+) {
+    let reclaimable: Vec<String> = registry
+        .iter()
+        .filter(|(_, state)| retired_replay_scope_is_reclaimable(state, now))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in reclaimable {
+        registry.remove(&key);
+    }
+}
 
 /// Resolve the process-global replay state for `scope_key`.
 ///
@@ -953,7 +1001,9 @@ static NONCE_REPLAY_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<Mutex<NonceRepl
 /// Retention is not a parameter here: every generation joining a scope expires
 /// entries against the same fixed [`NONCE_CLAIM_RETENTION_SECONDS`] horizon, so
 /// there is no per-scope mark to reconcile, raise, or carry across a reload.
-/// Joining an existing scope is therefore a pure lookup.
+/// Joining an existing scope is therefore a pure lookup. Creating a *new* scope
+/// first reclaims retired empty/fully-expired scopes so deleted configs cannot
+/// permanently exhaust [`MAX_NONCE_REPLAY_SCOPES`].
 fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplayState>>, String> {
     let Some(scope_key) = scope_key else {
         return Ok(Arc::new(Mutex::new(NonceReplayState::new())));
@@ -971,6 +1021,7 @@ fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplay
         }
         return Ok(existing);
     }
+    prune_retired_nonce_replay_scopes(&mut registry, Instant::now());
     if registry.len() >= MAX_NONCE_REPLAY_SCOPES {
         // Fixed diagnostic: the scope key embeds an operator resource id, which
         // is not secret but is also not needed to act on this.
@@ -983,6 +1034,30 @@ fn process_replay_state(scope_key: Option<&str>) -> Result<Arc<Mutex<NonceReplay
     registry.insert(scope_key.to_string(), Arc::clone(&state));
     Ok(state)
 }
+
+/// Current process-global replay-scope registry cardinality (test support).
+#[allow(dead_code)]
+pub(crate) fn nonce_replay_registry_len_for_tests() -> Result<usize, String> {
+    let Ok(registry) = NONCE_REPLAY_REGISTRY.lock() else {
+        return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
+    };
+    Ok(registry.len())
+}
+
+/// Whether `scope_key` is still present in the process-global registry.
+#[allow(dead_code)]
+pub(crate) fn nonce_replay_registry_contains_for_tests(scope_key: &str) -> Result<bool, String> {
+    let Ok(registry) = NONCE_REPLAY_REGISTRY.lock() else {
+        return Err("soap_ws_security: replay-scope registry is unavailable".to_string());
+    };
+    Ok(registry.contains_key(scope_key))
+}
+
+#[allow(dead_code)]
+pub(crate) const MAX_NONCE_REPLAY_SCOPES_FOR_TESTS: usize = MAX_NONCE_REPLAY_SCOPES;
+
+#[allow(dead_code)]
+pub(crate) const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 = NONCE_CLAIM_RETENTION_SECONDS;
 
 /// Stable process-global replay-scope identity for a plugin config.
 fn nonce_replay_scope_key(namespace: &str, plugin_config_id: &str) -> String {
@@ -1756,7 +1831,9 @@ impl SoapWsSecurity {
         // Durations are pre-converted at config admission and `parse_ws_datetime`
         // clamps parsed instants to `MIN_PARSED_YEAR..=MAX_PARSED_YEAR`, so
         // neither the duration construction nor the instant arithmetic below can
-        // overflow and panic this request task.
+        // overflow under the current admission invariants. `checked_add_signed`
+        // on Expires remains as defensive fail-closed arithmetic against future
+        // clamp drift.
         let skew = self.clock_skew;
         let max_age = self.timestamp_max_age;
 
@@ -2489,6 +2566,20 @@ impl SoapWsSecurity {
         Ok(())
     }
 
+    /// Poison this instance's process replay-scope mutex (test support).
+    #[allow(dead_code)]
+    pub(crate) fn poison_nonce_replay_state_for_tests(&self) -> Result<(), String> {
+        let NonceReplayBackend::Process(replay_state) = &self.nonce_backend else {
+            return Err("soap_ws_security: replay test state is process-scope only".to_string());
+        };
+        let state = Arc::clone(replay_state);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().expect("lock before poison");
+            panic!("soap_ws_security: intentional nonce replay state poison for tests");
+        }));
+        Ok(())
+    }
+
     // ── X.509 signature verification ────────────────────────────────────
 
     fn validate_x509_signature(&self, security_block: &str, envelope: &str) -> Result<(), String> {
@@ -2879,8 +2970,10 @@ impl SoapWsSecurity {
             unique_child_element(assertion_node, "Conditions", "WS-Security: SAML")?
         {
             // Pre-converted at admission. Attacker-supplied instants still use
-            // checked addition because the upper accepted year can be close to
-            // chrono's representable boundary.
+            // checked addition: overflow is unreachable under the current
+            // `parse_ws_datetime` year clamp (`MIN_PARSED_YEAR..=MAX_PARSED_YEAR`,
+            // upper bound 9999), and the checked operation keeps this path
+            // fail-closed if that admission invariant ever drifts.
             let skew = self.saml_clock_skew;
 
             if let Some(not_before_str) = conditions.attribute("NotBefore") {

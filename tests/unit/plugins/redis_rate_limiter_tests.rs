@@ -1277,16 +1277,20 @@ async fn spawn_set_then_drop_redis_server() -> (u16, oneshot::Sender<()>) {
 /// Fail-closed consumers (`soap_ws_security` with `nonce.replay_scope: shared`,
 /// `request_deduplication`) gate every future claim on `is_available()` and
 /// *reject* traffic while it is false. A transient command error on
-/// `set_bytes_nx_with_expire` — the atomic claim primitive both use — must
-/// therefore leave a live recovery task behind, or one blip pins replay
-/// enforcement closed until the next config reload.
+/// `set_bytes_nx_with_expire` must fail the claim closed and mark Redis
+/// unavailable.
+///
+/// Recovery-checker arming from a demonstrably *not-started* state is covered
+/// by `watch_cas_helpers_fail_closed_when_connection_drops_after_watch` (and by
+/// hostname egress-denial coverage below): this claim primitive uses the cached
+/// `ConnectionManager` path, whose successful connect already starts the
+/// checker, so asserting the flag here would not prove the unavailable
+/// transition itself.
 #[tokio::test]
-async fn a_command_error_on_the_claim_primitive_arms_the_recovery_checker() {
+async fn a_command_error_on_the_claim_primitive_fails_closed_and_marks_unavailable() {
     let (port, shutdown) = spawn_set_then_drop_redis_server().await;
     let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
     config.connect_timeout_seconds = 5;
-    // Long enough that the checker cannot itself flip availability during the
-    // assertions below — this test is about the task existing, not its result.
     config.health_check_interval_seconds = 3600;
     let client = redis_rate_limit_client_for_test(config);
 
@@ -1301,20 +1305,77 @@ async fn a_command_error_on_the_claim_primitive_arms_the_recovery_checker() {
         !client.is_available(),
         "a failed claim must mark Redis unavailable"
     );
+
+    let _ = shutdown.send(());
+}
+
+/// A hostname that currently resolves to an egress-denied address must arm the
+/// recovery checker: DNS answers can change, and fail-closed consumers would
+/// otherwise stay unavailable until the next config reload. This path never
+/// establishes a cached connection, so the checker was not started beforehand.
+#[tokio::test]
+async fn hostname_egress_denial_arms_the_recovery_checker() {
+    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+    use std::collections::HashMap;
+
+    let mut overrides = HashMap::new();
+    overrides.insert("redis.denied.test".to_string(), "10.0.0.1".to_string());
+    let dns_cache = DnsCache::new(DnsConfig {
+        global_overrides: overrides,
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+        ..DnsConfig::default()
+    });
+    let mut config = make_config("redis://redis.denied.test:6379/0", false);
+    config.health_check_interval_seconds = 3600;
+    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None);
+
+    assert!(
+        !client.health_checker_started_for_test(),
+        "precondition: checker must not already be running"
+    );
+    assert!(
+        !client.connect_cached_for_test().await,
+        "hostname egress denial must fail closed without dialing"
+    );
+    assert!(!client.is_available());
     assert!(
         client.health_checker_started_for_test(),
-        "a failed claim must leave a recovery task that can clear the outage"
+        "hostname egress denial must arm recovery so a later DNS answer can restore the client"
     );
-
     let abort = client
         .health_checker_abort_for_test()
         .expect("recovery checker abort handle");
-    assert!(
-        !abort.is_finished(),
-        "the recovery checker must still be running after the failed claim"
-    );
+    assert!(!abort.is_finished());
+}
 
-    let _ = shutdown.send(());
+/// A denied literal-IP `redis_url` is static configuration: re-screening the
+/// same address stays denied, so the recovery checker must not start.
+#[tokio::test]
+async fn literal_ip_egress_denial_does_not_arm_the_recovery_checker() {
+    use ferrum_edge::config::BackendAllowIps;
+    use ferrum_edge::config::BackendEgressPolicy;
+    use ferrum_edge::dns::{DnsCache, DnsConfig};
+
+    let dns_cache = DnsCache::new(DnsConfig {
+        backend_allow_ips: BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+        ..DnsConfig::default()
+    });
+    let mut config = make_config("redis://127.0.0.1:6379/0", false);
+    config.health_check_interval_seconds = 3600;
+    let client = RedisRateLimitClient::new(config, Some(dns_cache), false, None);
+
+    assert!(!client.health_checker_started_for_test());
+    assert!(
+        !client.connect_cached_for_test().await,
+        "literal-IP egress denial must fail closed without dialing"
+    );
+    assert!(!client.is_available());
+    assert!(
+        !client.health_checker_started_for_test(),
+        "literal-IP egress denial must not arm a recovery checker"
+    );
 }
 
 /// Validation diagnostics on the shared Redis admission path must name the

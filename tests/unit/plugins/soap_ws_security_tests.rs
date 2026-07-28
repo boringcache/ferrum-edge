@@ -1,6 +1,9 @@
 use ferrum_edge::_test_support::{
-    SoapNonceReplayHarness, soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
+    MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, SoapNonceReplayHarness,
+    soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
     soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
+    soap_nonce_replay_registry_contains_for_test, soap_nonce_replay_scope_key_for_test,
+    soap_poison_process_replay_scope_for_test, soap_retire_inconsistent_process_replay_scope_for_test,
     soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
@@ -5458,6 +5461,68 @@ fn password_text_does_not_require_a_replay_scope() {
 }
 
 #[test]
+fn openapi_requires_replay_scope_for_password_digest_only() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = &spec["components"]["schemas"]["SoapWsSecurityConfig"];
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("SoapWsSecurityConfig schema compiles");
+
+    let digest_missing_scope = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&digest_missing_scope).is_err(),
+        "OpenAPI must reject PasswordDigest without nonce.replay_scope"
+    );
+
+    let digest_default_password_type = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&digest_default_password_type).is_err(),
+        "omitted password_type defaults to PasswordDigest and still requires replay_scope"
+    );
+
+    let digest_ok = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "process" }
+    });
+    assert!(
+        validator.validate(&digest_ok).is_ok(),
+        "PasswordDigest with an explicit replay_scope must validate"
+    );
+
+    let text_ok = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&text_ok).is_ok(),
+        "PasswordText must remain valid without a replay scope"
+    );
+}
+
+#[test]
 fn invalid_replay_scope_value_is_rejected() {
     let mut config = username_token_digest_config();
     config["nonce"]["replay_scope"] = json!("cluster");
@@ -5579,6 +5644,206 @@ async fn identityless_construction_gets_private_replay_state() {
     assert!(
         live.check_nonce_replay("validation-probe-nonce").is_err(),
         "and must not have consumed the live claim either"
+    );
+}
+
+// ── Retired process replay-scope pruning ────────────────────────────────────
+
+#[tokio::test]
+async fn active_strong_references_keep_a_replay_scope_from_being_pruned() {
+    let scope = "soap-prune-active-ref";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let live = digest_plugin_with_config_id(Some(scope));
+    live.check_nonce_replay("active-ref-nonce")
+        .expect("claim must admit");
+
+    // Creating an unrelated scope runs cold-path pruning; the live holder keeps
+    // strong_count > 1, so the scope must remain.
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-active-ref-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a scope with a live plugin generation must not be pruned"
+    );
+    assert!(
+        live.check_nonce_replay("active-ref-nonce").is_err(),
+        "the live claim must still be present"
+    );
+}
+
+#[tokio::test]
+async fn a_retired_scope_with_a_live_claim_is_retained() {
+    let scope = "soap-prune-live-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    {
+        let generation = digest_plugin_with_config_id(Some(scope));
+        generation
+            .check_nonce_replay("live-retired-nonce")
+            .expect("claim must admit");
+    }
+    // Registry is now the sole strong owner, but the newest claim is still live.
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-live-retired-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a retired scope with any live claim must stay fail-closed"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert!(
+        rejoined.check_nonce_replay("live-retired-nonce").is_err(),
+        "rejoining must inherit the live claim rather than starting empty"
+    );
+}
+
+#[tokio::test]
+async fn a_fully_expired_retired_scope_is_reclaimed() {
+    let scope = "soap-prune-expired-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let epoch = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(CLAIM_RETENTION_SECONDS + 120))
+        .expect("instant subtract");
+    {
+        let harness = SoapNonceReplayHarness::with_scope(
+            &username_token_digest_config(),
+            scope,
+            epoch,
+        )
+        .expect("scoped harness");
+        harness
+            .claim_at("expired-retired-nonce", Duration::ZERO)
+            .expect("backdated claim must admit");
+    }
+    assert!(soap_nonce_replay_registry_contains_for_test(&key).expect("registry"));
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-expired-retired-probe"));
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a retired scope whose newest claim is past retention must be reclaimed"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert!(
+        rejoined.check_nonce_replay("expired-retired-nonce").is_ok(),
+        "reclaiming must free the slot without resurrecting expired claims"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_retired_scope_is_reclaimable() {
+    let scope = "soap-prune-empty-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    {
+        let _generation = digest_plugin_with_config_id(Some(scope));
+    }
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-empty-retired-probe"));
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "an empty retired scope must free its registry slot"
+    );
+}
+
+#[tokio::test]
+async fn retired_empty_scopes_free_registry_capacity() {
+    let http = PluginHttpClient::default();
+    let mut holders = Vec::new();
+    for i in 0..(MAX_NONCE_REPLAY_SCOPES_FOR_TESTS + 8) {
+        let id = format!("soap-prune-cap-fill-{i}");
+        match SoapWsSecurity::new_with_http_client_and_config_id(
+            &username_token_digest_config(),
+            http.clone(),
+            Some(&id),
+        ) {
+            Ok(plugin) => holders.push(plugin),
+            Err(err) => {
+                assert!(
+                    err.contains("refusing to create more"),
+                    "unexpected construction failure before the cap: {err}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        !holders.is_empty(),
+        "test must hold at least one scope against the registry cap"
+    );
+    let overflow = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        http.clone(),
+        Some("soap-prune-cap-overflow-while-held"),
+    );
+    assert!(
+        overflow.is_err(),
+        "held empty scopes must consume registry capacity"
+    );
+
+    holders.clear();
+    SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        http,
+        Some("soap-prune-cap-after-reclaim"),
+    )
+    .expect("reclaiming empty retired scopes must free capacity for a new scope");
+}
+
+#[tokio::test]
+async fn poisoned_retired_scopes_are_not_replaced() {
+    let scope = "soap-prune-poisoned";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_poison_process_replay_scope_for_test(&username_token_digest_config(), scope)
+        .expect("poison helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-poisoned-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "poisoned state must remain fail-closed rather than being silently replaced"
+    );
+    let err = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        Some(scope),
+    )
+    .err()
+    .expect("rejoining a poisoned scope must fail closed");
+    assert!(err.contains("unavailable"), "{err}");
+}
+
+#[tokio::test]
+async fn inconsistent_retired_scopes_are_not_replaced() {
+    let scope = "soap-prune-inconsistent";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_retire_inconsistent_process_replay_scope_for_test(
+        &username_token_digest_config(),
+        scope,
+    )
+    .expect("inconsistent retire helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-inconsistent-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "structurally inconsistent state must not be silently replaced"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert_eq!(
+        rejoined
+            .check_nonce_replay("inconsistent-probe-nonce")
+            .expect_err("inconsistent state must fail closed"),
+        "WS-Security: replay protection state is at capacity"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_generations_retain_one_shared_replay_state() {
+    let scope = "soap-prune-overlap-gens";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let generation_one = digest_plugin_with_config_id(Some(scope));
+    let generation_two = digest_plugin_with_config_id(Some(scope));
+    generation_one
+        .check_nonce_replay("overlap-nonce")
+        .expect("first claim");
+    drop(generation_one);
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-overlap-gens-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "an overlapping live generation must keep the shared scope"
+    );
+    assert!(
+        generation_two.check_nonce_replay("overlap-nonce").is_err(),
+        "both generations must share one claim map"
     );
 }
 
