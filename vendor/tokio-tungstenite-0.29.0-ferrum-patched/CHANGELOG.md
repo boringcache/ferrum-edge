@@ -1,6 +1,7 @@
 # Ferrum local patch
 
 - Backport snapview/tokio-tungstenite#380: add `WebSocketStream::into_inner_with_read_buffer()` delegating to the patched tungstenite accessor so raw stream takeovers can recover buffered bytes.
+- Add `WebSocketStream::set_fragment_accounting()` delegating to the patched tungstenite fragment-accounting API, so a caller can install a shared `FragmentMeter` and the incomplete-message frame/duration bounds before `split()` hides the codec.
 
 # 0.29.0
 
