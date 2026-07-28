@@ -10122,7 +10122,10 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
     // Create.
     let created = make_config(
         vec![proxy()],
-        vec![serverless_terminate_plugin_config("sls-terminate", "terminate")],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "terminate",
+        )],
     );
     let cache = PluginCache::new(&created).expect("terminate config builds");
 
@@ -10148,7 +10151,10 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
         "terminate mode must be the published behavior"
     );
     assert!(!created_instance.modifies_request_headers());
-    assert_eq!(created_instance.warmup_hostnames(), vec!["example.com".to_string()]);
+    assert_eq!(
+        created_instance.warmup_hostnames(),
+        vec!["example.com".to_string()]
+    );
     drop(created_instance);
 
     // Update + reload: flipping the mode AND the function URL republishes in
@@ -10186,7 +10192,10 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
     // partially published.
     let invalid = make_config(
         vec![proxy()],
-        vec![serverless_terminate_plugin_config("sls-terminate", "shortcircuit")],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "shortcircuit",
+        )],
     );
     let error = cache
         .rebuild(&invalid)
@@ -10202,8 +10211,13 @@ fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete()
     drop(after_failed_reload);
 
     // Delete.
-    let deleted = make_config(vec![make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec![])], vec![]);
-    cache.rebuild(&deleted).expect("cache reloads without the plugin");
+    let deleted = make_config(
+        vec![make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec![])],
+        vec![],
+    );
+    cache
+        .rebuild(&deleted)
+        .expect("cache reloads without the plugin");
     assert!(
         !resolved_plugin_names(&cache, ProxyProtocol::Grpc)
             .contains(&"serverless_function".to_string()),

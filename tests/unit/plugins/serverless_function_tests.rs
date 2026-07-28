@@ -1106,7 +1106,10 @@ async fn test_terminate_mode_frames_native_grpc_unary_response() {
             assert_eq!(body, framed);
             (body, headers)
         }
-        other => panic!("Expected RejectBinary framed gRPC response, got {:?}", other),
+        other => panic!(
+            "Expected RejectBinary framed gRPC response, got {:?}",
+            other
+        ),
     };
 
     // End-to-end state transition: the provenance the plugin stamped is what
@@ -1501,16 +1504,22 @@ fn test_ordinary_grpc_reject_still_skips_response_body_lifecycle() {
         &mut ctx,
         ferrum_edge::config::types::HttpFlavor::Grpc,
     );
-    assert!(!synthetic_response_body_hooks_apply_for_test(200, true, &framed, &plugins, &ctx));
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        200, true, &framed, &plugins, &ctx
+    ));
 
     // Terminate provenance present, but these are not the authored bytes — the
     // carve-out is provenance, never shape.
     let ctx = grpc_terminate_context_with_frame(&framed);
     let other = frame_terminate_message(b"tampered");
-    assert!(!synthetic_response_body_hooks_apply_for_test(200, true, &other, &plugins, &ctx));
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        200, true, &other, &plugins, &ctx
+    ));
 
     // Same bytes, but not the status the contract authored.
-    assert!(!synthetic_response_body_hooks_apply_for_test(500, true, &framed, &plugins, &ctx));
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        500, true, &framed, &plugins, &ctx
+    ));
 }
 
 /// The authorization is native-gRPC only. A non-gRPC request keeps the ordinary

@@ -2597,12 +2597,11 @@ impl Plugin for ServerlessFunction {
                                     .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
                                     .map(|(name, value)| (name.clone(), value.clone()))
                                     .collect();
-                                let authored =
-                                    crate::plugins::ServerlessGrpcTerminateFrame {
-                                        http_status: status_code,
-                                        frame: framed_body.clone(),
-                                        trailers,
-                                    };
+                                let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+                                    http_status: status_code,
+                                    frame: framed_body.clone(),
+                                    trailers,
+                                };
                                 ctx.serverless_grpc_terminate_frame =
                                     Some(std::sync::Arc::new(authored));
                             }

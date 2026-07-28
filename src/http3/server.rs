@@ -12101,7 +12101,9 @@ async fn send_h3_reject_flavor_aware_with_header_state(
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
         stream.send_response(resp).await?;
-        stream.send_data(Bytes::copy_from_slice(framed_body)).await?;
+        stream
+            .send_data(Bytes::copy_from_slice(framed_body))
+            .await?;
         let trailers =
             crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(framed_trailers);
         stream.send_trailers(trailers).await?;
