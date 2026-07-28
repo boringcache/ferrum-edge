@@ -2720,7 +2720,7 @@ where
                     stream,
                     ctx,
                     StatusCode::BAD_GATEWAY,
-                    &error_body,
+                    bytes::Bytes::from(error_body),
                     &empty_headers,
                     backend_start,
                     bytes_sent,
