@@ -36530,7 +36530,7 @@ mod tests {
             response_headers.get("x-after-reject").map(String::as_str),
             Some("applied")
         );
-        assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert_eq!(&*body, br#"{"error":"blocked"}"#);
         assert!(!ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY));
     }
 
@@ -36583,7 +36583,7 @@ mod tests {
         .await;
 
         assert_eq!(status, 503);
-        assert_eq!(body, b"late fail-closed rejection");
+        assert_eq!(&*body, b"late fail-closed rejection");
         assert_eq!(
             headers.get("x-after-reject").map(String::as_str),
             Some("applied"),
@@ -36725,7 +36725,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::OK);
-        assert_eq!(response.body, body);
+        assert_eq!(&*response.body, body);
     }
 
     #[tokio::test]
@@ -36845,7 +36845,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.body, b"transformed application response");
+        assert_eq!(&*response.body, b"transformed application response");
         assert!(!response.headers.contains_key("etag"));
         assert!(!response.headers.contains_key("content-digest"));
         assert_eq!(
@@ -36874,7 +36874,7 @@ mod tests {
         let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
 
         assert_eq!(response.http_status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.body, b"ordinary gateway rejection");
+        assert_eq!(&*response.body, b"ordinary gateway rejection");
         assert_eq!(
             response.headers.get("etag").map(String::as_str),
             Some("\"gateway-v1\"")
@@ -37516,7 +37516,7 @@ mod tests {
             response_headers.get("x-frame-options").map(String::as_str),
             Some("SAMEORIGIN")
         );
-        assert_eq!(body, br#"{"error":"blocked"}"#);
+        assert_eq!(&*body, br#"{"error":"blocked"}"#);
     }
 
     #[tokio::test]
@@ -37880,7 +37880,7 @@ mod tests {
         let ResponseBody::Buffered(body) = resp.body else {
             panic!("SNI direct-H2 rejection should be buffered");
         };
-        assert_eq!(body.as_slice(), br#"{"error":"Bad Gateway"}"#);
+        assert_eq!(&*body, br#"{"error":"Bad Gateway"}"#);
     }
 
     #[test]
@@ -41088,7 +41088,7 @@ mod tests {
         let ResponseBody::Buffered(body) = &resp.body else {
             panic!("H3 read-timeout response must be buffered");
         };
-        assert_eq!(body.as_slice(), br#"{"error":"Backend timeout"}"#);
+        assert_eq!(body.as_ref(), br#"{"error":"Backend timeout"}"#);
         assert!(
             !resp.connection_error,
             "post-wire read timeout must not be treated as a connect failure"

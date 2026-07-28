@@ -12233,6 +12233,7 @@ fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_st
 
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
+    use bytes::Bytes;
     use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
 
     #[tokio::test]
@@ -12534,7 +12535,7 @@ mod h3_streaming_after_proxy_tests {
         .expect("after_proxy rejection should be surfaced");
 
         assert_eq!(reject.status_code, 451);
-        assert_eq!(reject.body, b"blocked by response policy");
+        assert_eq!(&*reject.body, b"blocked by response policy");
         assert_eq!(
             reject.headers.get("x-policy").map(String::as_str),
             Some("blocked")

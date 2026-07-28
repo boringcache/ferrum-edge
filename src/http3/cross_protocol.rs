@@ -8209,7 +8209,7 @@ mod tests {
         .await;
 
         assert_eq!(response_status, 403);
-        assert_eq!(response_body, br#"{"error":"Forbidden"}"#);
+        assert_eq!(&*response_body, br#"{"error":"Forbidden"}"#);
         assert_eq!(
             response_headers
                 .get("content-type")
