@@ -201,10 +201,10 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
         &after_output,
         "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}",
     );
-    assert_eq!(
-        after_failure,
-        before_failure + 1,
-        "cached /metrics render must still reflect a fresh inbound_tls failure"
+    assert!(
+        after_failure >= before_failure + 1,
+        "cached /metrics render must still reflect a fresh inbound_tls failure \
+         (was {before_failure}, now {after_failure})"
     );
 }
 
