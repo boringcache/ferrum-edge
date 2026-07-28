@@ -137,6 +137,32 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
     }
 
+    /// Classify an unexpected DTLS recv-loop JoinHandle result the same way
+    /// production does when the accept loop observes recv-task exit.
+    pub fn classify_dtls_recv_loop_exit_for_test(
+        join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        crate::proxy::udp_proxy::classify_dtls_recv_loop_exit(join_result)
+    }
+
+    /// Drive DTLS recv-loop vs shutdown supervision with synthetic tasks.
+    pub async fn supervise_dtls_recv_loop_task_for_test(
+        server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        global_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_shutdown: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::udp_proxy::supervise_dtls_recv_loop_task(
+            server_task,
+            shutdown_rx,
+            global_shutdown_rx,
+            started,
+            on_shutdown,
+        )
+        .await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(

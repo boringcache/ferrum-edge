@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::db_backend::NamespacedResourceId;
@@ -2838,6 +2838,87 @@ fn spawn_session_cleanup(
     });
 }
 
+/// Classify an unexpected DTLS recv-loop task exit for listener failure.
+///
+/// Any completion of the recv-loop task while the accept loop is still live is
+/// an operational failure: graceful shutdown closes the server on a different
+/// select arm and awaits the task there. `Ok(())` without that path means the
+/// loop stopped without an operator/listener shutdown signal.
+pub(crate) fn classify_dtls_recv_loop_exit(
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match join_result {
+        Ok(Ok(())) => {
+            anyhow::anyhow!("DTLS server recv loop exited unexpectedly without error")
+        }
+        Ok(Err(err)) => err.context("DTLS server recv loop exited with error"),
+        Err(join_err) if join_err.is_cancelled() => {
+            anyhow::anyhow!("DTLS server recv loop was cancelled unexpectedly")
+        }
+        Err(join_err) if join_err.is_panic() => {
+            anyhow::anyhow!("DTLS server recv loop panicked: {join_err}")
+        }
+        Err(join_err) => {
+            anyhow::anyhow!("DTLS server recv loop failed to join: {join_err}")
+        }
+    }
+}
+
+/// Fail the DTLS frontend listener after an unexpected recv-loop exit.
+///
+/// Clears `started` so readiness cannot stay healthy while UDP demux has
+/// stopped, then returns a contextual error for `StreamListenerManager`
+/// async bind-failure / reconcile.
+pub(crate) fn fail_dtls_listener_on_recv_loop_exit(
+    started: &AtomicBool,
+    join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    let err = classify_dtls_recv_loop_exit(join_result);
+    error!(
+        error = %err,
+        "DTLS server recv loop exited unexpectedly; failing listener"
+    );
+    started.store(false, Ordering::Release);
+    err
+}
+
+/// Supervise the DTLS recv-loop task against operator/global shutdown.
+///
+/// Production wires the same classification beside `server.accept()` in
+/// [`start_dtls_frontend_listener`]. This seam lets external tests drive
+/// panic/error/shutdown classification with synthetic tasks without a
+/// production panic or socket fault injector.
+pub(crate) async fn supervise_dtls_recv_loop_task(
+    mut server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    mut global_shutdown_rx: Option<watch::Receiver<bool>>,
+    started: Arc<AtomicBool>,
+    on_shutdown: impl FnOnce(),
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        join_result = &mut server_task => {
+            Err(fail_dtls_listener_on_recv_loop_exit(&started, join_result))
+        }
+        _ = shutdown_rx.changed() => {
+            on_shutdown();
+            let _ = server_task.await;
+            Ok(())
+        }
+        _ = async {
+            match global_shutdown_rx.as_mut() {
+                Some(rx) => {
+                    let _ = rx.changed().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
+            on_shutdown();
+            let _ = server_task.await;
+            Ok(())
+        }
+    }
+}
+
 /// Start a DTLS frontend listener that accepts encrypted client connections.
 ///
 /// Uses `DtlsServer` from the `dtls` module which demultiplexes incoming UDP
@@ -2898,14 +2979,12 @@ async fn start_dtls_frontend_listener(
     started.store(true, Ordering::Release);
     info!(proxy_id = %proxy_id, "DTLS frontend listener started on {}", addr);
 
-    // Spawn the server's recv loop in a background task
+    // Spawn the server's recv loop in a background task. The accept select
+    // below supervises this handle (issue #3215): an unexpected exit must
+    // fail the listener promptly rather than leaving `accept()` blocked with
+    // `started` still true while no task reads UDP.
     let server_runner = server.clone();
-    let runner_proxy_id = proxy_id.clone();
-    let server_task = tokio::spawn(async move {
-        if let Err(e) = server_runner.run().await {
-            warn!(proxy_id = %runner_proxy_id, "DTLS server recv loop error: {}", e);
-        }
-    });
+    let mut server_task = tokio::spawn(async move { server_runner.run().await });
 
     let mut shutdown_rx = shutdown;
     // Optional gateway-wide shutdown — fires on SIGTERM/SIGINT regardless of
@@ -3196,6 +3275,14 @@ async fn start_dtls_frontend_listener(
                         .active_sessions
                         .fetch_sub(1, Ordering::Relaxed);
                 });
+            }
+            join_result = &mut server_task => {
+                // Recv loop terminated while accept was still live. Close so
+                // any lingering accept waiters / sessions stop, clear started,
+                // and return Err for StreamListenerManager reconcile.
+                let err = fail_dtls_listener_on_recv_loop_exit(&started, join_result);
+                server.close().await;
+                return Err(err);
             }
             _ = shutdown_rx.changed() => {
                 info!(proxy_id = %proxy_id, "DTLS frontend listener shutting down on port {}", port);
