@@ -288,6 +288,17 @@ pub struct IngressRedirectPacket {
     /// `true` when `(destination address, dst_port)` is present in
     /// `FERRUM_POD_INBOUND_PORTS` / `FERRUM_POD_INBOUND_PORTS6`.
     pub destination_port_declared: bool,
+    /// `true` when the datagram is an IPv4 fragment (More-Fragments set, or a
+    /// non-zero fragment offset), or an IPv6 packet carrying a fragment /
+    /// extension header.
+    ///
+    /// A fragmented datagram has **no trustworthy L4 header**: only the first
+    /// fragment carries the TCP ports at all, and a *non-first* fragment's
+    /// payload begins with arbitrary application bytes that would be read as
+    /// ports. Redirecting (or dropping) on those bytes would steer an unrelated
+    /// flow, so a fragment is always [`IngressRedirectAction::Pass`] — the
+    /// pre-existing direct-pod guard stays its only inbound control.
+    pub fragmented: bool,
 }
 
 impl IngressRedirectPacket {
@@ -300,8 +311,33 @@ impl IngressRedirectPacket {
             protocol_is_tcp: true,
             destination_pod_opted_in: true,
             destination_port_declared: true,
+            fragmented: false,
         }
     }
+}
+
+/// `true` when an IPv4 header's flags/fragment-offset word describes a
+/// **fragment** whose L4 ports must not be read.
+///
+/// `word` is the third 16-bit field of the IPv4 header (offset 6) in **host**
+/// byte order. Bit 13 (`0x2000`) is More-Fragments; bits 0..12 (`0x1fff`) are
+/// the fragment offset. Either being set means this datagram is one piece of a
+/// larger one:
+///
+/// * offset `!= 0` — a non-first fragment. Its payload starts with arbitrary
+///   application bytes, so "the TCP ports" read at `IHL` are attacker-chosen
+///   data that can be made to match any declared `(pod, port)` pair.
+/// * offset `== 0` with More-Fragments — the first fragment. Its ports ARE
+///   real, but its successors will not be redirected, so steering it would
+///   split one datagram across two destinations.
+///
+/// Declining both is the only answer that never misattributes a packet, which
+/// is why this is a shared predicate rather than an inline kernel branch: the
+/// classifier and the host-side tests evaluate the same function.
+pub const fn ipv4_is_fragment(word: u16) -> bool {
+    const MORE_FRAGMENTS: u16 = 0x2000;
+    const FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
+    word & MORE_FRAGMENTS != 0 || word & FRAGMENT_OFFSET_MASK != 0
 }
 
 /// The single source of truth for the inbound tc redirect decision.
@@ -310,7 +346,7 @@ impl IngressRedirectPacket {
 /// order (it short-circuits the cheap mark/port guards before spending a map
 /// lookup) without diverging from this table:
 ///
-/// `Steer` ⟺ armed ∧ TCP ∧ ¬bypass ∧ pod opted in ∧ port declared.
+/// `Steer` ⟺ armed ∧ TCP ∧ ¬fragmented ∧ ¬bypass ∧ pod opted in ∧ port declared.
 pub const fn ingress_redirect_action(
     config: &BpfCaptureConfig,
     packet: &IngressRedirectPacket,
@@ -319,6 +355,12 @@ pub const fn ingress_redirect_action(
         return IngressRedirectAction::Pass;
     }
     if !packet.protocol_is_tcp {
+        return IngressRedirectAction::Pass;
+    }
+    // Ordered BEFORE every scope gate: a fragment's "ports" may be arbitrary
+    // payload bytes, so it must not reach a decision that could drop it as the
+    // wrong flow either.
+    if packet.fragmented {
         return IngressRedirectAction::Pass;
     }
     if config.ingress_redirect_bypass(packet.skb_mark, packet.dst_port) {
@@ -452,6 +494,22 @@ pub struct BpfCaptureConfig {
     /// the default, so a node that has not been explicitly opted in keeps its
     /// previous behavior.
     pub node_waypoint_ingress_redirect_mark: u32,
+    /// TCP port of the NodeWaypoint **transparent inbound capture** listener —
+    /// the socket `ferrum_tc_ingress_redirect` steers captured `podIP:appPort`
+    /// bytes into.
+    ///
+    /// **This is deliberately NOT [`Self::hbone_redirect_port`].** The HBONE
+    /// listener terminates authenticated HTTP/2 CONNECT over verified mesh
+    /// mTLS; captured application bytes are ordinary plaintext (or the app's
+    /// own TLS) and `IP_TRANSPARENT` does not transform them into an HBONE
+    /// handshake. Steering them at the HBONE port would either fail the mesh
+    /// TLS handshake or drop them. The capture listener is a separate protocol
+    /// boundary — a plaintext L4 relay that recovers the original destination
+    /// and re-enters mesh inbound routing under the PeerAuthentication and
+    /// authorization gates — so the two ports must stay distinct.
+    ///
+    /// Zero disarms the redirect (see [`Self::ingress_redirect_armed`]).
+    pub node_waypoint_ingress_capture_port: u32,
 }
 
 /// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
@@ -542,6 +600,17 @@ pub const OUTBOUND_CAPTURE_PORT: u16 = 15001;
 
 /// Inbound HBONE port carried in the capture config for sidecarless topologies.
 pub const INBOUND_HBONE_PORT: u16 = 15008;
+
+/// Default TCP port of the NodeWaypoint transparent inbound **capture**
+/// listener — the redirect's steer target.
+///
+/// Deliberately the mesh inbound listener port (`FERRUM_MESH_INBOUND_LISTEN_ADDR`,
+/// default `0.0.0.0:15006`), which NodeWaypoint topology otherwise leaves
+/// unused, rather than a new port with its own environment variable: the proxy
+/// binds that address and the node-agent reads the same variable, so the two
+/// processes cannot drift apart. It is NOT [`INBOUND_HBONE_PORT`] — see
+/// `BpfCaptureConfig::node_waypoint_ingress_capture_port`.
+pub const NODE_WAYPOINT_INGRESS_CAPTURE_PORT: u16 = 15006;
 
 /// Socket mark used by the destination NodeWaypoint inbound HBONE relay when
 /// dialing the local backend pod. Chosen adjacent to Ferrum's TPROXY mark but
@@ -713,6 +782,9 @@ impl BpfCaptureConfig {
             // engages once an operator opts the node in AND the node-agent has
             // installed the matching local-delivery routing.
             node_waypoint_ingress_redirect_mark: 0,
+            // Likewise fail closed: with no capture listener port there is
+            // nothing to steer into, so the redirect stays disarmed.
+            node_waypoint_ingress_capture_port: 0,
         }
     }
 
@@ -736,18 +808,32 @@ impl BpfCaptureConfig {
         self
     }
 
+    /// Set the transparent inbound **capture** listener port the redirect
+    /// steers into — see [`Self::node_waypoint_ingress_capture_port`]. Zero
+    /// disables the redirect.
+    pub const fn with_node_waypoint_ingress_capture_port(mut self, port: u16) -> Self {
+        self.node_waypoint_ingress_capture_port = port as u32;
+        self
+    }
+
     /// `true` when the inbound tc ingress redirect is armed. Requires a
-    /// non-zero redirect mark AND a non-zero relay port to steer to; either
-    /// missing leaves the datapath on the pre-existing direct-pod guard.
+    /// non-zero redirect mark AND a non-zero **capture listener** port to steer
+    /// to; either missing leaves the datapath on the pre-existing direct-pod
+    /// guard.
+    ///
+    /// The capture port — not `hbone_redirect_port` — is the gate: HBONE is a
+    /// different protocol boundary and can be live while the capture listener
+    /// is not.
     pub const fn ingress_redirect_armed(&self) -> bool {
-        self.node_waypoint_ingress_redirect_mark != 0 && self.hbone_redirect_port != 0
+        self.node_waypoint_ingress_redirect_mark != 0
+            && self.node_waypoint_ingress_capture_port != 0
     }
 
     /// Loop / self-capture bypass for the tc ingress redirect: `true` means
     /// "leave this packet completely alone".
     ///
     /// Lives here rather than in the kernel program so the host-side unit tests
-    /// exercise the exact truth table the classifier evaluates. Three
+    /// exercise the exact truth table the classifier evaluates. Four
     /// independent conditions:
     ///
     /// 1. `mark == node_waypoint_inbound_auth_mark` — the relay's own
@@ -755,8 +841,13 @@ impl BpfCaptureConfig {
     ///    feed the relay its own traffic in a loop.
     /// 2. `mark == node_waypoint_ingress_redirect_mark` — already redirected by
     ///    this program (or a peer hook); never redirect twice.
-    /// 3. `dst_port == hbone_redirect_port` — already addressed to the relay
-    ///    listener (peer-to-peer HBONE included), so it must reach it directly.
+    /// 3. `dst_port == node_waypoint_ingress_capture_port` — already addressed
+    ///    to the capture listener, so it must reach it directly. This is the
+    ///    self-capture guard proper.
+    /// 4. `dst_port == hbone_redirect_port` — peer-to-peer HBONE. The HBONE
+    ///    listener is a distinct protocol boundary (authenticated H2 CONNECT
+    ///    over mesh mTLS) and must never be fed captured plaintext, so its port
+    ///    is bypassed too.
     ///
     /// A zero auth mark (local-pod mode) must NOT make an unmarked packet look
     /// authorized, which is why condition 1 is guarded on a non-zero mark.
@@ -767,6 +858,11 @@ impl BpfCaptureConfig {
         }
         if self.node_waypoint_ingress_redirect_mark != 0
             && mark == self.node_waypoint_ingress_redirect_mark
+        {
+            return true;
+        }
+        if self.node_waypoint_ingress_capture_port != 0
+            && dst_port as u32 == self.node_waypoint_ingress_capture_port
         {
             return true;
         }
@@ -868,9 +964,10 @@ mod tests {
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        // BpfCaptureConfig: five u32 = 20 bytes, 4-byte aligned. The fifth word
-        // is the tc-ingress-redirect mark.
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 20);
+        // BpfCaptureConfig: six u32 = 24 bytes, 4-byte aligned. The fifth and
+        // sixth words are the tc-ingress-redirect mark and the transparent
+        // inbound capture listener port.
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 24);
         assert_eq!(mem::align_of::<BpfCaptureConfig>(), 4);
         // InboundRedirectKey4: u32 + two u16 = 8 bytes; the v6 key is
         // [u32;4] + two u16 = 20 bytes. Both are fully defined (explicit pad).
@@ -1175,24 +1272,55 @@ mod tests {
             default.node_waypoint_ingress_redirect_mark, 0,
             "the inbound tc redirect must be opt-in, never on by default"
         );
+        assert_eq!(
+            default.node_waypoint_ingress_capture_port, 0,
+            "no capture listener is assumed until one is configured"
+        );
         assert!(
             !default.ingress_redirect_armed(),
             "a zero mark must leave the redirect disarmed"
         );
 
-        let armed =
-            default.with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        let armed = default
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+            .with_node_waypoint_ingress_capture_port(NODE_WAYPOINT_INGRESS_CAPTURE_PORT);
         assert_eq!(
             armed.node_waypoint_ingress_redirect_mark,
             NODE_WAYPOINT_INGRESS_REDIRECT_MARK
         );
+        assert_eq!(
+            armed.node_waypoint_ingress_capture_port,
+            NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+        );
         assert!(armed.ingress_redirect_armed());
 
-        // A relay port of zero must disarm even with a mark set: there would be
-        // no listener to steer to and the program must not drop traffic.
-        let no_port = BpfCaptureConfig::new(15001, 0)
+        // A CAPTURE port of zero must disarm even with a mark set: there would
+        // be no listener to steer to and the program must not drop traffic.
+        // A live HBONE port is NOT a substitute — HBONE is a different
+        // protocol boundary.
+        let no_capture_port = BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
             .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
-        assert!(!no_port.ingress_redirect_armed());
+        assert!(
+            !no_capture_port.ingress_redirect_armed(),
+            "a live HBONE port must never arm the redirect on its own"
+        );
+    }
+
+    #[test]
+    fn the_capture_port_is_never_the_hbone_port() {
+        // The regression this pins: steering ordinary plaintext application
+        // bytes at the authenticated HBONE listener (H2 CONNECT over verified
+        // mesh mTLS) cannot work — IP_TRANSPARENT preserves addresses, it does
+        // not transform the payload. The two ports are separate protocol
+        // boundaries and the shipped defaults must reflect that.
+        assert_ne!(NODE_WAYPOINT_INGRESS_CAPTURE_PORT, INBOUND_HBONE_PORT);
+        let armed = armed_redirect_config();
+        assert_ne!(
+            armed.node_waypoint_ingress_capture_port, armed.hbone_redirect_port,
+            "the redirect must steer at the capture listener, never at HBONE"
+        );
+        // ... and HBONE-addressed traffic still bypasses the redirect entirely.
+        assert!(armed.ingress_redirect_bypass(0, INBOUND_HBONE_PORT));
     }
 
     /// The armed configuration the redirect decision tests are written against.
@@ -1200,6 +1328,7 @@ mod tests {
         BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
             .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
             .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+            .with_node_waypoint_ingress_capture_port(NODE_WAYPOINT_INGRESS_CAPTURE_PORT)
     }
 
     #[test]
@@ -1243,6 +1372,67 @@ mod tests {
             IngressRedirectAction::Pass,
             "an enrolled pod's undeclared port stays on the direct-pod guard"
         );
+
+        let fragment = IngressRedirectPacket {
+            fragmented: true,
+            ..in_scope
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &fragment),
+            IngressRedirectAction::Pass,
+            "a fragment carries no trustworthy L4 header; its 'ports' may be payload bytes"
+        );
+    }
+
+    #[test]
+    fn ipv4_fragments_are_declined_before_any_scope_decision() {
+        // Third 16-bit word of the IPv4 header, host byte order.
+        assert!(
+            !ipv4_is_fragment(0x0000),
+            "an unfragmented datagram with no flags must be parsed normally"
+        );
+        assert!(
+            !ipv4_is_fragment(0x4000),
+            "Don't-Fragment alone does not make a datagram a fragment"
+        );
+        assert!(
+            ipv4_is_fragment(0x2000),
+            "the FIRST fragment (More-Fragments, offset 0) must be declined: its successors \
+             would not be redirected, splitting one datagram across two destinations"
+        );
+        assert!(
+            ipv4_is_fragment(0x0001),
+            "a non-first fragment (offset 8 bytes) must be declined"
+        );
+        assert!(
+            ipv4_is_fragment(0x00b9),
+            "a mid-stream non-first fragment must be declined"
+        );
+        assert!(
+            ipv4_is_fragment(0x2001),
+            "More-Fragments AND a non-zero offset (a middle fragment) must be declined"
+        );
+        assert!(
+            ipv4_is_fragment(0x1fff),
+            "the maximum fragment offset must be declined"
+        );
+        // Reserved / DF bits must not be mistaken for fragmentation.
+        assert!(!ipv4_is_fragment(0x8000), "the reserved bit is not MF");
+        assert!(!ipv4_is_fragment(0xc000), "reserved + DF is still not MF");
+
+        // A fragment whose payload bytes happen to look like a declared port is
+        // the exact misattribution this gate exists to prevent.
+        let config = armed_redirect_config();
+        let spoofed = IngressRedirectPacket {
+            fragmented: true,
+            ..IngressRedirectPacket::fully_in_scope(8080)
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &spoofed),
+            IngressRedirectAction::Pass,
+            "a fragment must never be steered — and, just as importantly, never DROPPED as an \
+             in-scope packet, because the port it appears to carry is attacker-chosen data"
+        );
     }
 
     #[test]
@@ -1257,12 +1447,13 @@ mod tests {
             "a node that was never opted in must behave exactly as before"
         );
 
-        // A relay port of zero means there is no listener to steer into, so the
-        // program must pass rather than drop in-scope traffic.
-        let no_relay = BpfCaptureConfig::new(15001, 0)
+        // A capture port of zero means there is no listener to steer into, so
+        // the program must pass rather than drop in-scope traffic — even with a
+        // perfectly live HBONE port configured.
+        let no_capture_listener = BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
             .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
         assert_eq!(
-            ingress_redirect_action(&no_relay, &in_scope),
+            ingress_redirect_action(&no_capture_listener, &in_scope),
             IngressRedirectAction::Pass
         );
     }
@@ -1293,12 +1484,23 @@ mod tests {
             "a packet must never be redirected twice"
         );
 
-        // (3) traffic already aimed at the relay listener, including peer HBONE.
-        let to_the_relay = IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT);
+        // (3) traffic already aimed at the CAPTURE listener — the self-capture
+        // guard proper.
+        let to_the_capture_listener =
+            IngressRedirectPacket::fully_in_scope(NODE_WAYPOINT_INGRESS_CAPTURE_PORT);
         assert_eq!(
-            ingress_redirect_action(&config, &to_the_relay),
+            ingress_redirect_action(&config, &to_the_capture_listener),
             IngressRedirectAction::Pass,
-            "HBONE traffic addressed to the relay listener must reach it directly"
+            "traffic already addressed to the capture listener must reach it directly"
+        );
+
+        // (4) peer-to-peer HBONE. A different protocol boundary that must never
+        // be fed captured plaintext.
+        let to_hbone = IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT);
+        assert_eq!(
+            ingress_redirect_action(&config, &to_hbone),
+            IngressRedirectAction::Pass,
+            "HBONE traffic addressed to the HBONE listener must reach it directly"
         );
 
         // An unrelated CNI mark is NOT a bypass — otherwise a co-resident CNI
@@ -1320,7 +1522,8 @@ mod tests {
         // packets) would read as "already relayed" and disable the redirect.
         let config = BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
             .with_node_waypoint_inbound_auth_mark(0)
-            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+            .with_node_waypoint_ingress_capture_port(NODE_WAYPOINT_INGRESS_CAPTURE_PORT);
         assert!(!config.ingress_redirect_bypass(0, 8080));
         assert_eq!(
             ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(8080)),
@@ -1337,8 +1540,10 @@ mod tests {
         // A packet this program already redirected must never be redirected
         // again.
         assert!(config.ingress_redirect_bypass(NODE_WAYPOINT_INGRESS_REDIRECT_MARK, 8080));
-        // Traffic already aimed at the relay listener reaches it directly.
-        assert!(config.ingress_redirect_bypass(0, 15008));
+        // Traffic already aimed at the capture listener reaches it directly.
+        assert!(config.ingress_redirect_bypass(0, NODE_WAYPOINT_INGRESS_CAPTURE_PORT));
+        // ... and so does peer-to-peer HBONE.
+        assert!(config.ingress_redirect_bypass(0, INBOUND_HBONE_PORT));
         // Ordinary inbound app traffic is NOT bypassed.
         assert!(!config.ingress_redirect_bypass(0, 8080));
         // An unrelated CNI mark is not mistaken for either Ferrum mark.
@@ -1353,8 +1558,18 @@ mod tests {
                 .is_steer()
         );
         assert!(
-            !ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(15008))
-                .is_steer()
+            !ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket::fully_in_scope(NODE_WAYPOINT_INGRESS_CAPTURE_PORT)
+            )
+            .is_steer()
+        );
+        assert!(
+            !ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT)
+            )
+            .is_steer()
         );
     }
 

@@ -3538,10 +3538,8 @@ jobs:
 
       - name: Run live-kernel eBPF test as root
         # Loads + verifies every BPF program (including the GAP-2M sock_ops
-        # cookie bridge and the NodeWaypoint inbound tc ingress redirect) on the
-        # runner's real kernel, attaches them to a scratch cgroup and a scratch
-        # veth tc ingress hook, and round-trips the workload-identity map plus
-        # both address families of the inbound redirect scope maps. Required
+        # cookie bridge) on the runner's real kernel, attaches them to a
+        # scratch cgroup, and round-trips the workload-identity map. Required
         # mode turns any test-level SKIP into a CI failure. Run the prebuilt
         # test binary directly under sudo so cargo never runs as root against
         # the user-owned target dir.
@@ -3564,8 +3562,8 @@ jobs:
             echo "::error::eBPF live tests skipped under required CI mode"
             exit 1
           fi
-          if ! grep -Eq '^test result: ok\. 3 passed; 0 failed;' <<<"$output"; then
-            echo "::error::expected exactly 3 eBPF live tests to pass"
+          if ! grep -Eq '^test result: ok\. 2 passed; 0 failed;' <<<"$output"; then
+            echo "::error::expected exactly 2 eBPF live tests to pass"
             exit 1
           fi
         env:

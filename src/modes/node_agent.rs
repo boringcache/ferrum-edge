@@ -302,25 +302,33 @@ impl NodeAgentConfig {
             } else {
                 NODE_WAYPOINT_INGRESS_REDIRECT_MARK
             };
-        if !capture_contract.ingress_redirect_ifaces.is_empty()
-            && env_config.node_agent_proxy_mode != NodeAgentProxyMode::NodeWaypoint
-        {
-            return Err(format!(
-                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires \
-                 FERRUM_NODE_AGENT_PROXY_MODE=node_waypoint (got {}); only NodeWaypoint has an \
-                 inbound HBONE relay to steer captured traffic into",
-                env_config.node_agent_proxy_mode
-            ));
+        // The steer target is the proxy's TRANSPARENT INBOUND CAPTURE listener,
+        // NOT the HBONE listener: HBONE terminates authenticated H2 CONNECT
+        // over mesh mTLS, while captured traffic is raw application bytes.
+        //
+        // Both processes derive the port from the SAME variable
+        // (`FERRUM_MESH_INBOUND_LISTEN_ADDR`, which the proxy binds), so there
+        // is no second setting that can silently disagree — and a chart that
+        // sets it on only one of the two DaemonSet containers lands on the
+        // default on the other, which the validation below still catches if the
+        // two are incompatible.
+        if !capture_contract.ingress_redirect_ifaces.is_empty() {
+            let capture_addr = crate::modes::mesh::node_waypoint_ingress_capture_addr()?;
+            crate::modes::mesh::validate_ingress_capture_addr(capture_addr)?;
+            capture_contract.ingress_capture_port = capture_addr.port();
         }
-        // The redirect steers to the relay's inbound listener, so an excluded
-        // relay port is a contradiction: the guard that keeps the relay's own
-        // listener reachable is the classifier's `dst_port == relay_port`
-        // bypass, and the port must be a real listener.
-        if capture_contract.ingress_redirect_enabled() && capture_contract.hbone_redirect_port == 0
+        // Fail closed on the whole port contract before anything is attached.
+        capture_contract.validate_ingress_redirect()?;
+        // The redirect is armed only when every precondition holds; if the
+        // operator asked for it and it did not arm, that is a bug in the gate
+        // above rather than a silent downgrade, so refuse to start.
+        if !capture_contract.ingress_redirect_ifaces.is_empty()
+            && !capture_contract.ingress_redirect_enabled()
         {
             return Err(
-                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires a non-zero \
-                 FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT to steer captured inbound traffic into"
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES is set but the inbound tc ingress \
+                 redirect could not be armed; refusing to start rather than silently leaving \
+                 inbound capture on the previous datapath"
                     .to_string(),
             );
         }
@@ -417,15 +425,17 @@ fn node_agent_ingress_redirect_ifaces_from_env() -> Vec<String> {
 /// Whether this node is configured for the NodeWaypoint inbound tc ingress
 /// redirect.
 ///
-/// Read by the **mesh proxy** (not just the node-agent) to decide whether its
-/// inbound relay listener must bind `IP_TRANSPARENT`: the redirect preserves
-/// the packet's original destination, so the accepted socket's local address is
+/// Read by the **mesh proxy** (not just the node-agent) to decide whether to
+/// emit its transparent inbound CAPTURE listener: the redirect preserves the
+/// packet's original destination, so that listener's accepted socket carries
 /// the workload's `podIP:appPort` and replies can only be routed from a
 /// transparent socket. Both processes read the same operator variable, so there
 /// is no IPC to keep in sync — mirroring the pinned-path / registry-dir
-/// contracts the node-waypoint datapath already uses.
+/// contracts the node-waypoint datapath already uses. The PORT contract is
+/// likewise single-sourced, from `FERRUM_MESH_INBOUND_LISTEN_ADDR`
+/// (`crate::modes::mesh::node_waypoint_ingress_capture_addr`).
 ///
-/// Evaluated once per listener bind at startup, never on a request path.
+/// Evaluated once per listener plan / startup, never on a request path.
 pub fn node_waypoint_ingress_redirect_configured() -> bool {
     !node_agent_ingress_redirect_ifaces_from_env().is_empty()
 }
@@ -481,7 +491,7 @@ fn pod_inbound_redirect_ports_from_spec(spec: Option<&PodSpec>) -> Vec<u16> {
 /// conventional tables so a co-resident Istio is unaffected.
 ///
 /// Pure so the exact rule/route shape is unit-testable without root.
-fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> {
+pub(crate) fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> {
     let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
     let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
     let mark = format!("{NODE_WAYPOINT_INGRESS_REDIRECT_MARK:#x}");
@@ -520,7 +530,7 @@ fn ingress_redirect_routing_commands(ipv6: bool) -> Vec<Vec<String>> {
 ///
 /// Deletion names the exact priority + table (never `flush`, never a
 /// lookup-only match), so a co-resident routing policy is never disturbed.
-fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<String>> {
+pub(crate) fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<String>> {
     let ip_family: &[&str] = if ipv6 { &["-6"] } else { &[] };
     let default_route = if ipv6 { "::/0" } else { "0.0.0.0/0" };
     let table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE.to_string();
@@ -6326,7 +6336,8 @@ fn initialize_backend_after_load(
         }
         info!(
             ifaces = ?config.capture_contract.ingress_redirect_ifaces,
-            relay_port = config.capture_contract.hbone_redirect_port,
+            capture_port = config.capture_contract.ingress_capture_port,
+            hbone_port = config.capture_contract.hbone_redirect_port,
             mark = format!("{:#x}", config.capture_contract.node_waypoint_ingress_redirect_mark),
             table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
             "NodeWaypoint inbound tc ingress redirect installed; enrolled workloads no longer \
@@ -7374,23 +7385,41 @@ mod tests {
         );
 
         contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+        // Still not armed: the steer target is the transparent inbound CAPTURE
+        // listener, and without its port there is no socket to assign.
+        assert!(!contract.ingress_redirect_enabled());
+
+        contract.ingress_capture_port = crate::ebpf::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
         assert!(contract.ingress_redirect_enabled());
+        let published = contract.bpf_capture_config();
         assert_eq!(
-            contract
-                .bpf_capture_config()
-                .node_waypoint_ingress_redirect_mark,
+            published.node_waypoint_ingress_redirect_mark,
             NODE_WAYPOINT_INGRESS_REDIRECT_MARK
         );
-        assert!(contract.bpf_capture_config().ingress_redirect_armed());
+        assert_eq!(
+            published.node_waypoint_ingress_capture_port,
+            crate::ebpf::NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+        );
+        assert_ne!(
+            published.node_waypoint_ingress_capture_port, published.hbone_redirect_port,
+            "the kernel must steer at the capture listener, never at the HBONE listener"
+        );
+        assert!(published.ingress_redirect_armed());
 
-        // Local-pod mode has no inbound relay, so the redirect stays disarmed
-        // even with interfaces and a mark configured.
+        // Local-pod mode has no capture listener, so the redirect stays disarmed
+        // even with interfaces, a mark, and a port configured.
         contract.proxy_mode = NodeAgentProxyMode::LocalPod;
         assert!(!contract.ingress_redirect_enabled());
         assert_eq!(
             contract
                 .bpf_capture_config()
                 .node_waypoint_ingress_redirect_mark,
+            0
+        );
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_capture_port,
             0
         );
     }

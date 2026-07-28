@@ -1,5 +1,5 @@
 //! tc **ingress** redirect — steer inbound traffic for enrolled NodeWaypoint
-//! workloads into the node's local HBONE relay.
+//! workloads into the node's local transparent inbound **capture** listener.
 //!
 //! This is the eBPF-owned replacement for the node-global `nat PREROUTING -j
 //! REDIRECT` rule that the iptables fallback installs. Where that rule rewrites
@@ -12,18 +12,31 @@
 //! ## Mechanism: `bpf_sk_assign`, not NAT
 //!
 //! The packet's addresses are **never rewritten**. Instead the program looks up
-//! the NodeWaypoint inbound listener and attaches it to the skb with
-//! `bpf_sk_assign()`, then stamps `skb->mark` with the configured redirect mark
-//! so the node-agent's policy-routing rule (`ip rule fwmark <mark> lookup
-//! <table>` + `ip route add local default dev lo table <table>`) delivers the
-//! packet locally instead of forwarding it on to the pod.
+//! the NodeWaypoint **transparent inbound capture** listener and attaches it to
+//! the skb with `bpf_sk_assign()`, then stamps `skb->mark` with the configured
+//! redirect mark so the node-agent's policy-routing rule (`ip rule fwmark
+//! <mark> lookup <table>` + `ip route add local default dev lo table <table>`)
+//! delivers the packet locally instead of forwarding it on to the pod.
 //!
 //! Preserving the addresses is what preserves the **original destination
-//! metadata** for free: the relay's accepted socket reports the workload's real
-//! `podIP:appPort` from `getsockname()`, with no conntrack table, no reverse
-//! NAT, and no checksum rewriting. The listener must be bound
+//! metadata** for free: the capture listener's accepted socket reports the
+//! workload's real `podIP:appPort` from `getsockname()`, with no conntrack
+//! table, no reverse NAT, and no checksum rewriting. The listener is bound
 //! `IP_TRANSPARENT`/`IPV6_TRANSPARENT` so its replies may be sourced from the
 //! pod address it is terminating on behalf of.
+//!
+//! ## The steer target is the capture listener, NOT the HBONE listener
+//!
+//! `node_waypoint_ingress_capture_port` is deliberately distinct from
+//! `hbone_redirect_port`. HBONE (`:15008`) terminates authenticated HTTP/2
+//! CONNECT over verified mesh mTLS; the bytes this program steers are ordinary
+//! plaintext application traffic (or the application's own TLS). `IP_TRANSPARENT`
+//! preserves addresses — it does not transform a payload — so steering these
+//! bytes at the HBONE listener would attempt a mesh TLS handshake on application
+//! data and fail. The capture listener is a separate protocol boundary: a
+//! plaintext L4 relay that recovers the original destination and re-enters mesh
+//! inbound routing under the PeerAuthentication and authorization gates. Both
+//! ports are bypassed below so neither listener is ever fed its own traffic.
 //!
 //! ## Ordering: existing flow first, listener second
 //!
@@ -36,21 +49,33 @@
 //!
 //! ## Loop and self-capture prevention
 //!
-//! Three independent guards, any one of which returns the packet untouched:
+//! Four independent guards, any one of which returns the packet untouched:
 //!
 //! 1. `skb->mark == node_waypoint_inbound_auth_mark` — the relay's own
 //!    authorized dial back down to the local backend pod. Redirecting it would
 //!    feed the relay its own traffic forever.
 //! 2. `skb->mark == node_waypoint_ingress_redirect_mark` — this program already
 //!    handled the packet (or a peer hook did); never redirect twice.
-//! 3. `dst_port == hbone_redirect_port` — traffic already aimed at the relay
-//!    listener, including peer-to-peer HBONE, must reach it directly.
+//! 3. `dst_port == node_waypoint_ingress_capture_port` — traffic already aimed
+//!    at the capture listener must reach it directly.
+//! 4. `dst_port == hbone_redirect_port` — peer-to-peer HBONE must reach the
+//!    HBONE listener directly and must never be re-steered as plaintext.
+//!
+//! ## Fragments are never parsed
+//!
+//! An IPv4 datagram with More-Fragments set or a non-zero fragment offset has
+//! no trustworthy L4 header: only the first fragment carries the TCP ports, and
+//! a non-first fragment's payload begins with arbitrary application bytes that
+//! would be read as ports at `IHL`. Both are declined (`TC_ACT_OK`) before any
+//! port is read, so a crafted fragment can neither be steered nor dropped as
+//! some other flow. IPv6 stays fail-safe the same way: only a bare TCP
+//! next-header is parsed, so a fragment or extension header passes through.
 //!
 //! ## Fail-closed
 //!
 //! A packet that IS in scope (enrolled pod, opted in, declared port) but for
-//! which no relay socket can be found is **dropped**, not delivered. Delivering
-//! it would silently bypass `mesh_authz` for exactly the traffic the operator
+//! which no capture-listener socket can be found is **dropped**, not
+//! delivered. Delivering it would silently bypass `mesh_authz` for exactly the traffic the operator
 //! asked to capture. Out-of-scope packets are never dropped by this program —
 //! the pre-existing `ferrum_tc_inbound` direct-pod guard remains the authority
 //! for those.
@@ -71,7 +96,8 @@ use aya_ebpf::helpers::{bpf_sk_assign, bpf_sk_release, bpf_skc_lookup_tcp};
 use aya_ebpf::macros::classifier;
 use aya_ebpf::programs::TcContext;
 use ferrum_ebpf_common::{
-    BpfCaptureConfig, CidrKey6, InboundRedirectKey4, InboundRedirectKey6, FERRUM_CAPTURE_CONFIG_KEY,
+    ipv4_is_fragment, BpfCaptureConfig, CidrKey6, InboundRedirectKey4, InboundRedirectKey6,
+    FERRUM_CAPTURE_CONFIG_KEY,
 };
 
 use crate::maps::{
@@ -121,7 +147,9 @@ pub fn ferrum_tc_ingress_redirect(ctx: TcContext) -> i32 {
 #[derive(Clone, Copy)]
 struct RedirectConfig {
     config: BpfCaptureConfig,
-    relay_port: u16,
+    /// The transparent inbound **capture** listener port — the steer target.
+    /// Never `hbone_redirect_port`; see the module docs.
+    capture_port: u16,
     redirect_mark: u32,
 }
 
@@ -139,7 +167,7 @@ fn redirect_config() -> Option<RedirectConfig> {
     }
     Some(RedirectConfig {
         config: *config,
-        relay_port: config.hbone_redirect_port as u16,
+        capture_port: config.node_waypoint_ingress_capture_port as u16,
         redirect_mark: config.node_waypoint_ingress_redirect_mark,
     })
 }
@@ -173,6 +201,18 @@ fn redirect_ipv4(ctx: &mut TcContext, config: &RedirectConfig) -> Result<i32, i6
         return Ok(TC_ACT_OK);
     }
 
+    // Fragments carry no trustworthy L4 header. Checked BEFORE the ports are
+    // read at all: a non-first fragment's payload begins with arbitrary
+    // application bytes, so reading "ports" there could steer — or, worse,
+    // fail-closed DROP — a packet belonging to an entirely different flow.
+    // Declining both the first fragment (its successors would not follow it
+    // into the relay) and every later one is the only answer that cannot
+    // misattribute a packet.
+    let flags_frag_off_be: u16 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
+    if ipv4_is_fragment(u16::from_be(flags_frag_off_be)) {
+        return Ok(TC_ACT_OK);
+    }
+
     // Honor the IHL so options-bearing headers still locate the TCP ports.
     let version_ihl: u8 = ctx.load(ETH_HDR_LEN).map_err(|_| -1i64)?;
     let ihl = ((version_ihl & 0x0f) as usize) * 4;
@@ -203,8 +243,9 @@ fn redirect_ipv4(ctx: &mut TcContext, config: &RedirectConfig) -> Result<i32, i6
         return Ok(TC_ACT_OK);
     }
 
-    // In scope from here on: the packet is either assigned to a relay socket or
-    // dropped. It is never delivered to the pod unredirected.
+    // In scope from here on: the packet is either assigned to a
+    // capture-listener socket or dropped. It is never delivered to the pod
+    // unredirected.
     let mut tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
     tuple.__bindgen_anon_1.ipv4.saddr = src_ip;
     tuple.__bindgen_anon_1.ipv4.daddr = dst_ip;
@@ -222,12 +263,12 @@ fn redirect_ipv4(ctx: &mut TcContext, config: &RedirectConfig) -> Result<i32, i6
     }
 
     // Wildcard listener lookup: a zero destination address matches a listener
-    // bound to `0.0.0.0`, which is how the relay's inbound listener binds.
+    // bound to `0.0.0.0`, which is how the capture listener binds.
     let mut listen_tuple: bpf_sock_tuple = unsafe { mem::zeroed() };
     listen_tuple.__bindgen_anon_1.ipv4.saddr = 0;
     listen_tuple.__bindgen_anon_1.ipv4.daddr = 0;
     listen_tuple.__bindgen_anon_1.ipv4.sport = 0;
-    listen_tuple.__bindgen_anon_1.ipv4.dport = config.relay_port.to_be();
+    listen_tuple.__bindgen_anon_1.ipv4.dport = config.capture_port.to_be();
 
     let listener = lookup_socket(ctx, &mut listen_tuple, tuple_len_v4());
     Ok(assign_listener_or_drop(ctx, listener, config))
@@ -298,16 +339,16 @@ fn redirect_ipv6(ctx: &mut TcContext, config: &RedirectConfig) -> Result<i32, i6
     listen_tuple.__bindgen_anon_1.ipv6.saddr = [0u32; 4];
     listen_tuple.__bindgen_anon_1.ipv6.daddr = [0u32; 4];
     listen_tuple.__bindgen_anon_1.ipv6.sport = 0;
-    listen_tuple.__bindgen_anon_1.ipv6.dport = config.relay_port.to_be();
+    listen_tuple.__bindgen_anon_1.ipv6.dport = config.capture_port.to_be();
 
     let listener = lookup_socket(ctx, &mut listen_tuple, tuple_len_v6());
     Ok(assign_listener_or_drop(ctx, listener, config))
 }
 
 /// Socket lookup in the **current** network namespace. The tc hook runs in the
-/// host netns where the NodeWaypoint relay listens, so `BPF_F_CURRENT_NETNS`
-/// scopes the lookup to exactly the relay this node owns — never a socket in a
-/// pod netns.
+/// host netns where the NodeWaypoint capture listener binds, so
+/// `BPF_F_CURRENT_NETNS` scopes the lookup to exactly the listener this node
+/// owns — never a socket in a pod netns.
 #[inline(always)]
 fn lookup_socket(
     ctx: &TcContext,
@@ -351,11 +392,11 @@ fn assign_and_release(
     TC_ACT_OK
 }
 
-/// Assign the relay's **listening** socket, or drop.
+/// Assign the capture listener's **listening** socket, or drop.
 ///
-/// A null lookup (relay not listening yet, or listening on a different port
-/// than the capture config claims) and a non-listening result are both hard
-/// failures for an in-scope packet: there is no safe way to deliver it.
+/// A null lookup (capture listener not up yet, or listening on a different
+/// port than the capture config claims) and a non-listening result are both
+/// hard failures for an in-scope packet: there is no safe way to deliver it.
 #[inline(always)]
 fn assign_listener_or_drop(
     ctx: &mut TcContext,

@@ -30,8 +30,9 @@ use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
 pub use ferrum_ebpf_common::{
     INCLUDE_PORTS_MAX, IncludePortsPolicy, NODE_WAYPOINT_INBOUND_AUTH_MARK,
-    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
-    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, POD_CAPTURE_FLAG_INBOUND_REDIRECT, WorkloadIdentity,
+    NODE_WAYPOINT_INGRESS_CAPTURE_PORT, NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+    NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY, NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+    POD_CAPTURE_FLAG_INBOUND_REDIRECT, WorkloadIdentity,
 };
 
 pub const NODE_AGENT_CAPTURE_STATE_STARTING: &str = "starting";
@@ -221,16 +222,75 @@ pub struct CaptureContract {
     /// `skb->mark` used for local delivery of redirected inbound packets. Zero
     /// (the default) disarms the kernel-side redirect entirely.
     pub node_waypoint_ingress_redirect_mark: u32,
+    /// TCP port of the proxy's transparent inbound **capture** listener — the
+    /// redirect's steer target, read from the same
+    /// `FERRUM_MESH_INBOUND_LISTEN_ADDR` the proxy binds so the two processes
+    /// cannot drift. Zero disarms the redirect.
+    ///
+    /// Never [`Self::hbone_redirect_port`]: HBONE terminates authenticated H2
+    /// CONNECT over mesh mTLS, while captured traffic is raw application bytes.
+    /// [`Self::validate_ingress_redirect`] rejects a configuration that
+    /// collapses the two.
+    pub ingress_capture_port: u16,
 }
 
 impl CaptureContract {
     /// `true` when the inbound tc ingress redirect should be installed: it is
-    /// NodeWaypoint-only (local-pod mode has no relay to steer into), needs at
-    /// least one capture interface, and needs a non-zero delivery mark.
+    /// NodeWaypoint-only (local-pod mode has no capture listener to steer
+    /// into), needs at least one capture interface, a non-zero delivery mark,
+    /// and a non-zero capture listener port.
     pub fn ingress_redirect_enabled(&self) -> bool {
         self.proxy_mode == NodeAgentProxyMode::NodeWaypoint
             && self.node_waypoint_ingress_redirect_mark != 0
+            && self.ingress_capture_port != 0
             && !self.ingress_redirect_ifaces.is_empty()
+    }
+
+    /// Fail-closed validation of the ingress-redirect port contract, run at
+    /// node-agent startup before anything is attached.
+    ///
+    /// The node-agent and the mesh proxy are separate processes in the same
+    /// DaemonSet; they agree on the capture port only because both read
+    /// `FERRUM_MESH_INBOUND_LISTEN_ADDR`. This check makes a disagreement (or a
+    /// port collision that would make the datapath ambiguous) a startup error
+    /// rather than a silent black hole.
+    pub fn validate_ingress_redirect(&self) -> Result<(), String> {
+        if self.ingress_redirect_ifaces.is_empty() {
+            return Ok(());
+        }
+        if self.proxy_mode != NodeAgentProxyMode::NodeWaypoint {
+            return Err(format!(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires \
+                 FERRUM_NODE_AGENT_PROXY_MODE=node_waypoint (got {}); only NodeWaypoint runs the \
+                 transparent inbound capture listener the redirect steers into",
+                self.proxy_mode
+            ));
+        }
+        if self.ingress_capture_port == 0 {
+            return Err(
+                "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires a non-zero port in \
+                 FERRUM_MESH_INBOUND_LISTEN_ADDR: that is the transparent inbound capture \
+                 listener the redirect steers captured traffic into"
+                    .to_string(),
+            );
+        }
+        if self.ingress_capture_port == self.hbone_redirect_port {
+            return Err(format!(
+                "the NodeWaypoint inbound capture port ({}) must differ from the HBONE port \
+                 (FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT={}). HBONE terminates authenticated \
+                 HTTP/2 CONNECT over mesh mTLS; captured traffic is raw application bytes, so \
+                 steering it at the HBONE listener would fail the mesh TLS handshake",
+                self.ingress_capture_port, self.hbone_redirect_port
+            ));
+        }
+        if self.ingress_capture_port == self.outbound_capture_port {
+            return Err(format!(
+                "the NodeWaypoint inbound capture port ({}) must differ from the outbound \
+                 capture port ({})",
+                self.ingress_capture_port, self.outbound_capture_port
+            ));
+        }
+        Ok(())
     }
 
     pub fn new(
@@ -266,6 +326,7 @@ impl CaptureContract {
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
+            ingress_capture_port: 0,
         })
     }
 
@@ -280,6 +341,7 @@ impl CaptureContract {
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
+            ingress_capture_port: 0,
         }
     }
 
@@ -292,15 +354,23 @@ impl CaptureContract {
         // precondition holds (NodeWaypoint, a capture interface to attach to,
         // and a configured mark). Publishing it otherwise would arm a kernel
         // datapath whose local-delivery routing was never installed.
-        let ingress_redirect_mark = if self.ingress_redirect_enabled() {
-            self.node_waypoint_ingress_redirect_mark
+        //
+        // The capture PORT is published on the same all-or-nothing condition:
+        // a port without a mark (or vice versa) would leave the classifier
+        // half-configured, and `ingress_redirect_armed()` requires both.
+        let (ingress_redirect_mark, ingress_capture_port) = if self.ingress_redirect_enabled() {
+            (
+                self.node_waypoint_ingress_redirect_mark,
+                self.ingress_capture_port,
+            )
         } else {
-            0
+            (0, 0)
         };
         BpfCaptureConfig::new(self.outbound_capture_port, self.hbone_redirect_port)
             .with_ipv6_outbound_deny(self.ipv6_outbound_deny)
             .with_node_waypoint_inbound_auth_mark(inbound_auth_mark)
             .with_node_waypoint_ingress_redirect_mark(ingress_redirect_mark)
+            .with_node_waypoint_ingress_capture_port(ingress_capture_port)
     }
 }
 
@@ -1342,6 +1412,75 @@ mod tests {
             BpfCaptureConfig::new(16001, 16008)
                 .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
         );
+    }
+
+    #[test]
+    fn ingress_redirect_port_contract_fails_closed() {
+        let mut contract = CaptureContract::new(
+            NodeAgentProxyMode::NodeWaypoint,
+            OUTBOUND_CAPTURE_PORT,
+            INBOUND_HBONE_PORT,
+            "/tmp/ferrum.sock",
+        )
+        .unwrap();
+
+        // Redirect not requested: nothing to validate, and nothing published.
+        assert!(contract.validate_ingress_redirect().is_ok());
+        assert!(!contract.ingress_redirect_enabled());
+
+        contract.ingress_redirect_ifaces = vec!["eth0".to_string()];
+        contract.node_waypoint_ingress_redirect_mark = NODE_WAYPOINT_INGRESS_REDIRECT_MARK;
+
+        // Requested but with no capture listener port: the proxy would never
+        // bind a socket for the classifier to assign, so in-scope traffic would
+        // be dropped. Startup must refuse.
+        contract.ingress_capture_port = 0;
+        let error = contract.validate_ingress_redirect().unwrap_err();
+        assert!(
+            error.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"),
+            "the error must name the variable both processes read: {error}"
+        );
+        assert!(
+            !contract.ingress_redirect_enabled(),
+            "a missing capture port must leave the redirect disarmed"
+        );
+        assert_eq!(
+            contract
+                .bpf_capture_config()
+                .node_waypoint_ingress_redirect_mark,
+            0,
+            "a disarmed redirect must publish no mark to the kernel"
+        );
+
+        // The HBONE port is NOT a legal capture port — that collapse is the
+        // protocol-boundary bug this contract exists to prevent.
+        contract.ingress_capture_port = INBOUND_HBONE_PORT;
+        let error = contract.validate_ingress_redirect().unwrap_err();
+        assert!(error.contains("HBONE"), "{error}");
+
+        // Nor is the outbound capture port.
+        contract.ingress_capture_port = OUTBOUND_CAPTURE_PORT;
+        assert!(contract.validate_ingress_redirect().is_err());
+
+        // A distinct capture port is the supported configuration.
+        contract.ingress_capture_port = NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
+        assert!(contract.validate_ingress_redirect().is_ok());
+        assert!(contract.ingress_redirect_enabled());
+        let published = contract.bpf_capture_config();
+        assert_eq!(
+            published.node_waypoint_ingress_capture_port,
+            NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+        );
+        assert_ne!(
+            published.node_waypoint_ingress_capture_port, published.hbone_redirect_port,
+            "the kernel must steer at the capture listener, never at HBONE"
+        );
+        assert!(published.ingress_redirect_armed());
+
+        // Local-pod mode has no capture listener at all.
+        contract.proxy_mode = NodeAgentProxyMode::LocalPod;
+        assert!(contract.validate_ingress_redirect().is_err());
+        assert!(!contract.ingress_redirect_enabled());
     }
 
     #[test]

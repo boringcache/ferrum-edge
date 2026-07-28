@@ -299,6 +299,17 @@ pub(crate) struct MeshTcpInboundEntry {
     /// Postgres), where peeking would block the relay on the handshake clock
     /// before the backend greeting can arrive.
     pub(crate) first_bytes_inspect: bool,
+    /// `SO_MARK` to stamp on the backend dial, or `None` for an unmarked dial.
+    ///
+    /// `None` for the Sidecar loopback routes built here: the app shares the
+    /// pod netns and there is no per-pod guard to satisfy. The NodeWaypoint
+    /// transparent inbound capture relay synthesizes its own entry with
+    /// `Some(NODE_WAYPOINT_INBOUND_AUTH_MARK)`, because its dial leaves the
+    /// host netns and must be recognized by the pod-veth `ferrum_tc_inbound`
+    /// guard as an authorized relay dial rather than dropped as direct pod
+    /// traffic — and by `ferrum_tc_ingress_redirect` as already-relayed, so it
+    /// is never steered back into the capture listener in a loop.
+    pub(crate) socket_mark: Option<u32>,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -2246,6 +2257,9 @@ impl RouterCache {
                         service_fqdn: route.service_fqdn.clone(),
                         tls_inspect: route.tls_inspect,
                         first_bytes_inspect: route.first_bytes_inspect,
+                        // Sidecar loopback dial: same netns as the app, no
+                        // per-pod eBPF guard to satisfy.
+                        socket_mark: None,
                     })
                 });
             }

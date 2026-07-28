@@ -386,29 +386,83 @@ kubelet health checking never depends on the relay being up. A pod that declares
 no inbound TCP port is never flagged, and traffic to an enrolled pod on an
 undeclared port is left to the direct-pod guard.
 
+Fragmented IPv4 datagrams are declined outright, before any port is read: only
+the first fragment carries the TCP ports at all, and a *non-first* fragment's
+payload begins with arbitrary application bytes that would otherwise be parsed
+as ports at `IHL` and could be made to match any declared `(pod, port)` pair.
+Both the More-Fragments and non-zero-offset cases return `TC_ACT_OK`, so a
+crafted fragment can neither be steered nor dropped as some other flow. IPv6
+stays fail-safe the same way: only a bare TCP next-header is parsed, so a
+fragment or extension-header chain passes through to the direct-pod guard.
+
 **No NAT, and original destination metadata is preserved for free.** The packet's
-addresses are never rewritten. The classifier resolves a relay socket and
-attaches it to the skb with `bpf_sk_assign()`, so the relay's accepted socket
+addresses are never rewritten. The classifier resolves the capture listener's
+socket and attaches it to the skb with `bpf_sk_assign()`, so the accepted socket
 reports the workload's real `podIP:appPort` from `getsockname()` — no conntrack
 table, no reverse NAT, no checksum rewriting. An already-established flow is
 assigned back to its own socket before the listener is considered, so mid-flow
 packets are never re-dispatched.
 
+#### The steer target is a capture listener, not the HBONE listener
+
+The redirect steers into a **dedicated transparent inbound capture listener**,
+bound on `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default `0.0.0.0:15006`, which
+NodeWaypoint topology otherwise leaves unused). It is deliberately **not** the
+HBONE listener on `:15008`.
+
+HBONE terminates authenticated HTTP/2 CONNECT over verified mesh mTLS. What the
+redirect carries is ordinary application traffic — plaintext HTTP, Redis,
+Postgres, or the application's own TLS — and `IP_TRANSPARENT` preserves
+addresses; it does not transform a payload. Steering captured bytes at the HBONE
+listener would attempt a mesh TLS handshake on application data and fail. The
+two listeners are separate protocol boundaries, and both ports are in the
+classifier's bypass set so neither is ever fed its own traffic.
+
+The capture listener terminates nothing. It:
+
+1. recovers the original destination from `getsockname()` (there is no NAT to
+   consult) and refuses anything that carries no captured destination — it is
+   not a general-purpose relay anyone on the node may address;
+2. consults the **live PeerAuthentication posture for the recovered app port**
+   (the same `modes_by_port` table the mesh inbound TLS selector reads). Direct
+   captured plaintext is admitted only where that posture permits it: under
+   `STRICT` it is refused and the peer must arrive over authenticated mesh
+   transport instead. Enabling the redirect therefore does not weaken STRICT;
+3. applies the same open-relay guard as the inbound HBONE relay — the
+   destination must be a slice-declared in-mesh workload address and port;
+4. runs the L4 `on_stream_connect` chain, including the mesh-injected
+   `__mesh_authz`, with the captured **app** port as the authorization
+   destination, then relays byte-for-byte. Application TLS is carried opaquely
+   and is never mistaken for mesh TLS.
+
+The backend dial carries `SO_MARK = 0x734`, so the pod-veth `ferrum_tc_inbound`
+guard admits it as an authorized relay dial and the ingress redirect bypasses it
+as already-relayed instead of steering it back in a loop.
+
 Because the accepted socket's local address is the pod's (not an address
-configured on the host), the NodeWaypoint inbound relay listener binds
-`IP_TRANSPARENT` / `IPV6_TRANSPARENT` whenever this variable is set — the kernel
-otherwise refuses to route a reply from a non-local source. The mesh proxy reads
-the same operator variable the node-agent does, so there is no IPC to keep in
-sync; the Helm chart therefore renders
-`FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` into **both** the node-agent
-DaemonSet and the ambient NodeWaypoint DaemonSet from the single
-`nodeAgent.ingressRedirectIfaces` value. Setting it by hand outside the chart
-means setting it on both pods: a redirect whose relay listener is not
-transparent accepts inbound SYNs it can never answer. For the same reason
+configured on the host), the capture listener — and **only** that listener —
+binds `IP_TRANSPARENT` / `IPV6_TRANSPARENT`; the kernel otherwise refuses to
+route a reply from a non-local source. The capability is never conferred on the
+HBONE or admin listeners. It must bind a **wildcard** address, because
+`bpf_sk_assign` resolves it with a wildcard socket lookup; a specific-IP bind is
+invisible to the classifier and the node-agent refuses to start rather than
+black-hole every captured connection.
+
+The mesh proxy reads the same operator variables the node-agent does, so there
+is no IPC to keep in sync: `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` decides
+whether the capture listener exists at all, and `FERRUM_MESH_INBOUND_LISTEN_ADDR`
+is the single source of truth for its port on both sides. The Helm chart renders
+both into **both** the node-agent DaemonSet and the ambient NodeWaypoint
+DaemonSet from the single `nodeAgent.ingressRedirectIfaces` value. Setting them
+by hand outside the chart means setting them on both pods. Startup fails closed
+if the two contracts cannot agree: the node-agent rejects a zero, non-wildcard,
+HBONE-colliding, or outbound-capture-colliding capture port before it attaches
+anything, and a capture listener that cannot bind (including a failed
+`IP_TRANSPARENT`) fails the proxy's listener readiness. For the same reason
 `nodeAgent.ingressRedirectIfaces` requires `ambient.enabled=true` with
-`ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint` — the redirect fails closed,
-so enabling it without a relay on the node would drop all in-scope inbound
-traffic.
+`ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint` — the redirect fails closed, so
+enabling it without a capture listener on the node would drop all in-scope
+inbound traffic.
 
 Assigned packets still need to be classified as locally deliverable, so the
 node-agent installs a Ferrum-owned policy route per family:
@@ -431,17 +485,18 @@ and refuses readiness rather than serving a half-installed redirect. The image
 therefore needs `iproute2` (`ip`) and `NET_ADMIN` — the same capability the
 existing tc and cgroup attachments already require. No new privilege is added.
 
-**Loop and self-capture prevention** — three independent guards, any of which
+**Loop and self-capture prevention** — four independent guards, any of which
 returns the packet untouched:
 
 | Guard | Why |
 |---|---|
 | `skb->mark == 0x734` (relay auth mark) | The relay's own authorized dial down to the local backend pod; redirecting it would feed the relay its own traffic. |
 | `skb->mark == 0x735` (redirect mark) | Already redirected by this program; never redirect twice. |
-| `dst_port == hbone_redirect_port` | Already addressed to the relay listener (peer-to-peer HBONE included). |
+| `dst_port == ingress capture port` | Already addressed to the capture listener — the self-capture guard proper. |
+| `dst_port == hbone_redirect_port` | Peer-to-peer HBONE, which must reach the HBONE listener directly and must never be re-steered as plaintext. |
 
-**Fail-closed.** A packet that IS in scope but for which no relay socket
-resolves is dropped, not delivered — delivering it would silently bypass
+**Fail-closed.** A packet that IS in scope but for which no capture-listener
+socket resolves is dropped, not delivered — delivering it would silently bypass
 `mesh_authz` for exactly the traffic the operator asked to capture. Out-of-scope
 packets are never dropped by this program.
 
@@ -462,26 +517,43 @@ eBPF-capable node no longer has to accept node-global REDIRECT semantics to get
 an inbound capture path.
 
 Like the rest of the in-netns datapath this is Linux-only and gated by
-live-kernel CI. The `ebpf-live` job load/verifies the program on a real kernel
-(the only way to check the `bpf_skc_lookup_tcp` / `bpf_sk_assign` /
-`bpf_sk_release` reference-tracking rules the verifier enforces on every
-branch), attaches and detaches it on a scratch veth tc ingress hook — asserting
-the classifier is present after attach and absent after detach, and that a
-second detach is a clean no-op — and round-trips both address families of the
-scope maps through write, narrow, and clear. The decision table itself is
-unit-tested in `ferrum-ebpf-common`.
+live-kernel CI. The required `ebpf-live` job:
 
-**What is not yet covered: end-to-end packet steering.** No live test drives a
-real TCP connection through the redirect into a transparent listener and back;
-that needs a live multi-pod node and belongs in the `node-waypoint-ebpf-live`
-workflow. Until it lands, treat this opt-in as unproven end to end — which is
-why it is default-off and why the iptables fallback is retained. Two further
-residual risks: the `ip rule` priority is below `main` and the table is
-Ferrum-owned, but a cluster running its own low-priority rules could still
-order ahead of it (verified only by the rule-shape unit tests); and the attach
-point is operator-supplied, so naming the wrong interface yields no redirect
-(traffic simply never reaches the hook) rather than a wrong one, with no
-auto-detection or validation.
+- load/verifies the program on a real kernel — the only way to check the
+  `bpf_skc_lookup_tcp` / `bpf_sk_assign` / `bpf_sk_release` reference-tracking
+  rules the verifier enforces on every branch;
+- attaches and detaches it on a scratch veth tc ingress hook, asserting the
+  classifier is present after attach, absent after detach, and that a second
+  detach is a clean no-op;
+- round-trips both address families of the scope maps through write, narrow,
+  and clear;
+- and **drives a real TCP flow end to end**: a client in a scratch network
+  namespace connects to a pod address that is configured nowhere on the host,
+  the classifier steers the flow into the transparent capture listener, the
+  relay asserts the original destination it observes on the accepted socket is
+  exactly that `podIP:appPort`, replies, and the reply reaches the client —
+  which is only possible because the socket is transparent. It then detaches,
+  clears the scope, and asserts the same dial is no longer steered, covering
+  cleanup as well as the happy path. The production `ip rule` / `ip route`
+  argument vectors are taken from the node-agent itself, so the test proves the
+  shipped routing shape actually delivers.
+
+The decision table — arming, scope, all four loop-prevention bypasses, and the
+IPv4 fragment gate — is unit-tested in `ferrum-ebpf-common`, and the port
+contract (`validate_ingress_redirect`, wildcard capture address) in
+`src/ebpf/mod.rs` and `src/modes/mesh/mod.rs`.
+
+Every prerequisite the live datapath test needs routes through the same
+skip-or-fail gate as the rest of the live suite, so under
+`FERRUM_LIVE_TESTS_REQUIRED=1` a runner or kernel that cannot support the
+mechanism fails the gate rather than reporting the feature ready.
+
+Residual risks: the `ip rule` priority is below `main` and the table is
+Ferrum-owned, but a cluster running its own low-priority rules could still order
+ahead of it (verified only by the rule-shape unit tests); and the attach point is
+operator-supplied, so naming the wrong interface yields no redirect (traffic
+simply never reaches the hook) rather than a wrong one, with no auto-detection
+or validation.
 
 Because the relay dials backend pods from a node-local source address, at least
 one trusted node source IP (`FERRUM_NODE_AGENT_NODE_IP` /

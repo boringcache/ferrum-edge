@@ -55,6 +55,7 @@ pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
 pub mod netns_udp_capture;
+pub(crate) mod node_waypoint_ingress_capture;
 pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;
@@ -2120,6 +2121,67 @@ fn build_inbound_hbone_relay_proxy(
     Some(Arc::new(
         crate::modes::mesh::mesh_inbound_hbone_relay_proxy(host, port),
     ))
+}
+
+/// Build the captured-inbound relay entry for a NodeWaypoint connection the
+/// eBPF tc ingress redirect steered into the transparent capture listener
+/// (issue #3287).
+///
+/// NodeWaypoint materializes no inbound routes (its inbound surface is the
+/// HBONE relay), so the relay target is synthesized per connection from the
+/// recovered original destination — the direct-plaintext counterpart of
+/// [`build_inbound_hbone_relay_proxy`], and gated by the **same** open-relay
+/// guard: the destination must be a slice-declared in-mesh workload address and
+/// port. Returns `None` when it is not, and the caller closes the connection.
+///
+/// The dial is marked `NODE_WAYPOINT_INBOUND_AUTH_MARK` so the pod-veth
+/// `ferrum_tc_inbound` guard admits it as an authorized relay dial, and the
+/// ingress redirect bypasses it as already-relayed instead of steering it back
+/// into the capture listener.
+pub(crate) fn build_node_waypoint_capture_relay_entry(
+    orig_dst: SocketAddr,
+    epoch: &crate::request_epoch::RequestEpoch,
+) -> Option<Arc<crate::router_cache::MeshTcpInboundEntry>> {
+    let mesh = epoch.config.mesh.as_deref()?;
+    let host = orig_dst.ip().to_string();
+    if !inbound_hbone_relay_destination_allowed(&host, orig_dst.port(), Some(mesh)) {
+        return None;
+    }
+    // Name the relay after the owning workload when the slice declares one, so
+    // the synthesized proxy id, authorization namespace, and logs identify the
+    // real service instead of a bare address. A loopback destination (permitted
+    // by the guard on a declared app port) has no address match; fall back to
+    // the mesh namespace.
+    let workload = mesh
+        .workloads
+        .iter()
+        .find(|workload| workload.addresses.iter().any(|addr| addr == &host));
+    let (namespace, service_name) = match workload {
+        Some(workload) => (workload.namespace.clone(), workload.service_name.clone()),
+        None => (String::new(), "node-waypoint-capture".to_string()),
+    };
+    let route = crate::modes::mesh::config::MeshInboundTcpRoute {
+        match_port: orig_dst.port(),
+        backend_addr: orig_dst,
+        namespace,
+        service_name,
+        service_fqdn: format!("{host}:{}", orig_dst.port()),
+        // The capture relay never peeks: it is protocol-agnostic by
+        // construction (the captured stream may be HTTP, a server-first binary
+        // protocol, or the application's own TLS), and a pre-dial peek on a
+        // server-first port would park the relay on the handshake clock.
+        tls_inspect: false,
+        first_bytes_inspect: false,
+    };
+    let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route));
+    Some(Arc::new(crate::router_cache::MeshTcpInboundEntry {
+        relay_proxy,
+        backend_addr: orig_dst,
+        service_fqdn: route.service_fqdn,
+        tls_inspect: false,
+        first_bytes_inspect: false,
+        socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+    }))
 }
 
 #[allow(dead_code)]
@@ -13762,20 +13824,23 @@ pub(crate) fn create_proxy_socket(
         socket.set_reuse_port(true)?;
     }
 
-    // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint inbound relay
-    // listener when the eBPF tc ingress redirect is installed (issue #3287).
+    // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint transparent
+    // inbound CAPTURE listener (issue #3287). That listener is the only caller
+    // that passes `transparent = true`.
     //
     // The redirect never rewrites addresses: `bpf_sk_assign` hands the packet
-    // to this listener with the workload's real `podIP:appPort` intact. That is
-    // what preserves the original destination metadata, but it also means the
-    // accepted socket's local address is NOT configured on this host, so its
-    // replies can only be routed if the socket is transparent (the kernel needs
-    // `FLOWI_FLAG_ANYSRC` to accept a non-local source). Without this the
-    // redirect delivers inbound SYNs and then silently fails to send SYN-ACKs.
+    // to the capture listener with the workload's real `podIP:appPort` intact.
+    // That is what preserves the original destination metadata, but it also
+    // means the accepted socket's local address is NOT configured on this host,
+    // so its replies can only be routed if the socket is transparent (the
+    // kernel needs `FLOWI_FLAG_ANYSRC` to accept a non-local source). Without
+    // this the redirect delivers inbound SYNs and then silently fails to send
+    // SYN-ACKs.
     //
-    // Set BEFORE bind, and only for the one listener that opts in — a
-    // transparent socket may bind non-local addresses, so this is deliberately
-    // not a global default.
+    // Set BEFORE bind, and only for the one socket that opts in. A transparent
+    // socket may bind and source addresses this host does not own, so the
+    // capability is deliberately not conferred on a whole class of listeners
+    // (and never on the HBONE or admin listeners) by a process-wide switch.
     #[cfg(target_os = "linux")]
     if transparent {
         use std::os::unix::io::AsRawFd;
@@ -13787,10 +13852,10 @@ pub(crate) fn create_proxy_socket(
         };
         // Fatal, not a warning: the caller only asks for a transparent bind
         // when the tc ingress redirect is installed, and a non-transparent
-        // listener there accepts connections it can never answer.
+        // capture listener accepts connections it can never answer.
         result.map_err(|e| {
             anyhow::anyhow!(
-                "failed to enable IP_TRANSPARENT on the NodeWaypoint inbound listener \
+                "failed to enable IP_TRANSPARENT on the NodeWaypoint inbound capture listener \
                  {addr}, which the eBPF tc ingress redirect requires in order to reply \
                  from captured pod addresses: {e}"
             )
@@ -14445,13 +14510,13 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    // The NodeWaypoint inbound relay listener binds transparent when the eBPF
-    // tc ingress redirect is installed, so it can answer from the captured pod
-    // address. Every other listener binds exactly as before.
-    let transparent = mesh_direction
-        .is_some_and(|direction| direction == crate::modes::mesh::MeshTrafficDirection::Inbound)
-        && crate::modes::node_agent::node_waypoint_ingress_redirect_configured();
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, transparent)?;
+    //
+    // NEVER transparent here. `IP_TRANSPARENT` lets a socket bind and source
+    // addresses that are not configured on this host, so it is granted to
+    // exactly one listener — the NodeWaypoint inbound capture socket, which
+    // opts in explicitly in `proxy::node_waypoint_ingress_capture` — and never
+    // to a whole class of listeners on the strength of a process-wide env var.
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -14477,7 +14542,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, transparent)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, false)?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();

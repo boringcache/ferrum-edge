@@ -172,6 +172,21 @@ pub enum MeshListenerKind {
     /// cmsg, and (Stage 3) drops them — the egress relay is Stage 4. Only
     /// emitted when `FERRUM_MESH_CAPTURE_UDP_ENABLED` is set (default-off).
     PlaintextUdpCapture,
+    /// NodeWaypoint **transparent inbound capture** listener (issue #3287).
+    ///
+    /// Bound `IP_TRANSPARENT` on the wildcard `FERRUM_MESH_INBOUND_LISTEN_ADDR`,
+    /// and emitted only when the node-agent's eBPF tc ingress redirect is
+    /// configured. `ferrum_tc_ingress_redirect` steers captured inbound TCP for
+    /// an enrolled `podIP:appPort` here with `bpf_sk_assign()`, so the accepted
+    /// socket's local address IS the workload's original destination.
+    ///
+    /// **A separate protocol boundary from [`Self::HboneTermination`].** HBONE
+    /// terminates authenticated HTTP/2 CONNECT over verified mesh mTLS;
+    /// captured bytes are ordinary application traffic (possibly the app's own
+    /// TLS) and are relayed opaquely at L4 after the PeerAuthentication and
+    /// authorization gates. This listener never terminates TLS, so it must
+    /// never be given a mesh inbound `ServerConfig`.
+    TransparentInboundCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,11 +817,13 @@ impl MeshRuntimeConfig {
                 listeners
             }
             MeshTopology::NodeWaypoint | MeshTopology::ServiceWaypoint => {
-                vec![MeshListener {
+                let mut listeners = vec![MeshListener {
                     direction: MeshTrafficDirection::Inbound,
                     kind: MeshListenerKind::HboneTermination,
                     addr: self.hbone_listen_addr,
-                }]
+                }];
+                listeners.extend(self.transparent_inbound_capture_listener());
+                listeners
             }
             MeshTopology::EastWestGateway => Vec::new(),
             MeshTopology::EgressGateway => vec![MeshListener {
@@ -815,6 +832,49 @@ impl MeshRuntimeConfig {
                 addr: self.egress_listen_addr,
             }],
         }
+    }
+
+    /// The optional NodeWaypoint transparent inbound capture listener
+    /// (issue #3287), emitted only when the node-agent's eBPF tc ingress
+    /// redirect is configured on this node.
+    ///
+    /// Gated to `NodeWaypoint` alone: `ServiceWaypoint` serves a named set of
+    /// services over HBONE and has no node-agent installing a per-node tc
+    /// classifier, so binding a transparent capture socket there would claim a
+    /// port for a datapath that never delivers to it. `EastWestGateway` and the
+    /// gateways are likewise out of scope.
+    ///
+    /// The address deliberately reuses `FERRUM_MESH_INBOUND_LISTEN_ADDR` — the
+    /// same variable the node-agent reads to learn the redirect's steer target
+    /// (see [`node_waypoint_ingress_capture_addr`]), so the two processes share
+    /// one source of truth. A malformed or non-wildcard value warn-skips here
+    /// because this helper is infallible (read-only predicates call it too);
+    /// `serve_mesh_runtime` re-validates the same value with `?` before binding,
+    /// so on the serving path a bad setting fails startup rather than silently
+    /// dropping the listener.
+    fn transparent_inbound_capture_listener(&self) -> Option<MeshListener> {
+        if self.topology != MeshTopology::NodeWaypoint {
+            return None;
+        }
+        if !crate::modes::node_agent::node_waypoint_ingress_redirect_configured() {
+            return None;
+        }
+        let addr = match node_waypoint_ingress_capture_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = validate_ingress_capture_addr(addr) {
+            warn!("Skipping the NodeWaypoint transparent inbound capture listener: {e}");
+            return None;
+        }
+        Some(MeshListener {
+            direction: MeshTrafficDirection::Inbound,
+            kind: MeshListenerKind::TransparentInboundCapture,
+            addr,
+        })
     }
 
     /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
@@ -10557,10 +10617,7 @@ async fn arm_mesh_runtime_startup(
     let mut startup_signals = admin_startup_signals;
     let mesh_topology = runtime.topology;
     for listener in runtime.listener_plan() {
-        let uses_mesh_inbound_tls = matches!(
-            listener.kind,
-            MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-        );
+        let uses_mesh_inbound_tls = uses_mesh_inbound_tls_kind(listener.kind);
         let tls_config = if uses_mesh_inbound_tls {
             None
         } else {
@@ -10573,10 +10630,7 @@ async fn arm_mesh_runtime_startup(
             tls_config.is_some()
         };
         if !listener_has_tls
-            && matches!(
-                listener.kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            )
+            && uses_mesh_inbound_tls_kind(listener.kind)
             && inbound_mtls_mode != config::MtlsMode::Disable
         {
             warn!(
@@ -10604,10 +10658,7 @@ async fn arm_mesh_runtime_startup(
                 addr = %addr,
                 "Starting mesh listener"
             );
-            let records_mesh_mtls_metric = matches!(
-                kind,
-                MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
-            );
+            let records_mesh_mtls_metric = uses_mesh_inbound_tls_kind(kind);
             let listener_result = if records_mesh_mtls_metric {
                 let allows_plaintext = kind == MeshListenerKind::MtlsTermination
                     && mesh_inbound_listener_allows_plaintext(mesh_topology, mesh_production_mode);
@@ -10617,6 +10668,21 @@ async fn arm_mesh_runtime_startup(
                     shutdown,
                     Some(direction),
                     allows_plaintext,
+                    Some(started_tx),
+                )
+                .await
+            } else if matches!(kind, MeshListenerKind::TransparentInboundCapture) {
+                // NodeWaypoint transparent inbound capture (issue #3287). Its
+                // own accept loop: the socket binds IP_TRANSPARENT, recovers
+                // the original destination from `getsockname()` rather than
+                // SO_ORIGINAL_DST (the redirect performs no NAT), gates on the
+                // live PeerAuthentication posture for the recovered app port,
+                // and relays opaquely at L4. `tls_config` is always None — this
+                // listener terminates nothing.
+                proxy::node_waypoint_ingress_capture::start_listener(
+                    addr,
+                    state,
+                    shutdown,
                     Some(started_tx),
                 )
                 .await
@@ -12738,14 +12804,33 @@ fn validate_egress_gateway_mtls_config(
     Ok(())
 }
 
+/// Whether a listener kind runs the mesh inbound TLS path (a `ServerConfig`
+/// resolved per connection from the live PeerAuthentication policy).
+///
+/// Deliberately excludes `TransparentInboundCapture`: that listener carries raw
+/// captured application bytes — possibly the application's own TLS — and must
+/// relay them opaquely. Handing it a mesh inbound `ServerConfig` would both
+/// fail the handshake and mistake application TLS for mesh TLS.
+fn uses_mesh_inbound_tls_kind(kind: MeshListenerKind) -> bool {
+    matches!(
+        kind,
+        MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination
+    )
+}
+
 fn listener_tls_config(
     listener: &MeshListener,
     frontend_tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Option<Arc<rustls::ServerConfig>> {
     match listener.kind {
-        // Both plaintext listeners (TCP outbound capture and the UDP TPROXY
-        // capture listener) terminate no TLS.
-        MeshListenerKind::PlaintextCapture | MeshListenerKind::PlaintextUdpCapture => None,
+        // The plaintext listeners (TCP outbound capture, the UDP TPROXY capture
+        // listener, and the NodeWaypoint transparent inbound capture listener)
+        // terminate no TLS. For the last of those it is load-bearing, not
+        // incidental: the captured stream may itself be application TLS, which
+        // must be relayed byte-for-byte and never mistaken for mesh TLS.
+        MeshListenerKind::PlaintextCapture
+        | MeshListenerKind::PlaintextUdpCapture
+        | MeshListenerKind::TransparentInboundCapture => None,
         MeshListenerKind::MtlsTermination | MeshListenerKind::HboneTermination => frontend_tls,
     }
 }
@@ -14343,6 +14428,56 @@ pub mod startup_rollback_test_seams {
 fn parse_socket_addr(key: &str, raw: &str) -> Result<SocketAddr, String> {
     raw.parse::<SocketAddr>()
         .map_err(|e| format!("{key} must be a socket address (got '{raw}'): {e}"))
+}
+
+/// The NodeWaypoint **transparent inbound capture** listener address, resolved
+/// from `FERRUM_MESH_INBOUND_LISTEN_ADDR` (default `0.0.0.0:15006`).
+///
+/// This is the single source of truth for the eBPF ingress-redirect port
+/// contract, and it is deliberately ONE variable rather than a proxy-side and a
+/// node-agent-side setting that must be kept equal: the mesh proxy binds this
+/// address, and `node_agent` reads the very same function to decide what port
+/// `ferrum_tc_ingress_redirect` steers into. A chart that sets the variable on
+/// only one of the two DaemonSet containers therefore fails startup validation
+/// instead of producing a silent black hole.
+///
+/// NodeWaypoint topology otherwise leaves this address unused (its listener
+/// plan is HBONE-only), so reusing it introduces no new operator surface.
+pub fn node_waypoint_ingress_capture_addr() -> Result<SocketAddr, String> {
+    parse_socket_addr(
+        "FERRUM_MESH_INBOUND_LISTEN_ADDR",
+        resolve_ferrum_var("FERRUM_MESH_INBOUND_LISTEN_ADDR")
+            .as_deref()
+            .unwrap_or(DEFAULT_INBOUND_LISTEN_ADDR),
+    )
+}
+
+/// Fail-closed validation of a capture-listener bind address.
+///
+/// `bpf_sk_assign` resolves the listener with a **wildcard** socket lookup
+/// (`saddr = daddr = 0`), because the packet still carries the workload's real
+/// `podIP:appPort` and no address on this host matches it. A listener bound to
+/// a specific IP is therefore invisible to the classifier: every in-scope
+/// packet would fail the lookup and be dropped fail-closed. Reject that at
+/// startup rather than black-holing inbound traffic for every enrolled pod.
+pub fn validate_ingress_capture_addr(addr: SocketAddr) -> Result<(), String> {
+    if addr.port() == 0 {
+        return Err(
+            "FERRUM_MESH_INBOUND_LISTEN_ADDR must name a non-zero port when the NodeWaypoint \
+             eBPF ingress redirect is enabled: that port is the redirect's steer target"
+                .to_string(),
+        );
+    }
+    if !addr.ip().is_unspecified() {
+        return Err(format!(
+            "FERRUM_MESH_INBOUND_LISTEN_ADDR must be a wildcard address (0.0.0.0 or [::]) when \
+             the NodeWaypoint eBPF ingress redirect is enabled, got {addr}. The redirect resolves \
+             the capture listener with a wildcard socket lookup because the captured packet still \
+             carries the workload's own address; a specific-IP bind is invisible to it and every \
+             captured connection would be dropped"
+        ));
+    }
+    Ok(())
 }
 
 /// Parse `FERRUM_MESH_WORKLOAD_LABELS` (`k1=v1,k2=v2`). Empty / `None` returns
@@ -22893,6 +23028,106 @@ mod tests {
                 assert_eq!(plan[0].addr.port(), 15008);
             },
         );
+    }
+
+    #[test]
+    fn node_waypoint_adds_a_separate_transparent_capture_listener_when_the_redirect_is_on() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                let plan = runtime.listener_plan();
+
+                // The HBONE listener is untouched: it keeps its own protocol
+                // boundary (authenticated H2 CONNECT over mesh mTLS) and is
+                // never handed captured plaintext.
+                let hbone = plan
+                    .iter()
+                    .find(|listener| listener.kind == MeshListenerKind::HboneTermination)
+                    .expect("the HBONE listener must still be planned");
+                assert_eq!(hbone.addr.port(), 15008);
+
+                let capture = plan
+                    .iter()
+                    .find(|listener| {
+                        listener.kind == MeshListenerKind::TransparentInboundCapture
+                    })
+                    .expect("the transparent inbound capture listener must be planned");
+                assert_eq!(capture.direction, MeshTrafficDirection::Inbound);
+                assert_ne!(
+                    capture.addr.port(),
+                    hbone.addr.port(),
+                    "the capture listener must be a DISTINCT protocol boundary from HBONE"
+                );
+                assert_eq!(capture.addr.port(), 15006);
+                assert!(
+                    capture.addr.ip().is_unspecified(),
+                    "bpf_sk_assign resolves the capture listener with a wildcard lookup"
+                );
+                // It terminates nothing: `listener_tls_config` maps this kind to
+                // the plaintext arm, so a frontend ServerConfig is never given
+                // to it. Feeding application bytes to a TLS terminator would
+                // both fail and mistake application TLS for mesh TLS.
+                assert!(listener_tls_config(capture, None).is_none());
+                assert!(
+                    !uses_mesh_inbound_tls_kind(capture.kind),
+                    "the capture listener must never take the mesh inbound TLS path"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_service_waypoint_never_binds_the_transparent_capture_listener() {
+        // ServiceWaypoint has no node-agent installing a per-node classifier,
+        // so binding a transparent socket there would claim a port for a
+        // datapath that never delivers to it.
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "service_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(
+                    !runtime
+                        .listener_plan()
+                        .iter()
+                        .any(|listener| listener.kind
+                            == MeshListenerKind::TransparentInboundCapture)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn a_non_wildcard_capture_address_is_refused() {
+        // `bpf_sk_assign` resolves the capture listener with a wildcard socket
+        // lookup, so a specific-IP bind is invisible to the classifier and
+        // every captured packet would be dropped fail-closed.
+        assert!(validate_ingress_capture_addr("0.0.0.0:15006".parse().unwrap()).is_ok());
+        assert!(validate_ingress_capture_addr("[::]:15006".parse().unwrap()).is_ok());
+        assert!(validate_ingress_capture_addr("10.0.0.5:15006".parse().unwrap()).is_err());
+        assert!(validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap()).is_err());
     }
 
     #[test]
