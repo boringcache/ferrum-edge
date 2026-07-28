@@ -4064,23 +4064,24 @@ fn test_timestamp_bound_boundaries() {
 
 #[tokio::test]
 async fn test_out_of_range_expires_is_rejected_not_panicking() {
-    // A year outside the admitted window is invalid. Year 9999 is inside that
-    // window but adding the configured skew can still exceed chrono's upper
-    // boundary. Both must reject rather than panic the request task.
+    // Years outside `MIN_PARSED_YEAR..=MAX_PARSED_YEAR` are invalid at parse
+    // time. That clamp is what keeps later `Expires + skew` arithmetic inside
+    // chrono's representable range (see the module docs), so a six-digit year
+    // must reject rather than reach — or panic inside — the skew addition.
+    // Year 9999 is the *upper admitted* year and is intentionally accepted when
+    // the rest of the Timestamp policy holds; do not treat it as out-of-range.
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    for expires in ["262143-12-31T23:59:59Z", "9999-12-31T23:59:59Z"] {
-        let security = format!(
-            r#"<wsu:Timestamp>
-            <wsu:Created>{created}</wsu:Created>
-            <wsu:Expires>{expires}</wsu:Expires>
-        </wsu:Timestamp>"#
-        );
-        let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
-        let mut headers = soap_headers();
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-        assert_eq!(reject_status(&result), 401, "Expires={expires}");
-    }
+    let security = format!(
+        r#"<wsu:Timestamp>
+        <wsu:Created>{created}</wsu:Created>
+        <wsu:Expires>262143-12-31T23:59:59Z</wsu:Expires>
+    </wsu:Timestamp>"#
+    );
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(reject_status(&result), 401);
 }
 
 // ── GHSA-gr7f-55c2-rpvw: strict configuration admission ────────────────────
@@ -4307,19 +4308,18 @@ fn test_zero_nonce_cache_controls_are_rejected() {
     // `cache_ttl_seconds` is intentionally absent: retention is fixed, so the
     // key is no longer part of the schema at all (see
     // `the_removed_retention_key_is_rejected_rather_than_ignored`).
-    for key in ["max_cache_size"] {
-        let mut nonce = serde_json::Map::new();
-        nonce.insert(key.to_string(), json!(0));
-        let config = json!({
-            "timestamp": { "require": true },
-            "nonce": Value::Object(nonce),
-            "reject_missing_security_header": false
-        });
-        let err = SoapWsSecurity::new(&config)
-            .err()
-            .expect("zero must be rejected");
-        assert!(err.contains(key), "unexpected error for {key}: {err}");
-    }
+    let config = json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 0 },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("zero must be rejected");
+    assert!(
+        err.contains("max_cache_size"),
+        "unexpected error: {err}"
+    );
 }
 
 // ── GHSA-3ffh-5842-8m92: bounded, cache-safe nonce state ───────────────────
@@ -5507,14 +5507,12 @@ fn misspelled_redis_root_keys_still_fail_closed() {
 
 #[test]
 fn zero_replay_bounds_remain_rejected_for_password_digest() {
-    for (key, value) in [("max_cache_size", 0)] {
-        let mut config = username_token_digest_config();
-        config["nonce"][key] = json!(value);
-        let err = SoapWsSecurity::new(&config)
-            .err()
-            .unwrap_or_else(|| panic!("nonce.{key} = 0 must be rejected"));
-        assert!(err.contains(key), "{err}");
-    }
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(0);
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("nonce.max_cache_size = 0 must be rejected");
+    assert!(err.contains("max_cache_size"), "{err}");
 }
 
 // ── Replay state across generations, instances, and replicas ────────────────
