@@ -147,10 +147,6 @@ struct LokiByteBudget {
 }
 
 impl LokiByteBudget {
-    fn new(max_bytes: usize) -> Self {
-        Self::with_ceiling(max_bytes, process_ceiling())
-    }
-
     fn with_ceiling(max_bytes: usize, ceiling: &'static RetainedByteCeiling) -> Self {
         Self {
             used_bytes: Arc::new(AtomicUsize::new(0)),
@@ -1415,7 +1411,7 @@ mod tests {
         labels_b.insert("service".to_string(), "ferrum-edge".to_string());
         labels_b.insert("proxy_id".to_string(), "p-2".to_string());
 
-        let budget = LokiByteBudget::new(4096);
+        let budget = LokiByteBudget::with_ceiling(4096, process_ceiling());
         let batch = [
             LokiEntry {
                 labels: Arc::new(labels_a.clone()),
