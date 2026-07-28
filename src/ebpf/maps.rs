@@ -399,11 +399,7 @@ impl BpfMaps {
     /// reachable port (a black hole, since in-scope traffic fails closed).
     /// Clearing an absent map is a no-op so teardown still succeeds against an
     /// older ELF.
-    pub fn replace_pod_inbound_ports(
-        &mut self,
-        ip: Ipv4Addr,
-        ports: &[u16],
-    ) -> Result<(), String> {
+    pub fn replace_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
         let addr = ipv4_to_nbo_key(ip);
         let Some(pod_inbound_ports) = self.pod_inbound_ports.as_mut() else {
             if ports.is_empty() {

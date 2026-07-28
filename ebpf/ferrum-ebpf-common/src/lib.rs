@@ -761,8 +761,7 @@ impl BpfCaptureConfig {
     /// A zero auth mark (local-pod mode) must NOT make an unmarked packet look
     /// authorized, which is why condition 1 is guarded on a non-zero mark.
     pub const fn ingress_redirect_bypass(&self, mark: u32, dst_port: u16) -> bool {
-        if self.node_waypoint_inbound_auth_mark != 0
-            && mark == self.node_waypoint_inbound_auth_mark
+        if self.node_waypoint_inbound_auth_mark != 0 && mark == self.node_waypoint_inbound_auth_mark
         {
             return true;
         }
@@ -772,28 +771,6 @@ impl BpfCaptureConfig {
             return true;
         }
         self.hbone_redirect_port != 0 && dst_port as u32 == self.hbone_redirect_port
-    }
-
-
-    /// The loop / self-capture guards. `true` means "leave this packet alone":
-    /// it is the relay's own authorized dial down to the local backend pod, a
-    /// packet this program (or a peer hook) already redirected, or traffic
-    /// already aimed at the relay listener itself (peer HBONE included).
-    ///
-    /// Without all three a redirected packet would be re-dispatched to the
-    /// relay forever, and the relay's own backend dial would be fed back into
-    /// itself.
-    /// A **zero** configured mark never matches: local-pod mode publishes a
-    /// zero inbound auth mark, and treating that as "already relayed" would
-    /// bypass every unmarked packet — i.e. everything.
-    pub const fn ingress_redirect_bypass(&self, skb_mark: u32, dst_port: u16) -> bool {
-        if skb_mark != 0
-            && (skb_mark == self.node_waypoint_inbound_auth_mark
-                || skb_mark == self.node_waypoint_ingress_redirect_mark)
-        {
-            return true;
-        }
-        dst_port as u32 == self.hbone_redirect_port
     }
 
     pub const fn default_ports() -> Self {
@@ -1203,8 +1180,8 @@ mod tests {
             "a zero mark must leave the redirect disarmed"
         );
 
-        let armed = default
-            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        let armed =
+            default.with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
         assert_eq!(
             armed.node_waypoint_ingress_redirect_mark,
             NODE_WAYPOINT_INGRESS_REDIRECT_MARK

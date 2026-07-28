@@ -43,8 +43,8 @@ use crate::ebpf::{
     NODE_AGENT_CAPTURE_STATE_NODE_GLOBAL_FALLBACK, NODE_AGENT_CAPTURE_STATE_PARTIALLY_ATTACHED,
     NODE_AGENT_CAPTURE_STATE_READY, NODE_AGENT_CAPTURE_STATE_UNAVAILABLE,
     NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
-    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, NodeAgentMetrics, NodeAgentProxyMode,
-    PodAttachmentState, PodInfo, TcAttachDirection,
+    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, NodeAgentMetrics, NodeAgentProxyMode, PodAttachmentState,
+    PodInfo, TcAttachDirection,
 };
 use crate::modes::node_agent_cni_server::{
     self, CniWorkItem, CniWorkReceiver, cni_work_channel, spawn_cni_listener,
@@ -295,8 +295,7 @@ impl NodeAgentConfig {
         // node-global iptables REDIRECT for enrolled workloads and needs an
         // explicit attach point, and silently guessing the uplink would be a
         // node-wide datapath change made on the node-agent's own initiative.
-        capture_contract.ingress_redirect_ifaces =
-            node_agent_ingress_redirect_ifaces_from_env();
+        capture_contract.ingress_redirect_ifaces = node_agent_ingress_redirect_ifaces_from_env();
         capture_contract.node_waypoint_ingress_redirect_mark =
             if capture_contract.ingress_redirect_ifaces.is_empty() {
                 0
@@ -317,8 +316,7 @@ impl NodeAgentConfig {
         // relay port is a contradiction: the guard that keeps the relay's own
         // listener reachable is the classifier's `dst_port == relay_port`
         // bypass, and the port must be a real listener.
-        if capture_contract.ingress_redirect_enabled()
-            && capture_contract.hbone_redirect_port == 0
+        if capture_contract.ingress_redirect_enabled() && capture_contract.hbone_redirect_port == 0
         {
             return Err(
                 "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES requires a non-zero \
@@ -7443,7 +7441,9 @@ mod tests {
         assert!(flagged.inbound_redirect_enabled());
         // Reversible so a narrowed / un-enrolled pod converges back.
         assert!(
-            !flagged.with_inbound_redirect(false).inbound_redirect_enabled(),
+            !flagged
+                .with_inbound_redirect(false)
+                .inbound_redirect_enabled(),
             "clearing the flag must un-enroll the pod from the redirect"
         );
         // The UDP lifecycle flags are untouched by the redirect flag.

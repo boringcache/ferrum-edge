@@ -197,7 +197,8 @@ fn redirect_ipv4(ctx: &mut TcContext, config: &RedirectConfig) -> Result<i32, i6
     }
     // Scope: and the destination port must be one of its declared inbound
     // application ports.
-    if unsafe { FERRUM_POD_INBOUND_PORTS.get(&InboundRedirectKey4::new(dst_ip, dst_port)) }.is_none()
+    if unsafe { FERRUM_POD_INBOUND_PORTS.get(&InboundRedirectKey4::new(dst_ip, dst_port)) }
+        .is_none()
     {
         return Ok(TC_ACT_OK);
     }

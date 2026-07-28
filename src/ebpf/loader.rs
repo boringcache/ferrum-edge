@@ -380,7 +380,8 @@ impl EbpfBackend for AyaEbpfBackend {
         let link_id = prog.attach(iface, TcAttachType::Ingress).map_err(|e| {
             format!("Failed to attach '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress: {e}")
         })?;
-        self.ingress_redirect_link_ids.push((iface.to_string(), link_id));
+        self.ingress_redirect_link_ids
+            .push((iface.to_string(), link_id));
 
         info!(
             program = INGRESS_REDIRECT_PROGRAM,
@@ -922,9 +923,7 @@ mod live_kernel_tests {
     #[test]
     #[ignore = "requires root + real Linux >= 5.7 kernel (cgroup v2 + bpffs); run via the ebpf-live CI job"]
     fn tc_ingress_redirect_loads_attaches_and_detaches_on_a_live_kernel() {
-        use ferrum_ebpf_common::{
-            BpfCaptureConfig, NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
-        };
+        use ferrum_ebpf_common::{BpfCaptureConfig, NODE_WAYPOINT_INGRESS_REDIRECT_MARK};
         use std::net::Ipv6Addr;
 
         let _ = tracing_subscriber::fmt()
@@ -954,9 +953,9 @@ mod live_kernel_tests {
         // The load runs the in-kernel verifier over `ferrum_tc_ingress_redirect`
         // along with every other program. This is the core live validation for
         // the blind-built socket-assign code.
-        backend
-            .load_programs()
-            .expect("load + verify BPF programs (incl. the tc ingress redirect) on the running kernel");
+        backend.load_programs().expect(
+            "load + verify BPF programs (incl. the tc ingress redirect) on the running kernel",
+        );
 
         // Arm the redirect exactly as the node-agent does in NodeWaypoint mode.
         let armed = BpfCaptureConfig::new(15001, 15008)

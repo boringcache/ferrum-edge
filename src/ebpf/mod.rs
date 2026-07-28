@@ -1043,7 +1043,9 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn attach_ingress_redirect(&mut self, iface: &str) -> Result<(), String> {
         if self.fail_attach_ingress_redirect {
-            return Err(format!("injected ingress redirect attach failure for {iface}"));
+            return Err(format!(
+                "injected ingress redirect attach failure for {iface}"
+            ));
         }
         self.operations
             .push(format!("attach_ingress_redirect:{iface}"));
@@ -1066,7 +1068,8 @@ impl EbpfBackend for MockEbpfBackend {
             ));
         }
         // Replace, matching the real backend: a removed port must not survive.
-        self.pod_inbound_ports.retain(|(entry_ip, _)| *entry_ip != ip);
+        self.pod_inbound_ports
+            .retain(|(entry_ip, _)| *entry_ip != ip);
         for port in ports {
             self.pod_inbound_ports.insert((ip, *port));
         }
@@ -1074,7 +1077,8 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn clear_pod_inbound_ports(&mut self, ip: Ipv4Addr) -> Result<(), String> {
-        self.pod_inbound_ports.retain(|(entry_ip, _)| *entry_ip != ip);
+        self.pod_inbound_ports
+            .retain(|(entry_ip, _)| *entry_ip != ip);
         Ok(())
     }
 
