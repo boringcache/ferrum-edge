@@ -474,14 +474,6 @@ fn build_h3_quinn_server_config(
     Ok(server_config)
 }
 
-/// Failure side for [`finish_h3_response_with_backend_trailers`].
-///
-/// The trailer-finish phase touches both ends of the relay: reading
-/// trailers from the BACKEND recv stream and sending trailers/FIN to the
-/// CLIENT send stream. Call sites must not conflate the two — a backend
-/// trailer-read fault is a backend transport error (classified via
-/// `classify_http3_error`, reported to circuit breaker / passive health),
-/// while a client send/finish failure is a genuine `ClientDisconnect`.
 /// Everything the trailer-finish phase needs to re-apply the response-header
 /// policy boundary to a STREAMING relay's trailer section.
 ///
@@ -507,6 +499,14 @@ struct H3StreamingTrailerPolicy<'a> {
     governance: ResponseTrailerGovernance<'a>,
 }
 
+/// Failure side for [`finish_h3_response_with_backend_trailers`].
+///
+/// The trailer-finish phase touches both ends of the relay: reading
+/// trailers from the BACKEND recv stream and sending trailers/FIN to the
+/// CLIENT send stream. Call sites must not conflate the two — a backend
+/// trailer-read fault is a backend transport error (classified via
+/// `classify_http3_error`, reported to circuit breaker / passive health),
+/// while a client send/finish failure is a genuine `ClientDisconnect`.
 enum H3TrailerFinishError {
     /// `recv_trailers()` on the backend stream failed non-gracefully.
     Backend(h3::error::StreamError),

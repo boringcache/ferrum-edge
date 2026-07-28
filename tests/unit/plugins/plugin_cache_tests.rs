@@ -7093,6 +7093,64 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
 }
 
 #[test]
+fn test_priority_override_delegates_response_trailer_policy() {
+    // The priority-override wrapper hand-forwards the `Plugin` trait, so a
+    // declaration it forgets to delegate silently collapses to the
+    // `ResponseTrailerPolicy::None` default — and a trailer-forwarding HTTP/3
+    // path would stop binding the very fields the plugin owns.
+    let mut security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    security.priority_override = Some(321);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 321);
+    let names: Vec<String> = cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http)
+        .response_trailer_policy_names()
+        .to_vec();
+    assert_eq!(
+        names,
+        vec!["x-powered-by".to_string()],
+        "the priority-override wrapper must delegate the bounded trailer policy"
+    );
+
+    // The fail-closed arm has to survive the wrapper too, or an unbounded chain
+    // would silently start reconciling trailers field by field.
+    let mut transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    transformer.priority_override = Some(322);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 322);
+    assert!(
+        cache
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "the priority-override wrapper must delegate the fail-closed unbounded arm"
+    );
+}
+
+#[test]
 fn test_grpc_backend_path_plugins_are_precomputed_with_priority_override() {
     let config = make_config(
         vec![make_proxy("p1", "/api", vec!["router"])],
