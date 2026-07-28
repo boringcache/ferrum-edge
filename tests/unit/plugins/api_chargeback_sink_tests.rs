@@ -3183,10 +3183,7 @@ impl SpoolBeforeWriteGate {
     fn wait_until_finished(&self) {
         let mut finished = self.finished.lock().expect("finished gate lock");
         while !*finished {
-            finished = self
-                .finished_cv
-                .wait(finished)
-                .expect("finished gate wait");
+            finished = self.finished_cv.wait(finished).expect("finished gate wait");
         }
     }
 
