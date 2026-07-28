@@ -601,7 +601,7 @@ impl MeshConfigSync for MeshGrpcServer {
         let node_id = inner.node_id;
         let node_version = inner.ferrum_version;
         let node_namespace = inner.namespace;
-        let bearer_namespaces = allowed.0.clone();
+        let bearer_namespaces = allowed.effective_namespaces().cloned();
 
         let slice_request = MeshSliceRequest::from_native(
             node_id.clone(),
@@ -852,7 +852,7 @@ mod tests {
     }
 
     fn allowed_namespaces(namespaces: &[&str]) -> AllowedNamespaces {
-        AllowedNamespaces(Some(namespaces.iter().map(|ns| ns.to_string()).collect()))
+        AllowedNamespaces::claimed(namespaces.iter().map(|ns| ns.to_string()).collect())
     }
 
     #[test]

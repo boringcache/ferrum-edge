@@ -1648,7 +1648,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1934,7 +1934,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 

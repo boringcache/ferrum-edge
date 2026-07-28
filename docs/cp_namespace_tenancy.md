@@ -97,9 +97,12 @@ The CP authorisation order is:
    verification credential must check the signature. `kid` is a *selector*,
    never a grant — naming another tenant's `kid` without holding that key
    fails step 2. A CP running a trust bundle rejects a token with no `kid`
-   (`missing_key_id`), an unknown one (`unknown_key_id`), or one whose `alg`
-   is not the algorithm that credential was provisioned for
-   (`algorithm_mismatch`).
+   (`missing_key_id` — actionable for migration), an unknown one
+   (`unknown_key_id`), or one whose `alg` is not the algorithm that credential
+   was provisioned for (`algorithm_mismatch`). Unknown-key, algorithm-mismatch,
+   and signature/claims-validation failures share one fixed outward
+   `UNAUTHENTICATED` message so response text cannot enumerate the trusted
+   inventory; internal diagnostics use the closed reason labels above.
 
 2. **Standard JWT validation**: signature under the selected credential,
    `iss == FERRUM_CP_DP_GRPC_JWT_ISSUER`, `exp`/`iat`/`sub` present, `exp`
@@ -119,12 +122,15 @@ The CP authorisation order is:
    before any tenant state is read.
 
 4. **`ns` claim presence policy**: when the CP scope is `Set` or `All`, or
-   when `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, a request with no resolved
-   namespace set is rejected with `PERMISSION_DENIED`. Missing claims remain
-   compatible only for `Single` scope with the flag unset and no trust bundle.
+   when `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true`, a JWT that does not carry an
+   `ns` claim is rejected with `PERMISSION_DENIED` — even if a trust-bundle
+   credential or SPIFFE peer already produced a non-empty effective set. A
+   server-derived ceiling must never make a missing claim look present.
+   Missing claims remain compatible only for `Single` scope with the flag
+   unset; in that case the effective credential ∩ peer bound still applies.
 
 5. **Requested-namespace authorisation**: if the requested namespace is NOT in
-   the resolved set, reject with `PERMISSION_DENIED`. This is the
+   the resolved (effective) set, reject with `PERMISSION_DENIED`. This is the
    most-restrictive gate — even if the CP scope would otherwise allow the
    namespace, a restrictive credential or claim wins.
 

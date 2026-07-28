@@ -92,6 +92,11 @@ pub enum TenantAuthRejectReason {
     /// for. Refused before verification so a credential can never be used
     /// under an algorithm it was not provisioned for.
     AlgorithmMismatch,
+    /// Signature or standard-claim validation failed after credential
+    /// selection. Shares the outward message with [`Self::UnknownKeyId`] and
+    /// [`Self::AlgorithmMismatch`] so callers cannot enumerate the trusted
+    /// inventory from response text.
+    TokenValidation,
     /// The bearer's credential, its `ns` claim, and any authenticated peer
     /// identity intersect to no namespace at all.
     NoAuthorizedNamespace,
@@ -110,6 +115,7 @@ impl TenantAuthRejectReason {
             Self::MissingKeyId => "missing_key_id",
             Self::UnknownKeyId => "unknown_key_id",
             Self::AlgorithmMismatch => "algorithm_mismatch",
+            Self::TokenValidation => "token_validation",
             Self::NoAuthorizedNamespace => "no_authorized_namespace",
         }
     }
@@ -117,6 +123,11 @@ impl TenantAuthRejectReason {
     /// Operator-facing message. Deliberately fixed strings: the rejected token,
     /// its `kid`, its claims, and the trusted key inventory are all withheld so
     /// an unauthenticated caller cannot probe the CP's tenant configuration.
+    ///
+    /// Unknown-key, algorithm-mismatch, and signature/claims-validation
+    /// failures share one outward string so response text cannot reveal whether
+    /// selection reached a known credential. Missing `kid` stays actionable for
+    /// trust-bundle migration.
     pub const fn as_status_message(self) -> &'static str {
         match self {
             Self::MalformedHeader => "Invalid token: malformed JWS header",
@@ -124,11 +135,10 @@ impl TenantAuthRejectReason {
                 "Invalid token: this control plane selects verification credentials by JWS \
                  `kid`, and the token carries none"
             }
-            Self::UnknownKeyId => {
-                "Invalid token: no verification credential is trusted for this token"
-            }
-            Self::AlgorithmMismatch => {
-                "Invalid token: algorithm does not match the selected verification credential"
+            // Shared outward surface: must not distinguish unknown kid /
+            // algorithm / signature-or-claims failure.
+            Self::UnknownKeyId | Self::AlgorithmMismatch | Self::TokenValidation => {
+                "Invalid token: authentication failed"
             }
             Self::NoAuthorizedNamespace => {
                 "The presented credential is not authorized for any namespace on this control \

@@ -754,3 +754,354 @@ fn verifier_debug_never_renders_material() {
         "got: {rendered}"
     );
 }
+
+// ── Claim presence vs server-derived effective set ───────────────────────
+
+/// A trust-bundle credential with `kid` but no `ns` claim must not satisfy the
+/// automatic multi-namespace claim requirement on ConfigSync — even though the
+/// credential binding alone would produce a non-empty effective set.
+#[tokio::test(flavor = "multi_thread")]
+async fn configsync_rejects_trust_bundle_token_with_kid_but_no_ns_claim() {
+    let (addr, handle) = start_configsync(two_tenant_bundle()).await;
+
+    let no_ns = mint(TENANT_A_SECRET, Some(TENANT_A), "dp-a", None, None);
+    let mut client = configsync_client!(addr, no_ns);
+    let err = client
+        .subscribe(tonic::Request::new(subscribe_request("dp-a", TENANT_A)))
+        .await
+        .expect_err("missing ns claim must be refused on multi-namespace ConfigSync");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("ns"),
+        "refusal should name the missing claim, got: {}",
+        err.message()
+    );
+
+    handle.abort();
+}
+
+/// Native MeshSubscribe shares the same claim-presence contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn mesh_subscribe_rejects_trust_bundle_token_with_kid_but_no_ns_claim() {
+    let (addr, handle) = start_mesh(two_tenant_bundle()).await;
+
+    let no_ns = mint(
+        TENANT_A_SECRET,
+        Some(TENANT_A),
+        "mesh-a",
+        None,
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
+    );
+    let mut client = mesh_client!(addr, no_ns);
+    let err = client
+        .mesh_subscribe(tonic::Request::new(
+            ferrum_edge::grpc::proto::MeshSubscribeRequest {
+                node_id: "mesh-a".to_string(),
+                ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+                namespace: TENANT_A.to_string(),
+                workload_spiffe_id: String::new(),
+                labels: HashMap::new(),
+                waypoint_name: String::new(),
+                ambient_udp_source_scoping: false,
+                remote_discovery: false,
+            },
+        ))
+        .await
+        .expect_err("missing ns claim must be refused on multi-namespace MeshSubscribe");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    handle.abort();
+}
+
+/// xDS ADS under `CpScope::All` with a single-namespace-bound credential and no
+/// `ns` claim: the effective set is a sole namespace, which the pre-fix model
+/// misread as a present claim. Must stay PermissionDenied.
+#[tokio::test(flavor = "multi_thread")]
+async fn xds_all_scope_rejects_bound_credential_without_ns_claim() {
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
+    let (_cp, update_tx) = CpGrpcServer::builder(cfg_arc.clone(), TENANT_A_SECRET.to_string())
+        .channel_capacity(64)
+        .scope(CpScope::All)
+        .build();
+    let server = XdsAdsServer::new(
+        cfg_arc,
+        update_tx,
+        TENANT_A_SECRET.to_string(),
+        TEST_ISSUER.to_string(),
+        TENANT_A.to_string(),
+        32,
+    )
+    .with_verifier(two_tenant_bundle())
+    .with_scope(CpScope::All);
+    let (listener, addr) = bind_loopback().await;
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("xDS server failed");
+    });
+    settle().await;
+
+    let no_ns = mint(TENANT_A_SECRET, Some(TENANT_A), "xds-a", None, None);
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client =
+        ferrum_edge::xds::proto::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient::new(
+            channel,
+        );
+    let requests = tokio_stream::iter(vec![ferrum_edge::xds::proto::DiscoveryRequest {
+        version_info: String::new(),
+        node: Some(ferrum_edge::xds::proto::Node {
+            id: "xds-a".to_string(),
+            cluster: String::new(),
+            metadata: Vec::new(),
+        }),
+        resource_names: vec!["*".to_string()],
+        type_url: LDS_TYPE_URL.to_string(),
+        response_nonce: String::new(),
+        error_detail: None,
+    }]);
+    let mut request = tonic::Request::new(requests);
+    request.metadata_mut().insert(
+        "authorization",
+        tonic::metadata::MetadataValue::try_from(format!("Bearer {no_ns}")).unwrap(),
+    );
+    let err = client
+        .stream_aggregated_resources(request)
+        .await
+        .expect_err("missing ns claim must not be satisfied by a sole bound namespace");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    handle.abort();
+}
+
+/// Single-scope CP with `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM=true` rejects a
+/// trust-bound token that carries `kid` but no `ns`, even though the effective
+/// set would otherwise authorize the sole namespace.
+#[tokio::test(flavor = "multi_thread")]
+async fn single_scope_require_ns_claim_rejects_token_without_ns() {
+    let verifier = single_tenant_bundle();
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
+    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
+        .channel_capacity(64)
+        .registry(Arc::new(DpNodeRegistry::new()))
+        .expected_issuer(TEST_ISSUER.to_string())
+        .verifier(verifier)
+        .scope(CpScope::Single(TENANT_A.to_string()))
+        .require_ns_claim(true)
+        .real_ip_header(None)
+        .build();
+    let (listener, addr) = bind_loopback().await;
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("ConfigSync server failed");
+    });
+    settle().await;
+
+    let no_ns = mint(TENANT_A_SECRET, Some(TENANT_A), "dp-a", None, None);
+    let mut client = configsync_client!(addr, no_ns);
+    let err = client
+        .subscribe(tonic::Request::new(subscribe_request("dp-a", TENANT_A)))
+        .await
+        .expect_err("require_ns_claim=true must refuse a missing claim");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("FERRUM_CP_REQUIRE_NAMESPACE_CLAIM"),
+        "got: {}",
+        err.message()
+    );
+
+    handle.abort();
+}
+
+/// Single-scope + `require_ns_claim=false` keeps the compatible path: a token
+/// with `kid` and no `ns` is accepted, but the credential bound still applies
+/// (the bearer cannot reach a namespace outside the intersected set).
+#[tokio::test(flavor = "multi_thread")]
+async fn single_scope_without_require_accepts_no_ns_but_applies_bound() {
+    let verifier = single_tenant_bundle();
+    let cfg_arc = Arc::new(ArcSwap::new(Arc::new(tenant_marked_config())));
+    let (server, _tx) = CpGrpcServer::builder(cfg_arc, TENANT_A_SECRET.to_string())
+        .channel_capacity(64)
+        .registry(Arc::new(DpNodeRegistry::new()))
+        .expected_issuer(TEST_ISSUER.to_string())
+        .verifier(verifier)
+        .scope(CpScope::Single(TENANT_A.to_string()))
+        .require_ns_claim(false)
+        .real_ip_header(None)
+        .build();
+    let (listener, addr) = bind_loopback().await;
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server.into_service())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("ConfigSync server failed");
+    });
+    settle().await;
+
+    let no_ns = mint(TENANT_A_SECRET, Some(TENANT_A), "dp-a", None, None);
+    let mut client = configsync_client!(addr, no_ns.clone());
+    client
+        .subscribe(tonic::Request::new(subscribe_request("dp-a", TENANT_A)))
+        .await
+        .expect("single-scope require=false accepts a missing claim for the bound namespace");
+
+    // Asking for a namespace outside the credential bound (and outside the
+    // single CP scope) remains refused.
+    let mut client = configsync_client!(addr, no_ns);
+    let err = client
+        .subscribe(tonic::Request::new(subscribe_request("dp-a", TENANT_B)))
+        .await
+        .expect_err("bound/scope must still refuse an out-of-scope namespace");
+    assert!(
+        err.code() == tonic::Code::PermissionDenied
+            || err.code() == tonic::Code::FailedPrecondition,
+        "got {:?}",
+        err.code()
+    );
+
+    handle.abort();
+}
+
+/// Admin JWT `AllowedNamespaces::is_present()` tracks claim presence only —
+/// unchanged by the CP/DP server-derived ceiling split.
+#[test]
+fn admin_allowed_namespaces_is_present_tracks_claim_only() {
+    use ferrum_edge::grpc::auth::AllowedNamespaces;
+    use std::collections::HashSet;
+
+    // Admin has no server-derived ceiling: empty == missing claim.
+    assert!(!AllowedNamespaces::empty().is_present());
+    assert!(!AllowedNamespaces::empty().allows("prod"));
+
+    // Claimed (including present-but-empty) keeps is_present == true.
+    let mut set = HashSet::new();
+    set.insert("prod".to_string());
+    let claimed = AllowedNamespaces::claimed(set);
+    assert!(claimed.is_present());
+    assert!(claimed.allows("prod"));
+    assert!(!claimed.allows("staging"));
+
+    let empty_claim = AllowedNamespaces::claimed(HashSet::new());
+    assert!(empty_claim.is_present());
+    assert!(!empty_claim.allows("prod"));
+}
+
+// ── Outward authentication failure non-disclosure ────────────────────────
+
+/// Unknown `kid`, known `kid` with a wrong signature, and known `kid` with a
+/// wrong algorithm must produce identical public Status messages so an
+/// unauthenticated caller cannot enumerate the trusted key inventory.
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthenticated_failures_do_not_disclose_key_inventory() {
+    let (addr, handle) = start_configsync(two_tenant_bundle()).await;
+
+    let unknown_kid = mint(
+        TENANT_A_SECRET,
+        Some("tenant-z"),
+        "dp-a",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let wrong_sig = mint(
+        "wrong-secret-that-is-long-enough-32b!",
+        Some(TENANT_A),
+        "dp-a",
+        Some(json!(TENANT_A)),
+        None,
+    );
+    let wrong_alg = {
+        let now = Utc::now().timestamp();
+        let claims = json!({
+            "sub": "dp-a",
+            "iat": now,
+            "exp": now + 600,
+            "iss": TEST_ISSUER,
+            "role": "data_plane",
+            "ns": TENANT_A,
+        });
+        // Header claims HS384 while the trust-bundle credential is HS256.
+        let mut header = Header::new(Algorithm::HS384);
+        header.kid = Some(TENANT_A.to_string());
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_secret(TENANT_A_SECRET.as_bytes()),
+        )
+        .expect("test JWT must encode")
+    };
+
+    let mut messages = Vec::new();
+    for token in [unknown_kid, wrong_sig, wrong_alg] {
+        let mut client = configsync_client!(addr, token);
+        let err = client
+            .subscribe(tonic::Request::new(subscribe_request("dp-a", TENANT_A)))
+            .await
+            .expect_err("forged/unknown credential must be unauthenticated");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        let message = err.message().to_string();
+        assert!(
+            !message.contains(TENANT_A)
+                && !message.contains(TENANT_B)
+                && !message.contains(TENANT_A_SECRET)
+                && !message.contains("HS256")
+                && !message.contains("HS384")
+                && !message.contains("tenant-z"),
+            "public rejection must not echo kid/alg/secret inventory, got: {message}"
+        );
+        messages.push(message);
+    }
+
+    assert_eq!(
+        messages[0], messages[1],
+        "unknown kid and wrong signature must share one public message"
+    );
+    assert_eq!(
+        messages[0], messages[2],
+        "unknown kid and wrong algorithm must share one public message"
+    );
+    assert_eq!(messages[0], "Invalid token: authentication failed");
+
+    // Internal labels remain distinct (closed fixed-cardinality set).
+    use ferrum_edge::grpc::cp_trust::TenantAuthRejectReason;
+    assert_eq!(
+        TenantAuthRejectReason::UnknownKeyId.as_status_message(),
+        TenantAuthRejectReason::AlgorithmMismatch.as_status_message()
+    );
+    assert_eq!(
+        TenantAuthRejectReason::UnknownKeyId.as_status_message(),
+        TenantAuthRejectReason::TokenValidation.as_status_message()
+    );
+    assert_ne!(
+        TenantAuthRejectReason::UnknownKeyId.as_metric_label(),
+        TenantAuthRejectReason::AlgorithmMismatch.as_metric_label()
+    );
+    assert_ne!(
+        TenantAuthRejectReason::UnknownKeyId.as_metric_label(),
+        TenantAuthRejectReason::TokenValidation.as_metric_label()
+    );
+
+    handle.abort();
+}
+
+fn single_tenant_bundle() -> Arc<CpDpVerifier> {
+    let document = json!({
+        "version": 1,
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256", "secret": TENANT_A_SECRET,
+              "namespaces": [TENANT_A] },
+        ]
+    })
+    .to_string();
+    let bundle = CpDpTrustBundle::from_document_str(&document, "single-tenant-bundle")
+        .expect("single-tenant bundle must load");
+    Arc::new(CpDpVerifier::TrustBundle(bundle))
+}

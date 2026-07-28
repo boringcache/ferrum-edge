@@ -633,10 +633,18 @@ impl CpGrpcServer {
             ));
         }
 
-        if allowed.is_present() && !allowed.allows(namespace) {
+        // Enforce the effective set (claim and/or server-derived ceiling) even
+        // when the JWT carried no `ns` claim. A missing claim must not drop a
+        // trust-bundle / SPIFFE bound.
+        if allowed.effective_namespaces().is_some() && !allowed.allows(namespace) {
+            if allowed.is_present() {
+                return Err(Status::permission_denied(format!(
+                    "JWT `ns` claim does not authorise namespace '{namespace}'; \
+                     the bearer can only subscribe to the namespaces listed in its token"
+                )));
+            }
             return Err(Status::permission_denied(format!(
-                "JWT `ns` claim does not authorise namespace '{namespace}'; \
-                 the bearer can only subscribe to the namespaces listed in its token"
+                "Presented credential is not authorised for namespace '{namespace}'"
             )));
         }
 
@@ -661,10 +669,14 @@ impl CpGrpcServer {
         require_ns_claim: bool,
         allowed: &AllowedNamespaces,
     ) -> Result<String, Status> {
+        // Compatible single-scope path when no claim is required. Still apply
+        // any server-derived ceiling before accepting the CP's sole namespace —
+        // a missing claim must not drop the credential/peer bound.
         if !scope.namespace_claim_required(require_ns_claim)
             && !allowed.is_present()
             && let CpScope::Single(namespace) = scope
         {
+            Self::authorise_namespace_for_scope(scope, require_ns_claim, allowed, namespace)?;
             return Ok(namespace.clone());
         }
 
@@ -2285,7 +2297,7 @@ mod tests {
         let server = cp_with_scope(CpScope::Set(set), false);
         let mut allowed = HashSet::new();
         allowed.insert("prod".to_string());
-        let allowed = AllowedNamespaces(Some(allowed));
+        let allowed = AllowedNamespaces::claimed(allowed);
         assert!(server.authorise_namespace(&allowed, "prod").is_ok());
     }
 
@@ -2297,7 +2309,7 @@ mod tests {
         let server = cp_with_scope(CpScope::Set(set), false);
         let mut allowed = HashSet::new();
         allowed.insert("dev".to_string());
-        let allowed = AllowedNamespaces(Some(allowed));
+        let allowed = AllowedNamespaces::claimed(allowed);
         let err = server.authorise_namespace(&allowed, "dev").unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("dev"));
@@ -2319,7 +2331,7 @@ mod tests {
         let server = cp_with_scope(CpScope::All, false);
         let mut allowed = HashSet::new();
         allowed.insert("any-ns".to_string());
-        let allowed = AllowedNamespaces(Some(allowed));
+        let allowed = AllowedNamespaces::claimed(allowed);
         assert!(server.authorise_namespace(&allowed, "any-ns").is_ok());
     }
 
@@ -2328,7 +2340,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert("prod".to_string());
         set.insert("staging".to_string());
-        let allowed = AllowedNamespaces(Some(set));
+        let allowed = AllowedNamespaces::claimed(set);
 
         let namespace = CpGrpcServer::resolve_stream_namespace_for_scope(
             &CpScope::Single("prod".to_string()),
@@ -2345,7 +2357,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert("staging".to_string());
         set.insert("dev".to_string());
-        let allowed = AllowedNamespaces(Some(set));
+        let allowed = AllowedNamespaces::claimed(set);
 
         let err = CpGrpcServer::resolve_stream_namespace_for_scope(
             &CpScope::Single("prod".to_string()),
@@ -2363,7 +2375,7 @@ mod tests {
     fn claim_present_must_authorise_requested_namespace() {
         let mut set = HashSet::new();
         set.insert("staging".to_string());
-        let allowed = AllowedNamespaces(Some(set));
+        let allowed = AllowedNamespaces::claimed(set);
         let server = cp_with_scope(CpScope::All, false);
         // Claim only allows staging — production must be rejected.
         let err = server
@@ -2377,7 +2389,7 @@ mod tests {
     fn claim_present_allowing_namespace_passes_scope_check() {
         let mut set = HashSet::new();
         set.insert("production".to_string());
-        let allowed = AllowedNamespaces(Some(set));
+        let allowed = AllowedNamespaces::claimed(set);
         let server = cp_with_scope(CpScope::Single("production".to_string()), false);
         assert!(server.authorise_namespace(&allowed, "production").is_ok());
     }
@@ -2396,9 +2408,44 @@ mod tests {
     fn require_claim_accepts_when_claim_matches() {
         let mut set = HashSet::new();
         set.insert("prod".to_string());
-        let allowed = AllowedNamespaces(Some(set));
+        let allowed = AllowedNamespaces::claimed(set);
         let server = cp_with_scope(CpScope::Single("prod".to_string()), true);
         assert!(server.authorise_namespace(&allowed, "prod").is_ok());
+    }
+
+    #[test]
+    fn server_derived_effective_set_without_claim_still_constrains() {
+        // Trust-bundle / SPIFFE ceiling with no JWT `ns` claim: is_present is
+        // false (claim requirement still applies for multi-namespace), but the
+        // effective set must still authorise the requested namespace.
+        let mut set = HashSet::new();
+        set.insert("prod".to_string());
+        let allowed = AllowedNamespaces::resolved(false, Some(set));
+        let server = cp_with_scope(CpScope::Single("prod".to_string()), false);
+        assert!(server.authorise_namespace(&allowed, "prod").is_ok());
+        let err = server
+            .authorise_namespace(&allowed, "staging")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("staging"));
+    }
+
+    #[test]
+    fn all_scope_xds_rejects_effective_sole_namespace_without_claim() {
+        // The pre-fix bug: a single-namespace-bound credential with no `ns`
+        // claim produced an effective sole namespace that xDS misread as a
+        // present claim under CpScope::All.
+        let mut set = HashSet::new();
+        set.insert("tenant-a".to_string());
+        let allowed = AllowedNamespaces::resolved(false, Some(set));
+        let err = CpGrpcServer::resolve_stream_namespace_for_scope(
+            &CpScope::All,
+            false,
+            &allowed,
+        )
+        .expect_err("missing claim must not be satisfied by a server-derived sole namespace");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("ns"));
     }
 
     // ── Per-namespace broadcast partition ──────────────────────────────────
