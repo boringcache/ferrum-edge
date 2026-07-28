@@ -452,14 +452,14 @@ fn multipart_encoding_header_content_spec(header_object: &str) -> String {
 #[test]
 fn importer_preserves_multipart_encoding_header_content_form() {
     let spec = multipart_encoding_header_content_spec(
-        r#"{
+        r##"{
           "required": true,
           "content": {
             "application/json": {
               "schema": {"$ref": "#/components/schemas/PartMeta"}
             }
           }
-        }"#,
+        }"##,
     );
     let config = extract_validator_config(&spec);
     let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
@@ -593,14 +593,14 @@ fn importer_rejects_multipart_encoding_header_content_wildcards_and_control_para
 #[test]
 fn importer_preserves_multipart_encoding_header_content_with_valid_parameters() {
     let spec = multipart_encoding_header_content_spec(
-        r#"{
+        r##"{
           "required": true,
           "content": {
             "application/json; charset=utf-8": {
               "schema": {"$ref": "#/components/schemas/PartMeta"}
             }
           }
-        }"#,
+        }"##,
     );
     let config = extract_validator_config(&spec);
     let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
