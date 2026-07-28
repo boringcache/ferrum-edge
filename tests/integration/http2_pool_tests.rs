@@ -594,6 +594,56 @@ async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failur
 }
 
 #[tokio::test]
+async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
+    let (h2_listener, http1_listener, http1_ip, port) = bind_dual_loopback_listeners().await;
+    let http1_attempts = Arc::new(AtomicUsize::new(0));
+    let _http1_task = start_tls_backend_on_counted(
+        http1_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&http1_attempts)),
+    )
+    .await
+    .expect("start HTTP/1.1 TLS backend");
+    let _h2_task = start_tls_backend_on(
+        h2_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"h2".to_vec()],
+    )
+    .await
+    .expect("start H2 TLS backend");
+    let dns =
+        TestDnsServer::spawn(vec![IpAddr::V4(http1_ip), IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "multi-address-sni-h2.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+    let sender = pool.get_sender(&proxy).await;
+    assert!(
+        sender.is_ok(),
+        "SNI route should continue to the healthy H2 candidate: {:?}",
+        sender.err()
+    );
+    assert_eq!(
+        http1_attempts.load(Ordering::Relaxed),
+        1,
+        "the HTTP/1.1 candidate should be attempted before H2 failover"
+    );
+}
+
+#[tokio::test]
 async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
     let (healthy_listener, failing_listener, failing_ip, port) =
         bind_dual_loopback_listeners().await;

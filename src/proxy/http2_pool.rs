@@ -239,9 +239,15 @@ impl Http2PoolManager {
                 // Keep both phases inside the candidate attempt so a bad first
                 // address cannot suppress a healthy later DNS answer.
                 if !matches!(tls_stream.get_ref().1.alpn_protocol(), Some(b"h2")) {
-                    return Ok(Http2CandidateOutcome::BackendSelectedHttp1 {
-                        pool_key: self.pool_key_owned(proxy, svid_generation),
-                    });
+                    let pool_key = self.pool_key_owned(proxy, svid_generation);
+                    // Reqwest cannot apply a backend SNI override per request,
+                    // so HTTP/1.1 is not a usable outcome for these routes.
+                    // Keep scanning to prevent one candidate from downgrading
+                    // the capability of a target that has a later H2 address.
+                    if proxy.resolved_tls.sni.is_some() {
+                        return Err(Http2PoolError::BackendSelectedHttp1 { pool_key });
+                    }
+                    return Ok(Http2CandidateOutcome::BackendSelectedHttp1 { pool_key });
                 }
 
                 let io = TokioIo::new(tls_stream);
