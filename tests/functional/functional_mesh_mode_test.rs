@@ -908,16 +908,31 @@ fn fixture_servers_bind_through_the_mesh_port_aware_helper() {
 /// returning it, and must not hand back the rejected port on a later attempt.
 #[tokio::test]
 async fn fixture_listener_bind_rerolls_past_a_rejected_port() {
-    let probe = TcpListener::bind(loopback_ephemeral())
-        .await
-        .expect("probe bind");
-    let rejected = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-
-    let listener = bind_fixture_listener_where(loopback_ephemeral(), |port| port != rejected)
-        .await
-        .expect("fixture listener bind");
+    let predicate_calls = AtomicUsize::new(0);
+    let rejected = Mutex::new(None);
+    let listener = bind_fixture_listener_where(loopback_ephemeral(), |port| {
+        if predicate_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            let mut rejected_slot = rejected
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *rejected_slot = Some(port);
+            false
+        } else {
+            true
+        }
+    })
+    .await
+    .expect("fixture listener bind");
     let port = listener.local_addr().expect("fixture addr").port();
+    let rejected = rejected
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("predicate records its rejected first candidate");
+    assert_eq!(
+        predicate_calls.load(Ordering::Relaxed),
+        2,
+        "the test must exercise exactly one rejected bind and one accepted re-roll"
+    );
     assert_ne!(
         port, rejected,
         "bind_fixture_listener_where returned the port its predicate rejected"
