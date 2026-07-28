@@ -2273,12 +2273,6 @@ impl AnthropicSseNormalizer {
         }
     }
 
-    fn unread(&self) -> &[u8] {
-        // cursor is only advanced within buf.len(); keep the slice infallible.
-        let start = self.cursor.min(self.buf.len());
-        &self.buf[start..]
-    }
-
     fn unread_len(&self) -> usize {
         self.buf.len().saturating_sub(self.cursor)
     }
@@ -3128,12 +3122,120 @@ mod sse_buffer_tests {
         assert_eq!(normalizer.scan_cursor, 0);
         // Compaction reclaims the consumed prefix; capacity must stay far below
         // the quadratic alternative of retaining every prior event.
+        let capacity = normalizer.buf.capacity();
+        let total_input = iterations * event.len();
         assert!(
-            normalizer.buf.capacity() < iterations * event.len() / 2,
-            "capacity {} should stay well below total input {}",
-            normalizer.buf.capacity(),
-            iterations * event.len()
+            capacity < total_input / 2,
+            "capacity {capacity} should stay well below total input {total_input}"
         );
         assert_eq!(normalizer.bytes_ingested, iterations * event.len());
+    }
+
+    #[test]
+    fn maybe_compact_is_noop_when_nothing_consumed() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        normalizer.maybe_compact();
+        assert_eq!(normalizer.cursor, 0);
+        assert!(normalizer.buf.is_empty());
+    }
+
+    #[test]
+    fn push_chunk_rejects_oversized_partial_without_boundary() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        normalizer.buf = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
+        let mut out = String::new();
+        assert!(
+            normalizer.push_chunk(b"y", &mut out),
+            "partial event past the hard cap must fail closed"
+        );
+        assert!(out.contains("oversized"), "{out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    #[test]
+    fn normalized_output_limit_fails_closed_during_drain() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        let mut out = String::new();
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        assert!(!normalizer.push_chunk(start.as_bytes(), &mut out));
+        normalizer.commit_forwarded(&out);
+        normalizer.normalized_out_bytes = MAX_SSE_NORMALIZED_OUTPUT_BYTES;
+        out.clear();
+        let delta = format!(
+            "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+            "z".repeat(64)
+        );
+        assert!(
+            normalizer.push_chunk(delta.as_bytes(), &mut out),
+            "one more normalized delta must trip the cumulative output cap"
+        );
+        assert!(
+            out.contains("cumulative normalized size limit"),
+            "{out}"
+        );
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    #[test]
+    fn finish_stream_rejects_oversized_trailing_partial() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        normalizer.buf = vec![b'z'; MAX_SSE_EVENT_BYTES + 1];
+        let mut out = String::new();
+        assert!(
+            normalizer.finish_stream(&mut out),
+            "EOF with an oversized trailing partial must fail closed"
+        );
+        assert!(out.contains("oversized"), "{out}");
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    #[test]
+    fn finish_stream_rejects_non_terminating_trailing_event_without_delimiter() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        let mut out = String::new();
+        let prefix = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        assert!(!normalizer.push_chunk(prefix.as_bytes(), &mut out));
+        normalizer.buf.extend_from_slice(b"data: {\"type\":\"ping\"}");
+        out.clear();
+        assert!(
+            normalizer.finish_stream(&mut out),
+            "non-terminating trailing event without a delimiter must fail closed"
+        );
+        assert!(
+            out.contains("malformed trailing data"),
+            "{out}"
+        );
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+    }
+
+    #[test]
+    fn finish_stream_drains_buffered_message_stop() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        let stream = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let stop_offset = stream
+            .find("event: message_stop")
+            .expect("message_stop must be present");
+        normalizer.buf.extend_from_slice(stream.as_bytes());
+        normalizer.cursor = stop_offset;
+        normalizer.message_started = true;
+        normalizer.role_emitted = true;
+        let mut out = String::new();
+        assert!(
+            normalizer.finish_stream(&mut out),
+            "finish_stream must drain a buffered terminal event"
+        );
+        assert!(out.trim_end().ends_with("data: [DONE]"), "{out}");
+        assert!(!out.contains("upstream_error"), "{out}");
     }
 }

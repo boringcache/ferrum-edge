@@ -2223,6 +2223,55 @@ async fn test_normalizer_rejects_excessive_json_depth() {
 }
 
 #[tokio::test]
+async fn test_normalizer_trailing_incomplete_event_is_malformed() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tr\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"",
+    );
+    match inspector.on_chunk(body.as_bytes()).await {
+        ResponseStreamAction::Forward(_) => {}
+        other => panic!("incomplete trailing frame must wait for EOF: {other:?}"),
+    }
+    match inspector.on_end().await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("malformed trailing data"), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        }
+        other => panic!("EOF must fail closed on incomplete trailing data: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_sse_comment_frames_are_ignored() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let body = concat!(
+        ": keepalive\n\n",
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    match inspector.on_chunk(body.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("\"content\":\"ok\""), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+            assert!(!text.contains("upstream_error"), "{text}");
+        }
+        ResponseStreamAction::Terminate(None) => {
+            panic!("comment frames must not terminate the stream early")
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_normalizer_buffered_path_enforces_complete_event_size() {
     let (plugin, mut ctx, _inspector) = claimed_anthropic_inspector().await;
     let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
