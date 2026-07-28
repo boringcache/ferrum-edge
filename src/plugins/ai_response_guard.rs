@@ -2058,7 +2058,26 @@ fn parse_grpc_frames(
         let payload = if flag == 1 {
             match encoding {
                 GrpcMessageEncoding::Gzip => {
-                    Cow::Owned(decompress_grpc_gzip(raw, max_message_bytes)?)
+                    // Never inflate past what the aggregate `max_scan_bytes`
+                    // budget could still admit. Bytes above it are rejected
+                    // below no matter what they decompress to, so inflating to
+                    // the (independently configurable, potentially much larger)
+                    // per-message ceiling first is pure amplification: a small
+                    // compressed frame would materialize `max_message_bytes` of
+                    // heap only to be discarded.
+                    let remaining = max_scan_bytes.saturating_sub(decoded_total);
+                    let scan_budget_binds = remaining < max_message_bytes;
+                    let inflate_limit = max_message_bytes.min(remaining);
+                    match decompress_grpc_gzip(raw, inflate_limit) {
+                        Ok(payload) => Cow::Owned(payload),
+                        // Attribute the refusal to whichever ceiling actually
+                        // bound this frame, so the fail-closed reason stays
+                        // truthful.
+                        Err(GrpcFramingError::MessageTooLarge) if scan_budget_binds => {
+                            return Err(GrpcFramingError::DecodedTooLarge);
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 GrpcMessageEncoding::Identity | GrpcMessageEncoding::Unsupported => {
                     return Err(GrpcFramingError::UnsupportedEncoding);
@@ -2080,19 +2099,21 @@ fn parse_grpc_frames(
 }
 
 /// Bounded gzip inflate for one gRPC message. The ceiling is enforced while
-/// reading so a compression bomb cannot allocate past it. The compressed
+/// reading so a compression bomb cannot allocate past it; the caller passes the
+/// tighter of the per-message ceiling and the remaining aggregate scan budget,
+/// then re-labels the refusal to whichever bound applied. The compressed
 /// payload must be exactly one fully consumed gzip member: trailing garbage
 /// and concatenated additional members are rejected.
 fn decompress_grpc_gzip(
     payload: &[u8],
-    max_message_bytes: usize,
+    max_decompressed_bytes: usize,
 ) -> Result<Vec<u8>, GrpcFramingError> {
     // Use `bufread::GzDecoder` (not `read::GzDecoder`): the read variant wraps
     // a `BufReader` and may pull past the first member's trailer into its
     // internal buffer, which would make a leftover-slice check miss trailing
     // garbage or a second concatenated member.
     let mut decoder = GzDecoder::new(payload);
-    let mut decompressed = Vec::with_capacity(payload.len().min(max_message_bytes));
+    let mut decompressed = Vec::with_capacity(payload.len().min(max_decompressed_bytes));
     let mut buffer = [0u8; 8192];
     loop {
         let read = decoder
@@ -2101,7 +2122,7 @@ fn decompress_grpc_gzip(
         if read == 0 {
             break;
         }
-        if decompressed.len().saturating_add(read) > max_message_bytes {
+        if decompressed.len().saturating_add(read) > max_decompressed_bytes {
             return Err(GrpcFramingError::MessageTooLarge);
         }
         decompressed.extend_from_slice(&buffer[..read]);
@@ -2877,6 +2898,21 @@ impl Plugin for AiResponseGuard {
                 );
             }
             return PluginResult::Continue;
+        }
+
+        // A gRPC-framed response reaching the JSON/SSE/text model belongs to a
+        // request that is not native gRPC (a native one returned above), so the
+        // descriptor contract cannot name a message type for it and
+        // `transform_response_body` declines these bytes. Scanning length-
+        // prefixed frames as a raw text document would let `scan_mode: all`
+        // report a redaction the transform can never apply; fail closed for
+        // enforcing actions instead, exactly as content mode already does.
+        if is_native_grpc_content_type(content_type) {
+            return self.respond_to_uninspectable(
+                ctx,
+                "grpc_framed_response_requires_grpc_contract",
+                "gRPC-framed responses are only inspectable through the grpc enrollment contract",
+            );
         }
 
         // --- SSE path: parse frames, extract accumulated texts, detect ---

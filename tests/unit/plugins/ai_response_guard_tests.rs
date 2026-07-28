@@ -4507,3 +4507,113 @@ fn grpc_method_path_requires_protobuf_identifier_grammar() {
     });
     assert!(AiResponseGuard::new(&dup).is_err());
 }
+
+/// A gRPC-framed response on a request that is NOT native gRPC has no
+/// descriptor contract, and `transform_response_body` declines those bytes.
+/// `scan_fields: all` must therefore not report a redaction the transform can
+/// never apply — it fails closed exactly as content mode already does.
+#[tokio::test]
+async fn scan_all_grpc_framed_response_on_http_request_fails_closed() {
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "pii_patterns": ["email"],
+        "scan_fields": "all"
+    }));
+    // Valid UTF-8 framed bytes: without the guard this is scanned as raw text.
+    let body = grpc_frame(b"contact ops@example.com now");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    let result = plugin
+        .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+        .await;
+    assert!(
+        matches!(result, PluginResult::Reject { .. }),
+        "gRPC-framed response must not be redacted as a text document"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_rejected"),
+        Some(&"grpc_framed_response_requires_grpc_contract".to_string())
+    );
+    assert!(!ctx.metadata.contains_key("ai_response_guard_redacted"));
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none(),
+        "the text transform must never rewrite gRPC framing"
+    );
+}
+
+/// Warn-only guards keep their documented pass-through posture for the same
+/// uninspectable response, recording the reason instead of rejecting.
+#[tokio::test]
+async fn scan_all_grpc_framed_response_on_http_request_warns_in_warn_mode() {
+    let plugin = make_plugin(json!({
+        "action": "warn",
+        "pii_patterns": ["email"],
+        "scan_fields": "all"
+    }));
+    let body = grpc_frame(b"contact ops@example.com now");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_warning"),
+        Some(&"grpc_framed_response_requires_grpc_contract".to_string())
+    );
+}
+
+/// A highly compressible gzip frame is bounded by the aggregate
+/// `max_scan_bytes` budget, not just by the (independently configurable)
+/// per-message ceiling, so a small compressed frame cannot inflate to the much
+/// larger per-message limit before being refused.
+#[tokio::test]
+async fn grpc_gzip_bomb_is_bounded_by_max_scan_bytes() {
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "max_scan_bytes": 4096,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "max_message_bytes": 1048576,
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let payload = vec![b'a'; 512_000];
+    let body = gzip_grpc_frame(&payload);
+    assert!(
+        body.len() <= 4096,
+        "the compressed frame itself must fit under max_scan_bytes"
+    );
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_rejected"),
+        Some(&"grpc_decoded_exceeds_max_scan_bytes".to_string())
+    );
+}

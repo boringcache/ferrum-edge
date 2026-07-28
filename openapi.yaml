@@ -21175,9 +21175,10 @@ components:
               default: 1048576
               description: >-
                 Per-message ceiling, applied to the declared frame length and
-                enforced while inflating a gzip-compressed frame. Aggregate
-                decoded payload across frames is additionally capped by
-                max_scan_bytes.
+                enforced while inflating a gzip-compressed frame; inflation
+                stops at the tighter of this ceiling and the remaining
+                max_scan_bytes budget. Aggregate decoded payload across frames
+                is additionally capped by max_scan_bytes.
             max_messages:
               type: integer
               minimum: 1
