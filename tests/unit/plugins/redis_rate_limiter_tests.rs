@@ -2236,7 +2236,7 @@ async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
 /// Static canary over the limiter surfaces that talk to the shared Redis client.
 #[test]
 fn limiter_log_statements_never_carry_identity_bearing_keys() {
-    let sources: [(&str, &str); 6] = [
+    let sources: [(&str, &str); 8] = [
         (
             "src/plugins/utils/redis_rate_limiter.rs",
             include_str!("../../../src/plugins/utils/redis_rate_limiter.rs"),
@@ -2260,6 +2260,19 @@ fn limiter_log_statements_never_carry_identity_bearing_keys() {
         (
             "src/plugins/udp_rate_limiting.rs",
             include_str!("../../../src/plugins/udp_rate_limiting.rs"),
+        ),
+        // The remaining two Redis-backed enforcement consumers. They do not log
+        // a rate key today, and this canary is what keeps that true: both build
+        // an identity-bearing key (`limit_by` consumer/identity/SPIFFE/IP) and
+        // both gained a fail-closed refusal arm here, which is exactly the kind
+        // of edit that tends to add a "which key?" diagnostic.
+        (
+            "src/plugins/graphql.rs",
+            include_str!("../../../src/plugins/graphql.rs"),
+        ),
+        (
+            "src/plugins/grpc_method_router.rs",
+            include_str!("../../../src/plugins/grpc_method_router.rs"),
         ),
     ];
 
