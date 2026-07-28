@@ -1502,6 +1502,15 @@ async fn run_tcp_accept_loop(
                     }
                 };
                 accept_backoff.on_success();
+                // Fold the accepted peer to one canonical principal at the
+                // ingress boundary (GHSA-vjwj-657f-5w9g). A dual-stack listener
+                // reports an IPv4 client as `::ffff:a.b.c.d`; every downstream
+                // consumer of this address — stream identity, PROXY-protocol
+                // trust check, consistent-hash LB key, node-waypoint scope, and
+                // the connection log lines — must agree on one representation.
+                // Safe to rewrite here because the stream is already accepted:
+                // nothing on this path dials or sends to `remote_addr`.
+                let remote_addr = crate::util::client_identity::canonical_socket_addr(remote_addr);
 
                 // Reject new connections under critical overload (same as HTTP proxy).
                 if state.overload.reject_new_connections.load(Ordering::Relaxed) {
@@ -1556,7 +1565,12 @@ async fn run_tcp_accept_loop(
 
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
-                    let direct_client_ip = remote_addr.ip().to_canonical().to_string();
+                    // Single TCP client-identity boundary: a dual-stack listener
+                    // reports an IPv4 peer as `::ffff:a.b.c.d`, and both this value and
+                    // any PROXY-protocol-forwarded source below are folded before the
+                    // stream plugin chain keys on them (GHSA-vjwj-657f-5w9g).
+                    let direct_client_ip =
+                        crate::util::client_identity::canonical_ip_string(remote_addr.ip());
 
                     // Inbound PROXY protocol (v1 text / v2 binary) — opt-in per proxy.
                     // When `stream_proxy_protocol: true` is set on the Proxy config, every
@@ -3894,7 +3908,7 @@ fn stream_port_override_affects_selection(
 }
 
 fn stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    ip.to_canonical().to_string()
+    crate::util::client_identity::canonical_ip_string(ip)
 }
 
 fn validate_stream_hash_on(

@@ -32,8 +32,14 @@
 //! - `anthropic`: OpenAI Chat Completions request is translated to the Anthropic
 //!   Messages API streaming request (including assistant `tool_calls` and
 //!   matching `role: "tool"` results); Anthropic SSE events are normalized back
-//!   to OpenAI `chat.completion.chunk` SSE. Normalization requires Anthropic
-//!   `message_stop` (or an explicit provider `error`) before emitting a
+//!   to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"` becomes
+//!   Anthropic `{"type":"none"}` with the tools list retained; unsupported
+//!   tool_choice values and forced tool use with manual extended thinking
+//!   (`thinking.type: "enabled"`) are rejected at admission. Adaptive thinking
+//!   may combine with OpenAI `required` / named choices. Provider `tool_use`
+//!   under a none constraint fails closed instead of becoming OpenAI
+//!   `tool_calls`. Normalization requires
+//!   Anthropic `message_stop` (or an explicit provider `error`) before emitting a
 //!   success-shaped terminal sequence; premature EOF / malformed events fail
 //!   closed with an upstream-error SSE frame. Requests that will be normalized
 //!   strip `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip /
@@ -117,6 +123,10 @@ const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
 const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
+/// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
+/// Request-local only: the response normalizer fails closed if the provider
+/// nevertheless emits `tool_use` for that generation.
+const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
 /// Provider `Content-Encoding` that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
@@ -1006,7 +1016,191 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
-    validate_openai_tool_history(messages)
+    validate_openai_tool_history(messages)?;
+    let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
+    resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?;
+    Ok(())
+}
+
+/// OpenAI `tool_choice` kinds that Anthropic translation understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolChoiceKind {
+    None,
+    Auto,
+    /// OpenAI `required` → Anthropic `{"type":"any"}`.
+    ForcedAny,
+    ForcedNamed,
+}
+
+fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
+    let Some(tools) = openai_body.get("tools") else {
+        return Ok(None);
+    };
+    if tools.is_null() {
+        return Ok(None);
+    }
+    let arr = tools
+        .as_array()
+        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(arr.len());
+    for tool in arr {
+        let func = tool.get("function").unwrap_or(tool);
+        let name = func
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        names.push(name);
+    }
+    Ok(Some(names))
+}
+
+/// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
+/// else `max_completion_tokens`, else the translation default).
+fn anthropic_effective_max_tokens(openai_body: &Value) -> u64 {
+    openai_body["max_tokens"]
+        .as_u64()
+        .or_else(|| openai_body["max_completion_tokens"].as_u64())
+        .unwrap_or(4096)
+}
+
+/// Map supported OpenAI `tool_choice` values to Anthropic's object form.
+/// Unsupported, malformed, or ambiguous values fail closed — never silently
+/// dropped into the provider default (`auto` when tools are present).
+fn resolve_anthropic_tool_choice(
+    openai_body: &Value,
+) -> Result<Option<(ToolChoiceKind, Value)>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    if choice.is_null() {
+        return Ok(None);
+    }
+
+    let (kind, translated) = match choice {
+        Value::String(value) => match value.as_str() {
+            "none" => (ToolChoiceKind::None, json!({ "type": "none" })),
+            "auto" => (ToolChoiceKind::Auto, json!({ "type": "auto" })),
+            // OpenAI Chat Completions string form; Anthropic `any` is the
+            // translated object type, not an accepted OpenAI input string.
+            "required" => (ToolChoiceKind::ForcedAny, json!({ "type": "any" })),
+            _ => {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+        },
+        Value::Object(object) => {
+            // Closed OpenAI shape: {type:"function", function:{name:...}}.
+            if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("function") {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let function = object
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            if function.len() != 1 {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| valid_tool_name(value))
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            (
+                ToolChoiceKind::ForcedNamed,
+                json!({ "type": "tool", "name": name }),
+            )
+        }
+        _ => return Err("unsupported or malformed tool_choice".to_string()),
+    };
+
+    let tools = openai_declared_tool_names(openai_body)?;
+    if kind != ToolChoiceKind::None && tools.is_none() {
+        return Err("tool_choice requires a non-empty tools array".to_string());
+    }
+    if kind == ToolChoiceKind::ForcedNamed {
+        let name = translated
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+        if !tools.as_ref().is_some_and(|names| names.contains(&name)) {
+            return Err("named tool_choice does not match any declared tool".to_string());
+        }
+    }
+
+    Ok(Some((kind, translated)))
+}
+
+/// Forward closed Anthropic thinking shapes when present. Manual extended
+/// thinking (`type: "enabled"`) cannot combine with forced tool use; adaptive
+/// thinking may. Budget must satisfy Anthropic's ordinary contract relative to
+/// the effective `max_tokens` this route forwards.
+fn resolve_anthropic_thinking(
+    openai_body: &Value,
+    tool_choice_kind: Option<ToolChoiceKind>,
+) -> Result<Option<Value>, String> {
+    let Some(thinking) = openai_body.get("thinking") else {
+        return Ok(None);
+    };
+    if thinking.is_null() {
+        return Ok(None);
+    }
+    let object = thinking
+        .as_object()
+        .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+    let thinking_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+
+    let forwarded = match thinking_type {
+        "enabled" => {
+            // Closed shape: exactly `type` and `budget_tokens`.
+            if object.len() != 2 || !object.contains_key("budget_tokens") {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            let budget_value = object
+                .get("budget_tokens")
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            if !budget_value.is_u64() {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            let budget = budget_value
+                .as_u64()
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            let max_tokens = anthropic_effective_max_tokens(openai_body);
+            // Ordinary Anthropic contract: budget_tokens >= 1024 and strictly
+            // less than the forwarded max_tokens (this route does not opt into
+            // interleaved manual thinking via anthropic-beta).
+            if budget < 1024 || budget >= max_tokens {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            if matches!(
+                tool_choice_kind,
+                Some(ToolChoiceKind::ForcedAny | ToolChoiceKind::ForcedNamed)
+            ) {
+                return Err("forced tool_choice is incompatible with extended thinking".to_string());
+            }
+            json!({ "type": "enabled", "budget_tokens": budget })
+        }
+        "adaptive" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "adaptive" })
+        }
+        "disabled" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "disabled" })
+        }
+        _ => return Err("unsupported or malformed thinking".to_string()),
+    };
+
+    Ok(Some(forwarded))
 }
 
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
@@ -1101,10 +1295,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         message_index += 1;
     }
 
-    let max_tokens = openai_body["max_tokens"]
-        .as_u64()
-        .or_else(|| openai_body["max_completion_tokens"].as_u64())
-        .unwrap_or(4096);
+    let max_tokens = anthropic_effective_max_tokens(openai_body);
 
     let mut body = json!({
         "model": model,
@@ -1128,8 +1319,14 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
     if let Some(tools) = translate_tools(openai_body.get("tools")) {
         body["tools"] = tools;
     }
-    if let Some(choice) = translate_tool_choice(openai_body.get("tool_choice")) {
-        body["tool_choice"] = choice;
+    let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
+    if let Some((_, choice)) = &tool_choice {
+        body["tool_choice"] = choice.clone();
+    }
+    if let Some(thinking) =
+        resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?
+    {
+        body["thinking"] = thinking;
     }
 
     serde_json::to_vec(&body)
@@ -1168,26 +1365,6 @@ fn translate_tools(tools: Option<&Value>) -> Option<Value> {
         None
     } else {
         Some(Value::Array(out))
-    }
-}
-
-fn translate_tool_choice(choice: Option<&Value>) -> Option<Value> {
-    match choice? {
-        Value::String(s) => match s.as_str() {
-            "auto" => Some(json!({"type": "auto"})),
-            "required" | "any" => Some(json!({"type": "any"})),
-            // Anthropic has no "none"; omit so the model is free to answer.
-            "none" => None,
-            _ => None,
-        },
-        Value::Object(_) => {
-            let name = choice?
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)?;
-            Some(json!({"type": "tool", "name": name}))
-        }
-        _ => None,
     }
 }
 
@@ -1363,17 +1540,24 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        // Fail closed on Anthropic tool-history shapes that cannot be
-        // represented safely before the route override commits.
+        // Fail closed on Anthropic tool-history / tool_choice / thinking shapes
+        // that cannot be represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
             && let Err(message) = validate_anthropic_translation(&openai_body)
         {
+            let (param, code) = if message.contains("thinking") {
+                (Some("thinking"), Some("invalid_thinking"))
+            } else if message.contains("tool_choice") || message.contains("tools") {
+                (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else {
+                (Some("messages"), Some("invalid_messages"))
+            };
             return openai_error_response(
                 400,
                 &format!("Invalid request for Anthropic translation: {message}"),
                 "invalid_request_error",
-                Some("messages"),
-                Some("invalid_messages"),
+                param,
+                code,
             );
         }
 
@@ -1533,6 +1717,12 @@ impl Plugin for AiStreamRouter {
                 let translated = translate_to_anthropic(&openai_body, &model).ok()?;
                 ctx.metadata
                     .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
+                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                    ctx.metadata
+                        .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
+                } else {
+                    ctx.metadata.remove(META_TOOL_CHOICE_NONE);
+                }
                 Some(translated)
             }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
@@ -1606,7 +1796,13 @@ impl Plugin for AiStreamRouter {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        Some(wrap_anthropic_normalizer(model, encoding.as_deref()))
+        let tools_forbidden =
+            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
+        Some(wrap_anthropic_normalizer(
+            model,
+            encoding.as_deref(),
+            tools_forbidden,
+        ))
     }
 
     async fn normalize_response_body_with_context(
@@ -1651,7 +1847,9 @@ impl Plugin for AiStreamRouter {
                 return Some(upstream_sse_error_body(&message));
             }
         };
-        normalize_anthropic_sse_buffered(model, &plaintext).await
+        let tools_forbidden =
+            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
+        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
     }
 
     async fn after_proxy(
@@ -1862,8 +2060,9 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 fn wrap_anthropic_normalizer(
     model: String,
     encoding: Option<&str>,
+    tools_forbidden: bool,
 ) -> Box<dyn ResponseStreamInspector> {
-    let inner = AnthropicSseNormalizer::new(model);
+    let inner = AnthropicSseNormalizer::new(model, tools_forbidden);
     match encoding {
         Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(inner)),
         Some("br") => Box::new(ContentDecodingNormalizer::brotli(inner)),
@@ -1991,6 +2190,9 @@ struct AnthropicSseNormalizer {
     role_emitted: bool,
     done_emitted: bool,
     terminal: Option<StreamTerminal>,
+    /// When true, any Anthropic `tool_use` fails closed instead of becoming
+    /// OpenAI `tool_calls` deltas (caller constrained this generation to none).
+    tools_forbidden: bool,
     /// Anthropic content-block index → OpenAI `tool_calls` index.
     tool_indices: HashMap<u64, u32>,
     next_tool_index: u32,
@@ -1999,7 +2201,7 @@ struct AnthropicSseNormalizer {
 }
 
 impl AnthropicSseNormalizer {
-    fn new(model: String) -> Self {
+    fn new(model: String, tools_forbidden: bool) -> Self {
         Self {
             carry: Vec::new(),
             model,
@@ -2009,6 +2211,7 @@ impl AnthropicSseNormalizer {
             role_emitted: false,
             done_emitted: false,
             terminal: None,
+            tools_forbidden,
             tool_indices: HashMap::new(),
             next_tool_index: 0,
             prompt_tokens: None,
@@ -2109,6 +2312,14 @@ impl AnthropicSseNormalizer {
                 let index = event["index"].as_u64().unwrap_or(0);
                 let block = &event["content_block"];
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if self.tools_forbidden {
+                        self.emit_upstream_error(
+                            "upstream provider emitted tool use despite tool_choice none",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
                     let tool_index = self.next_tool_index;
                     self.next_tool_index += 1;
                     self.tool_indices.insert(index, tool_index);
@@ -2142,6 +2353,14 @@ impl AnthropicSseNormalizer {
                         }
                     }
                     Some("input_json_delta") => {
+                        if self.tools_forbidden {
+                            self.emit_upstream_error(
+                                "upstream provider emitted tool use despite tool_choice none",
+                                out,
+                            );
+                            self.finish(StreamTerminal::UpstreamFailure, out);
+                            return true;
+                        }
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             let tool_index = self.tool_indices.get(&index).copied().unwrap_or(0);
                             out.push_str(&self.chunk_line(
@@ -2168,7 +2387,16 @@ impl AnthropicSseNormalizer {
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
                     self.completion_tokens = Some(tokens);
                 }
-                let finish = map_stop_reason(event["delta"]["stop_reason"].as_str());
+                let stop_reason = event["delta"]["stop_reason"].as_str();
+                if self.tools_forbidden && stop_reason == Some("tool_use") {
+                    self.emit_upstream_error(
+                        "upstream provider emitted tool use despite tool_choice none",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                let finish = map_stop_reason(stop_reason);
                 out.push_str(&self.chunk_line(json!({}), Some(finish)));
                 false
             }
@@ -2509,8 +2737,12 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
-async fn normalize_anthropic_sse_buffered(model: String, body: &[u8]) -> Option<Vec<u8>> {
-    let mut normalizer = AnthropicSseNormalizer::new(model);
+async fn normalize_anthropic_sse_buffered(
+    model: String,
+    body: &[u8],
+    tools_forbidden: bool,
+) -> Option<Vec<u8>> {
+    let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
     let mut out = Vec::new();
     match normalizer.on_chunk(body).await {
         ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),

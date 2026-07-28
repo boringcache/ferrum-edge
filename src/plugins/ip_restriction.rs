@@ -292,7 +292,7 @@ fn range_binary_search(ranges: &[ParsedRule], client: u128) -> bool {
 }
 
 fn ip_key(client_ip: IpAddr) -> (IpFamily, u128) {
-    match client_ip.to_canonical() {
+    match crate::util::client_identity::canonical_ip(client_ip) {
         IpAddr::V4(ip) => (IpFamily::V4, u128::from(u32::from(ip))),
         IpAddr::V6(ip) => (IpFamily::V6, u128::from(ip)),
     }
@@ -378,7 +378,7 @@ fn v4_range(value: u32, prefix: u8) -> Option<ParsedRule> {
 }
 
 fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
-    match super::parse_client_ip_literal(ip)? {
+    match crate::util::client_identity::parse_client_ip_literal(ip)? {
         IpAddr::V4(ipv4) if is_canonical_ipv4_literal(ip, ipv4) => Some(IpAddr::V4(ipv4)),
         IpAddr::V4(_) => None,
         IpAddr::V6(ipv6) => Some(IpAddr::V6(ipv6)),
@@ -408,7 +408,7 @@ fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
 /// plugin hooks use the context-cached typed client IP and compiled range set.
 #[allow(dead_code)]
 pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let client_ip = super::parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical());
+    let client_ip = crate::util::client_identity::parse_canonical_client_ip(client_ip);
     match (client_ip, parse_rule(rule)) {
         (Some(client_ip), Some(rule)) => rule.matches(client_ip),
         _ => false,

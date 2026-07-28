@@ -12,9 +12,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -210,7 +208,8 @@ impl TcpConnectionThrottle {
                 key
             }
             None => {
-                let canonical_ip = canonical_client_ip(&ctx.client_ip);
+                let canonical_ip =
+                    crate::util::client_identity::canonical_client_ip_text(&ctx.client_ip);
                 let mut key = String::with_capacity(
                     "proxy::ip:".len() + ctx.proxy_id.len() + canonical_ip.len(),
                 );
@@ -221,18 +220,6 @@ impl TcpConnectionThrottle {
                 key
             }
         }
-    }
-}
-
-fn canonical_client_ip(client_ip: &str) -> Cow<'_, str> {
-    if let Ok(IpAddr::V6(ip)) = client_ip.parse::<IpAddr>()
-        && let Some(mapped) = ip.to_ipv4_mapped()
-    {
-        Cow::Owned(mapped.to_string())
-    } else {
-        // Gateway-produced client IP strings are already canonical. Borrow the
-        // common case so the throttle allocates only its final map key.
-        Cow::Borrowed(client_ip)
     }
 }
 
