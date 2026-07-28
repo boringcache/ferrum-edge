@@ -90,7 +90,7 @@ never dropped for being pathless.
 
 | `matches[]` shape | Materialized as |
 |---|---|
-| `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}`; no request-time predicate |
+| `method.type: Exact` with `service` **and** `method` | Exact listen path `=/{service}/{method}` — the method predicate itself is fully represented by that listen path; the mandatory gRPC `content-type` gate still runs at request time |
 | `method.type: Exact` with `service` only | Listen path prefix `/{service}/` — a gRPC `:path` always carries a trailing method segment, so this selects exactly that service |
 | `service` written in fully-qualified `.pkg.Svc` form | The optional leading `.` is normalized away — a gRPC `:path` never carries it, so `.pkg.Svc` and `pkg.Svc` denote the same service and collapse onto the same route |
 | `method.type: Exact` with `method` only | `/` listener plus a `mesh_route_dispatch` URI regex `/[^/]+/{method}` (the method literal is regex-escaped) |
