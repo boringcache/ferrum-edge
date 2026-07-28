@@ -65,6 +65,8 @@ const NOSAMPLE: &str = "/nosample/probe";
 const MIRRORED: &str = "/mirrored/probe";
 const SATURATED: &str = "/saturated/probe";
 const CANCEL: &str = "/cancel/probe";
+const CANCEL_ABORTED: &str = "/cancel/aborted";
+const CANCEL_RECOVERED: &str = "/cancel/recovered";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Proto {
@@ -202,20 +204,25 @@ async fn request_mirror_releases_reserved_capacity_when_a_client_cancels() {
 
     // Abort mid-body after declaring the whole aggregate budget.
     harness.reset_captures();
-    harness.abort_mid_body(CANCEL, CEILING, 64).await;
+    harness.abort_mid_body(CANCEL_ABORTED, CEILING, 64).await;
 
     // Retry until the aborted request's lease is observably released. A leaked
     // lease permanently exhausts the budget, so no retry could ever succeed.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut mirrored_again = false;
     while tokio::time::Instant::now() < deadline {
-        let status = harness.post_declared(CANCEL, SMALL).await;
+        let status = harness.post_declared(CANCEL_RECOVERED, SMALL).await;
         assert_eq!(
             status,
             StatusCode::OK,
             "the primary request must stay unaffected by mirror budget state"
         );
-        if harness.cancel_mirror.wait_for_request().await.is_some() {
+        if harness
+            .cancel_mirror
+            .wait_for_target(CANCEL_RECOVERED)
+            .await
+            .is_some()
+        {
             mirrored_again = true;
             break;
         }
@@ -232,7 +239,6 @@ async fn request_mirror_releases_reserved_capacity_when_a_client_cancels() {
 
 #[derive(Clone, Debug)]
 struct Captured {
-    #[allow(dead_code)]
     target: String,
     body_bytes: usize,
 }
@@ -287,10 +293,32 @@ impl CaptureBackend {
             .cloned()
     }
 
+    fn first_for_target(&self, target: &str) -> Option<Captured> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .find(|request| request.target == target)
+            .cloned()
+    }
+
     async fn wait_for_request(&self) -> Option<Captured> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(first) = self.first() {
+                return Some(first);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_target(&self, target: &str) -> Option<Captured> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(first) = self.first_for_target(target) {
                 return Some(first);
             }
             if tokio::time::Instant::now() >= deadline {
