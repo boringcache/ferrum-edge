@@ -141,9 +141,14 @@ impl RequestMatcher {
     }
 }
 
-/// A parsed HTTP/1.1 request line + headers. Body is not parsed — scripted
-/// backends decide whether to read it based on headers (Content-Length /
-/// Transfer-Encoding).
+/// A parsed HTTP/1.1 request line + headers, plus the decoded request body.
+///
+/// The body is decoded from whichever framing the peer used (`Content-Length`
+/// or `Transfer-Encoding: chunked`) and captured up to
+/// [`MAX_CAPTURED_REQUEST_BODY`]. Anything that prevents a lossless capture —
+/// a short body, an unparseable chunked stream, or a body larger than the cap
+/// — sets [`Request::body_truncated`], so a test can never assert equality
+/// against a silently clipped prefix.
 #[derive(Debug, Clone)]
 pub struct Request {
     pub method: String,
@@ -153,6 +158,13 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
     /// Raw bytes of the request prelude (everything before the body).
     pub raw_prelude: Vec<u8>,
+    /// Decoded request body bytes (chunk framing removed).
+    pub body: Vec<u8>,
+    /// `true` when `body` is NOT the complete body the peer intended to send.
+    /// Always check this before asserting on `body` — otherwise a truncated
+    /// or misframed body can make a `body.is_empty()` assertion pass for the
+    /// wrong reason.
+    pub body_truncated: bool,
 }
 
 impl Request {
@@ -162,6 +174,18 @@ impl Request {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The complete decoded body, or `None` when the fixture could not
+    /// capture it losslessly. Prefer this over touching [`Request::body`]
+    /// directly: it forces callers to handle the truncated case instead of
+    /// asserting against a partial capture.
+    pub fn complete_body(&self) -> Option<&[u8]> {
+        if self.body_truncated {
+            None
+        } else {
+            Some(&self.body)
+        }
     }
 }
 
@@ -424,48 +448,189 @@ async fn read_http_prelude(
         version,
         headers,
         raw_prelude: prelude_slice.to_vec(),
+        body: Vec::new(),
+        body_truncated: false,
     }))
 }
 
-/// Consume `Content-Length` body bytes for `req`. `carryover` is the
-/// pre-read buffer (bytes that arrived in the same `read()` as the prelude
-/// or a previous step). The function drains `Content-Length` bytes from
-/// the front of `carryover`, then from the socket for any remainder —
-/// **bytes past Content-Length stay in `carryover`** so a subsequent
-/// `ExpectRequest` can parse a pipelined next request without losing the
-/// bytes the peer already sent.
-///
-/// Transfer-Encoding: chunked is not parsed; if the caller needs to drain
-/// a chunked body they must do so themselves.
-async fn drain_body(
-    stream: &mut TcpStream,
-    req: &Request,
-    carryover: &mut Vec<u8>,
-) -> io::Result<()> {
-    let Some(cl) = req.header("content-length") else {
-        return Ok(());
-    };
-    let Ok(n) = cl.parse::<usize>() else {
-        return Ok(());
-    };
-    if n == 0 {
-        return Ok(());
-    }
-    // Drain up to N body bytes from the front of carryover, leaving the
-    // tail (pipelined next request) behind.
-    let from_carry = carryover.len().min(n);
-    carryover.drain(..from_carry);
-    let mut remaining = n - from_carry;
-    while remaining > 0 {
-        let mut buf = [0u8; 4096];
-        let want = remaining.min(buf.len());
-        match stream.read(&mut buf[..want]).await {
-            Ok(0) => break,
-            Ok(m) => remaining -= m,
-            Err(_) => break,
+/// Upper bound on request-body bytes retained per request. Captured bodies
+/// exist for assertions, not throughput. A body larger than this is still
+/// drained off the socket (so the connection stays framed) but is reported
+/// through [`Request::body_truncated`].
+pub const MAX_CAPTURED_REQUEST_BODY: usize = 256 * 1024;
+
+/// Hard ceiling on how many body bytes the fixture will pull off the socket
+/// for a single request. Beyond this the capture is abandoned as truncated
+/// rather than letting a hostile/looping peer pin the connection task.
+const MAX_DRAINED_REQUEST_BODY: usize = 8 * 1024 * 1024;
+
+/// Longest chunked-framing control line (`<hex-size>[;ext]` or a trailer)
+/// the fixture will accept before declaring the stream unparseable.
+const MAX_CHUNK_CONTROL_LINE: usize = 1024;
+
+/// Body bytes captured for one request plus whether the capture is lossless.
+#[derive(Default)]
+struct BodyCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    drained: usize,
+}
+
+impl BodyCapture {
+    fn push(&mut self, chunk: &[u8]) {
+        self.drained = self.drained.saturating_add(chunk.len());
+        let room = MAX_CAPTURED_REQUEST_BODY.saturating_sub(self.bytes.len());
+        if chunk.len() > room {
+            self.bytes.extend_from_slice(&chunk[..room]);
+            self.truncated = true;
+        } else {
+            self.bytes.extend_from_slice(chunk);
         }
     }
-    Ok(())
+
+    fn apply_to(self, req: &mut Request) {
+        req.body = self.bytes;
+        req.body_truncated = self.truncated;
+    }
+}
+
+/// Read one more socket chunk into `carryover`. Returns `false` on EOF or an
+/// I/O error — both mean "no more body bytes are coming".
+async fn fill_carryover(stream: &mut TcpStream, carryover: &mut Vec<u8>) -> bool {
+    let mut buf = [0u8; 4096];
+    match stream.read(&mut buf).await {
+        Ok(0) | Err(_) => false,
+        Ok(n) => {
+            carryover.extend_from_slice(&buf[..n]);
+            true
+        }
+    }
+}
+
+/// Consume a CRLF-terminated control line from `carryover` (reading more from
+/// the socket as needed), returning the line without its terminator. `None`
+/// means EOF or a line longer than `MAX_CHUNK_CONTROL_LINE`.
+async fn read_control_line(stream: &mut TcpStream, carryover: &mut Vec<u8>) -> Option<Vec<u8>> {
+    loop {
+        if let Some(pos) = carryover.windows(2).position(|w| w == b"\r\n") {
+            if pos > MAX_CHUNK_CONTROL_LINE {
+                return None;
+            }
+            let line = carryover[..pos].to_vec();
+            carryover.drain(..pos + 2);
+            return Some(line);
+        }
+        if carryover.len() > MAX_CHUNK_CONTROL_LINE {
+            return None;
+        }
+        if !fill_carryover(stream, carryover).await {
+            return None;
+        }
+    }
+}
+
+/// Move exactly `n` body bytes out of `carryover`/the socket into `capture`.
+/// Returns `false` if the peer closed first (capture marked truncated).
+async fn take_body_bytes(
+    stream: &mut TcpStream,
+    carryover: &mut Vec<u8>,
+    capture: &mut BodyCapture,
+    n: usize,
+) -> bool {
+    let mut remaining = n;
+    while remaining > 0 {
+        if capture.drained >= MAX_DRAINED_REQUEST_BODY {
+            capture.truncated = true;
+            return false;
+        }
+        if carryover.is_empty() && !fill_carryover(stream, carryover).await {
+            capture.truncated = true;
+            return false;
+        }
+        let take = carryover.len().min(remaining);
+        capture.push(&carryover[..take]);
+        carryover.drain(..take);
+        remaining -= take;
+    }
+    true
+}
+
+/// Consume and capture `req`'s body. `carryover` is the pre-read buffer
+/// (bytes that arrived in the same `read()` as the prelude or a previous
+/// step). Body bytes are drained from the front of `carryover` first, then
+/// from the socket — **bytes past the end of the body stay in `carryover`**
+/// so a subsequent `ExpectRequest` can parse a pipelined next request
+/// without losing the bytes the peer already sent.
+///
+/// Both `Content-Length` and `Transfer-Encoding: chunked` framings are
+/// decoded. Anything that stops the capture from being lossless (peer closed
+/// mid-body, unparseable chunk framing, body above
+/// [`MAX_CAPTURED_REQUEST_BODY`]) is reported through
+/// [`Request::body_truncated`] rather than silently yielding a short body —
+/// a silent short body would let a `body == expected` assertion fail for an
+/// unrelated reason, and a silent empty body would let one pass vacuously.
+async fn drain_body(stream: &mut TcpStream, req: &Request, carryover: &mut Vec<u8>) -> BodyCapture {
+    let mut capture = BodyCapture::default();
+
+    let chunked = req
+        .header("transfer-encoding")
+        .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
+    if chunked {
+        loop {
+            let Some(header) = read_control_line(stream, carryover).await else {
+                capture.truncated = true;
+                return capture;
+            };
+            let header_text = String::from_utf8_lossy(&header);
+            // Strip any chunk extension (`<size>;name=value`).
+            let size_text = header_text.split(';').next().unwrap_or("").trim();
+            let Ok(size) = usize::from_str_radix(size_text, 16) else {
+                capture.truncated = true;
+                return capture;
+            };
+            if size == 0 {
+                // Trailer section: lines until the terminating empty line.
+                loop {
+                    match read_control_line(stream, carryover).await {
+                        Some(line) if line.is_empty() => return capture,
+                        Some(_) => continue,
+                        None => {
+                            capture.truncated = true;
+                            return capture;
+                        }
+                    }
+                }
+            }
+            if !take_body_bytes(stream, carryover, &mut capture, size).await {
+                return capture;
+            }
+            // Every chunk's data is followed by a bare CRLF.
+            match read_control_line(stream, carryover).await {
+                Some(line) if line.is_empty() => {}
+                _ => {
+                    capture.truncated = true;
+                    return capture;
+                }
+            }
+        }
+    }
+
+    let Some(cl) = req.header("content-length") else {
+        // No Content-Length and no chunked framing: RFC 9112 says there is
+        // no body on a request. Nothing to capture, nothing lost.
+        return capture;
+    };
+    let Ok(n) = cl.parse::<usize>() else {
+        // An unparseable Content-Length means we cannot know where the body
+        // ends; refuse to guess and report the capture as lossy.
+        capture.truncated = true;
+        return capture;
+    };
+    if n == 0 {
+        return capture;
+    }
+    take_body_bytes(stream, carryover, &mut capture, n).await;
+    capture
 }
 
 async fn run_http_script(
@@ -495,8 +660,10 @@ async fn run_http_script(
         match step {
             HttpStep::ExpectRequest(matcher) => {
                 match read_http_prelude(&mut stream, &mut carryover).await {
-                    Ok(Some(req)) => {
-                        drain_body(&mut stream, &req, &mut carryover).await.ok();
+                    Ok(Some(mut req)) => {
+                        drain_body(&mut stream, &req, &mut carryover)
+                            .await
+                            .apply_to(&mut req);
                         // Matcher is informational — the script continues either
                         // way — but we surface mismatches via a counter so tests
                         // can observe the result instead of it being silently
@@ -564,9 +731,11 @@ async fn run_http_script(
                 // already did. (The step returns right after writing the
                 // response, so we don't bother flipping `request_consumed`.)
                 if !request_consumed
-                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                    && let Ok(Some(mut r)) = read_http_prelude(&mut stream, &mut carryover).await
                 {
-                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    drain_body(&mut stream, &r, &mut carryover)
+                        .await
+                        .apply_to(&mut r);
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -587,9 +756,11 @@ async fn run_http_script(
                 reset,
             } => {
                 if !request_consumed
-                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                    && let Ok(Some(mut r)) = read_http_prelude(&mut stream, &mut carryover).await
                 {
-                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    drain_body(&mut stream, &r, &mut carryover)
+                        .await
+                        .apply_to(&mut r);
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -619,9 +790,11 @@ async fn run_http_script(
                 pause,
             } => {
                 if !request_consumed
-                    && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
+                    && let Ok(Some(mut r)) = read_http_prelude(&mut stream, &mut carryover).await
                 {
-                    drain_body(&mut stream, &r, &mut carryover).await.ok();
+                    drain_body(&mut stream, &r, &mut carryover)
+                        .await
+                        .apply_to(&mut r);
                     state.requests.lock().await.push(r);
                 }
                 stream
@@ -1044,5 +1217,270 @@ mod tests {
             !errs.is_empty(),
             "expected write failure to be captured in step_errors"
         );
+    }
+
+    // ── Request-body capture ────────────────────────────────────────────
+    //
+    // Regression coverage for the fixture capability that replaced the
+    // hand-rolled `ReadUntil(\r\n\r\n) + ReadExact(len)` scripts in the
+    // A2A SSE tests (issue #3431). Those scripts guessed the body length
+    // instead of reading the framing, so any connection that was not the
+    // expected HTTP/1.1 request — notably the gateway's startup h2c
+    // capability probe, whose HTTP/2 preface contains a `\r\n\r\n` —
+    // short-read and failed the test. Body assertions are only meaningful
+    // if the capture is lossless and reports when it is not.
+
+    /// Drive one request through a backend whose only job is to record it.
+    async fn record_request(raw: &[u8]) -> Request {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .step(HttpStep::RespondStatus {
+                status: 204,
+                reason: "No Content".into(),
+            })
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(raw).await.expect("write");
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp))
+            .await
+            .expect("backend answered within timeout")
+            .expect("read");
+
+        backend
+            .request(0)
+            .await
+            .expect("backend recorded the request")
+    }
+
+    /// A `Content-Length` body coalesced with the prelude must be captured
+    /// byte-for-byte and flagged complete.
+    #[tokio::test]
+    async fn content_length_body_is_captured_losslessly() {
+        let body = br#"{"jsonrpc":"2.0","method":"message/send"}"#;
+        let raw = format!(
+            "POST /a2a HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let req = record_request(raw.as_bytes()).await;
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/a2a");
+        assert!(!req.body_truncated, "capture should be complete");
+        assert_eq!(req.complete_body(), Some(&body[..]));
+    }
+
+    /// The same body split across TCP segments must still be captured in
+    /// full — the capture must read the socket, not just the pre-read
+    /// buffer that happened to arrive with the prelude.
+    #[tokio::test]
+    async fn content_length_body_split_across_segments_is_captured_losslessly() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "POST", "/split",
+            )))
+            .step(HttpStep::RespondStatus {
+                status: 204,
+                reason: "No Content".into(),
+            })
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(b"POST /split HTTP/1.1\r\nHost: x\r\nContent-Length: 9\r\n\r\n")
+            .await
+            .expect("write prelude");
+        s.write_all(b"abc").await.expect("write part 1");
+        s.write_all(b"def").await.expect("write part 2");
+        s.write_all(b"ghi").await.expect("write part 3");
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp))
+            .await
+            .expect("backend answered within timeout")
+            .expect("read");
+
+        let req = backend.request(0).await.expect("recorded request");
+        assert!(!req.body_truncated);
+        assert_eq!(req.complete_body(), Some(&b"abcdefghi"[..]));
+        backend.assert_no_matcher_mismatches().await;
+    }
+
+    /// A chunked body must be decoded (framing removed) rather than left
+    /// on the socket. Before this capability the fixture ignored chunked
+    /// framing entirely, so the chunk bytes were misread as the next
+    /// pipelined request.
+    #[tokio::test]
+    async fn chunked_body_is_decoded_and_framing_is_consumed() {
+        let raw = b"POST /chunked HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    5\r\nhello\r\n\
+                    6;ext=1\r\n world\r\n\
+                    0\r\n\r\n";
+        let req = record_request(raw).await;
+        assert_eq!(req.path, "/chunked");
+        assert!(!req.body_truncated, "chunked capture should be complete");
+        assert_eq!(req.complete_body(), Some(&b"hello world"[..]));
+    }
+
+    /// A peer that closes before delivering the declared `Content-Length`
+    /// must produce a *flagged* partial capture. Silently returning the
+    /// short prefix would let `body == expected` fail for the wrong
+    /// reason, and silently returning nothing would let an
+    /// `assert!(body.is_empty())` pass vacuously.
+    #[tokio::test]
+    async fn short_body_is_reported_as_truncated() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .spawn()
+            .expect("spawn");
+
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            s.write_all(b"POST /short HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+                .await
+                .expect("write");
+            // Drop: FIN after only 3 of the 10 declared body bytes.
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let req = loop {
+            if let Some(r) = backend.request(0).await {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backend never recorded the truncated request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            req.body_truncated,
+            "an incomplete body must be flagged, got {:?}",
+            String::from_utf8_lossy(&req.body)
+        );
+        assert_eq!(req.complete_body(), None);
+        assert_eq!(req.body, b"abc".to_vec());
+    }
+
+    /// Unparseable chunk framing must be reported as truncated instead of
+    /// being silently treated as an empty body.
+    #[tokio::test]
+    async fn malformed_chunked_body_is_reported_as_truncated() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+            .spawn()
+            .expect("spawn");
+
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            s.write_all(
+                b"POST /bad HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nnot-hex\r\n",
+            )
+            .await
+            .expect("write");
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let req = loop {
+            if let Some(r) = backend.request(0).await {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "backend never recorded the malformed request"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(req.body_truncated);
+        assert_eq!(req.complete_body(), None);
+    }
+
+    /// The capture is bounded: a body above `MAX_CAPTURED_REQUEST_BODY` is
+    /// still drained (so the connection stays framed and the response
+    /// fires) but is reported as truncated.
+    #[tokio::test]
+    async fn oversized_body_is_bounded_and_flagged() {
+        let over = MAX_CAPTURED_REQUEST_BODY + 4096;
+        let mut raw =
+            format!("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {over}\r\n\r\n").into_bytes();
+        raw.extend(std::iter::repeat_n(b'z', over));
+        let req = record_request(&raw).await;
+        assert!(req.body_truncated, "oversized body must be flagged");
+        assert_eq!(req.complete_body(), None);
+        assert_eq!(
+            req.body.len(),
+            MAX_CAPTURED_REQUEST_BODY,
+            "capture must stop at the documented cap"
+        );
+    }
+
+    /// Body capture must not disturb the pipelining contract: the bytes
+    /// following a `Content-Length` body still belong to the next request.
+    #[tokio::test]
+    async fn pipelined_request_after_captured_body_is_still_parsed() {
+        let reservation = reserve_port().await.expect("port");
+        let port = reservation.port;
+        let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "POST", "/first",
+            )))
+            .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+                "GET", "/second",
+            )))
+            .step(HttpStep::RespondStatus {
+                status: 204,
+                reason: "No Content".into(),
+            })
+            .step(HttpStep::RespondBodyEnd)
+            .spawn()
+            .expect("spawn");
+
+        let mut s = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        s.write_all(
+            b"POST /first HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\n\
+              abc\
+              GET /second HTTP/1.1\r\nHost: x\r\n\r\n",
+        )
+        .await
+        .expect("write");
+
+        let mut resp = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp))
+            .await
+            .expect("both requests parsed within timeout")
+            .expect("read");
+
+        let reqs = backend.received_requests().await;
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert_eq!(reqs[0].complete_body(), Some(&b"abc"[..]));
+        assert_eq!(
+            reqs[1].complete_body(),
+            Some(&b""[..]),
+            "a bodyless request captures an empty, complete body"
+        );
+        backend.assert_no_matcher_mismatches().await;
+        backend.assert_no_step_errors().await;
     }
 }
