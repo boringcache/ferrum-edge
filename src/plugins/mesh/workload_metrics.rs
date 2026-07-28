@@ -58,6 +58,7 @@ const B3_TRACE_HEADERS: [&str; 6] = [
 const MAX_CUSTOM_TAGS: usize = 32;
 const MAX_CUSTOM_TAG_NAME_BYTES: usize = 128;
 const MAX_CUSTOM_TAG_VALUE_BYTES: usize = 1024;
+const MAX_CUSTOM_ENV_VAR_NAME_BYTES: usize = 256;
 const MAX_METRIC_TAG_VALUE_BYTES: usize = 256;
 
 fn mesh_direction_str(direction: MeshTrafficDirection) -> &'static str {
@@ -248,11 +249,27 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
+        let custom_env_tags: HashMap<String, String> = config
+            .get("custom_env_tags")
+            .and_then(Value::as_object)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let ValidatedCustomTags {
-            custom_tags,
+            mut custom_tags,
             custom_header_tags,
+            custom_env_tags,
             custom_trace_attributes_marker,
-        } = validate_custom_tags(custom_tags, custom_header_tags)?;
+        } = validate_custom_tags(custom_tags, custom_header_tags, custom_env_tags)?;
+        // Resolve Istio environment custom tags from *this* data-plane process
+        // environment at construction/reload — never on the request hot path
+        // and never from a controller-host translation.
+        resolve_custom_env_tags(&mut custom_tags, &custom_env_tags)?;
         let ParsedMetricConfig {
             request_count_tag_overrides,
             request_duration_tag_overrides,
@@ -1332,9 +1349,13 @@ pub(crate) fn validate_istio_telemetry_config(
     metrics: Option<&MeshMetricsConfig>,
 ) -> Result<(), String> {
     if let Some(tracing) = tracing {
+        // Structural validation only — do not resolve environment values here.
+        // Controllers and CP translators must not treat host process env as the
+        // target data plane.
         validate_custom_tags(
             tracing.custom_tags.clone(),
             tracing.custom_header_tags.clone(),
+            tracing.custom_env_tags.clone(),
         )?;
         validate_trace_provider_endpoints(&tracing.providers).map_err(|error| {
             format!("workload_metrics: invalid tracing exporter config: {error}")
@@ -1351,16 +1372,19 @@ pub(crate) fn validate_istio_telemetry_config(
 struct ValidatedCustomTags {
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
+    custom_env_tags: HashMap<String, String>,
     custom_trace_attributes_marker: Option<String>,
 }
 
 fn validate_custom_tags(
     custom_tags: HashMap<String, String>,
     custom_header_tags: HashMap<String, String>,
+    custom_env_tags: HashMap<String, String>,
 ) -> Result<ValidatedCustomTags, String> {
     let mut names: Vec<String> = custom_tags
         .keys()
         .chain(custom_header_tags.keys())
+        .chain(custom_env_tags.keys())
         .cloned()
         .collect();
     names.sort();
@@ -1395,12 +1419,74 @@ fn validate_custom_tags(
         normalized_header_tags.insert(name, header_name.as_str().to_string());
     }
 
+    let mut normalized_env_tags = HashMap::with_capacity(custom_env_tags.len());
+    for (name, env_var) in custom_env_tags {
+        validate_env_var_name(&name, &env_var)?;
+        normalized_env_tags.insert(name, env_var);
+    }
+
     let marker = (!names.is_empty()).then(|| names.join(","));
     Ok(ValidatedCustomTags {
         custom_tags,
         custom_header_tags: normalized_header_tags,
+        custom_env_tags: normalized_env_tags,
         custom_trace_attributes_marker: marker,
     })
+}
+
+/// Resolve `custom_env_tags` against the local data-plane process environment.
+///
+/// Istio/Envoy semantics: a present variable overrides any literal default in
+/// `custom_tags`; a missing variable keeps the default when one was translated,
+/// otherwise the tag is omitted. Resolved values are never logged.
+fn resolve_custom_env_tags(
+    custom_tags: &mut HashMap<String, String>,
+    custom_env_tags: &HashMap<String, String>,
+) -> Result<(), String> {
+    for (tag, env_var) in custom_env_tags {
+        match std::env::var(env_var) {
+            Ok(value) => {
+                if value.len() > MAX_CUSTOM_TAG_VALUE_BYTES {
+                    return Err(format!(
+                        "workload_metrics: custom env tag '{tag}' value from '{env_var}' exceeds {MAX_CUSTOM_TAG_VALUE_BYTES} bytes"
+                    ));
+                }
+                custom_tags.insert(tag.clone(), value);
+            }
+            Err(std::env::VarError::NotPresent) => {
+                // Keep any translated defaultValue already in custom_tags;
+                // otherwise omit the tag (Istio/Envoy).
+            }
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!(
+                    "workload_metrics: custom env tag '{tag}' environment variable '{env_var}' is not valid UTF-8"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
+    if env_var.is_empty() || env_var.len() > MAX_CUSTOM_ENV_VAR_NAME_BYTES {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    }
+    let mut chars = env_var.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name"
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' has invalid environment variable name '{env_var}'"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_custom_tag_name(name: &str) -> Result<(), String> {
@@ -1889,6 +1975,56 @@ mod tests {
                 .map(String::as_str),
             Some("literal,tenant")
         );
+    }
+
+    #[test]
+    fn custom_env_tags_resolve_at_construction_with_istio_missing_semantics() {
+        const ENV_VAR: &str = "FERRUM_TEST_WORKLOAD_METRICS_ENV_TAG";
+        // SAFETY: isolated to this single-threaded unit test module path.
+        unsafe {
+            std::env::remove_var(ENV_VAR);
+        }
+
+        let missing = WorkloadMetrics::new(&json!({
+            "custom_tags": {"cluster": "fallback"},
+            "custom_env_tags": {
+                "cluster": ENV_VAR,
+                "region": "FERRUM_TEST_WORKLOAD_METRICS_ENV_TAG_ABSENT"
+            }
+        }))
+        .expect("missing env keeps default / omits tag");
+        let mut metadata = HashMap::new();
+        missing.apply_telemetry_metadata(&mut metadata, &HashMap::new());
+        assert_eq!(
+            metadata.get("cluster").map(String::as_str),
+            Some("fallback")
+        );
+        assert!(!metadata.contains_key("region"));
+
+        unsafe {
+            std::env::set_var(ENV_VAR, "live");
+        }
+        let present = WorkloadMetrics::new(&json!({
+            "custom_tags": {"cluster": "fallback"},
+            "custom_env_tags": {"cluster": ENV_VAR}
+        }))
+        .expect("present env overrides default");
+        let mut metadata = HashMap::new();
+        present.apply_telemetry_metadata(&mut metadata, &HashMap::new());
+        assert_eq!(metadata.get("cluster").map(String::as_str), Some("live"));
+
+        let invalid = WorkloadMetrics::new(&json!({
+            "custom_env_tags": {"cluster": "BAD-NAME"}
+        }));
+        assert!(
+            invalid
+                .expect_err("invalid env var name")
+                .contains("invalid environment variable name")
+        );
+
+        unsafe {
+            std::env::remove_var(ENV_VAR);
+        }
     }
 
     #[test]

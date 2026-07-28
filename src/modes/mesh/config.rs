@@ -876,14 +876,22 @@ pub struct MeshTracingConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub disable_span_reporting: Option<bool>,
-    /// Literal custom tags and environment-tag `defaultValue`s injected into
-    /// every span / transaction metadata. Process environment values are never
-    /// resolved from this configuration.
+    /// Literal custom tags and environment-tag `defaultValue` fallbacks injected
+    /// into every span / transaction metadata. Live environment values are never
+    /// resolved from this map on the controller; see [`Self::custom_env_tags`].
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_tags: HashMap<String, String>,
     /// Custom tags resolved from request headers at runtime.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub custom_header_tags: HashMap<String, String>,
+    /// Istio `customTags.<tag>.environment` references carried as
+    /// `tag_name -> env_var_name`. The Kubernetes translator never reads the
+    /// controller-host environment: the mesh data plane resolves these at
+    /// `workload_metrics` construction/reload. A present value overrides any
+    /// matching [`Self::custom_tags`] default; a missing variable without a
+    /// default omits the tag (Istio/Envoy semantics).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_env_tags: HashMap<String, String>,
     /// Provider-specific tracing backends (Zipkin / Datadog / Lightstep / OpenTelemetry).
     ///
     /// The legacy singular `provider` spelling deserializes into this vector

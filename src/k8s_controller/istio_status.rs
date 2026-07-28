@@ -3507,6 +3507,38 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_invalid_environment_custom_tag_is_rejected() {
+        let obj = object(
+            "telemetry.istio.io/v1",
+            "Telemetry",
+            "bad-env-tag",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "cluster": {
+                            "environment": {
+                                "name": "BAD-NAME"
+                            }
+                        }
+                    }
+                }]
+            }),
+        );
+        let updates = plan_istio_status_updates(&[obj], options());
+        let c = find_condition(
+            updates[0].status["conditions"].as_array().unwrap(),
+            "FerrumAccepted",
+        );
+        assert_eq!(c["status"].as_str(), Some("False"));
+        assert_eq!(c["reason"].as_str(), Some("Invalid"));
+        let message = c["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("invalid environment variable name"),
+            "expected visible env-tag rejection, got {message}"
+        );
+    }
+
+    #[test]
     fn telemetry_invalid_tracing_mode_is_rejected() {
         // tracing.match.mode of an unknown value is rejected by the translator.
         let obj = object(

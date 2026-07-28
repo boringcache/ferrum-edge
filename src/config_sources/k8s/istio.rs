@@ -4504,6 +4504,7 @@ fn telemetry(
                 disable_span_reporting: None,
                 custom_tags: HashMap::new(),
                 custom_header_tags: HashMap::new(),
+                custom_env_tags: HashMap::new(),
                 providers: Vec::new(),
             };
             let mut emits_server = false;
@@ -4522,52 +4523,66 @@ fn telemetry(
                 saw_entry = true;
                 let sampling = telemetry_sampling_percentage(object, t)?;
                 let mut custom_header_tags: HashMap<String, String> = HashMap::new();
-                let custom_tags: HashMap<String, String> = t
-                    .get("customTags")
-                    .and_then(Value::as_object)
-                    .map(|tags| {
-                        tags.iter()
-                            .filter_map(|(key, val)| {
-                                // Istio customTags: { tagName: { literal: { value: "v" } } }
-                                if let Some(header_name) = val
-                                    .get("header")
-                                    .and_then(|h| h.get("name"))
-                                    .and_then(Value::as_str)
-                                {
-                                    custom_header_tags.insert(key.clone(), header_name.to_string());
-                                    return val
-                                        .get("header")
-                                        .and_then(|header| header.get("defaultValue"))
-                                        .and_then(Value::as_str)
-                                        .map(|value| (key.clone(), value.to_string()));
-                                }
+                let mut custom_env_tags: HashMap<String, String> = HashMap::new();
+                let mut custom_tags: HashMap<String, String> = HashMap::new();
+                if let Some(tags) = t.get("customTags").and_then(Value::as_object) {
+                    for (key, val) in tags {
+                        // Istio customTags: { tagName: { literal: { value: "v" } } }
+                        // | { header: { name, defaultValue? } }
+                        // | { environment: { name, defaultValue? } }
+                        if let Some(header_name) = val
+                            .get("header")
+                            .and_then(|h| h.get("name"))
+                            .and_then(Value::as_str)
+                        {
+                            custom_header_tags.insert(key.clone(), header_name.to_string());
+                            if let Some(value) = val
+                                .get("header")
+                                .and_then(|header| header.get("defaultValue"))
+                                .and_then(Value::as_str)
+                            {
+                                custom_tags.insert(key.clone(), value.to_string());
+                            }
+                            continue;
+                        }
 
-                                let value = val
-                                    .get("literal")
-                                    .and_then(|l| l.get("value"))
-                                    .and_then(Value::as_str)
-                                    .map(str::to_string)
-                                    .or_else(|| {
-                                        let env_tag = val.get("environment")?;
-                                        let name = env_tag.get("name").and_then(Value::as_str)?;
-                                        let default_value = env_tag
-                                            .get("defaultValue")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_string);
-                                        if default_value.is_none() {
-                                            tracing::debug!(
-                                                tag = %key,
-                                                env_var = %name,
-                                                "dropping telemetry custom tag environment reference without defaultValue"
-                                            );
-                                        }
-                                        default_value
-                                    });
-                                value.map(|v| (key.clone(), v))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                        if let Some(literal) = val
+                            .get("literal")
+                            .and_then(|l| l.get("value"))
+                            .and_then(Value::as_str)
+                        {
+                            custom_tags.insert(key.clone(), literal.to_string());
+                            continue;
+                        }
+
+                        if let Some(env_tag) = val.get("environment") {
+                            let Some(name) = env_tag
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|name| !name.is_empty())
+                            else {
+                                return Err(invalid_resource(
+                                    object,
+                                    format!(
+                                        "Telemetry tracing customTags.{key}.environment.name is required"
+                                    ),
+                                ));
+                            };
+                            // Carry a typed DP lookup. Never resolve the
+                            // controller-host environment here — sidecar env is
+                            // only known on the target data plane.
+                            custom_env_tags.insert(key.clone(), name.to_string());
+                            if let Some(default_value) = env_tag
+                                .get("defaultValue")
+                                .and_then(Value::as_str)
+                            {
+                                custom_tags.insert(key.clone(), default_value.to_string());
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let providers = telemetry_tracing_providers(acc, object, t)?;
                 if sampling.is_some() {
                     merged.sampling_percentage = sampling;
@@ -4580,6 +4595,9 @@ fn telemetry(
                 }
                 if !custom_header_tags.is_empty() {
                     merged.custom_header_tags.extend(custom_header_tags);
+                }
+                if !custom_env_tags.is_empty() {
+                    merged.custom_env_tags.extend(custom_env_tags);
                 }
                 if !providers.is_empty() {
                     extend_unique_tracing_providers(&mut merged.providers, providers);
@@ -7278,7 +7296,7 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_uses_default_value() {
+    fn telemetry_environment_custom_tag_carries_default_and_typed_lookup() {
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -7310,10 +7328,52 @@ mod tests {
             tracing.custom_tags.get("region").map(String::as_str),
             Some("us-east-1")
         );
+        assert_eq!(
+            tracing.custom_env_tags.get("region").map(String::as_str),
+            Some("FERRUM_TEST_TELEMETRY_REGION_UNSET")
+        );
     }
 
     #[test]
-    fn telemetry_environment_custom_tag_ignores_process_environment_values() {
+    fn telemetry_environment_custom_tag_without_default_is_carried_not_dropped() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "cluster": {
+                                "environment": {
+                                    "name": "ISTIO_META_CLUSTER_ID"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert!(
+            !tracing.custom_tags.contains_key("cluster"),
+            "no defaultValue means no literal fallback at translation"
+        );
+        assert_eq!(
+            tracing.custom_env_tags.get("cluster").map(String::as_str),
+            Some("ISTIO_META_CLUSTER_ID")
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_does_not_resolve_controller_host_env() {
         // SAFETY: this test is single-threaded — `mod tests` here doesn't
         // touch `FERRUM_TEST_TELEMETRY_ENV_TAG` from any other thread, so
         // the Rust 2024 unsafe contract on `set_var` is satisfied. We do not
@@ -7351,7 +7411,96 @@ mod tests {
 
         assert_eq!(
             tracing.custom_tags.get("env_tag").map(String::as_str),
-            Some("fallback-value")
+            Some("fallback-value"),
+            "controller must not read host env as the data plane"
+        );
+        assert_eq!(
+            tracing.custom_env_tags.get("env_tag").map(String::as_str),
+            Some("FERRUM_TEST_TELEMETRY_ENV_TAG")
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_missing_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "defaultValue": "fallback"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("environment tag without name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("environment.name is required"),
+            "expected field-specific rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_empty_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "name": "   "
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("empty environment name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("environment.name is required"),
+            "expected field-specific rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_invalid_env_var_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "env_tag": {
+                                "environment": {
+                                    "name": "BAD-NAME"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("invalid environment variable name must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid environment variable name"),
+            "expected env-var name rejection, got {message}"
         );
     }
 

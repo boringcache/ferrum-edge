@@ -15649,9 +15649,9 @@ components:
         non-mesh gateways that want Istio-style workload labels in logs.
 
         Runtime admission permits at most 32 distinct custom tag names across
-        `custom_tags` and `custom_header_tags` combined. The individual
-        `maxProperties: 32` bounds remain for generated clients, but the
-        cross-property combined total cannot be expressed mechanically.
+        `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
+        individual `maxProperties: 32` bounds remain for generated clients, but
+        the cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -15712,8 +15712,10 @@ components:
             Custom tags injected into transaction metadata and exported spans.
             Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
             and cannot collide with reserved, sensitive, `mesh.*`, trace, or
-            authorization keys. This map and `custom_header_tags` may contain
-            at most 32 distinct tag names combined.
+            authorization keys. This map, `custom_header_tags`, and
+            `custom_env_tags` may contain at most 32 distinct tag names combined.
+            For Istio environment tags, values here are `defaultValue`
+            fallbacks only — live data-plane resolution uses `custom_env_tags`.
         custom_header_tags:
           type: object
           maxProperties: 32
@@ -15723,8 +15725,26 @@ components:
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
             sensitive destination names are rejected; runtime values over 1024
-            bytes are omitted. This map and `custom_tags` may contain at most
-            32 distinct tag names combined.
+            bytes are omitted. This map, `custom_tags`, and `custom_env_tags`
+            may contain at most 32 distinct tag names combined.
+        custom_env_tags:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            type: string
+            maxLength: 256
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+          description: |
+            Istio `customTags.<tag>.environment` lookups (`tag_name ->
+            env_var_name`) resolved from the local data-plane process
+            environment at plugin construction and reload. Controllers must
+            not resolve these against the controller-host environment. A
+            present UTF-8 value overrides any matching `custom_tags` default;
+            a missing variable keeps that default when present and otherwise
+            omits the tag. Non-UTF-8 or >1024-byte values fail construction
+            closed. Resolved values are never logged. Combined with
+            `custom_tags` and `custom_header_tags`, at most 32 distinct tag
+            names are admitted.
         metrics:
           type: object
           description: |
