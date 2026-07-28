@@ -1009,6 +1009,376 @@ async fn test_final_request_body_rejects_every_malformed_envelope_boundary() {
     }
 }
 
+// ── Request-side trailer frames (issue #3291) ──
+
+/// Drive the owner-scoped request-body pipeline for one gRPC-Web request and
+/// report `(backend-bound body, staged trailers, final-hook outcome)`.
+async fn run_grpc_web_request_pipeline(
+    content_type: &str,
+    wire_body: &[u8],
+) -> (Vec<u8>, Option<Vec<(String, String)>>, PluginResult) {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context(content_type);
+    assert!(matches!(
+        plugin.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let transformed = plugin
+        .transform_request_body_with_context(&mut ctx, wire_body, None, &headers)
+        .await
+        .unwrap_or_else(|| wire_body.to_vec());
+    let staged = ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata);
+    let outcome = plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &transformed)
+        .await;
+    (transformed, staged, outcome)
+}
+
+fn grpc_web_text_body(binary: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .encode(binary)
+        .into_bytes()
+}
+
+fn segmented_grpc_web_text_body(message: &[u8], trailer: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut wire = STANDARD.encode(message);
+    wire.push_str(&STANDARD.encode(trailer));
+    wire.into_bytes()
+}
+
+#[test]
+fn split_request_trailer_frame_reports_data_boundary_and_metadata() {
+    let mut body = request_frame(0x00, b"hello");
+    let data_end = body.len();
+    body.extend_from_slice(&request_frame(
+        0x80,
+        b"x-app-id: 42\r\nX-Trace-Bin: AAEC\r\nx-app-id: 43\r\n",
+    ));
+
+    let split = ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body)
+        .expect("valid trailer frame")
+        .expect("trailer frame present");
+    assert_eq!(split.0, data_end, "message bytes must end at the trailer");
+    assert_eq!(
+        split.1,
+        vec![
+            ("x-app-id".to_string(), "42".to_string()),
+            // Names are lowercased; duplicates are preserved in wire order.
+            ("x-trace-bin".to_string(), "AAEC".to_string()),
+            ("x-app-id".to_string(), "43".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn split_request_trailer_frame_leaves_non_trailer_defects_to_the_envelope_validator() {
+    let complete = request_frame(0x00, b"ok");
+    let mut invalid_flag = complete.clone();
+    invalid_flag.extend_from_slice(&request_frame(0x42, b"later"));
+    let mut truncated_payload = complete.clone();
+    truncated_payload.extend_from_slice(&[0x00, 0, 0, 0, 9, b'x']);
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("no frames at all", Vec::new()),
+        ("data only", complete.clone()),
+        ("unknown flag", invalid_flag),
+        ("short header", vec![0x00, 0, 0]),
+        ("truncated payload", truncated_payload),
+        (
+            "declared length overflows the buffer",
+            vec![0x80, 0xff, 0xff, 0xff, 0xff],
+        ),
+    ];
+    for (case, body) in cases {
+        assert!(
+            matches!(
+                ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body),
+                Ok(None)
+            ),
+            "{case}: structural defects belong to the envelope validator"
+        );
+    }
+}
+
+#[test]
+fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
+    let message = request_frame(0x00, b"ok");
+    let valid_block = b"x-app-id: 42\r\n";
+
+    let mut trailer_then_data = message.clone();
+    trailer_then_data.extend_from_slice(&request_frame(0x80, valid_block));
+    trailer_then_data.extend_from_slice(&message);
+    let mut two_trailers = message.clone();
+    two_trailers.extend_from_slice(&request_frame(0x80, valid_block));
+    two_trailers.extend_from_slice(&request_frame(0x80, b"x-app-id: 43\r\n"));
+    let mut compressed = message.clone();
+    compressed.extend_from_slice(&request_frame(
+        ferrum_edge::_test_support::GRPC_FRAME_TRAILER_COMPRESSED,
+        valid_block,
+    ));
+    let oversized_block = format!(
+        "x-app-id: {}\r\n",
+        "a".repeat(ferrum_edge::_test_support::MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES)
+    );
+    let mut oversized = message.clone();
+    oversized.extend_from_slice(&request_frame(0x80, oversized_block.as_bytes()));
+    let too_many_block = (0..=ferrum_edge::_test_support::MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES)
+        .map(|index| format!("x-app-{index}: v\r\n"))
+        .collect::<String>();
+    let mut too_many = message.clone();
+    too_many.extend_from_slice(&request_frame(0x80, too_many_block.as_bytes()));
+    let long_value = format!("x-app-id: {}\r\n", "a".repeat(4097));
+    let long_name = format!("{}: v\r\n", "a".repeat(129));
+
+    let mut cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "trailer before any message frame",
+            request_frame(0x80, valid_block),
+        ),
+        ("data after trailer", trailer_then_data),
+        ("two trailer frames", two_trailers),
+        ("compressed trailer frame", compressed),
+        ("oversized trailer block", oversized),
+        ("too many trailer entries", too_many),
+    ];
+    let blocks: Vec<(&str, &[u8])> = vec![
+        ("empty block", b""),
+        ("blank line", b"\r\n"),
+        ("no CRLF terminator", b"x-app-id: 42"),
+        ("bare LF", b"x-app-id: 42\nx-other: 1\r\n"),
+        ("bare CR", b"x-app-id: 4\r2\r\n"),
+        ("missing colon", b"x-app-id 42\r\n"),
+        ("pseudo header", b":method: DELETE\r\n"),
+        ("space before colon", b"x-app-id : 42\r\n"),
+        ("invalid name charset", b"x-app~id: 42\r\n"),
+        ("forbidden framing name", b"content-length: 0\r\n"),
+        ("forbidden hop-by-hop name", b"connection: close\r\n"),
+        ("forbidden initial-only name", b"grpc-timeout: 1S\r\n"),
+        (
+            "future reserved grpc name",
+            b"grpc-future-control: value\r\n",
+        ),
+        ("forbidden terminal status", b"grpc-status: 0\r\n"),
+        ("forbidden credential", b"authorization: Bearer x\r\n"),
+        (
+            "forbidden gateway assertion",
+            b"x-consumer-username: root\r\n",
+        ),
+        (
+            "forbidden internal bridge",
+            b"x-ferrum-grpc-web-trailer-names: a\r\n",
+        ),
+        ("forbidden mode marker", b"x-grpc-web-mode: text\r\n"),
+        ("non-printable value", b"x-app-id: \x07\r\n"),
+        ("non-base64 binary value", b"x-trace-bin: not base64!\r\n"),
+        ("empty binary value", b"x-trace-bin: \r\n"),
+        ("over-long value", long_value.as_bytes()),
+        ("over-long name", long_name.as_bytes()),
+    ];
+    for (case, block) in blocks {
+        let mut body = message.clone();
+        body.extend_from_slice(&request_frame(0x80, block));
+        cases.push((case, body));
+    }
+
+    for (case, body) in cases {
+        assert!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body).is_err(),
+            "{case}: must fail closed"
+        );
+    }
+}
+
+#[test]
+fn split_request_trailer_frame_rejects_proxy_owned_forwarding_identity() {
+    // Gateway-authored forwarding identity is already on the initial header
+    // block. End-of-stream metadata must not restate or contradict it for
+    // backends that read trailing metadata. The parser lowercases names before
+    // the forbidden check, so mixed-case wire forms must also fail closed.
+    let message = request_frame(0x00, b"ok");
+    let cases: &[(&str, &[u8])] = &[
+        ("x-forwarded-for", b"x-forwarded-for: 203.0.113.9\r\n"),
+        ("x-forwarded-proto", b"x-forwarded-proto: https\r\n"),
+        ("x-forwarded-host", b"x-forwarded-host: evil.example\r\n"),
+        ("forwarded", b"forwarded: for=203.0.113.9\r\n"),
+        (
+            "X-Forwarded-For mixed case",
+            b"X-Forwarded-For: 203.0.113.9\r\n",
+        ),
+        (
+            "X-Forwarded-Proto mixed case",
+            b"X-Forwarded-Proto: https\r\n",
+        ),
+        (
+            "X-Forwarded-Host mixed case",
+            b"X-Forwarded-Host: evil.example\r\n",
+        ),
+        ("Forwarded mixed case", b"Forwarded: for=203.0.113.9\r\n"),
+        ("FORWARDED upper case", b"FORWARDED: for=203.0.113.9\r\n"),
+    ];
+    for (case, block) in cases {
+        let mut body = message.clone();
+        body.extend_from_slice(&request_frame(0x80, block));
+        assert!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&body).is_err(),
+            "{case}: proxy-owned forwarding identity must be rejected in request trailers"
+        );
+    }
+
+    // Custom application metadata remains accepted alongside the security gate.
+    let mut valid = message.clone();
+    valid.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+    assert!(
+        matches!(
+            ferrum_edge::_test_support::split_grpc_web_request_trailer_frame(&valid),
+            Ok(Some(_))
+        ),
+        "valid custom metadata must still stage"
+    );
+}
+
+#[tokio::test]
+async fn request_trailer_frame_is_staged_and_stripped_in_binary_and_text_modes() {
+    let message_only = request_frame(0x00, b"hello");
+    let trailer = request_frame(0x80, b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n");
+    let mut body = message_only.clone();
+    body.extend_from_slice(&trailer);
+
+    for (content_type, wire) in [
+        ("application/grpc-web+proto", body.clone()),
+        ("application/grpc-web-text+proto", grpc_web_text_body(&body)),
+        (
+            "application/grpc-web-text+proto",
+            segmented_grpc_web_text_body(&message_only, &trailer),
+        ),
+    ] {
+        let (transformed, staged, outcome) =
+            run_grpc_web_request_pipeline(content_type, &wire).await;
+        assert!(
+            matches!(outcome, PluginResult::Continue),
+            "{content_type}: valid trailer frame must be accepted, got {outcome:?}"
+        );
+        assert_eq!(
+            transformed, message_only,
+            "{content_type}: trailer bytes must not reach the backend as message bytes"
+        );
+        assert_eq!(
+            staged,
+            Some(vec![
+                ("x-app-id".to_string(), "42".to_string()),
+                ("x-trace-bin".to_string(), "AAEC".to_string()),
+            ]),
+            "{content_type}: trailers must be staged for native conversion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn request_without_trailer_frame_stages_nothing() {
+    let body = request_frame(0x00, b"hello");
+    for (content_type, wire) in [
+        ("application/grpc-web+proto", body.clone()),
+        ("application/grpc-web-text+proto", grpc_web_text_body(&body)),
+    ] {
+        let (transformed, staged, outcome) =
+            run_grpc_web_request_pipeline(content_type, &wire).await;
+        assert!(matches!(outcome, PluginResult::Continue), "{content_type}");
+        assert_eq!(transformed, body, "{content_type}");
+        assert!(staged.is_none(), "{content_type}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_request_trailer_frame_rejects_before_dispatch() {
+    let message = request_frame(0x00, b"ok");
+    let mut data_after_trailer = message.clone();
+    data_after_trailer.extend_from_slice(&request_frame(0x80, b"x-app-id: 42\r\n"));
+    data_after_trailer.extend_from_slice(&message);
+    let mut compressed = message.clone();
+    compressed.extend_from_slice(&request_frame(0x81, b"x-app-id: 42\r\n"));
+    let mut forbidden = message.clone();
+    forbidden.extend_from_slice(&request_frame(0x80, b"authorization: Bearer x\r\n"));
+    let mut empty_block = message.clone();
+    empty_block.extend_from_slice(&request_frame(0x80, b""));
+
+    for (case, body) in [
+        ("data after trailer", data_after_trailer),
+        ("compressed trailer", compressed),
+        ("forbidden credential trailer", forbidden),
+        ("empty trailer block", empty_block),
+    ] {
+        for (content_type, wire) in [
+            ("application/grpc-web+proto", body.clone()),
+            ("application/grpc-web-text+proto", grpc_web_text_body(&body)),
+        ] {
+            let (_, staged, outcome) = run_grpc_web_request_pipeline(content_type, &wire).await;
+            assert_grpc_web_request_rejected(outcome, &format!("{case} ({content_type})"));
+            assert!(
+                staged.is_none(),
+                "{case} ({content_type}): a rejected frame must stage no trailers"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn staged_request_trailers_reject_a_tampered_staging_block() {
+    use base64::Engine;
+
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web+proto");
+    plugin.on_request_received(&mut ctx).await;
+
+    let oversized_value = format!("x{}", "a".repeat(9 * 1024));
+    let oversized_staging = serde_json::to_string(&vec![("x-app-id", oversized_value)])
+        .expect("test staging serializes");
+    for (case, staged) in [
+        ("forbidden name", r#"[["authorization","Bearer x"]]"#),
+        (
+            "forbidden x-forwarded-for",
+            r#"[["x-forwarded-for","203.0.113.9"]]"#,
+        ),
+        (
+            "forbidden x-forwarded-proto",
+            r#"[["x-forwarded-proto","https"]]"#,
+        ),
+        (
+            "forbidden x-forwarded-host",
+            r#"[["x-forwarded-host","evil.example"]]"#,
+        ),
+        (
+            "forbidden forwarded",
+            r#"[["forwarded","for=203.0.113.9"]]"#,
+        ),
+        ("pseudo header", r#"[[":method","DELETE"]]"#),
+        ("CRLF value", "[[\"x-app-id\",\"4\\r\\n2\"]]"),
+        ("invalid binary value", r#"[["x-trace-bin","not base64!"]]"#),
+        ("empty block", "[]"),
+        ("not json", "definitely not json"),
+        ("oversized reconstructed block", oversized_staging.as_str()),
+    ] {
+        ctx.metadata.insert(
+            "grpc_web.request_trailers".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(staged),
+        );
+        assert!(
+            ferrum_edge::_test_support::staged_grpc_web_request_trailers(&ctx.metadata).is_none(),
+            "{case}: plugin-writable staging must be re-validated at dispatch"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_final_request_body_skips_non_grpc_web() {
     let plugin = create_plugin_default();
