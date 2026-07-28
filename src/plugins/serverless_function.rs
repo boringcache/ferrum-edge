@@ -2587,24 +2587,33 @@ impl Plugin for ServerlessFunction {
                             // Byte-exact provenance for the ONE rejection that
                             // may keep a body on a native gRPC stream, together
                             // with the terminal metadata that is allowed to
-                            // reach the client as trailers. An empty framed body
-                            // means the contract asked for a trailers-only
-                            // status, which needs no authorization and must not
-                            // mint one.
-                            if !framed_body.is_empty() {
-                                let trailers = grpc_headers
-                                    .iter()
-                                    .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
-                                    .map(|(name, value)| (name.clone(), value.clone()))
-                                    .collect();
-                                let authored = crate::plugins::ServerlessGrpcTerminateFrame {
-                                    http_status: status_code,
-                                    frame: framed_body.clone(),
-                                    trailers,
-                                };
-                                ctx.serverless_grpc_terminate_frame =
-                                    Some(std::sync::Arc::new(authored));
-                            }
+                            // reach the client as trailers.
+                            //
+                            // An empty `framed_body` is the status-only contract
+                            // shape: it authors NO frame, so this provenance can
+                            // never authorize DATA (`authorized_trailers`
+                            // refuses an empty frame). It is still recorded,
+                            // because the authored status + terminal metadata
+                            // are what let the normalizer tell an *unchanged*
+                            // status-only reply (legitimately trailers-only)
+                            // apart from one a response-body policy rewrote or
+                            // re-statused. Without it, an invalidated
+                            // status-only contract falls back to the mutable
+                            // reject header map and can ship the contract's
+                            // `grpc-status: 0` as an empty Trailers-Only
+                            // success.
+                            let trailers = grpc_headers
+                                .iter()
+                                .filter(|(name, _)| !name.eq_ignore_ascii_case("content-type"))
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                                .collect();
+                            let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+                                http_status: status_code,
+                                frame: framed_body.clone(),
+                                trailers,
+                            };
+                            ctx.serverless_grpc_terminate_frame =
+                                Some(std::sync::Arc::new(authored));
                             return PluginResult::RejectBinary {
                                 status_code,
                                 body: framed_body,

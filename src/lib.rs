@@ -3959,6 +3959,11 @@ pub mod _test_support {
     ///
     /// The authored HTTP status is 200, exactly as the production plugin stamps
     /// it — authorization is checked against that status as well as the bytes.
+    ///
+    /// An empty `frame` is the status-only contract shape, which production
+    /// stamps too: it can never authorize DATA, but it records the authored
+    /// status and terminal metadata so an invalidated status-only reply fails
+    /// closed instead of falling back to the mutable reject header map.
     pub fn set_serverless_grpc_terminate_frame_for_test(
         ctx: &mut crate::plugins::RequestContext,
         frame: &[u8],

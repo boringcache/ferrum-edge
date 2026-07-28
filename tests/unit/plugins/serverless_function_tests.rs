@@ -1465,14 +1465,24 @@ fn grpc_terminate_context_with_frame(frame: &[u8]) -> ferrum_edge::plugins::Requ
         ferrum_edge::config::types::HttpFlavor::Grpc,
     );
     ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut ctx, true);
-    if !frame.is_empty() {
-        ferrum_edge::_test_support::set_serverless_grpc_terminate_frame_for_test(
-            &mut ctx,
-            frame,
-            framed_grpc_terminate_trailers(),
-        );
-    }
+    // Production stamps the authored representation for BOTH terminate shapes.
+    // An empty `frame` is the status-only contract: it authors no DATA, but the
+    // provenance still records the authored status and terminal metadata.
+    ferrum_edge::_test_support::set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        frame,
+        framed_grpc_terminate_trailers(),
+    );
     ctx
+}
+
+/// The terminal metadata a status-only contract (`grpc_status: 5`, no
+/// `message_base64`) authors: no DATA, a real gRPC error status.
+fn status_only_grpc_terminate_trailers() -> HashMap<String, String> {
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "5".to_string());
+    trailers.insert("grpc-message".to_string(), "not found".to_string());
+    trailers
 }
 
 #[test]
@@ -1548,8 +1558,10 @@ fn test_normalize_reject_provenance_does_not_apply_to_non_grpc() {
     assert_eq!(normalized.grpc_status, None);
 }
 
-/// A terminate contract that asks for a status-only reply frames nothing, so no
-/// provenance is minted and the rejection stays on the trailers-only contract.
+/// A terminate contract that asks for a status-only reply frames nothing, so its
+/// authorized representation IS trailers-only — and the terminal metadata the
+/// client sees comes from the validated contract, not from the reject header map
+/// (which here still carries an unrelated `grpc-status: 0`).
 #[tokio::test]
 async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
     use wiremock::matchers::method;
@@ -1591,6 +1603,16 @@ async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
         other => panic!("Expected RejectBinary, got {:?}", other),
     }
 
+    // The status-only contract stamps provenance too — with an EMPTY frame, so
+    // it can never authorize DATA.
+    let authored = ferrum_edge::_test_support::serverless_grpc_terminate_frame_for_test(&ctx)
+        .expect("status-only terminate must stamp its authored representation");
+    assert!(
+        authored.0.is_empty(),
+        "the status-only contract authors no frame"
+    );
+    assert_eq!(authored.1.get("grpc-status").map(String::as_str), Some("5"));
+
     let normalized = ferrum_edge::_test_support::normalize_reject_response_with_context(
         &ctx,
         http::StatusCode::OK,
@@ -1600,6 +1622,167 @@ async fn test_terminate_mode_status_only_grpc_response_is_trailers_only() {
     );
     assert!(normalized.body.is_empty());
     assert!(normalized.grpc_trailers.is_empty());
+    assert_eq!(
+        normalized.grpc_status,
+        Some(5),
+        "the unchanged status-only reply must carry the CONTRACT's status, not the \
+         `grpc-status: 0` sitting in the decorated reject header map"
+    );
+    assert_eq!(normalized.grpc_message.as_deref(), Some("not found"));
+}
+
+/// The status-only contract authors no DATA, so nothing may put DATA back on the
+/// stream. A body a response transform introduced is not the authorized
+/// representation, and the contract's own `grpc-status` must not ride out with
+/// it as an empty Trailers-Only success either.
+#[test]
+fn test_normalize_reject_status_only_with_unauthored_body_fails_closed() {
+    use ferrum_edge::_test_support::{
+        framed_unary_reject_trailers, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let mut ctx = create_test_context();
+    // A status-only contract that reported success — the dangerous case: a
+    // silent fallback would emit `grpc-status: 0` with the body dropped.
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    set_serverless_grpc_terminate_frame_for_test(&mut ctx, b"", trailers);
+
+    let injected = frame_terminate_message(b"injected");
+    let normalized = normalize_reject_response_with_context(
+        &ctx,
+        StatusCode::OK,
+        &injected,
+        &framed_grpc_terminate_reject_headers(),
+        true,
+    );
+    assert!(
+        normalized.body.is_empty(),
+        "the status-only contract authored no DATA, so no body may be emitted"
+    );
+    assert!(framed_unary_reject_trailers(&normalized).is_none());
+    assert_eq!(
+        normalized.grpc_status,
+        Some(13),
+        "an unauthored body invalidates the status-only representation and must fail closed"
+    );
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated")
+    );
+}
+
+/// A body policy that replaces a status-only terminate reply selects its own
+/// status; failing closed must surface that status rather than the contract's
+/// residual `grpc-status: 0`.
+#[test]
+fn test_normalize_reject_status_only_invalidated_by_status_change_fails_closed() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let mut ctx = create_test_context();
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    set_serverless_grpc_terminate_frame_for_test(&mut ctx, b"", trailers);
+
+    let normalized = normalize_reject_response_with_context(
+        &ctx,
+        StatusCode::FORBIDDEN,
+        b"",
+        &framed_grpc_terminate_reject_headers(),
+        true,
+    );
+    assert!(normalized.body.is_empty());
+    assert_eq!(
+        normalized.grpc_status,
+        Some(7),
+        "a replacement rejection keeps its own status, never the contract's OK"
+    );
+}
+
+/// A status-only record whose own terminal metadata no longer proves a status
+/// cannot authorize anything: it is an invalidation like any other, not a
+/// fallback to the mutable reject header map.
+#[test]
+fn test_normalize_reject_status_only_unparsable_status_fails_closed() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let mut ctx = create_test_context();
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "not-a-number".to_string());
+    set_serverless_grpc_terminate_frame_for_test(&mut ctx, b"", trailers);
+
+    let normalized = normalize_reject_response_with_context(
+        &ctx,
+        StatusCode::OK,
+        b"",
+        &framed_grpc_terminate_reject_headers(),
+        true,
+    );
+    assert_eq!(
+        normalized.grpc_status,
+        Some(13),
+        "an unprovable status-only record must fail closed, not inherit the header map's OK"
+    );
+    assert_eq!(
+        normalized.grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated")
+    );
+}
+
+/// The status-only representation reaches the shared response-body policy
+/// lifecycle only through the explicit zero-byte inspection gate, and neither a
+/// body the contract never authored nor a status it never authored opens it.
+#[test]
+fn test_status_only_terminate_response_body_lifecycle_gate() {
+    use ferrum_edge::_test_support::synthetic_response_body_hooks_apply_for_test;
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    ferrum_edge::_test_support::set_serverless_terminate_response_for_test(&mut ctx, true);
+    ferrum_edge::_test_support::set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        b"",
+        status_only_grpc_terminate_trailers(),
+    );
+    let plugins = response_body_buffering_plugin();
+
+    // Bytes the contract did not author are not the terminate representation.
+    let injected = frame_terminate_message(b"injected");
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        200, true, &injected, &plugins, &ctx
+    ));
+
+    // Neither is the authored empty body under a status the contract never
+    // authored.
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        500,
+        true,
+        b"",
+        &plugins,
+        &ctx
+    ));
+
+    // The authored status-only representation itself still has to clear the
+    // explicit zero-byte inspection gate; a plugin that only asked for ordinary
+    // response-body buffering does not open it.
+    assert!(!synthetic_response_body_hooks_apply_for_test(
+        200,
+        true,
+        b"",
+        &plugins,
+        &ctx
+    ));
 }
 
 /// A mutable `content-type` must not opt a plain HTTP request into the

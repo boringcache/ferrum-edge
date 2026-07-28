@@ -106,7 +106,13 @@ shared synthetic response-body policy lifecycle so configured gRPC response vali
 not bypassed. Invalidated authorization (rewritten frame, replaced response, changed
 status) FAILS CLOSED: the body is dropped and a residual `grpc-status: 0` is replaced by
 the rejection's own status, or `INTERNAL` — never emitted as an empty Trailers-Only
-success.
+success. The status-only shape stamps the same provenance with an EMPTY frame: it can
+never authorize DATA, but while the reply is unchanged (authored status, still-empty body)
+it stays trailers-only with the contract's own terminal metadata instead of the decorated
+reject header map, and a changed status or an unauthored body fails closed identically.
+`request_deduplication` is not in this picture at all — it is `HTTP_ONLY_PROTOCOLS` while
+`HttpFlavor::Grpc` selects the `ProxyProtocol::Grpc` plugin view, so it is never effective
+on a native-gRPC request.
 
 ## Request Context And Body Rules
 

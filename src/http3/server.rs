@@ -12117,20 +12117,33 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     // Derive signalling from the sanitized response metadata.
     let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
     // This writer derives its own signal rather than reusing `normalized`, so it
-    // needs the same fail-closed correction the normalizer applies: reaching
-    // here while still HOLDING framed-terminate authorization means the authored
-    // representation was invalidated, and the contract's `grpc-status: 0` must
-    // not be emitted as an empty Trailers-Only success.
+    // needs the same two corrections the normalizer applies.
+    //
+    // 1. An UNCHANGED status-only terminate contract is legitimately
+    //    trailers-only, and its terminal metadata is the contract's own — not
+    //    whatever the decorated reject header map now says.
+    // 2. Otherwise, reaching here while still HOLDING terminate authorization
+    //    means the authored representation was invalidated, and the contract's
+    //    `grpc-status: 0` must not be emitted as an empty Trailers-Only success.
     let h3_mapped_status =
         crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
-    let fail_closed = crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
-        framed_unary_provenance,
-        grpc_status,
-        h3_mapped_status,
-    );
-    let (grpc_status, grpc_message) = match fail_closed {
-        Some((status, message)) => (status, std::borrow::Cow::Borrowed(message)),
-        None => (grpc_status, grpc_message),
+    let status_only =
+        crate::proxy::status_only_grpc_signal(framed_unary_provenance, http_status, http_body);
+    let (grpc_status, grpc_message) = match status_only {
+        Some((authored_status, authored_message)) => {
+            (authored_status, std::borrow::Cow::Owned(authored_message))
+        }
+        None => {
+            let fail_closed = crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
+                framed_unary_provenance,
+                grpc_status,
+                h3_mapped_status,
+            );
+            match fail_closed {
+                Some((status, message)) => (status, std::borrow::Cow::Borrowed(message)),
+                None => (grpc_status, grpc_message),
+            }
+        }
     };
 
     // Build a trailers-only gRPC error that preserves any custom headers

@@ -1779,6 +1779,15 @@ impl std::fmt::Debug for PeerConnectionSignal {
 /// inherit the original successful trailers just because its body happens to
 /// match: a replacement rejection carries its own status, and a rejection that
 /// matched on bytes alone would otherwise present as the original success.
+///
+/// An EMPTY `frame` is the status-only contract shape — the function asked for
+/// a trailers-only reply and authored no message at all. That representation can
+/// never authorize DATA (`FramedGrpcUnaryProvenance::authorized_trailers`
+/// refuses an empty frame), but recording it is what lets the normalizer tell an
+/// unchanged status-only reply from one a response-body policy rewrote or
+/// re-statused: unchanged keeps the contract's own terminal metadata, changed
+/// fails closed instead of falling back to a possibly-successful `grpc-status`
+/// read out of the mutable reject header map.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerlessGrpcTerminateFrame {
     pub(crate) http_status: u16,

@@ -15924,9 +15924,10 @@ pub(crate) fn should_apply_synthetic_response_body_hooks(
 /// - the request must be the native-gRPC flavor the frontend stamped at intake,
 /// - the plugin must have marked a terminate response,
 /// - the status must be the one the contract authored, and
-/// - the bytes must still be the authored frame — or empty, which is the
-///   status-only contract shape that authors no frame at all (that case still
-///   has to clear the explicit zero-byte inspection gate in
+/// - the bytes must still be the authored frame — which for the status-only
+///   contract shape is the empty frame it authored, so an empty body matches and
+///   a body that the contract never authored does not (that case still has to
+///   clear the explicit zero-byte inspection gate in
 ///   [`should_apply_synthetic_response_body_hooks`]).
 ///
 /// A body hook that rewrites or replaces these bytes invalidates the
@@ -15944,9 +15945,10 @@ fn authorized_serverless_grpc_terminate_representation(
         Some(authored) => {
             authored.http_status == status_code && authored.frame.as_ref() == response_body
         }
-        // Status-only terminate: the contract authored no frame, so the
-        // representation is the empty body the plugin returned with it.
-        None => status_code == 200 && response_body.is_empty(),
+        // Every native-gRPC terminate contract — framed and status-only alike —
+        // stamps the authored representation. No provenance therefore means this
+        // is not the terminate representation at all, and the gate stays closed.
+        None => false,
     }
 }
 
@@ -16713,11 +16715,14 @@ impl<'a> FramedGrpcUnaryProvenance<'a> {
         Self { authored }
     }
 
-    /// Whether this request holds a framed-terminate authorization at all.
+    /// Whether this request holds a terminate authorization at all — framed or
+    /// status-only.
     ///
-    /// `true` + "the framed representation was not emitted" is exactly the
+    /// `true` + "the authorized representation was not emitted" is exactly the
     /// invalidated case that must fail closed rather than fall back to the
-    /// authored (possibly successful) `grpc-status`.
+    /// authored (possibly successful) `grpc-status`. The one representation for
+    /// which trailers-only is *not* an invalidation is the unchanged status-only
+    /// contract; see [`Self::intact_status_only_signal`].
     pub(crate) fn is_authorizing(&self) -> bool {
         self.authored.is_some()
     }
@@ -16745,6 +16750,59 @@ impl<'a> FramedGrpcUnaryProvenance<'a> {
         }
         (authored.frame.as_ref() == body).then_some(&authored.trailers)
     }
+
+    /// The authorized terminal `(grpc-status, grpc-message)` for the *status-only*
+    /// terminate contract — the shape that authored no frame and whose correct
+    /// client representation therefore IS trailers-only.
+    ///
+    /// `Some` only while the response is still exactly what the contract
+    /// authored: the authored HTTP status and a still-empty body. The signal
+    /// comes from the authored terminal metadata rather than the reject header
+    /// map, which has been through `after_proxy` decorators, initial-header
+    /// policy, and — since the framed representation now runs it — the shared
+    /// response-body lifecycle.
+    ///
+    /// `None` for a framed authorization (it authored DATA, so trailers-only is
+    /// not its representation), for a changed status or a body the contract
+    /// never authored, and for a status-only record whose own `grpc-status` no
+    /// longer parses. Each of those is an invalidation and falls through to
+    /// [`invalidated_grpc_terminate_fail_closed_signal`].
+    fn intact_status_only_signal(&self, status: StatusCode, body: &[u8]) -> Option<(u32, String)> {
+        let authored = self.authored?;
+        if !authored.frame.is_empty() || !body.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        let grpc_status = authored.trailers.get("grpc-status")?.parse::<u32>().ok()?;
+        let grpc_message = authored
+            .trailers
+            .get("grpc-message")
+            .map(|message| sanitize_grpc_message(message))
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
+        Some((grpc_status, grpc_message))
+    }
+}
+
+/// The authorized trailers-only signal for an unchanged status-only
+/// `serverless_function` terminate contract, shared by the H1/H2 normalizer and
+/// the direct-H3 writer (which derives its own signal and would otherwise read
+/// the mutable reject header map instead).
+///
+/// Every emitter must consult this BEFORE
+/// [`invalidated_grpc_terminate_fail_closed_signal`]: `Some` is the one case in
+/// which a terminate authorization legitimately produces no DATA, and `None`
+/// means the fail-closed correction applies. Ordering it this way keeps the
+/// carve-out at the call site, so an emitter that forgets it fails closed rather
+/// than silently emitting the contract's `grpc-status`.
+pub(crate) fn status_only_grpc_signal(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
+    status: StatusCode,
+    body: &[u8],
+) -> Option<(u32, String)> {
+    framed_unary_provenance.intact_status_only_signal(status, body)
 }
 
 /// The `grpc-message` emitted when a framed serverless-terminate authorization
@@ -16767,6 +16825,12 @@ pub(crate) const INVALIDATED_GRPC_TERMINATE_MESSAGE: &str =
 ///
 /// `http_status_fallback` is the caller's own HTTP→gRPC mapping so the H1/H2 and
 /// H3 emitters stay on their respective tables.
+///
+/// This deliberately knows nothing about the one authorization for which
+/// emitting no DATA is *correct* — the unchanged status-only contract. Callers
+/// resolve that first through [`status_only_grpc_signal`] and only reach
+/// here when it declined, so an emitter that forgets the carve-out fails closed
+/// instead of falling through to the contract's possibly-successful status.
 ///
 /// Returns the replacement `(grpc-status, grpc-message)`, or `None` when no
 /// correction is required.
@@ -16844,30 +16908,41 @@ pub(crate) fn normalize_reject_response_with_provenance(
         return framed;
     }
 
-    // Past this point the framed representation is NOT being emitted. If this
-    // request nonetheless held framed-terminate authorization, the authored
-    // representation was invalidated (rewritten body, changed status, or a
-    // replacement rejection) and the authored `grpc-status: 0` must not survive
-    // as an empty Trailers-Only success.
+    // Past this point no DATA is emitted. That is correct for exactly one
+    // authorization — the status-only terminate contract, which authored no
+    // frame — and only while that reply is unchanged. For every other holder of
+    // terminate authorization, reaching here means the authored representation
+    // was invalidated (rewritten body, changed status, a body the status-only
+    // contract never authored, or a replacement rejection), and the contract's
+    // `grpc-status: 0` must not survive as an empty Trailers-Only success.
     let mapped_status = map_http_reject_status_to_grpc_status(status);
-    let derived_grpc_status = headers
-        .get("grpc-status")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(mapped_status);
-    let fail_closed = invalidated_grpc_terminate_fail_closed_signal(
-        framed_unary_provenance,
-        derived_grpc_status,
-        mapped_status,
-    );
-    let (grpc_status, grpc_message) = match fail_closed {
-        Some((status_code, message)) => (status_code, message.to_string()),
+    let status_only = status_only_grpc_signal(framed_unary_provenance, status, body);
+    let (grpc_status, grpc_message) = match status_only {
+        // The status-only terminate contract authored no frame, so trailers-only
+        // IS its authorized representation, and its own terminal metadata — not
+        // the decorated reject header map — is what the client must see.
+        Some(signal) => signal,
         None => {
-            let message = headers
-                .get("grpc-message")
-                .cloned()
-                .or_else(|| extract_grpc_reject_message(body))
-                .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
-            (derived_grpc_status, message)
+            let derived_grpc_status = headers
+                .get("grpc-status")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(mapped_status);
+            let fail_closed = invalidated_grpc_terminate_fail_closed_signal(
+                framed_unary_provenance,
+                derived_grpc_status,
+                mapped_status,
+            );
+            match fail_closed {
+                Some((status_code, message)) => (status_code, message.to_string()),
+                None => {
+                    let message = headers
+                        .get("grpc-message")
+                        .cloned()
+                        .or_else(|| extract_grpc_reject_message(body))
+                        .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
+                    (derived_grpc_status, message)
+                }
+            }
         }
     };
     let grpc_message = sanitize_grpc_message(&grpc_message);
