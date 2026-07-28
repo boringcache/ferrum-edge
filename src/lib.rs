@@ -3075,6 +3075,49 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
+    pub const GRPC_FRAME_TRAILER_COMPRESSED: u8 =
+        crate::plugins::grpc_web::GRPC_FRAME_TRAILER_COMPRESSED;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_BLOCK_BYTES;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_ENTRIES;
+
+    /// Wire-level view of the request-side gRPC-Web trailer-frame split.
+    ///
+    /// Returns `Ok(None)` when the body carries no trailer frame, the
+    /// `(data_end, trailers)` split when it carries a valid one, and the
+    /// field-specific diagnostic when the frame is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn split_grpc_web_request_trailer_frame(
+        data: &[u8],
+    ) -> Result<Option<(usize, Vec<(String, String)>)>, &'static str> {
+        crate::plugins::grpc_web::split_request_trailer_frame(data)
+            .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
+    }
+
+    /// The request trailers a gRPC dispatch would send, read back from
+    /// owner-scoped request staging exactly as the dispatch paths read them.
+    ///
+    /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
+    /// the sort is stable, so repeated values of one name keep wire order.
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String)>> {
+        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
+            let mut entries: Vec<(String, String)> = map
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        })
+    }
+
     pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }

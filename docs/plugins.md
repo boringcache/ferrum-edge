@@ -4047,9 +4047,48 @@ declared. Every five-byte header and declared payload must be present, later
 frame flags are checked, and the buffer must be consumed exactly. Empty bodies,
 truncated frames, trailing bytes, unsupported flags, and compressed frames
 without a usable encoding fail closed with a gRPC-Web-shaped client error.
-Request-side body trailer frames (`0x80`/`0x81`) are unsupported and rejected:
-Ferrum does not translate them into native HTTP/2 request trailers, so they are
-never forwarded to the backend as message bytes.
+**Request trailer frames.** A gRPC-Web client cannot emit HTTP/2 trailers, so it
+encodes end-of-stream metadata as a final `0x80` frame in the request body.
+Ferrum splits that frame off the message frames, validates it, and re-emits it
+as a real HTTP/2 TRAILERS block after the backend-bound DATA, in both binary and
+text mode. The trailer bytes never reach the backend as message bytes, and they
+are never folded into the initial header block: metadata that arrives at end of
+stream is not interchangeable with metadata the gateway already authenticated,
+authorized, and forwarded.
+
+Validation is fail-closed and produces a field-specific 400 (surfaced to the
+client as a gRPC-Web terminal frame) before any backend dispatch:
+
+- `0x81` (`Compressed-Flag` set on a trailer frame) is not defined by the wire
+  format and is refused rather than guessed at.
+- The trailer frame must be the **last** frame. A second trailer frame, or any
+  DATA after one, is refused — the parse must land exactly on the end of the
+  buffer.
+- A trailer frame must follow at least one message frame, and its block must
+  carry at least one entry.
+- Each line must be `name: value` and CRLF-terminated. Bare CR/LF, a missing
+  colon, whitespace around the name, and a leading `:` (pseudo-header) are
+  refused.
+- Names are lowercased and must match the gRPC Custom-Metadata charset; values
+  must be printable ASCII, and a `-bin` value must be base64 (padded or not).
+- Forbidden at end of stream: pseudo-headers, connection/framing fields
+  (`connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
+  `content-length`, `content-type`, `content-encoding`, `host`, …),
+  initial-only gRPC call parameters (`grpc-timeout`, `grpc-encoding`,
+  `grpc-accept-encoding`, `grpc-message-type`, `user-agent`), response terminal
+  metadata (`grpc-status`, `grpc-message`, `grpc-status-details-bin`),
+  credentials and gateway-authoritative assertions (`authorization`, `cookie`,
+  `x-api-key`, `x-geo-country`, `x-consumer-*`, `x-ferrum-*`), and Ferrum's
+  internal gRPC-Web bridge headers.
+- The block is bounded at 8 KiB and 64 entries (names 128 bytes, values 4096
+  bytes) inside the existing gRPC receive ceiling. The block does not stay body
+  bytes — it becomes a header block the backend holds decoded — so it may not
+  consume the whole body budget.
+
+Duplicate names are preserved as repeated trailer entries. Retries replay the
+same complete request, trailers included. Request streaming is unchanged: only
+the already-buffered gRPC-Web envelope is inspected, and native gRPC requests
+keep their streaming fast path and backpressure.
 
 On the response path, `grpc_web` streams backend DATA as it arrives and embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, `grpc-status-details-bin`, and valid ASCII custom trailing metadata such as `request-id` — as exactly one final length-prefixed trailer frame (flag byte `0x80`) in the response body. Binary mode forwards each bounded DATA chunk without an additional translation copy; text mode base64-encodes each runtime flush independently, including protocol-permitted padding at flush boundaries, so neither mode waits for backend EOF before publishing server-streaming messages. Backpressure, cancellation, resets, absolute deadlines, response-size enforcement, load-balancer/admission guards, and deferred logging remain attached to the live body pipeline. The configured response-size ceiling applies to native backend DATA before text expansion; client-visible byte accounting records the encoded bytes and terminal frame.
 
@@ -4062,7 +4101,7 @@ likewise take precedence over response streaming.
 
 The plugin rewrites `content-type` to the **negotiated** gRPC-Web variant and removes an upstream `Content-Length`, because streaming text expansion and the terminal frame change the final representation length. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and ordinary initial response headers are not copied into the terminal block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name. A backend error propagates as a stream error and does not gain a fabricated clean terminal status; a clean EOF without valid trailers receives the documented HTTP-to-gRPC synthesized status.
 
-Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
+Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope — including its trailer frame — before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
 
