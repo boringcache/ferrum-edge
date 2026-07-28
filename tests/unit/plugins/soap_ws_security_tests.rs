@@ -3,7 +3,8 @@ use ferrum_edge::_test_support::{
     soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
     soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
     soap_nonce_replay_registry_contains_for_test, soap_nonce_replay_scope_key_for_test,
-    soap_poison_process_replay_scope_for_test, soap_retire_inconsistent_process_replay_scope_for_test,
+    soap_poison_process_replay_scope_for_test,
+    soap_retire_inconsistent_process_replay_scope_for_test,
     soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
@@ -5701,12 +5702,9 @@ async fn a_fully_expired_retired_scope_is_reclaimed() {
         .checked_sub(Duration::from_secs(CLAIM_RETENTION_SECONDS + 120))
         .expect("instant subtract");
     {
-        let harness = SoapNonceReplayHarness::with_scope(
-            &username_token_digest_config(),
-            scope,
-            epoch,
-        )
-        .expect("scoped harness");
+        let harness =
+            SoapNonceReplayHarness::with_scope(&username_token_digest_config(), scope, epoch)
+                .expect("scoped harness");
         harness
             .claim_at("expired-retired-nonce", Duration::ZERO)
             .expect("backdated claim must admit");
@@ -5807,11 +5805,8 @@ async fn poisoned_retired_scopes_are_not_replaced() {
 async fn inconsistent_retired_scopes_are_not_replaced() {
     let scope = "soap-prune-inconsistent";
     let key = soap_nonce_replay_scope_key_for_test(scope);
-    soap_retire_inconsistent_process_replay_scope_for_test(
-        &username_token_digest_config(),
-        scope,
-    )
-    .expect("inconsistent retire helper");
+    soap_retire_inconsistent_process_replay_scope_for_test(&username_token_digest_config(), scope)
+        .expect("inconsistent retire helper");
     let _probe = digest_plugin_with_config_id(Some("soap-prune-inconsistent-probe"));
     assert!(
         soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),

@@ -1392,9 +1392,10 @@ pub mod _test_support {
         }
     }
 
-    pub use crate::plugins::soap_ws_security::{
-        MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS,
-    };
+    pub const MAX_NONCE_REPLAY_SCOPES_FOR_TESTS: usize =
+        crate::plugins::soap_ws_security::MAX_NONCE_REPLAY_SCOPES_FOR_TESTS;
+    pub const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 =
+        crate::plugins::soap_ws_security::NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS;
 
     pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
         crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
@@ -1418,11 +1419,12 @@ pub mod _test_support {
         config: &serde_json::Value,
         plugin_config_id: &str,
     ) -> Result<(), String> {
-        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
-            config,
-            crate::plugins::PluginHttpClient::default(),
-            Some(plugin_config_id),
-        )?;
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
         plugin.poison_nonce_replay_state_for_tests()?;
         // Drop the plugin so the registry is the sole strong owner; prune must
         // still refuse to replace poisoned state.
@@ -1436,11 +1438,12 @@ pub mod _test_support {
         config: &serde_json::Value,
         plugin_config_id: &str,
     ) -> Result<(), String> {
-        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
-            config,
-            crate::plugins::PluginHttpClient::default(),
-            Some(plugin_config_id),
-        )?;
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
         plugin.check_nonce_replay("inconsistent-retired-seed")?;
         plugin.corrupt_nonce_age_index_for_tests()?;
         drop(plugin);

@@ -951,10 +951,7 @@ static NONCE_REPLAY_REGISTRY: LazyLock<Mutex<HashMap<String, Arc<Mutex<NonceRepl
 /// (silently replacing it would reopen a replay window). Live claims are
 /// detected from the age index's **newest** entry — if the newest is still
 /// inside [`NONCE_CLAIM_RETENTION_SECONDS`], every older entry is live too.
-fn retired_replay_scope_is_reclaimable(
-    state: &Arc<Mutex<NonceReplayState>>,
-    now: Instant,
-) -> bool {
+fn retired_replay_scope_is_reclaimable(state: &Arc<Mutex<NonceReplayState>>, now: Instant) -> bool {
     if Arc::strong_count(state) != 1 {
         return false;
     }
