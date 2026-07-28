@@ -4549,17 +4549,44 @@ async fn advisory_repeated_authorize_replaces_same_instance_admission() {
         "replacement must keep a single staged admission"
     );
 
-    // Taking the admission transfers ownership; the slot is empty afterward.
+    // Taking the admission transfers ownership of the permit and the lease to
+    // the detached task. The slot itself stays staged as a consumed marker: the
+    // proxy re-evaluates `should_buffer_request_body` *after* `before_proxy`
+    // (`final_request_body_requirements` on a header-transformed request), so
+    // the predicate must keep reporting the answer the body was collected under.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 4096]));
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert!(
-        !plugin.should_buffer_request_body(&ctx),
-        "take must clear the staged admission for this instance"
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        1,
+        "take must hand the single admission to exactly one dispatch"
     );
     assert!(
-        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 0 }"),
-        "Debug must report zero staged admissions after take"
+        plugin.should_buffer_request_body(&ctx),
+        "the buffering predicate must stay stable once the body was collected"
+    );
+    assert!(
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 1 }"),
+        "the consumed marker stays staged and Debug still exposes only the count"
+    );
+
+    // Ownership moved out exactly once: a repeated `before_proxy` finds the
+    // consumed marker, so it can neither re-sample, re-acquire a permit, nor
+    // dispatch a second shadow request.
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    let after_repeat = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        after_repeat.dispatched, 1,
+        "a consumed admission must never yield a second lease or dispatch"
+    );
+    assert_eq!(
+        after_repeat.concurrency_drops, 0,
+        "a consumed admission must not re-enter the permit path"
+    );
+    assert_eq!(
+        after_repeat.budget_drops, 0,
+        "a consumed admission must not re-enter the byte-budget path"
     );
 
     let _ = ctx.collect_mirror_result().await;
@@ -4613,13 +4640,32 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         "Debug must report both staged admissions"
     );
 
-    // Taking one instance must leave the sibling admission intact.
+    // Taking one instance must leave the sibling admission untouched.
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 2048]));
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(a.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&a).dispatched,
+        1,
+        "instance a's admission moved to exactly one dispatch"
+    );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&b).dispatched,
+        0,
+        "taking a must not dispatch b"
+    );
+    // a's slot stays staged as a consumed marker so the buffering predicate is
+    // stable for the whole request, but its lease moved out exactly once: a
+    // repeated `before_proxy` cannot re-acquire or dispatch again.
+    plugin_utils::assert_continue(a.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&a).dispatched,
+        1,
+        "instance a must be taken exactly once"
+    );
     assert!(
-        !a.should_buffer_request_body(&ctx),
-        "instance a must be taken"
+        a.should_buffer_request_body(&ctx),
+        "a consumed admission keeps the buffering predicate stable"
     );
     assert!(
         b.should_buffer_request_body(&ctx),
@@ -4631,8 +4677,8 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         "taking a must not release b's lease"
     );
     assert!(
-        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 1 }"),
-        "Debug must report the remaining sibling admission"
+        format!("{ctx:?}").contains("RequestMirrorAdmissions { staged: 2 }"),
+        "Debug must still report both slots, count only"
     );
 
     // Dropping the live context releases every remaining staged lease once.
