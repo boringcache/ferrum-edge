@@ -1454,10 +1454,7 @@ async fn test_warmup_reordering_shared_hostname_ttl_isolation() {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         assert!(
-            cache
-                .resolve("127.0.0.1", None, Some(600))
-                .await
-                .is_ok(),
+            cache.resolve("127.0.0.1", None, Some(600)).await.is_ok(),
             "600s consumer stays fresh after either warmup order"
         );
         assert!(

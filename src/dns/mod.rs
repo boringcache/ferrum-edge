@@ -659,20 +659,12 @@ impl DnsCache {
     }
 
     /// Per-caller fresh-until instant for a shared success entry.
-    fn consumer_fresh_until(
-        &self,
-        entry: &DnsCacheEntry,
-        per_proxy_ttl: Option<u64>,
-    ) -> Instant {
+    fn consumer_fresh_until(&self, entry: &DnsCacheEntry, per_proxy_ttl: Option<u64>) -> Instant {
         entry.resolved_at + self.effective_ttl(entry.native_ttl, per_proxy_ttl)
     }
 
     /// Per-caller stale-until instant (fresh window + `stale_ttl`).
-    fn consumer_stale_until(
-        &self,
-        entry: &DnsCacheEntry,
-        per_proxy_ttl: Option<u64>,
-    ) -> Instant {
+    fn consumer_stale_until(&self, entry: &DnsCacheEntry, per_proxy_ttl: Option<u64>) -> Instant {
         self.consumer_fresh_until(entry, per_proxy_ttl) + self.stale_ttl
     }
 
@@ -704,19 +696,16 @@ impl DnsCache {
 
         // Preserve the shortest-per-proxy atomic across refreshes so a later
         // short-TTL consumer is not forgotten when a long-TTL peer refreshes.
-        let (next_start, shortest) =
-            if let Some(prior) = self.cache.get(cache_key.as_ref()) {
-                let shortest = prior.shortest_per_proxy_ttl_secs.clone();
-                prior.note_per_proxy_ttl(per_proxy_ttl);
-                (Arc::new(AtomicU64::new(0)), shortest)
-            } else {
-                (
-                    Arc::new(AtomicU64::new(0)),
-                    Arc::new(AtomicU64::new(
-                        per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL),
-                    )),
-                )
-            };
+        let (next_start, shortest) = if let Some(prior) = self.cache.get(cache_key.as_ref()) {
+            let shortest = prior.shortest_per_proxy_ttl_secs.clone();
+            prior.note_per_proxy_ttl(per_proxy_ttl);
+            (Arc::new(AtomicU64::new(0)), shortest)
+        } else {
+            (
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL))),
+            )
+        };
 
         let shortest_ttl = {
             let secs = shortest.load(Ordering::Relaxed);
@@ -815,11 +804,10 @@ impl DnsCache {
                                 // Refresh publishes shared data; scheduling uses
                                 // the shortest observed per-proxy (including this
                                 // caller) so short-TTL peers keep getting updates.
-                                let refresh_ttl = per_proxy_ttl
-                                    .or_else(|| entry.load_shortest_per_proxy_ttl());
+                                let refresh_ttl =
+                                    per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
                                 tokio::spawn(async move {
-                                    if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await
-                                    {
+                                    if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await {
                                         warn!("DNS stale refresh failed for {}: {}", host, e);
                                     }
                                     cache.refreshing.remove(&host);
@@ -1832,10 +1820,7 @@ impl DnsCache {
                     let remaining = expires_at.saturating_duration_since(now);
                     let threshold = refresh_ttl * refresh_remaining_pct / 100;
                     if remaining < threshold && remaining > Duration::ZERO {
-                        to_refresh.push((
-                            entry.key().clone(),
-                            entry.load_shortest_per_proxy_ttl(),
-                        ));
+                        to_refresh.push((entry.key().clone(), entry.load_shortest_per_proxy_ttl()));
                     }
                 }
 
@@ -2816,7 +2801,10 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = Instant::now() + Duration::from_secs(1); exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp) },
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(1);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
                 native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(600),
@@ -2855,13 +2843,18 @@ mod tests {
             DnsCacheEntry {
                 addresses: addrs.into(),
                 next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = Instant::now() + refresh_ttl; exp.checked_sub(refresh_ttl).unwrap_or(exp) },
+                resolved_at: {
+                    let exp = Instant::now() + refresh_ttl;
+                    exp.checked_sub(refresh_ttl).unwrap_or(exp)
+                },
                 native_ttl: refresh_ttl,
                 stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
                 applied_ttl: refresh_ttl,
                 record_type_used: record_type,
                 is_error: false,
-                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new((captured).unwrap_or(NO_PER_PROXY_TTL))),
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                    (captured).unwrap_or(NO_PER_PROXY_TTL),
+                )),
                 consecutive_failures: 0,
                 first_failed_at: None,
             },
@@ -2898,7 +2891,10 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = Instant::now() + Duration::from_secs(4); exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp) },
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(4);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
                 native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
@@ -2994,7 +2990,10 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = Instant::now() + Duration::from_secs(60); exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp) },
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(60);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
                 native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
@@ -3078,7 +3077,10 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = Instant::now() - Duration::from_secs(1); exp.checked_sub(Duration::from_secs(5)).unwrap_or(exp) },
+                resolved_at: {
+                    let exp = Instant::now() - Duration::from_secs(1);
+                    exp.checked_sub(Duration::from_secs(5)).unwrap_or(exp)
+                },
                 native_ttl: Duration::ZERO,
                 stale_deadline: Instant::now() - Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(5),
@@ -3525,18 +3527,21 @@ mod tests {
             cache.cache.insert(
                 host.to_string(),
                 DnsCacheEntry {
-                addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
-                next_start: Arc::new(AtomicU64::new(0)),
-                resolved_at: { let exp = now + Duration::from_secs(offset); exp.checked_sub(Duration::from_secs(offset)).unwrap_or(exp) },
-                native_ttl: Duration::from_secs(offset),
-                stale_deadline: now + Duration::from_secs(offset + 60),
-                applied_ttl: Duration::from_secs(offset),
-                record_type_used: None,
-                is_error: false,
-                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_PER_PROXY_TTL)),
-                consecutive_failures: 0,
-                first_failed_at: None,
-            },
+                    addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
+                    next_start: Arc::new(AtomicU64::new(0)),
+                    resolved_at: {
+                        let exp = now + Duration::from_secs(offset);
+                        exp.checked_sub(Duration::from_secs(offset)).unwrap_or(exp)
+                    },
+                    native_ttl: Duration::from_secs(offset),
+                    stale_deadline: now + Duration::from_secs(offset + 60),
+                    applied_ttl: Duration::from_secs(offset),
+                    record_type_used: None,
+                    is_error: false,
+                    shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_PER_PROXY_TTL)),
+                    consecutive_failures: 0,
+                    first_failed_at: None,
+                },
             );
         }
         // Two young errors with far-future expires_at (would sort after lives
@@ -3743,10 +3748,7 @@ mod tests {
             ..DnsConfig::default()
         });
         // Native for 127.0.0.1 is 24h; global override is 3600s; per-proxy is 1s.
-        cache
-            .resolve("127.0.0.1", None, Some(1))
-            .await
-            .unwrap();
+        cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
         // A peer without per-proxy override uses the global 3600s policy on the
         // same shared row.
         cache.resolve("127.0.0.1", None, None).await.unwrap();
