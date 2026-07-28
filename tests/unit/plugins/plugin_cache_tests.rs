@@ -449,7 +449,10 @@ fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
         Ok(_) => panic!("blank SOAP replay identity must fail closed"),
         Err(error) => error,
     };
-    assert!(error.contains("plugin config id must not be blank"), "{error}");
+    assert!(
+        error.contains("plugin config id must not be blank"),
+        "{error}"
+    );
 }
 
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {

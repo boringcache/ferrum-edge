@@ -5825,7 +5825,10 @@ fn the_created_acceptance_interval_has_exactly_the_span_the_retention_covers() {
     // Earliest acceptance: the token may arrive a full skew *before* its own
     // Created. This is the earliest instant at which its nonce can be claimed.
     let earliest = created_at - chrono::Duration::seconds(SKEW);
-    assert!(decide(earliest).is_ok(), "the future-skew boundary is accepted");
+    assert!(
+        decide(earliest).is_ok(),
+        "the future-skew boundary is accepted"
+    );
     assert!(
         decide(earliest - chrono::Duration::seconds(1))
             .expect_err("one second earlier is out of policy")
