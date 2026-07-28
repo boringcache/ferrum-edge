@@ -866,8 +866,12 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         .split("let mut body = if let Some(inspector) = response_inspector {")
         .next()
         .expect("bounded streaming H2 body-construction region");
-    let constructors = region.matches("_h2_body_strip_hop_by_hop_trailers(").count();
-    let governed = region.matches("h2_streaming_trailer_governor.take()").count();
+    let constructors = region
+        .matches("_h2_body_strip_hop_by_hop_trailers(")
+        .count();
+    let governed = region
+        .matches("h2_streaming_trailer_governor.take()")
+        .count();
     assert_eq!(
         constructors, 4,
         "the plain streaming H2 arm should build exactly four body variants"
