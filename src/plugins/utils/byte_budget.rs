@@ -564,6 +564,10 @@ impl ReservedPayload {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
 }
 
 /// Reserve `bound` bytes against `ceiling` **before** anything is written, run
