@@ -3044,7 +3044,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 | `mode` | String | `"pre_proxy"` | `"pre_proxy"` or `"terminate"`. Unknown values rejected at plugin load. **Note:** terminate mode is not supported for gRPC requests — gRPC reject normalization would drop the function response body, so the request fails with 500 |
 | `forward_body` | bool | `false` | Include the lossless buffered request body for every method. UTF-8 bytes are an exact string with `body_encoding: "utf8"`; other bytes are base64 with `body_encoding: "base64"`. The active media type is carried separately as `body_content_type` |
 | `forward_headers` | String[] | `[]` | Header names to forward to the function (lowercased at config load). Read from the effective `before_proxy` header view, so a field line an earlier plugin removed — `authorization` under `strip_authorization_on_success`, or a gateway-owned `claim_headers` destination with no verified claim — is absent from the payload rather than re-read from the client's original request |
-| `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
+| `forward_query_params` | bool | `false` | Include decoded query parameters after omitting credentials that an earlier auth plugin marked for backend stripping. Starts from the same canonical backend-visible query primary dispatch uses (including any prior `request_transformer` ordered query mutation). Duplicate decoded names, invalid percent-encoded UTF-8, raw `+` ambiguity, and parameters lacking the original encoded representation fail before invocation |
 | `timeout_ms` | u64 | `5000` | Function invocation timeout in milliseconds. Must be > 0 |
 | `max_response_body_bytes` | u64 | `10485760` | Max function response body size (10 MiB). Must be > 0 |
 | `on_error` | String | `"reject"` | `"reject"` returns error to client; `"continue"` skips and proxies normally. Unknown values rejected at plugin load |
@@ -3054,7 +3054,7 @@ Invokes AWS Lambda, Azure Functions, or Google Cloud Functions as middleware in 
 
 `function_url` and `aws_endpoint_url` reject URL userinfo (`user:password@host`). The AWS endpoint override must be an origin only, with no path, query, or fragment. Automatic redirects are disabled. In `pre_proxy` mode only a 2xx function response is approval; every other response uses `on_error` and `error_status_code`. In `terminate` mode only final 2xx-5xx statuses (`200..=599`) are returned intentionally; informational or out-of-range three-digit statuses use the configured error path.
 
-When `forward_body` is enabled, the plugin buffers before `before_proxy` for every HTTP method and fails closed without calling the function if the exact body bytes are unavailable or the request carries a non-identity `Content-Encoding`. The buffered bytes are the original client body, so the encoding check consults the **original** request headers (captured at request intake) as well as the active header map: a header-only `request_transformer` that removes or renames `Content-Encoding` before this plugin cannot strip the label off the still-compressed bytes and smuggle them past the boundary. The payload has one authoritative lossless body representation: Ferrum never parses JSON into a structured value, so duplicate object members, lexical number forms, whitespace, and every other byte remain identical to the backend-visible request. Valid UTF-8 is carried as an exact JSON string with `body_encoding: "utf8"`; arbitrary bytes use base64 with `body_encoding: "base64"`. `body_content_type` separately records the active hook `Content-Type` when present without changing the representation. Query forwarding starts from the same effective raw query used for backend dispatch, so credentials that an earlier auth plugin marked for hiding are removed before parsing and cannot be resurrected in external policy egress. Because that payload is rebuilt from the raw query to preserve plus/duplicate/decode invariants, it cannot faithfully reflect a `request_transformer` **query** rule (add/remove/update/rename operates on the decoded parameter map); a request that ran such a query transform before this plugin therefore fails closed rather than emit a payload that silently ignores the operator's transform. Query/body representation ambiguity is governed input and remains fail-closed even with `on_error: "continue"`; that option applies to invocation/response failures, not to inputs the configured policy cannot inspect faithfully. A serverless body-egress instance cannot share a protocol chain with a request-body transformer; candidate admission and cache construction reject that composition so the external decision and backend cannot observe different representations. Registered custom plugins participate in the same validation through `egresses_request_body_before_finalization()` rather than a built-in-name exception.
+When `forward_body` is enabled, the plugin buffers before `before_proxy` for every HTTP method and fails closed without calling the function if the exact body bytes are unavailable or the request carries a non-identity `Content-Encoding`. The buffered bytes are the original client body, so the encoding check consults the **original** request headers (captured at request intake) as well as the active header map: a header-only `request_transformer` that removes or renames `Content-Encoding` before this plugin cannot strip the label off the still-compressed bytes and smuggle them past the boundary. The payload has one authoritative lossless body representation: Ferrum never parses JSON into a structured value, so duplicate object members, lexical number forms, whitespace, and every other byte remain identical to the backend-visible request. Valid UTF-8 is carried as an exact JSON string with `body_encoding: "utf8"`; arbitrary bytes use base64 with `body_encoding: "base64"`. `body_content_type` separately records the active hook `Content-Type` when present without changing the representation. Query forwarding starts from the same canonical effective query used for backend dispatch (transformer outbound query when present, otherwise the retained raw query, then auth credential strips), so credentials that an earlier auth plugin marked for hiding are removed before parsing and cannot be resurrected in external policy egress, and operator query transforms are reflected rather than ignored. Query/body representation ambiguity is governed input and remains fail-closed even with `on_error: "continue"`; that option applies to invocation/response failures, not to inputs the configured policy cannot inspect faithfully. A serverless body-egress instance cannot share a protocol chain with a request-body transformer; candidate admission and cache construction reject that composition so the external decision and backend cannot observe different representations. Registered custom plugins participate in the same validation through `egresses_request_body_before_finalization()` rather than a built-in-name exception.
 
 Candidate composition admission derives only the serverless protocol, effective priority, `mode`, and `forward_body` capabilities and does not construct the environment-bound HTTP/AWS client. CP/database admission therefore does not require AWS or externally resolved credentials that intentionally exist only on DPs; runtime cache construction still resolves and validates them fail closed.
 
@@ -3320,6 +3320,8 @@ config:
 Body transformation only applies to `application/json` content types (or any `+json` suffix). When body rules modify the payload, the gateway recomputes the forwarded `Content-Length` automatically. On HTTPS backends, body-transforming requests bypass the direct backend H2 pool so the buffered plugin output is what reaches the upstream. HTTP/3 backends apply the same transformed buffered body before forwarding.
 
 **Hot-path cost:** rules are pre-partitioned at config load into header-only and query-only lists, and header keys are pre-lowercased — so per-request work is proportional to the number of matching rules, not the total. When a proxy's `request_transformer` is configured with only query or body rules, the handler skips the zero-clone header-fast-path gate and does not clone `ctx.headers`.
+
+**Query mutation contract:** query rules mutate an ordered, duplicate-aware representation of the retained raw wire query (not the single-value `query_params` map). Authentication-owned credential strips (`auth.strip_query_param.*`) are removed from that representation **before** any query rules run, so a rename/update/duplicate cannot relocate or re-encode an authenticated secret onto a new outbound name. The serialized result is published as the outbound query for every primary backend URL builder (H1/H2, native H3, gRPC, WebSocket/CONNECT, cross-protocol adapters, and retries/failover) and for `request_mirror`. The proxy applies the same strips again afterward as defense in depth when composing the canonical final outbound query. Unmodified pairs keep their original percent-encoding, ordering, duplicates, key-without-equals flags, empty values, and literal `+` bytes. Authored names/values use RFC 3986 percent-encoding (`%20` for spaces, never `+`). Duplicate-name semantics (decoded names): `add` appends only when absent; `update` rewrites every matching pair (or appends when absent); `remove` drops every matching pair; `rename` renames every matching pair while preserving value encoding and key-without-equals shape. Configured query `key` / `value` / `new_key` strings must not contain CR or LF. Debug diagnostics log parameter names only — never values. When no query rule mutates the request and no auth credential was stripped from the transform input, the raw wire query is preserved with no extra allocation or re-parse.
 
 ### `response_transformer`
 
@@ -3864,7 +3866,7 @@ Validates request and response bodies against operation schemas generated from a
 | `bypass.consumers` | String[] | `[]` | Consumer identities that skip validation |
 | `bypass.header_present` | object | `{}` | Header presence/value checks that skip validation. Case-equivalent duplicate keys are rejected at construction. |
 
-`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata, supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Required request bodies are buffered even when Content-Type is missing so presence checks cannot be skipped. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
+`openapi_validator` compiles path regexes and JSON Schemas at config-load time. It only buffers matching HTTP proxy requests/responses (plus schema-less matching responses when strict missing-schema enforcement requires inspection), decodes complete `Content-Encoding` chains (`gzip` / `br`, including stacked lists such as `gzip, br`) in reverse application order under `max_body_bytes`, maps XML according to OpenAPI `xml` metadata, validates form fields and multipart file metadata (including bounded RFC 5987/8187 `filename*`), supports OpenAPI response wildcard statuses such as `4XX`, and records `openapi_validator.*` metadata for logging. Required request bodies are buffered even when Content-Type is missing so presence checks cannot be skipped. Request `Accept` and internal streaming markers cannot waive response validation. If a matching operation with response schemas receives a pristine backend `text/event-stream`, the plugin records an uninspectable response mismatch before header commit: `block` returns the configured response error (502 by default), while `log_only` records the mismatch and permits the stream. Missing, ambiguous, or later-relabeled types stay on the normal validation path. Direct plugin creation is allowed only for proxy-scoped plugins whose proxy has an attached API spec.
 
 Config admission is closed: unknown keys at the root and in `bypass`, `error_response`, each `operations[]` entry, and `request_body` are rejected at construction with a spelling suggestion; explicit `null` cannot stand in for an omitted non-null field; and free-form media/status map keys are shape-validated. (`null` values in `bypass.header_present` intentionally mean “match any value.”) Response selection is status-first — an exact status precludes wildcard-range and `default` fallback, media selection happens only inside the selected response object, and an empty backend or gateway-generated synthetic body is parsed against the selected schema except for HEAD / 1xx / 204 / 205 / 304. Response validation errors are redacted to a fixed generic message plus the operator/schema-controlled schema location so backend response content (including JSON property names in instance paths) never reaches the client or the transaction log.
 
@@ -3937,15 +3939,15 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `cache_key_include_query` | bool | `true` | Include the exact raw query string in the cache key as a SHA-256 hash |
 | `cache_key_include_consumer` | bool | `false` | Add an explicit `_anon` cache-key partition for unauthenticated requests. Authenticated requests are always keyed by the hashed effective identity regardless of this flag. This key-partition option does not authorize storage of a response to an `Authorization`-bearing request; the response still requires `public`, `must-revalidate`, or `s-maxage`. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
-| `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension method, which is conservatively treated as unsafe). Safe methods that are not in `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating |
+| `invalidate_on_unsafe_methods` | bool | `true` | After a non-error origin response (status below 400) to an unsafe method (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension/custom method, which fails closed as unsafe), invalidate cached entries for the same matched proxy, normalized/transformed Host/authority partition, and path prefix (including descendants). Method safety is classified independently of `cacheable_methods`: an unsafe method listed there still invalidates after an origin MISS and non-error response, while a served cache HIT that never contacted the origin does not. Safe methods that are not in `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics that never receive a non-error origin status do not invalidate. Invalidation uses private origin-status provenance recorded before `after_proxy` hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation |
 
 Behavior:
-- Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, and header snapshot is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
+- Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, header snapshot, and pending unsafe-method invalidation host partition is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - A cache `HIT` or conditional `REVALIDATED` (`304`) sets a private `RequestContext` finalized-replay capability (shared with `request_deduplication` idempotent replay). The shared H1/H2/H3 synthetic rejection finalizer still runs response inspectors, final-body validators, and reject-path observability/`after_proxy` hooks, but skips ordinary presentation transforms — including `response_transformer` body rules and static/route-level header sequences — so non-idempotent rule sequences cannot mutate the stored representation again. Public request metadata cannot set or spoof that capability; unrelated synthetic short-circuits (mocks, faults, federation) do not inherit it.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
-- Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`, and unrecognized extension methods, which are conservatively treated as unsafe) invalidate cached entries for the matched path when `invalidate_on_unsafe_methods` is enabled. Safe methods that are absent from `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating.
+- Unsafe methods (`POST`, `PUT`, `PATCH`, `DELETE`, and unrecognized extension/custom methods, which fail closed as unsafe) invalidate cached entries for the matched path under the **same normalized/transformed Host/authority partition used by cache lookup** when `invalidate_on_unsafe_methods` is enabled. Method safety is separate from `cacheable_methods` storage eligibility: an unsafe method that is also cacheable still invalidates after an origin MISS and non-error response, and a served cache HIT that never contacted the origin does not. Invalidation is deferred until proxy core records a non-error origin status (status below 400) — before any `after_proxy` hook can reject and replace the client-visible response — matching RFC 9111 §4.4. A failed or unauthorized mutation, transport failure, gateway-only synthetic, or any 4xx/5xx does not evict. Safe methods that are absent from `cacheable_methods` (such as `OPTIONS`, or `HEAD` under a GET-only set) bypass without invalidating.
 - When a store would exceed `max_total_size_bytes`, expired entries are reclaimed first under the accounting lock; the new entry is skipped only if it still does not fit. Expired entries therefore cannot trap the byte budget even when `max_entries` was never exceeded.
 - Conditional requests are served from cache. Matching `If-None-Match` or `If-Modified-Since` requests return `304 Not Modified` directly from the edge cache when a fresh cached validator exists, including a current `Age` header.
 - Authenticated requests are always partitioned by hashed effective identity. Setting `cache_key_include_consumer: true` additionally partitions unauthenticated requests under `_anon`; it does not override origin storage policy.
@@ -4055,9 +4057,51 @@ declared. Every five-byte header and declared payload must be present, later
 frame flags are checked, and the buffer must be consumed exactly. Empty bodies,
 truncated frames, trailing bytes, unsupported flags, and compressed frames
 without a usable encoding fail closed with a gRPC-Web-shaped client error.
-Request-side body trailer frames (`0x80`/`0x81`) are unsupported and rejected:
-Ferrum does not translate them into native HTTP/2 request trailers, so they are
-never forwarded to the backend as message bytes.
+**Request trailer frames.** A gRPC-Web client cannot emit HTTP/2 trailers, so it
+encodes end-of-stream metadata as a final `0x80` frame in the request body.
+Ferrum splits that frame off the message frames, validates it, and re-emits it
+as a real HTTP/2 TRAILERS block after the backend-bound DATA, in both binary and
+text mode. The trailer bytes never reach the backend as message bytes, and they
+are never folded into the initial header block: metadata that arrives at end of
+stream is not interchangeable with metadata the gateway already authenticated,
+authorized, and forwarded.
+
+Validation is fail-closed and produces a field-specific 400 (surfaced to the
+client as a gRPC-Web terminal frame) before any backend dispatch:
+
+- `0x81` (`Compressed-Flag` set on a trailer frame) is not defined by the wire
+  format and is refused rather than guessed at.
+- The trailer frame must be the **last** frame. A second trailer frame, or any
+  DATA after one, is refused — the parse must land exactly on the end of the
+  buffer.
+- A trailer frame must follow at least one message frame, and its block must
+  carry at least one entry.
+- Each line must be `name: value` and CRLF-terminated. Bare CR/LF, a missing
+  colon, whitespace around the name, and a leading `:` (pseudo-header) are
+  refused.
+- Names are lowercased and must match the gRPC Custom-Metadata charset; values
+  must be printable ASCII, and a `-bin` value must be base64 (padded or not).
+- Forbidden at end of stream: pseudo-headers, connection/framing fields
+  (`connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`,
+  `content-length`, `content-type`, `content-encoding`, `host`, …),
+  initial-only gRPC call parameters (`grpc-timeout`, `grpc-encoding`,
+  `grpc-accept-encoding`, `grpc-message-type`, `user-agent`), response terminal
+  metadata (`grpc-status`, `grpc-message`, `grpc-status-details-bin`),
+  credentials and gateway-authoritative assertions (`authorization`, `cookie`,
+  `x-api-key`, `x-geo-country`, `x-consumer-*`, `x-ferrum-*`), Ferrum-owned
+  forwarding identity (`x-forwarded-for`, `x-forwarded-proto`,
+  `x-forwarded-host`, and RFC 7239 `forwarded` — rejected unconditionally even
+  when primary `Forwarded` generation is disabled), and Ferrum's internal
+  gRPC-Web bridge headers.
+- The block is bounded at 8 KiB and 64 entries (names 128 bytes, values 4096
+  bytes) inside the existing gRPC receive ceiling. The block does not stay body
+  bytes — it becomes a header block the backend holds decoded — so it may not
+  consume the whole body budget.
+
+Duplicate names are preserved as repeated trailer entries. Retries replay the
+same complete request, trailers included. Request streaming is unchanged: only
+the already-buffered gRPC-Web envelope is inspected, and native gRPC requests
+keep their streaming fast path and backpressure.
 
 On the response path, `grpc_web` streams backend DATA as it arrives and embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, `grpc-status-details-bin`, and valid ASCII custom trailing metadata such as `request-id` — as exactly one final length-prefixed trailer frame (flag byte `0x80`) in the response body. Binary mode forwards each bounded DATA chunk without an additional translation copy; text mode base64-encodes each runtime flush independently, including protocol-permitted padding at flush boundaries, so neither mode waits for backend EOF before publishing server-streaming messages. Backpressure, cancellation, resets, absolute deadlines, response-size enforcement, load-balancer/admission guards, and deferred logging remain attached to the live body pipeline. The configured response-size ceiling applies to native backend DATA before text expansion; client-visible byte accounting records the encoded bytes and terminal frame.
 
@@ -4070,7 +4114,7 @@ likewise take precedence over response streaming.
 
 The plugin rewrites `content-type` to the **negotiated** gRPC-Web variant and removes an upstream `Content-Length`, because streaming text expansion and the terminal frame change the final representation length. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and ordinary initial response headers are not copied into the terminal block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name. A backend error propagates as a stream error and does not gain a fabricated clean terminal status; a clean EOF without valid trailers receives the documented HTTP-to-gRPC synthesized status.
 
-Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
+Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope — including its trailer frame — before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
 
@@ -4248,7 +4292,7 @@ request path default.
 
 **gRPC transport:** Native gRPC shadows dial through the shared `PluginHttpClient` HTTP/2 companion (`http2_prior_knowledge`): cleartext `mirror_protocol: http` uses h2c prior knowledge, and `https` negotiates ALPN `h2`. Ordinary (non-gRPC) HTTP mirrors keep the default all-version client so HTTP/1.1 destinations continue to work. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport. DNS cache, TLS posture, pool keepalive, egress screening, configured mirror timeouts, and redacted logging remain on the shared plugin client.
 
-**Query fidelity:** The mirror request-target prefers the original raw query string after the same auth credential strips primary dispatch applies (`auth.strip_query_param.*`), preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when no raw query is available. Decoded `request_transformer` query-map mutations are not re-serialized onto the mirror URL, matching primary backend URL construction.
+**Query fidelity:** The mirror request-target prefers the same canonical backend-visible query primary dispatch uses — the `request_transformer` outbound query when present, otherwise the original raw query, after authentication credential strips (`auth.strip_query_param.*`) — preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when neither a raw nor outbound query is available.
 
 ```yaml
 plugin_name: request_mirror
@@ -5177,6 +5221,10 @@ Rate-limits consumers by LLM token consumption instead of request count. The lim
 
 Supports both regular JSON and SSE streaming responses — when `ai_token_metrics` is active, reads tokens from metadata; when used standalone, parses response bodies directly including SSE `data:` lines.
 
+**This plugin is HTTP-only.** Native gRPC is not supported and the plugin is not registered for the `Grpc` protocol view, so it can never be attached to native gRPC AI traffic as an enforcement control. The entire accounting lifecycle — prompt estimation, pre-reservation, and post-response reconciliation — is defined over bare JSON request bodies and JSON/SSE response bodies; native gRPC carries length-prefixed, optionally compressed protobuf frames with no gateway-known usage schema, and no explicitly configured descriptor-based usage extraction exists. Advertising gRPC previously meant an operator could deploy an apparently supported token limiter on a native gRPC AI route where every unary or streaming call re-checked an empty window and passed unbudgeted. Because gRPC is never pinned in proxy configuration — a single `http`/`https` proxy serves REST, gRPC, and WebSocket by per-request content-type detection — the declared protocol set *is* the admission boundary: `PluginCache` builds one plugin list per protocol, and the admin API, file mode, CP validation, and DP full/incremental config application all go through that same shared build, so none of them installs this limiter on the native gRPC view.
+
+**gRPC-Web is also unsupported.** gRPC-Web rides the HTTP (and composed H3 gRPC-Web) view, so the plugin can still observe it, and it explicitly stays out of the way: framed `application/grpc-web*` bodies — including the `+json` variants that otherwise satisfy the JSON content-type screen — are never buffered, never classified as a JSON AI request, and never parsed as a JSON usage document on the response side. Such traffic is left as ordinary non-AI traffic rather than being charged zero tokens against a budget or turned into a 502 by `on_unmetered_response`. Ordinary HTTP JSON and SSE AI traffic is unaffected.
+
 **Priority:** 4200
 
 | Parameter | Type | Default | Description |
@@ -5580,6 +5628,27 @@ post-reassembly chain, the first terminal Close from a priority-ordered
 admission/mutating hook is preserved: later mutating plugins are skipped for
 that frame, while observational hooks still see the final Close.
 
+**Physical fragments.** Because `on_ws_frame` sees only reassembled messages, a
+peer could otherwise spend unbounded wire frames — including zero-length
+continuation frames, which accumulate no bytes and therefore never trip any size
+ceiling — while paying for a single logical message. The relay now meters those
+frames inside the codec and charges them through `on_ws_reassembly_frames`
+before admitting the completing message, in both directions and on all three
+frontends (and for an interleaved Ping/Pong; a peer Close stays exempt, as it
+already bypasses mutating admission). Each wire frame is charged exactly once: the fragments through the
+reassembly hook, the completing frame through the ordinary message hook.
+Observational plugins are skipped for fragment batches, and only a returned
+`Message::Close` is honored (there is no message to mutate).
+
+Metering cannot bound a message that never completes, so the parser also applies
+two independent ceilings — `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+(physical frame count) and `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`
+(wall clock since the first fragment) — and closes the connection with RFC 6455
+code **1008** and a fixed, non-secret reason while the message is still
+incomplete. Both reset at every message boundary, so legitimately fragmented
+traffic on a long-lived connection is unaffected. These are separate from
+`ws_message_size_limiting`, which bounds bytes and closes with **1009**.
+
 ### `ws_message_size_limiting`
 
 Enforces an actual WebSocket frame-payload ceiling before payload reservation
@@ -5623,7 +5692,7 @@ parsers receive the effective limits before their first frame read.
 
 ### `ws_rate_limiting`
 
-Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
+Rate limits WebSocket frames per-connection using a token bucket algorithm. Closes the connection with close code **1008 (Policy Violation)** per RFC 6455 §7.4 when the configured frame rate is exceeded. Both client-to-backend and backend-to-client frames count against the same per-connection bucket. Budget is charged per **physical** frame, not per logical message: a message reassembled from N wire frames costs N tokens (the N−1 fragments are charged as one batched admission when the read that surfaced them returns, then the completing message costs one more). A message built from more wire frames than `burst_size` therefore can never be admitted, which is the intended fail-closed answer to a fragmentation flood. An inbound `Message::Close` already synthesized by an earlier admission/mutating frame plugin is ignored: the limiter neither charges local/Redis budget nor replaces that Close. The shared H1/H2/H3 relay also skips later mutating plugins once a terminal Close is selected. Unknown top-level keys are rejected at admission and reload.
 
 **Priority:** 2910
 
@@ -5781,9 +5850,9 @@ See [Mesh Observability](mesh.md#observability) for metric names, service graph 
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT / SYN-to-ACK latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
 
-See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters and the node-agent/process split.
+See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
 
 ---
 

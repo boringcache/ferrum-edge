@@ -6261,6 +6261,70 @@ fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
     assert!(grpc_web_view.plugins.iter().any(|name| name == "grpc_web"));
 }
 
+#[test]
+fn ai_rate_limiter_excluded_from_native_grpc_protocol_view() {
+    // GHSA-8f27-23x9-f825: the limiter's accounting lifecycle is HTTP JSON/SSE
+    // only, so it must never be installed on the native-gRPC view (H2 and H3
+    // native gRPC both resolve ProxyProtocol::Grpc). This shared protocol
+    // filter is what every configuration path — admin API, file mode, CP
+    // validation, and DP full/incremental apply — builds through, so the
+    // exclusion is the configuration-admission boundary. gRPC-Web keeps riding
+    // the composed HTTP view, where the plugin explicitly skips framed bodies.
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/ai",
+            vec!["ai-limiter", "grpc-web", "deadline"],
+        )],
+        vec![
+            make_plugin_config(
+                "ai-limiter",
+                "ai_rate_limiter",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "deadline",
+                "grpc_deadline",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+
+    let http_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        http_names.contains(&"ai_rate_limiter"),
+        "ordinary HTTP AI traffic must stay eligible for token budgeting"
+    );
+
+    let grpc_plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Grpc);
+    let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        !grpc_names.contains(&"ai_rate_limiter"),
+        "native gRPC protocol view must exclude the HTTP-only ai_rate_limiter \
+         rather than installing an enforcement plugin that never charges"
+    );
+    assert!(
+        grpc_names.contains(&"grpc_deadline"),
+        "genuinely gRPC-capable plugins must be unaffected"
+    );
+
+    let grpc_web_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        grpc_web_view
+            .plugins
+            .iter()
+            .any(|name| name == "ai_rate_limiter"),
+        "gRPC-Web composed view retains the HTTP limiter, which then skips framed bodies"
+    );
+}
+
 // ---- WebSocket per-frame plugin hook infrastructure ----
 
 #[tokio::test]
@@ -9042,6 +9106,40 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
         !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
     );
+}
+
+#[test]
+fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability() {
+    // Ordered query rules parse retained raw/outbound query themselves. Opting
+    // into the shared pre-auth decoded map would change key_auth/JWT/HMAC and
+    // cache/policy acceptance merely by attaching an unrelated transformer.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({
+                "rules": [
+                    {"operation": "remove", "target": "query", "key": "token"}
+                ]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
+        "request_transformer query rules must preserve HTTP/3 raw pre-auth query materialization"
+    );
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let transformer = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "request_transformer")
+        .expect("request_transformer is cached");
+    assert!(!transformer.requires_decoded_query_params());
 }
 
 #[test]

@@ -3324,12 +3324,9 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
 }
 
 #[tokio::test]
-async fn terminal_serverless_query_transform_releases_dedup_owner() {
-    // A request_transformer query rule recorded a decoded-query transform that
-    // the raw-query payload cannot faithfully honor. The serverless egress fails
-    // closed before any external call, so the dedup in-flight lock is released.
-    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
-
+async fn terminal_serverless_ambiguous_query_releases_dedup_owner() {
+    // A governed query ambiguity (`+`) fails closed before any external call,
+    // so the dedup in-flight lock is released for an identical retry.
     let dedup = make_plugin(json!({}));
     let serverless = ServerlessFunction::new(
         &json!({
@@ -3342,13 +3339,8 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
     )
     .unwrap();
     let mut ctx = new_ctx("POST", "/api");
-    // Raw query is otherwise valid; the transform marker alone drives the reject.
-    ctx.set_raw_query_string("page=1&sort=asc".to_string());
-    ctx.metadata.insert(
-        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-    let mut headers = HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    ctx.set_raw_query_string("name=alice+bob".to_string());
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "ambiguous".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
@@ -3360,21 +3352,17 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
                 headers,
                 body,
             } => (status_code, headers, body),
-            other => panic!("transformed-query composition must reject, got {other:?}"),
+            other => panic!("ambiguous query must reject, got {other:?}"),
         };
-    assert!(body.contains("query_params_transformed"));
+    assert!(body.contains("ambiguous_query_encoding"));
     dedup
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
     let mut retry_ctx = new_ctx("POST", "/api");
-    retry_ctx.set_raw_query_string("page=1&sort=asc".to_string());
-    retry_ctx.metadata.insert(
-        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
+    retry_ctx.set_raw_query_string("name=alice+bob".to_string());
     let mut retry_headers =
-        HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+        HashMap::from([("idempotency-key".to_string(), "ambiguous".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Continue

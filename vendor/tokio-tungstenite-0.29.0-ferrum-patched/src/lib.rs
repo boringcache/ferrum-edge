@@ -31,7 +31,9 @@ use futures_util::{
 use log::*;
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -46,7 +48,7 @@ use tungstenite::{
 };
 use tungstenite::{
     error::Error as WsError,
-    protocol::{Message, Role, WebSocket, WebSocketConfig},
+    protocol::{FragmentMeter, Message, Role, WebSocket, WebSocketConfig},
 };
 
 #[cfg(any(feature = "native-tls", feature = "__rustls-tls", feature = "connect"))]
@@ -287,6 +289,22 @@ impl<S> WebSocketStream<S> {
     /// Returns a reference to the configuration of the tungstenite stream.
     pub fn get_config(&self) -> &WebSocketConfig {
         self.inner.get_config()
+    }
+
+    /// Install fragment accounting for this read direction (Ferrum local
+    /// extension).
+    ///
+    /// See [`tungstenite::protocol::WebSocketContext::set_fragment_accounting`].
+    /// Call before the first poll: the shared `meter` survives a later
+    /// [`StreamExt::split`](futures_util::StreamExt::split), which otherwise
+    /// hides the codec behind a `SplitStream`.
+    pub fn set_fragment_accounting(
+        &mut self,
+        meter: Option<Arc<FragmentMeter>>,
+        max_frames: Option<usize>,
+        max_duration: Option<Duration>,
+    ) {
+        self.inner.set_fragment_accounting(meter, max_frames, max_duration);
     }
 
     /// Close the underlying web socket
