@@ -5781,9 +5781,9 @@ See [Mesh Observability](mesh.md#observability) for metric names, service graph 
 
 ### `__mesh_bpf_metrics`
 
-Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
+Reserved internal plugin auto-injected only for mesh `NodeWaypoint` topology. It exposes TCP-layer BPF SOCK_OPS counters and fixed-bucket SRTT / SYN-to-ACK latency histograms on the Prometheus scrape surface. Operator-managed plugin configs should not create names prefixed with `__`.
 
-See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters and the node-agent/process split.
+See [BPF SOCK_OPS observability](mesh.md#bpf-sock_ops-observability-gap-sc3) for emitted counters, histogram bucket bounds, and the node-agent/process split.
 
 ---
 

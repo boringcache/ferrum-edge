@@ -1043,7 +1043,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
 | `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
-| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks |
+| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks |
 | `transaction_log_schema` | — | — | — | — | — | Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999) |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.

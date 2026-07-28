@@ -6114,11 +6114,11 @@ pub mod priority {
     pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
-    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
-    /// SOCK_OPS event consumer. Auto-injected only when topology is
-    /// `NodeWaypoint`. Lives in the observability band alongside other
-    /// metric-emitter plugins so its `log` hook runs after all
-    /// transaction-summary serialization.
+    /// Rst, Fin, SRTT/SYN→ACK latency histograms, BPF drop reasons,
+    /// ringbuf overrun) from the SOCK_OPS event consumer. Auto-injected
+    /// only when topology is `NodeWaypoint`. Lives in the observability
+    /// band alongside other metric-emitter plugins so its `log` hook
+    /// runs after all transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the

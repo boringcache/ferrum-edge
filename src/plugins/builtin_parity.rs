@@ -696,7 +696,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         priority: 9365,
         active_phases: "(no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer)",
         matrix_protocols: ALL_PROTOCOLS,
-        protocol_rationale: "Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks",
+        protocol_rationale: "Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks",
     },
     BuiltinPluginParityMeta {
         name: "transaction_log_schema",
