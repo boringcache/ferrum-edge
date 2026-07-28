@@ -12155,9 +12155,16 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     for (k, v) in headers {
         // `eq_ignore_ascii_case` avoids the `to_ascii_lowercase` String
         // allocation that was previously executed per header.
+        // `content-length` is dropped for the same reason the H1/H2 normalizer
+        // drops it: this branch emits no DATA, so any surviving value describes
+        // bytes that are not being sent. The framed serverless-terminate
+        // representation runs the shared response-body lifecycle, whose
+        // transforms set `content-length` on the reject header map, so a stale
+        // nonzero value can reach here once that authorization is invalidated.
         if k.eq_ignore_ascii_case("content-type")
             || k.eq_ignore_ascii_case("grpc-status")
             || k.eq_ignore_ascii_case("grpc-message")
+            || k.eq_ignore_ascii_case("content-length")
         {
             continue;
         }
