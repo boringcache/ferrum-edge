@@ -13,9 +13,11 @@ use ferrum_edge::_test_support::{
     response_caching_instance_id_for_test, response_caching_shard_amount_for_test,
     response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
+    run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
+use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
 use ferrum_edge::plugins::{
     Plugin, PluginFailurePolicy, PluginResult, RequestContext, plugin_failure_policy,
     validate_plugin_config,
@@ -138,8 +140,24 @@ async fn cache_response(
     response_headers: &HashMap<String, String>,
     body: &[u8],
 ) {
+    cache_response_with_host(plugin, method, path, None, status, response_headers, body).await;
+}
+
+async fn cache_response_with_host(
+    plugin: &ResponseCaching,
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
     let mut ctx = make_ctx(method, path);
     let mut headers = HashMap::new();
+    if let Some(host) = host {
+        ctx.headers.insert("host".to_string(), host.to_string());
+        headers.insert("host".to_string(), host.to_string());
+    }
 
     // before_proxy (should be MISS)
     plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -154,6 +172,54 @@ async fn cache_response(
     plugin
         .on_final_response_body(&mut ctx, status, &resp_headers, body)
         .await;
+}
+
+/// Drive an unsafe-method request through lookup bypass and the response-side
+/// invalidation gate (RFC 9111 §4.4).
+async fn unsafe_method_cycle(
+    plugin: &ResponseCaching,
+    method: &str,
+    path: &str,
+    host: Option<&str>,
+    response_status: u16,
+) {
+    let mut ctx = make_ctx(method, path);
+    let mut headers = HashMap::new();
+    if let Some(host) = host {
+        ctx.headers.insert("host".to_string(), host.to_string());
+        headers.insert("host".to_string(), host.to_string());
+    }
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut resp_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, response_status, &mut resp_headers)
+        .await;
+}
+
+async fn assert_cache_hit_for_host(plugin: &ResponseCaching, path: &str, host: &str, body: &[u8]) {
+    let mut ctx = make_ctx("GET", path);
+    ctx.headers.insert("host".to_string(), host.to_string());
+    let mut headers = HashMap::new();
+    headers.insert("host".to_string(), host.to_string());
+    let (_, hit_body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(hit_body, body);
+}
+
+async fn assert_cache_miss_for_host(plugin: &ResponseCaching, path: &str, host: &str) {
+    let mut ctx = make_ctx("GET", path);
+    ctx.headers.insert("host".to_string(), host.to_string());
+    let mut headers = HashMap::new();
+    headers.insert("host".to_string(), host.to_string());
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ),
+        "expected MISS for host {host} path {path}"
+    );
 }
 
 // Simulate a backend refresh of an existing entry. A normal lookup would HIT
@@ -1386,10 +1452,8 @@ async fn test_post_invalidates_cached_get() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
 
-    // POST to the same path should invalidate
-    let mut ctx = make_ctx("POST", "/api/items");
-    let mut headers = HashMap::new();
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Successful POST to the same path should invalidate after the response
+    unsafe_method_cycle(&plugin, "POST", "/api/items", None, 200).await;
 
     // GET should now be a MISS
     let mut ctx = make_ctx("GET", "/api/items");
@@ -2644,10 +2708,8 @@ async fn test_invalidation_disabled() {
 
     cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"items").await;
 
-    // POST should NOT invalidate when disabled
-    let mut ctx = make_ctx("POST", "/api/items");
-    let mut headers = HashMap::new();
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Successful POST must NOT invalidate when disabled
+    unsafe_method_cycle(&plugin, "POST", "/api/items", None, 200).await;
 
     // GET should still be a HIT
     let mut ctx = make_ctx("GET", "/api/items");
@@ -3303,10 +3365,13 @@ async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
             let body = vec![b'x'; 512];
             cache_response(&plugin, "GET", &path, 200, &response_headers, &body).await;
 
-            // Interleave an invalidation via an unsafe method on the same path.
+            // Interleave an invalidation via an unsafe method on the same path
+            // after a non-error response (RFC 9111 §4.4 gate).
             let mut inv_ctx = make_ctx("POST", &path);
             let mut inv_headers = HashMap::new();
             let _ = plugin.before_proxy(&mut inv_ctx, &mut inv_headers).await;
+            let mut inv_resp = HashMap::new();
+            let _ = plugin.after_proxy(&mut inv_ctx, 200, &mut inv_resp).await;
         }));
     }
     for task in tasks {
@@ -4005,17 +4070,15 @@ async fn test_non_cacheable_head_does_not_invalidate_cached_get() {
 }
 
 /// Every standardized unsafe method must still invalidate the cached entry
-/// for the same path, preserving the documented POST/PUT/PATCH/DELETE
-/// behavior of `invalidate_on_unsafe_methods`.
+/// for the same path after a non-error response, preserving the documented
+/// POST/PUT/PATCH/DELETE behavior of `invalidate_on_unsafe_methods`.
 #[tokio::test]
 async fn test_every_unsafe_method_invalidates_cached_get() {
     for method in ["POST", "PUT", "PATCH", "DELETE"] {
         let plugin = default_plugin();
         cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
 
-        let mut ctx = make_ctx(method, "/api/items");
-        let mut headers = HashMap::new();
-        plugin.before_proxy(&mut ctx, &mut headers).await;
+        unsafe_method_cycle(&plugin, method, "/api/items", None, 200).await;
 
         let mut ctx = make_ctx("GET", "/api/items");
         let mut headers = HashMap::new();
@@ -4029,16 +4092,14 @@ async fn test_every_unsafe_method_invalidates_cached_get() {
     }
 }
 
-/// Extension methods have unknown semantics, so they are conservatively
-/// treated as unsafe and invalidate matching cached entries.
+/// Extension methods have unknown semantics, so they fail closed as unsafe
+/// and invalidate matching cached entries after a non-error response.
 #[tokio::test]
 async fn test_extension_method_conservatively_invalidates_cached_get() {
     let plugin = default_plugin();
     cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
 
-    let mut ctx = make_ctx("PURGE", "/api/items");
-    let mut headers = HashMap::new();
-    plugin.before_proxy(&mut ctx, &mut headers).await;
+    unsafe_method_cycle(&plugin, "PURGE", "/api/items", None, 200).await;
 
     let mut ctx = make_ctx("GET", "/api/items");
     let mut headers = HashMap::new();
@@ -4615,4 +4676,701 @@ async fn test_duplicate_max_age_keeps_the_most_restrictive_lifetime() {
         ),
         "the shorter duplicate `max-age` must bound freshness"
     );
+}
+
+// === Authority-scoped deferred invalidation (GHSA-7836-2m4x-3gwr) ===
+
+/// A successful mutation on authority A must not evict the same path cached
+/// under authority B on a shared proxy.
+#[tokio::test]
+async fn test_unsafe_invalidation_does_not_cross_authority_boundaries() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"tenant-a",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"tenant-b",
+    )
+    .await;
+
+    unsafe_method_cycle(&plugin, "POST", "/api/items", Some("a.example.com"), 200).await;
+
+    assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/api/items", "b.example.com", b"tenant-b").await;
+}
+
+/// Invalidation must use the same transformed Host partition as cache lookup:
+/// a mutation whose outbound Host was rewritten must evict only that partition.
+#[tokio::test]
+async fn test_unsafe_invalidation_uses_transformed_host_partition() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    // Store under the rewritten backend Host (lookup/storage contract).
+    let mut store_ctx = make_ctx("GET", "/api/items");
+    store_ctx
+        .headers
+        .insert("host".to_string(), "client.example.com".to_string());
+    let mut store_headers = HashMap::new();
+    store_headers.insert("host".to_string(), "backend.internal".to_string());
+    plugin
+        .before_proxy(&mut store_ctx, &mut store_headers)
+        .await;
+    let mut store_resp = HashMap::new();
+    plugin
+        .after_proxy(&mut store_ctx, 200, &mut store_resp)
+        .await;
+    plugin
+        .on_final_response_body(&mut store_ctx, 200, &store_resp, b"rewritten-host")
+        .await;
+
+    // Unrelated client-facing Host entry must survive.
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("other.example.com"),
+        200,
+        &HashMap::new(),
+        b"other-host",
+    )
+    .await;
+
+    // Mutation with the same Host rewrite must invalidate only the rewritten
+    // partition.
+    let mut post_ctx = make_ctx("POST", "/api/items");
+    post_ctx
+        .headers
+        .insert("host".to_string(), "client.example.com".to_string());
+    let mut post_headers = HashMap::new();
+    post_headers.insert("host".to_string(), "backend.internal".to_string());
+    plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+    let mut post_resp = HashMap::new();
+    plugin.after_proxy(&mut post_ctx, 204, &mut post_resp).await;
+
+    // Lookup with the rewritten Host must MISS.
+    let mut miss_ctx = make_ctx("GET", "/api/items");
+    miss_ctx
+        .headers
+        .insert("host".to_string(), "client.example.com".to_string());
+    let mut miss_headers = HashMap::new();
+    miss_headers.insert("host".to_string(), "backend.internal".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await,
+        PluginResult::Continue
+    ));
+
+    assert_cache_hit_for_host(&plugin, "/api/items", "other.example.com", b"other-host").await;
+}
+
+/// A failed mutation must not evict cache entries (RFC 9111 §4.4).
+#[tokio::test]
+async fn test_failed_unsafe_mutation_does_not_invalidate() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"still-fresh",
+    )
+    .await;
+
+    for status in [400u16, 401, 403, 404, 409, 500, 502, 503] {
+        unsafe_method_cycle(&plugin, "POST", "/api/items", Some("a.example.com"), status).await;
+        assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"still-fresh").await;
+    }
+}
+
+/// Successful unsafe mutations (2xx/3xx) do invalidate the matched authority.
+#[tokio::test]
+async fn test_successful_unsafe_mutation_invalidates_after_non_error_response() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    for status in [200u16, 201, 204, 301, 302, 303, 307, 399] {
+        cache_response_with_host(
+            &plugin,
+            "GET",
+            "/api/items",
+            Some("a.example.com"),
+            200,
+            &HashMap::new(),
+            b"cached",
+        )
+        .await;
+
+        // before_proxy alone must not evict.
+        let mut ctx = make_ctx("DELETE", "/api/items");
+        ctx.headers
+            .insert("host".to_string(), "a.example.com".to_string());
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "a.example.com".to_string());
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"cached").await;
+
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
+        assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
+    }
+}
+
+/// Unknown/custom methods fail closed as unsafe and invalidate after success.
+#[tokio::test]
+async fn test_unknown_method_fail_closed_invalidates_after_success() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response(&plugin, "GET", "/api/items", 200, &HashMap::new(), b"body").await;
+
+    // Error response for unknown method: no eviction.
+    unsafe_method_cycle(&plugin, "CUSTOM", "/api/items", None, 405).await;
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(is_reject(
+        &plugin.before_proxy(&mut ctx, &mut headers).await
+    ));
+
+    // Non-error response: evict.
+    unsafe_method_cycle(&plugin, "CUSTOM", "/api/items", None, 200).await;
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+/// Path-descendant invalidation remains authority-scoped.
+#[tokio::test]
+async fn test_path_descendant_invalidation_stays_authority_scoped() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items/42",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"a-child",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items/42",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"b-child",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/other",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"a-other",
+    )
+    .await;
+
+    unsafe_method_cycle(&plugin, "DELETE", "/api/items", Some("a.example.com"), 204).await;
+
+    assert_cache_miss_for_host(&plugin, "/api/items/42", "a.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/api/items/42", "b.example.com", b"b-child").await;
+    assert_cache_hit_for_host(&plugin, "/api/other", "a.example.com", b"a-other").await;
+}
+
+/// Concurrent successful invalidations on distinct authorities must not
+/// cross-evict each other's partitions.
+#[tokio::test]
+async fn test_concurrent_authority_scoped_invalidation() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = std::sync::Arc::new(default_plugin());
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"tenant-a",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"tenant-b",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("c.example.com"),
+        200,
+        &HashMap::new(),
+        b"tenant-c",
+    )
+    .await;
+
+    let plugin_a = plugin.clone();
+    let plugin_b = plugin.clone();
+    let ((), ()) = tokio::join!(
+        async move {
+            unsafe_method_cycle(&plugin_a, "POST", "/api/items", Some("a.example.com"), 200).await;
+        },
+        async move {
+            unsafe_method_cycle(&plugin_b, "PUT", "/api/items", Some("b.example.com"), 201).await;
+        },
+    );
+
+    assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
+    assert_cache_miss_for_host(&plugin, "/api/items", "b.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/api/items", "c.example.com", b"tenant-c").await;
+}
+
+/// Unsafe methods listed in `cacheable_methods` must still invalidate after an
+/// origin MISS and non-error response. Storage eligibility is not method safety.
+#[tokio::test]
+async fn test_unsafe_cacheable_method_miss_invalidates_after_success() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "invalidate_on_unsafe_methods": true
+    }));
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"cached-get",
+    )
+    .await;
+
+    // POST is cacheable, so before_proxy takes the lookup path (MISS) rather
+    // than the historical non-cacheable bypass — and must still stage
+    // invalidation for the origin-success boundary.
+    let mut post_ctx = make_ctx("POST", "/api/items");
+    post_ctx
+        .headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut post_headers = HashMap::new();
+    post_headers.insert("host".to_string(), "a.example.com".to_string());
+    assert!(matches!(
+        plugin.before_proxy(&mut post_ctx, &mut post_headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        post_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .map(String::as_str),
+        Some("MISS"),
+        "cacheable POST must take the MISS lookup path"
+    );
+    assert!(
+        post_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_pending_invalidate_host")),
+        "unsafe cacheable MISS must stage pending invalidation"
+    );
+
+    // before_proxy alone must not evict.
+    assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"cached-get").await;
+
+    let mut resp_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut post_ctx, 201, &mut resp_headers)
+        .await;
+    assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
+}
+
+/// An unsafe cacheable MISS that receives an error origin status must not
+/// invalidate peer GET/HEAD variants.
+#[tokio::test]
+async fn test_unsafe_cacheable_method_miss_error_does_not_invalidate() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "invalidate_on_unsafe_methods": true
+    }));
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"still-fresh",
+    )
+    .await;
+
+    for status in [400u16, 403, 404, 500, 502] {
+        let mut post_ctx = make_ctx("POST", "/api/items");
+        post_ctx
+            .headers
+            .insert("host".to_string(), "a.example.com".to_string());
+        let mut post_headers = HashMap::new();
+        post_headers.insert("host".to_string(), "a.example.com".to_string());
+        assert!(matches!(
+            plugin.before_proxy(&mut post_ctx, &mut post_headers).await,
+            PluginResult::Continue
+        ));
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut post_ctx, status, &mut resp_headers)
+            .await;
+        assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"still-fresh").await;
+    }
+}
+
+/// A served cache HIT for an unsafe-but-cacheable method never contacted the
+/// origin and must not flush other path variants.
+#[tokio::test]
+async fn test_unsafe_cacheable_method_hit_does_not_invalidate() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "cacheable_status_codes": [200],
+        "invalidate_on_unsafe_methods": true
+    }));
+
+    // Seed POST first so its successful store cannot invalidate a later GET.
+    cache_response_with_host(
+        &plugin,
+        "POST",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"post-body",
+    )
+    .await;
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"get-body",
+    )
+    .await;
+
+    let mut hit_ctx = make_ctx("POST", "/api/items");
+    hit_ctx
+        .headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut hit_headers = HashMap::new();
+    hit_headers.insert("host".to_string(), "a.example.com".to_string());
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"post-body");
+    assert!(
+        !hit_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_pending_invalidate_host")),
+        "HIT must clear pending invalidation without contacting the origin"
+    );
+
+    assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"get-body").await;
+}
+
+/// An earlier `after_proxy` rejection of a genuine non-error origin response
+/// must not suppress unsafe-method invalidation. Proxy core records private
+/// origin status and notifies plugins before the after_proxy loop.
+#[tokio::test]
+async fn test_earlier_after_proxy_reject_still_invalidates_on_origin_success() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let cache = Arc::new(default_plugin());
+    let size_limit = Arc::new(
+        ResponseSizeLimiting::new(&json!({ "max_bytes": 8 })).expect("size limiter config"),
+    );
+
+    cache_response_with_host(
+        &cache,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"stale",
+    )
+    .await;
+
+    let mut ctx = make_ctx("DELETE", "/api/items");
+    ctx.headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut req_headers = HashMap::new();
+    req_headers.insert("host".to_string(), "a.example.com".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cache, "cache_pending_invalidate_host"))
+    );
+
+    // Priority order: size limiting (3490) runs before caching (3500) and
+    // rejects the oversized Content-Length, so caching's after_proxy never
+    // sees the genuine 200. observe_origin_http_response_status must still
+    // apply the staged invalidation.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![size_limit, cache.clone()];
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-length".to_string(), "64".to_string());
+    resp_headers.insert("content-type".to_string(), "text/plain".to_string());
+    let reject = run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut resp_headers)
+        .await
+        .expect("size limiter must reject oversized origin response");
+    assert_eq!(reject.0, 502);
+
+    assert_cache_miss_for_host(&cache, "/api/items", "a.example.com").await;
+    assert!(
+        !ctx.metadata
+            .contains_key(&staging_key(&cache, "cache_pending_invalidate_host")),
+        "pending invalidation must be consumed exactly once"
+    );
+}
+
+/// An earlier after_proxy rejection of an origin *error* must still leave the
+/// cache intact — only non-error origin status invalidates.
+#[tokio::test]
+async fn test_earlier_after_proxy_reject_of_origin_error_does_not_invalidate() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let cache = Arc::new(default_plugin());
+    let size_limit = Arc::new(
+        ResponseSizeLimiting::new(&json!({ "max_bytes": 8 })).expect("size limiter config"),
+    );
+
+    cache_response_with_host(
+        &cache,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"fresh",
+    )
+    .await;
+
+    let mut ctx = make_ctx("POST", "/api/items");
+    ctx.headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut req_headers = HashMap::new();
+    req_headers.insert("host".to_string(), "a.example.com".to_string());
+    assert!(matches!(
+        cache.before_proxy(&mut ctx, &mut req_headers).await,
+        PluginResult::Continue
+    ));
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![size_limit, cache.clone()];
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-length".to_string(), "64".to_string());
+    let reject = run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 500, &mut resp_headers)
+        .await
+        .expect("size limiter must reject oversized origin error body");
+    assert_eq!(reject.0, 502);
+
+    assert_cache_hit_for_host(&cache, "/api/items", "a.example.com", b"fresh").await;
+}
+
+/// Public metadata cannot forge origin success: without private provenance and
+/// without a genuine after_proxy status argument that is non-error, staged
+/// invalidation must not fire from spoofed metadata alone.
+#[tokio::test]
+async fn test_forged_public_backend_status_metadata_cannot_force_invalidation() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"protected",
+    )
+    .await;
+
+    let mut ctx = make_ctx("POST", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    // Spoof the AI rate-limiter public metadata key — invalidation must ignore it.
+    ctx.metadata
+        .insert("ai_ratelimit_backend_status".to_string(), "200".to_string());
+
+    let mut resp_headers = HashMap::new();
+    plugin.after_proxy(&mut ctx, 500, &mut resp_headers).await;
+
+    let mut get_ctx = make_ctx("GET", "/api/items");
+    let mut get_headers = HashMap::new();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut get_ctx, &mut get_headers).await),
+        "forged public metadata must not invalidate on an error after_proxy status"
+    );
+}
+
+/// Sibling response_caching instances must not consume or overwrite each
+/// other's pending invalidation staging.
+#[tokio::test]
+async fn test_sibling_instances_do_not_consume_each_others_pending_invalidation() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let instance_a = plugin_with_config(json!({
+        "invalidate_on_unsafe_methods": true,
+        "cache_key_include_query": true
+    }));
+    let instance_b = plugin_with_config(json!({
+        "invalidate_on_unsafe_methods": true,
+        "cache_key_include_query": false
+    }));
+    assert_ne!(
+        response_caching_instance_id_for_test(&instance_a),
+        response_caching_instance_id_for_test(&instance_b)
+    );
+
+    cache_response(
+        &instance_a,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"a-body",
+    )
+    .await;
+    cache_response(
+        &instance_b,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"b-body",
+    )
+    .await;
+
+    let mut ctx = make_ctx("DELETE", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        instance_a.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        instance_b.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let key_a = staging_key(&instance_a, "cache_pending_invalidate_host");
+    let key_b = staging_key(&instance_b, "cache_pending_invalidate_host");
+    assert_ne!(key_a, key_b);
+    assert!(ctx.metadata.contains_key(&key_a));
+    assert!(ctx.metadata.contains_key(&key_b));
+
+    // Instance A observes origin success and consumes only its own staging.
+    instance_a.observe_origin_http_response_status(&mut ctx, 204);
+    assert!(!ctx.metadata.contains_key(&key_a));
+    assert!(
+        ctx.metadata.contains_key(&key_b),
+        "sibling pending invalidation must survive the other instance's observe"
+    );
+
+    let mut miss_a = make_ctx("GET", "/api/items");
+    let mut miss_headers = HashMap::new();
+    assert!(matches!(
+        instance_a
+            .before_proxy(&mut miss_a, &mut miss_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    // Instance B has not observed success yet — its entry remains.
+    let mut hit_b = make_ctx("GET", "/api/items");
+    let mut hit_headers = HashMap::new();
+    assert!(is_reject(
+        &instance_b.before_proxy(&mut hit_b, &mut hit_headers).await
+    ));
+
+    instance_b.observe_origin_http_response_status(&mut ctx, 204);
+    assert!(!ctx.metadata.contains_key(&key_b));
+    let mut miss_b = make_ctx("GET", "/api/items");
+    let mut miss_b_headers = HashMap::new();
+    assert!(matches!(
+        instance_b
+            .before_proxy(&mut miss_b, &mut miss_b_headers)
+            .await,
+        PluginResult::Continue
+    ));
+}
+
+/// Full lifecycle: observe via `run_after_proxy_hooks` then a later after_proxy
+/// pass must not double-apply (staging already consumed).
+#[tokio::test]
+async fn test_observe_then_after_proxy_does_not_double_invalidate() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let cache = Arc::new(default_plugin());
+
+    cache_response(&cache, "GET", "/api/items", 200, &HashMap::new(), b"once").await;
+
+    let mut ctx = make_ctx("POST", "/api/items");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        cache.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![cache.clone()];
+    let mut resp_headers = HashMap::new();
+    assert!(
+        !run_after_proxy_hooks_for_test(&plugins, &mut ctx, 200, &mut resp_headers).await,
+        "caching after_proxy must Continue"
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key(&staging_key(&cache, "cache_pending_invalidate_host"))
+    );
+
+    // Re-store and prove a second after_proxy without fresh staging is a no-op.
+    cache_response(&cache, "GET", "/api/items", 200, &HashMap::new(), b"again").await;
+    let mut resp_headers = HashMap::new();
+    cache.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    let mut hit_ctx = make_ctx("GET", "/api/items");
+    let mut hit_headers = HashMap::new();
+    let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
+    assert_eq!(body, b"again");
 }
