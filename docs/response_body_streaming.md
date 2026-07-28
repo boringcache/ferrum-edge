@@ -427,7 +427,10 @@ at all and reports final body completion, byte counts, disconnects, and typed
 streaming errors from the terminal transaction summary instead. Its header-time
 refinement only ever downgrades buffer to stream, so no long-lived or
 unknown-length response is pinned onto the buffered path by enabling the
-debugger.
+debugger. On a retry-enabled proxy it applies the same screen through the
+after-headers retry opt-in, so a response it will not sample is released to
+stream there too; only the responses it actually captures stay buffered and
+mid-body retryable.
 
 Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 

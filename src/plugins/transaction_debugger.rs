@@ -32,7 +32,19 @@
 //!   WebSocket upgrades, chunked/unknown-length, encoded, oversized, and binary
 //!   traffic keep streaming exactly as they do with capture disabled. They also
 //!   return `false` when the `transaction_debug` DEBUG target is not enabled,
-//!   because no capture record could be emitted for the buffered bytes.
+//!   because no capture record could be emitted for the buffered bytes. On a
+//!   retry-enabled proxy the same screen runs through
+//!   `should_release_response_body_under_retries`, so a response the debugger
+//!   will not sample is released after headers instead of being held for the
+//!   retry window.
+//!
+//! One behavior does change while response capture is enabled: on the buffered
+//! HTTP/3 path the proxy drops backend-controlled response trailers for any
+//! response a body-processing plugin chain handled (issue #2941), and this
+//! debugger joins that chain when `log_response_body` is on. That is inherent to
+//! the shared two-tier gate, not specific to capture eligibility, and is one
+//! more reason capture is a troubleshooting opt-in rather than a production
+//! default.
 //! * **Captured after normalization/transformation.** The request sample is
 //!   taken in `on_final_request_body` (backend-visible bytes, after every
 //!   request transform) and the response sample in `on_final_response_body`
@@ -680,6 +692,53 @@ impl TransactionDebugger {
         (out, dropped)
     }
 
+    /// Shared implementation of both final request-body hooks.
+    ///
+    /// `ctx`, when the proxy supplies it, is the authoritative source of the
+    /// request method and path. The hook header map is the backend-visible one
+    /// and carries `:method` / `:path` only on the gRPC and H3 body-transform
+    /// paths, so it is the fallback rather than the primary source.
+    fn capture_final_request_body(
+        &self,
+        ctx: Option<&RequestContext>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.log_request_body
+            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
+        {
+            return PluginResult::Continue;
+        }
+        let decision = self.request_body_capture_decision(headers);
+        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
+            let method = ctx
+                .map(|hook_ctx| hook_ctx.method.as_str())
+                .or_else(|| header_value(headers, ":method"))
+                .unwrap_or("-");
+            let path = ctx
+                .map(|hook_ctx| hook_ctx.path.as_str())
+                .or_else(|| header_value(headers, ":path"))
+                .unwrap_or("-");
+            // `Content-Length` admitted this message, but the backend-visible
+            // body is what actually gets walked. A stale/lying header or a
+            // transform that grew the body must not widen the capture ceiling,
+            // so fail closed before any UTF-8 scan, parse, or allocation.
+            if body.len() > max_bytes {
+                self.emit_body_capture(
+                    "request",
+                    method,
+                    path,
+                    BodyCaptureDecision::Skip("over_capture_limit"),
+                    None,
+                );
+                return PluginResult::Continue;
+            }
+            let sample = self.render_captured_body(body, kind, max_bytes);
+            self.emit_body_capture("request", method, path, decision, Some(&sample));
+        }
+        PluginResult::Continue
+    }
+
     /// Emit one capture record for a direction. `decision` describes what the
     /// buffering predicates concluded; `captured` is present only when the body
     /// was actually available.
@@ -749,7 +808,8 @@ impl Plugin for TransactionDebugger {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        capture_output_enabled()
+        self.log_request_body
+            && capture_output_enabled()
             && self
                 .request_body_capture_decision(&ctx.headers)
                 .is_capture()
@@ -785,6 +845,35 @@ impl Plugin for TransactionDebugger {
                 .is_capture()
     }
 
+    /// A retry-enabled proxy keeps every response buffered unless each active
+    /// buffering plugin explicitly opts a concrete response out once headers
+    /// arrive. Without this pair the retry path would never consult
+    /// [`Plugin::should_buffer_response_body_for_content_type`], so enabling
+    /// `log_response_body` would pin SSE and every other long-lived,
+    /// unknown-length, or encoded response onto the buffered path — exactly what
+    /// the capture design promises never to do.
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.should_buffer_response_body(ctx)
+    }
+
+    /// Release, after headers, every response this debugger will not sample.
+    ///
+    /// The capture screen is complete from the response headers alone, so the
+    /// only responses kept buffered — and therefore still mid-body retryable —
+    /// are the small, identity-encoded, known-length textual ones that are
+    /// actually going to be captured.
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && !self
+                .response_body_capture_decision(response_headers)
+                .is_capture()
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -809,33 +898,26 @@ impl Plugin for TransactionDebugger {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.log_request_body
-            || !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG)
-        {
-            return PluginResult::Continue;
-        }
-        let decision = self.request_body_capture_decision(headers);
-        if let BodyCaptureDecision::Capture { kind, max_bytes } = decision {
-            let method = header_value(headers, ":method").unwrap_or("-");
-            let path = header_value(headers, ":path").unwrap_or("-");
-            // `Content-Length` admitted this message, but the backend-visible
-            // body is what actually gets walked. A stale/lying header or a
-            // transform that grew the body must not widen the capture ceiling,
-            // so fail closed before any UTF-8 scan, parse, or allocation.
-            if body.len() > max_bytes {
-                self.emit_body_capture(
-                    "request",
-                    method,
-                    path,
-                    BodyCaptureDecision::Skip("over_capture_limit"),
-                    None,
-                );
-                return PluginResult::Continue;
-            }
-            let sample = self.render_captured_body(body, kind, max_bytes);
-            self.emit_body_capture("request", method, path, decision, Some(&sample));
-        }
-        PluginResult::Continue
+        self.capture_final_request_body(None, headers, body)
+    }
+
+    /// The hook-visible header map is the backend-visible one; only the gRPC
+    /// and H3 body-transform paths synthesize `:path` / `:method` into it. The
+    /// context carries both unconditionally, so opting in here is what keeps a
+    /// request capture record correlatable with its request on H1/H2. Gated on
+    /// the capture switch so a disabled debugger never asks the proxy to build
+    /// the hook context clone.
+    fn needs_final_request_body_context(&self) -> bool {
+        self.log_request_body
+    }
+
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        self.capture_final_request_body(Some(ctx), headers, body)
     }
 
     async fn after_proxy(

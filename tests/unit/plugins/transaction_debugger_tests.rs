@@ -1555,3 +1555,107 @@ fn test_reload_style_reconfiguration_changes_capture_behavior() {
     assert!(!before.requires_request_body_buffering());
     assert!(after.requires_request_body_buffering());
 }
+
+#[test]
+fn test_retry_enabled_proxies_release_responses_the_debugger_will_not_sample() {
+    // A retry-enabled proxy keeps every response buffered unless each active
+    // buffering plugin opts a concrete response out after headers arrive. The
+    // debugger must apply the same capture screen there, or enabling
+    // `log_response_body` would pin SSE and every other long-lived,
+    // unknown-length, or encoded response onto the buffered path.
+    let plugin = capture_plugin();
+    let ctx = make_ctx();
+
+    with_debug_target(|| {
+        assert!(
+            plugin.may_release_response_body_under_retries(&ctx),
+            "the debugger must participate in the after-headers retry opt-in"
+        );
+
+        // Server-sent events: released, never held for the retry window.
+        let mut sse = HashMap::new();
+        sse.insert("content-type".to_string(), "text/event-stream".to_string());
+        assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &sse));
+
+        // Unknown length (chunked), non-identity encoding, oversized, and
+        // non-textual responses are all released for the same reason.
+        let mut chunked = HashMap::new();
+        chunked.insert("content-type".to_string(), "application/json".to_string());
+        assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &chunked));
+
+        let mut encoded = body_headers("application/json", 32);
+        encoded.insert("content-encoding".to_string(), "gzip".to_string());
+        assert!(plugin.should_release_response_body_under_retries(&ctx, 200, &encoded));
+
+        assert!(plugin.should_release_response_body_under_retries(
+            &ctx,
+            200,
+            &body_headers("application/json", 4096),
+        ));
+        assert!(plugin.should_release_response_body_under_retries(
+            &ctx,
+            200,
+            &body_headers("application/octet-stream", 32),
+        ));
+
+        // A response that will actually be sampled stays buffered, so mid-body
+        // retry remains possible for it.
+        assert!(!plugin.should_release_response_body_under_retries(
+            &ctx,
+            200,
+            &body_headers("application/json", 32),
+        ));
+    });
+
+    // With capture disabled the plugin is not an active buffering plugin at
+    // all, so it never claims the retry opt-in.
+    let disabled = TransactionDebugger::new(&json!({})).unwrap();
+    with_debug_target(|| {
+        assert!(!disabled.may_release_response_body_under_retries(&ctx));
+        assert!(!disabled.should_release_response_body_under_retries(
+            &ctx,
+            200,
+            &body_headers("application/json", 32),
+        ));
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_request_capture_record_carries_method_and_path_from_context() {
+    // The backend-visible hook header map carries no `:method` / `:path`
+    // pseudo-headers on H1/H2, so without the hook context the record could
+    // only ever report `-` and would not be correlatable with its request.
+    let plugin = capture_plugin();
+    assert!(
+        plugin.needs_final_request_body_context(),
+        "capture must opt into the hook context to report method/path"
+    );
+    assert!(
+        !TransactionDebugger::new(&json!({}))
+            .unwrap()
+            .needs_final_request_body_context(),
+        "a disabled debugger must not ask the proxy to build a hook context"
+    );
+
+    let headers = body_headers("application/json", 24);
+    let body = br#"{"user":"alice"}"#;
+
+    let logs = capture_debug_logs(|| async {
+        let mut ctx = make_ctx();
+        let _ = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+    assert!(logs.contains("method=POST"), "got: {logs}");
+    assert!(logs.contains("path=/api/data"), "got: {logs}");
+
+    // The context-free hook still works and still emits a bounded record.
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.on_final_request_body(&headers, body).await;
+    })
+    .await;
+    assert!(logs.contains("capture=captured"), "got: {logs}");
+    assert!(logs.contains("alice"), "got: {logs}");
+}
