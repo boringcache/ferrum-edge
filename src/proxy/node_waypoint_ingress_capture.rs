@@ -66,11 +66,16 @@ const CAPTURE_BACKLOG: i32 = 1024;
 /// proxy must not report itself healthy.
 pub async fn start_listener(
     addr: SocketAddr,
-    state: Arc<ProxyState>,
+    state: ProxyState,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     started_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), anyhow::Error> {
     crate::modes::mesh::validate_ingress_capture_addr(addr).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Shared once for the lifetime of the listener, matching every other
+    // listener entry point: they take `ProxyState` by value and refcount it
+    // here so each accepted connection clones an `Arc`, not the struct.
+    let state = Arc::new(state);
 
     // `transparent = true` is passed only here. A transparent socket may bind
     // and source non-local addresses, so the capability stays scoped to the one
@@ -238,27 +243,25 @@ async fn handle_captured_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn only_a_wildcard_capture_address_is_accepted() {
         // `bpf_sk_assign` resolves the listener with a wildcard socket lookup,
         // so a specific-IP bind is invisible to the classifier and every
         // captured packet would be dropped fail-closed.
-        assert!(crate::modes::mesh::validate_ingress_capture_addr("0.0.0.0:15006".parse().unwrap())
-            .is_ok());
+        assert!(
+            crate::modes::mesh::validate_ingress_capture_addr("0.0.0.0:15006".parse().unwrap())
+                .is_ok()
+        );
         assert!(
             crate::modes::mesh::validate_ingress_capture_addr("[::]:15006".parse().unwrap())
                 .is_ok()
         );
-        let err = crate::modes::mesh::validate_ingress_capture_addr(
-            "10.0.0.5:15006".parse().unwrap(),
-        )
-        .unwrap_err();
-        assert!(err.contains("wildcard"), "{err}");
         let err =
-            crate::modes::mesh::validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap())
+            crate::modes::mesh::validate_ingress_capture_addr("10.0.0.5:15006".parse().unwrap())
                 .unwrap_err();
+        assert!(err.contains("wildcard"), "{err}");
+        let err = crate::modes::mesh::validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap())
+            .unwrap_err();
         assert!(err.contains("non-zero port"), "{err}");
     }
 }

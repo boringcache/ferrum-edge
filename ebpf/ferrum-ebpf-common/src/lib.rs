@@ -1557,20 +1557,16 @@ mod tests {
             ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(8080))
                 .is_steer()
         );
-        assert!(
-            !ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket::fully_in_scope(NODE_WAYPOINT_INGRESS_CAPTURE_PORT)
-            )
-            .is_steer()
-        );
-        assert!(
-            !ingress_redirect_action(
-                &config,
-                &IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT)
-            )
-            .is_steer()
-        );
+        assert!(!ingress_redirect_action(
+            &config,
+            &IngressRedirectPacket::fully_in_scope(NODE_WAYPOINT_INGRESS_CAPTURE_PORT)
+        )
+        .is_steer());
+        assert!(!ingress_redirect_action(
+            &config,
+            &IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT)
+        )
+        .is_steer());
     }
 
     #[test]

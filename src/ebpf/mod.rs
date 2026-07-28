@@ -232,6 +232,20 @@ pub struct CaptureContract {
     /// [`Self::validate_ingress_redirect`] rejects a configuration that
     /// collapses the two.
     pub ingress_capture_port: u16,
+    /// Whether the capture listener's bind address can accept IPv6.
+    ///
+    /// `bpf_sk_assign` resolves the listener with a wildcard socket lookup in
+    /// the packet's own address family, and the kernel never returns an
+    /// `AF_INET` socket for an IPv6 lookup. So a listener bound `0.0.0.0` (the
+    /// default) is invisible to the classifier's IPv6 path, and an in-scope
+    /// IPv6 packet would be **dropped** fail-closed rather than delivered. A
+    /// `[::]` bind is dual-stack (`bindv6only=0`) and covers both families.
+    ///
+    /// The node-agent therefore publishes IPv6 redirect scope only when this is
+    /// set; otherwise enrolled pods' IPv6 traffic stays out of scope entirely
+    /// and falls through to the pre-existing direct-pod guard, exactly as it
+    /// did before the redirect existed.
+    pub ingress_capture_supports_ipv6: bool,
 }
 
 impl CaptureContract {
@@ -327,6 +341,7 @@ impl CaptureContract {
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
             ingress_capture_port: 0,
+            ingress_capture_supports_ipv6: false,
         })
     }
 
@@ -342,6 +357,7 @@ impl CaptureContract {
             ingress_redirect_ifaces: Vec::new(),
             node_waypoint_ingress_redirect_mark: 0,
             ingress_capture_port: 0,
+            ingress_capture_supports_ipv6: false,
         }
     }
 

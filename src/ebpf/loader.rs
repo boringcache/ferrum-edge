@@ -1078,7 +1078,14 @@ mod live_kernel_tests {
 
             ip(&["netns", "add", &netns])?;
             ip(&[
-                "link", "add", &host_iface, "type", "veth", "peer", "name", &peer_iface,
+                "link",
+                "add",
+                &host_iface,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                &peer_iface,
             ])?;
             ip(&["link", "set", &peer_iface, "netns", &netns])?;
             ip(&[
@@ -1102,7 +1109,14 @@ mod live_kernel_tests {
                 &peer_iface,
             ])?;
             ip(&[
-                "netns", "exec", &netns, "ip", "link", "set", &peer_iface, "up",
+                "netns",
+                "exec",
+                &netns,
+                "ip",
+                "link",
+                "set",
+                &peer_iface,
+                "up",
             ])?;
             // Default route through the host, so a connection to the pod
             // address is sent to the host's MAC with the pod address intact —
@@ -1233,7 +1247,9 @@ mod live_kernel_tests {
                 continue;
             }
             if let Err(e) = ip(&argv) {
-                skip_or_fail(format!("could not install the redirect local-delivery routing: {e}"));
+                skip_or_fail(format!(
+                    "could not install the redirect local-delivery routing: {e}"
+                ));
                 return;
             }
         }
@@ -1364,8 +1380,7 @@ mod live_kernel_tests {
         // With the classifier gone the same dial has nowhere to go: nothing is
         // listening on the pod address and this host has no route to it, so the
         // client gets no reply. A leftover classifier would still capture it.
-        let post_detach_script =
-            format!("exec 3<>/dev/tcp/{POD_ADDR}/{APP_PORT}; head -c 4 <&3");
+        let post_detach_script = format!("exec 3<>/dev/tcp/{POD_ADDR}/{APP_PORT}; head -c 4 <&3");
         let post_detach_stdout = env
             .exec(&["timeout", "3", "bash", "-c", post_detach_script.as_str()])
             .unwrap_or_default();

@@ -245,8 +245,10 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // Marked when the entry demands it (NodeWaypoint capture relay): the dial
     // leaves the host netns and must be recognized as an authorized relay dial
     // by the pod-veth guard, and as already-relayed by the ingress redirect.
-    let connect =
-        crate::socket_opts::connect_with_socket_opts_and_mark(entry.backend_addr, entry.socket_mark);
+    let connect = crate::socket_opts::connect_with_socket_opts_and_mark(
+        entry.backend_addr,
+        entry.socket_mark,
+    );
     let backend_stream = if proxy.backend_connect_timeout_ms == 0 {
         connect.await
     } else {
@@ -412,8 +414,10 @@ async fn relay_to_loopback(
     // Marked when the entry demands it (NodeWaypoint capture relay): the dial
     // leaves the host netns and must be recognized as an authorized relay dial
     // by the pod-veth guard, and as already-relayed by the ingress redirect.
-    let connect =
-        crate::socket_opts::connect_with_socket_opts_and_mark(entry.backend_addr, entry.socket_mark);
+    let connect = crate::socket_opts::connect_with_socket_opts_and_mark(
+        entry.backend_addr,
+        entry.socket_mark,
+    );
     let backend_stream = if proxy.backend_connect_timeout_ms == 0 {
         connect.await
     } else {

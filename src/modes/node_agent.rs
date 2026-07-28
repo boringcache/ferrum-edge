@@ -316,6 +316,20 @@ impl NodeAgentConfig {
             let capture_addr = crate::modes::mesh::node_waypoint_ingress_capture_addr()?;
             crate::modes::mesh::validate_ingress_capture_addr(capture_addr)?;
             capture_contract.ingress_capture_port = capture_addr.port();
+            // `0.0.0.0` binds an AF_INET socket, and the kernel never returns
+            // an AF_INET socket for an IPv6 wildcard lookup — so the
+            // classifier's IPv6 path could not resolve it and would drop every
+            // in-scope IPv6 packet fail-closed. Only a `[::]` bind is
+            // dual-stack, so IPv6 scope is published only for that case.
+            capture_contract.ingress_capture_supports_ipv6 = capture_addr.is_ipv6();
+            if !capture_contract.ingress_capture_supports_ipv6 {
+                info!(
+                    %capture_addr,
+                    "The NodeWaypoint inbound capture listener is bound IPv4-only; enrolled pods' \
+                     IPv6 inbound traffic is left un-redirected and keeps its existing direct-pod \
+                     behavior. Bind FERRUM_MESH_INBOUND_LISTEN_ADDR to [::] to redirect IPv6 too."
+                );
+            }
         }
         // Fail closed on the whole port contract before anything is attached.
         capture_contract.validate_ingress_redirect()?;
@@ -4540,7 +4554,14 @@ fn handle_pod_added_inner(
                 if let Some(ip) = pod_ip {
                     scope_result = backend.update_pod_inbound_ports(ip, redirect_ports);
                 }
+                // IPv6 scope is published only when the capture listener can
+                // actually accept IPv6 (a `[::]` bind). Under an IPv4-only
+                // `0.0.0.0` bind the classifier's v6 wildcard lookup can never
+                // resolve the listener, so an in-scope v6 packet would be
+                // dropped fail-closed; leaving v6 out of scope keeps it on the
+                // pre-existing direct-pod guard instead.
                 if scope_result.is_ok()
+                    && config.capture_contract.ingress_capture_supports_ipv6
                     && let Some(ip) = pod_ip6
                 {
                     scope_result = backend.update_pod_inbound_ports6(ip, redirect_ports);
@@ -4867,7 +4888,13 @@ fn reconcile_existing_pod_ip6(
         return PodIpReconcileResult::default();
     }
 
-    let redirect_ports = state.inbound_redirect_ports.clone();
+    // Gated on the capture listener's family for the same reason enrollment is:
+    // an IPv4-only bind is invisible to the classifier's IPv6 wildcard lookup.
+    let redirect_ports = if config.capture_contract.ingress_capture_supports_ipv6 {
+        state.inbound_redirect_ports.clone()
+    } else {
+        Vec::new()
+    };
     if !redirect_ports.is_empty()
         && let Err(e) = backend.update_pod_inbound_ports6(new_ip, &redirect_ports)
     {
@@ -6907,6 +6934,7 @@ mod tests {
             pod_ip: Some(pod_ip.to_string()),
             pod_source_ips: PodSourceIps::default(),
             node_probe_ports: Vec::new(),
+            inbound_redirect_ports: Vec::new(),
             pod_pid: None,
         }
     }
@@ -8272,6 +8300,7 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
             &failed_cleanup_state,
@@ -8392,6 +8421,7 @@ mod tests {
                 pod_ip: Some(ip.to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
             &failed_cleanup_state,
@@ -8769,6 +8799,7 @@ mod tests {
                 pod_ip: Some("10.0.0.13".to_string()),
                 pod_source_ips: PodSourceIps::default(),
                 node_probe_ports: Vec::new(),
+                inbound_redirect_ports: Vec::new(),
                 pod_pid: None,
             },
         );

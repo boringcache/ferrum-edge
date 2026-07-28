@@ -23060,9 +23060,7 @@ mod tests {
 
                 let capture = plan
                     .iter()
-                    .find(|listener| {
-                        listener.kind == MeshListenerKind::TransparentInboundCapture
-                    })
+                    .find(|listener| listener.kind == MeshListenerKind::TransparentInboundCapture)
                     .expect("the transparent inbound capture listener must be planned");
                 assert_eq!(capture.direction, MeshTrafficDirection::Inbound);
                 assert_ne!(
@@ -23109,11 +23107,9 @@ mod tests {
                 let runtime =
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
                 assert!(
-                    !runtime
-                        .listener_plan()
-                        .iter()
-                        .any(|listener| listener.kind
-                            == MeshListenerKind::TransparentInboundCapture)
+                    !runtime.listener_plan().iter().any(
+                        |listener| listener.kind == MeshListenerKind::TransparentInboundCapture
+                    )
                 );
             },
         );

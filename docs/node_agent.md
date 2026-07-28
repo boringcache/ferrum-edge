@@ -418,6 +418,16 @@ listener would attempt a mesh TLS handshake on application data and fail. The
 two listeners are separate protocol boundaries, and both ports are in the
 classifier's bypass set so neither is ever fed its own traffic.
 
+**The bind address decides which families are redirected.** `bpf_sk_assign`
+resolves the listener with a wildcard socket lookup in the packet's own address
+family, and the kernel never returns an `AF_INET` socket for an IPv6 lookup. A
+`0.0.0.0` bind (the default) is therefore invisible to the classifier's IPv6
+path, so the node-agent publishes **IPv4 redirect scope only** in that case and
+logs which families it armed at startup; enrolled pods' IPv6 inbound traffic
+keeps its existing direct-pod behavior rather than being dropped fail-closed.
+Bind `FERRUM_MESH_INBOUND_LISTEN_ADDR` to `[::]:15006` — dual-stack under the
+default `bindv6only=0` — to redirect both families.
+
 The capture listener terminates nothing. It:
 
 1. recovers the original destination from `getsockname()` (there is no NAT to
