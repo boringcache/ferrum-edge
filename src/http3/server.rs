@@ -11100,14 +11100,8 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
         }
     };
     sanitize_client_response_headers_for_wire(&mut headers, framing);
-    send_h3_pre_sanitized_reject_response_with_recv_halt(
-        stream,
-        status,
-        body,
-        &headers,
-        halt_recv,
-    )
-    .await
+    send_h3_pre_sanitized_reject_response_with_recv_halt(stream, status, body, &headers, halt_recv)
+        .await
 }
 
 /// Send an already protocol-sanitized reject. Callers that must strip

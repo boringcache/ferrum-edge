@@ -3151,12 +3151,8 @@ fn test_normalized_reject_builder_strips_failed_websocket_content_length_only() 
     assert!(ordinary.get(http::header::UPGRADE).is_none());
     assert!(ordinary.get(http::header::CONNECTION).is_none());
 
-    let failed_ws = build_normalized_reject_wire_headers_for_test(
-        StatusCode::FORBIDDEN,
-        body,
-        headers,
-        true,
-    );
+    let failed_ws =
+        build_normalized_reject_wire_headers_for_test(StatusCode::FORBIDDEN, body, headers, true);
     assert!(
         failed_ws.get(http::header::CONTENT_LENGTH).is_none(),
         "failed WebSocket rejects must strip Content-Length after ExactBody repair"

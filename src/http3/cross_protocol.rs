@@ -6743,9 +6743,7 @@ where
     // Final protocol-aware strip after after_proxy: connection-specific fields
     // are malformed on HTTP/3 (RFC 9114 §4.2). Clone only when sanitization is
     // needed so the common clean map stays allocation-free on this path.
-    let framing = ClientResponseFraming::Streaming {
-        status,
-    };
+    let framing = ClientResponseFraming::Streaming { status };
     let mut owned_headers;
     let headers =
         if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing) {

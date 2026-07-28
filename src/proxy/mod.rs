@@ -16742,9 +16742,7 @@ pub(crate) fn build_response_from_normalized_reject(
     // prepare_synthetic, trailers-only gRPC, 204/205/304) must not gain an
     // invented Content-Length: 0.
     let framing = if is_grpc_error || reject.body.is_empty() {
-        headers_mod::ClientResponseFraming::Streaming {
-            status,
-        }
+        headers_mod::ClientResponseFraming::Streaming { status }
     } else {
         headers_mod::ClientResponseFraming::ExactBody {
             status,
