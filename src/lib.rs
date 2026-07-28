@@ -3771,15 +3771,26 @@ pub mod _test_support {
         headers: &std::collections::HashMap<String, String>,
         native_grpc: bool,
     ) -> (
-        crate::proxy::NormalizedRejectResponse,
+        NormalizedRejectResponse,
         Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
     ) {
-        crate::http3::cross_protocol::normalize_reject_for_client_for_test(
-            ctx,
-            status,
-            body,
-            headers,
-            native_grpc,
+        let (normalized, grpc_web_error) =
+            crate::http3::cross_protocol::normalize_reject_for_client_for_test(
+                ctx,
+                status,
+                body,
+                headers,
+                native_grpc,
+            );
+        (
+            NormalizedRejectResponse {
+                http_status: normalized.http_status,
+                headers: normalized.headers,
+                body: normalized.body,
+                grpc_status: normalized.grpc_status,
+                grpc_message: normalized.grpc_message,
+            },
+            grpc_web_error,
         )
     }
 

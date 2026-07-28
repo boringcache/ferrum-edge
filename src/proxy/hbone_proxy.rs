@@ -1635,7 +1635,6 @@ mod tests {
     use crate::retry::ErrorClass;
     use std::collections::HashMap;
 
-    use bytes::Bytes;
     use std::time::Instant;
 
     fn minimal_proxy() -> Proxy {
