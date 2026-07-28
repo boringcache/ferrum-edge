@@ -486,7 +486,7 @@ impl Plugin for RequestTransformer {
                 HeaderOp::Add => {
                     if let Some(ref val) = rule.value {
                         headers.entry(rule.key.clone()).or_insert_with(|| {
-                            debug!("request_transformer: added header {}={}", rule.key, val);
+                            debug!("request_transformer: added header {}", rule.key);
                             val.clone()
                         });
                     }
@@ -494,7 +494,7 @@ impl Plugin for RequestTransformer {
                 HeaderOp::Update => {
                     if let Some(ref val) = rule.value {
                         headers.insert(rule.key.clone(), val.clone());
-                        debug!("request_transformer: set header {}={}", rule.key, val);
+                        debug!("request_transformer: set header {}", rule.key);
                     }
                 }
                 HeaderOp::Remove => {

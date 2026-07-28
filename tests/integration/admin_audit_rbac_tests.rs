@@ -1414,3 +1414,260 @@ async fn rejected_batch_mutation_writes_no_audit_event() {
         "a fully rejected batch must not write a batch_create audit event: {audit_body:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Remaining observability sinks — advisory GHSA-8594-2xhc-8g38
+//
+// `http_logging`, `ai_transcript_audit`, and `api_chargeback_sink` accept
+// endpoints whose path/query can carry a reusable credential. Non-admin reads
+// and every audit projection must render only the structurally redacted form.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_logging_config_projections_redact_endpoint_and_headers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+    let operator = token("mesh-operator", Some("operator"));
+
+    let path_secret = "http-logging-sumo-path-canary";
+    let query_secret = "http-logging-mezmo-query-canary";
+    let header_secret = "http-logging-header-canary";
+    let endpoint = format!(
+        "https://endpoint1.collection.us1.sumologic.com/receiver/v1/http/{path_secret}?apikey={query_secret}"
+    );
+    let plugin = json!({
+        "id": "http-logging-redaction-config",
+        "plugin_name": "http_logging",
+        "scope": "global",
+        "config": {
+            "endpoint_url": endpoint,
+            "custom_headers": { "X-Sumo-Category": header_secret }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(status, 201, "http_logging plugin create failed: {body:?}");
+    assert_eq!(body["config"]["endpoint_url"], endpoint);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=http-logging-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_http_logging_projection_redacted(audit_config);
+
+    let mut projections = vec![audit_config.clone()];
+    for bearer in [&viewer, &operator] {
+        let (status, projected) = get_json(
+            &base,
+            "/plugins/config/http-logging-redaction-config",
+            bearer,
+        )
+        .await;
+        assert_eq!(status, 200, "projected read failed: {projected:?}");
+        assert_http_logging_projection_redacted(&projected["config"]);
+        projections.push(projected["config"].clone());
+    }
+
+    // The admin (raw) read is deliberately unredacted — an operator with the
+    // admin role must still be able to read back what they configured.
+    let (status, raw) = get_json(
+        &base,
+        "/plugins/config/http-logging-redaction-config",
+        &admin,
+    )
+    .await;
+    assert_eq!(status, 200, "admin raw read failed: {raw:?}");
+    assert_eq!(raw["config"]["endpoint_url"], endpoint);
+
+    for projection in &projections {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, header_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "http_logging projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_http_logging_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["endpoint_url"],
+        "https://endpoint1.collection.us1.sumologic.com/redacted"
+    );
+    assert_eq!(config["custom_headers"]["X-Sumo-Category"], "[REDACTED]");
+}
+
+#[tokio::test]
+async fn ai_transcript_audit_config_projections_redact_sink_endpoint_and_headers() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let path_secret = "transcript-path-canary";
+    let query_secret = "transcript-query-canary";
+    let header_secret = "transcript-header-canary";
+    let endpoint = format!("https://audit.example.com/ingest/{path_secret}?apikey={query_secret}");
+    let plugin = json!({
+        "id": "transcript-redaction-config",
+        "plugin_name": "ai_transcript_audit",
+        "scope": "global",
+        "config": {
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "custom_headers": { "X-Audit-Token": header_secret }
+            }
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(
+        status, 201,
+        "ai_transcript_audit plugin create failed: {body:?}"
+    );
+    assert_eq!(body["config"]["sink"]["endpoint_url"], endpoint);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=transcript-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_transcript_projection_redacted(audit_config);
+
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/transcript-redaction-config",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer read failed: {projected:?}");
+    assert_transcript_projection_redacted(&projected["config"]);
+
+    for projection in [audit_config, &projected["config"]] {
+        let serialized = projection.to_string();
+        for secret in [path_secret, query_secret, header_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "ai_transcript_audit projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_transcript_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["sink"]["endpoint_url"],
+        "https://audit.example.com/redacted"
+    );
+    assert_eq!(
+        config["sink"]["custom_headers"]["X-Audit-Token"],
+        "[REDACTED]"
+    );
+}
+
+#[tokio::test]
+async fn api_chargeback_sink_config_projections_redact_clickhouse_endpoint_and_params() {
+    let tmp = TempDir::new().unwrap();
+    let state = admin_state(make_store(&tmp).await);
+    let (base, _shutdown) = start_admin(state).await;
+    let admin = token("security-admin", Some("admin"));
+    let viewer = token("view-only", Some("viewer"));
+
+    let path_secret = "chargeback-path-canary";
+    let param_secret = "chargeback-param-value-canary";
+    let spool_dir = tmp.path().join("chargeback-spool");
+    std::fs::create_dir_all(&spool_dir).unwrap();
+    let clickhouse_url = format!("https://clickhouse.example.com:8443/{path_secret}");
+    let plugin = json!({
+        "id": "chargeback-redaction-config",
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "config": {
+            "mode": "per_event",
+            "clickhouse": {
+                "url": clickhouse_url,
+                "database": "ferrum",
+                "table": "charges_raw",
+                "timeout_ms": 1000,
+                "insert_query_params": { "async_insert": param_secret }
+            },
+            "batch": {"size": 2, "flush_interval_ms": 60000, "buffer_capacity": 10},
+            "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+            "spool": {
+                "enabled": true,
+                "dir": spool_dir.to_string_lossy(),
+                "max_bytes": 1048576,
+                "replay_interval_secs": 3600,
+                "compression": "none"
+            },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+            "bandwidth_pricing": {"price_per_byte_sent": 0.000001, "price_per_byte_received": 0.000002},
+            "stream_connection_pricing": {"price_per_connection": 0.1},
+            "pricing_version": "test-v1",
+            "currency": "USD"
+        }
+    });
+
+    let (status, body) = post_json(&base, "/plugins/config", &admin, &plugin).await;
+    assert_eq!(
+        status, 201,
+        "api_chargeback_sink plugin create failed: {body:?}"
+    );
+    assert_eq!(body["config"]["clickhouse"]["url"], clickhouse_url);
+
+    let audit_body = wait_for_audit_total(
+        &base,
+        "/audit?resource_type=plugin_config&resource_id=chargeback-redaction-config",
+        &admin,
+        1,
+    )
+    .await;
+    let audit_config =
+        &audit_body["items"].as_array().expect("audit items")[0]["diff"]["after"]["config"];
+    assert_chargeback_projection_redacted(audit_config);
+
+    let (status, projected) = get_json(
+        &base,
+        "/plugins/config/chargeback-redaction-config",
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, 200, "viewer read failed: {projected:?}");
+    assert_chargeback_projection_redacted(&projected["config"]);
+
+    for projection in [audit_config, &projected["config"]] {
+        let serialized = projection.to_string();
+        for secret in [path_secret, param_secret] {
+            assert!(
+                !serialized.contains(secret),
+                "api_chargeback_sink projection leaked {secret}: {serialized}"
+            );
+        }
+    }
+}
+
+fn assert_chargeback_projection_redacted(config: &Value) {
+    assert_eq!(
+        config["clickhouse"]["url"],
+        "https://clickhouse.example.com:8443/redacted"
+    );
+    assert_eq!(
+        config["clickhouse"]["insert_query_params"]["async_insert"],
+        "[REDACTED]"
+    );
+}

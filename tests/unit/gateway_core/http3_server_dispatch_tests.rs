@@ -1805,3 +1805,70 @@ fn the_trailer_reconciliation_exempts_no_field_name() {
         "governance stays the union of declaration, fail-closed arm, and observed mutation"
     );
 }
+
+/// GHSA-484w-rxg2-7jg5: an HTTP/3 request stream is served by a detached task
+/// that owns the stream, its `RequestGuard`, and the plugin snapshot. If a
+/// fault-injection delay cannot observe the client leaving, a peer that opens
+/// streams and immediately closes the QUIC connection multiplies short-lived
+/// clients into long-lived server-side retention.
+#[test]
+fn h3_stamps_a_connection_close_watch_so_injected_delays_cannot_outlive_the_peer() {
+    let src = include_str!("../../../src/http3/server.rs");
+
+    // The watch is connection-scoped and built exactly once per connection,
+    // before the accept loop, so each stream costs one `Arc` bump.
+    let watch = src
+        .find("struct QuicPeerConnectionWatch {")
+        .expect("HTTP/3 must define a QUIC peer-connection watch");
+    let watch_tail = &src[watch..];
+    let watch_end = watch_tail
+        .find("/// Handle a single HTTP/3 request stream.")
+        .expect("the watch must sit immediately before handle_h3_request");
+    let watch_body = &watch_tail[..watch_end];
+    assert!(
+        watch_body.contains("self.connection.closed().await"),
+        "the watch must observe QUIC connection close"
+    );
+    assert!(
+        watch_body.contains("self.connection.close_reason().is_some()"),
+        "the watch must offer a non-blocking already-closed check"
+    );
+    // Ownership guard: the watch must never touch the request stream. Reading
+    // or polling it from a detached watcher would race the proxy path for
+    // request bytes and could mask a stream-accounting failure.
+    for forbidden in [
+        "recv_data",
+        "poll_recv_data",
+        "recv_trailers",
+        "stop_sending",
+        "stop_stream",
+    ] {
+        assert!(
+            !watch_body.contains(forbidden),
+            "the peer watch must not touch the request stream ({forbidden})"
+        );
+    }
+
+    let construction = src
+        .find("PeerConnectionSignal::new(")
+        .expect("the connection loop must build the peer-connection signal");
+    let accept_loop = src
+        .find("let is_early_data = identity.is_early_data;")
+        .expect("per-stream identity snapshot must remain in the accept loop");
+    assert!(
+        construction < accept_loop,
+        "the watch must be built once per connection, not once per stream"
+    );
+
+    let handler = src
+        .find("async fn handle_h3_request(")
+        .expect("handle_h3_request must exist");
+    assert!(
+        src[handler..].contains("peer_connection: crate::plugins::PeerConnectionSignal"),
+        "each request stream must receive the connection-close watch"
+    );
+    assert!(
+        src[handler..].contains("ctx.peer_connection = Some(peer_connection);"),
+        "the watch must reach the plugin pipeline through the request context"
+    );
+}

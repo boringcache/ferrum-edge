@@ -12341,7 +12341,16 @@ components:
       properties:
         endpoint_url:
           type: string
-          description: URL to POST transaction logs to
+          description: >-
+            URL to POST transaction logs to. Must be http:// or https:// with a
+            hostname or IP address; userinfo credentials
+            (https://user:pass@host) are rejected — authenticate with
+            custom_headers. Some collectors require a credential in the URL
+            (Sumo Logic path token, Mezmo apikey query parameter), so this value
+            is never rendered in operational output: egress-denial, DNS/TLS,
+            retry, slow-call, and batch-failure diagnostics show only a
+            structurally redacted scheme://host:port/redacted form, and the
+            admin audit projection redacts it the same way.
         custom_headers:
           type: object
           additionalProperties:
@@ -18946,10 +18955,15 @@ components:
 
     RequestMirrorConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: request_mirror — Duplicates live proxy traffic to a secondary
         destination for shadow testing, validation, or migration checks
-        without affecting client responses. Mirrored requests are
+        without affecting client responses. Only the properties below are
+        admitted; unknown top-level keys are rejected so misspelled sampling,
+        body, protocol, or endpoint controls cannot silently fall back to
+        security-sensitive defaults (cleartext http, 100% mirroring, body
+        mirroring enabled). Mirrored requests are
         fire-and-forget: spawned via `tokio::spawn`, the gateway never waits
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
@@ -20014,7 +20028,7 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form, and the admin audit projection redacts it the same way."
             allow_insecure_loopback:
               type: boolean
               default: false
@@ -22531,6 +22545,17 @@ components:
                 `async_insert` is enabled and the wait setting is omitted, the
                 sink pins `wait_for_async_insert=1` rather than inheriting the
                 ClickHouse user/profile default.
+
+                Credential-bearing parameter names are rejected: the exact names
+                `user`, `password`, `access_token`, and `session_id`, plus any
+                name containing `apikey`, `api_key`, `credential`, `passwd`,
+                `secret`, or `token`. Authenticate with `username` and
+                `password_ref`, which are sent as an HTTP Basic header rather
+                than appended to the INSERT URL. Parameter values stay arbitrary
+                bounded strings, so the sink never renders the INSERT query
+                string in any diagnostic; failures report a structurally
+                redacted `scheme://host:port/redacted` endpoint. Admin audit
+                projections redact every value in this map.
             allow_lossy_async_insert:
               type: boolean
               default: false
@@ -24051,13 +24076,17 @@ components:
             - UnsupportedExternalRef
             - SchemaReference
             - SchemaTooDeep
+            - SchemaReferenceCycle
+            - SchemaTooLarge
           description: |
             Machine-readable error discriminant.
 
             **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
-            - `InvalidJson` — body is not valid JSON
-            - `InvalidYaml` — body is not valid YAML
+            - `InvalidJson` — body is not valid JSON, or the parsed JSON document exceeds the
+              500,000-node source-tree ceiling
+            - `InvalidYaml` — body is not valid YAML, uses anchors/aliases, or the parsed YAML
+              document exceeds the same 500,000-node source-tree ceiling
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
             - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
@@ -24073,6 +24102,13 @@ components:
             - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
             - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
+            - `SchemaReferenceCycle` — a local `$ref` chain re-enters a target that is still being
+              expanded (self-cycle, mutual cycle, or a longer ref loop). Rejected immediately on
+              re-entry rather than after exhausting the depth limit; `details` carries the chain of
+              `$ref` literals that closed the cycle
+            - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
+              per-document materialized-node / byte budget, or the generated operation table
+              exceeded the generated-config byte ceiling
         details:
           type: string
           description: |
