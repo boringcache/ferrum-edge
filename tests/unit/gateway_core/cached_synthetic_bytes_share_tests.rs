@@ -30,7 +30,11 @@ fn binary_headers() -> HashMap<String, String> {
 async fn reject_normalization_shares_cached_bytes_without_copy() {
     let cached = large_cached_body();
     let cached_ptr = cached.as_ptr() as usize;
-    let mut ctx = RequestContext::new("203.0.113.10".to_string(), "GET".to_string(), "/specz".into());
+    let mut ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/specz".into(),
+    );
     let rejection = PluginResult::RejectBinary {
         status_code: 200,
         body: cached.clone(),
@@ -64,15 +68,20 @@ async fn concurrent_cached_hits_share_one_retained_allocation() {
     for _ in 0..8 {
         let body = cached.clone();
         joins.push(tokio::spawn(async move {
-            let mut ctx =
-                RequestContext::new("203.0.113.10".to_string(), "GET".to_string(), "/cached".into());
+            let mut ctx = RequestContext::new(
+                "203.0.113.10".to_string(),
+                "GET".to_string(),
+                "/cached".into(),
+            );
             let rejection = PluginResult::RejectBinary {
                 status_code: 200,
                 body,
                 headers: binary_headers(),
             };
             let finalized = finalize_plugin_rejection_without_committed_hooks_for_test(
-                &[], &mut ctx, rejection,
+                &[],
+                &mut ctx,
+                rejection,
             )
             .await;
             match finalized {
@@ -144,7 +153,11 @@ async fn transform_composition_copies_only_on_write() {
 #[tokio::test]
 async fn head_no_body_finalization_drops_shared_body_bytes() {
     let cached = large_cached_body();
-    let mut ctx = RequestContext::new("203.0.113.10".to_string(), "HEAD".to_string(), "/specz".into());
+    let mut ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "HEAD".to_string(),
+        "/specz".into(),
+    );
     let mut status = 200u16;
     let mut headers = binary_headers();
     headers.insert("content-length".to_string(), cached.len().to_string());
@@ -163,7 +176,11 @@ async fn head_no_body_finalization_drops_shared_body_bytes() {
 #[tokio::test]
 async fn status_204_no_body_finalization_strips_length_and_bytes() {
     let cached = large_cached_body();
-    let mut ctx = RequestContext::new("203.0.113.10".to_string(), "GET".to_string(), "/empty".into());
+    let mut ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/empty".into(),
+    );
     let mut status = 204u16;
     let mut headers = binary_headers();
     headers.insert("content-length".to_string(), cached.len().to_string());
@@ -252,10 +269,7 @@ fn cached_producers_return_reject_binary_bytes_clones() {
         ),
         (
             include_str!("../../../src/plugins/request_deduplication.rs"),
-            &[
-                "PluginResult::RejectBinary {",
-                "body: cached.body.clone()",
-            ][..],
+            &["PluginResult::RejectBinary {", "body: cached.body.clone()"][..],
         ),
         (
             include_str!("../../../src/plugins/ai_semantic_cache.rs"),
@@ -290,8 +304,11 @@ async fn slow_client_retains_shared_handle_while_peers_replay() {
 
     // Simulate a slow recipient holding its response Bytes while other hits
     // continue to share the same retained allocation.
-    let mut slow_ctx =
-        RequestContext::new("203.0.113.10".to_string(), "GET".to_string(), "/slow".into());
+    let mut slow_ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/slow".into(),
+    );
     let slow = finalize_plugin_rejection_without_committed_hooks_for_test(
         &[],
         &mut slow_ctx,
@@ -311,8 +328,11 @@ async fn slow_client_retains_shared_handle_while_peers_replay() {
     assert_eq!(slow_body.as_ptr() as usize, cached_ptr);
 
     for _ in 0..4 {
-        let mut ctx =
-            RequestContext::new("203.0.113.11".to_string(), "GET".to_string(), "/peer".into());
+        let mut ctx = RequestContext::new(
+            "203.0.113.11".to_string(),
+            "GET".to_string(),
+            "/peer".into(),
+        );
         let peer = finalize_plugin_rejection_without_committed_hooks_for_test(
             &[],
             &mut ctx,

@@ -6835,12 +6835,8 @@ fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
-    let normalized = crate::proxy::normalize_reject_response(
-        status,
-        body,
-        headers,
-        native_grpc || grpc_web,
-    );
+    let normalized =
+        crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
@@ -6864,10 +6860,10 @@ fn normalize_reject_for_client(
     (normalized, translated)
 }
 
-fn reject_committed_response_view(
-    normalized: &crate::proxy::NormalizedRejectResponse,
-    translated: Option<&crate::plugins::grpc_web::GrpcWebErrorResponse>,
-) -> (u16, &HashMap<String, String>, Bytes) {
+fn reject_committed_response_view<'a>(
+    normalized: &'a crate::proxy::NormalizedRejectResponse,
+    translated: Option<&'a crate::plugins::grpc_web::GrpcWebErrorResponse>,
+) -> (u16, &'a HashMap<String, String>, Bytes) {
     if let Some(translated) = translated {
         (
             StatusCode::OK.as_u16(),

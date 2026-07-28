@@ -12233,8 +12233,8 @@ fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_st
 
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
-    use bytes::Bytes;
     use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn completed_pre_policy_upload_returns_without_timeout() {

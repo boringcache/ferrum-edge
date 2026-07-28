@@ -22,7 +22,11 @@ fn binary_headers() -> HashMap<String, String> {
 fn h3_normalize_reject_for_client_shares_cached_bytes_without_copy() {
     let cached = large_cached_body();
     let cached_ptr = cached.as_ptr() as usize;
-    let mut ctx = RequestContext::new("203.0.113.10".to_string(), "GET".to_string(), "/cached".into());
+    let mut ctx = RequestContext::new(
+        "203.0.113.10".to_string(),
+        "GET".to_string(),
+        "/cached".into(),
+    );
     let (normalized, _) = h3_normalize_reject_for_client_for_test(
         &mut ctx,
         StatusCode::OK,
