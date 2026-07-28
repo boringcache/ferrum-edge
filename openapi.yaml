@@ -19061,9 +19061,15 @@ components:
             Aggregate retained request-body budget for in-flight mirrors on this
             plugin instance. Charged at pre-buffer admission (declared
             Content-Length clamped to max_mirrored_request_body_bytes, or that
-            ceiling when the length is not declared) and reconciled to the
-            observed body length; exhaustion drops the new mirror attempt
-            without affecting the primary request. Default is 64 MiB.
+            whole ceiling when no Content-Length is declared) and reconciled to
+            the observed body length, returning any surplus. The reservation is
+            fail-closed and method-independent: HTTP/2 and HTTP/3 requests may
+            carry DATA without declaring framing headers, so a header-only GET,
+            HEAD, or OPTIONS reserves the ceiling too. Size this against
+            max_in_flight times max_mirrored_request_body_bytes when mirroring
+            mostly-bodyless traffic at high concurrency. Exhaustion drops the
+            new mirror attempt without affecting the primary request. Default is
+            64 MiB.
         max_mirrored_request_body_bytes:
           type: integer
           format: uint64

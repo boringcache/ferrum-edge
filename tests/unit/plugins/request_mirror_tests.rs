@@ -4718,50 +4718,145 @@ fn advisory_max_mirrored_request_body_bytes_is_documented_everywhere() {
 }
 
 #[tokio::test]
-async fn advisory_bodyless_request_reserves_no_retained_bytes() {
+async fn advisory_undeclared_request_reserves_the_ceiling_regardless_of_method() {
+    // Fail-closed reservation: HTTP/2 and HTTP/3 requests may carry DATA frames
+    // with neither `Content-Length` nor `Transfer-Encoding`, so method plus
+    // missing framing headers is NOT evidence that no mirror bytes will be
+    // buffered. Every admitted request without a declared length must therefore
+    // charge the whole plugin-local ceiling BEFORE body collection, so the
+    // aggregate budget really bounds concurrent transient prebuffers.
     let plugin = advisory_plugin(json!({
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
-        "max_retained_request_body_bytes": 65536,
-        "max_mirrored_request_body_bytes": 65536
+        "max_in_flight": 64,
+        "max_retained_request_body_bytes": 4096,
+        "max_mirrored_request_body_bytes": 1024
     }));
 
-    // A GET with no declared framing can never retain mirror bytes, so
-    // admission must not charge the ceiling and starve mirror coverage for
-    // ordinary read traffic.
+    // Header-only GET / HEAD / OPTIONS contexts, including H2/H3-shaped ones
+    // that carry only an `:authority` pseudo-header. Four ceilings exactly fill
+    // the aggregate budget; every later request must be refused at admission,
+    // i.e. before it can allocate anything.
     let mut live = Vec::new();
-    for _ in 0..8 {
+    let mut admitted = 0usize;
+    for index in 0..16 {
         let mut ctx = advisory_ctx(None);
-        ctx.method = "GET".to_string();
-        plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+        ctx.method = ["GET", "HEAD", "OPTIONS"][index % 3].to_string();
+        if index % 2 == 0 {
+            // H2/H3 shape: pseudo-authority instead of Host, no framing headers
+            // at all — exactly the case that can still stream DATA frames.
+            ctx.headers
+                .insert(":authority".to_string(), "mirror.local".to_string());
+        }
         assert!(
-            plugin.should_buffer_request_body(&ctx),
-            "a body-less GET must still be admissible for mirroring"
+            !ctx.headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")),
+            "the scenario models a request that declares no body framing at all"
         );
+        plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+        if plugin.should_buffer_request_body(&ctx) {
+            admitted += 1;
+        }
         live.push(ctx);
     }
     assert_eq!(
-        request_mirror_retained_request_body_bytes_for_test(&plugin),
-        0,
-        "a body-less request must reserve nothing"
+        admitted, 4,
+        "undeclared requests must be bounded by the aggregate reservation no matter their method"
     );
-
-    // A GET that declares chunked framing is treated as an unknown-length body.
-    let mut chunked = advisory_ctx(None);
-    chunked.method = "GET".to_string();
-    chunked
-        .headers
-        .insert("transfer-encoding".to_string(), "chunked".to_string());
-    plugin_utils::assert_continue(plugin.authorize(&mut chunked).await);
     assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
-        65536
+        4096,
+        "each undeclared admission reserves the full per-request ceiling up front"
     );
-    drop(chunked);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).budget_drops,
+        12,
+        "refused undeclared requests are attributable budget drops, not silent allocations"
+    );
+
     drop(live);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0,
+        "every reservation must release exactly once"
+    );
+
+    // A declared `Content-Length: 0` is authoritative framing, so it reserves
+    // nothing and cannot starve mirror coverage for genuinely bodyless traffic.
+    let mut declared_zero = advisory_ctx(Some(0));
+    declared_zero.method = "GET".to_string();
+    plugin_utils::assert_continue(plugin.authorize(&mut declared_zero).await);
+    assert!(plugin.should_buffer_request_body(&declared_zero));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0,
+        "a declared zero-length body reserves nothing"
+    );
+
+    // A declared bounded length reserves exactly that length.
+    let mut declared_bounded = advisory_ctx(Some(256));
+    plugin_utils::assert_continue(plugin.authorize(&mut declared_bounded).await);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        256
+    );
+    drop(declared_bounded);
+    drop(declared_zero);
     assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
         0
     );
+}
+
+#[tokio::test]
+async fn advisory_undeclared_request_with_no_body_reconciles_the_ceiling_back_to_zero() {
+    // The cost of the fail-closed reservation is transient: a header-only
+    // undeclared GET briefly holds the ceiling and `before_proxy` returns the
+    // whole surplus once the observed length (zero) is known.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "127.0.0.1",
+        "mirror_port": 9,
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_retained_request_body_bytes": 65536,
+        "max_mirrored_request_body_bytes": 65536,
+        "mirror_timeout_ms": 1
+    }));
+
+    let mut ctx = advisory_ctx(None);
+    ctx.method = "GET".to_string();
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        65536,
+        "an undeclared GET reserves the ceiling before the body is collected"
+    );
+
+    // No body materialized: reconciliation observes zero bytes.
+    assert!(ctx.request_body_bytes.is_none());
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        1,
+        "reconciliation must not turn a bodyless mirror into a drop"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0,
+        "zero observed bytes must reconcile the entire ceiling back to the budget"
+    );
+
+    let _ = ctx.collect_mirror_result().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while request_mirror_retained_request_body_bytes_for_test(&plugin) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the detached task must release its lease exactly once");
 }

@@ -128,10 +128,16 @@
 //!    sampling: it keeps streaming and is not mirrored, rather than truncating
 //!    the shadow payload or turning shadow policy into a client-visible `413`.
 //!    Otherwise admission reserves the declared `Content-Length` clamped to the
-//!    ceiling, the whole ceiling when a body is possible but its length is not
-//!    declared, and nothing when the method and framing say the request carries
-//!    no body; `before_proxy` then reconciles the reservation to the observed
-//!    length.
+//!    ceiling, and the whole ceiling for every request that does not declare
+//!    one. That reservation is fail-closed and method-independent: HTTP/2 and
+//!    HTTP/3 may carry DATA with neither `Content-Length` nor
+//!    `Transfer-Encoding`, so a header-only `GET`/`HEAD`/`OPTIONS` is charged
+//!    the ceiling too rather than being assumed bodyless. `before_proxy` then
+//!    reconciles the reservation to the observed length, returning the surplus
+//!    (down to `0` for an empty body) to the aggregate budget. The tradeoff:
+//!    mirroring mostly-bodyless traffic at high concurrency wants
+//!    `max_retained_request_body_bytes` sized against `max_in_flight ×
+//!    max_mirrored_request_body_bytes`, or a lower ceiling.
 //!    An undeclared (chunked) body larger than the ceiling is still rejected by
 //!    the combined request-body limit — raise `max_mirrored_request_body_bytes`
 //!    when mirroring routes that accept larger streamed uploads.
@@ -168,7 +174,7 @@
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed; bytes are discarded after sizing so keep-alive pools can reclaim the socket. |
 //! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
-//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. |
+//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read: the declared `Content-Length` clamped to the per-request ceiling, otherwise the whole ceiling) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. Size against `max_in_flight × max_mirrored_request_body_bytes` when mirroring undeclared traffic at high concurrency. |
 //! | `max_mirrored_request_body_bytes` | u64 | `10485760` (10 MiB) | Positive plugin-local ceiling on one mirrored request body, applied even when the global request-body limit is unlimited (`0`). Must not exceed `max_retained_request_body_bytes`. Applies only to requests this instance admitted. |
 //! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
@@ -902,27 +908,6 @@ async fn drain_mirror_response_body(
     }
 }
 
-/// Whether a header is present on the request, before or after materialization.
-fn request_has_header(ctx: &RequestContext, name: &str) -> bool {
-    ctx.raw_header_value_bytes(name).next().is_some()
-        || ctx
-            .headers
-            .keys()
-            .any(|header| header.eq_ignore_ascii_case(name))
-}
-
-/// Method/framing classification of whether this request can carry a body.
-///
-/// Mirrors `crate::proxy::request_may_have_body` so pre-buffer admission and
-/// the gateway's own empty-body fast path agree on which requests can never
-/// retain mirror bytes.
-fn request_may_carry_body(ctx: &RequestContext) -> bool {
-    if !matches!(ctx.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
-        return true;
-    }
-    request_has_header(ctx, "content-length") || request_has_header(ctx, "transfer-encoding")
-}
-
 /// Declared request body length, read before the body exists.
 ///
 /// Prefers the raw wire headers (no map materialization required) and falls
@@ -1293,27 +1278,35 @@ impl RequestMirror {
 
     /// Bytes to reserve from the aggregate budget before the body is read.
     ///
-    /// A declared `Content-Length` is the exact retained size for HTTP/1.1 and
-    /// HTTP/2 (both enforce the declared framing), so reserving it keeps the
-    /// budget's effective concurrency honest for ordinary uploads. Chunked and
-    /// otherwise undeclared bodies reserve the plugin-local ceiling, which is
-    /// the most this request can be allowed to retain.
+    /// Fail-closed (advisory `GHSA-jv66-mq44-m9v3`): reservation is a function
+    /// of the *declared* framing only, never of the request method.
     ///
-    /// A request whose method and framing say it carries no body reserves
-    /// nothing — charging the ceiling there would throttle mirror coverage of
-    /// ordinary `GET`/`HEAD`/`OPTIONS` traffic for memory that can never be
-    /// retained. The residual case (an HTTP/2 or HTTP/3 `GET` that streams DATA
-    /// without declaring framing) is still charged at reconcile time in
-    /// `before_proxy`: it cannot retain bytes the budget does not cover, and
-    /// its transient buffer stays bounded by the plugin-local ceiling and by
-    /// `max_in_flight`.
-    fn reserved_body_bytes(&self, ctx: &RequestContext, declared_length: Option<u64>) -> u64 {
+    /// A declared `Content-Length` is the exact retained size for HTTP/1.1 and
+    /// HTTP/2 (both enforce the declared framing), so reserving it clamped to
+    /// the plugin-local ceiling keeps the budget's effective concurrency honest
+    /// for ordinary uploads — including a declared `0`, which reserves nothing.
+    ///
+    /// Every other admitted request reserves the whole plugin-local ceiling,
+    /// which is the most it can be allowed to retain. That deliberately
+    /// includes header-only `GET`/`HEAD`/`OPTIONS` requests that declare
+    /// neither `Content-Length` nor `Transfer-Encoding`: HTTP/2 and HTTP/3 can
+    /// carry DATA frames with no framing headers at all (the H1/H2 collector's
+    /// empty fast path is guarded by `Body::is_end_stream()` for exactly that
+    /// reason, and H3 drains DATA independently of those headers), so method
+    /// plus missing headers is not evidence that no bytes will be buffered.
+    /// Inferring "bodyless" here would let many concurrent undeclared requests
+    /// each allocate up to the ceiling before `before_proxy` could charge them,
+    /// which is the aggregate bound this budget exists to enforce.
+    ///
+    /// The tradeoff is accepted and bounded: a header-only undeclared request
+    /// briefly holds the ceiling, and `before_proxy` reconciliation returns the
+    /// surplus (down to `0` for an empty body) as soon as the observed length
+    /// is known. Operators mirroring mostly-bodyless traffic at high
+    /// concurrency should size `max_retained_request_body_bytes` against
+    /// `max_in_flight × max_mirrored_request_body_bytes`, or lower the ceiling.
+    fn reserved_body_bytes(&self, declared_length: Option<u64>) -> u64 {
         let ceiling = self.max_mirrored_request_body_bytes;
-        match declared_length {
-            Some(declared) => declared.min(ceiling),
-            None if !request_may_carry_body(ctx) => 0,
-            None => ceiling,
-        }
+        declared_length.map_or(ceiling, |declared| declared.min(ceiling))
     }
 
     /// Snapshot of the per-instance mirror lifecycle counters for external
@@ -1755,7 +1748,7 @@ impl Plugin for RequestMirror {
             match self.mirror_in_flight.clone().try_acquire_owned() {
                 Ok(permit) => match self
                     .body_budget
-                    .try_reserve(self.reserved_body_bytes(ctx, declared_length))
+                    .try_reserve(self.reserved_body_bytes(declared_length))
                 {
                     Some(lease) => MirrorAdmissionState::Admitted { permit, lease },
                     None => {
