@@ -716,9 +716,7 @@ fn repeated_large_values_cannot_blow_past_subject_and_body_ceilings() {
     assert!(subject.ends_with("..."), "{subject}");
     assert!(std::str::from_utf8(subject.as_bytes()).is_ok());
 
-    let body = channel
-        .render_body(&note, &extras)
-        .expect("body renders");
+    let body = channel.render_body(&note, &extras).expect("body renders");
     assert!(
         body.len() <= 32 * 1024,
         "repeated body values must not exceed the body ceiling: {}",
@@ -746,7 +744,10 @@ fn exact_limit_and_limit_plus_one_keep_utf8_and_visible_markers() {
         .render_subject(&exact, &no_extras())
         .expect("exact subject");
     assert_eq!(subject.len(), 512);
-    assert!(!subject.ends_with("..."), "exact fit must not mark truncation");
+    assert!(
+        !subject.ends_with("..."),
+        "exact fit must not mark truncation"
+    );
     assert!(subject.is_char_boundary(subject.len()));
 
     // One byte over: marker replaces the tail on a UTF-8 boundary.

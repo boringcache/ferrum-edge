@@ -534,12 +534,8 @@ impl EmailChannel {
         extras: &HashMap<String, String>,
     ) -> Result<String, String> {
         let vars = self.template_vars(notification, extras);
-        let rendered = render_template_bounded(
-            &self.body_template,
-            &vars,
-            MAX_BODY_BYTES,
-            "\n[truncated]",
-        )?;
+        let rendered =
+            render_template_bounded(&self.body_template, &vars, MAX_BODY_BYTES, "\n[truncated]")?;
         Ok(truncate_utf8(
             &sanitize_body_text(&rendered),
             MAX_BODY_BYTES,
