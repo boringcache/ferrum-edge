@@ -128,7 +128,11 @@ fn email_channel_parses_through_the_common_channel_map_with_defaults() {
     assert_eq!(channel.tls_server_name(), "smtp.example.com");
     assert_eq!(channel.from(), "ferrum@example.com");
     assert_eq!(channel.recipients().len(), 2);
-    assert_eq!(channel.helo_name(), "example.com", "defaults to from-domain");
+    assert_eq!(
+        channel.helo_name(),
+        "example.com",
+        "defaults to from-domain"
+    );
     assert!(!channel.has_credentials());
     assert_eq!(channel.subject_template(), "[${severity}] ${title}");
     assert_eq!(channel.body_template(), "${body}\n\n${fields}");
@@ -379,19 +383,43 @@ fn host_port_timeout_and_template_bounds_are_explicit() {
             json!({"smtp_host": "https://smtp.example.com"}),
             "without scheme",
         ),
-        (json!({"smtp_host": "smtp.example.com:587"}), "must not include brackets or a port"),
+        (
+            json!({"smtp_host": "smtp.example.com:587"}),
+            "must not include brackets or a port",
+        ),
         (json!({"smtp_port": 0}), "between 1 and 65535"),
         (json!({"smtp_port": 70000}), "between 1 and 65535"),
-        (json!({"connect_timeout_ms": 10}), "must be between 100 and 60000 ms"),
-        (json!({"connect_timeout_ms": 60001}), "must be between 100 and 60000 ms"),
-        (json!({"command_timeout_ms": 0}), "must be between 100 and 120000 ms"),
-        (json!({"command_timeout_ms": 120001}), "must be between 100 and 120000 ms"),
+        (
+            json!({"connect_timeout_ms": 10}),
+            "must be between 100 and 60000 ms",
+        ),
+        (
+            json!({"connect_timeout_ms": 60001}),
+            "must be between 100 and 60000 ms",
+        ),
+        (
+            json!({"command_timeout_ms": 0}),
+            "must be between 100 and 120000 ms",
+        ),
+        (
+            json!({"command_timeout_ms": 120001}),
+            "must be between 100 and 120000 ms",
+        ),
         (json!({"subject_template": "${unbalanced"}), "unbalanced"),
         (json!({"body_template": "${unbalanced"}), "unbalanced"),
         (json!({"subject_template": ""}), "must not be empty"),
-        (json!({"helo_name": "not a hostname"}), "invalid 'helo_name'"),
-        (json!({"tls_server_name": ""}), "'tls_server_name' must not be empty"),
-        (json!({"tls_server_name": "not a name"}), "invalid TLS server name"),
+        (
+            json!({"helo_name": "not a hostname"}),
+            "invalid 'helo_name'",
+        ),
+        (
+            json!({"tls_server_name": ""}),
+            "'tls_server_name' must not be empty",
+        ),
+        (
+            json!({"tls_server_name": "not a name"}),
+            "invalid TLS server name",
+        ),
     ] {
         let mut base = json!({
             "type": "email",
@@ -457,7 +485,10 @@ fn templates_reuse_notification_variables_and_caller_extras() {
     let body = channel
         .render_body(&notification(EventAction::Trigger), &extras)
         .expect("body renders");
-    assert!(body.contains("5/100 requests matched [503] over 60s"), "{body}");
+    assert!(
+        body.contains("5/100 requests matched [503] over 60s"),
+        "{body}"
+    );
     assert!(body.contains("ns=ferrum action=trigger"), "{body}");
     assert!(body.contains("Rule: proxy_5xx"), "{body}");
     assert!(body.contains("Observed: 5.00%"), "{body}");
@@ -532,7 +563,10 @@ fn message_carries_the_expected_headers_and_a_decodable_body() {
             headers.contains("Content-Transfer-Encoding: base64"),
             "{headers}"
         );
-        assert!(headers.contains("Auto-Submitted: auto-generated"), "{headers}");
+        assert!(
+            headers.contains("Auto-Submitted: auto-generated"),
+            "{headers}"
+        );
         assert!(
             headers.contains("X-Ferrum-Notification-Severity: high"),
             "{headers}"
@@ -541,9 +575,13 @@ fn message_carries_the_expected_headers_and_a_decodable_body() {
             headers.contains(&format!("X-Ferrum-Notification-Event-Action: {expected}")),
             "{headers}"
         );
-        assert!(headers.contains("Subject: [high] [ALERT] proxy_5xx"), "{headers}");
         assert!(
-            !rendered.contains('\n') || rendered.matches('\n').count() == rendered.matches("\r\n").count(),
+            headers.contains("Subject: [high] [ALERT] proxy_5xx"),
+            "{headers}"
+        );
+        assert!(
+            !rendered.contains('\n')
+                || rendered.matches('\n').count() == rendered.matches("\r\n").count(),
             "every LF must be part of a CRLF pair"
         );
 
@@ -718,7 +756,9 @@ fn tls_materials(san: &str) -> (NamedTempFile, TlsAcceptor) {
 
     let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("leaf key");
     let leaf_params = CertificateParams::new(vec![san.to_string()]).expect("leaf params");
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).expect("signed leaf");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("signed leaf");
 
     let mut ca_file = NamedTempFile::new().expect("ca bundle file");
     ca_file
@@ -870,7 +910,9 @@ where
 /// relay starts in cleartext and upgrades on STARTTLS.
 async fn spawn_smtp_fixture(script: SmtpScript, implicit: bool, san: &str) -> SmtpFixture {
     let (ca_path, acceptor) = tls_materials(san);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fixture");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture");
     let addr = listener.local_addr().expect("fixture addr");
     let transcript: Transcript = Arc::new(Mutex::new(Vec::new()));
     let body = Arc::new(Mutex::new(String::new()));
@@ -925,7 +967,10 @@ async fn starttls_delivery_authenticates_only_inside_tls() {
     })));
 
     channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect("STARTTLS delivery succeeds");
 
@@ -969,7 +1014,10 @@ async fn implicit_tls_delivery_succeeds_with_auth_login() {
     })));
 
     channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect("implicit TLS delivery succeeds");
 
@@ -1028,12 +1076,18 @@ async fn missing_starttls_advertisement_fails_closed() {
         "password": SMTP_PASSWORD
     })));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("must refuse to continue in cleartext");
 
     assert!(error.contains("did not advertise STARTTLS"), "{error}");
-    assert!(!fixture.saw("AUTH"), "credentials must not leave the process");
+    assert!(
+        !fixture.saw("AUTH"),
+        "credentials must not leave the process"
+    );
     assert!(!fixture.saw("MAIL FROM"), "no cleartext envelope");
     fixture.handle.abort();
 }
@@ -1048,7 +1102,10 @@ async fn tls_handshake_failure_is_reported_without_downgrading() {
     })));
 
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("verification must fail");
 
@@ -1086,7 +1143,10 @@ async fn authentication_failure_is_sanitized() {
         "password": SMTP_PASSWORD
     })));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("auth failure must surface");
 
@@ -1099,7 +1159,10 @@ async fn authentication_failure_is_sanitized() {
         !error.contains("credentials invalid"),
         "server text leaked: {error}"
     );
-    assert!(!fixture.saw("MAIL FROM"), "envelope must not follow a failed AUTH");
+    assert!(
+        !fixture.saw("MAIL FROM"),
+        "envelope must not follow a failed AUTH"
+    );
     fixture.handle.abort();
 }
 
@@ -1114,7 +1177,10 @@ async fn missing_auth_mechanism_fails_closed_when_credentials_are_configured() {
         "password": SMTP_PASSWORD
     })));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("no mechanism must fail");
 
@@ -1131,12 +1197,18 @@ async fn rejected_recipient_and_rejected_message_are_reported_by_code_only() {
     let channel = parse_email(fixture.channel_def(json!({})));
 
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("rejected recipient must fail the send");
     assert!(error.contains("550"), "{error}");
     assert!(error.contains("RCPT TO"), "{error}");
-    assert!(!error.contains("no such user"), "server text leaked: {error}");
+    assert!(
+        !error.contains("no such user"),
+        "server text leaked: {error}"
+    );
     fixture.handle.abort();
 
     let mut script = SmtpScript::starttls_default();
@@ -1144,7 +1216,10 @@ async fn rejected_recipient_and_rejected_message_are_reported_by_code_only() {
     let fixture = spawn_smtp_fixture(script, false, "localhost").await;
     let channel = parse_email(fixture.channel_def(json!({})));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("rejected message must fail the send");
     assert!(error.contains("554"), "{error}");
@@ -1160,7 +1235,10 @@ async fn oversized_and_malformed_replies_fail_closed() {
     let fixture = spawn_smtp_fixture(script, false, "localhost").await;
     let channel = parse_email(fixture.channel_def(json!({})));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("oversized reply must fail");
     assert!(error.contains("response bounds"), "{error}");
@@ -1174,7 +1252,10 @@ async fn oversized_and_malformed_replies_fail_closed() {
     let fixture = spawn_smtp_fixture(script, false, "localhost").await;
     let channel = parse_email(fixture.channel_def(json!({})));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("reply-line flood must fail");
     assert!(error.contains("response bounds"), "{error}");
@@ -1186,7 +1267,10 @@ async fn oversized_and_malformed_replies_fail_closed() {
     let fixture = spawn_smtp_fixture(script, false, "localhost").await;
     let channel = parse_email(fixture.channel_def(json!({})));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("malformed reply must fail");
     assert!(error.contains("malformed SMTP reply"), "{error}");
@@ -1202,7 +1286,10 @@ async fn oversized_and_malformed_replies_fail_closed() {
     let fixture = spawn_smtp_fixture(script, false, "localhost").await;
     let channel = parse_email(fixture.channel_def(json!({})));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("inconsistent codes must fail");
     assert!(error.contains("malformed SMTP reply"), "{error}");
@@ -1221,7 +1308,10 @@ async fn multiline_greeting_and_ehlo_are_accepted() {
     let channel = parse_email(fixture.channel_def(json!({})));
 
     channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect("multiline replies are legal SMTP");
     assert!(fixture.saw("DATA"));
@@ -1239,11 +1329,17 @@ async fn a_reply_that_echoes_credential_material_aborts_the_session() {
         "password": SMTP_PASSWORD
     })));
     let error = channel
-        .dispatch(&notification(EventAction::Trigger), &client_with_ca(fixture.ca_path()))
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
         .await
         .expect_err("credential-reflecting reply must abort");
 
-    assert!(error.contains("echoed configured credential material"), "{error}");
+    assert!(
+        error.contains("echoed configured credential material"),
+        "{error}"
+    );
     assert!(!error.contains(SMTP_PASSWORD), "{error}");
     fixture.handle.abort();
 }
@@ -1269,7 +1365,10 @@ async fn command_timeout_bounds_a_silent_relay() {
         )
         .await
         .expect_err("a silent relay must time out");
-    assert!(error.contains("timed out during server greeting"), "{error}");
+    assert!(
+        error.contains("timed out during server greeting"),
+        "{error}"
+    );
     handle.abort();
 }
 

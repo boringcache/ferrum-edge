@@ -262,7 +262,8 @@ impl EmailChannel {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("channel '{name}' (email): 'smtp_host' is required"))?;
-        let socket_host = parse_socket_host(&format!("channel '{name}' (email)"), "smtp_host", raw_host)?;
+        let socket_host =
+            parse_socket_host(&format!("channel '{name}' (email)"), "smtp_host", raw_host)?;
 
         let tls_mode = match value.get("tls_mode") {
             Some(v) => {
@@ -345,10 +346,9 @@ impl EmailChannel {
             .to_string();
         validate_email_address(&from, "from", name)?;
 
-        let to_values = value
-            .get("to")
-            .and_then(Value::as_array)
-            .ok_or_else(|| format!("channel '{name}' (email): 'to' is required and must be an array of addresses"))?;
+        let to_values = value.get("to").and_then(Value::as_array).ok_or_else(|| {
+            format!("channel '{name}' (email): 'to' is required and must be an array of addresses")
+        })?;
         if to_values.is_empty() {
             return Err(format!(
                 "channel '{name}' (email): 'to' must contain at least one recipient"
@@ -661,7 +661,9 @@ impl EmailChannel {
                 let established = TlsEstablished;
                 let mut conn = SmtpConn::new(tls, self.command_timeout, guard);
                 conn.read_greeting().await?;
-                let result = self.deliver_authenticated(&mut conn, message, established).await;
+                let result = self
+                    .deliver_authenticated(&mut conn, message, established)
+                    .await;
                 conn.quit().await;
                 result
             }
@@ -690,7 +692,9 @@ impl EmailChannel {
                 .map_err(|_| SmtpFailure::TlsHandshake)?;
                 let established = TlsEstablished;
                 let mut conn = SmtpConn::new(tls, self.command_timeout, guard);
-                let result = self.deliver_authenticated(&mut conn, message, established).await;
+                let result = self
+                    .deliver_authenticated(&mut conn, message, established)
+                    .await;
                 conn.quit().await;
                 result
             }
@@ -768,8 +772,10 @@ fn build_client_config(
 ) -> Result<Arc<rustls::ClientConfig>, SmtpFailure> {
     let root_store = match ca_bundle_path.as_deref() {
         Some(path) => {
-            let source =
-                crate::tls::source::CertSource::parse(path, crate::tls::source::MaterialKind::CaBundle);
+            let source = crate::tls::source::CertSource::parse(
+                path,
+                crate::tls::source::MaterialKind::CaBundle,
+            );
             let material = crate::tls::source::load_material_blocking(
                 &source,
                 crate::tls::source::MaterialKind::CaBundle,
@@ -887,7 +893,11 @@ impl fmt::Display for SmtpFailure {
             Self::Timeout(phase) => write!(f, "timed out during {}", phase.as_str()),
             Self::Io(phase) => write!(f, "failed: I/O error during {}", phase.as_str()),
             Self::ClosedEarly(phase) => {
-                write!(f, "failed: server closed the connection during {}", phase.as_str())
+                write!(
+                    f,
+                    "failed: server closed the connection during {}",
+                    phase.as_str()
+                )
             }
             Self::MalformedReply(phase) => {
                 write!(f, "failed: malformed SMTP reply during {}", phase.as_str())
@@ -942,7 +952,9 @@ impl CredentialGuard {
     }
 
     fn reflects(&self, text: &str) -> bool {
-        self.needles.iter().any(|needle| text.contains(needle.as_str()))
+        self.needles
+            .iter()
+            .any(|needle| text.contains(needle.as_str()))
     }
 }
 
@@ -1027,12 +1039,8 @@ where
     ) -> Result<(), SmtpFailure> {
         if caps.auth_plain {
             let payload = plain_auth_payload(credentials);
-            self.command(
-                &format!("AUTH PLAIN {payload}"),
-                SmtpPhase::Auth,
-                &[235],
-            )
-            .await?;
+            self.command(&format!("AUTH PLAIN {payload}"), SmtpPhase::Auth, &[235])
+                .await?;
             return Ok(());
         }
         if caps.auth_login {
@@ -1207,7 +1215,10 @@ where
         // touching `stream` again, so the borrow of the peeked slice ends
         // before the `consume` call.
         let (complete, consumed) = {
-            let available = stream.fill_buf().await.map_err(|_| SmtpFailure::Io(phase))?;
+            let available = stream
+                .fill_buf()
+                .await
+                .map_err(|_| SmtpFailure::Io(phase))?;
             if available.is_empty() {
                 return Err(SmtpFailure::ClosedEarly(phase));
             }
@@ -1471,11 +1482,7 @@ fn bounded_timeout_ms(
 
 /// Credentials must survive an SMTP command line intact. CR/LF or other control
 /// bytes would let a crafted secret inject commands after the `AUTH` line.
-fn validate_credential_component(
-    raw: &str,
-    field: &str,
-    channel: &str,
-) -> Result<(), String> {
+fn validate_credential_component(raw: &str, field: &str, channel: &str) -> Result<(), String> {
     if raw.chars().any(char::is_control) {
         return Err(format!(
             "channel '{channel}' (email): resolved '{field}' must not contain control characters"
