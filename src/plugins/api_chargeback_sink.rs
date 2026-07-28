@@ -4326,11 +4326,13 @@ struct OwnedSpoolInventory {
 /// inventory/sort rather than rescanning after every deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QuotaEvictionReport {
-    /// How many times owned spool metadata was inventoried/sorted.
+    /// How many times owned spool metadata was inventoried/sorted. Greater than
+    /// one only when a selected candidate disappeared and the snapshot had to be
+    /// refreshed before an admission decision could be made.
     pub inventory_passes: u64,
-    /// Owned files present in that inventory snapshot.
+    /// Owned files observed, summed across every inventory pass.
     pub files_inventoried: u64,
-    /// Owned bytes observed before deletions.
+    /// Owned bytes observed by the first inventory pass, before any deletion.
     pub bytes_before: u64,
     /// Files successfully unlinked during the pass.
     pub files_deleted: u64,
@@ -5588,6 +5590,15 @@ impl SpoolManager {
                     inventory.stats.bytes = inventory.stats.bytes.saturating_add(len);
                     inventory.entries.push(OwnedSpoolEntry { path: file, len });
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A peer sharing the volume can unlink a listed file between
+                    // the walk and this stat. A path with no directory entry
+                    // occupies no quota bytes, so drop it from the snapshot
+                    // instead of failing the caller. The quota refresh loop
+                    // exists to survive exactly this race and cannot do so if
+                    // re-inventorying hard-errors on it.
+                    continue;
+                }
                 Err(error) => {
                     return Err(format!(
                         "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
@@ -5650,6 +5661,13 @@ impl SpoolManager {
             let mut remaining_bytes = inventory.stats.bytes;
             if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 return Ok(report);
+            }
+
+            // Test seam only: one uncontended slot read, taken after the early
+            // "already fits" return so the common admission path is untouched,
+            // and on a pass that has already paid for a full directory walk.
+            if let Some(hook) = snapshot_spool_write_hook_for_tests() {
+                hook(SpoolWriteHookPoint::QuotaInventoryTaken);
             }
 
             let wall_clock = SystemTime::now();
@@ -6847,11 +6865,16 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
 /// Observation points for the optional spool-write test seam.
 ///
 /// Used by external unit tests to inject deliberate stalls around
-/// [`SpoolManager::write_events`] without relying on wall-clock sleeps.
+/// [`SpoolManager::write_events`] without relying on wall-clock sleeps, and to
+/// mutate the spool tree at the exact instant a quota-eviction snapshot has been
+/// taken so the disappearing-candidate race is deterministic rather than timed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolWriteHookPoint {
     BeforeWrite,
     AfterWrite,
+    /// One quota-eviction inventory snapshot has been taken and the tree is over
+    /// the ceiling; deletions from that snapshot have not started yet.
+    QuotaInventoryTaken,
 }
 
 type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;

@@ -1525,6 +1525,188 @@ fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
     );
 }
 
+/// Lexicographically ordered owned data-file name for quota-eviction fixtures.
+fn planted_spool_name(index: u64) -> String {
+    owned_data_name(&format!("000000000000000000000000{index:02}"))
+}
+
+/// Clears the process-global spool write hook even if the test panics.
+struct ClearSpoolWriteHookGuard;
+
+impl Drop for ClearSpoolWriteHookGuard {
+    fn drop(&mut self) {
+        set_spool_write_hook_for_tests(None);
+    }
+}
+
+/// A peer sharing the volume removes a selected candidate and replaces it with
+/// files the stale snapshot never saw.
+///
+/// Crediting the vanished candidate's snapshot size would let admission stop
+/// early with the peer's replacement bytes unaccounted, leaving on-disk usage
+/// above `spool.max_bytes`. The eviction must instead refresh the inventory and
+/// keep reclaiming until the *observed* tree leaves room.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn quota_eviction_refreshes_inventory_when_a_candidate_disappears() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(planted_spool_name(index));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+    // Sort after every planted name, so the peer replacements are the newest
+    // entries and are only reclaimed after the originals.
+    let peers: Vec<_> = [50u64, 51u64]
+        .into_iter()
+        .map(|index| day.join(planted_spool_name(index)))
+        .collect();
+
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let vanishing = planted[0].clone();
+    let peers_for_hook = peers.clone();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        if calls_for_hook.fetch_add(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        // The first snapshot is already taken: unlink the oldest candidate and
+        // add two files that snapshot can never account for.
+        fs::remove_file(&vanishing).expect("peer removes the selected candidate");
+        for peer in &peers_for_hook {
+            fs::write(peer, vec![b'p'; file_len as usize]).expect("peer writes a replacement");
+        }
+    })));
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("eviction must refresh and succeed rather than fail closed");
+    set_spool_write_hook_for_tests(None);
+
+    assert_eq!(
+        report,
+        QuotaEvictionReport {
+            // One stale pass plus the refreshed pass that actually decides.
+            inventory_passes: 2,
+            // 10 in the stale snapshot, then 9 survivors + 2 peer replacements.
+            files_inventoried: 21,
+            bytes_before: file_len.saturating_mul(file_count),
+            // Only files this call actually unlinked; the vanished candidate is
+            // never counted as reclaimed work.
+            files_deleted: 9,
+            bytes_freed: file_len.saturating_mul(9),
+        },
+        "a disappearing candidate must force a refreshed inventory, not a stale byte credit"
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly the stale pass and the refreshed pass may plan deletions"
+    );
+    for path in &planted {
+        assert!(!path.exists(), "every original must be reclaimed or gone");
+    }
+    for peer in &peers {
+        assert!(
+            peer.exists(),
+            "newest peer replacements must be retained, not over-evicted"
+        );
+    }
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 2);
+    assert_eq!(after.bytes, file_len.saturating_mul(2));
+    assert_eq!(
+        after.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
+    // The load-bearing invariant: crediting the vanished candidate would have
+    // stopped eviction with 4 files (256 bytes) resident and admitted anyway.
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "admission must never leave on-disk owned usage above spool.max_bytes"
+    );
+}
+
+/// A namespace that keeps mutating under eviction must fail closed rather than
+/// admit on numbers no pass ever observed as consistent.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(planted_spool_name(index));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let planted_for_hook = planted.clone();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // Every pass loses its oldest candidate to a peer, so no pass ever gets
+        // to act on a snapshot that still describes the tree.
+        let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = planted_for_hook.get(call) {
+            fs::remove_file(path).expect("peer removes each pass's oldest candidate");
+        }
+    })));
+
+    let error = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect_err("a perpetually mutating namespace must refuse admission");
+    set_spool_write_hook_for_tests(None);
+
+    assert!(
+        error.contains("spool changed concurrently during 8 quota inventory passes"),
+        "refusal must name the bounded pass budget: {error}"
+    );
+    assert!(
+        error.contains("refusing to admit encoded batch (64 bytes)"),
+        "refusal must name the batch it declined: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        8,
+        "refresh must be bounded at 8 inventory passes, not unbounded"
+    );
+    // Eviction itself unlinked nothing: it broke to refresh on every pass and
+    // then declined, so the remaining files are exactly the untouched newest.
+    for path in planted.iter().skip(8) {
+        assert!(
+            path.exists(),
+            "fail-closed refusal must not delete beyond the vanished candidates"
+        );
+    }
+    assert_eq!(spool.scan_stats().unwrap().files, 2);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     let temp = tempfile::tempdir().unwrap();
@@ -3157,6 +3339,9 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
             *guard = true;
             cv.notify_all();
         }
+        // This test gates only the write boundary; quota-eviction snapshots are
+        // not part of the stall it asserts.
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
