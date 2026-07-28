@@ -7806,7 +7806,9 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
     assert_eq!(
         schema["properties"]["grpc"]["properties"]["methods"]["propertyNames"]["pattern"],
-        json!(r"^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$")
+        json!(
+            r"^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$"
+        )
     );
     for pointer in [
         "/properties/blocked_phrases/items/minLength",

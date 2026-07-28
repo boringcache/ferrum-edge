@@ -4185,7 +4185,7 @@ fn carrier_with_note(note: &str) -> Vec<u8> {
     let extension = pool.get_extension_by_name("ext.note").unwrap();
     let mut msg = DynamicMessage::new(descriptor);
     msg.set_field_by_name("base", Value::String("clean".into()));
-    msg.set_extension(extension, Value::String(note.to_string()));
+    msg.set_extension(&extension, Value::String(note.to_string()));
     msg.encode_to_vec()
 }
 
@@ -4210,7 +4210,7 @@ fn carrier_with_nested_unknown() -> Vec<u8> {
         "fixture must carry a nested unknown field"
     );
     let mut msg = DynamicMessage::new(descriptor);
-    msg.set_extension(extension, Value::Message(nested));
+    msg.set_extension(&extension, Value::Message(nested));
     msg.encode_to_vec()
 }
 

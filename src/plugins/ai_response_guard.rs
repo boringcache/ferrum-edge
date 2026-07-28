@@ -1749,9 +1749,14 @@ impl AiResponseGuard {
         }
         let encoding = grpc_message_encoding(response_headers);
         let max_bytes = grpc.max_message_bytes;
-        let frames =
-            parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages, self.max_scan_bytes)
-                .ok()?;
+        let frames = parse_grpc_frames(
+            body,
+            encoding,
+            max_bytes,
+            grpc.max_messages,
+            self.max_scan_bytes,
+        )
+        .ok()?;
 
         let mut rewritten = Vec::with_capacity(body.len());
         let mut changed = false;
@@ -2514,9 +2519,10 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     }
     // Reject whitespace interior to the path (trim only clears the edges) and
     // any percent/query/fragment syntax that is not part of a gRPC method path.
-    if trimmed.chars().any(|ch| {
-        ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';')
-    }) {
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';'))
+    {
         return Err(
             "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
                 .to_string(),
