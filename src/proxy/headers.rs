@@ -864,6 +864,67 @@ impl PrePolicyResponseHeaders {
     }
 }
 
+/// Owned, self-contained form of the streaming trailer-policy boundary, for
+/// relays whose trailer frame is produced by a BODY that outlives the request
+/// handler.
+///
+/// The native-HTTP/3 relays reconcile inline, so they can borrow the handler's
+/// final header map and pre-policy snapshot ([`ResponseTrailerGovernance`] +
+/// [`PrePolicyResponseHeaders`]). A streaming HTTP/2 response instead hands its
+/// body to hyper and returns: the backend TRAILERS frame is read minutes later,
+/// on a different task, long after `handle_proxy_request_inner`'s locals are
+/// gone. This struct is what the body carries instead — the same three inputs,
+/// owned.
+///
+/// Construction is once per governed streaming RESPONSE (one header-map clone
+/// for `final_headers`, one for the pre-policy snapshot, one `Arc` bump for the
+/// precomputed policy names). Never per body frame: the body wrapper only
+/// touches this on the single TRAILERS frame, and the reconciliation itself is
+/// bounded by the trailer count exactly as on the buffered path.
+pub(crate) struct StreamingResponseTrailerGovernor {
+    /// The response headers exactly as they went on the wire, after every
+    /// response-header phase AND the gateway's own builder-only writes.
+    final_headers: std::collections::HashMap<String, String>,
+    /// Evidence captured before the first response-header phase ran.
+    pre_policy: PrePolicyResponseHeaders,
+    /// Config-time union of `Plugin::response_trailer_policy()` names, shared
+    /// from the plugin cache generation (no per-request allocation).
+    policy_names: std::sync::Arc<Vec<String>>,
+    /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
+    unbounded: bool,
+}
+
+impl StreamingResponseTrailerGovernor {
+    pub(crate) fn new(
+        final_headers: std::collections::HashMap<String, String>,
+        pre_policy: PrePolicyResponseHeaders,
+        policy_names: std::sync::Arc<Vec<String>>,
+        unbounded: bool,
+    ) -> Self {
+        Self {
+            final_headers,
+            pre_policy,
+            policy_names,
+            unbounded,
+        }
+    }
+
+    /// Reconcile one backend trailer block against the retained boundary and
+    /// report how many fields were dropped. Call AFTER hop-by-hop stripping so
+    /// removed-field telemetry counts only policy-governed drops.
+    pub(crate) fn reconcile(&self, trailers: &mut http::HeaderMap) -> usize {
+        reconcile_streaming_backend_trailers(
+            trailers,
+            &self.final_headers,
+            &self.pre_policy,
+            ResponseTrailerGovernance {
+                policy_names: self.policy_names.as_slice(),
+                unbounded: self.unbounded,
+            },
+        )
+    }
+}
+
 /// Streaming-relay entry point for
 /// [`reconcile_backend_trailers_with_response_policy`].
 ///

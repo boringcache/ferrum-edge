@@ -1585,6 +1585,32 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
          response-header policy names and the fail-closed unbounded capability"
     );
 
+    // Hop-by-hop trailer names are stripped BEFORE the reconciliation, matching
+    // `finish_h3_response_with_backend_trailers`. Either order drops the same
+    // fields from the wire, but reconciling first counts them as policy-governed
+    // removals and inflates the `removed` telemetry.
+    let strip_at = reconcile
+        .find("strip_response_hop_by_hop_trailers(trailers);")
+        .expect("buffered H3 hop-by-hop trailer strip");
+    let reconcile_at = reconcile
+        .find("reconcile_backend_trailers_with_response_policy(")
+        .expect("buffered H3 reconciliation");
+    assert!(
+        strip_at < reconcile_at,
+        "buffered H3 must strip hop-by-hop trailer names before reconciling"
+    );
+    let forward_region = src
+        .split("// Forward backend response trailers, if any (issue #1630).")
+        .nth(1)
+        .expect("buffered trailer forward region")
+        .split("stream.send_trailers(")
+        .next()
+        .expect("bounded buffered trailer forward region");
+    assert!(
+        !forward_region.contains("strip_response_hop_by_hop_trailers("),
+        "buffered H3 must not strip hop-by-hop trailer names a second time"
+    );
+
     let send = src
         .split("// Backend trailers survive to here only when no response-body plugin")
         .nth(1)

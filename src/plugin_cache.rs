@@ -4053,6 +4053,13 @@ impl PluginCacheRequestView {
         self.response_trailer_policy_names.as_slice()
     }
 
+    /// Shared handle to the same list, for relays whose trailer boundary is
+    /// enforced by a response BODY that outlives the request handler (the
+    /// streaming HTTP/2 arm). One `Arc` bump, no per-request allocation.
+    pub fn response_trailer_policy_names_shared(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.response_trailer_policy_names)
+    }
+
     /// Get the pre-filtered committed-response observer chain.
     pub fn response_committed_plugins(&self) -> &[Arc<dyn Plugin>] {
         self.response_committed_plugins.as_slice()

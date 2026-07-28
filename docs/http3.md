@@ -370,6 +370,23 @@ exactly as before. Native gRPC over H3 inlines its own trailer finish and is not
 reconciled here, so `grpc-status` stays protocol-correct on the path that
 actually carries it.
 
+Both the buffered and streaming paths strip response-direction hop-by-hop
+trailer names **before** reconciling. Either order drops the same fields from
+the wire, but reconciling first would count a hop-by-hop name as a
+policy-governed removal and inflate the `removed` telemetry.
+
+### Direct HTTP/2 streaming
+
+The plain direct-H2 streaming relay (`ResponseBody::StreamingH2`) crosses the
+identical boundary and applies the identical three signals — see
+[docs/response_body_streaming.md → Backend trailers on the direct-HTTP/2
+streaming path](response_body_streaming.md#backend-trailers-on-the-direct-http2-streaming-path).
+Its only structural difference is ownership: the body is handed to hyper and the
+handler returns, so the boundary travels with the body as an owned
+`StreamingResponseTrailerGovernor` instead of borrowing the handler's locals.
+Native gRPC (mesh-mTLS) and translated gRPC-Web on that arm are excluded exactly
+as `dispatch_grpc_native_h3` is excluded here.
+
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 
 The H3 listener accepts WebSocket Extended CONNECT requests per

@@ -7147,6 +7147,12 @@ async fn handle_h3_request(
         let unbounded_trailer_policy = capabilities
             .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
         if let Some(trailers) = response_trailers.as_mut() {
+            // Strip hop-by-hop trailer names BEFORE reconciling, matching the
+            // streaming helper's order (`finish_h3_response_with_backend_trailers`).
+            // A hop-by-hop field is dropped either way, so the wire outcome is
+            // identical, but reconciling first would count it as a
+            // policy-governed removal and inflate the telemetry below.
+            strip_response_hop_by_hop_trailers(trailers);
             let removed = reconcile_backend_trailers_with_response_policy(
                 trailers,
                 &response_headers,
@@ -7231,16 +7237,15 @@ async fn handle_h3_request(
         // Auth/logging-only plugins must not wipe trailers merely because the
         // plugin chain is nonempty (#2941).
 
-        // Forward backend response trailers, if any (issue #1630). Strip
-        // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
-        // the same helper the streaming path's
-        // `finish_h3_response_with_backend_trailers` uses, then send them
-        // before FIN. An empty map after stripping is skipped — emit a bare
-        // `finish()` exactly as before.
+        // Forward backend response trailers, if any (issue #1630).
+        // Response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) were
+        // already stripped above, with the same helper the streaming path's
+        // `finish_h3_response_with_backend_trailers` uses, immediately before
+        // the policy reconciliation. Send what survived before FIN. An empty
+        // map is skipped — emit a bare `finish()` exactly as before.
         if body_completed {
             match response_trailers {
-                Some(mut trailers) => {
-                    strip_response_hop_by_hop_trailers(&mut trailers);
+                Some(trailers) => {
                     if !trailers.is_empty() {
                         let trailer_write = if terminal_gateway_deadline {
                             crate::http3::stream_util::await_terminal_response_write_before_deadline(

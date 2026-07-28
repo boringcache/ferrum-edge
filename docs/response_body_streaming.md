@@ -354,6 +354,17 @@ See [docs/size_limits.md](size_limits.md) for the full size limit enforcement ar
 
 Both protocols support streaming. By default, streaming responses use `ProxyBody::Stream` — a zero-overhead passthrough with no per-frame tracking. When `FERRUM_ENABLE_STREAMING_LATENCY_TRACKING=true`, the gateway calls `base_body.into_tracked(backend_start)` on the same base body the regular streaming path produces — so the tracked path inherits coalescing, the small-response eager buffer cutoff, and any `SizeLimitedStreamingResponse` wrapping. There is no separate "tracked + coalesced" or "tracked + size-limited" constructor; tracking is a transformation applied on top of whatever streaming dispatch the regular path picked. Per-frame cost: one atomic store via `StreamingMetrics`, plus one deferred `tokio::spawn` per streaming request.
 
+#### Backend trailers on the direct-HTTP/2 streaming path
+
+A direct-H2 streaming response (`ResponseBody::StreamingH2`) commits its initial HEADERS frame before the backend's TRAILERS frame exists, so it crosses the same response-header policy boundary the native-H3 streaming relays cross. Every direct / size-limited / coalescing variant of that arm therefore installs the same reconciliation, described in full in [docs/http3.md → Backend trailers and response header policy](http3.md#backend-trailers-and-response-header-policy): declared `Plugin::response_trailer_policy()` names, the observed pre-policy mutation witness, and the fail-closed `Unbounded` arm. Without it, `security_headers` configured with `{"remove": ["x-powered-by"]}` is a no-op on the initial header map when the backend sends `x-powered-by` only as a trailer, and the field lands on the wire after the policy already ran.
+
+Two direct-H2 dispatches are deliberately excluded, drawing the same line `dispatch_grpc_native_h3` draws on HTTP/3:
+
+- **Native gRPC** (the mesh-mTLS relay). `grpc-status`, `grpc-message`, and the application's terminal metadata are reserved trailer semantics, not backend-supplied header fields.
+- **Translated gRPC-Web.** Its terminal metadata is adapted into a final DATA frame, and the pristine Trailers-Only snapshot already governs what may appear there.
+
+Implementation notes: the pre-policy snapshot is taken on the pristine backend header map before any response-header phase runs, and only when a phase can actually mutate it (plugins present, sticky-cookie injection, or a gateway builder-only write). Because the body outlives the request handler, the boundary travels with it as an owned `StreamingResponseTrailerGovernor` — one final-header clone, one pre-policy clone, one `Arc` bump of the per-reload policy-name list, built at most once per governed streaming response. The header view handed to it is the response-header map **plus** the fields the gateway writes straight onto the response builder (`via`, `alt-svc`, `X-Gateway-Error`, `X-Gateway-Upstream-Status`), so a backend trailer of one of those names cannot reconcile as absent-to-absent. The body wrapper touches the governor only on the single TRAILERS frame — DATA frames pay nothing — and it reconciles immediately after the hop-by-hop trailer strip.
+
 ### HTTP/3 (QUIC)
 
 HTTP/3 responses support **streaming** across three distinct paths. See [docs/http3.md](http3.md) for the full dispatch model.

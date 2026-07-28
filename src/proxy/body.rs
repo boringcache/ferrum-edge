@@ -3459,6 +3459,7 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
 ) -> ProxyBody {
     // Bound the backend read so a backend that sends headers then stalls cannot
     // pin the streaming relay indefinitely. Two mutually-exclusive regimes
@@ -3470,7 +3471,7 @@ pub(crate) fn coalescing_h2_body_strip_hop_by_hop_trailers(
     // no buffered frame left to flush AND the backend is pending, so a per-frame
     // idle deadline measures genuine backend-read waits and never fires while a
     // sub-target frame is buffered waiting on a slow downstream client.
-    let stripped = StripHopByHopTrailers::new(body);
+    let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let coalescing = Coalescing::new(stripped, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(coalescing, Some(deadline));
@@ -3497,12 +3498,13 @@ pub(crate) fn size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
     coalesce_target: usize,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
 ) -> ProxyBody {
     // See `coalescing_h2_body_strip_hop_by_hop_trailers` for the two
     // mutually-exclusive deadline regimes (issue #1649). Either wraps the
     // coalescer OUTERMOST so a per-frame idle deadline never fires while a
     // buffered sub-target frame is waiting on a slow downstream client.
-    let stripped = StripHopByHopTrailers::new(body);
+    let stripped = StripHopByHopTrailers::with_trailer_governor(body, trailer_governor);
     let limited = SizeLimitedFrameSource::new(stripped, max_bytes);
     let coalescing = Coalescing::new(limited, coalesce_target, content_length);
     if let Some(deadline) = total_deadline {
@@ -3529,6 +3531,7 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     content_length: Option<u64>,
     read_timeout_ms: u64,
     total_deadline: Option<tokio::time::Instant>,
+    trailer_governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
 ) -> ProxyBody {
     use http_body_util::BodyExt;
 
@@ -3544,14 +3547,14 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
     if let Some(deadline) = total_deadline {
         let timed = TotalDeadlineBody::new(direct, Some(deadline));
         let fired = timed.deadline_fired_handle();
-        let stripped = StripHopByHopTrailers::new(timed);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped)).with_client_grpc_deadline_fired_flag(fired)
     } else if read_timeout_ms > 0 {
         let timed = IdleReadTimeoutBody::new(direct, read_timeout_ms);
-        let stripped = StripHopByHopTrailers::new(timed);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(timed, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped))
     } else {
-        let stripped = StripHopByHopTrailers::new(direct);
+        let stripped = StripHopByHopTrailers::with_trailer_governor(direct, trailer_governor);
         ProxyBody::streaming(Box::pin(stripped.map_err(|e| Box::new(e) as BoxError)))
     }
 }
@@ -3576,11 +3579,31 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
 /// natively, so this is safe.
 pub(crate) struct StripHopByHopTrailers<B> {
     inner: B,
+    /// Response-trailer policy boundary for a PLAIN streaming HTTP/2 response.
+    ///
+    /// `None` on every other path, which keeps the wrapper a pure hop-by-hop
+    /// filter: native gRPC (whose `grpc-status` / `grpc-message` trailers are
+    /// reserved terminal metadata, not backend-supplied header fields) and
+    /// gRPC-Web (whose terminal metadata is adapted into a DATA frame) pass
+    /// `None` exactly as they did before governance existed.
+    governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
 }
 
 impl<B> StripHopByHopTrailers<B> {
     pub(crate) fn new(inner: B) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            governor: None,
+        }
+    }
+
+    /// Same filter, plus the streaming HTTP/2 response-trailer policy
+    /// boundary. See [`crate::proxy::headers::StreamingResponseTrailerGovernor`].
+    pub(crate) fn with_trailer_governor(
+        inner: B,
+        governor: Option<Box<crate::proxy::headers::StreamingResponseTrailerGovernor>>,
+    ) -> Self {
+        Self { inner, governor }
     }
 }
 
@@ -3606,6 +3629,24 @@ where
                         Err(other) => return Poll::Ready(Some(Ok(other))),
                     };
                     crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut trailers);
+                    // Last point on a streaming HTTP/2 relay where the
+                    // response-header policy boundary can still bind the
+                    // trailer section: the initial HEADERS frame went on the
+                    // wire before the first body frame, so `after_proxy`,
+                    // sticky-cookie injection, and the gateway's own builder
+                    // writes are all already committed. Runs once per response,
+                    // on the trailer frame only — DATA frames never reach this
+                    // branch — and is skipped entirely (`None`) for every path
+                    // that is not a plain streaming HTTP/2 response.
+                    if let Some(governor) = this.governor.as_ref() {
+                        let removed = governor.reconcile(&mut trailers);
+                        if removed > 0 {
+                            debug!(
+                                removed,
+                                "streaming H2: dropped backend trailer fields governed by response header policy"
+                            );
+                        }
+                    }
                     Poll::Ready(Some(Ok(Frame::trailers(trailers))))
                 } else {
                     Poll::Ready(Some(Ok(frame)))

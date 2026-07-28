@@ -3202,6 +3202,43 @@ pub mod _test_support {
         surviving_trailer_lines_for_test(&map)
     }
 
+    /// Run the streaming HTTP/2 relay's OWNED trailer boundary over plain data.
+    ///
+    /// The native-H3 relays reconcile inline and can borrow the handler's
+    /// locals; a streaming HTTP/2 response instead hands its body to hyper and
+    /// returns, so the boundary travels with the body as a
+    /// `StreamingResponseTrailerGovernor`. This shim exercises exactly what the
+    /// `StripHopByHopTrailers` wrapper does on a backend TRAILERS frame:
+    /// hop-by-hop strip first, then the shared reconciliation through the owned
+    /// governor.
+    pub fn govern_streaming_h2_backend_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            crate::proxy::headers::ResponseTrailerGovernance {
+                policy_names,
+                unbounded: unbounded_policy,
+            },
+            header_phases_can_mutate,
+        );
+        let governor = crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+            final_headers.clone(),
+            pre_policy,
+            std::sync::Arc::new(policy_names.to_vec()),
+            unbounded_policy,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        governor.reconcile(&mut map);
+        surviving_trailer_lines_for_test(&map)
+    }
+
     fn backend_trailer_map_for_test(trailers: &[(&str, &str)]) -> http::HeaderMap {
         let mut map = http::HeaderMap::new();
         for (name, value) in trailers {
