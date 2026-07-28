@@ -5398,13 +5398,8 @@ async fn malformed_outer_timestamp_values_are_not_echoed() {
     assert!(is_reject(&created_result));
     assert!(!reject_body(&created_result).contains(marker));
 
-    let token = password_digest_security_block(
-        "alice",
-        "secret123",
-        b"bad-outer-expiry!",
-        &created,
-        None,
-    );
+    let token =
+        password_digest_security_block("alice", "secret123", b"bad-outer-expiry!", &created, None);
     let invalid_timestamp = format!(
         r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{created}</wsu:Created><wsu:Expires>{marker}</wsu:Expires></wsu:Timestamp>"#
     );
