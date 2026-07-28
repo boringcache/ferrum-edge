@@ -2972,8 +2972,11 @@ pub struct PluginPhaseData {
     /// cache-internal finalizer), `correlation_id`, `otel_tracing`,
     /// `workload_metrics`, `response_caching`, `ai_semantic_cache`,
     /// `rate_limiting`, and `ai_rate_limiter` all declare bounded name sets;
-    /// `response_transformer` declares `Unbounded` because its route-override
-    /// transforms are published at request time.
+    /// `response_transformer` and `ai_stream_router` declare `Unbounded` —
+    /// the former because route-override transforms are published at request
+    /// time, the latter because Anthropic SSE normalization invalidates
+    /// open-ended checksum-prefix families that no finite exact-name list can
+    /// cover.
     pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Final committed-response observers only, in configured priority order.
     pub response_committed_plugins: Arc<Vec<Arc<dyn Plugin>>>,

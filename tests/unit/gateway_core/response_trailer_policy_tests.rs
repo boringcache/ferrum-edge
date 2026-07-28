@@ -232,6 +232,37 @@ fn unbounded_policy_drops_every_reconcilable_trailer() {
 }
 
 #[test]
+fn unbounded_policy_drops_trailer_only_representation_metadata() {
+    // `ai_stream_router`'s Anthropic SSE normalization removes / invalidates
+    // these fields on the INITIAL header map. When the backend sent them ONLY
+    // as trailers, the pre-policy and final maps both lack the name
+    // (absent → absent), so the mutation witness forwards them unless the
+    // plugin's Unbounded declaration fails closed.
+    let backend = headers(&[("content-type", "text/event-stream")]);
+    let surviving = reconcile(
+        &[
+            ("content-encoding", "gzip"),
+            ("content-length", "42"),
+            ("vary", "accept-encoding"),
+            ("etag", "\"provider-repr\""),
+            ("digest", "sha-256=:AAAA:"),
+            ("signature", "sig1=:BBBB:"),
+            ("x-amz-checksum-sha256", "deadbeef"),
+            ("x-checksum-crc32", "AAAAAA=="),
+            ("x-keep", "yes"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+    );
+    assert!(
+        surviving.is_empty(),
+        "trailer-only representation metadata must not survive Unbounded: {surviving:?}"
+    );
+}
+
+#[test]
 fn a_grpc_named_trailer_gets_no_exemption_from_the_unbounded_arm() {
     // Every path that reaches this reconciliation is a PLAIN-flavor HTTP/3 relay
     // — native gRPC finishes its own trailers in `dispatch_grpc_native_h3` and is
@@ -449,6 +480,38 @@ fn streaming_relay_unbounded_policy_fails_closed_without_evidence() {
 }
 
 #[test]
+fn streaming_relay_unbounded_drops_trailer_only_representation_metadata() {
+    // Streaming H3 commits initial HEADERS before TRAILERS exist. Without
+    // `ai_stream_router`'s Unbounded ownership, a trailer-only
+    // `content-encoding` / validator / `x-amz-checksum-*` reconciles as
+    // absent→absent and reintroduces representation metadata the normalization
+    // already invalidated on the header channel.
+    let backend = headers(&[("content-type", "text/event-stream")]);
+    let surviving = reconcile_streaming(
+        &[
+            ("content-encoding", "br"),
+            ("content-length", "99"),
+            ("vary", "accept-encoding"),
+            ("etag", "\"sse-repr\""),
+            ("content-digest", "sha-256=:CCCC:"),
+            ("signature-input", "sig1=()"),
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+            ("x-checksum-sha256", "cafebabe"),
+            ("x-keep", "yes"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+    );
+    assert!(
+        surviving.is_empty(),
+        "streaming Unbounded must drop trailer-only representation metadata: {surviving:?}"
+    );
+}
+
+#[test]
 fn streaming_relay_binds_the_gateway_synthesized_default_content_type() {
     // Wire parity for the relays' `content-type: application/json` default. The
     // relay writes that field into the response-header MAP before building the
@@ -587,9 +650,10 @@ fn streaming_h2_observed_header_removal_binds_the_trailer_copy() {
 
 #[test]
 fn streaming_h2_unbounded_policy_fails_closed_without_evidence() {
-    // `response_transformer` (and anything else declaring `Unbounded`) drops
-    // the whole reconcilable trailer section, so the relay retains no snapshot
-    // at all. Same outcome as the buffered and streaming H3 unbounded arms.
+    // `response_transformer` / `ai_stream_router` (and anything else declaring
+    // `Unbounded`) drops the whole reconcilable trailer section, so the relay
+    // retains no snapshot at all. Same outcome as the buffered and streaming
+    // H3 unbounded arms.
     let backend = headers(&[("content-type", "text/plain")]);
     let surviving = govern_h2(
         &[("x-backend-finished", "true"), ("x-keep", "yes")],
@@ -602,6 +666,36 @@ fn streaming_h2_unbounded_policy_fails_closed_without_evidence() {
     assert!(
         surviving.is_empty(),
         "unbounded policy must drop every reconcilable trailer: {surviving:?}"
+    );
+}
+
+#[test]
+fn streaming_h2_unbounded_drops_trailer_only_representation_metadata() {
+    // Direct-H2 StreamingH2 commits HEADERS before TRAILERS, identical to the
+    // native-H3 streaming relays. Trailer-only representation metadata that
+    // `ai_stream_router` invalidated on the header channel must not survive.
+    let backend = headers(&[("content-type", "text/event-stream")]);
+    let surviving = govern_h2(
+        &[
+            ("content-encoding", "gzip"),
+            ("content-length", "12"),
+            ("vary", "accept-encoding"),
+            ("last-modified", "Mon, 01 Jan 2024 00:00:00 GMT"),
+            ("repr-digest", "sha-256=:DDDD:"),
+            ("content-signature", "sig1=:EEEE:"),
+            ("x-amz-checksum-sha256", "feedface"),
+            ("x-checksum-crc32c", "BBBBBB=="),
+            ("x-keep", "yes"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+    );
+    assert!(
+        surviving.is_empty(),
+        "H2 Unbounded must drop trailer-only representation metadata: {surviving:?}"
     );
 }
 

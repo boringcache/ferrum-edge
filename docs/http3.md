@@ -308,9 +308,12 @@ them against the response-header policy actually in force for the request:
   none.
 - **Fail-closed arm.** A plugin whose governed field set is not enumerable at
   config time declares `ResponseTrailerPolicy::Unbounded` and the whole trailer
-  section is dropped. `response_transformer` is in this class: its `after_proxy`
-  also applies `mesh_route_dispatch` route overrides, whose field names do not
-  exist until the request runs.
+  section is dropped. Two built-ins are in this class:
+
+  | Plugin | Why the set is not enumerable |
+  | --- | --- |
+  | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
+  | `ai_stream_router` | Anthropic SSE normalization removes `content-encoding` / `content-length`, invalidates every content-bound validator/digest/signature plus the open-ended `x-amz-checksum-*` / `x-checksum-*` families, and rewrites `vary` — prefix-derived names cannot be listed as finite exact names |
 
 **No field name is exempt, `grpc-*` included.** Every reconciled path is a
 plain-flavor H3 relay — the native H3 pool branches require

@@ -1172,9 +1172,12 @@ pub enum ResponseTrailerPolicy<'a> {
     /// trailers carrying one of them are dropped; every other trailer field is
     /// forwarded unchanged.
     Names(&'a [String]),
-    /// The governed field set is not enumerable at config time (for example
-    /// rules published at request time by another plugin). Trailer-forwarding
-    /// paths fail closed and drop the whole backend trailer section.
+    /// The governed field set is not enumerable at config time. Examples:
+    /// rules published at request time by another plugin
+    /// (`response_transformer`), and open-ended prefix families invalidated by
+    /// a representation rewrite (`ai_stream_router`'s
+    /// `x-amz-checksum-*` / `x-checksum-*`). Trailer-forwarding paths fail
+    /// closed and drop the whole backend trailer section.
     Unbounded,
 }
 
@@ -6858,9 +6861,10 @@ pub trait Plugin: Send + Sync {
     /// authenticate, or authorize correctly keep the
     /// [`ResponseTrailerPolicy::None`] default and preserve backend trailers
     /// (issue #2941). Declare the enumerable name set wherever it is
-    /// enumerable; reserve [`ResponseTrailerPolicy::Unbounded`] for governed
-    /// names that only exist at request time (`response_transformer`'s
-    /// route-override transforms).
+    /// enumerable; reserve [`ResponseTrailerPolicy::Unbounded`] when the
+    /// governed set cannot be listed as finite exact names — request-time
+    /// route overrides (`response_transformer`) and open-ended prefix families
+    /// (`ai_stream_router`'s content-bound checksum invalidation).
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
     }

@@ -2724,6 +2724,41 @@ async fn test_request_view_classifies_response_trailer_policy_by_capability() {
         view.capabilities()
             .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
     );
+
+    // `ai_stream_router` invalidates open-ended checksum-prefix families when
+    // normalizing Anthropic SSE, so it also fails closed rather than pretending
+    // a finite exact-name list covers `x-amz-checksum-*` / `x-checksum-*`.
+    let stream_router = make_plugin_config_with_json(
+        "asr",
+        "ai_stream_router",
+        json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["asr"])],
+        vec![stream_router],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.response_trailer_policy_names().is_empty(),
+        "Unbounded must not contribute bounded names"
+    );
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "ai_stream_router must classify as Unbounded response-trailer policy"
+    );
 }
 
 #[tokio::test]
