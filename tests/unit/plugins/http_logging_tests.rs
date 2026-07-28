@@ -740,7 +740,7 @@ async fn connect_failure_retry_and_slow_call_diagnostics_are_redacted() {
         &json!({
             "endpoint_url": sentinel_endpoint(&format!("http://{addr}")),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 2,
             "retry_delay_ms": 1,
         }),
@@ -793,7 +793,7 @@ async fn status_failure_diagnostics_are_redacted() {
         &json!({
             "endpoint_url": sentinel_endpoint(&format!("http://{addr}")),
             "batch_size": 1,
-            "flush_interval_ms": 50,
+            "flush_interval_ms": 100,
             "max_retries": 0,
         }),
         default_client(),
