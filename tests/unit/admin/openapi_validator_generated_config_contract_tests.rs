@@ -394,6 +394,270 @@ fn importer_rejects_case_equivalent_duplicate_multipart_encoding_headers() {
     );
 }
 
+fn multipart_encoding_header_content_spec(header_object: &str) -> String {
+    format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Upload API", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {{
+    "id": "upload-api",
+    "backend_host": "upload.internal",
+    "backend_port": 8080
+  }},
+  "components": {{
+    "schemas": {{
+      "PartMeta": {{
+        "type": "object",
+        "required": ["kind"],
+        "properties": {{
+          "kind": {{"type": "string", "minLength": 3}}
+        }},
+        "additionalProperties": false
+      }}
+    }}
+  }},
+  "paths": {{
+    "/upload": {{
+      "post": {{
+        "requestBody": {{
+          "required": true,
+          "content": {{
+            "multipart/form-data": {{
+              "schema": {{
+                "type": "object",
+                "required": ["file"],
+                "properties": {{
+                  "file": {{"type": "string", "format": "binary"}}
+                }}
+              }},
+              "encoding": {{
+                "file": {{
+                  "headers": {{
+                    "X-Part-Meta": {header_object}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }},
+        "responses": {{"204": {{"description": "ok"}}}}
+      }}
+    }}
+  }}
+}}"##
+    )
+}
+
+#[test]
+fn importer_preserves_multipart_encoding_header_content_form() {
+    let spec = multipart_encoding_header_content_spec(
+        r#"{
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {"$ref": "#/components/schemas/PartMeta"}
+            }
+          }
+        }"#,
+    );
+    let config = extract_validator_config(&spec);
+    let header = &config["operations"][0]["request_body"]["content"]["multipart/form-data"]
+        ["encoding"]["file"]["headers"]["X-Part-Meta"];
+    assert!(header.get("schema").is_none());
+    assert_eq!(header["required"], true);
+    assert!(header["content"]["application/json"]["schema"].get("$ref").is_none());
+    assert_eq!(
+        header["content"]["application/json"]["schema"]["type"],
+        "object"
+    );
+    assert_eq!(
+        header["content"]["application/json"]["schema"]["required"],
+        json!(["kind"])
+    );
+    assert_valid_against_admin_schema(&config, "multipart header content form");
+}
+
+#[test]
+fn importer_rejects_multipart_encoding_header_schema_content_exclusivity() {
+    let spec = multipart_encoding_header_content_spec(
+        r#"{
+          "schema": {"type": "string"},
+          "content": {
+            "application/json": {
+              "schema": {"type": "object"}
+            }
+          }
+        }"#,
+    );
+    let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("schema+content must fail closed");
+    let message = error.to_string();
+    assert!(
+        message.contains("schema") && message.contains("content"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn importer_rejects_multipart_encoding_header_content_without_exactly_one_media_type() {
+    for header_object in [
+        r#"{ "content": {} }"#,
+        r#"{
+          "content": {
+            "application/json": {"schema": {"type": "object"}},
+            "text/plain": {"schema": {"type": "string"}}
+          }
+        }"#,
+    ] {
+        let spec = multipart_encoding_header_content_spec(header_object);
+        let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+            .expect_err("content must require exactly one media type");
+        let message = error.to_string();
+        assert!(
+            message.contains("exactly one media type") || message.contains("content"),
+            "unexpected error: {message}"
+        );
+    }
+}
+
+#[test]
+fn importer_rejects_multipart_encoding_header_content_media_encoding_field() {
+    let spec = multipart_encoding_header_content_spec(
+        r#"{
+          "content": {
+            "application/json": {
+              "schema": {"type": "object"},
+              "encoding": {"nested": {"style": "form"}}
+            }
+          }
+        }"#,
+    );
+    let error = extract(spec.as_bytes(), Some(SpecFormat::Json), "prod")
+        .expect_err("header content Media Type Object must reject encoding");
+    let message = error.to_string();
+    assert!(
+        message.contains("encoding") || message.contains("unsupported field"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn importer_header_content_replacement_drops_prior_content_contract() {
+    let with_content = multipart_encoding_header_content_spec(
+        r#"{
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"type": "string"}}
+              }
+            }
+          }
+        }"#,
+    );
+    let with_schema = multipart_encoding_header_content_spec(
+        r#"{
+          "required": true,
+          "schema": {"type": "string", "minLength": 4}
+        }"#,
+    );
+    let content_config = extract_validator_config(&with_content);
+    let schema_config = extract_validator_config(&with_schema);
+    let content_header = &content_config["operations"][0]["request_body"]["content"]
+        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Meta"];
+    let schema_header = &schema_config["operations"][0]["request_body"]["content"]
+        ["multipart/form-data"]["encoding"]["file"]["headers"]["X-Part-Meta"];
+    assert!(content_header.get("content").is_some());
+    assert!(schema_header.get("content").is_none());
+    assert_eq!(schema_header["schema"]["type"], "string");
+    assert_valid_against_admin_schema(&schema_config, "replacement schema header form");
+}
+
+#[test]
+fn published_schema_accepts_encoding_header_content_form() {
+    let config = json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"file": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "file": {
+                                "headers": {
+                                    "X-Part-Meta": {
+                                        "required": true,
+                                        "content": {
+                                            "application/json": {
+                                                "schema": {
+                                                    "type": "object",
+                                                    "required": ["kind"],
+                                                    "properties": {"kind": {"type": "string"}}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    });
+    assert_valid_against_admin_schema(&config, "published encoding header content form");
+}
+
+#[test]
+fn published_schema_rejects_encoding_header_schema_and_content_together() {
+    let validator = openapi_validator_config_validator();
+    let config = json!({
+        "schema_draft": "draft2020-12",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {"file": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "file": {
+                                "headers": {
+                                    "X-Part-Meta": {
+                                        "schema": {"type": "string"},
+                                        "content": {
+                                            "application/json": {
+                                                "schema": {"type": "object"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    });
+    assert!(
+        validator.validate(&config).is_err(),
+        "schema+content Header Object must fail the published schema: {config}"
+    );
+}
+
 #[test]
 fn importer_rejects_unsupported_encoding_style_at_admission() {
     let spec = r##"{

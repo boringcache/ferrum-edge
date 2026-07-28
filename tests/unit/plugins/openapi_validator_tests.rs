@@ -4247,6 +4247,270 @@ async fn multipart_encoding_headers_use_full_json_schema_validation() {
     }
 }
 
+fn multipart_header_content_plugin(header_object: Value) -> OpenapiValidator {
+    OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Meta": header_object
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .expect("multipart header content config must construct")
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_json_validates_on_live_path() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    for (meta, expected_status) in [
+        (r#"{"kind":"doc"}"#, None),
+        (r#"{"kind":"ab"}"#, Some(400)),
+        ("not-json", Some(400)),
+        (r#"{"extra":true}"#, Some(400)),
+    ] {
+        let body = format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {meta}\r\n\r\nhello\r\n--abc--\r\n"
+        );
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        match expected_status {
+            Some(status) => assert_reject(result, Some(status)),
+            None => assert_continue(result),
+        }
+    }
+}
+
+#[test]
+fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_shapes() {
+    for header_object in [
+        json!({
+            "schema": {"type": "string"},
+            "content": {"application/json": {"schema": {"type": "object"}}}
+        }),
+        json!({"content": {}}),
+        json!({
+            "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "text/plain": {"schema": {"type": "string"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json": {
+                    "schema": {"type": "object"},
+                    "encoding": {"nested": {"style": "form"}}
+                }
+            }
+        }),
+        json!({
+            "content": {
+                "multipart/form-data": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({"content": {"not-a-media": {"schema": {"type": "string"}}}}),
+    ] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/header-content",
+                "path_regex": "^/header-content$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {"X-Part-Meta": header_object}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        assert!(
+            error.contains("content")
+                || error.contains("schema")
+                || error.contains("encoding")
+                || error.contains("media type")
+                || error.contains("multipart/form-data"),
+            "malformed header content must fail closed with a field-specific diagnostic: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_reload_replacement_and_delete_change_live_path() {
+    let content_plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let schema_plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "schema": {"type": "string", "pattern": "^[a-z]{4}$"}
+    }));
+    let deleted_plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {}
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let json_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: {\"kind\":\"doc\"}\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let scalar_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: abcd\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let missing_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_continue(
+        content_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, json_body.as_bytes())
+            .await,
+    );
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        content_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, scalar_body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Replacement/reload with schema form accepts the scalar contract and rejects JSON.
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_continue(
+        schema_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, scalar_body.as_bytes())
+            .await,
+    );
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        schema_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, json_body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Delete of the encoding header contract stops requiring the part header.
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_continue(
+        deleted_plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, missing_body.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_rejects_oversized_header_block() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {"type": "object"}
+            }
+        }
+    }));
+    // Entire part header block must stay under the existing 8 KiB ceiling.
+    let oversized = "x".repeat(9 * 1024);
+    let body = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {{\"pad\":\"{oversized}\"}}\r\n\r\nhello\r\n--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
 #[tokio::test]
 async fn multipart_encoding_headers_respect_header_object_required_default() {
     for (required, include_header, expected_status) in [

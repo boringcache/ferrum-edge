@@ -343,6 +343,11 @@ struct EncodingHeaderValidator {
     /// Precomputed at admission so header scalar conversion never re-walks.
     schema_types: SchemaTypeSet,
     validator: jsonschema::Validator,
+    /// When set, the header value is decoded as this single Media Type Object
+    /// media type before schema validation (OpenAPI Header Object `content`).
+    content_media_type: Option<String>,
+    /// Conversion plan for structured `content` decoding (JSON/XML/text/…).
+    conversion: ConversionPlan,
 }
 
 /// Hostile-input caps for multipart parsing (RFC 2046 / RFC 7578).
@@ -1975,13 +1980,6 @@ fn parse_property_encoding(
                 true
             };
             if is_header_object
-                && header_object.is_some_and(|object| object.contains_key("content"))
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].content is not supported; use a schema Header Object"
-                ));
-            }
-            if is_header_object
                 && let Some(style) = header_object.and_then(|object| object.get("style"))
                 && style.as_str() != Some("simple")
             {
@@ -1997,16 +1995,87 @@ fn parse_property_encoding(
                     "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
                 ));
             }
-            let schema_value = if is_header_object {
-                header_object
-                    .and_then(|object| object.get("schema"))
-                    .ok_or_else(|| {
+            let (schema_value, content_media_type) = if is_header_object {
+                let header_object = header_object.ok_or_else(|| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] must be a Header Object"
+                    )
+                })?;
+                let has_schema = header_object.contains_key("schema");
+                let has_content = header_object.contains_key("content");
+                if has_schema && has_content {
+                    return Err(format!(
+                        "encoding['{property}'].headers['{header_name}'] must not declare both schema and content"
+                    ));
+                }
+                if has_content {
+                    let content_object = header_object
+                        .get("content")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            format!(
+                                "encoding['{property}'].headers['{header_name}'].content must be an object"
+                            )
+                        })?;
+                    if content_object.len() != 1 {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].content must contain exactly one media type"
+                        ));
+                    }
+                    let (media_type, media_value) = content_object.iter().next().ok_or_else(|| {
                         format!(
-                            "encoding['{property}'].headers['{header_name}'] must contain schema"
+                            "encoding['{property}'].headers['{header_name}'].content must contain exactly one media type"
                         )
-                    })?
+                    })?;
+                    let media_base = content_type_base(Some(media_type))
+                        .unwrap_or(media_type)
+                        .to_ascii_lowercase();
+                    if !is_media_type_or_range(&media_base) {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].content contains '{media_type}', which is not a media type or media range"
+                        ));
+                    }
+                    if media_base == "multipart/form-data" {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].content['{media_type}'] does not support multipart/form-data"
+                        ));
+                    }
+                    let media_object = media_value.as_object().ok_or_else(|| {
+                        format!(
+                            "encoding['{property}'].headers['{header_name}'].content['{media_type}'] must be a Media Type Object"
+                        )
+                    })?;
+                    reject_unknown_keys(
+                        media_object,
+                        &format!(
+                            "encoding['{property}'].headers['{header_name}'].content['{media_type}']"
+                        ),
+                        &["schema", "example", "examples"],
+                        ERROR_PREFIX,
+                    )?;
+                    if let Some(examples) = media_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(format!(
+                            "encoding['{property}'].headers['{header_name}'].content['{media_type}'].examples must be an object"
+                        ));
+                    }
+                    let schema = media_object.get("schema").ok_or_else(|| {
+                        format!(
+                            "encoding['{property}'].headers['{header_name}'].content['{media_type}'] must contain schema"
+                        )
+                    })?;
+                    (schema, Some(media_base))
+                } else {
+                    let schema = header_object.get("schema").ok_or_else(|| {
+                        format!(
+                            "encoding['{property}'].headers['{header_name}'] must contain schema or content"
+                        )
+                    })?;
+                    (schema, None)
+                }
             } else {
-                header_schema
+                (header_schema, None)
             };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
@@ -2014,6 +2083,11 @@ fn parse_property_encoding(
                 )
             })?;
             let schema_types = collect_schema_types(schema_value);
+            let conversion = ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
+                format!(
+                    "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                )
+            })?;
             headers.insert(
                 name,
                 EncodingHeaderValidator {
@@ -2021,6 +2095,8 @@ fn parse_property_encoding(
                     schema: schema_value.clone(),
                     schema_types,
                     validator,
+                    content_media_type,
+                    conversion,
                 },
             );
         }
@@ -3584,6 +3660,39 @@ fn multipart_values_to_schema_value(
     multipart_part_to_schema_value(first, schema, encoding, conversion)
 }
 
+/// Decode an Encoding Object Header Object `content` value under the existing
+/// multipart header-size ceiling, then materialize a JSON Schema instance.
+fn header_content_to_schema_value(
+    value: &str,
+    media_type: &str,
+    schema: &Value,
+    conversion: &ConversionPlan,
+) -> Result<Value, String> {
+    if value.len() > MAX_MULTIPART_HEADER_BYTES {
+        return Err(format!(
+            "header content exceeds {MAX_MULTIPART_HEADER_BYTES} bytes"
+        ));
+    }
+    let media_type = media_type.to_ascii_lowercase();
+    if is_json_media_type(&media_type) {
+        return serde_json::from_str(value)
+            .map_err(|error| format!("Invalid JSON header content: {error}"));
+    }
+    if is_xml_media_type(&media_type) {
+        return xml_body_to_value(value, schema, conversion);
+    }
+    if media_type == "application/x-www-form-urlencoded" {
+        return form_urlencoded_to_value(value, schema, &AHashMap::new(), conversion);
+    }
+    if is_text_media_type(&media_type) {
+        return scalar_to_schema_value(value, schema, conversion);
+    }
+    match binary_body_to_schema_instance(value.as_bytes(), schema)? {
+        SchemaInstance::Value(instance) => Ok(instance),
+        SchemaInstance::BinaryLengthOnly => Ok(Value::String(value.to_string())),
+    }
+}
+
 fn multipart_part_to_schema_value(
     part: &MultipartPart,
     schema: &Value,
@@ -3615,12 +3724,34 @@ fn multipart_part_to_schema_value(
                 }
                 continue;
             };
-            let converted = scalar_to_schema_value_with_types(
-                header_value,
-                &header_validator.schema,
-                header_validator.schema_types,
-                schema_is_composed(&header_validator.schema).then_some(&header_validator.validator),
-            )?;
+            if header_value.len() > MAX_MULTIPART_HEADER_BYTES {
+                return Err(format!(
+                    "Multipart field '{}' header '{header_name}' exceeds {MAX_MULTIPART_HEADER_BYTES} bytes",
+                    part.name
+                ));
+            }
+            let converted = if let Some(media_type) = &header_validator.content_media_type {
+                header_content_to_schema_value(
+                    header_value,
+                    media_type,
+                    &header_validator.schema,
+                    &header_validator.conversion,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Multipart field '{}' header '{header_name}' failed content decoding: {error}",
+                        part.name
+                    )
+                })?
+            } else {
+                scalar_to_schema_value_with_types(
+                    header_value,
+                    &header_validator.schema,
+                    header_validator.schema_types,
+                    schema_is_composed(&header_validator.schema)
+                        .then_some(&header_validator.validator),
+                )?
+            };
             header_validator
                 .validator
                 .validate(&converted)
