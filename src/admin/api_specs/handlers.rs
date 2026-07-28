@@ -16,10 +16,11 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::admin::api_specs::extractor::{MAX_YAML_EXPANDED_NODES, count_value_nodes};
+use crate::admin::api_specs::extractor::{MAX_SOURCE_DOCUMENT_NODES, count_value_nodes};
 use crate::admin::api_specs::{
     ExtractError, ExtractedBundle, SpecFormat, extract, hash_resource_bundle,
 };
@@ -641,6 +642,7 @@ fn extract_error_code(e: &ExtractError) -> &'static str {
         ExtractError::UnsupportedExternalRef { .. } => "UnsupportedExternalRef",
         ExtractError::SchemaReference(_) => "SchemaReference",
         ExtractError::SchemaTooDeep { .. } => "SchemaTooDeep",
+        ExtractError::SchemaReferenceCycle { .. } => "SchemaReferenceCycle",
         ExtractError::SchemaTooLarge { .. } => "SchemaTooLarge",
     }
 }
@@ -671,6 +673,7 @@ fn extract_error_status(e: &ExtractError) -> StatusCode {
         | ExtractError::UnsupportedExternalRef { .. }
         | ExtractError::SchemaReference(_)
         | ExtractError::SchemaTooDeep { .. }
+        | ExtractError::SchemaReferenceCycle { .. }
         | ExtractError::SchemaTooLarge { .. } => StatusCode::UNPROCESSABLE_ENTITY,
     }
 }
@@ -1110,7 +1113,7 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
                 .map_err(|e| format!("YAML parse error during conversion: {e}"))?;
             let jv: serde_json::Value = serde_json::to_value(val)
                 .map_err(|e| format!("YAML→JSON conversion error: {e}"))?;
-            let mut budget = MAX_YAML_EXPANDED_NODES;
+            let mut budget = MAX_SOURCE_DOCUMENT_NODES;
             if !count_value_nodes(&jv, &mut budget) {
                 return Err(
                     "YAML alias expansion exceeds node limit during conversion; \
@@ -2877,6 +2880,42 @@ fn json_resp(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
 // POST /api-specs
 // ---------------------------------------------------------------------------
 
+/// Concurrent API-spec extractions admitted process-wide.
+///
+/// Import-time reference expansion is the single most expensive thing an
+/// authenticated admin request can ask this process to do: it is CPU-bound and
+/// materializes attacker-influenced structure. The extractor caps what *one*
+/// import may materialize; this caps how many such imports run at once, so the
+/// process-wide peak is a small constant multiple of that per-import ceiling
+/// rather than a multiple of however many admin requests are in flight
+/// (GHSA-8jc7-c52g-85xr).
+///
+/// This is deliberately a queue, not a rejection gate: waiting preserves the
+/// documented status-code contract for `/api-specs`, and the number of waiters
+/// is already bounded upstream by the admin connection limiter
+/// (`AdminConnLimiter`, global + per-IP) together with the advertised admin
+/// HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`. Admission is FIFO, so one
+/// namespace submitting large specs cannot starve another.
+const MAX_CONCURRENT_SPEC_EXTRACTIONS: usize = 4;
+
+static SPEC_EXTRACTION_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_SPEC_EXTRACTIONS));
+
+/// Run spec extraction under the bounded-admission gate.
+async fn extract_admitted(
+    body: &[u8],
+    declared_format: Option<SpecFormat>,
+    namespace: &str,
+) -> Result<(ExtractedBundle, crate::admin::api_specs::SpecMetadata), ApiSpecError> {
+    // INVARIANT: `SPEC_EXTRACTION_SLOTS` is a process-lifetime static that is
+    // never closed, so `acquire` cannot fail here. Fail closed rather than
+    // running an unadmitted extraction if that ever changes.
+    let _permit = SPEC_EXTRACTION_SLOTS.acquire().await.map_err(|_| {
+        ApiSpecError::AdmissionUnavailable("spec extraction admission unavailable".to_string())
+    })?;
+    extract(body, declared_format, namespace).map_err(ApiSpecError::Extract)
+}
+
 pub async fn handle_post_api_spec(
     req: Request<Incoming>,
     state: &AdminState,
@@ -2902,9 +2941,9 @@ pub async fn handle_post_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract(&body, declared_format, namespace) {
+    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
         Ok(v) => v,
-        Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
+        Err(e) => return Ok(error_response(e)),
     };
 
     // Assign IDs for POST: mint UUIDs for every empty ID, re-link references.
@@ -3070,9 +3109,9 @@ pub async fn handle_put_api_spec(
     };
 
     // Extract resources from the spec body.
-    let (mut bundle, metadata) = match extract(&body, declared_format, namespace) {
+    let (mut bundle, metadata) = match extract_admitted(&body, declared_format, namespace).await {
         Ok(v) => v,
-        Err(e) => return Ok(error_response(ApiSpecError::Extract(e))),
+        Err(e) => return Ok(error_response(e)),
     };
 
     // Serialize every graph-relevant read below through replacement

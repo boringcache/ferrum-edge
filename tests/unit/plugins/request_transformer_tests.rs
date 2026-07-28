@@ -114,15 +114,15 @@ async fn test_request_transformer_add_query_param() {
         ferrum_edge::plugins::PluginResult::Continue
     ));
     assert_eq!(ctx.query_params.get("version").unwrap(), "v2");
+    assert_eq!(ctx.outbound_query_string(), Some("version=v2"));
 }
 
 #[tokio::test]
 async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
     // Mirror of `QUERY_PARAMS_TRANSFORMED_METADATA_KEY` (pub(crate) in proxy).
-    // Raw-query consumers (serverless_function) fail closed on this marker.
     const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
 
-    // A query rule that actually mutates the decoded map sets the marker.
+    // A query rule that actually mutates the ordered query sets the marker.
     let mutating = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "remove", "target": "query", "key": "token"}
@@ -130,8 +130,8 @@ async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
     }))
     .unwrap();
     let mut ctx = make_ctx();
-    ctx.query_params
-        .insert("token".to_string(), "secret".to_string());
+    ctx.set_raw_query_string("token=secret&keep=1".to_string());
+    ctx.materialize_query_params();
     let mut headers: HashMap<String, String> = HashMap::new();
     let _ = mutating.before_proxy(&mut ctx, &mut headers).await;
     assert!(
@@ -139,9 +139,11 @@ async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
             .contains_key(QUERY_PARAMS_TRANSFORMED_METADATA_KEY),
         "an applied query transform must mark metadata for raw-query consumers"
     );
+    assert_eq!(ctx.outbound_query_string(), Some("keep=1"));
+    assert!(!ctx.query_params.contains_key("token"));
 
     // A query rule that no-ops (nothing to remove) must NOT set the marker, so a
-    // safe raw-query composition is not needlessly rejected.
+    // safe raw-query composition is not needlessly rewritten.
     let noop = RequestTransformer::new(&json!({
         "rules": [
             {"operation": "remove", "target": "query", "key": "absent"}
@@ -149,9 +151,8 @@ async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
     }))
     .unwrap();
     let mut noop_ctx = make_ctx();
-    noop_ctx
-        .query_params
-        .insert("keep".to_string(), "value".to_string());
+    noop_ctx.set_raw_query_string("keep=value".to_string());
+    noop_ctx.materialize_query_params();
     let mut noop_headers: HashMap<String, String> = HashMap::new();
     let _ = noop.before_proxy(&mut noop_ctx, &mut noop_headers).await;
     assert!(
@@ -160,6 +161,7 @@ async fn test_query_transform_marks_metadata_for_raw_query_consumers() {
             .contains_key(QUERY_PARAMS_TRANSFORMED_METADATA_KEY),
         "a no-op query rule must not mark a query transform"
     );
+    assert_eq!(noop_ctx.outbound_query_string(), None);
 
     // A header-only transform must not set the query-transform marker.
     let header_only = RequestTransformer::new(&json!({
@@ -2020,4 +2022,330 @@ async fn test_request_transformer_header_mutations_never_log_configured_values()
         logs.contains("request_transformer: removed header authorization"),
         "remove should still emit a name-only diagnostic"
     );
+}
+
+#[tokio::test]
+async fn test_ordered_query_duplicate_and_encoding_semantics() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "access_token"},
+            {"operation": "update", "target": "query", "key": "tag", "value": "green"},
+            {"operation": "add", "target": "query", "key": "version", "value": "v2"},
+            {"operation": "rename", "target": "query", "key": "old", "new_key": "new"}
+        ]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx();
+    // Duplicates, key-without-equals, empty value, plus, percent-encoded name/value,
+    // and an invalid percent triplet retained on an unmodified keep pair.
+    ctx.set_raw_query_string(
+        "access_token=secret&tag=red&tag=blue&flag&empty=&q=a+b&old=1&keep=%ZZ&name=%E2%9C%93"
+            .to_string(),
+    );
+    ctx.materialize_query_params();
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.outbound_query_string(),
+        Some("tag=green&tag=green&flag&empty=&q=a+b&new=1&keep=%ZZ&name=%E2%9C%93&version=v2")
+    );
+    assert!(!ctx.query_params.contains_key("access_token"));
+    assert_eq!(
+        ctx.query_params.get("tag").map(String::as_str),
+        Some("green")
+    );
+    assert_eq!(
+        ctx.query_params.get("version").map(String::as_str),
+        Some("v2")
+    );
+    assert_eq!(ctx.query_params.get("new").map(String::as_str), Some("1"));
+    assert!(!ctx.query_params.contains_key("old"));
+}
+
+#[tokio::test]
+async fn test_query_add_does_not_overwrite_existing_duplicate_name() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "query", "key": "tag", "value": "green"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("tag=red&tag=blue".to_string());
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(ctx.outbound_query_string(), None);
+    assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
+}
+
+#[tokio::test]
+async fn test_query_update_creates_when_absent_and_encodes_spaces() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "query", "key": "q", "value": "a b"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("keep=1".to_string());
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(ctx.outbound_query_string(), Some("keep=1&q=a%20b"));
+}
+
+#[tokio::test]
+async fn test_query_rename_preserves_flag_without_equals() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "flag", "new_key": "enabled"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("flag&keep=".to_string());
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(ctx.outbound_query_string(), Some("enabled&keep="));
+}
+
+#[tokio::test]
+async fn test_query_repeated_rules_apply_in_order() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "query", "key": "step", "value": "1"},
+            {"operation": "update", "target": "query", "key": "step", "value": "2"},
+            {"operation": "rename", "target": "query", "key": "step", "new_key": "phase"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(ctx.outbound_query_string(), Some("phase=2"));
+}
+
+#[tokio::test]
+async fn test_query_crlf_rejected_at_construction() {
+    let err = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "query", "key": "x", "value": "a\nb"}
+        ]
+    }))
+    .err()
+    .expect("CRLF query value must be rejected");
+    assert!(err.contains("must not contain CR or LF"), "got: {err}");
+}
+
+#[tokio::test]
+async fn test_query_transform_composes_with_auth_strip_helper() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "update", "target": "query", "key": "page", "value": "2"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("api_key=secret&page=1&keep=1".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Auth-marked credentials are stripped from the transform input before
+    // query rules run, so the published outbound query never retains them.
+    assert_eq!(ctx.outbound_query_string(), Some("page=2&keep=1"));
+    assert!(!ctx.query_params.contains_key("api_key"));
+    let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(effective, "page=2&keep=1");
+}
+
+#[tokio::test]
+async fn test_auth_marked_credential_cannot_survive_rename() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "access_token", "new_key": "moved"},
+            {"operation": "add", "target": "query", "key": "page", "value": "2"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("access_token=never-forward-this&keep=1".to_string());
+    ctx.materialize_query_params();
+    assert_eq!(
+        ctx.query_params.get("access_token").map(String::as_str),
+        Some("never-forward-this")
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.access_token".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Renaming an auth-marked credential must not move the secret to a new
+    // outbound name, nor leave it in the plugin-visible map.
+    assert_eq!(ctx.outbound_query_string(), Some("keep=1&page=2"));
+    assert!(!ctx.query_params.contains_key("access_token"));
+    assert!(!ctx.query_params.contains_key("moved"));
+    assert!(
+        !ctx.query_params
+            .values()
+            .any(|value| value == "never-forward-this")
+    );
+
+    let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(effective, "keep=1&page=2");
+    assert!(!effective.contains("never-forward-this"));
+    assert!(!effective.contains("moved="));
+    assert!(!effective.contains("access_token"));
+}
+
+#[tokio::test]
+async fn test_query_transform_does_not_log_secret_values() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "access_token"},
+            {"operation": "update", "target": "query", "key": "page", "value": "super-secret-page"}
+        ]
+    }))
+    .unwrap();
+    let logs = capture_debug_logs(|| async {
+        let mut ctx = make_ctx();
+        ctx.set_raw_query_string("access_token=never-log-this-token&page=1".to_string());
+        let mut headers = HashMap::new();
+        let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(ctx.outbound_query_string(), Some("page=super-secret-page"));
+    })
+    .await;
+    assert_secret_absent_from_logs(&logs, "never-log-this-token");
+    assert_secret_absent_from_logs(&logs, "super-secret-page");
+}
+
+#[tokio::test]
+async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
+    // Query matching parses the retained raw/outbound query itself, so this
+    // plugin must not flip the shared pre-auth H3 decoded-query capability.
+    let with_query = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "token"}
+        ]
+    }))
+    .unwrap();
+    assert!(
+        !with_query.requires_decoded_query_params(),
+        "request_transformer must not force H3 pre-auth decoded query materialization"
+    );
+
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    assert!(!header_only.requires_decoded_query_params());
+}
+
+#[tokio::test]
+async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
+    // H3 pre-auth materialization keeps percent-encoded names in
+    // `ctx.query_params`. Ordered rules must still match the decoded name from
+    // the retained raw query and publish a decoded plugin-visible map afterward.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "api key", "new_key": "api_key"},
+            {"operation": "update", "target": "query", "key": "tag", "value": "green"}
+        ]
+    }))
+    .unwrap();
+    assert!(!plugin.requires_decoded_query_params());
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("api%20key=secret&tag=red&keep=%ZZ".to_string());
+    ctx.materialize_query_params_raw();
+    assert_eq!(
+        ctx.query_params.get("api%20key").map(String::as_str),
+        Some("secret"),
+        "H3-style raw materialization must retain the percent-encoded name"
+    );
+    assert!(!ctx.query_params.contains_key("api key"));
+    assert_eq!(ctx.query_params.get("tag").map(String::as_str), Some("red"));
+
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.outbound_query_string(),
+        Some("api_key=secret&tag=green&keep=%ZZ")
+    );
+    assert!(!ctx.query_params.contains_key("api%20key"));
+    assert!(!ctx.query_params.contains_key("api key"));
+    assert_eq!(
+        ctx.query_params.get("api_key").map(String::as_str),
+        Some("secret")
+    );
+    assert_eq!(
+        ctx.query_params.get("tag").map(String::as_str),
+        Some("green")
+    );
+    // Unmodified keep pair stays in the decoded map with its lossy decode, while
+    // the outbound wire form retains the original invalid percent triplet.
+    assert_eq!(
+        ctx.query_params.get("keep").map(String::as_str),
+        Some("%ZZ")
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::request_transformer::runtime_overlay;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "token"}
+        ],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true
+    }))
+    .unwrap();
+    assert!(
+        !plugin.requires_decoded_query_params(),
+        "configured (even runtime-gated) query rules must not opt into decoded H3 materialization"
+    );
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("tok%65n=secret&keep=1".to_string());
+    ctx.materialize_query_params_raw();
+    let pre_auth = ctx.query_params.clone();
+    assert_eq!(
+        pre_auth.get("tok%65n").map(String::as_str),
+        Some("secret"),
+        "pre-auth map must remain H3 raw while rules are runtime-disabled"
+    );
+    assert!(!pre_auth.contains_key("token"));
+
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(ctx.outbound_query_string(), None);
+    assert_eq!(
+        ctx.query_params, pre_auth,
+        "runtime-disabled transformer must leave the H3 raw pre-auth map untouched"
+    );
+    assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
+
+    runtime_overlay::reset_for_test();
 }

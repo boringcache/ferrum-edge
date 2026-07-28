@@ -68,3 +68,6 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 - Tungstenite `auto_pong` opt-out (issue #2963): vendored `--lib auto_pong`,
   `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, and functional
   H1/H2/H3 Ping transparency tests in `functional_websocket_test.rs`.
+- Tungstenite/tokio-tungstenite fragment accounting + incomplete-message bounds
+  (GHSA-qq94-2gv2-phh6): vendored `--lib fragment` / `--lib incomplete_message`
+  and `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
