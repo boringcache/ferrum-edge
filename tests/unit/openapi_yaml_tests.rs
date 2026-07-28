@@ -9151,6 +9151,54 @@ fn ai_rate_limiter_token_limit_required_without_default_contract() {
     );
 }
 
+/// GHSA-8f27-23x9-f825: the published contract must state the HTTP-only
+/// applicability rather than implying the limiter enforces native gRPC budgets.
+#[test]
+fn ai_rate_limiter_advertises_http_only_protocol_contract() {
+    use ferrum_edge::plugins::{
+        Plugin, PluginHttpClient, ProxyProtocol, ai_rate_limiter::AiRateLimiter,
+    };
+
+    let plugin =
+        AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let description = spec["components"]["schemas"]["AiRateLimiterConfig"]["description"]
+        .as_str()
+        .expect("AiRateLimiterConfig description");
+    assert!(
+        description.contains("HTTP-only"),
+        "OpenAPI must advertise HTTP-only attachment for ai_rate_limiter: {description}"
+    );
+    assert!(
+        description.contains("Native gRPC is unsupported"),
+        "OpenAPI must retract the inert native-gRPC support claim: {description}"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_rate_limiter`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_rate_limiter docs section");
+    assert!(
+        section.contains("**This plugin is HTTP-only.**"),
+        "docs must declare the HTTP-only protocol scope"
+    );
+    assert!(
+        section.contains("**gRPC-Web is also unsupported.**"),
+        "docs must state that framed gRPC-Web is not charged as JSON AI traffic"
+    );
+
+    let order = include_str!("../../docs/plugin_execution_order.md");
+    assert!(
+        order.contains("| `ai_rate_limiter` | ✓ | | | | |"),
+        "protocol matrix row must show HTTP only for ai_rate_limiter"
+    );
+}
+
 #[test]
 fn ai_rate_limiter_provider_enum_matches_runtime() {
     use ferrum_edge::plugins::{PluginHttpClient, ai_rate_limiter::AiRateLimiter};
