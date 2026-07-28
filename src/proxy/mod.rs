@@ -16732,6 +16732,11 @@ fn try_normalize_framed_grpc_unary_reject(
         {
             continue;
         }
+        // Ferrum-owned gRPC-Web bridge fields must never reach a client, and
+        // this path promotes headers into client-visible trailers.
+        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(key) {
+            continue;
+        }
         if key.eq_ignore_ascii_case("connection")
             || key.eq_ignore_ascii_case("keep-alive")
             || key.eq_ignore_ascii_case("proxy-connection")
@@ -16766,7 +16771,9 @@ fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
         return false;
     }
     let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-    body.len() == 5 + msg_len
+    // `5 + msg_len` would overflow `usize` on a 32-bit target for a declared
+    // length near `u32::MAX`; a wrapped sum could then match a short body.
+    msg_len.checked_add(5) == Some(body.len())
 }
 
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {

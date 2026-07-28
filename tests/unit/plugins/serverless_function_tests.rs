@@ -1004,6 +1004,49 @@ async fn test_terminate_mode_rejects_grpc_web_requests() {
     }
 }
 
+/// Negative control for the ordering hazard: `grpc_web` (priority 260) rewrites
+/// `content-type` to `application/grpc` long before `serverless_function`
+/// (3025) runs, so a translated browser request reaches `before_proxy` looking
+/// exactly like native gRPC. Header inspection alone would frame a native unary
+/// response for a client that can only read gRPC-Web body-framed trailers.
+#[tokio::test]
+async fn test_terminate_mode_rejects_translated_grpc_web_requests() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "mode": "terminate"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::retain_grpc_web_client_content_type_for_test(
+        &mut ctx,
+        "application/grpc-web+proto",
+    );
+    // The rewrite `grpc_web` already performed on both header views.
+    ctx.headers
+        .insert("content-type".to_string(), "application/grpc".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 500);
+            assert!(body.contains("does not support gRPC-Web"));
+        }
+        other => panic!(
+            "Expected Reject for translated gRPC-Web terminate, got {:?}",
+            other
+        ),
+    }
+}
+
 #[tokio::test]
 async fn test_terminate_mode_frames_native_grpc_unary_response() {
     use wiremock::matchers::method;

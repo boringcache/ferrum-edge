@@ -3123,6 +3123,17 @@ pub mod _test_support {
         crate::plugins::grpc_web::is_grpc_web_text(ct)
     }
 
+    /// Stamp the retained gRPC-Web client representation the way
+    /// `on_request_received` does, so tests can build a request whose live
+    /// `content-type` has already been rewritten to `application/grpc` while
+    /// the client is still a gRPC-Web browser.
+    pub fn retain_grpc_web_client_content_type_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        content_type: &str,
+    ) {
+        crate::plugins::grpc_web::retain_client_content_type_for_errors(ctx, content_type);
+    }
+
     pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
         crate::plugins::grpc_web::build_trailer_frame(response_headers, None)
     }

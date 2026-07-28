@@ -1954,7 +1954,23 @@ fn is_native_grpc_terminate_request(
     })
 }
 
+/// True when the client spoke gRPC-Web, including after translation.
+///
+/// The live `content-type` alone cannot answer this: `grpc_web` (priority 260)
+/// runs its `on_request_received` / `before_proxy` well ahead of this plugin
+/// (3025) and rewrites both `ctx.headers` and the effective header view to
+/// `application/grpc`, so a translated browser request is indistinguishable
+/// from native gRPC by header inspection at this point. The request-scoped
+/// markers are the authoritative signal — the translation claim
+/// (`request_is_grpc_web_translated`) and the retained client representation
+/// used by pass-through deployments that omit the plugin
+/// (`client_uses_grpc_web`) — and neither is derivable from client input.
 fn is_grpc_web_terminate_request(headers: &HashMap<String, String>, ctx: &RequestContext) -> bool {
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        || crate::plugins::grpc_web::client_uses_grpc_web(ctx)
+    {
+        return true;
+    }
     request_content_type(headers, ctx)
         .is_some_and(crate::plugins::grpc_web::is_grpc_web_content_type)
 }
@@ -2117,7 +2133,22 @@ fn build_native_grpc_terminate_response(
         None => None,
         Some(Value::String(message)) => {
             let sanitized = sanitize_grpc_terminate_message(message);
-            (!sanitized.is_empty()).then_some(sanitized)
+            if sanitized.is_empty() {
+                None
+            } else {
+                // Custom trailers are field-value validated below; hold the
+                // protocol-owned message to the same bar. Without this a
+                // control byte the CR/LF sanitizer does not cover survives to
+                // trailer construction, where `HeaderValue::from_str` fails and
+                // silently drops `grpc-message` from the client's response.
+                if HeaderValue::from_str(&sanitized).is_err() {
+                    return Err(InvocationFailure::new(
+                        "invalid_grpc_terminate_response",
+                        "gRPC terminate 'grpc_message' is not a valid HTTP field value",
+                    ));
+                }
+                Some(sanitized)
+            }
         }
         Some(_) => {
             return Err(InvocationFailure::new(
