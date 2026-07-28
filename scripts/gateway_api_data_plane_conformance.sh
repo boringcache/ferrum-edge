@@ -15,6 +15,10 @@ CP_NAMESPACE="${CP_NAMESPACE:-ferrum}"
 DP_SERVICE_NAME="${DP_SERVICE_NAME:-ferrum-gateway-data-plane}"
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
 BACKEND_NAMESPACE="${BACKEND_NAMESPACE:-gateway-conformance-web-backend}"
+# Upstream Gateway API conformance also provisions this fixed backend namespace
+# (see kubernetes-sigs/gateway-api conformance constants). Keep it on the K8s
+# watch list even though CP/DP auth stays single-namespace.
+APP_BACKEND_NAMESPACE="${APP_BACKEND_NAMESPACE:-gateway-conformance-app-backend}"
 JWT_SECRET="${JWT_SECRET:-ferrum-edge-gateway-api-conformance-grpc-secret}"
 ADMIN_SECRET="${ADMIN_SECRET:-ferrum-edge-gateway-api-conformance-admin-secret}"
 
@@ -97,7 +101,8 @@ deploy_control_plane() {
     --set controlPlane.database.sqlite.mode=rwc \
     --set-string controlPlane.credentials.adminJwtSecret.value="$ADMIN_SECRET" \
     --set-string controlPlane.credentials.cpDpGrpcJwtSecret.value="$JWT_SECRET" \
-    --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+    --set-string "controlPlane.env.FERRUM_NAMESPACE=$DP_GATEWAY_NAMESPACE" \
+    --set-string "controlPlane.env.FERRUM_K8S_WATCH_NAMESPACES=${DP_GATEWAY_NAMESPACE}\\,${BACKEND_NAMESPACE}\\,${APP_BACKEND_NAMESPACE}" \
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
