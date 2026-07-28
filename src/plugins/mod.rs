@@ -6868,12 +6868,7 @@ pub trait Plugin: Send + Sync {
     /// order. Default is a no-op. Plugins whose success-boundary side effects
     /// must not depend on later hooks presenting the origin status to the
     /// client (for example cache invalidation) override this.
-    fn observe_origin_http_response_status(
-        &self,
-        _ctx: &mut RequestContext,
-        _status: u16,
-    ) {
-    }
+    fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
 
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted

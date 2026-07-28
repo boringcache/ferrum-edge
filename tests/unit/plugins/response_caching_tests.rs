@@ -5345,15 +5345,7 @@ async fn test_observe_then_after_proxy_does_not_double_invalidate() {
     let _policy_guard = response_cache_replay_policy_guard();
     let cache = Arc::new(default_plugin());
 
-    cache_response(
-        &cache,
-        "GET",
-        "/api/items",
-        200,
-        &HashMap::new(),
-        b"once",
-    )
-    .await;
+    cache_response(&cache, "GET", "/api/items", 200, &HashMap::new(), b"once").await;
 
     let mut ctx = make_ctx("POST", "/api/items");
     let mut headers = HashMap::new();
@@ -5374,15 +5366,7 @@ async fn test_observe_then_after_proxy_does_not_double_invalidate() {
     );
 
     // Re-store and prove a second after_proxy without fresh staging is a no-op.
-    cache_response(
-        &cache,
-        "GET",
-        "/api/items",
-        200,
-        &HashMap::new(),
-        b"again",
-    )
-    .await;
+    cache_response(&cache, "GET", "/api/items", 200, &HashMap::new(), b"again").await;
     let mut resp_headers = HashMap::new();
     cache.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     let mut hit_ctx = make_ctx("GET", "/api/items");

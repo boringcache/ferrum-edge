@@ -1747,9 +1747,7 @@ impl ResponseCaching {
         let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
             return;
         };
-        let status = ctx
-            .origin_http_response_status()
-            .unwrap_or(response_status);
+        let status = ctx.origin_http_response_status().unwrap_or(response_status);
         if Self::is_non_error_status(status) {
             self.invalidate_path(ctx, &host_part);
         }
@@ -2150,8 +2148,8 @@ impl Plugin for ResponseCaching {
         // `headers` view so a rewritten Host partitions identically to lookup.
         // HIT/REVALIDATED paths clear this staging below — a served cache HIT
         // never contacted the origin and must not flush peer variants.
-        let stage_unsafe_invalidation = self.config.invalidate_on_unsafe_methods
-            && Self::is_unsafe_method(&ctx.method);
+        let stage_unsafe_invalidation =
+            self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method);
         if stage_unsafe_invalidation {
             self.stage_pending_invalidation(ctx, headers);
         }
