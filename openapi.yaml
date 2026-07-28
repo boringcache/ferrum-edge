@@ -3545,12 +3545,19 @@ paths:
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
         redacted before it is written to the audit log. Sensitive plugin
-        configuration is redacted as well; Loki endpoint paths/queries,
-        authorization, and all custom-header values are never persisted in
-        the diff, Redis envelope signing keys (`redis_integrity_key` and any
+        configuration is redacted as well, through the same schema-aware
+        sensitivity contract used for non-admin plugin reads: credential-bearing
+        endpoint URLs keep only scheme/host/port with structural
+        `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers and
+        never userinfo, all values of arbitrary header maps and webhook body
+        templates are replaced by `[REDACTED]`, as are
+        `serverless_function.azure_function_key` and every
+        `kafka_logging.producer_config` property outside the safe-tuning
+        allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
         userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept.
+        scheme/host/port/database are kept. Explicit JSON `null` values on
+        sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
@@ -6747,12 +6754,30 @@ components:
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so
             their unmodeled values cannot be disclosed.
-            Sensitive plugin configuration is also redacted; loki_logging
-            endpoint paths/queries, authorization, and custom-header values
-            are never persisted, `redis_integrity_key` (and any other
+            Sensitive plugin configuration is also redacted through one
+            schema-aware sensitivity contract shared with non-admin plugin
+            reads. Every built-in plugin declares its credential-bearing
+            config paths; credential-bearing endpoint URLs keep only
+            `scheme://host[:port]` with `[REDACTED_PATH]` /
+            `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers and never
+            userinfo, every value of an arbitrary header or parameter map
+            (otel_tracing `headers`, loki_logging/http_logging
+            `custom_headers`, ai_transcript_audit `sink.custom_headers`, opa
+            `headers`, proxy_alerts channel `headers`,
+            api_chargeback_sink `clickhouse.insert_query_params`) is replaced
+            by `[REDACTED]`, as are `serverless_function.azure_function_key`,
+            proxy_alerts channel `body_template`, and every
+            `kafka_logging.producer_config` property outside the safe-tuning
+            allow-list. Mesh `workload_metrics` tracing-provider collector
+            URLs receive the same structural projection. `redis_integrity_key`
+            (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
             `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept.
+            scheme/host/port/database are kept. Any remaining URL-shaped
+            string carrying userinfo has that userinfo replaced. A plugin
+            config that is not an object (and not `null`) is replaced
+            wholesale. Explicit JSON `null` values on sensitive fields stay
+            `null`.
 
     AuditEventListResponse:
       type: object
@@ -12349,8 +12374,11 @@ components:
             (Sumo Logic path token, Mezmo apikey query parameter), so this value
             is never rendered in operational output: egress-denial, DNS/TLS,
             retry, slow-call, and batch-failure diagnostics show only a
-            structurally redacted scheme://host:port/redacted form, and the
-            admin audit projection redacts it the same way.
+            structurally redacted scheme://host:port/redacted form. The admin
+            audit and non-admin read projections apply the schema-aware
+            sensitivity contract instead, keeping only `scheme://host[:port]`
+            with `[REDACTED_PATH]` / `[REDACTED_QUERY]` /
+            `[REDACTED_FRAGMENT]` markers.
         custom_headers:
           type: object
           additionalProperties:
@@ -15594,7 +15622,9 @@ components:
                   a backend; takes precedence over `rewrite` and the route
                   override destination. A status-only redirect is valid and
                   preserves the original URL. A rule carrying a `redirect`
-                  does not require a `destination`.
+                  does not require a `destination`. `port` and `derive_port`
+                  are mutually exclusive (Istio oneof); scheme-default ports
+                  are omitted from Location.
                 properties:
                   uri:
                     type: [string, "null"]
@@ -15612,7 +15642,23 @@ components:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
-                    description: Replacement authority port; request host is preserved when authority is unset.
+                    description: |
+                      Replacement authority port (Istio `redirect.port`); request
+                      host is preserved when authority is unset. Mutually
+                      exclusive with `derive_port`. Scheme-default ports
+                      (`80`/`http`, `443`/`https`) are omitted from Location.
+                  derive_port:
+                    type: [string, "null"]
+                    enum: [FROM_PROTOCOL_DEFAULT, FROM_REQUEST_PORT, null]
+                    description: |
+                      Dynamically derive the Location authority port (Istio
+                      `redirect.derivePort`). `FROM_PROTOCOL_DEFAULT` uses 80 for
+                      http and 443 for https (including when `scheme` is set on
+                      the same redirect). `FROM_REQUEST_PORT` uses the trusted
+                      request port: original-destination port when capture
+                      rewrote the accept socket, otherwise the frontend listener
+                      port — never spoofable `X-Forwarded-Port` / `Forwarded`
+                      headers. Mutually exclusive with `port`.
                   scheme:
                     type: [string, "null"]
                     enum: [http, https, null]
@@ -15814,7 +15860,8 @@ components:
       type: object
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
-        plugin that exposes BPF SOCK_OPS counters on the Prometheus scrape
+        plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
+        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
@@ -15823,7 +15870,11 @@ components:
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
           default: ferrum_mesh_bpf
-          description: Prometheus metric name prefix for emitted BPF counters.
+          description: |
+            Prometheus metric name prefix for emitted BPF counters and
+            latency histograms (default families include
+            `{prefix}_srtt_microseconds` and
+            `{prefix}_syn_to_ack_microseconds`).
 
     SoapWsSecurityConfig:
       type: object
@@ -17106,10 +17157,20 @@ components:
           type: string
           enum: [add, remove, update, rename]
           description: |
-            add: insert if absent (does not overwrite).
-            update: write the query parameter value.
-            remove: delete the query parameter.
-            rename: move old → new query parameter name.
+            add: append if the decoded name is absent (does not overwrite;
+            existing duplicates are left untouched).
+            update: rewrite every matching decoded-name pair's value, or
+            append when absent.
+            remove: delete every matching decoded-name pair.
+            rename: rename every matching pair, preserving value encoding
+            and key-without-equals shape; existing destination names stay.
+            Mutations apply to an ordered, duplicate-aware representation of
+            the retained raw query after authentication-owned credential
+            pairs (`auth.strip_query_param.*`) are removed from that input,
+            and are published as the outbound query for every primary
+            backend URL builder and request_mirror. The proxy still applies
+            a final strip pass as defense in depth. A rename/update of a
+            marked credential name therefore cannot relocate the secret.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.
@@ -17118,15 +17179,20 @@ components:
           const: query
         key:
           type: string
-          description: Query parameter name.
+          description: |
+            Query parameter name matched after percent-decoding. Must not
+            contain CR or LF.
         value:
           type: string
           description: |
             Required for add/update; must not be set for remove/rename.
+            Must not contain CR or LF. Authored onto the outbound query with
+            RFC 3986 percent-encoding (`%20` for spaces, never `+`).
         new_key:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not contain CR or LF.
 
     RequestTransformerBodyRule:
       type: object
@@ -20211,7 +20277,7 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form, and the admin audit projection redacts it the same way."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
             allow_insecure_loopback:
               type: boolean
               default: false
@@ -21830,7 +21896,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -21901,23 +21967,6 @@ components:
                 type: boolean
                 default: false
                 description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
-        fallback:
-          type: object
-          additionalProperties: false
-          description: "Reserved fallback policy. Parsed and validated but not yet active: ai_stream_router cannot switch providers after the first downstream byte."
-          properties:
-            enabled:
-              type: boolean
-              default: false
-            on_connect_error:
-              type: boolean
-              default: true
-            on_5xx_before_first_byte:
-              type: boolean
-              default: true
-            max_attempts:
-              type: integer
-              default: 2
 
     A2aGatewayConfig:
       type: object
@@ -22777,6 +22826,12 @@ components:
               minimum: 1
               maximum: 1000000
               default: 50000
+              description: >
+                Bounded in-memory export channel capacity. With spool.enabled=false,
+                the 80% high-water mark is telemetry only and every slot remains
+                usable until the channel is actually full. With spool enabled,
+                high-water overflow is diverted to durable spool delivery instead
+                of consuming the remaining channel slots.
             buffer_max_bytes:
               type: integer
               minimum: 9312
@@ -23192,6 +23247,24 @@ components:
                 high_water_hits_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Enqueue attempts observed while in-memory queue depth was at
+                    or above the high-water mark. Telemetry only; does not imply
+                    diversion or loss.
+                high_water_diversions_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events whose high-water durable spool-delivery handoff was
+                    accepted. Zero when spool is disabled. Saturated or closed
+                    delivery queues are counted by spool loss metrics instead.
+                full_drops_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events dropped because the bounded in-memory queue was full
+                    and no durable overflow path accepted ownership. Shutdown or
+                    unavailable admission is not counted here.
             spool:
               type: object
               properties:
@@ -23238,6 +23311,10 @@ components:
                 events_enqueued_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Events admitted to the in-memory channel or accepted by a
+                    durable overflow handoff. Failed spool-delivery admission and
+                    shutdown/unavailable outcomes are not counted.
                 events_exported_total:
                   type: integer
                   minimum: 0
@@ -23328,6 +23405,22 @@ components:
               type: integer
             high_water_hits_total:
               type: integer
+              description: >
+                Enqueue attempts observed while in-memory queue depth was at or
+                above the high-water mark. Telemetry only; does not imply
+                diversion or loss.
+            high_water_diversions_total:
+              type: integer
+              description: >
+                Events whose high-water durable spool-delivery handoff was
+                accepted. Zero when spool is disabled. Saturated or closed
+                delivery queues are counted by spool loss metrics instead.
+            full_drops_total:
+              type: integer
+              description: >
+                Events dropped because the bounded in-memory queue was full and
+                no durable overflow path accepted ownership. Shutdown or
+                unavailable admission is not counted here.
         spool:
           type: object
           properties:
@@ -23371,6 +23464,10 @@ components:
           properties:
             events_enqueued_total:
               type: integer
+              description: >
+                Events admitted to the in-memory channel or accepted by a durable
+                overflow handoff. Failed spool-delivery admission and
+                shutdown/unavailable outcomes are not counted.
             events_exported_total:
               type: integer
             failures_total:

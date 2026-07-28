@@ -22,8 +22,12 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use h2::client as h2_client;
 use http::{HeaderMap, HeaderValue, Request, Response};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 /// A buffered gRPC response, captured eagerly.
@@ -271,6 +275,13 @@ impl GrpcClient {
     where
         T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // Observe the inbound HTTP/2 framing on the raw byte stream before h2
+        // consumes it. `h2`'s per-stream recv state is NOT a durable record of
+        // END_STREAM, so it cannot answer "was this response Trailers-Only?"
+        // after the fact — see `InboundResponseFraming` (#3422).
+        let framing = Arc::new(InboundResponseFraming::default());
+        let io = FrameObservingIo::new(io, Arc::clone(&framing));
+
         let (mut send_req, connection) = h2_client::handshake(io).await?;
         let conn_task = tokio::spawn(connection);
 
@@ -343,7 +354,12 @@ impl GrpcClient {
 
         let http_status = response.status().as_u16();
         let headers = response.headers().clone();
-        let initial_headers_end_stream = response.body().is_end_stream();
+        // Wire truth, not h2 stream state: did the FIRST response HEADERS frame
+        // carry END_STREAM (the gRPC Trailers-Only shape)? `RecvStream::
+        // is_end_stream()` cannot answer this, because a later
+        // RST_STREAM(NO_ERROR) rewrites the same recv state it reads and makes
+        // it report `false` for a response that already completed (#3422).
+        let initial_headers_end_stream = framing.initial_headers_end_stream();
         let (_parts, mut body_stream) = response.into_parts();
 
         // Bound body + trailer collection separately from `response_fut` so
@@ -441,6 +457,11 @@ impl GrpcClient {
 /// present in terminal headers or trailers. An initial `grpc-status` is
 /// authoritative only when that HEADERS block also ended the stream; otherwise
 /// a later reset could have truncated DATA and must remain visible.
+///
+/// `initial_headers_end_stream` must come from
+/// [`InboundResponseFraming::initial_headers_end_stream`] — a sticky wire
+/// observation — and not from `h2::RecvStream::is_end_stream()`, which the very
+/// reset being classified here can flip to `false` (#3422).
 fn suppress_benign_early_response_reset(
     stream_error: Option<String>,
     stream_error_is_remote_no_error_reset: bool,
@@ -477,6 +498,215 @@ fn is_valid_explicit_grpc_status(value: &HeaderValue) -> bool {
 
 fn is_remote_h2_no_error_reset(err: &h2::Error) -> bool {
     err.is_reset() && err.is_remote() && err.reason() == Some(h2::Reason::NO_ERROR)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Wire-level inbound framing observation (#3422)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// `suppress_benign_early_response_reset` may only clear the RFC 9113 §8.1
+// early-response `RST_STREAM(NO_ERROR)` when the response was genuinely
+// terminal — for the gateway's synthesized gRPC errors that means the initial
+// HEADERS block carried both END_STREAM and an explicit `grpc-status`
+// (Trailers-Only). That END_STREAM fact used to be read back from
+// `h2::RecvStream::is_end_stream()` AFTER the response future resolved, which
+// is not a durable record of the wire event:
+//
+//   * `Recv::is_end_stream` is `state.is_recv_end_stream() && pending_recv
+//     .is_empty()`, and `is_recv_end_stream()` matches only
+//     `Closed(Cause::EndStream) | HalfClosedRemote(..)`.
+//   * `State::recv_reset` overwrites ANY non-closed state — including the
+//     `HalfClosedRemote` a completed response just produced — with
+//     `Closed(Cause::Error(remote_reset))`, regardless of the reset's reason.
+//
+// So once the connection task processes the gateway's post-response
+// `RST_STREAM(NO_ERROR)`, `is_end_stream()` starts reporting `false` for a
+// response that arrived complete. Whether that happens before the test task
+// reads it is pure scheduling luck, which is exactly the nondeterminism behind
+// the recurring `backend_refuses_returns_502__grpc_to_grpc` failure
+// (HTTP 200 + `body error: stream error received: not a result of an error`).
+//
+// The bytes, unlike h2's mutable stream state, are unambiguous. Scanning the
+// inbound frame headers as they are read off the transport records END_STREAM
+// once, stickily, and independently of task interleaving. It deliberately does
+// NOT relax anything: a HEADERS block that did not carry END_STREAM is still
+// reported as non-terminal, so truncated DATA/trailers, local resets, and
+// non-`NO_ERROR` resets keep failing.
+
+/// HTTP/2 frame header length (RFC 9113 §4.1).
+const H2_FRAME_HEADER_LEN: usize = 9;
+/// `HEADERS` frame type.
+const H2_FRAME_TYPE_HEADERS: u8 = 0x1;
+/// `END_STREAM` flag, bit 0 of the frame `flags` octet.
+const H2_FLAG_END_STREAM: u8 = 0x1;
+
+/// No response HEADERS block has been observed yet.
+const FIRST_HEADERS_UNSEEN: u8 = 0;
+/// The first response HEADERS block carried `END_STREAM`.
+const FIRST_HEADERS_END_STREAM: u8 = 1;
+/// The first response HEADERS block left the response stream open.
+const FIRST_HEADERS_OPEN: u8 = 2;
+
+/// Sticky, wire-derived record of the inbound framing this client observed.
+///
+/// Shared between the transport wrapper (writer) and the request path (reader),
+/// so it uses an atomic rather than a lock — the client's read path is on the
+/// h2 connection task while the assertions run on the test task.
+#[derive(Debug, Default)]
+struct InboundResponseFraming {
+    /// One of the `FIRST_HEADERS_*` constants. Written at most once so a
+    /// trailers HEADERS block can never restate the initial response's shape.
+    first_headers: AtomicU8,
+}
+
+impl InboundResponseFraming {
+    fn record_response_headers(&self, end_stream: bool) {
+        let observed = if end_stream {
+            FIRST_HEADERS_END_STREAM
+        } else {
+            FIRST_HEADERS_OPEN
+        };
+        // First writer wins: a second HEADERS block on the same stream is
+        // trailers, and an interim 1xx would likewise not describe the final
+        // response's terminal shape.
+        let _ = self.first_headers.compare_exchange(
+            FIRST_HEADERS_UNSEEN,
+            observed,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// `true` only when a response HEADERS block was observed AND it carried
+    /// `END_STREAM`. An unobserved response (never possible once the response
+    /// future has resolved) reports `false`, keeping the caller strict.
+    fn initial_headers_end_stream(&self) -> bool {
+        self.first_headers.load(Ordering::Acquire) == FIRST_HEADERS_END_STREAM
+    }
+}
+
+/// Incremental scanner over the server → client HTTP/2 byte stream.
+///
+/// The inbound direction carries no connection preface, so the stream is a bare
+/// sequence of `[9-byte header][payload]`. Only frame headers are inspected;
+/// payloads (including HPACK blocks and any `CONTINUATION`) are skipped, which
+/// is sufficient because `END_STREAM` lives in the HEADERS frame's own flags.
+/// State is carried across `poll_read` calls so a frame header split across
+/// reads is still parsed exactly once.
+#[derive(Debug, Default)]
+struct H2FrameScanner {
+    /// Payload octets of the current frame still to be skipped.
+    payload_remaining: usize,
+    /// Partially received frame header.
+    header: [u8; H2_FRAME_HEADER_LEN],
+    /// Octets of `header` filled so far.
+    header_len: usize,
+}
+
+impl H2FrameScanner {
+    fn observe(&mut self, mut bytes: &[u8], framing: &InboundResponseFraming) {
+        while !bytes.is_empty() {
+            if self.payload_remaining > 0 {
+                let skip = self.payload_remaining.min(bytes.len());
+                self.payload_remaining -= skip;
+                bytes = &bytes[skip..];
+                continue;
+            }
+            let take = (H2_FRAME_HEADER_LEN - self.header_len).min(bytes.len());
+            self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
+            self.header_len += take;
+            bytes = &bytes[take..];
+            if self.header_len < H2_FRAME_HEADER_LEN {
+                return;
+            }
+            let [
+                len_hi,
+                len_mid,
+                len_lo,
+                frame_type,
+                flags,
+                id0,
+                id1,
+                id2,
+                id3,
+            ] = self.header;
+            let payload_len = u32::from_be_bytes([0, len_hi, len_mid, len_lo]) as usize;
+            let stream_id = u32::from_be_bytes([id0, id1, id2, id3]) & 0x7fff_ffff;
+            self.header_len = 0;
+            self.payload_remaining = payload_len;
+            // Stream 0 is connection control (SETTINGS/PING/GOAWAY/WINDOW_UPDATE)
+            // and never carries a response.
+            if frame_type == H2_FRAME_TYPE_HEADERS && stream_id != 0 {
+                framing.record_response_headers(flags & H2_FLAG_END_STREAM != 0);
+            }
+        }
+    }
+}
+
+/// Transport wrapper that records inbound HTTP/2 framing while passing bytes
+/// through untouched. Wraps whatever IO the request path uses, so it sees
+/// plaintext h2c frames and post-decryption h2-over-TLS frames alike.
+struct FrameObservingIo<T> {
+    io: T,
+    framing: Arc<InboundResponseFraming>,
+    scanner: H2FrameScanner,
+}
+
+impl<T> FrameObservingIo<T> {
+    fn new(io: T, framing: Arc<InboundResponseFraming>) -> Self {
+        Self {
+            io,
+            framing,
+            scanner: H2FrameScanner::default(),
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for FrameObservingIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let already_filled = buf.filled().len();
+        let this = &mut *self;
+        let poll = Pin::new(&mut this.io).poll_read(cx, buf);
+        if matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() > already_filled {
+            let fresh = &buf.filled()[already_filled..];
+            this.scanner.observe(fresh, &this.framing);
+        }
+        poll
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for FrameObservingIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
 }
 
 /// Decode the length-prefixed gRPC messages out of a concatenation of DATA
@@ -783,6 +1013,172 @@ mod tests {
             kept.is_some(),
             "non-terminal initial grpc-status must not mask truncated DATA"
         );
+    }
+
+    /// Serialize one HTTP/2 frame (header + opaque payload) for the scanner.
+    fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        assert!(len <= 0xff_ffff, "test frame payload too large");
+        let mut out = Vec::with_capacity(H2_FRAME_HEADER_LEN + len);
+        out.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        out.push(frame_type);
+        out.push(flags);
+        out.extend_from_slice(&stream_id.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    const H2_FRAME_TYPE_DATA: u8 = 0x0;
+    const H2_FRAME_TYPE_SETTINGS: u8 = 0x4;
+    const H2_FRAME_TYPE_RST_STREAM: u8 = 0x3;
+    const H2_FLAG_END_HEADERS: u8 = 0x4;
+
+    /// The exact recurring `backend_refuses_returns_502__grpc_to_grpc` wire
+    /// sequence (#3422): SETTINGS, a Trailers-Only HEADERS block carrying
+    /// `grpc-status`, then the RFC 9113 §8.1 `RST_STREAM(NO_ERROR)` that cancels
+    /// the client's unread upload. The observed END_STREAM must stay recorded
+    /// after the reset — that stickiness is what h2's own recv state lacks.
+    #[test]
+    fn backend_refusal_trailers_only_signature_survives_late_no_error_reset() {
+        let framing = InboundResponseFraming::default();
+        let mut scanner = H2FrameScanner::default();
+
+        let trailers_only = h2_frame(
+            H2_FRAME_TYPE_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            b"hpack-block",
+        );
+        let mut wire = h2_frame(H2_FRAME_TYPE_SETTINGS, 0, 0, &[]);
+        wire.extend_from_slice(&trailers_only);
+        scanner.observe(&wire, &framing);
+        assert!(
+            framing.initial_headers_end_stream(),
+            "Trailers-Only HEADERS must be recorded as terminal"
+        );
+
+        // The gateway's post-response reset arrives; the record must not move.
+        let reset = h2_frame(H2_FRAME_TYPE_RST_STREAM, 0, 1, &[0; 4]);
+        scanner.observe(&reset, &framing);
+        assert!(
+            framing.initial_headers_end_stream(),
+            "a late RST_STREAM(NO_ERROR) must not erase the observed END_STREAM"
+        );
+
+        // Full decision chain: this is the signature that must now pass.
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let cleared = suppress_benign_early_response_reset(
+            Some("body error: stream error received: not a result of an error".into()),
+            true,
+            &headers,
+            framing.initial_headers_end_stream(),
+            None,
+        );
+        assert!(
+            cleared.is_none(),
+            "complete Trailers-Only UNAVAILABLE + NO_ERROR reset must be well-formed"
+        );
+    }
+
+    /// Negative control: HEADERS that left the stream open is still reported
+    /// non-terminal, so a reset that may have truncated DATA keeps failing even
+    /// though `grpc-status` was present in the initial headers.
+    #[test]
+    fn open_initial_headers_are_not_recorded_as_terminal() {
+        let framing = InboundResponseFraming::default();
+        let mut scanner = H2FrameScanner::default();
+        let open_headers = h2_frame(H2_FRAME_TYPE_HEADERS, H2_FLAG_END_HEADERS, 1, b"hpack");
+        scanner.observe(&open_headers, &framing);
+        assert!(
+            !framing.initial_headers_end_stream(),
+            "HEADERS without END_STREAM must never be reported as Trailers-Only"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let kept = suppress_benign_early_response_reset(
+            Some("body error: stream error received: not a result of an error".into()),
+            true,
+            &headers,
+            framing.initial_headers_end_stream(),
+            None,
+        );
+        assert!(
+            kept.is_some(),
+            "non-terminal initial HEADERS must keep the reset visible"
+        );
+    }
+
+    /// Negative control: a terminal trailers HEADERS block after DATA must not
+    /// retroactively relabel the initial response as Trailers-Only.
+    #[test]
+    fn trailers_headers_block_does_not_overwrite_initial_headers_record() {
+        let framing = InboundResponseFraming::default();
+        let mut scanner = H2FrameScanner::default();
+        let data = h2_frame(H2_FRAME_TYPE_DATA, 0, 1, &[0; 5]);
+        let trailers = h2_frame(
+            H2_FRAME_TYPE_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            b"trailers",
+        );
+        let mut wire = h2_frame(H2_FRAME_TYPE_HEADERS, H2_FLAG_END_HEADERS, 1, b"hpack");
+        wire.extend_from_slice(&data);
+        wire.extend_from_slice(&trailers);
+        scanner.observe(&wire, &framing);
+        assert!(
+            !framing.initial_headers_end_stream(),
+            "only the FIRST HEADERS block describes the initial response shape"
+        );
+    }
+
+    /// A frame header may be split across `poll_read` boundaries; the scanner
+    /// must still classify it exactly once. Byte-by-byte feeding is the
+    /// worst case.
+    #[test]
+    fn scanner_parses_frame_headers_split_across_reads() {
+        let terminal_headers = h2_frame(
+            H2_FRAME_TYPE_HEADERS,
+            H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM,
+            1,
+            b"hpack-block-spanning-reads",
+        );
+        let mut wire = h2_frame(H2_FRAME_TYPE_SETTINGS, 0, 0, &[0, 3, 0, 0, 0, 100]);
+        wire.extend_from_slice(&terminal_headers);
+
+        let framing = InboundResponseFraming::default();
+        let mut scanner = H2FrameScanner::default();
+        for byte in &wire {
+            scanner.observe(std::slice::from_ref(byte), &framing);
+        }
+        assert!(
+            framing.initial_headers_end_stream(),
+            "split frame headers must not lose the END_STREAM observation"
+        );
+    }
+
+    /// Stream 0 carries connection control only. A malformed control frame with
+    /// the END_STREAM bit set must never be mistaken for a response.
+    #[test]
+    fn connection_control_frames_never_record_response_headers() {
+        let framing = InboundResponseFraming::default();
+        let mut scanner = H2FrameScanner::default();
+        let control = h2_frame(H2_FRAME_TYPE_HEADERS, H2_FLAG_END_STREAM, 0, b"bogus");
+        scanner.observe(&control, &framing);
+        assert!(
+            !framing.initial_headers_end_stream(),
+            "stream 0 never carries a response HEADERS block"
+        );
+    }
+
+    /// No response observed at all (transport failure before HEADERS) must
+    /// report non-terminal, so `suppress_benign_early_response_reset` stays
+    /// strict on the failed-before-headers path.
+    #[test]
+    fn unobserved_response_headers_report_non_terminal() {
+        let framing = InboundResponseFraming::default();
+        assert!(!framing.initial_headers_end_stream());
     }
 
     #[test]

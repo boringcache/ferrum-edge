@@ -957,6 +957,17 @@ impl Plugin for PriorityOverridePlugin {
             .on_ws_frame(proxy_id, connection_id, direction, message)
             .await
     }
+    async fn on_ws_reassembly_frames(
+        &self,
+        proxy_id: &str,
+        connection_id: u64,
+        direction: WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        self.inner
+            .on_ws_reassembly_frames(proxy_id, connection_id, direction, fragment_frames)
+            .await
+    }
     fn prepare_ws_frame_delivery(
         &self,
         message: &tokio_tungstenite::tungstenite::Message,
