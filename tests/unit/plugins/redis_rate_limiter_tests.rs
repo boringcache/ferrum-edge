@@ -1214,6 +1214,105 @@ async fn watch_cas_helpers_fail_closed_when_connection_drops_after_watch() {
         !client.is_available(),
         "I/O failure must mark Redis unavailable"
     );
+    // Only the dedicated (WATCH/MULTI) connection path ran here, and its
+    // success arm does not arm the recovery checker. Marking unavailable must
+    // therefore arm it itself, or a client that only ever uses dedicated
+    // connections stays unavailable until the next config reload.
+    assert!(
+        client.health_checker_started_for_test(),
+        "a command-error transition to unavailable must arm the recovery checker"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// Complete the redis-rs handshake with `+OK` replies, then drop the socket the
+/// moment a `SET` arrives. This produces a genuine *command* error on the
+/// cached connection-manager path (not a connect error), which is the only way
+/// `set_bytes_nx_with_expire` reaches its own `mark_unavailable()`.
+async fn spawn_set_then_drop_redis_server() -> (u16, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    tokio::spawn(async move {
+                        let mut buf = vec![0_u8; 16 * 1024];
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if buf[..n]
+                                .windows(b"$3\r\nSET\r\n".len())
+                                .any(|w| w == b"$3\r\nSET\r\n")
+                            {
+                                // Hang up mid-command: the claim must fail
+                                // closed rather than be reported as won.
+                                break;
+                            }
+                            let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
+                            let mut reply = Vec::new();
+                            for _ in 0..commands {
+                                reply.extend_from_slice(b"+OK\r\n");
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx)
+}
+
+/// Fail-closed consumers (`soap_ws_security` with `nonce.replay_scope: shared`,
+/// `request_deduplication`) gate every future claim on `is_available()` and
+/// *reject* traffic while it is false. A transient command error on
+/// `set_bytes_nx_with_expire` — the atomic claim primitive both use — must
+/// therefore leave a live recovery task behind, or one blip pins replay
+/// enforcement closed until the next config reload.
+#[tokio::test]
+async fn a_command_error_on_the_claim_primitive_arms_the_recovery_checker() {
+    let (port, shutdown) = spawn_set_then_drop_redis_server().await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    // Long enough that the checker cannot itself flip availability during the
+    // assertions below — this test is about the task existing, not its result.
+    config.health_check_interval_seconds = 3600;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let claimed = client
+        .set_bytes_nx_with_expire("claim-key", b"marker", 60)
+        .await;
+    assert!(
+        claimed.is_err(),
+        "a mid-command disconnect must fail the claim closed, got {claimed:?}"
+    );
+    assert!(
+        !client.is_available(),
+        "a failed claim must mark Redis unavailable"
+    );
+    assert!(
+        client.health_checker_started_for_test(),
+        "a failed claim must leave a recovery task that can clear the outage"
+    );
+
+    let abort = client
+        .health_checker_abort_for_test()
+        .expect("recovery checker abort handle");
+    assert!(
+        !abort.is_finished(),
+        "the recovery checker must still be running after the failed claim"
+    );
 
     let _ = shutdown.send(());
 }

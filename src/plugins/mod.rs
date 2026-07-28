@@ -8540,10 +8540,10 @@ pub(crate) fn validate_plugin_config_policy_only(
         return Err(errs.join("; "));
     }
     // Redis-backed plugins (rate_limit / request_deduplication /
-    // ai_semantic_cache / soap_ws_security with sync_mode=redis) build their client from
-    // `redis_url` WITHOUT the egress policy, and the client skips literals
-    // / falls back to the hostname on a DNS denial — so a denied literal
-    // endpoint must be rejected here at config-load.
+    // ai_semantic_cache / soap_ws_security with sync_mode=redis) build their
+    // client from `redis_url` WITHOUT the egress policy, and the client skips
+    // literals / falls back to the hostname on a DNS denial — so a denied
+    // literal endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
     // screened *inside* `create_plugin_with_http_client` above (before a dial),
@@ -8559,10 +8559,10 @@ pub(crate) fn validate_plugin_config_policy_only(
 /// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
 /// policy at config-load. Redis-backed plugins (`rate_limit`,
 /// `request_deduplication`, `ai_semantic_cache`, `soap_ws_security` with
-/// `sync_mode=redis`) build
-/// their client from `redis_url` WITHOUT the policy, and the client skips IP
-/// literals / falls back to the hostname on a DNS denial — so a denied literal
-/// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
+/// `sync_mode=redis`) build their client from `redis_url` WITHOUT the policy,
+/// and the client skips IP literals / falls back to the hostname on a DNS
+/// denial — so a denied literal endpoint (`redis://169.254.169.254:6379`)
+/// would otherwise be dialed. No-op
 /// when there is no `redis_url`, it's a hostname (screened at resolve), or it
 /// doesn't parse (shape errors are surfaced by the constructor).
 pub(crate) fn screen_redis_endpoint_egress(

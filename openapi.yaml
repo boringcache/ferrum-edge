@@ -16170,9 +16170,18 @@ components:
                 outage fails closed with HTTP 401 (failure class
                 nonce_shared_backend_unavailable); there is no degrade-to-local
                 option because a per-replica fallback would reinstate the
-                cross-replica bypass. Admission enforces the pairing in both
-                directions: shared without sync_mode=redis is rejected, and
-                sync_mode=redis without shared is rejected.
+                cross-replica bypass. Recovery is automatic: any error that
+                marks the shared client unavailable — connect, DNS, or a
+                transient command error — also arms the background recovery
+                checker, which restores enforcement within
+                redis_health_check_interval_seconds without a reload (an
+                egress-policy denial is the exception and is a configuration
+                fix). Claim durability is Redis's own: run the replay keyspace
+                with maxmemory-policy noeviction and consistent failover, since
+                a lost claim key makes its nonce claimable again. Admission
+                enforces the pairing in both directions: shared without
+                sync_mode=redis is rejected, and sync_mode=redis without shared
+                is rejected.
             max_cache_size:
               type: integer
               format: uint64

@@ -1099,10 +1099,11 @@ impl SoapWsSecurity {
     /// Construct with no gateway HTTP client and no stable plugin-config
     /// identity.
     ///
-    /// Replay state is private to the returned instance, so this form cannot be
-    /// used for a production PasswordDigest deployment that needs replay history
-    /// to survive a reload. Production construction goes through
-    /// [`Self::new_with_http_client_and_config_id`].
+    /// Process replay state is private to the returned instance, so this form
+    /// cannot be used for a production PasswordDigest deployment that needs
+    /// replay history to survive a reload. Production construction goes through
+    /// [`Self::new_with_http_client_and_config_id`]. See [`Self::build`] for why
+    /// a `replay_scope: shared` config is still safe to construct here.
     // Called through `lib::_test_support` and external tests; the binary target
     // compiles this module without that facade and uses
     // `new_with_http_client_and_config_id` for production wiring.
@@ -1121,8 +1122,18 @@ impl SoapWsSecurity {
 
     /// `http_client` is `Option` on purpose: the plain `new()` path (Admin
     /// config validation and direct/test construction) must not have to build a
-    /// reqwest/TLS/DNS stack it never uses, and it never reaches a shared replay
-    /// backend anyway because it has no stable plugin-config identity.
+    /// reqwest/TLS/DNS stack it never uses.
+    ///
+    /// A `replay_scope: shared` config still constructs its Redis client on that
+    /// path — the backend is chosen by the config, not by the caller — but the
+    /// client connects lazily and validation never issues a claim, so no
+    /// connection, no recovery task, and no keyspace mutation results. With no
+    /// plugin-config id the default key prefix is also distinct
+    /// (`__standalone__`), so a validation-constructed instance cannot collide
+    /// with a live policy's keyspace unless an explicit `redis_key_prefix` makes
+    /// it do so. `replay_scope: process` without an id gets private state, which
+    /// is what keeps validation from reading, mutating, or consuming a live
+    /// proxy's claims.
     fn build(
         config: &Value,
         http_client: Option<&PluginHttpClient>,

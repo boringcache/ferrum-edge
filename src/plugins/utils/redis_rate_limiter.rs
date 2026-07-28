@@ -51,6 +51,16 @@
 //! client: dropping the client aborts it so retired plugin generations do not
 //! retain connections or keep pinging obsolete endpoints.
 //!
+//! Every transition to unavailable arms that task, because
+//! [`RedisRateLimitClient::mark_unavailable`] owns both halves. Not every
+//! consumer of `is_available()` fails *open*: `soap_ws_security`'s
+//! `replay_scope: shared` PasswordDigest claims and `request_deduplication`'s
+//! exactly-once admission deliberately reject traffic while the shared backend
+//! is unavailable, so an unarmed checker would convert one transient command
+//! error into an outage lasting until the next config reload. The single
+//! exception is an egress-policy denial, which is configuration rather than a
+//! transient outage and uses `mark_unavailable_without_recovery`.
+//!
 //! # Connection pool
 //!
 //! `redis_pool_size` sizes a bounded set of multiplexed
@@ -783,11 +793,12 @@ impl RedisRateLimitClient {
         Arc::clone(&self.available)
     }
 
-    /// Mark Redis unavailable and start the recovery checker (test support).
+    /// Mark Redis unavailable (test support). Arming the recovery checker is
+    /// part of [`Self::mark_unavailable`] itself, so this exercises the same
+    /// transition production error paths take.
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
-        self.start_health_checker_if_needed();
     }
 
     /// Whether the background recovery checker has been started (test support).
@@ -1097,14 +1108,13 @@ impl RedisRateLimitClient {
                 // Policy denial: fail closed to the in-memory limiter with NO
                 // recovery checker — it would re-screen and stay denied every
                 // interval. A config change rebuilds the client.
-                self.mark_unavailable();
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
                 // Transient DNS failure: fail closed (never dial an unscreened
                 // host), but let the recovery checker re-screen later.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1118,7 +1128,6 @@ impl RedisRateLimitClient {
                     "Failed to create Redis client for rate limiting"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1145,7 +1154,6 @@ impl RedisRateLimitClient {
                     "Failed to connect to Redis for rate limiting — falling back to local"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1156,7 +1164,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting to Redis for rate limiting — falling back to local"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1189,14 +1196,13 @@ impl RedisRateLimitClient {
                 // Policy denial: fail closed to the in-memory limiter with NO
                 // recovery checker — it would re-screen and stay denied every
                 // interval. A config change rebuilds the client.
-                self.mark_unavailable();
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
                 // Transient DNS failure: fail closed (never dial an unscreened
                 // host), but let the recovery checker re-screen later.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1209,7 +1215,6 @@ impl RedisRateLimitClient {
                     "Failed to create dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1226,7 +1231,6 @@ impl RedisRateLimitClient {
                     "Failed to connect dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1236,7 +1240,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1250,8 +1253,41 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Mark Redis as unavailable and clear the connection for re-resolution.
+    /// Mark Redis as unavailable, clear the connection for re-resolution, and
+    /// guarantee the background recovery checker is running.
+    ///
+    /// Starting the checker here rather than at each call site is a security
+    /// invariant, not a convenience. Callers fall into two classes:
+    ///
+    /// - **Fail-open consumers** (the rate limiters) degrade to an in-memory
+    ///   limiter while `is_available()` is false, so a checker that never runs
+    ///   costs accuracy.
+    /// - **Fail-closed consumers** (`soap_ws_security`'s `replay_scope: shared`
+    ///   PasswordDigest replay claims, `request_deduplication`'s exactly-once
+    ///   admission) *reject* traffic while `is_available()` is false. For those,
+    ///   a missing checker turns one transient error into an outage that only a
+    ///   config reload can clear.
+    ///
+    /// Only the connect paths used to start it, so a client whose commands ran
+    /// on [`Self::get_dedicated_connection`] (which does not start it on
+    /// success) could be pinned unavailable forever by a single `WATCH`/`EXEC`
+    /// I/O error. Owning the transition here makes "unavailable implies a live
+    /// recovery task" hold for every present and future error path.
+    ///
+    /// The one transition that must *not* arm recovery is an egress-policy
+    /// denial — see [`Self::mark_unavailable_without_recovery`].
     fn mark_unavailable(&self) {
+        self.mark_unavailable_without_recovery();
+        self.start_health_checker_if_needed();
+    }
+
+    /// Mark Redis unavailable **without** arming the recovery checker.
+    ///
+    /// Reserved for egress-policy denials: re-screening the same denied
+    /// endpoint every interval would stay denied forever, so this is
+    /// configuration rather than a transient outage and a config change (which
+    /// rebuilds the client) is the recovery path.
+    fn mark_unavailable_without_recovery(&self) {
         self.available.store(false, Ordering::Relaxed);
         self.clear_connection();
     }
