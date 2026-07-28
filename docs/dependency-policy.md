@@ -44,6 +44,8 @@ Each row is the authoritative tracking record. Keep this table, the
 | `tungstenite` | 0.29.0 | Distinct `FrameTooLong` origin for pre-reservation frame policy | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason | Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tungstenite` | 0.29.0 | `WebSocketConfig::auto_pong` opt-out for transparent Ping relay | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy | Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong | [docs/upstream-tungstenite-patches/003-…](upstream-tungstenite-patches/003-optional-auto-pong/README.md) |
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
+| `tungstenite` | 0.29.0 | `FragmentMeter` + `max_incomplete_message_frames` / `max_incomplete_message_duration` (physical-fragment accounting and bounds) | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | The reader only sees reassembled messages, so fragmented (including zero-length continuation) frames bypass per-message admission policy and are unbounded in count and duration | Upstream ships an equivalent pre-reassembly fragment hook **and** independent incomplete-message count/duration bounds | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
+| `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 
 > Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
@@ -51,7 +53,8 @@ Each row is the authoritative tracking record. Keep this table, the
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
 > docs. Patches carried without an upstream PR, including the tungstenite frame
-> error-origin extension, the tungstenite `auto_pong` opt-out, and the dimpl
+> error-origin extension, the tungstenite `auto_pong` opt-out, the tungstenite /
+> tokio-tungstenite fragment-accounting extension, and the dimpl
 > credential-security patch, are governed by the
 > [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
 
@@ -63,7 +66,8 @@ tungstenite #556 / tokio-tungstenite #380); the weekly
 merges. Fork-only patches currently include **h3 002** (Extended CONNECT
 `:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
 frame-limit origin extension, **tungstenite `auto_pong`** (transparent Ping
-relay), and **dimpl 001** (DTLS certificate chains and private-key
+relay), **tungstenite / tokio-tungstenite 004** (fragment accounting and
+incomplete-message bounds), and **dimpl 001** (DTLS certificate chains and private-key
 zeroization). They are not untracked TODOs; they are carried as
 **deliberate, time-boxed forks** and are governed as follows:
 
@@ -190,6 +194,10 @@ of the vendor copy and must keep passing after retirement:
   `tests/unit/gateway_core/websocket_auto_pong_tests.rs`, with end-to-end
   coverage in `tests/functional/functional_websocket_test.rs`
   (`test_*websocket_ping_*`).
+- The tungstenite / tokio-tungstenite fragment-accounting regressions live in
+  the vendored crate (`protocol::tests::fragment_*`,
+  `protocol::tests::incomplete_message_*`) and in
+  `tests/unit/gateway_core/websocket_fragment_metering_tests.rs`.
 - The dimpl credential regressions live in
   `vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs`. They
   cover DTLS 1.2 and 1.3 chain transmission plus deterministic clone,
