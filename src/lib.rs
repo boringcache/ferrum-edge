@@ -1253,11 +1253,7 @@ pub mod _test_support {
         http_client: crate::plugins::PluginHttpClient,
         ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
     ) -> Result<crate::plugins::loki_logging::LokiLogging, String> {
-        crate::plugins::loki_logging::LokiLogging::new_with_ceiling(
-            config,
-            http_client,
-            ceiling,
-        )
+        crate::plugins::loki_logging::LokiLogging::new_with_ceiling(config, http_client, ceiling)
     }
 
     /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
