@@ -619,7 +619,17 @@ impl H2FrameScanner {
             if self.header_len < H2_FRAME_HEADER_LEN {
                 return;
             }
-            let [len_hi, len_mid, len_lo, frame_type, flags, id0, id1, id2, id3] = self.header;
+            let [
+                len_hi,
+                len_mid,
+                len_lo,
+                frame_type,
+                flags,
+                id0,
+                id1,
+                id2,
+                id3,
+            ] = self.header;
             let payload_len = u32::from_be_bytes([0, len_hi, len_mid, len_lo]) as usize;
             let stream_id = u32::from_be_bytes([id0, id1, id2, id3]) & 0x7fff_ffff;
             self.header_len = 0;
