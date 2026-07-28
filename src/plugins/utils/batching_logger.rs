@@ -500,14 +500,15 @@ impl<T: Send + 'static> BatchingLogger<T> {
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     return if on_overflow(item, "buffer full") {
                         TrySendOutcome::DiversionAccepted
                     } else {
+                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                         TrySendOutcome::BufferFull
                     };
                 }
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -773,14 +774,15 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
                 decrement_queue_depth(&self.outstanding_count);
-                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     return if on_overflow(item, "buffer full") {
                         TrySendOutcome::DiversionAccepted
                     } else {
+                        record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                         TrySendOutcome::BufferFull
                     };
                 }
+                record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 TrySendOutcome::BufferFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
