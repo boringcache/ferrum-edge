@@ -1841,8 +1841,16 @@ pub struct RequestContext {
     headers_materialized: bool,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
-    /// duplicate pairs.
+    /// duplicate pairs. Unmodified when no query mutation/strip applies.
     raw_query_string: Option<String>,
+    /// Backend-bound query after `request_transformer` ordered mutations.
+    /// `None` means "use [`Self::raw_query_string`] unchanged" (ordinary
+    /// no-transform hot path). `Some("")` is an explicit empty outbound query
+    /// after a transform removed every pair. Authentication-owned strips are
+    /// removed from the transformer input before query rules run, and the
+    /// proxy applies [`crate::proxy::query_string_after_plugin_strips`] again
+    /// as defense in depth when composing the canonical backend-visible query.
+    outbound_query_string: Option<String>,
     /// Whether either decoded or raw query-param materialization has already
     /// populated `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
@@ -1853,6 +1861,9 @@ pub struct RequestContext {
     /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
     /// historical compatibility. HTTP/3 materializes raw query params unless
     /// an active plugin explicitly requires the decoded representation.
+    /// After a query transform, this map is rebuilt from the ordered outbound
+    /// representation (last occurrence wins) so later plugins see coherent
+    /// state without re-parsing the wire query.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Arc<Consumer>>,
@@ -2525,6 +2536,7 @@ impl RequestContext {
             headers: HashMap::new(),
             headers_materialized: false,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
@@ -3326,6 +3338,7 @@ impl RequestContext {
             headers: self.headers.clone(),
             headers_materialized: true,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: self.matched_proxy.clone(),
@@ -4078,6 +4091,7 @@ impl RequestContext {
     pub fn set_raw_query_string(&mut self, qs: String) {
         self.query_params.clear();
         self.query_params_materialized = false;
+        self.outbound_query_string = None;
         self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
@@ -4088,6 +4102,34 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Publish the ordered outbound query after `request_transformer` mutations
+    /// and rebuild the plugin-visible single-value map from that same
+    /// representation.
+    ///
+    /// Pass an empty string when every pair was removed. Marks query params as
+    /// materialized so a later materialization pass cannot resurrect the
+    /// pre-transform raw query into `query_params`. Callers must not log the
+    /// outbound value — it may contain secrets the transform just relocated.
+    #[inline]
+    pub fn publish_transformed_query(
+        &mut self,
+        outbound: String,
+        params: std::collections::HashMap<String, String>,
+    ) {
+        self.outbound_query_string = Some(outbound);
+        self.query_params = params;
+        self.query_params_materialized = true;
+    }
+
+    /// Borrow the transformer-published outbound query, when present.
+    ///
+    /// `Some("")` is distinct from `None`: empty means the transform cleared
+    /// the query; `None` means no transform ran and the raw wire query applies.
+    #[inline]
+    pub fn outbound_query_string(&self) -> Option<&str> {
+        self.outbound_query_string.as_deref()
     }
 
     /// Record the client's original request target after canonicalization
@@ -6157,11 +6199,11 @@ pub mod priority {
     pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
-    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
-    /// SOCK_OPS event consumer. Auto-injected only when topology is
-    /// `NodeWaypoint`. Lives in the observability band alongside other
-    /// metric-emitter plugins so its `log` hook runs after all
-    /// transaction-summary serialization.
+    /// Rst, Fin, SRTT/SYN→ACK latency histograms, BPF drop reasons,
+    /// ringbuf overrun) from the SOCK_OPS event consumer. Auto-injected
+    /// only when topology is `NodeWaypoint`. Lives in the observability
+    /// band alongside other metric-emitter plugins so its `log` hook
+    /// runs after all transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
@@ -7626,6 +7668,42 @@ pub trait Plugin: Send + Sync {
         _connection_id: u64,
         _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        None
+    }
+
+    /// Called for the physical WebSocket frames a peer spent on message
+    /// reassembly that [`Plugin::on_ws_frame`] can never see.
+    ///
+    /// Tungstenite yields only reassembled messages, so the initial non-final
+    /// Text/Binary frame and every intermediate Continuation frame — including
+    /// zero-length ones — are invisible to `on_ws_frame`. Without this hook a
+    /// peer could drive unbounded framing work while paying for a single
+    /// logical message (GHSA-qq94-2gv2-phh6).
+    ///
+    /// `fragment_frames` is always `>= 1` and counts only frames that produced
+    /// no message. The completing frame is charged exactly once through the
+    /// ordinary [`Plugin::on_ws_frame`] call for the reassembled message, so a
+    /// plugin implementing both hooks charges each wire frame exactly once.
+    ///
+    /// The relay invokes this before the message chain for the read that
+    /// surfaced them, and also for an interleaved Ping/Pong that arrives
+    /// mid-reassembly. A peer `Close` is the exception: it bypasses mutating
+    /// admission entirely so no plugin can replace the peer's code/reason, and
+    /// the session is ending anyway. There is no message to mutate: only
+    /// `Some(Message::Close(..))` is honored, which closes the connection in
+    /// both directions; every other return value is ignored. Observational
+    /// plugins ([`Plugin::observes_ws_frame_decisions`]) are skipped entirely.
+    ///
+    /// The count/duration ceilings that stop a message which never completes
+    /// live in the parser (see `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+    /// / `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), not here.
+    async fn on_ws_reassembly_frames(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _fragment_frames: u64,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
     }
