@@ -12341,7 +12341,16 @@ components:
       properties:
         endpoint_url:
           type: string
-          description: URL to POST transaction logs to
+          description: >-
+            URL to POST transaction logs to. Must be http:// or https:// with a
+            hostname or IP address; userinfo credentials
+            (https://user:pass@host) are rejected — authenticate with
+            custom_headers. Some collectors require a credential in the URL
+            (Sumo Logic path token, Mezmo apikey query parameter), so this value
+            is never rendered in operational output: egress-denial, DNS/TLS,
+            retry, slow-call, and batch-failure diagnostics show only a
+            structurally redacted scheme://host:port/redacted form, and the
+            admin audit projection redacts it the same way.
         custom_headers:
           type: object
           additionalProperties:
@@ -15585,7 +15594,9 @@ components:
                   a backend; takes precedence over `rewrite` and the route
                   override destination. A status-only redirect is valid and
                   preserves the original URL. A rule carrying a `redirect`
-                  does not require a `destination`.
+                  does not require a `destination`. `port` and `derive_port`
+                  are mutually exclusive (Istio oneof); scheme-default ports
+                  are omitted from Location.
                 properties:
                   uri:
                     type: [string, "null"]
@@ -15603,7 +15614,23 @@ components:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
-                    description: Replacement authority port; request host is preserved when authority is unset.
+                    description: |
+                      Replacement authority port (Istio `redirect.port`); request
+                      host is preserved when authority is unset. Mutually
+                      exclusive with `derive_port`. Scheme-default ports
+                      (`80`/`http`, `443`/`https`) are omitted from Location.
+                  derive_port:
+                    type: [string, "null"]
+                    enum: [FROM_PROTOCOL_DEFAULT, FROM_REQUEST_PORT, null]
+                    description: |
+                      Dynamically derive the Location authority port (Istio
+                      `redirect.derivePort`). `FROM_PROTOCOL_DEFAULT` uses 80 for
+                      http and 443 for https (including when `scheme` is set on
+                      the same redirect). `FROM_REQUEST_PORT` uses the trusted
+                      request port: original-destination port when capture
+                      rewrote the accept socket, otherwise the frontend listener
+                      port — never spoofable `X-Forwarded-Port` / `Forwarded`
+                      headers. Mutually exclusive with `port`.
                   scheme:
                     type: [string, "null"]
                     enum: [http, https, null]
@@ -15805,7 +15832,8 @@ components:
       type: object
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
-        plugin that exposes BPF SOCK_OPS counters on the Prometheus scrape
+        plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
+        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
@@ -15814,7 +15842,11 @@ components:
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
           default: ferrum_mesh_bpf
-          description: Prometheus metric name prefix for emitted BPF counters.
+          description: |
+            Prometheus metric name prefix for emitted BPF counters and
+            latency histograms (default families include
+            `{prefix}_srtt_microseconds` and
+            `{prefix}_syn_to_ack_microseconds`).
 
     SoapWsSecurityConfig:
       type: object
@@ -16919,10 +16951,20 @@ components:
           type: string
           enum: [add, remove, update, rename]
           description: |
-            add: insert if absent (does not overwrite).
-            update: write the query parameter value.
-            remove: delete the query parameter.
-            rename: move old → new query parameter name.
+            add: append if the decoded name is absent (does not overwrite;
+            existing duplicates are left untouched).
+            update: rewrite every matching decoded-name pair's value, or
+            append when absent.
+            remove: delete every matching decoded-name pair.
+            rename: rename every matching pair, preserving value encoding
+            and key-without-equals shape; existing destination names stay.
+            Mutations apply to an ordered, duplicate-aware representation of
+            the retained raw query after authentication-owned credential
+            pairs (`auth.strip_query_param.*`) are removed from that input,
+            and are published as the outbound query for every primary
+            backend URL builder and request_mirror. The proxy still applies
+            a final strip pass as defense in depth. A rename/update of a
+            marked credential name therefore cannot relocate the secret.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.
@@ -16931,15 +16973,20 @@ components:
           const: query
         key:
           type: string
-          description: Query parameter name.
+          description: |
+            Query parameter name matched after percent-decoding. Must not
+            contain CR or LF.
         value:
           type: string
           description: |
             Required for add/update; must not be set for remove/rename.
+            Must not contain CR or LF. Authored onto the outbound query with
+            RFC 3986 percent-encoding (`%20` for spaces, never `+`).
         new_key:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not contain CR or LF.
 
     RequestTransformerBodyRule:
       type: object
@@ -18203,7 +18250,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. XML conversion honors OpenAPI XML Object fields
+        binary media types. Multipart Content-Disposition accepts ordinary
+        `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
+        unquoted ext-value) and rejects continuations, quoted `filename*`,
+        bare/non-token parameter segments, conflicts, and hostile extended
+        values.
+        XML conversion honors OpenAPI XML Object fields
         `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
@@ -19324,7 +19376,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -19400,7 +19452,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on unsafe methods (POST, PUT, PATCH, DELETE, and extension methods, which are conservatively treated as unsafe). Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating"
+          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
 
     GraphqlConfig:
       type: object
@@ -20047,7 +20099,7 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form, and the admin audit projection redacts it the same way."
             allow_insecure_loopback:
               type: boolean
               default: false
@@ -20792,7 +20844,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:
@@ -21666,7 +21718,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -21737,23 +21789,6 @@ components:
                 type: boolean
                 default: false
                 description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
-        fallback:
-          type: object
-          additionalProperties: false
-          description: "Reserved fallback policy. Parsed and validated but not yet active: ai_stream_router cannot switch providers after the first downstream byte."
-          properties:
-            enabled:
-              type: boolean
-              default: false
-            on_connect_error:
-              type: boolean
-              default: true
-            on_5xx_before_first_byte:
-              type: boolean
-              default: true
-            max_attempts:
-              type: integer
-              default: 2
 
     A2aGatewayConfig:
       type: object
@@ -22564,6 +22599,17 @@ components:
                 `async_insert` is enabled and the wait setting is omitted, the
                 sink pins `wait_for_async_insert=1` rather than inheriting the
                 ClickHouse user/profile default.
+
+                Credential-bearing parameter names are rejected: the exact names
+                `user`, `password`, `access_token`, and `session_id`, plus any
+                name containing `apikey`, `api_key`, `credential`, `passwd`,
+                `secret`, or `token`. Authenticate with `username` and
+                `password_ref`, which are sent as an HTTP Basic header rather
+                than appended to the INSERT URL. Parameter values stay arbitrary
+                bounded strings, so the sink never renders the INSERT query
+                string in any diagnostic; failures report a structurally
+                redacted `scheme://host:port/redacted` endpoint. Admin audit
+                projections redact every value in this map.
             allow_lossy_async_insert:
               type: boolean
               default: false
@@ -24084,13 +24130,17 @@ components:
             - UnsupportedExternalRef
             - SchemaReference
             - SchemaTooDeep
+            - SchemaReferenceCycle
+            - SchemaTooLarge
           description: |
             Machine-readable error discriminant.
 
             **Parse-time / structural — returned as HTTP 400 Bad Request:**
 
-            - `InvalidJson` — body is not valid JSON
-            - `InvalidYaml` — body is not valid YAML
+            - `InvalidJson` — body is not valid JSON, or the parsed JSON document exceeds the
+              500,000-node source-tree ceiling
+            - `InvalidYaml` — body is not valid YAML, uses anchors/aliases, or the parsed YAML
+              document exceeds the same 500,000-node source-tree ceiling
             - `UnknownVersion` — no recognised `swagger: "2.0"` or `openapi: "3.x.y"` at root
             - `MissingProxyExtension` — `x-ferrum-proxy` is absent
             - `MalformedExtension` — `x-ferrum-proxy`, `x-ferrum-upstream`, or `x-ferrum-plugins` failed to deserialise
@@ -24106,6 +24156,13 @@ components:
             - `UnsupportedExternalRef` — `x-ferrum-validate` references an external `$ref`; only local refs are resolved into generated plugin config
             - `SchemaReference` — a local schema `$id`, `$anchor`, URI fragment, or `$ref` is malformed, duplicated, or unresolved
             - `SchemaTooDeep` — `x-ferrum-validate` schema refs exceed the resolver depth limit
+            - `SchemaReferenceCycle` — a local `$ref` chain re-enters a target that is still being
+              expanded (self-cycle, mutual cycle, or a longer ref loop). Rejected immediately on
+              re-entry rather than after exhausting the depth limit; `details` carries the chain of
+              `$ref` literals that closed the cycle
+            - `SchemaTooLarge` — reference expansion exceeded the per-expansion or cumulative
+              per-document materialized-node / byte budget, or the generated operation table
+              exceeded the generated-config byte ceiling
         details:
           type: string
           description: |

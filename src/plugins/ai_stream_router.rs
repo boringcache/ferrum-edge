@@ -32,8 +32,14 @@
 //! - `anthropic`: OpenAI Chat Completions request is translated to the Anthropic
 //!   Messages API streaming request (including assistant `tool_calls` and
 //!   matching `role: "tool"` results); Anthropic SSE events are normalized back
-//!   to OpenAI `chat.completion.chunk` SSE. Normalization requires Anthropic
-//!   `message_stop` (or an explicit provider `error`) before emitting a
+//!   to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"` becomes
+//!   Anthropic `{"type":"none"}` with the tools list retained; unsupported
+//!   tool_choice values and forced tool use with manual extended thinking
+//!   (`thinking.type: "enabled"`) are rejected at admission. Adaptive thinking
+//!   may combine with OpenAI `required` / named choices. Provider `tool_use`
+//!   under a none constraint fails closed instead of becoming OpenAI
+//!   `tool_calls`. Normalization requires
+//!   Anthropic `message_stop` (or an explicit provider `error`) before emitting a
 //!   success-shaped terminal sequence; premature EOF / malformed events fail
 //!   closed with an upstream-error SSE frame. Requests that will be normalized
 //!   strip `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip /
@@ -42,10 +48,43 @@
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
 //!
-//! Fallback across providers after the first downstream byte is intentionally
-//! out of scope: once response headers/bytes have streamed to the client the
-//! provider cannot be switched. `ai_stream_router.fallback_attempts` is always
-//! `0` in this MVP.
+//! ## Provider fallback is rejected, not stored
+//!
+//! This plugin does **not** implement provider fallback, and a `fallback`
+//! config block is rejected at admission rather than parsed into an inert
+//! policy (issue #3328). Post-first-byte provider switching remains prohibited
+//! for the obvious reason — once response headers/bytes have streamed to the
+//! client the provider cannot be changed — but *pre*-first-byte fallback is
+//! also unimplementable at this layer, because the routing decision this plugin
+//! makes is committed exactly once and then consumed by the ordinary dispatch
+//! path:
+//!
+//! - `before_proxy` writes the provider's scheme/host/port/path/authority and
+//!   `route_override_resolved_tls` into [`RequestContext`]; the proxy bakes
+//!   those into a single effective `Arc<Proxy>` (`apply_route_overrides*`)
+//!   before any backend attempt.
+//! - The provider credential, `Host`, `anthropic-version`, and
+//!   `Accept-Encoding` policy are written into one request header map that the
+//!   dispatch loop borrows immutably for every attempt.
+//! - The provider-specific request body (Anthropic Messages translation vs.
+//!   OpenAI passthrough) is produced once by
+//!   `transform_request_body_with_context` and verified once by
+//!   `on_final_request_body_with_context`; the proxy guards that pipeline with
+//!   `request_body_prepared` so it cannot re-run.
+//! - The dispatch retry loop replays those exact prepared bytes and headers
+//!   against the same effective proxy, rotating only the load-balancer target
+//!   within one upstream. It has no per-attempt re-preparation boundary.
+//!
+//! A second provider needs a different endpoint/authority, different
+//! credentials, a different backend TLS resolution, a different translated
+//! body, and a different response-normalization decision — none of which are
+//! per-attempt today. Nor can the plugin retry internally: [`PluginResult`] can
+//! only short-circuit with a fully materialized body, so a plugin-owned
+//! fallback loop would have to buffer the entire SSE response and destroy the
+//! streaming contract this plugin exists to provide. Accepting a `fallback`
+//! block would therefore be worse than rejecting it: an operator could submit
+//! valid-looking failover policy and silently receive none. Admission fails
+//! closed instead.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -77,7 +116,6 @@ pub const AI_STREAM_ROUTER_CONFIG_KEYS: &[&str] = &[
     "inject_usage_options",
     "normalize_response_stream",
     "providers",
-    "fallback",
 ];
 
 /// Accepted keys for each `providers[]` entry.
@@ -93,13 +131,12 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "inherit_backend_tls",
 ];
 
-/// Accepted keys for the optional `fallback` object.
-pub const AI_STREAM_ROUTER_FALLBACK_KEYS: &[&str] = &[
-    "enabled",
-    "on_connect_error",
-    "on_5xx_before_first_byte",
-    "max_attempts",
-];
+/// Admission diagnostic for the rejected `fallback` block (issue #3328).
+///
+/// The plugin never switches providers, so storing a fallback policy could only
+/// ever be runtime-inert. See the module docs for why pre-first-byte fallback
+/// cannot be expressed at this layer.
+pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
 
 // ---------------------------------------------------------------------------
 // Metadata keys
@@ -115,8 +152,11 @@ const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
-const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
+/// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
+/// Request-local only: the response normalizer fails closed if the provider
+/// nevertheless emits `tool_use` for that generation.
+const META_TOOL_CHOICE_NONE: &str = "ai_stream_router.tool_choice_none";
 /// Provider `Content-Encoding` that must be decoded before Anthropic SSE
 /// normalization. Stamped in `after_proxy` before representation headers are
 /// repaired so both streaming and buffered normalizers see the same coding.
@@ -232,27 +272,6 @@ impl StreamProvider {
     }
 }
 
-/// Parsed `fallback` block. Stored for admin/observability parity; MVP does not
-/// switch providers after the first downstream byte.
-#[derive(Debug, Clone)]
-struct FallbackConfig {
-    enabled: bool,
-    on_connect_error: bool,
-    on_5xx_before_first_byte: bool,
-    max_attempts: u32,
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            on_connect_error: true,
-            on_5xx_before_first_byte: true,
-            max_attempts: 2,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Plugin struct
 // ---------------------------------------------------------------------------
@@ -264,8 +283,6 @@ pub struct AiStreamRouter {
     inject_usage_options: bool,
     normalize_response_stream: bool,
     providers: Vec<StreamProvider>,
-    #[allow(dead_code)]
-    fallback: FallbackConfig,
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
@@ -282,8 +299,8 @@ impl AiStreamRouter {
             .ok_or_else(|| "ai_stream_router: config must be an object".to_string())?;
 
         // Reject ambiguous fields that belong to `ai_federation`'s flat config
-        // shape, so an operator does not silently mix a non-streaming fallback
-        // config into this plugin (which uses a nested `fallback` block).
+        // shape, plus the `fallback` block this plugin cannot honor, BEFORE the
+        // generic unknown-key sweep so both get a specific diagnostic.
         reject_ambiguous_fields(config)?;
         reject_unknown_keys(
             config_object,
@@ -407,8 +424,6 @@ impl AiStreamRouter {
         // Ascending priority — lowest value is tried first.
         providers.sort_by_key(|p| p.priority);
 
-        let fallback = parse_fallback(config)?;
-
         let response_stream_hooks = enabled
             && normalize_response_stream
             && providers
@@ -422,7 +437,6 @@ impl AiStreamRouter {
             inject_usage_options,
             normalize_response_stream,
             providers,
-            fallback,
             response_stream_hooks,
         })
     }
@@ -438,7 +452,13 @@ impl AiStreamRouter {
 }
 
 /// Fields that belong to `ai_federation`'s flat config surface and would be
-/// silently ignored (or misinterpreted) here.
+/// silently ignored (or misinterpreted) here, plus the `fallback` block this
+/// plugin refuses to store (issue #3328).
+///
+/// The `fallback` rejection is deliberately a *separate*, more specific
+/// diagnostic than the generic unknown-key path: an operator submitting a
+/// well-formed failover policy needs to be told the capability does not exist,
+/// not that they made a typo.
 fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     const AMBIGUOUS: &[&str] = &[
         "stream",
@@ -452,37 +472,16 @@ fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     for field in AMBIGUOUS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and configures fallback under the nested 'fallback' block"
+                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and does not implement provider fallback"
             ));
         }
     }
+    // Any presence at all — object, empty object, `null`, or scalar — is
+    // refused. A policy that cannot be honored must never be admitted.
+    if config.get("fallback").is_some() {
+        return Err(AI_STREAM_ROUTER_FALLBACK_REJECTION.to_string());
+    }
     Ok(())
-}
-
-fn parse_fallback(config: &Value) -> Result<FallbackConfig, String> {
-    let Some(fb) = config.get("fallback") else {
-        return Ok(FallbackConfig::default());
-    };
-    let fallback_object = fb
-        .as_object()
-        .ok_or_else(|| "ai_stream_router: 'fallback' must be an object".to_string())?;
-    reject_unknown_keys(
-        fallback_object,
-        "config.fallback",
-        AI_STREAM_ROUTER_FALLBACK_KEYS,
-        "ai_stream_router: ",
-    )?;
-    let defaults = FallbackConfig::default();
-    Ok(FallbackConfig {
-        enabled: optional_bool(fb, "enabled")?.unwrap_or(defaults.enabled),
-        on_connect_error: optional_bool(fb, "on_connect_error")?
-            .unwrap_or(defaults.on_connect_error),
-        on_5xx_before_first_byte: optional_bool(fb, "on_5xx_before_first_byte")?
-            .unwrap_or(defaults.on_5xx_before_first_byte),
-        max_attempts: optional_u64(fb, "max_attempts")?
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
-            .unwrap_or(defaults.max_attempts),
-    })
 }
 
 fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
@@ -1006,7 +1005,191 @@ fn validate_anthropic_translation(openai_body: &Value) -> Result<(), String> {
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| "request missing 'messages' array".to_string())?;
-    validate_openai_tool_history(messages)
+    validate_openai_tool_history(messages)?;
+    let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
+    resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?;
+    Ok(())
+}
+
+/// OpenAI `tool_choice` kinds that Anthropic translation understands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolChoiceKind {
+    None,
+    Auto,
+    /// OpenAI `required` → Anthropic `{"type":"any"}`.
+    ForcedAny,
+    ForcedNamed,
+}
+
+fn openai_declared_tool_names(openai_body: &Value) -> Result<Option<Vec<&str>>, String> {
+    let Some(tools) = openai_body.get("tools") else {
+        return Ok(None);
+    };
+    if tools.is_null() {
+        return Ok(None);
+    }
+    let arr = tools
+        .as_array()
+        .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+    if arr.is_empty() {
+        return Ok(None);
+    }
+    let mut names = Vec::with_capacity(arr.len());
+    for tool in arr {
+        let func = tool.get("function").unwrap_or(tool);
+        let name = func
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| valid_tool_name(value))
+            .ok_or_else(|| "unsupported or malformed tools".to_string())?;
+        names.push(name);
+    }
+    Ok(Some(names))
+}
+
+/// Effective Anthropic `max_tokens` this route forwards (OpenAI `max_tokens`,
+/// else `max_completion_tokens`, else the translation default).
+fn anthropic_effective_max_tokens(openai_body: &Value) -> u64 {
+    openai_body["max_tokens"]
+        .as_u64()
+        .or_else(|| openai_body["max_completion_tokens"].as_u64())
+        .unwrap_or(4096)
+}
+
+/// Map supported OpenAI `tool_choice` values to Anthropic's object form.
+/// Unsupported, malformed, or ambiguous values fail closed — never silently
+/// dropped into the provider default (`auto` when tools are present).
+fn resolve_anthropic_tool_choice(
+    openai_body: &Value,
+) -> Result<Option<(ToolChoiceKind, Value)>, String> {
+    let Some(choice) = openai_body.get("tool_choice") else {
+        return Ok(None);
+    };
+    if choice.is_null() {
+        return Ok(None);
+    }
+
+    let (kind, translated) = match choice {
+        Value::String(value) => match value.as_str() {
+            "none" => (ToolChoiceKind::None, json!({ "type": "none" })),
+            "auto" => (ToolChoiceKind::Auto, json!({ "type": "auto" })),
+            // OpenAI Chat Completions string form; Anthropic `any` is the
+            // translated object type, not an accepted OpenAI input string.
+            "required" => (ToolChoiceKind::ForcedAny, json!({ "type": "any" })),
+            _ => {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+        },
+        Value::Object(object) => {
+            // Closed OpenAI shape: {type:"function", function:{name:...}}.
+            if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("function") {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let function = object
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            if function.len() != 1 {
+                return Err("unsupported or malformed tool_choice".to_string());
+            }
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| valid_tool_name(value))
+                .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+            (
+                ToolChoiceKind::ForcedNamed,
+                json!({ "type": "tool", "name": name }),
+            )
+        }
+        _ => return Err("unsupported or malformed tool_choice".to_string()),
+    };
+
+    let tools = openai_declared_tool_names(openai_body)?;
+    if kind != ToolChoiceKind::None && tools.is_none() {
+        return Err("tool_choice requires a non-empty tools array".to_string());
+    }
+    if kind == ToolChoiceKind::ForcedNamed {
+        let name = translated
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "unsupported or malformed tool_choice".to_string())?;
+        if !tools.as_ref().is_some_and(|names| names.contains(&name)) {
+            return Err("named tool_choice does not match any declared tool".to_string());
+        }
+    }
+
+    Ok(Some((kind, translated)))
+}
+
+/// Forward closed Anthropic thinking shapes when present. Manual extended
+/// thinking (`type: "enabled"`) cannot combine with forced tool use; adaptive
+/// thinking may. Budget must satisfy Anthropic's ordinary contract relative to
+/// the effective `max_tokens` this route forwards.
+fn resolve_anthropic_thinking(
+    openai_body: &Value,
+    tool_choice_kind: Option<ToolChoiceKind>,
+) -> Result<Option<Value>, String> {
+    let Some(thinking) = openai_body.get("thinking") else {
+        return Ok(None);
+    };
+    if thinking.is_null() {
+        return Ok(None);
+    }
+    let object = thinking
+        .as_object()
+        .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+    let thinking_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+
+    let forwarded = match thinking_type {
+        "enabled" => {
+            // Closed shape: exactly `type` and `budget_tokens`.
+            if object.len() != 2 || !object.contains_key("budget_tokens") {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            let budget_value = object
+                .get("budget_tokens")
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            if !budget_value.is_u64() {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            let budget = budget_value
+                .as_u64()
+                .ok_or_else(|| "unsupported or malformed thinking".to_string())?;
+            let max_tokens = anthropic_effective_max_tokens(openai_body);
+            // Ordinary Anthropic contract: budget_tokens >= 1024 and strictly
+            // less than the forwarded max_tokens (this route does not opt into
+            // interleaved manual thinking via anthropic-beta).
+            if budget < 1024 || budget >= max_tokens {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            if matches!(
+                tool_choice_kind,
+                Some(ToolChoiceKind::ForcedAny | ToolChoiceKind::ForcedNamed)
+            ) {
+                return Err("forced tool_choice is incompatible with extended thinking".to_string());
+            }
+            json!({ "type": "enabled", "budget_tokens": budget })
+        }
+        "adaptive" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "adaptive" })
+        }
+        "disabled" => {
+            if object.len() != 1 {
+                return Err("unsupported or malformed thinking".to_string());
+            }
+            json!({ "type": "disabled" })
+        }
+        _ => return Err("unsupported or malformed thinking".to_string()),
+    };
+
+    Ok(Some(forwarded))
 }
 
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
@@ -1101,10 +1284,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         message_index += 1;
     }
 
-    let max_tokens = openai_body["max_tokens"]
-        .as_u64()
-        .or_else(|| openai_body["max_completion_tokens"].as_u64())
-        .unwrap_or(4096);
+    let max_tokens = anthropic_effective_max_tokens(openai_body);
 
     let mut body = json!({
         "model": model,
@@ -1128,8 +1308,14 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
     if let Some(tools) = translate_tools(openai_body.get("tools")) {
         body["tools"] = tools;
     }
-    if let Some(choice) = translate_tool_choice(openai_body.get("tool_choice")) {
-        body["tool_choice"] = choice;
+    let tool_choice = resolve_anthropic_tool_choice(openai_body)?;
+    if let Some((_, choice)) = &tool_choice {
+        body["tool_choice"] = choice.clone();
+    }
+    if let Some(thinking) =
+        resolve_anthropic_thinking(openai_body, tool_choice.as_ref().map(|(kind, _)| *kind))?
+    {
+        body["thinking"] = thinking;
     }
 
     serde_json::to_vec(&body)
@@ -1168,26 +1354,6 @@ fn translate_tools(tools: Option<&Value>) -> Option<Value> {
         None
     } else {
         Some(Value::Array(out))
-    }
-}
-
-fn translate_tool_choice(choice: Option<&Value>) -> Option<Value> {
-    match choice? {
-        Value::String(s) => match s.as_str() {
-            "auto" => Some(json!({"type": "auto"})),
-            "required" | "any" => Some(json!({"type": "any"})),
-            // Anthropic has no "none"; omit so the model is free to answer.
-            "none" => None,
-            _ => None,
-        },
-        Value::Object(_) => {
-            let name = choice?
-                .get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(Value::as_str)?;
-            Some(json!({"type": "tool", "name": name}))
-        }
-        _ => None,
     }
 }
 
@@ -1363,17 +1529,24 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        // Fail closed on Anthropic tool-history shapes that cannot be
-        // represented safely before the route override commits.
+        // Fail closed on Anthropic tool-history / tool_choice / thinking shapes
+        // that cannot be represented safely before the route override commits.
         if provider.provider_type == ProviderType::Anthropic
             && let Err(message) = validate_anthropic_translation(&openai_body)
         {
+            let (param, code) = if message.contains("thinking") {
+                (Some("thinking"), Some("invalid_thinking"))
+            } else if message.contains("tool_choice") || message.contains("tools") {
+                (Some("tool_choice"), Some("invalid_tool_choice"))
+            } else {
+                (Some("messages"), Some("invalid_messages"))
+            };
             return openai_error_response(
                 400,
                 &format!("Invalid request for Anthropic translation: {message}"),
                 "invalid_request_error",
-                Some("messages"),
-                Some("invalid_messages"),
+                param,
+                code,
             );
         }
 
@@ -1500,8 +1673,9 @@ impl Plugin for AiStreamRouter {
         ctx.metadata.insert(META_MODEL.to_string(), model);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
-        ctx.metadata
-            .insert(META_FALLBACK_ATTEMPTS.to_string(), "0".to_string());
+        // No `ai_stream_router.fallback_attempts` key: this plugin never
+        // attempts a second provider, so a permanently-zero counter would only
+        // advertise a capability that does not exist (issue #3328).
 
         debug!(
             provider = %provider.name,
@@ -1533,6 +1707,12 @@ impl Plugin for AiStreamRouter {
                 let translated = translate_to_anthropic(&openai_body, &model).ok()?;
                 ctx.metadata
                     .insert(META_REQUEST_TRANSLATED.to_string(), "true".to_string());
+                if openai_body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+                    ctx.metadata
+                        .insert(META_TOOL_CHOICE_NONE.to_string(), "true".to_string());
+                } else {
+                    ctx.metadata.remove(META_TOOL_CHOICE_NONE);
+                }
                 Some(translated)
             }
             ProviderType::OpenAi | ProviderType::OpenAiCompatible => {
@@ -1606,7 +1786,13 @@ impl Plugin for AiStreamRouter {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
         let encoding = ctx.metadata.get(META_PROVIDER_ENCODING).cloned();
-        Some(wrap_anthropic_normalizer(model, encoding.as_deref()))
+        let tools_forbidden =
+            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
+        Some(wrap_anthropic_normalizer(
+            model,
+            encoding.as_deref(),
+            tools_forbidden,
+        ))
     }
 
     async fn normalize_response_body_with_context(
@@ -1651,7 +1837,9 @@ impl Plugin for AiStreamRouter {
                 return Some(upstream_sse_error_body(&message));
             }
         };
-        normalize_anthropic_sse_buffered(model, &plaintext).await
+        let tools_forbidden =
+            ctx.metadata.get(META_TOOL_CHOICE_NONE).map(String::as_str) == Some("true");
+        normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
     }
 
     async fn after_proxy(
@@ -1862,8 +2050,9 @@ fn upstream_sse_error_body(message: &str) -> Vec<u8> {
 fn wrap_anthropic_normalizer(
     model: String,
     encoding: Option<&str>,
+    tools_forbidden: bool,
 ) -> Box<dyn ResponseStreamInspector> {
-    let inner = AnthropicSseNormalizer::new(model);
+    let inner = AnthropicSseNormalizer::new(model, tools_forbidden);
     match encoding {
         Some("gzip") => Box::new(ContentDecodingNormalizer::gzip(inner)),
         Some("br") => Box::new(ContentDecodingNormalizer::brotli(inner)),
@@ -1991,6 +2180,9 @@ struct AnthropicSseNormalizer {
     role_emitted: bool,
     done_emitted: bool,
     terminal: Option<StreamTerminal>,
+    /// When true, any Anthropic `tool_use` fails closed instead of becoming
+    /// OpenAI `tool_calls` deltas (caller constrained this generation to none).
+    tools_forbidden: bool,
     /// Anthropic content-block index → OpenAI `tool_calls` index.
     tool_indices: HashMap<u64, u32>,
     next_tool_index: u32,
@@ -1999,7 +2191,7 @@ struct AnthropicSseNormalizer {
 }
 
 impl AnthropicSseNormalizer {
-    fn new(model: String) -> Self {
+    fn new(model: String, tools_forbidden: bool) -> Self {
         Self {
             carry: Vec::new(),
             model,
@@ -2009,6 +2201,7 @@ impl AnthropicSseNormalizer {
             role_emitted: false,
             done_emitted: false,
             terminal: None,
+            tools_forbidden,
             tool_indices: HashMap::new(),
             next_tool_index: 0,
             prompt_tokens: None,
@@ -2109,6 +2302,14 @@ impl AnthropicSseNormalizer {
                 let index = event["index"].as_u64().unwrap_or(0);
                 let block = &event["content_block"];
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    if self.tools_forbidden {
+                        self.emit_upstream_error(
+                            "upstream provider emitted tool use despite tool_choice none",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        return true;
+                    }
                     let tool_index = self.next_tool_index;
                     self.next_tool_index += 1;
                     self.tool_indices.insert(index, tool_index);
@@ -2142,6 +2343,14 @@ impl AnthropicSseNormalizer {
                         }
                     }
                     Some("input_json_delta") => {
+                        if self.tools_forbidden {
+                            self.emit_upstream_error(
+                                "upstream provider emitted tool use despite tool_choice none",
+                                out,
+                            );
+                            self.finish(StreamTerminal::UpstreamFailure, out);
+                            return true;
+                        }
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                             let tool_index = self.tool_indices.get(&index).copied().unwrap_or(0);
                             out.push_str(&self.chunk_line(
@@ -2168,7 +2377,16 @@ impl AnthropicSseNormalizer {
                 if let Some(tokens) = event["usage"]["output_tokens"].as_u64() {
                     self.completion_tokens = Some(tokens);
                 }
-                let finish = map_stop_reason(event["delta"]["stop_reason"].as_str());
+                let stop_reason = event["delta"]["stop_reason"].as_str();
+                if self.tools_forbidden && stop_reason == Some("tool_use") {
+                    self.emit_upstream_error(
+                        "upstream provider emitted tool use despite tool_choice none",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    return true;
+                }
+                let finish = map_stop_reason(stop_reason);
                 out.push_str(&self.chunk_line(json!({}), Some(finish)));
                 false
             }
@@ -2509,8 +2727,12 @@ impl ResponseStreamInspector for ImmediateUpstreamErrorNormalizer {
     }
 }
 
-async fn normalize_anthropic_sse_buffered(model: String, body: &[u8]) -> Option<Vec<u8>> {
-    let mut normalizer = AnthropicSseNormalizer::new(model);
+async fn normalize_anthropic_sse_buffered(
+    model: String,
+    body: &[u8],
+    tools_forbidden: bool,
+) -> Option<Vec<u8>> {
+    let mut normalizer = AnthropicSseNormalizer::new(model, tools_forbidden);
     let mut out = Vec::new();
     match normalizer.on_chunk(body).await {
         ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),

@@ -615,18 +615,13 @@ fn next_loki_emitter_id() -> Result<String, String> {
     Ok(value)
 }
 
+/// Structurally redacted collector URL for diagnostics (path/query omitted).
+///
+/// Delegates to the shared sink helper so every HTTP-backed log sink renders
+/// one identical form. Retained as a named item because Loki's flush config and
+/// unit tests refer to it directly.
 pub(crate) fn redacted_endpoint_url(endpoint: &url::Url) -> String {
-    let host = match endpoint.host() {
-        Some(url::Host::Domain(host)) => host.to_string(),
-        Some(url::Host::Ipv4(host)) => host.to_string(),
-        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
-        None => "redacted-host".to_string(),
-    };
-    let port = endpoint
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    format!("{}://{}{}/redacted", endpoint.scheme(), host, port)
+    super::utils::redacted_endpoint_url(endpoint)
 }
 
 fn is_valid_loki_label_name(name: &str) -> bool {

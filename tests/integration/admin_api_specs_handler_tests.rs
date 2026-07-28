@@ -6550,3 +6550,216 @@ async fn post_with_duplicate_plugin_ids_returns_error() {
         "error must mention duplicate plugin id; got: {details}"
     );
 }
+
+// ============================================================================
+// Recursive `$ref` expansion admission (advisory GHSA-8jc7-c52g-85xr)
+//
+// The extractor-level accounting is covered in
+// `tests/unit/admin/api_specs_ref_expansion_budget_tests.rs`. These tests pin
+// the externally visible contract: a deterministic protocol-appropriate 4xx
+// with a stable, non-secret error code and reference path, identical treatment
+// of JSON and YAML submissions, no cross-namespace effect, and a bounded
+// admission gate that queues concurrent expensive imports rather than changing
+// their outcome.
+// ============================================================================
+
+/// OpenAPI 3.1 document whose request schema sits on a mutual `$ref` cycle.
+fn cyclic_ref_spec(proxy_id: &str) -> Value {
+    json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Cyclic Ref API", "version": "1.0.0"},
+        "x-ferrum-validate": true,
+        "x-ferrum-proxy": {
+            "id": proxy_id,
+            "backend_host": "backend.internal",
+            "backend_port": 443,
+            "listen_path": format!("/{proxy_id}")
+        },
+        "components": {
+            "schemas": {
+                "A": {
+                    "type": "object",
+                    "properties": {"b": {"$ref": "#/components/schemas/B"}}
+                },
+                "B": {
+                    "type": "object",
+                    "properties": {"a": {"$ref": "#/components/schemas/A"}}
+                }
+            }
+        },
+        "paths": {
+            "/things": {
+                "post": {
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/A"}
+                            }
+                        }
+                    },
+                    "responses": {"204": {"description": "ok"}}
+                }
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn post_cyclic_ref_spec_returns_deterministic_422_with_cycle_path() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let (status, body) = client
+        .post_json("/api-specs", &cyclic_ref_spec(&proxy_id))
+        .await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "a cyclic $ref document must be rejected, never panic or OOM; body: {body}"
+    );
+    assert_eq!(
+        body["code"].as_str().unwrap_or(""),
+        "SchemaReferenceCycle",
+        "body: {body}"
+    );
+    let details = body["details"].as_str().unwrap_or("");
+    assert!(
+        details.contains("#/components/schemas/A") && details.contains("#/components/schemas/B"),
+        "details must report the reference path that closed the cycle; got: {details}"
+    );
+    // The reported path is document structure only — no resolver internals and
+    // no configuration values.
+    assert!(
+        !details.contains("ferrum.invalid"),
+        "cycle report must not disclose the internal resolver document base; got: {details}"
+    );
+}
+
+#[tokio::test]
+async fn cyclic_ref_spec_is_rejected_identically_as_yaml() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let proxy_id = uid("proxy");
+    let yaml = serde_yaml::to_string(&cyclic_ref_spec(&proxy_id))
+        .expect("cyclic fixture must serialize as YAML");
+
+    let (status, body) = client.post_yaml("/api-specs", &yaml).await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "YAML submissions must be bounded identically to JSON; body: {body}"
+    );
+    assert_eq!(
+        body["code"].as_str().unwrap_or(""),
+        "SchemaReferenceCycle",
+        "body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rejected_cyclic_import_persists_nothing_and_leaves_later_imports_intact() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let hostile_proxy = uid("proxy");
+    let (status, body) = client
+        .post_json_in_namespace("/api-specs", "ferrum", &cyclic_ref_spec(&hostile_proxy))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "body: {body}"
+    );
+
+    // A subsequent import starts from a full resolution account and is
+    // unaffected by the rejected one. Cross-namespace independence of that
+    // account is asserted directly against the extractor in
+    // `tests/unit/admin/api_specs_ref_expansion_budget_tests.rs`.
+    let benign_proxy = uid("proxy");
+    let (status, body) = client
+        .post_json_in_namespace("/api-specs", "ferrum", &minimal_json_spec(&benign_proxy))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "a rejected hostile import must not disturb later imports; body: {body}"
+    );
+
+    // The rejected spec persisted nothing.
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let stored: Vec<&str> = list_body["items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["proxy_id"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !stored.contains(&hostile_proxy.as_str()),
+        "rejected cyclic import must not be persisted: {list_body}"
+    );
+    assert!(
+        stored.contains(&benign_proxy.as_str()),
+        "benign import must be persisted: {list_body}"
+    );
+}
+
+/// Concurrent expensive imports are admitted under a bounded gate. The gate
+/// queues rather than rejects, so every submission must still receive the same
+/// deterministic 4xx — and the batch must complete rather than deadlock.
+#[tokio::test]
+async fn concurrent_cyclic_imports_all_return_deterministic_422() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = Arc::new(AdminClient::new(base));
+
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let client = Arc::clone(&client);
+        let proxy_id = uid("proxy");
+        tasks.push(tokio::spawn(async move {
+            client
+                .post_json("/api-specs", &cyclic_ref_spec(&proxy_id))
+                .await
+        }));
+    }
+
+    for task in tasks {
+        let (status, body) = task.await.expect("concurrent import task must not panic");
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "every concurrent hostile import must return the same 4xx; body: {body}"
+        );
+        assert_eq!(
+            body["code"].as_str().unwrap_or(""),
+            "SchemaReferenceCycle",
+            "body: {body}"
+        );
+    }
+
+    // The admin surface is still healthy after the concurrent burst.
+    let benign_proxy = uid("proxy");
+    let (status, body) = client
+        .post_json("/api-specs", &minimal_json_spec(&benign_proxy))
+        .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "admin must remain serviceable after concurrent hostile imports; body: {body}"
+    );
+}

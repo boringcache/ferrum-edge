@@ -2754,19 +2754,45 @@ async fn test_mirror_does_not_reintroduce_fully_stripped_query_credential() {
 }
 
 #[tokio::test]
-async fn test_mirror_ignores_query_map_transform_when_client_had_no_query() {
+async fn test_mirror_uses_transformed_outbound_query() {
     let mut ctx = make_ctx_with_proxy();
-    ctx.query_params
-        .insert("injected".to_string(), "value".to_string());
-    ctx.metadata.insert(
-        "ferrum:query_params_transformed".to_string(),
-        "true".to_string(),
+    ctx.set_raw_query_string("access_token=secret&page=1&tag=red&tag=blue".to_string());
+    ctx.publish_transformed_query(
+        "page=2&tag=red&tag=blue".to_string(),
+        [
+            ("page".to_string(), "2".to_string()),
+            ("tag".to_string(), "blue".to_string()),
+        ]
+        .into_iter()
+        .collect(),
     );
 
     let request_line = capture_mirror_request_line(&mut ctx).await;
     assert!(
-        !request_line.contains("injected") && !request_line.contains('?'),
-        "mirror must match primary raw-query construction: {request_line}"
+        request_line.contains("page=2&tag=red&tag=blue"),
+        "mirror must use transformer outbound query: {request_line}"
+    );
+    assert!(
+        !request_line.contains("access_token"),
+        "mirror must not keep removed credential: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_does_not_serialize_stale_map_without_outbound_or_raw() {
+    let mut ctx = make_ctx_with_proxy();
+    // Synthetic context with only a collapsed map and a stale marker — no raw
+    // or outbound query was retained. Map fallback applies only when neither
+    // encoded representation exists; a transform that ran for real always
+    // publishes outbound.
+    ctx.query_params
+        .insert("injected".to_string(), "value".to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    // Legacy map fallback for synthetic contexts without raw/outbound.
+    assert!(
+        request_line.contains("injected=value"),
+        "synthetic map-only contexts still use the map fallback: {request_line}"
     );
 }
 

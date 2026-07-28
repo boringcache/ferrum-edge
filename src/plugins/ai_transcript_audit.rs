@@ -70,7 +70,7 @@ use super::utils::response_body::{
 use super::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
     HTTP_BATCH_RESPONSE_BODY_LIMIT_BYTES, LoggerHooks, PluginHttpClient, build_batch_config,
-    parse_http_endpoint, validate_batch_config,
+    parse_http_endpoint, redacted_endpoint_url_str, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -1541,7 +1541,14 @@ impl RecordsPerMinute {
 
 #[derive(Clone)]
 struct HttpFlushConfig {
+    /// Complete configured URL. Used **only** to build the outbound request; a
+    /// collector may legitimately carry a reusable credential in its path or
+    /// query.
     endpoint_url: String,
+    /// Structurally redacted rendering of [`Self::endpoint_url`] for every
+    /// diagnostic surface: egress denial, DNS/TLS/connect failure, retry,
+    /// slow-call, and batch-failure error strings.
+    endpoint_url_for_logs: String,
     /// Fully materialized outbound headers, resolved once at background-task
     /// activation from [`CustomHeaderSpec`]s (secrets marked sensitive so they
     /// are never logged). Empty until `start_background_tasks` publishes the
@@ -1956,6 +1963,7 @@ impl AiTranscriptAudit {
         let shard_amount = http_client.pool_shard_amount();
         let sink_healthy = Arc::new(AtomicBool::new(true));
         let flush_config = HttpFlushConfig {
+            endpoint_url_for_logs: redacted_endpoint_url_str(&endpoint_url),
             endpoint_url,
             // Materialized from `custom_header_specs` at `start_background_tasks`.
             custom_headers: Arc::new(Vec::new()),
@@ -4510,9 +4518,14 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Res
     for (name, value) in cfg.custom_headers.iter() {
         request = request.header(name.clone(), value.clone());
     }
+    // `execute_redacted`, not `execute`: the configured collector endpoint may
+    // embed a credential in its path or query, and both the shared client's
+    // diagnostics (egress denial, retry, slow call) and the `Err` rendered
+    // below would otherwise carry the complete URL. The request itself still
+    // goes to `endpoint_url`.
     let response = cfg
         .http_client
-        .execute(request, "ai_transcript_audit")
+        .execute_redacted(request, "ai_transcript_audit", &cfg.endpoint_url_for_logs)
         .await;
     // Sink health is derived from the raw collector response, NOT from the
     // shared `handle_http_batch_response` result: that helper treats a
