@@ -2215,11 +2215,7 @@ fn openai_response_without_usage() -> Vec<u8> {
     .unwrap()
 }
 
-async fn assert_fixed_provider_unmetered_rejects(
-    count_mode: &str,
-    body: Vec<u8>,
-    provider: &str,
-) {
+async fn assert_fixed_provider_unmetered_rejects(count_mode: &str, body: Vec<u8>, provider: &str) {
     let plugin = AiRateLimiter::new(
         &json!({
             "token_limit": 1000,
