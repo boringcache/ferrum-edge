@@ -1874,7 +1874,8 @@ impl Plugin for MeshAuthz {
                     crate::modes::mesh::node_waypoint_observability::NodeWaypointAssertedIdentityRejectReason::TrustDomainMismatch,
                 );
             } else if baggage_outcome == BaggageOutcome::Honored {
-                crate::modes::mesh::node_waypoint_observability::record_asserted_identity_accepted();
+                crate::modes::mesh::node_waypoint_observability::record_asserted_identity_accepted(
+                );
             }
         }
         let mut host = ctx

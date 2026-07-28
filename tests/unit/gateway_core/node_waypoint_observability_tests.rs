@@ -129,27 +129,28 @@ fn enabled_producers_increment_and_render_bounded_labels() {
 
     let registry = MetricsRegistry::new();
     let output = registry.render_uncached();
-    assert!(output.contains(
-        "# TYPE ferrum_mesh_node_waypoint_hbone_handshakes_total counter"
-    ));
+    assert!(output.contains("# TYPE ferrum_mesh_node_waypoint_hbone_handshakes_total counter"));
     assert!(output.contains(
         "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}"
     ));
-    assert!(output.contains(
-        "# TYPE ferrum_mesh_node_waypoint_asserted_identity_total counter"
-    ));
+    assert!(output.contains("# TYPE ferrum_mesh_node_waypoint_asserted_identity_total counter"));
     assert!(output.contains(
         "ferrum_mesh_node_waypoint_asserted_identity_total{result=\"rejected\",reason=\"untrusted_assertor\"}"
     ));
-    assert!(output.contains(
-        "# TYPE ferrum_mesh_node_waypoint_destination_policy_rejections_total counter"
-    ));
-    assert!(output.contains(
-        "# TYPE ferrum_mesh_node_waypoint_missing_destination_metadata_total counter"
-    ));
-    assert!(output.contains(
-        "# TYPE ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total counter"
-    ));
+    assert!(
+        output.contains(
+            "# TYPE ferrum_mesh_node_waypoint_destination_policy_rejections_total counter"
+        )
+    );
+    assert!(
+        output.contains(
+            "# TYPE ferrum_mesh_node_waypoint_missing_destination_metadata_total counter"
+        )
+    );
+    assert!(
+        output
+            .contains("# TYPE ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total counter")
+    );
     // Cardinality contract: no identity/IP/URL label keys.
     for forbidden in [
         "spiffe_id=",

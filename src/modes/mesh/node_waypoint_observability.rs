@@ -136,7 +136,9 @@ impl NodeWaypointDestinationPolicyRejectReason {
         match self {
             Self::AuthzDeny => &DESTINATION_POLICY_REJECTION_AUTHZ_DENY,
             Self::ScopeMissing => &DESTINATION_POLICY_REJECTION_SCOPE_MISSING,
-            Self::DestinationScopeMissing => &DESTINATION_POLICY_REJECTION_DESTINATION_SCOPE_MISSING,
+            Self::DestinationScopeMissing => {
+                &DESTINATION_POLICY_REJECTION_DESTINATION_SCOPE_MISSING
+            }
             Self::RelayDestinationDenied => &DESTINATION_POLICY_REJECTION_RELAY_DESTINATION_DENIED,
         }
     }
@@ -313,8 +315,16 @@ outbound_dial is independent on the source).\n",
     );
     output.push_str("# TYPE ferrum_mesh_node_waypoint_hbone_handshakes_total counter\n");
     for (phase, result, value) in [
-        ("inbound_tls", "success", snap.hbone_handshakes.inbound_tls_success),
-        ("inbound_tls", "failure", snap.hbone_handshakes.inbound_tls_failure),
+        (
+            "inbound_tls",
+            "success",
+            snap.hbone_handshakes.inbound_tls_success,
+        ),
+        (
+            "inbound_tls",
+            "failure",
+            snap.hbone_handshakes.inbound_tls_failure,
+        ),
         (
             "inbound_connect",
             "success",
@@ -396,10 +406,7 @@ NodeWaypoint. Distinct from asserted-identity rejections.\n",
     output
         .push_str("# TYPE ferrum_mesh_node_waypoint_destination_policy_rejections_total counter\n");
     for (reason, value) in [
-        (
-            "authz_deny",
-            snap.destination_policy_rejections.authz_deny,
-        ),
+        ("authz_deny", snap.destination_policy_rejections.authz_deny),
         (
             "scope_missing",
             snap.destination_policy_rejections.scope_missing,
@@ -440,8 +447,7 @@ metadata was absent.\n",
 Prohibited plaintext fallback attempts blocked under identity-backed \
 NodeWaypoint (fail-closed instead of retaining a plaintext backend).\n",
     );
-    output
-        .push_str("# TYPE ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total counter\n");
+    output.push_str("# TYPE ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total counter\n");
     render_gauge_like_counter(
         output,
         "ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total",
@@ -450,12 +456,7 @@ NodeWaypoint (fail-closed instead of retaining a plaintext backend).\n",
     );
 }
 
-fn render_gauge_like_counter(
-    output: &mut String,
-    name: &str,
-    value: u64,
-    gateway_ns_label: &str,
-) {
+fn render_gauge_like_counter(output: &mut String, name: &str, value: u64, gateway_ns_label: &str) {
     if gateway_ns_label.is_empty() {
         output.push_str(&format!("{name} {value}\n"));
     } else {
