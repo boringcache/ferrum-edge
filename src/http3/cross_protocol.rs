@@ -2855,7 +2855,7 @@ where
                                 "content-length".to_string(),
                                 transformed.len().to_string(),
                             );
-                            response_body = transformed;
+                            response_body = bytes::Bytes::from(transformed);
                             crate::plugins::finalize_response_body_transformation(
                                 plugin.as_ref(),
                                 ctx,
@@ -3011,7 +3011,7 @@ where
         let bytes_streamed = response_body.len() as u64;
         let buffered_write = async {
             if !response_body.is_empty() {
-                stream.send_data(Bytes::from(response_body)).await?;
+                stream.send_data(response_body).await?;
             }
             stream.finish().await
         };
@@ -4946,7 +4946,7 @@ where
                     if let Some(transformed) = transformed {
                         plugin_response_headers
                             .insert("content-length".to_string(), transformed.len().to_string());
-                        response_body = transformed;
+                        response_body = bytes::Bytes::from(transformed);
                         crate::plugins::finalize_response_body_transformation(
                             plugin.as_ref(),
                             ctx,
@@ -5066,15 +5066,19 @@ where
                 let content_type = plugin_response_headers
                     .get("content-type")
                     .map(String::as_str);
-                if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                    &mut response_body,
+                let mut owned_body = crate::retry::ResponseBody::take_buffered_vec(&mut response_body);
+                let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                    &mut owned_body,
                     content_type,
                     &response_trailers,
                     http_status,
-                ) {
+                );
+                let synced_len = owned_body.len();
+                crate::retry::ResponseBody::store_buffered_vec(&mut response_body, owned_body);
+                if synced {
                     plugin_response_headers.insert(
                         "content-length".to_string(),
-                        response_body.len().to_string(),
+                        synced_len.to_string(),
                     );
                 }
             }
@@ -5219,13 +5223,13 @@ where
                 let body_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
                         grpc_deadline_at,
-                        stream.send_data(Bytes::from(response_body)),
+                        stream.send_data(response_body),
                     )
                     .await
                 } else {
                     crate::http3::stream_util::await_response_write_before_deadline(
                         grpc_deadline_at,
-                        stream.send_data(Bytes::from(response_body)),
+                        stream.send_data(response_body),
                     )
                     .await
                 };
@@ -6831,8 +6835,12 @@ fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
-    let normalized =
-        crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
+    let normalized = crate::proxy::normalize_reject_response(
+        status,
+        bytes::Bytes::copy_from_slice(body),
+        headers,
+        native_grpc || grpc_web,
+    );
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }
@@ -6921,7 +6929,7 @@ async fn run_cross_protocol_reject_committed_hooks(
             plugins[index + 1..].to_vec(),
             status,
             Arc::new(headers.clone()),
-            Arc::new(body.to_vec()),
+            bytes::Bytes::copy_from_slice(body),
         );
         return deadline_replaced;
     }
@@ -7321,7 +7329,12 @@ fn normalize_h3_grpc_reject(
     body: &[u8],
     headers: &HashMap<String, String>,
 ) -> crate::proxy::NormalizedRejectResponse {
-    crate::proxy::normalize_reject_response(status, body, headers, true)
+    crate::proxy::normalize_reject_response(
+        status,
+        bytes::Bytes::copy_from_slice(body),
+        headers,
+        true,
+    )
 }
 
 fn apply_h3_grpc_reject_metadata(
@@ -7482,7 +7495,7 @@ where
             plugins[index + 1..].to_vec(),
             normalized.http_status.as_u16(),
             Arc::new(normalized.headers.clone()),
-            Arc::new(normalized.body.clone()),
+            normalized.body.clone(),
         );
         break;
     }

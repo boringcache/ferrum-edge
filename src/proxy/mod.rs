@@ -14282,7 +14282,7 @@ async fn reject_mesh_inbound_peer_auth_transport_mismatch(
         plugins,
         ctx,
         StatusCode::FORBIDDEN,
-        br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#,
+        Bytes::from_static(br#"{"error":"Mesh inbound transport does not satisfy PeerAuthentication for the resolved application port"}"#),
         HashMap::new(),
         is_grpc_request,
     )
@@ -16599,11 +16599,10 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
 
 pub(crate) fn normalize_reject_response(
     status: StatusCode,
-    body: impl Into<Bytes>,
+    body: Bytes,
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    let body = body.into();
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
     if !is_grpc_request || grpc_web_accept_rejected {
@@ -17626,7 +17625,7 @@ fn build_pre_plugin_reject_response(
 ) -> Response<ProxyBody> {
     let reject = normalize_reject_response(
         status,
-        body,
+        Bytes::copy_from_slice(body),
         headers,
         request_uses_grpc_content_type || grpc_web_response_content_type.is_some(),
     );
@@ -17766,7 +17765,7 @@ async fn run_backend_path_plugins_or_build_reject(
                     plugins,
                     ctx,
                     status,
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -17806,7 +17805,7 @@ async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: impl Into<Bytes>,
+    body: Bytes,
     headers: HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
@@ -17826,13 +17825,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     status: StatusCode,
-    body: impl Into<Bytes>,
+    body: Bytes,
     mut headers: HashMap<String, String>,
     is_grpc_request: bool,
     invoke_response_committed: bool,
 ) -> NormalizedRejectResponse {
     let mut response_status = status.as_u16();
-    let mut response_body = body.into();
+    let mut response_body = body;
     let hook_start = Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
@@ -17884,7 +17883,7 @@ async fn finalize_terminal_request_body_read_rejection(
         plugins,
         ctx,
         status,
-        body,
+        Bytes::copy_from_slice(body),
         HashMap::new(),
         is_grpc_request,
     )
@@ -17920,7 +17919,7 @@ async fn handle_backend_admission_rejection(
         plugins,
         ctx,
         StatusCode::from_u16(rejection.status_code).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-        &rejection.body,
+        rejection.body.clone(),
         rejection.headers,
         is_grpc_request,
         grpc_web_error_content_type.is_none(),
@@ -17963,7 +17962,7 @@ pub(crate) async fn build_finalized_upload_deadline_response(
         plugins,
         ctx,
         deadline.http_status,
-        &deadline.body,
+        deadline.body.clone(),
         deadline.headers,
         true,
         grpc_web_response_content_type.is_none(),
@@ -18034,7 +18033,7 @@ const MISSING_AUTHENTICATION_BODY: &[u8] = br#"{"error":"Authentication required
 
 fn missing_authentication_reject(
     auth_plugins: &[Arc<dyn Plugin>],
-) -> (u16, Vec<u8>, HashMap<String, String>) {
+) -> (u16, Bytes, HashMap<String, String>) {
     let mut headers = HashMap::new();
     // Challenge selection follows configured priority order: mechanisms that
     // do not advertise a challenge are skipped, and the first available
@@ -18044,7 +18043,11 @@ fn missing_authentication_reject(
         .find_map(|plugin| plugin.authentication_challenge())
         .unwrap_or("ferrum-edge");
     headers.insert("WWW-Authenticate".to_string(), challenge.to_string());
-    (401, MISSING_AUTHENTICATION_BODY.to_vec(), headers)
+    (
+        401,
+        Bytes::from_static(MISSING_AUTHENTICATION_BODY),
+        headers,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -18607,7 +18610,7 @@ pub async fn run_authentication_phase(
     auth_plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
     consumer_index: &ConsumerIndex,
-) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+) -> Option<(u16, Bytes, HashMap<String, String>)> {
     // Mark every configured query credential location before multi-auth can
     // stop at the first successful mechanism. Presence is enough to redact:
     // an invalid token may coexist with a different successful credential and
@@ -18621,8 +18624,8 @@ pub async fn run_authentication_phase(
             // Execute auth plugins; first success stops iteration.
             // Multi-auth success includes external identity auth (e.g. jwks_auth)
             // even when no gateway Consumer record exists.
-            let mut last_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
-            let mut server_reject: Option<(u16, Vec<u8>, HashMap<String, String>)> = None;
+            let mut last_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
+            let mut server_reject: Option<(u16, Bytes, HashMap<String, String>)> = None;
             for auth_plugin in auth_plugins {
                 let deadline = ctx.grpc_deadline_at();
                 let auth_result = match crate::plugins::await_grpc_deadline(
@@ -18638,7 +18641,7 @@ pub async fn run_authentication_phase(
                         let Some(reject) = plugin_result_into_reject_parts(reject) else {
                             return Some((
                                 500,
-                                br#"{"error":"Internal error"}"#.to_vec(),
+                                Bytes::from_static(br#"{"error":"Internal error"}"#),
                                 HashMap::new(),
                             ));
                         };
@@ -19787,7 +19790,7 @@ async fn handle_proxy_request_inner(
         reject_headers.insert("allow".to_string(), allow_header.clone());
         let mut reject = normalize_reject_response(
             StatusCode::METHOD_NOT_ALLOWED,
-            br#"{"error":"Method Not Allowed"}"#,
+            Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
             &reject_headers,
             is_grpc_request,
         );
@@ -19836,7 +19839,7 @@ async fn handle_proxy_request_inner(
         warn!(method = %method, path = %path, "Rejected gRPC request: method must be POST");
         let mut reject = normalize_reject_response(
             StatusCode::BAD_REQUEST,
-            br#"{"error":"gRPC requires POST method"}"#,
+            Bytes::from_static(br#"{"error":"gRPC requires POST method"}"#),
             &EMPTY_HEADERS,
             true,
         );
@@ -19927,7 +19930,7 @@ async fn handle_proxy_request_inner(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(plugin_reject.status_code).unwrap_or(StatusCode::BAD_REQUEST),
-                &plugin_reject.body,
+                plugin_reject.body.clone(),
                 plugin_reject.headers,
                 true,
                 grpc_web_response_content_type.is_none(),
@@ -19993,7 +19996,7 @@ async fn handle_proxy_request_inner(
                         &mut ctx,
                         StatusCode::from_u16(status_code)
                             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                        &plugin_reject.body,
+                        plugin_reject.body.clone(),
                         plugin_reject.headers,
                         is_grpc_request,
                         grpc_web_response_content_type.is_none(),
@@ -20180,7 +20183,7 @@ async fn handle_proxy_request_inner(
                 &plugins,
                 &mut ctx,
                 StatusCode::from_u16(status_code).unwrap_or(StatusCode::UNAUTHORIZED),
-                &body,
+                body,
                 headers,
                 is_grpc_request,
                 grpc_web_response_content_type.is_none(),
@@ -20361,7 +20364,7 @@ async fn handle_proxy_request_inner(
                         &plugins,
                         &mut ctx,
                         StatusCode::from_u16(status_code).unwrap_or(StatusCode::FORBIDDEN),
-                        &plugin_reject.body,
+                        plugin_reject.body.clone(),
                         plugin_reject.headers,
                         is_grpc_request,
                         grpc_web_response_content_type.is_none(),
@@ -20581,7 +20584,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -20647,7 +20650,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -20712,7 +20715,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -21061,7 +21064,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     status,
-                    &plugin_reject.body,
+                    plugin_reject.body.clone(),
                     plugin_reject.headers,
                     is_grpc_request,
                     grpc_web_response_content_type.is_none(),
@@ -21276,7 +21279,7 @@ async fn handle_proxy_request_inner(
                                 &plugins,
                                 &mut ctx,
                                 status,
-                                &reject.body,
+                                reject.body.clone(),
                                 reject.headers,
                                 is_grpc_request,
                                 grpc_web_response_content_type.is_none(),
@@ -21347,7 +21350,7 @@ async fn handle_proxy_request_inner(
                     &plugins,
                     &mut ctx,
                     StatusCode::SERVICE_UNAVAILABLE,
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                    Bytes::from_static(br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#),
                     HashMap::new(),
                     is_grpc_request,
                 )
@@ -21591,7 +21594,7 @@ async fn handle_proxy_request_inner(
                                 &plugins,
                                 &mut ctx,
                                 status,
-                                &reject.body,
+                                reject.body.clone(),
                                 reject.headers,
                                 is_grpc_request,
                                 grpc_web_response_content_type.is_none(),
@@ -22231,7 +22234,7 @@ async fn handle_proxy_request_inner(
                             &plugins,
                             &mut ctx,
                             status,
-                            &reject.body,
+                            reject.body.clone(),
                             reject.headers,
                             true,
                             grpc_web_response_content_type.is_none(),
@@ -23249,7 +23252,7 @@ async fn handle_proxy_request_inner(
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
-                            &reject.body,
+                            reject.body.clone(),
                             &reject.headers,
                             true,
                         );
@@ -23747,7 +23750,7 @@ async fn handle_proxy_request_inner(
                 let mut response_status = grpc_resp.status;
                 let mut response_headers: HashMap<String, String> = grpc_resp.headers;
                 let mut response_trailers: HashMap<String, String> = grpc_resp.trailers;
-                let mut response_body = grpc_resp.body;
+                let mut response_body = Bytes::from(grpc_resp.body);
                 if let Some(grpc_status) =
                     grpc_proxy::grpc_status_from_maps(&response_trailers, &response_headers)
                 {
@@ -23890,7 +23893,7 @@ async fn handle_proxy_request_inner(
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
-                            &reject.body,
+                            reject.body.clone(),
                             &reject.headers,
                             true,
                         );
@@ -24108,7 +24111,7 @@ async fn handle_proxy_request_inner(
                                     );
                                     response_status = 200;
                                     response_headers = translated.headers;
-                                    response_body = translated.body;
+                                    response_body = Bytes::from(translated.body);
                                     // Same body-framed shape as the gate's
                                     // replacement above: the finalized status
                                     // lives in the trailer frame only.
@@ -24176,15 +24179,19 @@ async fn handle_proxy_request_inner(
                         let content_type = plugin_response_headers
                             .get("content-type")
                             .map(String::as_str);
-                        if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
-                            &mut response_body,
+                        let mut owned_body = ResponseBody::take_buffered_vec(&mut response_body);
+                        let synced = crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                            &mut owned_body,
                             content_type,
                             &response_trailers,
                             http_status,
-                        ) {
+                        );
+                        let synced_len = owned_body.len();
+                        ResponseBody::store_buffered_vec(&mut response_body, owned_body);
+                        if synced {
                             plugin_response_headers.insert(
                                 "content-length".to_string(),
-                                response_body.len().to_string(),
+                                synced_len.to_string(),
                             );
                         }
                     }
@@ -24404,7 +24411,6 @@ async fn handle_proxy_request_inner(
                     &response_headers,
                 );
 
-                let response_body = Bytes::from(response_body);
                 let body = if !response_body.is_empty() && !response_trailers.is_empty() {
                     // Split LF-joined duplicate metadata before HeaderValue
                     // construction — from_str rejects embedded LF and would
@@ -30467,7 +30473,9 @@ fn hbone_hyper_error_response(
     error!(proxy_id = %proxy.id, error = %err, "HBONE tunneled HTTP request failed");
     retry::BackendResponse {
         status_code: 502,
-        body: ResponseBody::buffered(r#"{"error":"HBONE backend unavailable"}"#.into()),
+        body: ResponseBody::buffered(Bytes::from_static(
+            br#"{"error":"HBONE backend unavailable"}"#,
+        )),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: resolved_ip,
@@ -36692,7 +36700,7 @@ mod tests {
             plugins,
             ctx,
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::OK),
-            &reject.body,
+            reject.body.clone(),
             reject.headers,
             false,
         )

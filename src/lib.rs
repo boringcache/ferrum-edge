@@ -3618,7 +3618,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
-    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> Option<(u16, bytes::Bytes, HashMap<String, String>)> {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .map(|reject| (reject.status_code, reject.body, reject.headers))
@@ -3784,7 +3784,7 @@ pub mod _test_support {
             None,
         );
         let body = match response.body {
-            crate::retry::ResponseBody::Buffered(body) => body,
+            crate::retry::ResponseBody::Buffered(body) => body.to_vec(),
             crate::retry::ResponseBody::Streaming { .. }
             | crate::retry::ResponseBody::StreamingH2(_)
             | crate::retry::ResponseBody::StreamingH3(_) => Vec::new(),
@@ -3909,8 +3909,12 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         is_grpc_request: bool,
     ) -> NormalizedRejectResponse {
-        let normalized =
-            crate::proxy::normalize_reject_response(status, body, headers, is_grpc_request);
+        let normalized = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            is_grpc_request,
+        );
         NormalizedRejectResponse {
             http_status: normalized.http_status,
             headers: normalized.headers,

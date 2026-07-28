@@ -168,7 +168,7 @@ fn h3_request_body_timeout_contract<E>(
 struct FinalizedH3TerminalBodyRejection {
     http_status: StatusCode,
     headers: HashMap<String, String>,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 /// Commit an H3 terminal request-body failure before provider/backend I/O.
@@ -6545,7 +6545,7 @@ async fn handle_h3_request(
                     );
                     result = H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                        body: Bytes::from_static(br#"{"error":"backend address blocked by egress policy"}"#),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
@@ -6717,7 +6717,7 @@ async fn handle_h3_request(
 
         let backend_ttfb_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
         let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-        let mut response_body = Bytes::from(response_body);
+        let mut response_body = response_body;
 
         // Capture original response invariants before `after_proxy` runs on this
         // buffered native-H3 path. Unlike the streamed paths, the body here IS
@@ -7040,7 +7040,7 @@ async fn handle_h3_request(
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
-            && await_buffered_h3_write!(stream.send_data(Bytes::from(response_body)))
+            && await_buffered_h3_write!(stream.send_data(response_body))
         {
             bytes_received = response_body_bytes;
         }
@@ -8079,7 +8079,7 @@ async fn proxy_to_backend_h3_refined_response(
                 // buffered response path.
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
-                    body: reject_body.as_bytes().to_vec(),
+                    body: Bytes::copy_from_slice(reject_body.as_bytes()),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -8198,7 +8198,7 @@ async fn collect_h3_open_response_body(
     {
         return H3BufferedDispatchResult {
             status: 502,
-            body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
             headers: HashMap::new(),
             trailers: None,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -8233,7 +8233,7 @@ async fn collect_h3_open_response_body(
                     // backend has not proved it lost H3 support.
                     return H3BufferedDispatchResult {
                         status: 504,
-                        body: br#"{"error":"Backend timeout"}"#.to_vec(),
+                        body: Bytes::from_static(br#"{"error":"Backend timeout"}"#),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
@@ -8252,7 +8252,7 @@ async fn collect_h3_open_response_body(
                 {
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+                        body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -8277,7 +8277,7 @@ async fn collect_h3_open_response_body(
                     );
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"HTTP/3 backend response truncated"}"#.to_vec(),
+                        body: Bytes::from_static(br#"{"error":"HTTP/3 backend response truncated"}"#),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
@@ -8312,7 +8312,7 @@ async fn collect_h3_open_response_body(
                 }
                 return H3BufferedDispatchResult {
                     status: 502,
-                    body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                    body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -8349,7 +8349,7 @@ async fn collect_h3_open_response_body(
             }
             return H3BufferedDispatchResult {
                 status: 502,
-                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),
@@ -8360,7 +8360,7 @@ async fn collect_h3_open_response_body(
 
     H3BufferedDispatchResult {
         status: response_status,
-        body: response_body,
+        body: Bytes::from(response_body),
         headers: response_headers,
         trailers: response_trailers,
         error_class: None,
@@ -10748,7 +10748,7 @@ async fn proxy_to_backend_h3_streaming(
 ///   `retry_on_connect_failure` can fire regardless of HTTP method.
 struct H3BufferedDispatchResult {
     status: u16,
-    body: Vec<u8>,
+    body: Bytes,
     headers: HashMap<String, String>,
     /// Backend response trailers (issue #1630), still unsanitized. The buffered
     /// native-H3 send path forwards them only when no response-body plugin
@@ -10783,7 +10783,7 @@ fn h3_buffered_result_from_backend_response(
         | crate::retry::ResponseBody::StreamingH3(_) => {
             return H3BufferedDispatchResult {
                 status: 502,
-                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(crate::retry::ErrorClass::ProtocolError),
@@ -10873,9 +10873,7 @@ async fn proxy_to_backend_h3(
                 );
                 return H3BufferedDispatchResult {
                     status: 502,
-                    body: r#"{"error":"Backend response body exceeds maximum size"}"#
-                        .as_bytes()
-                        .to_vec(),
+                    body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -10889,7 +10887,7 @@ async fn proxy_to_backend_h3(
 
             H3BufferedDispatchResult {
                 status,
-                body: resp_body,
+                body: Bytes::from(resp_body),
                 headers: resp_headers,
                 // Forward backend trailers verbatim; the buffered send path
                 // strips response-direction hop-by-hop names before emitting
@@ -10930,7 +10928,7 @@ async fn proxy_to_backend_h3(
             let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
-                body: reject_body.as_bytes().to_vec(),
+                body: Bytes::copy_from_slice(reject_body.as_bytes()),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),
@@ -11113,7 +11111,12 @@ async fn send_h3_grpc_web_reject_with_recv_halt(
     // H1/H2 `normalize_reject_response`. Do not rewrite them into a gRPC-Web
     // trailer-frame response with HTTP 200.
     if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
-        let normalized = crate::proxy::normalize_reject_response(http_status, body, headers, true);
+        let normalized = crate::proxy::normalize_reject_response(
+            http_status,
+            Bytes::copy_from_slice(body),
+            headers,
+            true,
+        );
         return send_h3_finalized_reject_response_with_recv_halt(
             stream,
             normalized.http_status,
@@ -11229,8 +11232,12 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
             // committed observers (chargeback, exporters), matching the sender.
             if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
-                let normalized =
-                    crate::proxy::normalize_reject_response(http_status, body, headers, true);
+                let normalized = crate::proxy::normalize_reject_response(
+                    http_status,
+                    Bytes::copy_from_slice(body),
+                    headers,
+                    true,
+                );
                 (normalized.http_status, normalized.headers, normalized.body)
             } else {
                 let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
@@ -11244,12 +11251,16 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                     &[],
                     Some(headers),
                 );
-                (StatusCode::OK, translated.headers, translated.body)
+                (
+                    StatusCode::OK,
+                    translated.headers,
+                    Bytes::from(translated.body),
+                )
             }
         } else {
             let normalized = crate::proxy::normalize_reject_response(
                 http_status,
-                body,
+                Bytes::copy_from_slice(body),
                 headers,
                 matches!(flavor, HttpFlavor::Grpc),
             );
@@ -11282,13 +11293,13 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 plugins[index + 1..].to_vec(),
                 committed_status.as_u16(),
                 Arc::new(committed_headers.clone()),
-                Arc::new(committed_body.clone()),
+                committed_body.clone(),
             );
             return false;
         }
 
         let mut deadline_headers = headers.clone();
-        let mut deadline_body = body.to_vec();
+        let mut deadline_body = Bytes::copy_from_slice(body);
         let deadline_http_status = replace_buffered_h3_response_with_grpc_deadline(
             ctx,
             grpc_web_response_content_type,
@@ -11305,7 +11316,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             } else {
                 let normalized = crate::proxy::normalize_reject_response(
                     deadline_http_status,
-                    &deadline_body,
+                    deadline_body.clone(),
                     &deadline_headers,
                     matches!(flavor, HttpFlavor::Grpc),
                 );
@@ -11318,7 +11329,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             plugins[index + 1..].to_vec(),
             deadline_status.as_u16(),
             Arc::new(deadline_headers),
-            Arc::new(deadline_body),
+            deadline_body,
         );
         return true;
     }
@@ -11444,7 +11455,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if terminal_gateway_deadline {
         let mut deadline_headers = headers.clone();
-        let mut deadline_body = body.to_vec();
+        let mut deadline_body = Bytes::copy_from_slice(body);
         let deadline_status = replace_buffered_h3_response_with_grpc_deadline(
             ctx,
             grpc_web_response_content_type,
