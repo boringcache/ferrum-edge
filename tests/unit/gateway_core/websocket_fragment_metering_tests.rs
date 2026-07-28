@@ -343,7 +343,9 @@ fn incomplete_message_duration_zero_arms_on_initial_frame() {
     );
     socket.set_fragment_accounting(None, None, Some(Duration::ZERO));
 
-    let error = socket.read().expect_err("peer must reset without completing");
+    let error = socket
+        .read()
+        .expect_err("peer must reset without completing");
     assert!(matches!(
         error,
         WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
@@ -402,10 +404,7 @@ fn incomplete_message_duration_rejects_final_continuation_bypass() {
 /// the duration bound.
 #[test]
 fn incomplete_message_duration_rejects_interleaved_ping_pong() {
-    for bytes in [
-        vec![0x01, 0x00, 0x89, 0x00],
-        vec![0x01, 0x00, 0x8a, 0x00],
-    ] {
+    for bytes in [vec![0x01, 0x00, 0x89, 0x00], vec![0x01, 0x00, 0x8a, 0x00]] {
         let mut socket = tokio_tungstenite::tungstenite::protocol::WebSocket::from_raw_socket(
             std::io::Cursor::new(bytes),
             Role::Client,

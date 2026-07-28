@@ -1677,6 +1677,18 @@ pub struct EnvConfig {
     /// `FERRUM_HTTP3_IDLE_TIMEOUT` when isolated H3 WebSockets need a longer
     /// idle window.
     pub websocket_idle_timeout_seconds: u64,
+    /// Maximum physical WebSocket frames a single fragmented message may consume
+    /// before the connection is closed with RFC 6455 code `1008`. Counts the
+    /// initial non-final Text/Binary frame plus every continuation frame that
+    /// does not finish the message, regardless of payload length. `0` disables
+    /// the bound. Default: 1024.
+    pub websocket_max_incomplete_message_frames: usize,
+    /// Maximum wall-clock seconds a WebSocket message may stay incomplete,
+    /// measured from its first fragment and checked on every subsequent
+    /// non-Close frame while the message is still incomplete — including the
+    /// completing continuation and interleaved Ping/Pong. Independent of the
+    /// frame-count bound. `0` disables the bound. Default: 60.
+    pub websocket_max_incomplete_message_seconds: u64,
     /// Maximum number of credential entries per type per consumer (for zero-downtime rotation).
     pub max_credentials_per_type: usize,
     /// HTTP/1.1 header read timeout in seconds. Protects against slowloris attacks
@@ -2584,6 +2596,8 @@ impl Default for EnvConfig {
             websocket_write_buffer_size: 131_072, // 128 KB
             websocket_tunnel_mode: false,
             websocket_idle_timeout_seconds: 300,
+            websocket_max_incomplete_message_frames: 1_024,
+            websocket_max_incomplete_message_seconds: 60,
             max_credentials_per_type: 2,
             http_header_read_timeout_seconds: 10,
             frontend_tls_handshake_timeout_seconds: 10,
@@ -3680,6 +3694,8 @@ impl EnvConfig {
             websocket_write_buffer_size,
             websocket_tunnel_mode,
             websocket_idle_timeout_seconds,
+            websocket_max_incomplete_message_frames,
+            websocket_max_incomplete_message_seconds,
             max_credentials_per_type,
             http_header_read_timeout_seconds,
             frontend_tls_handshake_timeout_seconds,
