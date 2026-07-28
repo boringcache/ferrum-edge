@@ -7635,7 +7635,13 @@ fn decode_spool_artifact(
     let decoded_bound = if compressed {
         let ratio_limit = spool_decompression_limit(encoded_len);
         match read_zstd_frame_content_size(&mut file, path)? {
-            Some(declared) => declared.min(ratio_limit),
+            Some(declared) if declared <= SPOOL_MAX_ARTIFACT_BYTES => declared,
+            Some(declared) => {
+                return Err(SpoolDecodeError::Unreadable(format!(
+                    "{PLUGIN_NAME}: spool file '{}' declares a {declared}-byte decoded size above the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
+                    path.display()
+                )));
+            }
             None => ratio_limit,
         }
     } else {

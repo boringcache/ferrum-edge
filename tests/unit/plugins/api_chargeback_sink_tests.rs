@@ -6907,3 +6907,27 @@ fn a_zstd_artifact_this_build_writes_declares_its_decompressed_size() {
         plain.len()
     );
 }
+
+#[test]
+fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size() {
+    // A legitimate one-shot artifact can compress beyond the heuristic used
+    // for foreign/headerless frames. Its declared size remains authoritative
+    // up to the absolute artifact ceiling, so replay must not quarantine it.
+    let temp = tempfile::tempdir().unwrap();
+    let plain = vec![b'\n'; 2 * 1024 * 1024];
+    let encoded = encode_spool_bytes_for_tests(&plain, SpoolCompression::Zstd).unwrap();
+    let ratio_bound = spool_decompression_limit_for_tests(encoded.len() as u64);
+    assert!(
+        ratio_bound < plain.len() as u64,
+        "fixture must exceed the fallback ratio bound: ratio={ratio_bound} actual={}",
+        plain.len()
+    );
+
+    let path = temp
+        .path()
+        .join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
+    fs::write(&path, encoded).unwrap();
+    let decoded = decode_spool_file_for_tests(&path)
+        .expect("a writer-owned frame with a safe declared size must decode");
+    assert_eq!(decoded.len(), plain.len());
+}
