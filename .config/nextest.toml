@@ -52,8 +52,17 @@
 [test-groups]
 # At most one HTTP/3 test's QUIC gateway starts up / runs at a time.
 http3-serial = { max-threads = 1 }
+# `serial_test` only coordinates tests inside one process, while nextest runs
+# every case in its own process. Mirror the shared `#[serial]` lock used by the
+# LDAP and Kafka service-integration tests so their heavyweight containers do
+# not boot and operate concurrently in hosted CI.
+service-integration-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(/h3/) or test(/http3/) or test(/capability/)'
 test-group = 'http3-serial'
 threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'binary(=service_integration) and (test(/^ldap::/) or test(/^kafka::/))'
+test-group = 'service-integration-serial'
