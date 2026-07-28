@@ -1212,7 +1212,10 @@ fn split_request_trailer_frame_rejects_proxy_owned_forwarding_identity() {
         ("x-forwarded-proto", b"x-forwarded-proto: https\r\n"),
         ("x-forwarded-host", b"x-forwarded-host: evil.example\r\n"),
         ("forwarded", b"forwarded: for=203.0.113.9\r\n"),
-        ("X-Forwarded-For mixed case", b"X-Forwarded-For: 203.0.113.9\r\n"),
+        (
+            "X-Forwarded-For mixed case",
+            b"X-Forwarded-For: 203.0.113.9\r\n",
+        ),
         (
             "X-Forwarded-Proto mixed case",
             b"X-Forwarded-Proto: https\r\n",
@@ -1342,7 +1345,10 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
         .expect("test staging serializes");
     for (case, staged) in [
         ("forbidden name", r#"[["authorization","Bearer x"]]"#),
-        ("forbidden x-forwarded-for", r#"[["x-forwarded-for","203.0.113.9"]]"#),
+        (
+            "forbidden x-forwarded-for",
+            r#"[["x-forwarded-for","203.0.113.9"]]"#,
+        ),
         (
             "forbidden x-forwarded-proto",
             r#"[["x-forwarded-proto","https"]]"#,
@@ -1351,7 +1357,10 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
             "forbidden x-forwarded-host",
             r#"[["x-forwarded-host","evil.example"]]"#,
         ),
-        ("forbidden forwarded", r#"[["forwarded","for=203.0.113.9"]]"#),
+        (
+            "forbidden forwarded",
+            r#"[["forwarded","for=203.0.113.9"]]"#,
+        ),
         ("pseudo header", r#"[[":method","DELETE"]]"#),
         ("CRLF value", "[[\"x-app-id\",\"4\\r\\n2\"]]"),
         ("invalid binary value", r#"[["x-trace-bin","not base64!"]]"#),
