@@ -4513,11 +4513,14 @@ fn parse_header_type_and_params(
         if piece.is_empty() {
             continue;
         }
+        // MIME parameters are always `attribute=value`. Bare segments such as
+        // `filename*` / `filename*0` must fail closed so extended filename
+        // family markers cannot disappear before file-part resolution.
         let Some((key, raw_value)) = piece.split_once('=') else {
-            continue;
+            return Err("Malformed header parameter: expected name=value".to_string());
         };
         let key = key.trim().to_ascii_lowercase();
-        if key.is_empty() || key.len() > 256 {
+        if key.is_empty() || key.len() > 256 || !is_mime_token(&key) {
             return Err("Invalid header parameter name".to_string());
         }
         let decoded = decode_header_param_value(raw_value.trim())?;
@@ -4604,10 +4607,13 @@ fn decode_header_param_value(value: &str) -> Result<HeaderParamValue, String> {
 ///
 /// Supports ordinary RFC 7578 `filename` and a single RFC 5987/8187
 /// `filename*` extended value (`charset'language'value-chars`). Continuations
-/// (`filename*0*`, …), duplicates, ambiguous `filename`+`filename*`,
-/// unsupported charsets, malformed percent-encoding, invalid UTF-8, CR/LF/NUL,
-/// and encoded/decoded length overflow fail closed. Either form marks a file
-/// part so structured body spoofing cannot demote the part to a non-file field.
+/// (`filename*0*`, …), duplicates, ambiguous `filename`+`filename*`, quoted
+/// `filename*` (RFC 8187 `ext-value` is not a quoted-string), unsupported
+/// charsets, malformed percent-encoding, invalid UTF-8, CR/LF/NUL, and encoded
+/// length overflow fail closed. A decoded-length cap is kept as defense in
+/// depth even though percent-decoding cannot expand past the raw value-chars
+/// budget. Either form marks a file part so structured body spoofing cannot
+/// demote the part to a non-file field.
 fn resolve_multipart_filename(
     params: &HashMap<String, HeaderParamValue>,
 ) -> Result<Option<String>, String> {
@@ -4636,6 +4642,13 @@ fn resolve_multipart_filename(
             Ok(Some(ordinary.value.clone()))
         }
         (None, Some(extended)) => {
+            // RFC 8187 `ext-value` is not a quoted-string. Stripping quotes and
+            // decoding would accept a non-conforming wire form.
+            if extended.was_quoted {
+                return Err(
+                    "Malformed multipart part: filename* must not be a quoted-string".to_string(),
+                );
+            }
             let decoded = decode_rfc8187_filename_star(&extended.value)?;
             Ok(Some(decoded))
         }
@@ -4674,6 +4687,9 @@ fn decode_rfc8187_filename_star(raw: &str) -> Result<String, String> {
     if value_chars.len() > MAX_MULTIPART_PARAM_BYTES {
         return Err("Multipart filename* exceeds size limit".to_string());
     }
+    // Percent-decoding maps 3 wire bytes to 1 output byte (or copies attr-char
+    // 1:1), so decoded length cannot exceed the raw value-chars cap above. The
+    // decoded-length checks below are defense in depth only.
     let decoded_bytes = decode_rfc8187_value_chars(value_chars)?;
     if decoded_bytes.len() > MAX_MULTIPART_PARAM_BYTES {
         return Err("Multipart filename* decoded value exceeds size limit".to_string());
@@ -4747,6 +4763,8 @@ fn decode_rfc8187_value_chars(value_chars: &str) -> Result<Vec<u8>, String> {
                 );
             }
         }
+        // Defense in depth: unreachable while callers cap value_chars length
+        // first, because decoding never expands past the wire length.
         if out.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart filename* decoded value exceeds size limit".to_string());
         }

@@ -2899,6 +2899,56 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
                 "--abc--\r\n"
             ),
         ),
+        (
+            "quoted filename* ext-value",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=\"UTF-8''evil.txt\"\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare ordinary filename segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare filename* segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare filename* continuation segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*0\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "non-token parameter name",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; file name=\"a.txt\"\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
     ];
 
     for (label, body) in cases {
@@ -2916,34 +2966,101 @@ async fn multipart_filename_star_hostile_inputs_fail_closed() {
         );
     }
 
-    // Encoded-value length overflow (value-chars alone exceed the param cap).
-    let oversized = format!(
+    // Raw filename* param value exact bound (UTF-8'' + value-chars == 4 KiB).
+    let exact_raw_chars = 4 * 1024 - "UTF-8''".len();
+    let exact_filename = "a".repeat(exact_raw_chars);
+    let exact_raw = format!(
         "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
-        "a".repeat(4 * 1024 + 1)
+        exact_filename
+    );
+    let plugin_exact = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": exact_filename},
+                                    "content_type": {"type": "string", "const": "text/plain"},
+                                    "size": {"type": "integer", "const": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin_exact
+            .on_final_request_body_with_context(&mut ctx, &headers, exact_raw.as_bytes())
+            .await,
+    );
+
+    // One-over raw filename* param value (UTF-8'' + value-chars == 4 KiB + 1).
+    let one_over_raw = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
+        "a".repeat(exact_raw_chars + 1)
     );
     let mut ctx = post_ctx("/upload");
     ctx.headers = headers.clone();
     assert_reject(
         plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, oversized.as_bytes())
+            .on_final_request_body_with_context(&mut ctx, &headers, one_over_raw.as_bytes())
             .await,
         Some(400),
     );
 
-    // Decoded length overflow: many `%41` triplets expand past the decoded cap.
-    // Keep the wire value under the raw header/param budget while decoding past
-    // MAX_MULTIPART_PARAM_BYTES (4 KiB).
-    let decoded_overflow = format!(
-        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
-        "%41".repeat(4 * 1024 + 1)
+    // Unknown key=value parameters remain accepted alongside filename*.
+    let with_unknown = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a.txt; x-custom=keep\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
     );
+    let plugin_unknown = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "a.txt"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
     let mut ctx = post_ctx("/upload");
     ctx.headers = headers.clone();
-    assert_reject(
-        plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, decoded_overflow.as_bytes())
+    assert_continue(
+        plugin_unknown
+            .on_final_request_body_with_context(&mut ctx, &headers, with_unknown.as_bytes())
             .await,
-        Some(400),
     );
 }
 
@@ -2992,6 +3109,24 @@ async fn multipart_filename_star_keeps_structured_body_spoofing_fail_closed() {
     assert_reject(
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Bare filename* must fail closed at the parser boundary, not demote the
+    // part to a non-file field that would accept attacker-controlled JSON.
+    let bare_star = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"filename\":\"safe.png\",\"content_type\":\"image/png\",\"size\":2,\"content\":\"ok\"}\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, bare_star.as_bytes())
             .await,
         Some(400),
     );
