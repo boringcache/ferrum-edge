@@ -3896,11 +3896,7 @@ mod tests {
             "30s after publish, a 600s peer must still keep the shared row"
         );
         assert!(
-            no_global.shared_stale_deadline(
-                entry.resolved_at,
-                entry.native_ttl,
-                Some(5),
-            ) < now,
+            no_global.shared_stale_deadline(entry.resolved_at, entry.native_ttl, Some(5),) < now,
             "if retention wrongly used only the short peer, the row would already be past deadline"
         );
     }
@@ -4004,7 +4000,10 @@ mod tests {
             .expect("second publish");
         let entry = cache.cache.get("shared.example").expect("second row");
         assert!(Arc::ptr_eq(&first, &entry.shortest_per_proxy_ttl_secs));
-        assert!(Arc::ptr_eq(&first_longest, &entry.longest_per_proxy_ttl_secs));
+        assert!(Arc::ptr_eq(
+            &first_longest,
+            &entry.longest_per_proxy_ttl_secs
+        ));
         assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(5));
         assert_eq!(entry.load_longest_per_proxy_ttl(), Some(600));
     }
