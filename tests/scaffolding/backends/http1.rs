@@ -1421,8 +1421,8 @@ mod tests {
     #[tokio::test]
     async fn oversized_body_is_bounded_and_flagged() {
         let over = MAX_CAPTURED_REQUEST_BODY + 4096;
-        let mut raw = format!("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {over}\r\n\r\n")
-            .into_bytes();
+        let mut raw =
+            format!("POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: {over}\r\n\r\n").into_bytes();
         raw.extend(std::iter::repeat_n(b'z', over));
         let req = record_request(&raw).await;
         assert!(req.body_truncated, "oversized body must be flagged");
