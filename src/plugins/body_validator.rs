@@ -415,7 +415,15 @@ impl BodyValidator {
                 }
             };
 
-            let result = if is_json_like_content_type(content_type) && has_json_validation {
+            // JSON branch matches `before_proxy`: any matching JSON-like body is
+            // screened once request validation is active for this content type,
+            // even when only XML rules (plus `content_types: ["application/json"]`)
+            // activated the plugin — otherwise a request-body transform can
+            // reintroduce duplicate members after the first screen and the final
+            // backend-visible bytes are never checked. `has_json_validation` is
+            // consulted only by the early Continue above so protobuf-only configs
+            // still never treat arbitrary non-gRPC payloads as JSON.
+            let result = if is_json_like_content_type(content_type) {
                 Self::validate_json_body(
                     body_str,
                     &self.required_fields,

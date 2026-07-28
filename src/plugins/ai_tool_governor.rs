@@ -2290,25 +2290,33 @@ impl AiToolGovernor {
                 "streamed response body is not valid UTF-8 and cannot be inspected",
             );
         }
-        // Record the hash of the SSE body governed here so the post-transform
-        // `on_final_response_body` re-check (which routes SSE-labeled/shaped
-        // bodies back through this path) can skip an unchanged body instead of
-        // re-governing it — for `require_approval` policies that would mean a
-        // duplicate approval webhook call. Stored on the non-serialized
-        // per-instance `ai_tool_governor_response_hashes` map so this body-derived hash never
-        // reaches transaction logs.
-        self.set_response_hash(ctx, sha256_hex_bytes(body));
         let extracted = extract_sse_tool_calls(body);
         // Mirror the live streaming finalizer: a buffered SSE tool call that
         // cannot be policy-checked (missing `function.name` or non-string
         // `function.arguments`) is ungovernable. Fail closed in enforce, forward
         // in dry-run.
+        //
+        // Screen BEFORE staging the skip hash (same ordering as the decoded
+        // JSON ambiguity screens): an ungovernable body was never governed, so
+        // recording its hash would let dry-run Continue — or a later final
+        // re-check after an enforce Reject — hash-skip bytes that must be
+        // re-evaluated as uninspectable.
         if extracted.ungovernable {
             return self.uninspectable_governed_response(
                 ctx,
                 "streamed response body contains an ungovernable tool call",
             );
         }
+        // Record the hash of the SSE body governed here so the post-transform
+        // `on_final_response_body` re-check (which routes SSE-labeled/shaped
+        // bodies back through this path) can skip an unchanged body instead of
+        // re-governing it — for `require_approval` policies that would mean a
+        // duplicate approval webhook call. Stored on the non-serialized
+        // per-instance `ai_tool_governor_response_hashes` map so this body-derived hash never
+        // reaches transaction logs. Staged only after the ungovernable screen
+        // so governable responses (including empty-call bodies) keep
+        // no-duplicate-approval skip behavior.
+        self.set_response_hash(ctx, sha256_hex_bytes(body));
         if extracted.calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -3181,8 +3189,14 @@ impl Plugin for AiToolGovernor {
         // silent `None`, which would forward the body unredacted and let the
         // terminal re-check hash-skip it) routes the ambiguity to
         // `on_final_response_body`, which fails closed — the same recovery the
-        // serialization-overflow branch below uses.
-        if json_dup_keys::slice_ambiguity(strip_json_bom(body)).is_some() {
+        // serialization-overflow branch below uses. Use the shared per-request
+        // memo (exact BOM-stripped bytes as key) like every other
+        // context-bearing screen on this plugin.
+        if ctx
+            .json_scan_memo
+            .ambiguity(strip_json_bom(body))
+            .is_some()
+        {
             self.clear_response_hash(ctx);
             ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
             return None;
@@ -3744,7 +3758,7 @@ impl StreamingToolCallAccumulator {
                     ToolCallsContainer::Array(items) => items,
                     // Present but not an array: cannot be accumulated. Flag the
                     // batch ungovernable (mirrors the buffered non-array case) so
-                    // `has_ungovernable_call()` fails closed in enforce.
+                    // `finalize_checked()` fails closed in enforce.
                     ToolCallsContainer::Malformed => {
                         self.malformed = true;
                         &[]
@@ -3876,42 +3890,36 @@ impl StreamingToolCallAccumulator {
         self.calls.iter().all(|((c, _), _)| finished.contains(c))
     }
 
-    /// Whether any accumulated tool call cannot be policy-checked: it never
-    /// received a `function.name`, its `function.arguments` arrived as a
-    /// non-string JSON value, a frame carried a MALFORMED `tool_calls`
-    /// container (present but not an array), its streaming identity is
-    /// ambiguous (duplicate indexes / conflicting ids), or its accumulated
-    /// `arguments` JSON string carries duplicate object member names
-    /// (advisory `GHSA-c78j-5w9p-cpq6` — the value this gateway would evaluate
-    /// is not necessarily the one the client's parser reads). `build_calls()`
-    /// silently drops unnamed calls and `push_frame` cannot accumulate a
-    /// non-array container, so a governable named call in the same batch must
-    /// not carry an ungovernable sibling past policy.
-    ///
-    /// This is the single choke point both the live streaming finalizer and the
-    /// buffered-SSE batch sealer consult, so their ungovernable semantics
-    /// cannot drift.
-    fn has_ungovernable_call(&self) -> bool {
-        self.malformed
-            || self.calls.iter().any(|(_, c)| {
-                c.name.is_empty()
-                    || c.non_string_args
-                    || c.ambiguous_identity
-                    || json_dup_keys::str_ambiguity(&c.arguments).is_some()
-            })
-    }
-
-    fn build_calls(&self) -> Vec<ToolCall> {
-        self.calls
-            .iter()
-            .filter(|(_, c)| !c.name.is_empty())
-            .map(|(_, c)| ToolCall {
+    /// Authoritative checked finalization for a sealed batch: each accumulated
+    /// call's `arguments` string is screened for duplicate-member ambiguity at
+    /// most once. Returns `Err(())` (ungovernable) when any call cannot be
+    /// policy-checked — malformed container, missing name, non-string args,
+    /// ambiguous identity, or duplicate-member arguments — otherwise the built
+    /// governable calls. Both the live streaming finalizer and the buffered-SSE
+    /// batch sealer consult this single choke point so their ungovernable
+    /// semantics and argument-scan cost cannot drift.
+    fn finalize_checked(&self) -> Result<Vec<ToolCall>, ()> {
+        if self.malformed {
+            return Err(());
+        }
+        let mut out = Vec::with_capacity(self.calls.len());
+        for (_, c) in &self.calls {
+            if c.name.is_empty() || c.non_string_args || c.ambiguous_identity {
+                return Err(());
+            }
+            // One ambiguity scan per call: an ambiguous arguments document
+            // makes the whole batch ungovernable (same class as a missing name).
+            if json_dup_keys::str_ambiguity(&c.arguments).is_some() {
+                return Err(());
+            }
+            out.push(ToolCall {
                 name: c.name.clone(),
                 parsed_args: serde_json::from_str(&c.arguments).ok(),
-                args_ambiguous: json_dup_keys::str_ambiguity(&c.arguments).is_some(),
+                args_ambiguous: false,
                 raw_args: c.arguments.clone(),
-            })
-            .collect()
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -4169,25 +4177,28 @@ impl ToolCallStreamInspector {
             return Finalize::Released;
         }
         // Any accumulated tool call that cannot be policy-checked — no
-        // `function.name`, or non-string `function.arguments` — makes the whole
+        // `function.name`, non-string `function.arguments`, malformed container,
+        // ambiguous identity, or duplicate-member arguments — makes the whole
         // batch ungovernable: a governable named call in the same SSE batch
         // could otherwise carry an unchecked sibling to the client. Enforce mode
         // fails closed (cut the stream); dry-run releases the held frames
-        // unchanged so observation never disrupts traffic. Detecting ANY
-        // ungovernable call (not just the all-unnamed case) is required because
-        // `build_calls()` silently drops unnamed calls.
-        if self.accumulator.has_ungovernable_call() {
-            if self.engine.mode == Mode::Enforce {
-                self.record_uninspectable_metadata();
+        // unchanged so observation never disrupts traffic. A single
+        // `finalize_checked` pass both screens and builds so arguments are not
+        // scanned twice.
+        let calls = match self.accumulator.finalize_checked() {
+            Err(()) => {
+                if self.engine.mode == Mode::Enforce {
+                    self.record_uninspectable_metadata();
+                    self.held.clear();
+                    return Finalize::Blocked;
+                }
+                out.extend_from_slice(&self.held);
                 self.held.clear();
-                return Finalize::Blocked;
+                self.reset_batch();
+                return Finalize::Released;
             }
-            out.extend_from_slice(&self.held);
-            self.held.clear();
-            self.reset_batch();
-            return Finalize::Released;
-        }
-        let calls = self.accumulator.build_calls();
+            Ok(calls) => calls,
+        };
         if calls.is_empty() {
             // Saw a tool-call array but no governable calls (e.g. an empty
             // array): nothing to check, release the held frames unchanged.
@@ -4882,13 +4893,17 @@ impl BufferedSseBatches {
 
     /// Seal the pending batch at a completion boundary: fold its calls (under
     /// their TRUE per-batch names) and its ungovernable state into the
-    /// extract, then reset the accumulator for the next batch.
+    /// extract, then reset the accumulator for the next batch. Uses the same
+    /// single checked-finalization pass as the live streaming finalizer so
+    /// argument ambiguity is screened once per call.
     fn seal_batch(&mut self) {
         if !self.saw_tool_calls {
             return;
         }
-        self.extract.ungovernable |= self.acc.has_ungovernable_call();
-        self.extract.calls.extend(self.acc.build_calls());
+        match self.acc.finalize_checked() {
+            Err(()) => self.extract.ungovernable = true,
+            Ok(calls) => self.extract.calls.extend(calls),
+        }
         self.acc = StreamingToolCallAccumulator::default();
         self.finished.clear();
         self.saw_tool_calls = false;

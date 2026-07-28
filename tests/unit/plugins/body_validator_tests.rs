@@ -5329,3 +5329,53 @@ async fn pathologically_deep_body_is_refused_without_stack_overflow() {
     let mut headers = make_json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
 }
+
+/// Narrow XML-activated config with `content_types: ["application/json"]` and
+/// no JSON schema/required fields: `before_proxy` still screens matching JSON,
+/// so the final backend-visible hook must too — a transform must not be able to
+/// reintroduce duplicate members after the first screen.
+#[tokio::test]
+async fn xml_activated_json_content_type_final_rejects_reintroduced_duplicates() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "content_types": ["application/json"]
+    }))
+    .unwrap();
+
+    let clean = r#"{"role":"safe"}"#;
+    let mut ctx = make_json_ctx(clean);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Transform reintroduces ambiguity on the backend-visible bytes.
+    let ambiguous = br#"{"role":"admin","role":"safe"}"#;
+    assert_reject(
+        plugin.on_final_request_body(&headers, ambiguous).await,
+        Some(400),
+    );
+
+    // Unambiguous final body still passes (parity with before_proxy).
+    assert_continue(plugin.on_final_request_body(&headers, clean.as_bytes()).await);
+
+    // XML gating preserved: XML content type is outside this content_types list.
+    let xml_headers = make_xml_headers();
+    assert_continue(
+        plugin
+            .on_final_request_body(&xml_headers, b"<root/>")
+            .await,
+    );
+}
+
+/// Protobuf-only configs must not treat arbitrary non-gRPC payloads as JSON on
+/// the final request-body hook (early Continue before the JSON branch).
+#[tokio::test]
+async fn protobuf_only_final_request_does_not_json_screen_non_grpc() {
+    let plugin = protobuf_plugin();
+    let headers = make_json_headers();
+    // Duplicate members would fail a JSON screen; protobuf-only must Continue.
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, br#"{"role":"admin","role":"safe"}"#)
+            .await,
+    );
+}

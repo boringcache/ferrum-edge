@@ -4147,6 +4147,78 @@ async fn buffered_sse_ungovernable_call_fails_closed() {
     );
 }
 
+/// An ungovernable buffered SSE body must not stage a skip hash: otherwise a
+/// later `on_final_response_body` of the same bytes would hash-skip and
+/// Continue past the uninspectable screen (even after the initial Reject).
+#[tokio::test]
+async fn buffered_sse_ungovernable_never_stages_final_skip_hash() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+    // Same context + same body: must still fail closed. Staging a hash before
+    // the ungovernable screen would let this final re-check hash-skip.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Governable buffered SSE still stages a skip hash so an unchanged final body
+/// does not re-fire a `require_approval` webhook.
+#[tokio::test]
+async fn buffered_sse_governable_still_hash_skips_unchanged_final() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"report.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers, body.as_bytes())
+            .await,
+    );
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .await,
+    );
+    server.verify().await;
+}
+
 /// A request whose `Content-Type` was stripped by a transform is still governed
 /// when the body is JSON-shaped.
 #[tokio::test]
@@ -9177,6 +9249,59 @@ async fn redact_args_amplification_clears_hash_on_transform() {
     assert_reject(
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// Context-bearing response transform screens ambiguity through the shared
+/// per-request memo (exact BOM-stripped bytes), clears skip ledgers, and lets
+/// the final re-check fail closed — the same recovery as amplification failure.
+#[tokio::test]
+async fn transform_response_ambiguous_body_clears_hash_via_memo_screen() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "token" }]
+            }
+        }
+    }));
+    let clean = response_with_tool_call("filesystem.write", "{\"data\":\"my token here\"}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
+            .await,
+    );
+
+    // Large enough for the digest-keyed memo path; leading BOM is stripped
+    // before the screen (same bytes-as-key semantics as other context sites).
+    let padding = "x".repeat(8192);
+    let ambiguous = format!(
+        "\u{feff}{{\"pad\":\"{padding}\",\"choices\":[{{\"message\":{{\"tool_calls\":[\
+{{\"id\":\"c1\",\"type\":\"function\",\"function\":{{\
+\"name\":\"filesystem.write\",\"name\":\"other\",\"arguments\":\"{{}}\"}}}}]}}}}]}}"
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                ambiguous.as_bytes(),
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "ambiguous transform body must decline rewrite"
+    );
+
+    // Skip ledgers cleared: final re-check must not hash-skip the ambiguous
+    // client-visible bytes. A second screen of the same BOM-stripped payload on
+    // this context reuses the memo entry rather than inheriting a stale pass.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), ambiguous.as_bytes())
             .await,
         Some(502),
     );
