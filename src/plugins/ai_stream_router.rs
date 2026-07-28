@@ -2179,6 +2179,22 @@ const SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES: usize = 512;
 const SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE: &str =
     "upstream provider SSE stream exceeded the cumulative normalized size limit; stream terminated";
 
+/// Fixed bytes wrapping a bound diagnostic in one terminal emission:
+/// `data: {"error":{"message":"…","type":"upstream_error"}}\n\n` (56) plus the
+/// `data: [DONE]\n\n` sentinel (14). Bound diagnostics are ASCII literals, so
+/// JSON escaping never expands them beyond their own length.
+const SSE_BOUND_DIAGNOSTIC_ENVELOPE_BYTES: usize = 70;
+
+// The reserve is what lets a terminal frame replace an over-budget emission
+// without itself crossing `MAX_SSE_NORMALIZED_OUTPUT_BYTES`. Pin that invariant
+// to the longest `fail_bound` diagnostic at compile time so lengthening a
+// message cannot silently break it.
+const _: () = assert!(
+    SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE.len() + SSE_BOUND_DIAGNOSTIC_ENVELOPE_BYTES
+        <= SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES,
+    "terminal reserve must cover the normalized-output bound diagnostic frame"
+);
+
 /// Maximum complete SSE events accepted by one normalizer instance. Defends
 /// against tiny-event floods that stay under the per-event and body-byte caps.
 pub const MAX_SSE_EVENTS: usize = 100_000;
@@ -2744,9 +2760,12 @@ impl AnthropicSseNormalizer {
         false
     }
 
-    fn finish_stream(&mut self, out: &mut String) -> bool {
+    /// Terminal EOF handling. Always ends the OpenAI stream: every path emits a
+    /// terminal frame (or reuses one already emitted), so there is no
+    /// "continue reading" outcome to report back.
+    fn finish_stream(&mut self, out: &mut String) {
         if self.drain_complete(out) {
-            return true;
+            return;
         }
         // Transcode any trailing event that lacked a final blank-line boundary.
         if self.unread_len() > 0 {
@@ -2755,14 +2774,14 @@ impl AnthropicSseNormalizer {
                     "upstream provider sent an oversized SSE event; stream terminated",
                     out,
                 );
-                return true;
+                return;
             }
             if self.events_seen >= MAX_SSE_EVENTS {
                 self.fail_bound(
                     "upstream provider SSE stream exceeded the event count limit; stream terminated",
                     out,
                 );
-                return true;
+                return;
             }
             let start = self.cursor;
             let end = self.buf.len();
@@ -2784,15 +2803,15 @@ impl AnthropicSseNormalizer {
                     );
                     self.finish(StreamTerminal::UpstreamFailure, out);
                     let _ = self.normalized_output_exceeded(out, true);
-                    return true;
+                    return;
                 }
                 outcome => {
                     let terminate = self.apply_frame_outcome(outcome, out);
                     if self.normalized_output_exceeded(out, terminate) {
-                        return true;
+                        return;
                     }
                     if terminate {
-                        return true;
+                        return;
                     }
                     // Preserve prior EOF framing: a non-terminating trailing frame
                     // that is not pure whitespace is treated as malformed trailing
@@ -2804,7 +2823,7 @@ impl AnthropicSseNormalizer {
                         );
                         self.finish(StreamTerminal::UpstreamFailure, out);
                         let _ = self.normalized_output_exceeded(out, true);
-                        return true;
+                        return;
                     }
                 }
             }
@@ -2817,7 +2836,6 @@ impl AnthropicSseNormalizer {
         );
         self.finish(StreamTerminal::UpstreamFailure, out);
         let _ = self.normalized_output_exceeded(out, true);
-        true
     }
 
     fn commit_forwarded(&mut self, out: &str) {
@@ -2848,7 +2866,7 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
             return ResponseStreamAction::Terminate(None);
         }
         let mut out = String::new();
-        let _ = self.finish_stream(&mut out);
+        self.finish_stream(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
     }
 }
