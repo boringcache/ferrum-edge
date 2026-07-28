@@ -4400,13 +4400,13 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
                 .as_slice(),
         ),
     ] {
+        // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
         let proxy: Proxy = serde_json::from_value(json!({
             "id": proxy_id,
             "namespace": "ferrum",
             "backend_host": "backend.example.com",
             "backend_port": 443,
-            "listen_path": listen_path,
-            "api_spec_id": spec_id
+            "listen_path": listen_path
         }))
         .expect("proxy deserialization failed");
         let bundle = ferrum_edge::ExtractedBundle {
@@ -4455,8 +4455,7 @@ async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
             "namespace": "tenant-b",
             "backend_host": "backend.example.com",
             "backend_port": 443,
-            "listen_path": "/other",
-            "api_spec_id": "spec-other-ns"
+            "listen_path": "/other"
         }))
         .expect("proxy deserialization failed");
         let bundle = ferrum_edge::ExtractedBundle {
@@ -4558,13 +4557,13 @@ async fn test_restore_rollback_restores_api_specs() {
         .expect("Failed to connect to test database");
     let pool = db.pool();
 
+    // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
     let proxy: Proxy = serde_json::from_value(json!({
         "id": "spec-proxy",
         "namespace": "ferrum",
         "backend_host": "backend.example.com",
         "backend_port": 443,
-        "listen_path": "/spec-proxy",
-        "api_spec_id": "spec-1"
+        "listen_path": "/spec-proxy"
     }))
     .expect("proxy deserialization failed");
     let bundle = ferrum_edge::ExtractedBundle {
@@ -4669,13 +4668,13 @@ async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
         .await
         .expect("Failed to connect to test database");
 
+    // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
     let proxy: Proxy = serde_json::from_value(json!({
         "id": "spec-proxy",
         "namespace": "ferrum",
         "backend_host": "backend.example.com",
         "backend_port": 443,
-        "listen_path": "/spec-proxy",
-        "api_spec_id": "spec-1"
+        "listen_path": "/spec-proxy"
     }))
     .expect("proxy deserialization failed");
     let bundle = ferrum_edge::ExtractedBundle {
