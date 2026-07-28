@@ -8484,7 +8484,7 @@ mod tests {
     fn h3_grpc_reject_normalization_preserves_custom_headers_and_metadata() {
         let normalized = normalize_h3_grpc_reject(
             StatusCode::TOO_MANY_REQUESTS,
-            Bytes::from_static(br#"{"error":"Rate limit exceeded"}"#),
+            bytes::Bytes::from_static(br#"{"error":"Rate limit exceeded"}"#),
             &HashMap::from([("x-ratelimit-limit".to_string(), "5".to_string())]),
         );
         let mut ctx = RequestContext::new(
