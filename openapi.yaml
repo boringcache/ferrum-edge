@@ -21857,7 +21857,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission and ordered response assembly, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -21879,7 +21879,7 @@ components:
               items:
                 type: string
               default: ["2025-11-25"]
-              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version.
+              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
           properties:
@@ -22046,6 +22046,24 @@ components:
               minimum: 1
               default: 8388608
               description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
+            max_batch_items:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 32
+              description: "Maximum JSON-RPC batch array members admitted before session, catalog, or upstream work. Empty batches are rejected separately as Invalid Request. Must be greater than 0."
+            max_batch_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum aggregate request-body bytes admitted for a JSON-RPC batch before expensive work. Must be greater than 0 and at least max_batch_item_bytes."
+            max_batch_item_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 262144
+              description: "Maximum serialized bytes admitted for one JSON-RPC batch member. Must be greater than 0 and must not exceed max_batch_bytes."
         observability:
           type: object
           properties:

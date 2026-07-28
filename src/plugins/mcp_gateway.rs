@@ -41,6 +41,9 @@ const MAX_MCP_PAGINATION_PAGES: usize = 100;
 const DEFAULT_MAX_MCP_CATALOG_ITEMS_PER_LIST: usize = 10_000;
 const DEFAULT_MAX_MCP_CATALOG_BYTES_PER_LIST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_JSONRPC_BATCH_ITEMS: usize = 32;
+const DEFAULT_MAX_JSONRPC_BATCH_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES: usize = 256 * 1024;
 const MAX_UPSTREAM_SSE_EVENT_BYTES: usize = 1024 * 1024;
 const MCP_STREAMABLE_HTTP_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_TEMPLATE_RESOURCE_URI_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
@@ -225,6 +228,12 @@ struct McpValidationConfig {
     max_catalog_items_per_list: usize,
     /// Max total serialized bytes accumulated across paginated catalog pages.
     max_catalog_bytes_per_list: usize,
+    /// Max JSON-RPC batch array members admitted before expensive dispatch.
+    max_batch_items: usize,
+    /// Max aggregate request-body bytes admitted for a JSON-RPC batch.
+    max_batch_bytes: usize,
+    /// Max serialized bytes admitted for one JSON-RPC batch member.
+    max_batch_item_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -589,15 +598,8 @@ impl McpGateway {
                 "mcp_gateway: 'endpoint.protocol_versions' entries must not be empty".to_string(),
             );
         }
-        if supported_protocol_versions
-            .iter()
-            .any(|version| version == "2025-03-26")
-        {
-            return Err(
-                "mcp_gateway: endpoint.protocol_versions cannot include 2025-03-26 because JSON-RPC batch messages are not supported in V1"
-                    .to_string(),
-            );
-        }
+        // `2025-03-26` is admitted: JSON-RPC batches are handled by the gateway
+        // with explicit item/byte/nesting limits (see validation.max_batch_*).
 
         let discovery = parse_discovery(object)?;
         let sessions = parse_sessions(object)?;
@@ -3171,6 +3173,671 @@ impl McpGateway {
         self.set_route_to_server(ctx, headers, server, downstream_session_id.as_deref());
         PluginResult::Continue
     }
+
+    async fn handle_jsonrpc_batch(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        batch: &[Value],
+        body_len: usize,
+    ) -> PluginResult {
+        // JSON-RPC 2.0: an empty array is an invalid batch and yields a single
+        // Response object (not an array). Bound aggregate/item sizes and nesting
+        // before any session, catalog, or upstream work.
+        if let Err(response) = self.admit_jsonrpc_batch(batch, body_len) {
+            return response;
+        }
+        if self.observability.emit_metadata {
+            ctx.metadata
+                .insert("mcp.batch".to_string(), "true".to_string());
+            ctx.metadata
+                .insert("mcp.batch_size".to_string(), batch.len().to_string());
+        }
+
+        // Transparent mode keeps a single upstream, so an admitted batch is
+        // forwarded as the original array after per-item envelope checks.
+        if self.mode == McpGatewayMode::TransparentProxy {
+            let mut first_envelope = None;
+            for item in batch {
+                match parse_mcp_envelope_value(item) {
+                    Ok(envelope) => {
+                        if first_envelope.is_none() {
+                            first_envelope = Some(envelope);
+                        }
+                    }
+                    Err(_) => {
+                        // Per-item invalidity still fails closed for transparent
+                        // forwarding: unrelated siblings must not bypass the same
+                        // envelope rules applied to singletons.
+                        return json_rpc_error(
+                            item.get("id").cloned(),
+                            -32600,
+                            "Invalid MCP JSON-RPC request",
+                            None,
+                        );
+                    }
+                }
+            }
+            if let Some(envelope) = first_envelope.as_ref() {
+                self.emit_envelope_metadata(ctx, envelope);
+                let _ = self.mark_protocol_version(ctx, headers, Some(envelope));
+            }
+            return self.handle_transparent_post(
+                ctx,
+                headers,
+                first_envelope.as_ref().unwrap_or(&McpEnvelope {
+                    jsonrpc: "2.0".to_string(),
+                    id: None,
+                    method: None,
+                    params: None,
+                    result: None,
+                    error: None,
+                    message_kind: McpMessageKind::Notification,
+                }),
+            );
+        }
+
+        // Aggregate batches are executed by the gateway (never Continue): items
+        // may route to different upstreams or synthetic handlers. Process
+        // sequentially so RequestContext mutations stay lock-free and concurrency
+        // cannot fan out unbounded tasks per item.
+        let mut responses = Vec::new();
+        let mut session_header: Option<(String, String)> = None;
+        let mut saw_response_bearing = false;
+        let inbound_headers = headers.clone();
+
+        for item in batch {
+            *headers = inbound_headers.clone();
+            self.clear_batch_item_routing_state(ctx);
+
+            let envelope = match parse_mcp_envelope_value(item) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    saw_response_bearing = true;
+                    responses.push(json_rpc_error_value(
+                        item.get("id").cloned(),
+                        -32600,
+                        "Invalid MCP JSON-RPC request",
+                    ));
+                    continue;
+                }
+            };
+            // Client→server response/error objects are not MCP gateway requests.
+            if matches!(
+                envelope.message_kind,
+                McpMessageKind::Response | McpMessageKind::ErrorResponse
+            ) {
+                saw_response_bearing = true;
+                responses.push(json_rpc_error_value(
+                    envelope.id.clone(),
+                    -32600,
+                    "Invalid MCP JSON-RPC request",
+                ));
+                continue;
+            }
+
+            self.emit_envelope_metadata(ctx, &envelope);
+            let result = self.dispatch_post_envelope(ctx, headers, &envelope).await;
+            match classify_batch_item_result(result, envelope.id.clone()) {
+                BatchItemOutcome::Notification => {}
+                BatchItemOutcome::Response {
+                    value,
+                    session_header: item_session,
+                } => {
+                    saw_response_bearing = true;
+                    if let Some((name, value)) = item_session {
+                        // Later members of the same batch must observe a session
+                        // minted by an earlier initialize member.
+                        inbound_headers.insert(name.clone(), value.clone());
+                        session_header = Some((name, value));
+                    }
+                    responses.push(value);
+                }
+                BatchItemOutcome::NeedsUpstream { id } => {
+                    saw_response_bearing = true;
+                    let upstream_response = self
+                        .execute_prepared_batch_upstream(ctx, headers, item, id)
+                        .await;
+                    responses.push(upstream_response);
+                }
+            }
+        }
+
+        self.clear_batch_item_routing_state(ctx);
+        *headers = inbound_headers;
+
+        if !saw_response_bearing {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return empty_response(202);
+        }
+
+        ctx.metadata.insert(
+            "mcp.route_decision".to_string(),
+            "synthetic_response".to_string(),
+        );
+        let session = session_header
+            .as_ref()
+            .map(|(name, value)| (name.as_str(), value.as_str()));
+        json_response(200, Value::Array(responses), session)
+    }
+
+    fn admit_jsonrpc_batch(&self, batch: &[Value], body_len: usize) -> Result<(), PluginResult> {
+        if batch.is_empty() {
+            return Err(json_rpc_error(None, -32600, "Invalid Request", None));
+        }
+        if body_len > self.validation.max_batch_bytes {
+            return Err(json_rpc_error(
+                None,
+                -32600,
+                "Invalid Request",
+                Some("JSON-RPC batch exceeded max_batch_bytes".to_string()),
+            ));
+        }
+        if batch.len() > self.validation.max_batch_items {
+            return Err(json_rpc_error(
+                None,
+                -32600,
+                "Invalid Request",
+                Some("JSON-RPC batch exceeded max_batch_items".to_string()),
+            ));
+        }
+        for item in batch {
+            // Nested arrays (batch-in-batch) and non-objects fail admission with a
+            // single Invalid Request before any dispatch work.
+            if !item.is_object() {
+                return Err(json_rpc_error(
+                    None,
+                    -32600,
+                    "Invalid Request",
+                    Some("JSON-RPC batch members must be objects".to_string()),
+                ));
+            }
+            let item_bytes = match serde_json::to_vec(item) {
+                Ok(bytes) => bytes.len(),
+                Err(_) => {
+                    return Err(json_rpc_error(
+                        None,
+                        -32600,
+                        "Invalid Request",
+                        Some("JSON-RPC batch member could not be measured".to_string()),
+                    ));
+                }
+            };
+            if item_bytes > self.validation.max_batch_item_bytes {
+                return Err(json_rpc_error(
+                    None,
+                    -32600,
+                    "Invalid Request",
+                    Some("JSON-RPC batch member exceeded max_batch_item_bytes".to_string()),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_batch_item_routing_state(&self, ctx: &mut RequestContext) {
+        ctx.route_override_backend_scheme = None;
+        ctx.route_override_backend_host = None;
+        ctx.route_override_backend_port = None;
+        ctx.route_override_resolved_tls = None;
+        ctx.route_override_path = None;
+        ctx.route_override_path_is_absolute = false;
+        ctx.route_override_authority = None;
+        ctx.mcp_trusted_tool_name_rewrite = None;
+        ctx.mcp_response_resource_binding = None;
+        ctx.metadata.remove(METADATA_REWRITE_KEY);
+        ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY);
+        ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY);
+        ctx.metadata.remove(METADATA_REWRITE_PUBLIC_VALUE_KEY);
+        ctx.metadata.remove(METADATA_REWRITE_UPSTREAM_VALUE_KEY);
+        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_KEY);
+        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_METHOD_KEY);
+        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_SERVER_KEY);
+        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_SESSION_KEY);
+        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY);
+    }
+
+    async fn execute_prepared_batch_upstream(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        original_item: &Value,
+        id: Option<Value>,
+    ) -> Value {
+        let Some(server) = ctx
+            .metadata
+            .get("mcp.server_id")
+            .and_then(|server_id| self.servers.get(server_id).cloned())
+            .or_else(|| {
+                ctx.route_override_backend_host.as_ref().and_then(|host| {
+                    self.servers
+                        .values()
+                        .find(|server| server.target.host == *host && server.enabled)
+                        .cloned()
+                })
+            })
+        else {
+            return json_rpc_error_value(id, -32002, "Unknown upstream MCP server");
+        };
+
+        let mut upstream_item = original_item.clone();
+        if ctx.metadata.get(METADATA_REWRITE_KEY).as_deref() == Some("true") {
+            let method = ctx
+                .metadata
+                .get(METADATA_REWRITE_METHOD_KEY)
+                .cloned()
+                .unwrap_or_default();
+            let param = ctx
+                .metadata
+                .get(METADATA_REWRITE_PARAM_KEY)
+                .cloned()
+                .unwrap_or_default();
+            let upstream_value = ctx
+                .metadata
+                .get(METADATA_REWRITE_UPSTREAM_VALUE_KEY)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(params) = upstream_item
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+            {
+                if upstream_item.get("method").and_then(Value::as_str) == Some(method.as_str()) {
+                    params.insert(param, Value::String(upstream_value));
+                }
+            }
+        }
+
+        let mut request = self
+            .http_client
+            .get()
+            .post(&server.upstream_url)
+            .header("content-type", "application/json")
+            .header("accept", MCP_STREAMABLE_HTTP_ACCEPT);
+        if let Some(version) = header_value(headers, "mcp-protocol-version") {
+            request = request.header("mcp-protocol-version", version);
+        }
+        if let Some(session_id) = header_value(headers, &self.sessions.upstream_session_header) {
+            request = request.header(&self.sessions.upstream_session_header, session_id);
+        }
+
+        let response = match self
+            .http_client
+            .execute_tracked(
+                request.json(&upstream_item),
+                "mcp_gateway.batch",
+                &ctx.plugin_http_call_ns,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(
+                    server_id = %server.server_id,
+                    error = %error,
+                    "MCP batch upstream request failed"
+                );
+                return json_rpc_error_value(id, -32005, "Upstream MCP session unavailable");
+            }
+        };
+        if !response.status().is_success() {
+            warn!(
+                server_id = %server.server_id,
+                status = %response.status(),
+                "MCP batch upstream returned non-success status"
+            );
+            return json_rpc_error_value(id, -32005, "Upstream MCP session unavailable");
+        }
+
+        let mut response_body = match upstream_response_json(
+            response,
+            &server.server_id,
+            upstream_item
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            self.validation.max_upstream_response_bytes,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(
+                    server_id = %server.server_id,
+                    error = %error,
+                    "MCP batch upstream response could not be parsed"
+                );
+                return json_rpc_error_value(id, -32005, "Upstream MCP session unavailable");
+            }
+        };
+
+        // Preserve the client-visible JSON-RPC id even when upstream rewrote it.
+        if let Some(id) = id {
+            if let Some(object) = response_body.as_object_mut() {
+                object.insert("id".to_string(), id);
+            }
+        }
+
+        if ctx.metadata.get(METADATA_RESPONSE_REWRITE_KEY).as_deref() == Some("true")
+            && let Some(result) = response_body.get_mut("result")
+        {
+            let method = ctx
+                .metadata
+                .get(METADATA_RESPONSE_REWRITE_METHOD_KEY)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let server_id = ctx
+                .metadata
+                .get(METADATA_RESPONSE_REWRITE_SERVER_KEY)
+                .map(String::as_str)
+                .unwrap_or(server.server_id.as_str());
+            let session_hash = ctx.metadata.get(METADATA_RESPONSE_REWRITE_SESSION_KEY);
+            let expected_catalog_version = ctx
+                .metadata
+                .get(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY)
+                .and_then(|value| value.parse::<u64>().ok());
+            let catalog_lock = session_hash.and_then(|hash| {
+                self.session_catalogs_by_hash
+                    .get(hash)
+                    .map(|catalog| Arc::clone(catalog.value()))
+            });
+            if let Some(catalog_lock) = catalog_lock {
+                let catalog = catalog_lock.read().await;
+                let catalog_version_matches = expected_catalog_version
+                    .is_some_and(|expected| catalog.version == expected);
+                match method {
+                    "resources/read" => {
+                        let _ = rewrite_resource_read_result(
+                            result,
+                            Some(&catalog),
+                            server_id,
+                            ctx.mcp_response_resource_binding
+                                .as_ref()
+                                .map(|(upstream, public)| (upstream.as_str(), public.as_str())),
+                            catalog_version_matches,
+                        );
+                    }
+                    "tools/call" if catalog_version_matches => {
+                        let _ = rewrite_tool_call_result(result, &catalog, server_id);
+                    }
+                    "prompts/get" if catalog_version_matches => {
+                        let _ = rewrite_prompt_get_result(result, &catalog, server_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        response_body
+    }
+
+    async fn dispatch_post_envelope(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &mut HashMap<String, String>,
+        envelope: &McpEnvelope,
+    ) -> PluginResult {
+        self.emit_envelope_metadata(ctx, envelope);
+        let protocol_version = self.mark_protocol_version(ctx, headers, Some(envelope));
+        let method = envelope.method.as_deref().unwrap_or_default();
+        // Methods the aggregate router handles itself are all JSON-RPC requests.
+        // A notification-form one (no id) is accepted with 202/no body and must run
+        // none of the request-side side effects, so this guard precedes protocol
+        // validation and the session touch/validation below: a stale session header
+        // must not turn it into a 404, a live one must not bump last_seen, and no
+        // catalog refresh or routing may occur. Genuine notifications/*,
+        // notification-form ping, and passthrough/unknown methods keep their handling
+        // in the match below. Transparent mode forwards notifications to its single
+        // upstream, so this only applies in aggregate mode.
+        if self.mode == McpGatewayMode::AggregateRouter
+            && envelope.message_kind == McpMessageKind::Notification
+            && matches!(
+                method,
+                "initialize"
+                    | "tools/list"
+                    | "tools/call"
+                    | "prompts/list"
+                    | "prompts/get"
+                    | "resources/list"
+                    | "resources/templates/list"
+                    | "resources/read"
+            )
+        {
+            ctx.metadata.insert(
+                "mcp.route_decision".to_string(),
+                "synthetic_response".to_string(),
+            );
+            return empty_response(202);
+        }
+        if method != "initialize"
+            && let Some(version) = protocol_version.as_deref()
+            && !self
+                .supported_protocol_versions
+                .iter()
+                .any(|supported| supported.as_str() == version)
+        {
+            ctx.metadata
+                .insert("mcp.route_decision".to_string(), "deny".to_string());
+            return json_response(
+                400,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": envelope.id.clone().unwrap_or(Value::Null),
+                    "error": {
+                        "code": -32600,
+                        "message": "Unsupported MCP protocol version"
+                    }
+                }),
+                None,
+            );
+        }
+        if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
+            if self.mode == McpGatewayMode::AggregateRouter
+                && method != "initialize"
+                && !self.touch_downstream_session(&session_id, ctx).await
+            {
+                return session_not_found_response();
+            }
+            ctx.metadata
+                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
+        }
+
+        if self.mode == McpGatewayMode::TransparentProxy {
+            return self.handle_transparent_post(ctx, headers, envelope);
+        }
+
+        match method {
+            "initialize" => {
+                // MCP initialize is a negotiation, not a gate: echo a supported
+                // requested version; otherwise answer with the gateway's
+                // preferred supported version and let the client decide whether
+                // to continue on it. Post-initialize requests still fail closed
+                // above when the MCP-Protocol-Version header is unsupported.
+                let version = match protocol_version {
+                    Some(requested)
+                        if self
+                            .supported_protocol_versions
+                            .iter()
+                            .any(|supported| supported == &requested) =>
+                    {
+                        requested
+                    }
+                    Some(_) => {
+                        let negotiated = self.preferred_protocol_version().to_string();
+                        ctx.metadata.insert(
+                            "mcp.protocol_version_negotiated".to_string(),
+                            negotiated.clone(),
+                        );
+                        negotiated
+                    }
+                    None => self.preferred_protocol_version().to_string(),
+                };
+                let client_info = envelope
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("clientInfo"))
+                    .cloned();
+                let client_capabilities = envelope
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("capabilities"))
+                    .cloned();
+                let downstream_session_id = self
+                    .create_downstream_session(
+                        ctx,
+                        version.clone(),
+                        client_info,
+                        client_capabilities,
+                    )
+                    .await;
+                ctx.metadata.insert(
+                    "mcp.session.downstream".to_string(),
+                    hash_str(&downstream_session_id),
+                );
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                self.synthetic_initialize_response(envelope, &version, &downstream_session_id)
+            }
+            "notifications/initialized" | "ping" => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                if envelope.message_kind == McpMessageKind::Notification {
+                    return empty_response(202);
+                }
+                json_response(
+                    200,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": envelope.id.clone().unwrap_or(Value::Null),
+                        "result": {}
+                    }),
+                    None,
+                )
+            }
+            "tools/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_tools_list(ctx, envelope, &session_id).await
+            }
+            "tools/call" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_tool_call(ctx, headers, envelope, &session_id)
+                    .await
+            }
+            "prompts/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_prompts_list(ctx, envelope, &session_id)
+                    .await
+            }
+            "prompts/get" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_prompt_get(ctx, headers, envelope, &session_id)
+                    .await
+            }
+            "resources/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_resources_list(ctx, envelope, &session_id)
+                    .await
+            }
+            "resources/templates/list" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.aggregate_resource_templates_list(ctx, envelope, &session_id)
+                    .await
+            }
+            "resources/read" => {
+                let session_id = match self
+                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                    .await
+                {
+                    Ok(session_id) => session_id,
+                    Err(result) => return result,
+                };
+                self.route_resource_read(ctx, headers, envelope, &session_id)
+                    .await
+            }
+            _ if self.capabilities.passthrough_unknown_methods => {
+                if let Some(server) = self.primary_server() {
+                    let session_id = match self
+                        .require_live_downstream_session(headers, envelope.id.clone(), ctx)
+                        .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(result) => return result,
+                    };
+                    if let Err(error) = self
+                        .ensure_upstream_initialized(&session_id, &server.server_id, ctx)
+                        .await
+                    {
+                        return json_rpc_error(
+                            envelope.id.clone(),
+                            -32005,
+                            "Upstream MCP session unavailable",
+                            Some(error),
+                        );
+                    }
+                    self.set_route_to_server(ctx, headers, server, Some(&session_id));
+                    PluginResult::Continue
+                } else {
+                    json_rpc_error(
+                        envelope.id.clone(),
+                        -32002,
+                        "Unknown upstream MCP server",
+                        None,
+                    )
+                }
+            }
+            _ if envelope.message_kind == McpMessageKind::Notification => {
+                ctx.metadata.insert(
+                    "mcp.route_decision".to_string(),
+                    "synthetic_response".to_string(),
+                );
+                empty_response(202)
+            }
+            _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
+        }
+    }
+
 }
 
 #[async_trait]
@@ -3388,267 +4055,20 @@ impl Plugin for McpGateway {
         let Some(body) = self.request_body(ctx) else {
             return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None);
         };
-        let envelope = match parse_mcp_envelope(body) {
+        let parsed: Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
+        };
+        if let Some(batch) = parsed.as_array() {
+            return self
+                .handle_jsonrpc_batch(ctx, headers, batch, body.len())
+                .await;
+        }
+        let envelope = match parse_mcp_envelope_value(&parsed) {
             Ok(envelope) => envelope,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
-        self.emit_envelope_metadata(ctx, &envelope);
-        let protocol_version = self.mark_protocol_version(ctx, headers, Some(&envelope));
-        let method = envelope.method.as_deref().unwrap_or_default();
-        // Methods the aggregate router handles itself are all JSON-RPC requests.
-        // A notification-form one (no id) is accepted with 202/no body and must run
-        // none of the request-side side effects, so this guard precedes protocol
-        // validation and the session touch/validation below: a stale session header
-        // must not turn it into a 404, a live one must not bump last_seen, and no
-        // catalog refresh or routing may occur. Genuine notifications/*,
-        // notification-form ping, and passthrough/unknown methods keep their handling
-        // in the match below. Transparent mode forwards notifications to its single
-        // upstream, so this only applies in aggregate mode.
-        if self.mode == McpGatewayMode::AggregateRouter
-            && envelope.message_kind == McpMessageKind::Notification
-            && matches!(
-                method,
-                "initialize"
-                    | "tools/list"
-                    | "tools/call"
-                    | "prompts/list"
-                    | "prompts/get"
-                    | "resources/list"
-                    | "resources/templates/list"
-                    | "resources/read"
-            )
-        {
-            ctx.metadata.insert(
-                "mcp.route_decision".to_string(),
-                "synthetic_response".to_string(),
-            );
-            return empty_response(202);
-        }
-        if method != "initialize"
-            && let Some(version) = protocol_version.as_deref()
-            && !self
-                .supported_protocol_versions
-                .iter()
-                .any(|supported| supported.as_str() == version)
-        {
-            ctx.metadata
-                .insert("mcp.route_decision".to_string(), "deny".to_string());
-            return json_response(
-                400,
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": envelope.id.clone().unwrap_or(Value::Null),
-                    "error": {
-                        "code": -32600,
-                        "message": "Unsupported MCP protocol version"
-                    }
-                }),
-                None,
-            );
-        }
-        if let Some(session_id) = self.downstream_session_id_from_headers(headers) {
-            if self.mode == McpGatewayMode::AggregateRouter
-                && method != "initialize"
-                && !self.touch_downstream_session(&session_id, ctx).await
-            {
-                return session_not_found_response();
-            }
-            ctx.metadata
-                .insert("mcp.session.downstream".to_string(), hash_str(&session_id));
-        }
-
-        if self.mode == McpGatewayMode::TransparentProxy {
-            return self.handle_transparent_post(ctx, headers, &envelope);
-        }
-
-        match method {
-            "initialize" => {
-                // MCP initialize is a negotiation, not a gate: echo a supported
-                // requested version; otherwise answer with the gateway's
-                // preferred supported version and let the client decide whether
-                // to continue on it. Post-initialize requests still fail closed
-                // above when the MCP-Protocol-Version header is unsupported.
-                let version = match protocol_version {
-                    Some(requested)
-                        if self
-                            .supported_protocol_versions
-                            .iter()
-                            .any(|supported| supported == &requested) =>
-                    {
-                        requested
-                    }
-                    Some(_) => {
-                        let negotiated = self.preferred_protocol_version().to_string();
-                        ctx.metadata.insert(
-                            "mcp.protocol_version_negotiated".to_string(),
-                            negotiated.clone(),
-                        );
-                        negotiated
-                    }
-                    None => self.preferred_protocol_version().to_string(),
-                };
-                let client_info = envelope
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("clientInfo"))
-                    .cloned();
-                let client_capabilities = envelope
-                    .params
-                    .as_ref()
-                    .and_then(|params| params.get("capabilities"))
-                    .cloned();
-                let downstream_session_id = self
-                    .create_downstream_session(
-                        ctx,
-                        version.clone(),
-                        client_info,
-                        client_capabilities,
-                    )
-                    .await;
-                ctx.metadata.insert(
-                    "mcp.session.downstream".to_string(),
-                    hash_str(&downstream_session_id),
-                );
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
-                self.synthetic_initialize_response(&envelope, &version, &downstream_session_id)
-            }
-            "notifications/initialized" | "ping" => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
-                if envelope.message_kind == McpMessageKind::Notification {
-                    return empty_response(202);
-                }
-                json_response(
-                    200,
-                    json!({
-                        "jsonrpc": "2.0",
-                        "id": envelope.id.clone().unwrap_or(Value::Null),
-                        "result": {}
-                    }),
-                    None,
-                )
-            }
-            "tools/list" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.aggregate_tools_list(ctx, &envelope, &session_id).await
-            }
-            "tools/call" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.route_tool_call(ctx, headers, &envelope, &session_id)
-                    .await
-            }
-            "prompts/list" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.aggregate_prompts_list(ctx, &envelope, &session_id)
-                    .await
-            }
-            "prompts/get" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.route_prompt_get(ctx, headers, &envelope, &session_id)
-                    .await
-            }
-            "resources/list" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.aggregate_resources_list(ctx, &envelope, &session_id)
-                    .await
-            }
-            "resources/templates/list" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.aggregate_resource_templates_list(ctx, &envelope, &session_id)
-                    .await
-            }
-            "resources/read" => {
-                let session_id = match self
-                    .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                    .await
-                {
-                    Ok(session_id) => session_id,
-                    Err(result) => return result,
-                };
-                self.route_resource_read(ctx, headers, &envelope, &session_id)
-                    .await
-            }
-            _ if self.capabilities.passthrough_unknown_methods => {
-                if let Some(server) = self.primary_server() {
-                    let session_id = match self
-                        .require_live_downstream_session(headers, envelope.id.clone(), ctx)
-                        .await
-                    {
-                        Ok(session_id) => session_id,
-                        Err(result) => return result,
-                    };
-                    if let Err(error) = self
-                        .ensure_upstream_initialized(&session_id, &server.server_id, ctx)
-                        .await
-                    {
-                        return json_rpc_error(
-                            envelope.id.clone(),
-                            -32005,
-                            "Upstream MCP session unavailable",
-                            Some(error),
-                        );
-                    }
-                    self.set_route_to_server(ctx, headers, server, Some(&session_id));
-                    PluginResult::Continue
-                } else {
-                    json_rpc_error(
-                        envelope.id.clone(),
-                        -32002,
-                        "Unknown upstream MCP server",
-                        None,
-                    )
-                }
-            }
-            _ if envelope.message_kind == McpMessageKind::Notification => {
-                ctx.metadata.insert(
-                    "mcp.route_decision".to_string(),
-                    "synthetic_response".to_string(),
-                );
-                empty_response(202)
-            }
-            _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
-        }
+        self.dispatch_post_envelope(ctx, headers, &envelope).await
     }
 
     async fn transform_request_body_with_context(
@@ -4159,8 +4579,7 @@ fn expand_public_resource_template(
     (capture_index == captures.len()).then_some(public_uri)
 }
 
-fn parse_mcp_envelope(body: &[u8]) -> Result<McpEnvelope, String> {
-    let value: Value = serde_json::from_slice(body).map_err(|error| error.to_string())?;
+fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "JSON-RPC envelope must be an object".to_string())?;
@@ -4447,6 +4866,83 @@ fn json_rpc_error(
         }),
         None,
     )
+}
+
+fn json_rpc_error_value(id: Option<Value>, code: i64, message: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id.unwrap_or(Value::Null),
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
+}
+
+enum BatchItemOutcome {
+    Notification,
+    Response {
+        value: Value,
+        session_header: Option<(String, String)>,
+    },
+    NeedsUpstream { id: Option<Value> },
+}
+
+fn classify_batch_item_result(result: PluginResult, id: Option<Value>) -> BatchItemOutcome {
+    match result {
+        PluginResult::Continue => BatchItemOutcome::NeedsUpstream { id },
+        PluginResult::Reject {
+            status_code: 202,
+            body,
+            ..
+        } if body.is_empty() => BatchItemOutcome::Notification,
+        PluginResult::Reject {
+            status_code: 404,
+            body,
+            ..
+        } if body.is_empty() => BatchItemOutcome::Response {
+            value: json_rpc_error_value(id, -32004, "MCP session not found"),
+            session_header: None,
+        },
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            let session_header = headers.iter().find_map(|(name, value)| {
+                if name.eq_ignore_ascii_case("mcp-session-id") {
+                    Some((name.clone(), value.clone()))
+                } else {
+                    None
+                }
+            });
+            if let Ok(value) = serde_json::from_str::<Value>(&body)
+                && value.is_object()
+            {
+                return BatchItemOutcome::Response {
+                    value,
+                    session_header,
+                };
+            }
+            // Non-JSON terminal responses (and empty bodies) become bounded
+            // per-item errors so sibling batch members still validate.
+            let message = match status_code {
+                400 => "Invalid MCP JSON-RPC request",
+                404 => "MCP session not found",
+                405 => "Unsupported MCP aggregate HTTP method",
+                _ => "MCP gateway request failed",
+            };
+            BatchItemOutcome::Response {
+                value: json_rpc_error_value(id, -32600, message),
+                session_header: None,
+            }
+        }
+        // Other plugin results are not produced by MCP dispatch today; fail closed.
+        _ => BatchItemOutcome::Response {
+            value: json_rpc_error_value(id, -32603, "Internal MCP gateway error"),
+            session_header: None,
+        },
+    }
 }
 
 fn catalog_error_response(
@@ -5152,12 +5648,41 @@ fn parse_validation(object: &Map<String, Value>) -> Result<McpValidationConfig, 
                 .to_string(),
         );
     }
+    let max_batch_items = optional_u64_from_object(validation, "max_batch_items")?
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_ITEMS);
+    if max_batch_items == 0 {
+        return Err("mcp_gateway: 'validation.max_batch_items' must be greater than 0".to_string());
+    }
+    let max_batch_bytes = optional_u64_from_object(validation, "max_batch_bytes")?
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_BYTES);
+    if max_batch_bytes == 0 {
+        return Err("mcp_gateway: 'validation.max_batch_bytes' must be greater than 0".to_string());
+    }
+    let max_batch_item_bytes = optional_u64_from_object(validation, "max_batch_item_bytes")?
+        .map(|value| value as usize)
+        .unwrap_or(DEFAULT_MAX_JSONRPC_BATCH_ITEM_BYTES);
+    if max_batch_item_bytes == 0 {
+        return Err(
+            "mcp_gateway: 'validation.max_batch_item_bytes' must be greater than 0".to_string(),
+        );
+    }
+    if max_batch_item_bytes > max_batch_bytes {
+        return Err(
+            "mcp_gateway: 'validation.max_batch_item_bytes' must not exceed 'validation.max_batch_bytes'"
+                .to_string(),
+        );
+    }
     Ok(McpValidationConfig {
         validate_tool_arguments: optional_bool_from_object(validation, "validate_tool_arguments")?
             .unwrap_or(true),
         max_upstream_response_bytes,
         max_catalog_items_per_list,
         max_catalog_bytes_per_list,
+        max_batch_items,
+        max_batch_bytes,
+        max_batch_item_bytes,
     })
 }
 

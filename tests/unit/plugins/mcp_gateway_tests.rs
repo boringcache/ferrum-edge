@@ -858,11 +858,6 @@ fn invalid_config_shapes_are_rejected() {
             "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } },
             "policy": { "tools": { "github.x": { "action": "maybe" } } }
         }),
-        json!({
-            "mode": "aggregate_router",
-            "endpoint": { "path": "/mcp", "protocol_versions": ["2025-03-26"] },
-            "servers": { "github": { "upstream_url": "http://x/mcp", "namespace": "github" } }
-        }),
         // Server id with a URI-reserved '/' would parse back to the wrong id in
         // public mcp:// resource URIs.
         json!({
@@ -922,11 +917,14 @@ fn validation_upstream_and_catalog_limits_parse() {
     config["validation"] = json!({
         "max_upstream_response_bytes": 1024,
         "max_catalog_items_per_list": 5,
-        "max_catalog_bytes_per_list": 2048
+        "max_catalog_bytes_per_list": 2048,
+        "max_batch_items": 8,
+        "max_batch_bytes": 4096,
+        "max_batch_item_bytes": 1024
     });
     assert!(
         create_plugin("mcp_gateway", &config).is_ok(),
-        "positive upstream/catalog limit overrides should be accepted"
+        "positive upstream/catalog/batch limit overrides should be accepted"
     );
 }
 
@@ -937,6 +935,9 @@ fn validation_zero_limits_are_rejected() {
         "max_upstream_response_bytes",
         "max_catalog_items_per_list",
         "max_catalog_bytes_per_list",
+        "max_batch_items",
+        "max_batch_bytes",
+        "max_batch_item_bytes",
     ] {
         let mut config = transparent_config("http://127.0.0.1:9/mcp");
         let mut validation = serde_json::Map::new();
@@ -951,6 +952,47 @@ fn validation_zero_limits_are_rejected() {
             "rejection should name {field}, got: {err}"
         );
     }
+}
+
+#[test]
+fn protocol_version_2025_03_26_is_admitted_with_batch_support() {
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
+    config["endpoint"]["protocol_versions"] = json!(["2025-03-26"]);
+    assert!(
+        create_plugin("mcp_gateway", &config).is_ok(),
+        "2025-03-26 must be constructible now that JSON-RPC batches are supported"
+    );
+}
+
+#[test]
+fn batch_limit_reload_update_and_delete_change_admission() {
+    // Simulate config reload/update/delete by reconstructing plugin instances:
+    // admission bounds come from the published generation, not construction-only
+    // sticky state.
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({
+        "max_batch_items": 2,
+        "max_batch_bytes": 4096,
+        "max_batch_item_bytes": 2048
+    });
+    let first = create_plugin("mcp_gateway", &config)
+        .expect("initial batch limits must construct")
+        .expect("plugin enabled");
+
+    config["validation"]["max_batch_items"] = json!(1);
+    let updated = create_plugin("mcp_gateway", &config)
+        .expect("updated batch limits must construct")
+        .expect("plugin enabled");
+    drop(first);
+    drop(updated);
+
+    // Delete: constructing without the plugin is represented by a disabled
+    // instance / absent attachment — disabled continues without batch handling.
+    config["enabled"] = json!(false);
+    let deleted = create_plugin("mcp_gateway", &config)
+        .expect("disabled mcp_gateway must construct")
+        .expect("plugin object still returned");
+    assert_eq!(deleted.name(), "mcp_gateway");
 }
 
 #[tokio::test]
@@ -5451,4 +5493,265 @@ async fn composed_governor_keeps_public_policy_name_across_aggregate_tool_rewrit
             "final arguments must still be governed under the public policy (emit_metadata={emit_metadata})"
         );
     }
+}
+
+#[tokio::test]
+async fn aggregate_batch_empty_is_invalid_request() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(body.is_object(), "empty batch must yield a single Response object");
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "Invalid Request");
+}
+
+#[tokio::test]
+async fn aggregate_batch_oversized_item_count_is_rejected() {
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = json!({ "max_batch_items": 1 });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} },
+        { "jsonrpc": "2.0", "id": 2, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(body.is_object());
+    assert_eq!(body["error"]["code"], -32600);
+    assert_eq!(body["error"]["message"], "Invalid Request");
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("ping"),
+        "admission errors must not reflect attacker method names: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_batch_nested_array_is_rejected() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        [{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert!(body.is_object());
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn aggregate_batch_all_notifications_returns_no_content() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} },
+        { "jsonrpc": "2.0", "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_raw(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 202);
+    assert!(body.is_empty());
+    assert_eq!(
+        ctx.metadata.get("mcp.batch").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.batch_size").map(String::as_str),
+        Some("2")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_batch_mixed_notifications_and_requests_preserves_order_and_ids() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} },
+        { "jsonrpc": "2.0", "id": "req-a", "method": "ping", "params": {} },
+        { "jsonrpc": "2.0", "method": "ping", "params": {} },
+        { "jsonrpc": "2.0", "id": 7, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("mixed batch must return a response array");
+    assert_eq!(responses.len(), 2, "notifications must be omitted from the response array");
+    assert_eq!(responses[0]["id"], "req-a");
+    assert!(responses[0].get("result").is_some());
+    assert_eq!(responses[1]["id"], 7);
+    assert!(responses[1].get("result").is_some());
+}
+
+#[tokio::test]
+async fn aggregate_batch_partial_invalidity_keeps_valid_siblings() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} },
+        { "jsonrpc": "1.0", "id": 2, "method": "ping", "params": {} },
+        { "jsonrpc": "2.0", "id": 3, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("partial invalidity must still return an array");
+    assert_eq!(responses.len(), 3);
+    assert!(responses[0].get("result").is_some());
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["error"]["code"], -32600);
+    assert!(responses[2].get("result").is_some());
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("attacker"),
+        "per-item errors must stay bounded: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_batch_duplicate_ids_preserve_both_responses() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} },
+        { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().unwrap();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert_eq!(responses[1]["id"], 1);
+}
+
+#[tokio::test]
+async fn aggregate_batch_policy_rejection_is_per_item() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["policy"] = json!({
+        "default_action": "deny",
+        "tools": {
+            "github.create_pr": { "action": "allow" },
+            "github.merge_pr": { "action": "deny" }
+        }
+    });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 10).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "github.merge_pr", "arguments": {} }
+        }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id);
+
+    // Mount a tools/call success for the allowed tool once the batch executes it.
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({
+            "method": "tools/call",
+            "params": { "name": "create_pr" }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "content": [{ "type": "text", "text": "ok" }] }
+        })))
+        .mount(&server)
+        .await;
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("policy batch must return an array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], 1);
+    assert!(
+        responses[0].get("result").is_some(),
+        "allowed tool must still execute: {}",
+        responses[0]
+    );
+    assert_eq!(responses[1]["id"], 2);
+    assert_eq!(responses[1]["error"]["code"], -32001);
+}
+
+#[tokio::test]
+async fn transparent_batch_is_forwarded_after_admission() {
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} },
+        { "jsonrpc": "2.0", "id": 2, "method": "ping", "params": {} }
+    ]));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("mcp.batch").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("github-mcp.example")
+    );
+}
+
+#[tokio::test]
+async fn aggregate_batch_tools_list_live_path() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["endpoint"]["protocol_versions"] = json!(["2025-03-26", "2025-11-25"]);
+    config["policy"] = json!({ "default_action": "allow" });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": "list-1", "method": "tools/list", "params": {} },
+        { "jsonrpc": "2.0", "id": "ping-1", "method": "ping", "params": {} }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().unwrap();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "list-1");
+    assert!(responses[0]["result"]["tools"].as_array().is_some());
+    assert_eq!(responses[1]["id"], "ping-1");
+    assert!(responses[1].get("result").is_some());
 }
