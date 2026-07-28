@@ -2292,7 +2292,10 @@ async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
     );
     // Unmodified keep pair stays in the decoded map with its lossy decode, while
     // the outbound wire form retains the original invalid percent triplet.
-    assert_eq!(ctx.query_params.get("keep").map(String::as_str), Some("%ZZ"));
+    assert_eq!(
+        ctx.query_params.get("keep").map(String::as_str),
+        Some("%ZZ")
+    );
 }
 
 #[tokio::test]
