@@ -477,7 +477,8 @@ Fields covered by the schema include:
 | `proxy_alerts` | `channels.*.url` | structural URL (`channels.*.webhook_url` is caught wholesale by the name heuristic and projects as `[REDACTED]`) |
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
-| `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,token_endpoint,authorization_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
+| `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
+| `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
 | `mcp_gateway` | `servers.*.upstream_url` | structural URL |
 | `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
 | `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |

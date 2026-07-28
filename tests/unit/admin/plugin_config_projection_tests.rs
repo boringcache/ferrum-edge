@@ -1080,8 +1080,6 @@ fn identity_provider_endpoints_are_projected_in_the_admitted_nested_shape() {
     let provider = &projected["providers"][0];
     for field in [
         "discovery_url",
-        "token_endpoint",
-        "authorization_endpoint",
         "userinfo_endpoint",
         "end_session_endpoint",
         "jwks_uri",
@@ -1091,6 +1089,12 @@ fn identity_provider_endpoints_are_projected_in_the_admitted_nested_shape() {
             "provider field {field} was not projected"
         );
     }
+    // The additive name-heuristic floor is deliberately stricter for these
+    // spellings: `token` is classified per segment, while `authorization`
+    // matches the built-in sensitive substring list. Schema projection must
+    // never weaken that existing full redaction.
+    assert_eq!(provider["token_endpoint"], REDACTED);
+    assert_eq!(provider["authorization_endpoint"], REDACTED);
     assert_eq!(provider["client_id"], "edge");
     assert_eq!(projected["session"]["ttl_secs"], 3600);
     assert_no_canaries(
