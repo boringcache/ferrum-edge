@@ -51,6 +51,62 @@ async fn redis_is_available() -> bool {
     }
 }
 
+/// Wire Redis key for one rate-limit bucket written under `prefix`.
+///
+/// Rate-limit counters are hash-tagged — `{escaped-prefix:escaped-rate-key}`
+/// followed by the suffix components — so tests must derive the key through the
+/// same builder the gateway uses. Concatenating `prefix:rate_key:index` reads a
+/// key that is never written.
+fn redis_bucket_key(prefix: &str, rate_key: &str, suffix: &[&str]) -> String {
+    use ferrum_edge::plugins::utils::redis_rate_limiter::{RedisConfig, RedisRateLimitClient};
+
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": REDIS_URL,
+            "redis_key_prefix": prefix,
+        }),
+        prefix,
+    )
+    .expect("redis config parses")
+    .expect("redis mode enabled");
+    RedisRateLimitClient::new(config, None, false, None).make_slot_key(rate_key, suffix)
+}
+
+/// Every `KEYS` glob a plugin's records may live under for `prefix`.
+///
+/// Two key families share these helpers: rate-limit counters are hash-tagged
+/// (see [`redis_bucket_key`]) while `request_deduplication` records stay flat
+/// (`prefix:component:…`). Matching both keeps one cleanup/observation helper
+/// correct for every caller instead of silently missing one family.
+fn redis_key_globs(prefix: &str) -> Vec<String> {
+    // Derived from the production builder with an empty rate key, so the tag
+    // escaping can never drift from the gateway's: `{escaped-prefix:}`. The
+    // trailing separator is dropped so callers may pass a *partial* prefix
+    // (a namespace without the plugin-config id, say) exactly as they can with
+    // the flat glob.
+    let empty_tag = redis_bucket_key(prefix, "", &[]);
+    let open_tag = empty_tag
+        .strip_suffix(":}")
+        .expect("slot key ends with an empty rate key inside its hash tag");
+    vec![format!("{prefix}*"), format!("{open_tag}*")]
+}
+
+/// Lua fragment iterating `body` over every glob for `prefix`.
+///
+/// `keys` is bound to the matches of one pattern per iteration.
+fn redis_glob_loop(prefix: &str, body: &str) -> String {
+    let patterns = redis_key_globs(prefix)
+        .into_iter()
+        .map(|pattern| format!("'{pattern}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "for _,pattern in ipairs({{{patterns}}}) do \
+         local keys = redis.call('KEYS',pattern) {body} end"
+    )
+}
+
 /// Delete only Redis keys matching a specific prefix (DB 15).
 /// Uses prefix-scoped deletion to avoid cross-test interference from FLUSHDB.
 async fn delete_redis_keys_by_prefix(prefix: &str) {
@@ -70,13 +126,15 @@ async fn delete_redis_keys_by_prefix(prefix: &str) {
         .unwrap();
     let _ = reader.read(&mut buf).await;
 
-    // Use EVAL with Lua to atomically SCAN+DEL keys matching the pattern.
+    // Use EVAL with Lua to atomically SCAN+DEL keys matching the patterns.
     // This avoids the race of KEYS returning stale results and is safe for
     // concurrent test execution since it only touches keys with our prefix.
-    let pattern = format!("{}*", prefix);
     let lua_script = format!(
-        "local keys = redis.call('KEYS','{}') for i=1,#keys do redis.call('DEL',keys[i]) end return #keys",
-        pattern
+        "local deleted = 0 {} return deleted",
+        redis_glob_loop(
+            prefix,
+            "for i=1,#keys do redis.call('DEL',keys[i]) deleted = deleted + 1 end",
+        )
     );
     let lua_len = lua_script.len();
     let cmd = format!(
@@ -107,8 +165,10 @@ async fn redis_key_count_by_prefix(prefix: &str) -> usize {
     }
     let _ = reader.read(&mut buf).await;
 
-    let pattern = format!("{}*", prefix);
-    let lua_script = format!("return #redis.call('KEYS','{}')", pattern);
+    let lua_script = format!(
+        "local found = 0 {} return found",
+        redis_glob_loop(prefix, "found = found + #keys")
+    );
     let lua_len = lua_script.len();
     let cmd = format!(
         "*3\r\n$4\r\nEVAL\r\n${}\r\n{}\r\n$1\r\n0\r\n",
@@ -152,12 +212,13 @@ async fn redis_sum_counters_by_prefix(prefix: &str) -> i64 {
     }
     let _ = reader.read(&mut buf).await;
 
-    let pattern = format!("{}*", prefix);
     let lua_script = format!(
-        "local keys = redis.call('KEYS','{}') local sum = 0 \
-         for i=1,#keys do local v = redis.call('GET',keys[i]) \
-         if v then sum = sum + (tonumber(v) or 0) end end return sum",
-        pattern
+        "local sum = 0 {} return sum",
+        redis_glob_loop(
+            prefix,
+            "for i=1,#keys do local v = redis.call('GET',keys[i]) \
+             if v then sum = sum + (tonumber(v) or 0) end end",
+        )
     );
     let lua_len = lua_script.len();
     let cmd = format!(
@@ -996,11 +1057,13 @@ async fn test_rate_limiting_redis_one_second_previous_bucket_decays() {
             sleep(Duration::from_millis(5)).await;
         };
 
-        let previous_key = format!(
-            "{unique_prefix}:ip:127.0.0.1:{}",
-            current_index.saturating_sub(1)
+        let previous_key = redis_bucket_key(
+            &unique_prefix,
+            "ip:127.0.0.1",
+            &[&current_index.saturating_sub(1).to_string()],
         );
-        let current_key = format!("{unique_prefix}:ip:127.0.0.1:{current_index}");
+        let current_key =
+            redis_bucket_key(&unique_prefix, "ip:127.0.0.1", &[&current_index.to_string()]);
         set_redis_counter(&previous_key, 10, 3).await;
 
         let response = client

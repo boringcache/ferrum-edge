@@ -1396,10 +1396,52 @@ fn slot_keys_of_one_rate_key_share_a_hash_tag() {
     assert_ne!(hash_tag(&hostile), hash_tag(&curr));
 }
 
+/// Parse one complete RESP command array out of `buf`.
+///
+/// Returns the uppercased command name and the number of bytes it consumed, or
+/// `None` when the buffer holds only a partial command. Framing has to be exact:
+/// a fake server that guesses reply counts from a read chunk (say, by counting
+/// `*` bytes) answers a split or coalesced write with the wrong number of
+/// replies, and an extra reply drives the client's multiplexed connection into
+/// an internal accounting underflow instead of the behavior under test.
+fn parse_resp_command(buf: &[u8]) -> Option<(String, usize)> {
+    fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+        let rest = buf.get(from..)?;
+        let idx = rest.windows(2).position(|w| w == b"\r\n")?;
+        Some((&rest[..idx], from + idx + 2))
+    }
+
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (count_line, mut cursor) = read_line(buf, 1)?;
+    let argc: usize = std::str::from_utf8(count_line).ok()?.parse().ok()?;
+    let mut name = None;
+    for arg in 0..argc {
+        if *buf.get(cursor)? != b'$' {
+            return None;
+        }
+        let (len_line, after_len) = read_line(buf, cursor + 1)?;
+        let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+        let end = after_len.checked_add(len)?;
+        let payload = buf.get(after_len..end)?;
+        if buf.get(end..end + 2)? != b"\r\n" {
+            return None;
+        }
+        if arg == 0 {
+            name = Some(String::from_utf8_lossy(payload).to_uppercase());
+        }
+        cursor = end + 2;
+    }
+    Some((name?, cursor))
+}
+
 /// Minimal RESP server: replies `+OK` to every command except `INFO`, which gets
 /// `info_payload` as a bulk string. Once `after_info_reply` is set, every later
-/// command receives that raw reply instead of `+OK`. Counts accepted TCP
-/// connections and observed `INCR` payloads.
+/// command receives that raw reply instead of `+OK` — except `MULTI`, which is
+/// still answered `+OK` because that is what a real Cluster node does: it opens
+/// the transaction and redirects the keyed commands queued inside it. Counts
+/// accepted TCP connections and observed `INCR` commands.
 async fn spawn_topology_redis_server(
     info_payload: &'static str,
     after_info_reply: Option<&'static str>,
@@ -1422,38 +1464,39 @@ async fn spawn_topology_redis_server(
                     let incrs = Arc::clone(&incrs_task);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
+                        let mut pending: Vec<u8> = Vec::new();
                         let mut info_seen = false;
                         loop {
                             let n = match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => n,
                             };
-                            let chunk = &buf[..n];
-                            if chunk
-                                .windows(b"$4\r\nINCR\r\n".len())
-                                .any(|w| w == b"$4\r\nINCR\r\n")
-                            {
-                                incrs.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let commands = chunk.iter().filter(|&&b| b == b'*').count().max(1);
+                            pending.extend_from_slice(&buf[..n]);
                             let mut reply = Vec::new();
-                            if chunk
-                                .windows(b"$4\r\nINFO\r\n".len())
-                                .any(|w| w == b"$4\r\nINFO\r\n")
-                            {
-                                info_seen = true;
-                                reply.extend_from_slice(
-                                    format!("${}\r\n{info_payload}\r\n", info_payload.len())
-                                        .as_bytes(),
-                                );
-                            } else if info_seen && let Some(raw) = after_info_reply {
-                                for _ in 0..commands {
-                                    reply.extend_from_slice(raw.as_bytes());
+                            // Exactly one reply per fully received command, so
+                            // the client's in-flight accounting always matches.
+                            while let Some((name, consumed)) = parse_resp_command(&pending) {
+                                pending.drain(..consumed);
+                                if name == "INCR" {
+                                    incrs.fetch_add(1, Ordering::Relaxed);
                                 }
-                            } else {
-                                for _ in 0..commands {
+                                if name == "INFO" {
+                                    info_seen = true;
+                                    reply.extend_from_slice(
+                                        format!("${}\r\n{info_payload}\r\n", info_payload.len())
+                                            .as_bytes(),
+                                    );
+                                } else if info_seen
+                                    && let Some(raw) = after_info_reply
+                                    && name != "MULTI"
+                                {
+                                    reply.extend_from_slice(raw.as_bytes());
+                                } else {
                                     reply.extend_from_slice(b"+OK\r\n");
                                 }
+                            }
+                            if reply.is_empty() {
+                                continue;
                             }
                             if stream.write_all(&reply).await.is_err() {
                                 break;
@@ -1507,6 +1550,12 @@ async fn cluster_enabled_endpoint_is_refused_before_serving_policy_operations() 
 
 /// A server that hides its topology from `INFO` is still caught the first time
 /// it answers with a Cluster-only redirection.
+///
+/// The redirection has to be caught through the shape a real Cluster node
+/// produces: `incr_with_expire` sends a `MULTI`/`EXEC` transaction, the node
+/// accepts `MULTI` and redirects the keyed commands at queue time, and the
+/// client surfaces one aborted-transaction error whose *own* code is
+/// `EXECABORT` with the `MOVED` replies nested inside it.
 #[tokio::test]
 async fn cluster_redirection_error_permanently_disables_the_endpoint() {
     let (port, shutdown, accepts, _incrs) = spawn_topology_redis_server(

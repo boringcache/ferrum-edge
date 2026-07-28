@@ -13,11 +13,10 @@ use super::utils::ai_providers::{
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
     AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
-    ENFORCEMENT_UNAVAILABLE_STATUS, RateLimitBackend, RateLimitOutcome, ReservationBackend,
-    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
-    validate_window_seconds,
+    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup,
+    debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
@@ -161,7 +160,7 @@ const AI_RATE_LIMITER_POLICY_CONFIG_KEYS: &[&str] = &[
 /// Closed top-level key set for `ai_rate_limiter` plugin config.
 ///
 /// Must stay aligned with OpenAPI `AiRateLimiterConfig` (which must declare
-/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `additionalProperties: false`), [`RATE_LIMIT_REDIS_CONFIG_KEYS`], and
 /// `docs/plugins.md`. Unknown root keys fail closed: a valid `token_limit` can
 /// mask a misspelled `sync_mdoe`, `on_unmetered_responce`, or `limit_byy`, so
 /// construction would succeed while distributed enforcement, identity scope,
@@ -174,7 +173,7 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "provider",
     "on_unmetered_response",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
     "redis_tls",
@@ -184,6 +183,7 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 pub struct AiRateLimiter {
@@ -225,10 +225,16 @@ impl AiRateLimiter {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_rate_limiter: config must be an object".to_string())?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity. The Redis group is
+        // the rate-limit list (shared keys plus `redis_failure_policy`), not the
+        // bare shared list: an enforcement plugin that unioned the shared list
+        // would reject the advisory's fail-closed/local_fallback opt-in.
+        debug_assert_rate_limit_redis_keys();
         debug_assert_closed_root_keys(
             AI_RATE_LIMITER_CONFIG_KEYS,
             AI_RATE_LIMITER_POLICY_CONFIG_KEYS,
-            REDIS_PLUGIN_CONFIG_KEYS,
+            RATE_LIMIT_REDIS_CONFIG_KEYS,
         );
         reject_unknown_keys(
             object,

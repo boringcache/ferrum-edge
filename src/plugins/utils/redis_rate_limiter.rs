@@ -29,6 +29,10 @@
 //! 2. **Reactively**, any command answered with a Cluster-only error code
 //!    (`MOVED`, `ASK`, `CROSSSLOT`, `CLUSTERDOWN`, `TRYAGAIN` — see
 //!    [`is_cluster_topology_code`]) marks the endpoint permanently unusable.
+//!    Enforcement primitives send `MULTI`/`EXEC` pipelines, so the redirection
+//!    usually arrives as a per-command server error inside an aborted
+//!    transaction rather than as the outer error's own code
+//!    ([`is_cluster_topology_error`]).
 //!
 //! The proactive probe is bounded by the configured
 //! `redis_connect_timeout_seconds` (no separate knob): a server can accept and
@@ -629,6 +633,29 @@ pub fn is_cluster_topology_code(code: Option<&str>) -> bool {
     )
 }
 
+/// Whether a failed command proves the endpoint is a Cluster, including
+/// redirections that only appear *inside* an aggregated pipeline error.
+///
+/// The top-level code is not sufficient. Every enforcement primitive here sends
+/// a `MULTI`/`EXEC` pipeline, and a Cluster node answers `MULTI` with `+OK` and
+/// only then redirects the keyed commands at queue time. The client surfaces
+/// that as one aborted-transaction error whose own code is `EXECABORT`, with the
+/// `MOVED`/`ASK`/… replies carried as the per-command server errors. Classifying
+/// on the outer code alone would read a proven Cluster as an ordinary outage —
+/// recoverable, and a Cluster node answers recovery `PING`s perfectly well — so
+/// the endpoint would never reach the terminal state the advisory requires.
+pub fn is_cluster_topology_error(error: &redis::RedisError) -> bool {
+    if is_cluster_topology_code(error.code()) {
+        return true;
+    }
+    // `into_server_errors` consumes the error; `RedisError` is `Clone` and the
+    // aggregated variants are `Arc`-backed, so this is a refcount bump.
+    let Some(errors) = error.clone().into_server_errors() else {
+        return false;
+    };
+    errors.iter().any(|(_, err)| is_cluster_topology_code(Some(err.code())))
+}
+
 /// Read `cluster_enabled` out of an `INFO CLUSTER` reply.
 ///
 /// Returns `None` when the field is absent — the server may be a
@@ -805,7 +832,7 @@ async fn screen_connection_topology(
     match tokio::time::timeout(probe_timeout, probe.query_async::<redis::Value>(conn)).await {
         Ok(Ok(value)) => screen_from_info_value(&value),
         Ok(Err(error)) => {
-            if is_cluster_topology_code(error.code()) {
+            if is_cluster_topology_error(&error) {
                 TopologyScreen::ClusterProven
             } else if error.code().is_some() {
                 // The server *answered* with an error reply (unknown command,
@@ -1673,7 +1700,7 @@ impl RedisRateLimitClient {
     /// Classify a failed Redis command: an unsupported topology is terminal,
     /// anything else is an ordinary (recoverable) availability failure.
     fn note_command_failure(&self, error: &redis::RedisError) {
-        if is_cluster_topology_code(error.code()) {
+        if is_cluster_topology_error(error) {
             self.mark_topology_unsupported("cluster redirection or cross-slot error");
         } else {
             self.mark_unavailable();
