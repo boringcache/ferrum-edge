@@ -6141,11 +6141,11 @@ pub mod priority {
     pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
-    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
-    /// SOCK_OPS event consumer. Auto-injected only when topology is
-    /// `NodeWaypoint`. Lives in the observability band alongside other
-    /// metric-emitter plugins so its `log` hook runs after all
-    /// transaction-summary serialization.
+    /// Rst, Fin, SRTT/SYN→ACK latency histograms, BPF drop reasons,
+    /// ringbuf overrun) from the SOCK_OPS event consumer. Auto-injected
+    /// only when topology is `NodeWaypoint`. Lives in the observability
+    /// band alongside other metric-emitter plugins so its `log` hook
+    /// runs after all transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
@@ -7610,6 +7610,42 @@ pub trait Plugin: Send + Sync {
         _connection_id: u64,
         _direction: WebSocketFrameDirection,
         _message: &tokio_tungstenite::tungstenite::Message,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        None
+    }
+
+    /// Called for the physical WebSocket frames a peer spent on message
+    /// reassembly that [`Plugin::on_ws_frame`] can never see.
+    ///
+    /// Tungstenite yields only reassembled messages, so the initial non-final
+    /// Text/Binary frame and every intermediate Continuation frame — including
+    /// zero-length ones — are invisible to `on_ws_frame`. Without this hook a
+    /// peer could drive unbounded framing work while paying for a single
+    /// logical message (GHSA-qq94-2gv2-phh6).
+    ///
+    /// `fragment_frames` is always `>= 1` and counts only frames that produced
+    /// no message. The completing frame is charged exactly once through the
+    /// ordinary [`Plugin::on_ws_frame`] call for the reassembled message, so a
+    /// plugin implementing both hooks charges each wire frame exactly once.
+    ///
+    /// The relay invokes this before the message chain for the read that
+    /// surfaced them, and also for an interleaved Ping/Pong that arrives
+    /// mid-reassembly. A peer `Close` is the exception: it bypasses mutating
+    /// admission entirely so no plugin can replace the peer's code/reason, and
+    /// the session is ending anyway. There is no message to mutate: only
+    /// `Some(Message::Close(..))` is honored, which closes the connection in
+    /// both directions; every other return value is ignored. Observational
+    /// plugins ([`Plugin::observes_ws_frame_decisions`]) are skipped entirely.
+    ///
+    /// The count/duration ceilings that stop a message which never completes
+    /// live in the parser (see `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+    /// / `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), not here.
+    async fn on_ws_reassembly_frames(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _fragment_frames: u64,
     ) -> Option<tokio_tungstenite::tungstenite::Message> {
         None
     }

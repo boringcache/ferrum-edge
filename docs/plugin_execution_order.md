@@ -442,6 +442,18 @@ policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
 
+Physical fragments that produce no message — the initial non-final Text/Binary
+frame and every intermediate continuation, including zero-length ones — are
+metered inside the codec and charged through the separate
+`on_ws_reassembly_frames` hook, which runs **before** the `on_ws_frame` chain
+for the read that surfaced them (and also for an interleaved Ping/Pong that
+arrives mid-reassembly). The completing frame is charged once by the ordinary
+message hook, so each wire frame is counted exactly once. Observational plugins
+are skipped for fragment batches and only a returned `Message::Close` is
+honored. Independently, `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` and
+`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS` bound the in-flight
+reassembly itself and close both peers with code 1008.
+
 Peer-originated **Close** frames take a separate forward path: mutating
 admission hooks are skipped so a later plugin cannot replace the peer's
 code/reason, while observational delivery hooks (see below) still record the
@@ -514,7 +526,7 @@ Plugins execute in priority order (lower number runs first):
 | # | Plugin | Priority | Behavior |
 |---|--------|----------|----------|
 | 1 | `ws_message_size_limiting` | 2810 | Pre-read actual-frame and bounded-reassembly policy; closes both peers with 1009 |
-| 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket frame rate limiting |
+| 2 | `ws_rate_limiting` | 2910 | Per-connection token-bucket rate limiting, charged per physical frame (fragments batched via `on_ws_reassembly_frames`) |
 | 3 | `ws_frame_logging` | 9050 | Logs final delivered frame metadata (and policy Close decisions); never mutates |
 
 ### Zero-Overhead Opt-In
@@ -645,7 +657,7 @@ Given all built-in plugins enabled, the execution order is:
 | 32 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
 | 33 | `graphql` | 2850 | before_proxy |
 | 34 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 35 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 35 | `ws_rate_limiting` | 2910 | on_ws_frame, on_ws_reassembly_frames |
 | 36 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
@@ -1043,7 +1055,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
 | `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
-| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks |
+| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface (counters + fixed latency histograms); no request hooks |
 | `transaction_log_schema` | — | — | — | — | — | Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999) |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
