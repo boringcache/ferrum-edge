@@ -165,10 +165,7 @@ async fn start_grpc_echo_backend() -> (u16, tokio::task::JoinHandle<()>) {
                     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
                     let _ = tx.send(Ok(Frame::data(body_bytes))).await;
                     let mut trailers = hyper::HeaderMap::new();
-                    trailers.insert(
-                        "grpc-status",
-                        hyper::header::HeaderValue::from_static("0"),
-                    );
+                    trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
                     let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                     drop(tx);
 
@@ -329,7 +326,8 @@ fn assert_nonzero_terminal_grpc_status(call: &GrpcCall, context: &str) {
         )
     });
     assert_ne!(
-        code, 0,
+        code,
+        0,
         "{context}: expected nonzero terminal grpc-status, got {code} \
          (headers={:?}, trailers={:?})",
         call.headers.get("grpc-status"),
