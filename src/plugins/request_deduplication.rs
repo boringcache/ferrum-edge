@@ -683,6 +683,13 @@ enum CompletionSkipReason {
 /// multiple scoped instances (distinct headers / Redis prefixes) mark and
 /// token-release independently without overwriting one another's lifecycle
 /// state.
+///
+/// Observability projections must never see this material. Historical public
+/// metadata names (`_dedup_key`, `_dedup_fingerprint`,
+/// `_dedup_local_inflight_token`, `_dedup_redis_lock_token`) are covered by the
+/// shared `_dedup_` internal-only filter in
+/// [`crate::plugins::utils::metadata_redaction`]; do not reintroduce them into
+/// `ctx.metadata`.
 #[derive(Clone)]
 pub(crate) struct RequestDeduplicationRequestState {
     key: String,
