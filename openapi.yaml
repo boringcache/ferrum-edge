@@ -15741,8 +15741,10 @@ components:
             not resolve these against the controller-host environment. A
             present UTF-8 value overrides any matching `custom_tags` default;
             a missing variable keeps that default when present and otherwise
-            omits the tag. Non-UTF-8 or >1024-byte values fail construction
-            closed. Resolved values are never logged. Combined with
+            omits the tag. Credential-bearing environment variable names
+            (including secret/password/token names and operator-configured
+            sensitive metadata names) are rejected. Non-UTF-8 or >1024-byte
+            values fail construction closed. Resolved values are never logged. Combined with
             `custom_tags` and `custom_header_tags`, at most 32 distinct tag
             names are admitted.
         metrics:

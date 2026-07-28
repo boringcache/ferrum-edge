@@ -249,17 +249,24 @@ impl WorkloadMetrics {
                     .collect()
             })
             .unwrap_or_default();
-        let custom_env_tags: HashMap<String, String> = config
-            .get("custom_env_tags")
-            .and_then(Value::as_object)
-            .map(|tags| {
-                tags.iter()
-                    .filter_map(|(key, value)| {
-                        value.as_str().map(|value| (key.clone(), value.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let custom_env_tags: HashMap<String, String> = match config.get("custom_env_tags") {
+            None => HashMap::new(),
+            Some(Value::Object(tags)) => {
+                let mut parsed = HashMap::with_capacity(tags.len());
+                for (key, value) in tags {
+                    let Some(env_var) = value.as_str() else {
+                        return Err(format!(
+                            "workload_metrics: custom_env_tags.{key} must be a string"
+                        ));
+                    };
+                    parsed.insert(key.clone(), env_var.to_string());
+                }
+                parsed
+            }
+            Some(_) => {
+                return Err("workload_metrics: custom_env_tags must be an object".to_string());
+            }
+        };
         let ValidatedCustomTags {
             mut custom_tags,
             custom_header_tags,
@@ -1486,6 +1493,11 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
             "workload_metrics: custom tag '{tag}' has invalid environment variable name '{env_var}'"
         ));
     }
+    if is_sensitive_metadata_key(env_var) {
+        return Err(format!(
+            "workload_metrics: custom tag '{tag}' cannot copy sensitive environment variable '{env_var}'"
+        ));
+    }
     Ok(())
 }
 
@@ -2021,6 +2033,31 @@ mod tests {
                 .expect_err("invalid env var name")
                 .contains("invalid environment variable name")
         );
+
+        let sensitive = WorkloadMetrics::new(&json!({
+            "custom_env_tags": {"credential": "AWS_SESSION_TOKEN"}
+        }));
+        assert!(
+            sensitive
+                .expect_err("sensitive env var name")
+                .contains("cannot copy sensitive environment variable")
+        );
+
+        for invalid in [
+            json!(null),
+            json!([]),
+            json!("ISTIO_META_CLUSTER_ID"),
+            json!({"cluster": 42}),
+        ] {
+            let error = WorkloadMetrics::new(&json!({
+                "custom_env_tags": invalid
+            }))
+            .expect_err("invalid custom_env_tags shape must fail closed");
+            assert!(
+                error.contains("custom_env_tags"),
+                "expected field-specific custom_env_tags error, got {error}"
+            );
+        }
 
         unsafe {
             std::env::remove_var(ENV_VAR);

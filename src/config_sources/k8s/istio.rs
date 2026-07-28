@@ -4590,15 +4590,11 @@ fn telemetry(
                 if let Some(disabled) = t.get("disableSpanReporting").and_then(Value::as_bool) {
                     merged.disable_span_reporting = Some(disabled);
                 }
-                if !custom_tags.is_empty() {
-                    merged.custom_tags.extend(custom_tags);
-                }
-                if !custom_header_tags.is_empty() {
-                    merged.custom_header_tags.extend(custom_header_tags);
-                }
-                if !custom_env_tags.is_empty() {
-                    merged.custom_env_tags.extend(custom_env_tags);
-                }
+                merged.merge_custom_tag_sources(
+                    &custom_tags,
+                    &custom_header_tags,
+                    &custom_env_tags,
+                );
                 if !providers.is_empty() {
                     extend_unique_tracing_providers(&mut merged.providers, providers);
                 }
@@ -7501,6 +7497,105 @@ mod tests {
         assert!(
             message.contains("invalid environment variable name"),
             "expected env-var name rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_environment_custom_tag_rejects_sensitive_env_var_name() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [{
+                        "customTags": {
+                            "credential": {
+                                "environment": {
+                                    "name": "FERRUM_ADMIN_JWT_SECRET"
+                                }
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("credential-bearing environment variable must fail closed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot copy sensitive environment variable"),
+            "expected sensitive env-var rejection, got {message}"
+        );
+    }
+
+    #[test]
+    fn telemetry_tracing_entries_replace_custom_tag_source_exclusively() {
+        let result = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "tracing": [
+                        {
+                            "customTags": {
+                                "cluster": {
+                                    "environment": {
+                                        "name": "ISTIO_META_CLUSTER_ID",
+                                        "defaultValue": "fallback-cluster"
+                                    }
+                                },
+                                "region": {"literal": {"value": "old-region"}},
+                                "zone": {
+                                    "environment": {
+                                        "name": "ISTIO_META_ZONE",
+                                        "defaultValue": "fallback-zone"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "customTags": {
+                                "cluster": {"literal": {"value": "literal-cluster"}},
+                                "region": {
+                                    "environment": {
+                                        "name": "FERRUM_REGION"
+                                    }
+                                },
+                                "zone": {
+                                    "header": {
+                                        "name": "x-zone"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }),
+            )],
+            options(),
+        )
+        .expect("translation succeeds");
+
+        let mesh = result.config.mesh.expect("mesh config");
+        let tracing = mesh.telemetry_resources[0]
+            .config
+            .tracing
+            .as_ref()
+            .expect("tracing config");
+
+        assert_eq!(
+            tracing.custom_tags.get("cluster").map(String::as_str),
+            Some("literal-cluster")
+        );
+        assert!(!tracing.custom_env_tags.contains_key("cluster"));
+        assert!(!tracing.custom_tags.contains_key("region"));
+        assert_eq!(
+            tracing.custom_env_tags.get("region").map(String::as_str),
+            Some("FERRUM_REGION")
+        );
+        assert!(!tracing.custom_tags.contains_key("zone"));
+        assert!(!tracing.custom_env_tags.contains_key("zone"));
+        assert_eq!(
+            tracing.custom_header_tags.get("zone").map(String::as_str),
+            Some("x-zone")
         );
     }
 

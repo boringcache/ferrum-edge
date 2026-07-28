@@ -905,6 +905,48 @@ pub struct MeshTracingConfig {
     pub providers: Vec<TracingProvider>,
 }
 
+impl MeshTracingConfig {
+    /// Merge custom-tag definitions while preserving the oneof semantics of
+    /// Istio's literal/header/environment tag sources.
+    ///
+    /// `custom_tags` may accompany a header or environment source as its
+    /// `defaultValue`, so every key named by `next` replaces that key across
+    /// all three maps before the new source and optional fallback are copied.
+    /// Without the cross-map removal, a more-specific source can leave an
+    /// inherited environment/header lookup or literal fallback active.
+    pub fn merge_custom_tag_sources(
+        &mut self,
+        custom_tags: &HashMap<String, String>,
+        custom_header_tags: &HashMap<String, String>,
+        custom_env_tags: &HashMap<String, String>,
+    ) {
+        let keys: HashSet<&str> = custom_tags
+            .keys()
+            .chain(custom_header_tags.keys())
+            .chain(custom_env_tags.keys())
+            .map(String::as_str)
+            .collect();
+
+        for key in keys {
+            self.custom_tags.remove(key);
+            self.custom_header_tags.remove(key);
+            self.custom_env_tags.remove(key);
+
+            if let Some(value) = custom_tags.get(key) {
+                self.custom_tags.insert(key.to_string(), value.clone());
+            }
+            if let Some(header) = custom_header_tags.get(key) {
+                self.custom_header_tags
+                    .insert(key.to_string(), header.clone());
+            }
+            if let Some(env_var) = custom_env_tags.get(key) {
+                self.custom_env_tags
+                    .insert(key.to_string(), env_var.clone());
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TelemetryTracingMode {
