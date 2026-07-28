@@ -18719,7 +18719,7 @@ components:
                 # is not exactly `*` (so `*/*` and `application/*` fail closed,
                 # while `*` remains allowed inside a longer token). Parameters
                 # require token names and token or quoted-string values.
-                pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))?)*[ \t]*$'
+                pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))*[ \t]*$'
               additionalProperties:
                 $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
               description: >

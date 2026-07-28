@@ -4916,6 +4916,26 @@ fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_s
         (
             json!({
                 "content": {
+                    "application/json;": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;; charset=utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
                     "application/json; charset=\"unterminated": {
                         "schema": {"type": "object"}
                     }

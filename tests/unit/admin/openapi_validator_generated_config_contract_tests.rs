@@ -578,6 +578,14 @@ fn importer_rejects_malformed_multipart_encoding_header_content() {
             "concrete media type",
         ),
         (
+            r#"{ "content": { "application/json;": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
+            r#"{ "content": { "application/json;; charset=utf-8": { "schema": { "type": "object" } } } }"#,
+            "concrete media type",
+        ),
+        (
             r#"{ "content": { "application/json; charset =utf-8": { "schema": { "type": "object" } } } }"#,
             "concrete media type",
         ),
@@ -797,6 +805,16 @@ fn published_schema_rejects_encoding_header_content_wildcards_and_inert_fields()
         json!({
             "content": {
                 "application/json; charset": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json;": {"schema": {"type": "object"}}
+            }
+        }),
+        json!({
+            "content": {
+                "application/json;; charset=utf-8": {"schema": {"type": "object"}}
             }
         }),
         json!({

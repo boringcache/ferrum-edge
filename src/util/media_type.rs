@@ -9,7 +9,7 @@ pub fn is_concrete_http_media_type(value: &str) -> bool {
     let (base, parameters) = value
         .split_once(';')
         .map_or((value, None), |(base, parameters)| (base, Some(parameters)));
-    let base = base.trim_end_matches(|character| matches!(character, ' ' | '\t'));
+    let base = base.trim_end_matches([' ', '\t']);
     let Some((type_, subtype)) = base.split_once('/') else {
         return false;
     };
@@ -25,11 +25,7 @@ fn valid_media_type_parameters(parameters: &str) -> bool {
     loop {
         skip_ows(bytes, &mut index);
         if index == bytes.len() {
-            return true;
-        }
-        if bytes.get(index) == Some(&b';') {
-            index += 1;
-            continue;
+            return false;
         }
         let name_start = index;
         while bytes
