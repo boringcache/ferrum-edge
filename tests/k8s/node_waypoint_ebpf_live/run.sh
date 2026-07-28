@@ -2582,8 +2582,13 @@ run_hbone_listener_negative_check() {
 }
 
 collect_ambient_observability_metrics() {
-  local out_dir="$RESULTS_DIR/ambient-observability-metrics"
-  mkdir -p "$out_dir"
+  local out_root="$RESULTS_DIR/ambient-observability-metrics"
+  mkdir -p "$out_root"
+  # Keep each scrape isolated. Ambient rollouts replace pod names, so reusing
+  # one directory would leave stale .prom files that could make a later
+  # counter assertion pass against metrics from a terminated process.
+  local out_dir
+  out_dir="$(mktemp -d "$out_root/snapshot.XXXXXX")"
   local -a pods
   mapfile -t pods < <(ambient_pods)
   local idx=0 pod port metrics_file pf_log pf_pid
@@ -2599,6 +2604,7 @@ collect_ambient_observability_metrics() {
     fi
     stop_port_forward "$pf_pid"
   done
+  printf '%s\n' "$out_dir"
 }
 
 sum_ambient_metric_total() {
@@ -2608,8 +2614,9 @@ sum_ambient_metric_total() {
   # gateway_namespace appended before the closing brace. Missing series count
   # as zero so first-scrape baselines work. Malformed samples are skipped.
   local metric_selector="$1"
-  collect_ambient_observability_metrics
-  python3 - "$RESULTS_DIR/ambient-observability-metrics" "$metric_selector" <<'PY'
+  local snapshot_dir
+  snapshot_dir="$(collect_ambient_observability_metrics)"
+  python3 - "$snapshot_dir" "$metric_selector" <<'PY'
 import pathlib
 import re
 import sys
@@ -3053,7 +3060,7 @@ run_spire_restart_recovery_check() {
 
 run_traffic_checks() {
   log "running IPv4 Service authorization and bypass checks"
-  local dst_a_ip dst_b_ip
+  local dst_a_ip dst_b_ip outbound_before outbound_after
   dst_a_ip="$(pod_ip dst-a)"
   dst_b_ip="$(pod_ip dst-b)"
 
@@ -3068,6 +3075,11 @@ run_traffic_checks() {
     "http://dst-a.$WORKLOAD_NS.svc.cluster.local:8080/" \
     "ok-a" \
     4
+
+  if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
+    outbound_before="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}')"
+  fi
+
   recorded_expect_allowed \
     node_waypoint.ipv4.service_allow_cross_node \
     src-a \
@@ -3078,15 +3090,14 @@ run_traffic_checks() {
     4
 
   if [[ "$SPIRE_PRODUCTION" == "true" ]]; then
-    local outbound_success
-    outbound_success="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}')"
-    if [[ "$outbound_success" -gt 0 ]]; then
+    outbound_after="$(sum_ambient_metric_total 'ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}')"
+    if [[ "$outbound_after" -gt "$outbound_before" ]]; then
       record_live_assertion \
         node_waypoint.observability.hbone_handshake_outbound_success \
         pass \
         src-a \
         dst-b \
-        "outbound_dial_success=$outbound_success" \
+        "outbound_dial_success_before=$outbound_before after=$outbound_after" \
         "$(spiffe_for_sa src-a)" \
         "$(spiffe_for_sa dst-b)" \
         "ambient-observability-metrics"
@@ -3096,7 +3107,7 @@ run_traffic_checks() {
         fail \
         src-a \
         dst-b \
-        "outbound_dial_success_still_zero_after_cross_node_allow" \
+        "outbound_dial_success_did_not_increase before=$outbound_before after=$outbound_after" \
         "$(spiffe_for_sa src-a)" \
         "$(spiffe_for_sa dst-b)" \
         "ambient-observability-metrics"
