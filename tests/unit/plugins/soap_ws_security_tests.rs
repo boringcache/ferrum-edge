@@ -4064,20 +4064,23 @@ fn test_timestamp_bound_boundaries() {
 
 #[tokio::test]
 async fn test_out_of_range_expires_is_rejected_not_panicking() {
-    // An `Expires` far outside the four-digit year window would overflow
-    // `expires + skew` in chrono. It must be rejected as an invalid timestamp.
+    // A year outside the admitted window is invalid. Year 9999 is inside that
+    // window but adding the configured skew can still exceed chrono's upper
+    // boundary. Both must reject rather than panic the request task.
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let security = format!(
-        r#"<wsu:Timestamp>
-        <wsu:Created>{created}</wsu:Created>
-        <wsu:Expires>262143-12-31T23:59:59Z</wsu:Expires>
-    </wsu:Timestamp>"#
-    );
-    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
-    let mut headers = soap_headers();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(reject_status(&result), 401);
+    for expires in ["262143-12-31T23:59:59Z", "9999-12-31T23:59:59Z"] {
+        let security = format!(
+            r#"<wsu:Timestamp>
+            <wsu:Created>{created}</wsu:Created>
+            <wsu:Expires>{expires}</wsu:Expires>
+        </wsu:Timestamp>"#
+        );
+        let mut ctx = make_ctx_with_soap_body(&wrap_soap(&security));
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(reject_status(&result), 401, "Expires={expires}");
+    }
 }
 
 // ── GHSA-gr7f-55c2-rpvw: strict configuration admission ────────────────────

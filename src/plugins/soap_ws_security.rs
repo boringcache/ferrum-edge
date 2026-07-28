@@ -372,9 +372,9 @@ const MAX_NONCE_MAX_TOTAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Hard ceiling on exact oldest-index entries reclaimed by one request,
 /// independent of `max_cache_size`. Only entries proven older than the
-/// configured TTL are ever reclaimed; each costs O(log n) tree/map work. When
-/// this budget is spent without freeing room the request fails closed rather
-/// than reaching for a live entry.
+/// fixed claim-retention horizon are ever reclaimed; each costs O(log n)
+/// tree/map work. When this budget is spent without freeing room the request
+/// fails closed rather than reaching for a live entry.
 const NONCE_MAX_MAINTENANCE_ENTRIES: usize = 64;
 
 /// Representable-year window for parsed WS-Security / SAML instants.
@@ -1766,8 +1766,11 @@ impl SoapWsSecurity {
         if let Some(expires_str) = find_element_text(&ts_block, "Expires") {
             let expires = parse_ws_datetime(&expires_str)
                 .ok_or_else(|| "WS-Security: invalid Expires timestamp".to_string())?;
+            let expires_with_skew = expires.checked_add_signed(skew).ok_or_else(|| {
+                "WS-Security: Expires timestamp is outside the supported range".to_string()
+            })?;
 
-            if now > expires + skew {
+            if now > expires_with_skew {
                 return Err("WS-Security: Timestamp has expired".to_string());
             }
         } else if self.timestamp_require_expires {
@@ -1862,12 +1865,16 @@ impl SoapWsSecurity {
                 self.ut_created_max_timestamp_divergence_seconds
             ));
         }
-        if let Some(outer_expires) = outer_expires
-            && created > outer_expires + skew
-        {
-            return Err(
-                "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
-            );
+        if let Some(outer_expires) = outer_expires {
+            let outer_expires_with_skew =
+                outer_expires.checked_add_signed(skew).ok_or_else(|| {
+                    "WS-Security: Timestamp Expires is outside the supported range".to_string()
+                })?;
+            if created > outer_expires_with_skew {
+                return Err(
+                    "WS-Security: UsernameToken Created is past the Timestamp Expires".to_string(),
+                );
+            }
         }
 
         Ok(())
@@ -2065,8 +2072,8 @@ impl SoapWsSecurity {
         "WS-Security: Nonce exceeds the maximum permitted length".to_string()
     }
 
-    /// Claim `nonce` for exactly one authenticated request inside the configured
-    /// TTL, on whichever backend the operator declared.
+    /// Claim `nonce` for exactly one authenticated request inside the fixed
+    /// retention horizon, on whichever backend the operator declared.
     ///
     /// Reached only after the PasswordDigest has verified, so untrusted input
     /// never mutates, consumes, or evicts replay state.
@@ -2152,8 +2159,8 @@ impl SoapWsSecurity {
             .map_or(0, |age| age.as_secs())
     }
 
-    /// Check if a nonce has been seen before within the TTL window, inserting
-    /// it when it is not a replay.
+    /// Check if a nonce has been seen before within the fixed retention window,
+    /// inserting it when it is not a replay.
     ///
     /// The cache is bounded on three independent axes so a caller cannot turn
     /// replay state into a memory or CPU sink: per-nonce encoded length, total
@@ -2860,8 +2867,9 @@ impl SoapWsSecurity {
         if let Some(conditions) =
             unique_child_element(assertion_node, "Conditions", "WS-Security: SAML")?
         {
-            // Pre-converted at admission; parsed condition instants are
-            // year-clamped, so no arithmetic below can overflow.
+            // Pre-converted at admission. Attacker-supplied instants still use
+            // checked addition because the upper accepted year can be close to
+            // chrono's representable boundary.
             let skew = self.saml_clock_skew;
 
             if let Some(not_before_str) = conditions.attribute("NotBefore") {
@@ -2880,7 +2888,11 @@ impl SoapWsSecurity {
                         not_on_or_after_str
                     )
                 })?;
-                if now > not_on_or_after + skew {
+                let not_on_or_after_with_skew =
+                    not_on_or_after.checked_add_signed(skew).ok_or_else(|| {
+                        "WS-Security: SAML NotOnOrAfter is outside the supported range".to_string()
+                    })?;
+                if now > not_on_or_after_with_skew {
                     return Err("WS-Security: SAML Assertion has expired".to_string());
                 }
             }
@@ -5084,9 +5096,10 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 fn parse_ws_datetime(s: &str) -> Option<DateTime<Utc>> {
     // Reject instants outside the representable WS-Security window. `chrono`'s
     // `%Y` accepts years far beyond four digits and its `DateTime` `Add`/`Sub`
-    // impls panic on overflow, so an unclamped `Expires` / `NotOnOrAfter` could
-    // turn `instant + skew` into a panicked request task. No legitimate
-    // WS-Security or SAML instant falls outside this range.
+    // impls panic on overflow. Callers still use checked addition near the
+    // accepted upper boundary; this clamp rejects nonsensical distant years
+    // before any policy arithmetic. No legitimate WS-Security or SAML instant
+    // falls outside this range.
     let parsed = parse_ws_datetime_unbounded(s)?;
     let year = parsed.year();
     if !(MIN_PARSED_YEAR..=MAX_PARSED_YEAR).contains(&year) {
