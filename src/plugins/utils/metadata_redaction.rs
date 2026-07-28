@@ -262,13 +262,13 @@ pub fn is_internal_only_metadata_key(key: &str) -> bool {
 
     // Normalized spellings (`_dedup-…`, `_DedupRedisLockToken`, …): leading `_`
     // with first segment exactly `dedup`.
-    let mut first_segment: Option<&str> = None;
+    let mut first_segment_is_dedup: Option<bool> = None;
     for_each_metadata_key_segment(key, |segment| {
-        if first_segment.is_none() {
-            first_segment = Some(segment);
+        if first_segment_is_dedup.is_none() {
+            first_segment_is_dedup = Some(segment.eq_ignore_ascii_case("dedup"));
         }
     });
-    first_segment.is_some_and(|segment| segment.eq_ignore_ascii_case("dedup"))
+    first_segment_is_dedup == Some(true)
 }
 
 /// Strip every internal-only metadata key from a cloned observability map.
