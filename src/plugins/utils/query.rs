@@ -127,10 +127,6 @@ impl OrderedQuery {
         Self { pairs: Vec::new() }
     }
 
-    pub fn pairs(&self) -> &[QueryPair] {
-        &self.pairs
-    }
-
     /// Parse a raw query string. Empty `&` segments are skipped (they are not
     /// parameters). Invalid percent-encoding is retained on the wire form and
     /// decoded lossily for matching — never panics.
@@ -156,10 +152,6 @@ impl OrderedQuery {
             pairs.push(QueryPair::authored(name, value));
         }
         Self { pairs }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
     }
 
     pub fn contains_decoded_name(&self, name: &str) -> bool {
