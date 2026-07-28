@@ -51,15 +51,94 @@
 //! Missing / malformed entries fall back to the static config so a partial
 //! overlay never silently disables the plugin. A valid zero temporarily
 //! disables that fault side for the accepted generation.
+//!
+//! ## Delay retention bounds
+//!
+//! An injected delay deliberately parks a live request or connection, so it is
+//! bounded three ways by [`super::utils::fault_delay`]: the configuration
+//! ceiling ([`MAX_FAULT_DELAY_MS`]), a process-wide budget of concurrently
+//! delayed work (`FERRUM_MAX_CONCURRENT_FAULT_DELAYS`), and cancellation on
+//! peer departure or gateway shutdown drain. A delay that ends early records
+//! `fault_delay_outcome` in metadata; a delay cut short because the client
+//! transport is gone rejects with 499 instead of dialing a backend.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use super::utils::fault_delay::{FaultDelayOutcome, run_fault_delay};
 use super::utils::fault_roll::{FaultRoller, MAX_FAULT_DELAY_MS};
 use super::{Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext};
 
 pub mod runtime_overlay;
+
+/// Metadata key recording why an injected delay ended when it did not run to
+/// completion. Absent on the ordinary "the delay elapsed" path so existing
+/// log consumers see no new field for normal chaos experiments.
+pub(crate) const FAULT_DELAY_OUTCOME_METADATA_KEY: &str = "fault_delay_outcome";
+
+/// Status used when an injected delay is cut short because the client
+/// transport is gone. Matches the gateway-wide 499 convention for
+/// "client closed request" and never reaches a wire the peer is still reading.
+pub(crate) const CLIENT_GONE_STATUS: u16 = 499;
+
+/// Terminal result of an injected HTTP-path delay, shared by the proxy-scoped
+/// plugin and `mesh_route_dispatch`'s route-local fault.
+pub(crate) enum FaultDelayDisposition {
+    /// The delay finished (or was skipped/cut short harmlessly); continue.
+    Proceed,
+    /// The client transport is gone; abandon the request.
+    ClientGone,
+}
+
+/// Record a non-completing delay outcome. Values are compiled-in labels from a
+/// closed enum, never request-, peer-, or credential-derived.
+fn record_delay_outcome(metadata: &mut HashMap<String, String>, outcome: FaultDelayOutcome) {
+    let key = FAULT_DELAY_OUTCOME_METADATA_KEY.to_string();
+    let label = outcome.metadata_label().to_string();
+    metadata.insert(key, label);
+}
+
+/// Run an injected HTTP-path delay with the shared retention bounds and record
+/// its outcome in `metadata`.
+///
+/// Returns [`FaultDelayDisposition::ClientGone`] when the frontend's peer watch
+/// says the client transport is gone — the caller must then abandon the request
+/// instead of dialing a backend for a response nobody will read.
+pub(crate) async fn run_http_fault_delay(
+    ctx: &mut RequestContext,
+    duration_ms: u64,
+) -> FaultDelayDisposition {
+    // Cheap non-blocking pre-check: an already-dead transport must not even
+    // consume a slot from the process-wide delayed-work budget.
+    if ctx
+        .peer_connection
+        .as_ref()
+        .is_some_and(|signal| signal.is_closed())
+    {
+        let gone = FaultDelayOutcome::CancelledByPeer;
+        record_delay_outcome(&mut ctx.metadata, gone);
+        return FaultDelayDisposition::ClientGone;
+    }
+
+    // Race the timer against the frontend's peer-gone watch (HTTP/3 only
+    // today) and the gateway shutdown token. Whichever fires first ends the
+    // wait, so this task stops holding its request guard, stream, and plugin
+    // snapshot the moment they are pointless.
+    // Clone the handle (one `Arc` bump, delay path only) so the borrow of
+    // `ctx` ends before the metadata write below.
+    let signal = ctx.peer_connection.clone();
+    let peer_gone = signal.as_ref().map(|signal| signal.closed());
+    let outcome = run_fault_delay(duration_ms, peer_gone).await;
+    if !outcome.completed() {
+        record_delay_outcome(&mut ctx.metadata, outcome);
+    }
+    if outcome == FaultDelayOutcome::CancelledByPeer {
+        FaultDelayDisposition::ClientGone
+    } else {
+        FaultDelayDisposition::Proceed
+    }
+}
 
 const NON_UDP_PROTOCOLS: &[ProxyProtocol] = &[
     ProxyProtocol::Http,
@@ -335,9 +414,22 @@ impl Plugin for FaultInjectionPlugin {
             .insert("fault_injected".to_string(), "true".to_string());
 
         if delay_triggered && let Some(d) = self.delay.as_ref() {
-            tokio::time::sleep(std::time::Duration::from_millis(d.duration_ms)).await;
+            let disposition = run_http_fault_delay(ctx, d.duration_ms).await;
             ctx.metadata
                 .insert("fault_delay_ms".to_string(), d.duration_ms.to_string());
+            if matches!(disposition, FaultDelayDisposition::ClientGone) {
+                // The client transport is gone. Abandon the request here
+                // rather than dialing a backend for a response nobody will
+                // read; the proxy path's normal rejection cleanup releases the
+                // request guard and finalizes the stream.
+                ctx.metadata
+                    .insert("fault_type".to_string(), "delay".to_string());
+                return PluginResult::Reject {
+                    status_code: CLIENT_GONE_STATUS,
+                    body: String::new(),
+                    headers: HashMap::new(),
+                };
+            }
         }
 
         if abort_triggered && let Some(a) = self.abort.as_ref() {
@@ -370,8 +462,19 @@ impl Plugin for FaultInjectionPlugin {
         ctx.insert_metadata("fault_injected".to_string(), "true".to_string());
 
         if delay_triggered && let Some(d) = self.delay.as_ref() {
-            tokio::time::sleep(std::time::Duration::from_millis(d.duration_ms)).await;
+            // No per-context peer watch here: the stream proxy owns the
+            // accepted socket and races this whole hook against a
+            // read-half-preserving socket-error watch
+            // (`tcp_proxy::wait_for_tcp_peer_reset`), which cancels this future
+            // and drops the admission permit. What the plugin still owns is the
+            // shutdown token and the process-wide delayed-work budget.
+            let outcome = run_fault_delay(d.duration_ms, None).await;
             ctx.insert_metadata("fault_delay_ms".to_string(), d.duration_ms.to_string());
+            if !outcome.completed() {
+                let key = FAULT_DELAY_OUTCOME_METADATA_KEY.to_string();
+                let label = outcome.metadata_label().to_string();
+                ctx.insert_metadata(key, label);
+            }
         }
 
         if abort_triggered && let Some(a) = self.abort.as_ref() {

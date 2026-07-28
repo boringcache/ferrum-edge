@@ -223,6 +223,14 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     (
         "ai_transcript_audit",
         &[
+            // The HTTP sink's collector URL and free-form header map live under
+            // `sink` (`AI_TRANSCRIPT_AUDIT_SINK_KEYS`); vendors document a
+            // reusable ingest token in the path or query, and a header value
+            // template may resolve a `${secret:NAME}` reference.
+            endpoint_url(&["sink", "endpoint_url"]),
+            secret(&["sink", "custom_headers", "*"]),
+            // Retained for a flat/legacy shape so the rules can only add
+            // redaction, never reveal.
             endpoint_url(&["endpoint_url"]),
             secret(&["headers", "*"]),
             secret(&["custom_headers", "*"]),
@@ -346,7 +354,14 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("api_chargeback", NONE),
     (
         "api_chargeback_sink",
-        &[endpoint_url(&["clickhouse", "url"])],
+        &[
+            endpoint_url(&["clickhouse", "url"]),
+            // Operator-authored INSERT query parameters are appended to the
+            // ClickHouse URL. Credential-*named* keys are already rejected at
+            // validation, but the values stay arbitrary strings, so no name
+            // rule can vouch for them.
+            secret(&["clickhouse", "insert_query_params", "*"]),
+        ],
     ),
     ("workload_metrics", NONE),
     ("__mesh_bpf_metrics", NONE),
@@ -456,12 +471,25 @@ fn apply_rule(value: &mut Value, path: &[&str], sensitivity: FieldSensitivity) {
                 }
             }
         }
-        // Traverse arrays transparently so one rule covers both an
-        // object-keyed and an array-shaped container, and so an array-wrapped
-        // scalar still reaches the leaf rule.
         Value::Array(items) => {
-            for item in items {
-                apply_rule(item, path, sensitivity);
+            if *head == "*" {
+                // `*` names *each entry of the container*. For an array the
+                // entries are the elements themselves, so the segment is
+                // consumed here. Traversing transparently instead would hand
+                // the same `*` to every element's own fields, and the remaining
+                // path would then be resolved against sibling scalars
+                // (`providers[0].name`), fail-closing values the schema never
+                // named.
+                for item in items {
+                    apply_rule(item, rest, sensitivity);
+                }
+            } else {
+                // A named segment traverses arrays transparently so one rule
+                // covers both an object-keyed and an array-shaped container,
+                // and so an array-wrapped scalar still reaches the leaf rule.
+                for item in items {
+                    apply_rule(item, path, sensitivity);
+                }
             }
         }
         Value::Null => {}

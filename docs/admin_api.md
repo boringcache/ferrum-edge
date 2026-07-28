@@ -471,6 +471,9 @@ Fields covered by the schema include:
 | `otel_tracing` | `endpoint` | structural URL |
 | `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
 | `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
+| `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
+| `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
+| `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
 | `proxy_alerts` | `channels.*.url`, `channels.*.webhook_url` | structural URL |
 | `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
 | `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |

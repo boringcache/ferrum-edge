@@ -599,3 +599,149 @@ fn redis_url_keeps_its_documented_projection_shape() {
         ],
     );
 }
+
+// ---------------------------------------------------------------------------
+// Wildcard entry semantics over array-shaped containers
+// ---------------------------------------------------------------------------
+
+/// A `*` segment names *each entry of the container*. Over an array the entries
+/// are the elements themselves, so the segment must be consumed at the array
+/// rather than handed to each element's own fields — otherwise the remaining
+/// path (`base_url`) resolves against sibling scalars and fail-closes every
+/// non-credential provider field the schema never named.
+#[test]
+fn array_shaped_provider_entries_keep_their_non_credential_fields() {
+    let projected = project(
+        "ai_federation",
+        json!({
+            "providers": [{
+                "name": "redaction-provider",
+                "provider_type": "openai",
+                "api_key": "federation-provider-api-key-canary",
+                "base_url": "https://api.example.com/v1/federation-base-canary",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+    );
+    let provider = &projected["providers"][0];
+    // The credential-bearing paths are still projected...
+    assert_eq!(provider["api_key"], REDACTED);
+    assert_eq!(
+        provider["base_url"],
+        "https://api.example.com/[REDACTED_PATH]"
+    );
+    // ...while the safe identifiers an operator reads a config back by survive.
+    assert_eq!(provider["name"], "redaction-provider");
+    assert_eq!(provider["provider_type"], "openai");
+    assert_eq!(provider["model_patterns"][0], "gpt-*");
+    assert_no_canaries(
+        &projected,
+        &[
+            "federation-provider-api-key-canary",
+            "federation-base-canary",
+        ],
+    );
+}
+
+/// The same wildcard rule over an object-keyed container, so the two shapes
+/// stay one contract rather than two behaviors.
+#[test]
+fn object_keyed_provider_entries_keep_their_non_credential_fields() {
+    let projected = project(
+        "ai_stream_router",
+        json!({
+            "providers": {
+                "primary": {
+                    "endpoint": "https://router.example.com/v1/stream-endpoint-canary",
+                    "weight": 70
+                }
+            }
+        }),
+    );
+    assert_eq!(
+        projected["providers"]["primary"]["endpoint"],
+        "https://router.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["providers"]["primary"]["weight"], 70);
+    assert_no_canaries(&projected, &["stream-endpoint-canary"]);
+}
+
+/// A wildcard entry that is a scalar where the schema expects a container
+/// cannot be classified, so it must still fail closed.
+#[test]
+fn scalar_wildcard_entries_still_fail_closed() {
+    let projected = project(
+        "ai_federation",
+        json!({"providers": ["https://svc:scalar-provider-canary@api.example.com/v1"]}),
+    );
+    assert_eq!(projected["providers"][0], REDACTED);
+    assert_no_canaries(&projected, &["scalar-provider-canary"]);
+}
+
+// ---------------------------------------------------------------------------
+// Nested sink / parameter maps
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ai_transcript_audit_sink_endpoint_and_header_values_are_projected() {
+    let projected = project(
+        "ai_transcript_audit",
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/ingest/transcript-path-canary?apikey=transcript-query-canary",
+                "custom_headers": {"X-Audit-Token": "transcript-header-canary"},
+                "batch_size": 25
+            }
+        }),
+    );
+    assert_eq!(
+        projected["sink"]["endpoint_url"],
+        "https://audit.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        projected["sink"]["custom_headers"]["X-Audit-Token"],
+        REDACTED
+    );
+    // Safe-value controls: sink wiring stays legible.
+    assert_eq!(projected["sink"]["type"], "http");
+    assert_eq!(projected["sink"]["batch_size"], 25);
+    assert_no_canaries(
+        &projected,
+        &[
+            "transcript-path-canary",
+            "transcript-query-canary",
+            "transcript-header-canary",
+        ],
+    );
+}
+
+#[test]
+fn chargeback_clickhouse_endpoint_and_insert_params_are_projected() {
+    let projected = project(
+        "api_chargeback_sink",
+        json!({
+            "clickhouse": {
+                "url": "https://clickhouse.example.com:8443/chargeback-path-canary",
+                "database": "ferrum",
+                "table": "charges_raw",
+                "insert_query_params": {"async_insert": "chargeback-param-canary"}
+            }
+        }),
+    );
+    assert_eq!(
+        projected["clickhouse"]["url"],
+        "https://clickhouse.example.com:8443/[REDACTED_PATH]"
+    );
+    assert_eq!(
+        projected["clickhouse"]["insert_query_params"]["async_insert"],
+        REDACTED
+    );
+    // Safe-value controls: routing metadata an operator needs stays readable.
+    assert_eq!(projected["clickhouse"]["database"], "ferrum");
+    assert_eq!(projected["clickhouse"]["table"], "charges_raw");
+    assert_no_canaries(
+        &projected,
+        &["chargeback-path-canary", "chargeback-param-canary"],
+    );
+}
