@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,7 +11,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
-    clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
+    decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     encode_spool_bytes_without_content_size_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests, probe_compact_recovery_retry_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
@@ -4361,7 +4363,9 @@ fn admission_eviction_never_unlinks_a_fresh_peer_process_temp() {
 fn compressed_spool_record_expanding_past_its_bound_fails_closed() {
     let temp = tempfile::tempdir().unwrap();
     let bomb_plain = vec![b'\n'; 2 * 1024 * 1024];
-    let bomb = encode_spool_bytes_for_tests(&bomb_plain, SpoolCompression::Zstd).unwrap();
+    let bomb =
+        encode_spool_bytes_without_content_size_for_tests(&bomb_plain, SpoolCompression::Zstd)
+            .unwrap();
     assert!(
         bomb.len() < 4096,
         "the fixture must exercise a high compression ratio"
@@ -6839,6 +6843,75 @@ fn compact_snapshot_recovery_owns_its_reservation_and_restores_deltas_on_a_faile
     assert_eq!(
         after_drop, 0,
         "dropping the recovery releases its reservation exactly once"
+    );
+}
+
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn compact_snapshot_recovery_serializes_take_write_restore_attempts() {
+    let ceiling = leaked_chargeback_test_ceiling(1024 * 1024);
+    let temp = tempfile::tempdir().unwrap();
+    let spool = ceiling_spool(&temp, ceiling);
+    let events: Vec<ChargeEvent> = (0..12)
+        .map(|index| sample_event(&format!("compact-concurrent-{index}")))
+        .collect();
+    let recovery = Arc::new(
+        compact_recovery_probe_for_tests(ceiling, events, spool)
+            .expect("compact recovery must fit below the test ceiling"),
+    );
+
+    let gate = SpoolBeforeWriteGate::new();
+    let _clear_hook = ClearSpoolWriteHookOnDrop {
+        gate: Arc::clone(&gate),
+    };
+    let hook_gate = Arc::clone(&gate);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
+        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+    })));
+
+    let first_recovery = Arc::clone(&recovery);
+    let first = thread::spawn(move || first_recovery.try_spool_for_tests());
+    gate.wait_until_parked(1, Duration::from_secs(5))
+        .expect("first retry must park after taking the pending set");
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let second_recovery = Arc::clone(&recovery);
+    let second = thread::spawn(move || {
+        started_tx.send(()).expect("publish second retry start");
+        let durable = second_recovery.try_spool_for_tests();
+        done_tx.send(durable).expect("publish second retry outcome");
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second retry must start");
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a concurrent retry must wait rather than treating the borrowed empty set as success"
+    );
+
+    gate.release_all();
+    assert!(
+        first.join().expect("first retry thread must not panic"),
+        "the first retry must durably spool the pending set"
+    );
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second retry must finish after the first"),
+        "the serialized second retry must observe durable completion"
+    );
+    second.join().expect("second retry thread must not panic");
+    assert_eq!(recovery.pending_len_for_tests(), 0);
+    drop(recovery);
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "dropping the drained recovery releases its reservation"
     );
 }
 

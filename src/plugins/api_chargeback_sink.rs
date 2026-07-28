@@ -309,6 +309,10 @@ impl PendingSnapshotFinalization {
 struct CompactSnapshotRecovery {
     generation: u64,
     plugin_config_id: Arc<str>,
+    /// Serializes the take/write/restore transaction. An empty `events` vector
+    /// is only a durable-success signal while no other retry owns the pending
+    /// set outside the mutex.
+    attempt_lock: Mutex<()>,
     events: Mutex<Vec<ChargeEvent>>,
     retained_bytes: usize,
     /// Process-wide charge on [`Self::events`], transferred from the Full
@@ -376,8 +380,14 @@ impl CompactSnapshotRecovery {
     }
 
     fn try_spool(&self) -> bool {
+        let _attempt_guard = match self.attempt_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         // Ownership is taken out of the mutex, which is released before any
-        // filesystem work begins.
+        // filesystem work begins. `attempt_lock` remains held until the
+        // borrowed set commits or is restored, so another retry cannot mistake
+        // the temporary empty vector for durable success.
         let borrowed = self.borrow_pending();
         if borrowed.events().is_empty() {
             return true;
@@ -696,10 +706,10 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
         .map(charge_event_retained_bytes)
         .fold(0usize, usize::saturating_add);
     // Transfer the projection's reservation to the Compact owner and true it up
-    // to the measured retained size. A shortfall (the bound is conservative, so
-    // this is not expected) is charged rather than silently dropped; if the
-    // ceiling refuses the difference the deltas are still retained, and the
-    // undercharge is recorded with a fixed label.
+    // to the measured retained size. A shortfall is not expected because the
+    // projection bound is conservative, but it must still fail closed: retain
+    // the Full generation and retry later instead of publishing an undercharged
+    // compact recovery.
     if retained_bytes <= projection.held() {
         projection.shrink_by(projection.held().saturating_sub(retained_bytes));
     } else if !projection.try_grow(retained_bytes.saturating_sub(projection.held())) {
@@ -707,12 +717,14 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
             plugin = PLUGIN_NAME,
             generation = lifecycle.generation,
             retained_bytes,
-            "Chargeback sink compact snapshot recovery is undercharged against the retained-byte ceiling; pending deltas are retained"
+            "Chargeback sink cannot compact failed finalization because its measured recovery payload exceeds the reserved projection; Full generation retained"
         );
+        return false;
     }
     let recovery = Arc::new(CompactSnapshotRecovery {
         generation: lifecycle.generation,
         plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
+        attempt_lock: Mutex::new(()),
         events: Mutex::new(events),
         retained_bytes,
         _reservation: projection,
@@ -7908,6 +7920,7 @@ pub fn probe_compact_recovery_retry_for_tests(
     let recovery = CompactSnapshotRecovery {
         generation: 1,
         plugin_config_id: Arc::from("probe"),
+        attempt_lock: Mutex::new(()),
         events: Mutex::new(events),
         retained_bytes,
         _reservation: reservation,
@@ -7929,6 +7942,64 @@ pub fn probe_compact_recovery_retry_for_tests(
     };
     drop(recovery);
     Ok((retained_bytes, held, pending, ceiling.used()))
+}
+
+/// Opaque compact-recovery handle for deterministic external concurrency tests.
+#[doc(hidden)]
+pub struct CompactRecoveryProbe {
+    recovery: CompactSnapshotRecovery,
+}
+
+impl CompactRecoveryProbe {
+    /// Run one synchronous retry through the production take/write/restore path.
+    #[doc(hidden)]
+    pub fn try_spool_for_tests(&self) -> bool {
+        self.recovery.try_spool()
+    }
+
+    /// Pending deltas currently owned by the recovery.
+    #[doc(hidden)]
+    pub fn pending_len_for_tests(&self) -> usize {
+        match self.recovery.events.lock() {
+            Ok(guard) => guard.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+}
+
+/// Build a compact recovery backed by a real spool for deterministic external
+/// concurrency tests.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn compact_recovery_probe_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    events: Vec<ChargeEvent>,
+    spool: SpoolManager,
+) -> Result<CompactRecoveryProbe, String> {
+    let retained_bytes = events
+        .iter()
+        .map(charge_event_retained_bytes)
+        .fold(0usize, usize::saturating_add);
+    let reservation = GrowableProcessReservation::new(ceiling);
+    if !reservation.try_grow(retained_bytes) {
+        return Err(format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ));
+    }
+    Ok(CompactRecoveryProbe {
+        recovery: CompactSnapshotRecovery {
+            generation: 1,
+            plugin_config_id: Arc::from("concurrency-probe"),
+            attempt_lock: Mutex::new(()),
+            events: Mutex::new(events),
+            retained_bytes,
+            _reservation: reservation,
+            closed_at: Instant::now(),
+            spool: Some(Arc::new(spool)),
+            metrics: Arc::new(SinkMetrics::default()),
+        },
+    })
 }
 
 #[doc(hidden)]
