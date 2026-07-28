@@ -43,6 +43,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
+use super::utils::byte_budget::{
+    JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ReservedPayload,
+    RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
+};
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
@@ -2027,6 +2031,10 @@ struct ClickHouseFlushConfig {
     password: Option<String>,
     timeout: Duration,
     metrics: Arc<SinkMetrics>,
+    /// Retained-byte ceiling the JSONEachRow request body is charged to. The
+    /// queued `ChargeEvent`s already hold a per-instance lease; the serialized
+    /// body is a second attacker-shaped copy that coexists with them.
+    ceiling: &'static RetainedByteCeiling,
 }
 
 #[derive(Clone)]
@@ -2185,6 +2193,7 @@ impl ApiChargebackSink {
             password,
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
             metrics: Arc::clone(&metrics),
+            ceiling: process_ceiling(),
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
@@ -2316,6 +2325,7 @@ impl ApiChargebackSink {
                     password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
+                    ceiling: process_ceiling(),
                 },
                 self.config.batch.size,
                 self.config.spool.replay_interval_secs,
@@ -3591,12 +3601,82 @@ impl ClickHouseAckIncomplete {
     }
 }
 
+/// Fixed JSONEachRow row framing plus the compile-time field-name set one
+/// serialized charge event costs beyond its own retained strings.
+const CHARGE_ROW_JSON_OVERHEAD_BYTES: usize = 1_024;
+
+/// Conservative upper bound on the JSONEachRow request body for `batch`.
+///
+/// Charge-event strings are raw, so JSON escaping can expand each byte six-fold.
+fn charge_body_byte_bound(batch: &[ChargeEvent]) -> Option<usize> {
+    let mut total = CHARGE_ROW_JSON_OVERHEAD_BYTES;
+    for event in batch {
+        total = total
+            .checked_add(
+                charge_event_retained_bytes(event).checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+            )?
+            .checked_add(CHARGE_ROW_JSON_OVERHEAD_BYTES)?;
+    }
+    Some(total)
+}
+
+/// Serialize `batch` into the reserved-and-charged JSONEachRow request body.
+///
+/// The queued events still hold their per-instance leases here, so the body is a
+/// second attacker-shaped copy: it is reserved against the retained-byte ceiling
+/// before serialization and stays charged until the request (and every retry
+/// handle taken from it) is gone.
+fn materialize_charge_body(
+    cfg: &ClickHouseFlushConfig,
+    batch: &[ChargeEvent],
+) -> Result<ReservedPayload, String> {
+    for event in batch {
+        for (field, value) in [
+            ("charge_call", event.charge_call),
+            ("charge_bytes_sent", event.charge_bytes_sent),
+            ("charge_bytes_received", event.charge_bytes_received),
+            ("charge_total", event.charge_total),
+        ] {
+            require_finite_charge(value, field).map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: event '{}' cannot be serialized: {error}",
+                    event.event_id
+                )
+            })?;
+        }
+    }
+    let bound = charge_body_byte_bound(batch).ok_or_else(|| {
+        format!(
+            "{PLUGIN_NAME}: {}",
+            PayloadMaterializationError::BoundOverflowed.reason()
+        )
+    })?;
+    materialize_reserved_payload(cfg.ceiling, bound, |writer| {
+        for (index, event) in batch.iter().enumerate() {
+            if index > 0 {
+                writer
+                    .write_all(b"\n")
+                    .map_err(|error| format!("failed to write row separator: {error}"))?;
+            }
+            serde_json::to_writer(&mut *writer, event)
+                .map_err(|error| format!("failed to serialize charge event: {error}"))?;
+        }
+        Ok(())
+    })
+    .map_err(|error| format!("{PLUGIN_NAME}: {}", error.reason()))
+}
+
 async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Result<(), String> {
-    let body = serialize_json_each_row(&batch).inspect_err(|error| {
+    let event_count = batch.len();
+    let body = materialize_charge_body(cfg, &batch).inspect_err(|error| {
         cfg.metrics
             .record_failure(FailureReason::Serialize, error.clone());
     })?;
-    match post_json_each_row(cfg, body, batch.len()).await {
+    // The reserved body is the only representation delivery needs; the events
+    // themselves are released here so peak retention is the queue's leases plus
+    // one bounded body rather than the queue plus per-attempt copies.
+    drop(batch);
+    match post_json_each_row(cfg, body, event_count).await {
         DeliveryOutcome::Delivered => Ok(()),
         other => Err(other.safe_message().to_string()),
     }
@@ -3604,7 +3684,7 @@ async fn send_batch(cfg: &ClickHouseFlushConfig, batch: Vec<ChargeEvent>) -> Res
 
 async fn post_json_each_row(
     cfg: &ClickHouseFlushConfig,
-    body: String,
+    body: ReservedPayload,
     event_count: usize,
 ) -> DeliveryOutcome {
     let start = Instant::now();
@@ -3614,7 +3694,8 @@ async fn post_json_each_row(
     }
     .timeout(cfg.timeout)
     .header(CONTENT_TYPE, "application/json")
-    .body(body);
+    // Refcount handle on the reserved body: no second copy per attempt.
+    .body(body.bytes());
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
@@ -7015,8 +7096,37 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
         password: None,
         timeout: Duration::from_secs(5),
         metrics: Arc::clone(&spool.metrics),
+        ceiling: process_ceiling(),
     };
     replay_spool_once(spool, &flush_config, batch_size.max(1)).await
+}
+
+/// Deterministic body-materialization probe for external unit tests.
+///
+/// Returns `(reserved_bound, ceiling_used_while_body_held, ceiling_used_after_drop)`,
+/// or `Err` when the ceiling refused the body before it was serialized.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn probe_charge_body_materialization_for_tests(
+    ceiling: &'static RetainedByteCeiling,
+    batch: &[ChargeEvent],
+) -> Result<(usize, usize, usize), String> {
+    let metrics = Arc::new(SinkMetrics::default());
+    let cfg = ClickHouseFlushConfig {
+        http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
+        insert_url: "http://127.0.0.1/".to_string(),
+        username: None,
+        password: None,
+        timeout: Duration::from_secs(1),
+        metrics,
+        ceiling,
+    };
+    let bound =
+        charge_body_byte_bound(batch).ok_or_else(|| format!("{PLUGIN_NAME}: bound overflowed"))?;
+    let body = materialize_charge_body(&cfg, batch)?;
+    let held = ceiling.used();
+    drop(body);
+    Ok((bound, held, ceiling.used()))
 }
 
 #[doc(hidden)]
@@ -7066,6 +7176,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
         password: None,
         timeout: Duration::from_secs(1),
         metrics,
+        ceiling: process_ceiling(),
     };
     classify_clickhouse_delivery(
         &cfg,
@@ -7507,7 +7618,35 @@ async fn replay_spool_lines(
                 .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
             spool.renew_claim_locked(claim)?;
         }
-        let body = chunk.join("\n");
+        // The joined replay body is a second in-memory copy of the claimed spool
+        // lines, so it is reserved against the retained-byte ceiling before it is
+        // built. A refusal is reported as retryable, which leaves the durable
+        // claim untouched for a later attempt. Lines are written verbatim, so the
+        // bound (row bytes plus one separator each) is exact.
+        let body_bound = chunk
+            .iter()
+            .try_fold(chunk.len(), |total, line| total.checked_add(line.len()))
+            .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay body byte bound overflowed"))?;
+        let body =
+            materialize_reserved_payload(flush_config.ceiling, body_bound, |writer| {
+                for (index, line) in chunk.iter().enumerate() {
+                    if index > 0 {
+                        writer
+                            .write_all(b"\n")
+                            .map_err(|error| format!("row separator: {error}"))?;
+                    }
+                    writer
+                        .write_all(line.as_bytes())
+                        .map_err(|error| format!("row: {error}"))?;
+                }
+                Ok(())
+            })
+            .map_err(|error| {
+                format!(
+                    "{PLUGIN_NAME}: spool replay body was not materialized: {}",
+                    error.reason()
+                )
+            })?;
         match post_json_each_row(flush_config, body, chunk.len()).await {
             DeliveryOutcome::Delivered => {}
             DeliveryOutcome::Retryable { message } => return Err(message),

@@ -11,13 +11,15 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    new_ulid, probe_charge_body_materialization_for_tests, render_prometheus, render_status_json,
+    replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
     set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
+use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
 use ferrum_edge::plugins::{
     Plugin, PluginHttpClient, REQUEST_ID_METADATA_KEY, TransactionSummary, WsDisconnectContext,
 };
@@ -5659,4 +5661,62 @@ fn snapshot_exports_at_limit_identity_verbatim() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].consumer_id, consumer);
+}
+
+// ---------------------------------------------------------------------------
+// JSONEachRow request-body retained-byte ownership — GHSA-83h5-52mw-f33p.
+//
+// The queued `ChargeEvent`s hold a per-instance lease covering one copy. The
+// serialized insert body is a second attacker-shaped copy that coexists with
+// them, so it is reserved against the retained-byte ceiling before serialization
+// and released when the request (and every retry handle) is gone.
+// ---------------------------------------------------------------------------
+
+fn leaked_chargeback_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
+    let ceiling: &'static RetainedByteCeiling =
+        Box::leak(Box::new(RetainedByteCeiling::new(max_bytes)));
+    ceiling.set_max_unclamped_for_test(max_bytes);
+    ceiling
+}
+
+#[test]
+fn chargeback_insert_body_is_reserved_before_serialization_and_released_on_drop() {
+    let ceiling = leaked_chargeback_test_ceiling(4 * 1024 * 1024);
+    let events: Vec<ChargeEvent> = (0..8)
+        .map(|index| sample_event(&format!("event-{index}")))
+        .collect();
+
+    let (bound, held, after) =
+        probe_charge_body_materialization_for_tests(ceiling, &events).expect("body materialized");
+
+    assert!(bound > 0);
+    assert_eq!(
+        held, bound,
+        "the reserved bound stays charged for the request body's whole life"
+    );
+    assert_eq!(
+        after, 0,
+        "the body reservation releases exactly once, with no underflow"
+    );
+}
+
+#[test]
+fn chargeback_insert_body_is_refused_rather_than_serialized_under_a_saturated_ceiling() {
+    let ceiling = leaked_chargeback_test_ceiling(1_024);
+    let events: Vec<ChargeEvent> = (0..8)
+        .map(|index| sample_event(&format!("event-{index}")))
+        .collect();
+
+    let error = probe_charge_body_materialization_for_tests(ceiling, &events)
+        .expect_err("a 1 KiB ceiling cannot admit an eight-row insert body");
+    assert!(
+        error.contains("ceiling"),
+        "the refusal must name the ceiling: {error}"
+    );
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a refused body must not charge the ceiling"
+    );
+    assert!(ceiling.rejections() > 0);
 }

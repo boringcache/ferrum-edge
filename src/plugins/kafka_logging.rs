@@ -8,11 +8,17 @@
 //! worst-case Ferrum retained-byte lease before cloning or serializing
 //! attacker-shaped summary fields, then shrinks the lease to the purpose-built
 //! Kafka record's exact retained size.
-//! Local `ThreadedProducer::send` success only means the record was admitted
-//! to librdkafka's in-memory queue (Ferrum then releases its byte lease).
-//! Terminal broker delivery (including `acks: 0` local completion) is observed
-//! through a custom [`ProducerContext`] delivery callback and exposed as
-//! authenticated diagnostics/metrics.
+//! Local `ThreadedProducer::send` success only means the record was admitted to
+//! librdkafka's in-memory queue, which retains its own copy of the payload until
+//! delivery resolves. Ferrum therefore *transfers* the byte lease into the
+//! record's librdkafka delivery opaque instead of releasing it at handoff, so a
+//! stalled broker's pinned downstream queue stays charged to both the
+//! per-instance budget and the process-wide retained-byte ceiling.
+//! Terminal broker delivery (including `acks: 0` local completion), terminal
+//! failure, and purge-on-destroy are all observed through a custom
+//! [`ProducerContext`] delivery callback, which releases the lease and feeds
+//! authenticated diagnostics/metrics. An immediate `send` rejection hands the
+//! opaque back and releases it on that path instead.
 //!
 //! Construction (`new`) is runtime-free: it parses and admits configuration,
 //! including a native-configuration-only validation pass that rejects unknown
@@ -48,7 +54,7 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::utils::byte_budget::ProcessByteReservation;
+use super::utils::byte_budget::{ProcessByteReservation, RetainedByteCeiling, process_ceiling};
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchingLogger, BatchingLoggerHandle, LoggerHooks, PluginHttpClient, RetryPolicy,
@@ -805,13 +811,26 @@ struct KafkaDeliveryContext {
 impl ClientContext for KafkaDeliveryContext {}
 
 impl ProducerContext for KafkaDeliveryContext {
-    type DeliveryOpaque = ();
+    /// The retained-byte lease for the record librdkafka copied.
+    ///
+    /// `ThreadedProducer::send` success only means librdkafka accepted the
+    /// record into its own in-memory queue with `RD_KAFKA_MSG_F_COPY`; that copy
+    /// is retained until terminal delivery, terminal failure, or producer
+    /// destruction (`rd_kafka_destroy` purges the queue and still fires this
+    /// callback for every purged message). Carrying the lease as the delivery
+    /// opaque is what keeps that downstream layer inside both the per-instance
+    /// budget and the process-wide ceiling instead of releasing at handoff.
+    type DeliveryOpaque = Arc<KafkaByteLease>;
 
-    fn delivery(&self, delivery_result: &DeliveryResult<'_>, _opaque: Self::DeliveryOpaque) {
+    fn delivery(&self, delivery_result: &DeliveryResult<'_>, opaque: Self::DeliveryOpaque) {
         match delivery_result {
             Ok(_) => self.metrics.record_delivered(),
             Err((error, _message)) => self.metrics.record_delivery_failed(error),
         }
+        // Terminal outcome: librdkafka no longer retains the payload. Dropping
+        // the last handle releases the lease exactly once (`Arc` refcount), on
+        // the delivery, failure, and purge-on-destroy paths alike.
+        drop(opaque);
     }
 }
 
@@ -858,13 +877,22 @@ impl Drop for KafkaByteLease {
 struct KafkaByteBudget {
     used_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
+    ceiling: &'static RetainedByteCeiling,
 }
 
 impl KafkaByteBudget {
     fn new(max_bytes: usize) -> Self {
+        Self::with_ceiling(max_bytes, process_ceiling())
+    }
+
+    /// Construct a budget bound to an explicit ceiling. Production always uses
+    /// [`process_ceiling`]; external tests pass their own leaked ceiling so
+    /// downstream-ownership assertions stay exact under concurrency.
+    fn with_ceiling(max_bytes: usize, ceiling: &'static RetainedByteCeiling) -> Self {
         Self {
             used_bytes: Arc::new(AtomicUsize::new(0)),
             max_bytes,
+            ceiling,
         }
     }
 
@@ -875,7 +903,7 @@ impl KafkaByteBudget {
     fn try_acquire(&self, bytes: usize) -> Option<Arc<KafkaByteLease>> {
         // Process ceiling first: a failed aggregate reservation must never
         // leave per-instance bytes held.
-        let process = ProcessByteReservation::try_acquire(bytes)?;
+        let process = self.ceiling.try_acquire(bytes)?;
         let reserved = self
             .used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -894,13 +922,18 @@ impl KafkaByteBudget {
 }
 
 /// Pre-serialized Kafka record retained in the Ferrum userspace channel.
-/// The byte lease is released when librdkafka admission returns (or on drop
-/// before admission), because librdkafka copies/assumes downstream ownership.
+///
+/// The byte lease covers the record for its whole retention window: the Ferrum
+/// channel, then librdkafka's own copy after `send` accepts it. `send_batch`
+/// transfers the lease into the delivery opaque instead of releasing it, so a
+/// stalled broker's pinned librdkafka queue stays inside both the per-instance
+/// budget and the process-wide ceiling. Dropping a record before admission (or
+/// a rejected record afterwards) releases it.
 #[derive(Clone)]
 struct KafkaRecord {
     payload: Arc<str>,
     key: Option<Arc<str>>,
-    lease: Option<Arc<KafkaByteLease>>,
+    lease: Arc<KafkaByteLease>,
 }
 
 struct BoundedJsonWriter {
@@ -1106,7 +1139,7 @@ impl KafkaAdmission {
         Some(KafkaRecord {
             payload,
             key,
-            lease: Some(lease),
+            lease,
         })
     }
 }
@@ -1951,7 +1984,7 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
         handle.try_send(KafkaRecord {
             payload: Arc::from("{}"),
             key: None,
-            lease: Some(lease),
+            lease,
         })
     };
     let _ = inject(&handle, &byte_budget);
@@ -2030,6 +2063,72 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
     drop(held_lease);
     let _ = logger.close_and_await().await;
     (exhausted, oversize)
+}
+
+/// Deterministic downstream-ownership probe for external unit tests.
+///
+/// Sends `record_count` records through a real `ThreadedProducer` pointed at an
+/// unreachable broker with a long `message.timeout.ms`, so librdkafka accepts
+/// each record into its own queue and cannot resolve delivery. Returns
+/// `(instance_used_after_send, ceiling_used_after_send, instance_used_after_destroy,
+/// ceiling_used_after_destroy)`.
+///
+/// The first two values must stay non-zero — librdkafka still retains its copies,
+/// so the lease must not have been released at handoff. The last two must be
+/// zero: producer destruction purges the queue, fires the delivery callback for
+/// every purged record, and releases each lease exactly once with no underflow.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_downstream_lease_ownership_for_test(
+    ceiling: &'static RetainedByteCeiling,
+    record_count: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 21));
+    let mut kafka_config = ClientConfig::new();
+    // Unroutable broker: local enqueue succeeds, delivery never resolves within
+    // the probe, so the retained downstream copy is observable.
+    kafka_config.set("bootstrap.servers", "127.0.0.1:1");
+    kafka_config.set("message.timeout.ms", "300000");
+    kafka_config.set("socket.timeout.ms", "1000");
+    let producer: ThreadedProducer<KafkaDeliveryContext> = kafka_config
+        .create_with_context(KafkaDeliveryContext {
+            metrics: Arc::clone(&metrics),
+        })
+        .ok()?;
+
+    let byte_budget = Arc::new(KafkaByteBudget::with_ceiling(1_048_576, ceiling));
+    let mut batch = Vec::with_capacity(record_count);
+    for _ in 0..record_count {
+        let lease = byte_budget.try_acquire(64)?;
+        batch.push(KafkaRecord {
+            payload: Arc::from("{\"probe\":true}"),
+            key: None,
+            lease,
+        });
+    }
+
+    let state = Arc::new(KafkaProducerState {
+        producer,
+        metrics,
+        flush_timeout: Duration::from_millis(500),
+        max_entry_bytes: 64,
+        buffer_max_bytes: 1_048_576,
+        byte_budget: Arc::clone(&byte_budget),
+        finalized: AtomicBool::new(false),
+    });
+    let _ = send_batch(&state, "ferrum-edge-downstream-ownership-probe", batch);
+    let instance_after_send = byte_budget.used();
+    let ceiling_after_send = ceiling.used();
+
+    // `ThreadedProducer::drop` joins the poll thread and the inner
+    // `BaseProducer::drop` purges queue + in-flight, then flushes; the flush
+    // polls until the delivery callbacks for every purged record have run.
+    drop(state);
+    Some((
+        instance_after_send,
+        ceiling_after_send,
+        byte_budget.used(),
+        ceiling.used(),
+    ))
 }
 
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
@@ -2398,27 +2497,53 @@ fn send_batch(
     topic: &str,
     batch: Vec<KafkaRecord>,
 ) -> Result<(), String> {
-    for mut record in batch {
+    for record in batch {
         // `ThreadedProducer::send` is the non-blocking local-queue admission
         // API; broker I/O and delivery callbacks run on librdkafka's own
         // thread. Calling it directly avoids queueing one Tokio blocking task
         // per record and leaves that pool available for the single owned final
         // flush below.
-        let enqueue_error = match record.key.as_deref() {
+        //
+        // Ownership of the retained-byte lease is *transferred* into the
+        // delivery opaque rather than released at handoff: librdkafka copies
+        // the payload (`RD_KAFKA_MSG_F_COPY`) and keeps that copy until
+        // terminal delivery, terminal failure, or producer destruction. Ferrum
+        // therefore keeps charging the downstream queue against both the
+        // per-instance budget and the process-wide ceiling, and
+        // `KafkaDeliveryContext::delivery` performs the single release.
+        let KafkaRecord {
+            payload,
+            key,
+            lease,
+        } = record;
+        let enqueue_error = match key.as_deref() {
             Some(key) => state
                 .producer
                 .send(
-                    BaseRecord::<str, str>::to(topic)
-                        .payload(record.payload.as_ref())
+                    BaseRecord::<str, str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
+                        .payload(payload.as_ref())
                         .key(key),
                 )
                 .err()
-                .map(|(error, _)| error),
+                .map(|(error, rejected)| {
+                    // Immediate rejection: librdkafka never took the payload
+                    // and handed the opaque back. Dropping the returned record
+                    // releases the lease exactly once — the callback will not
+                    // fire for a record that was never enqueued.
+                    drop(rejected);
+                    error
+                }),
             None => state
                 .producer
-                .send(BaseRecord::<(), str>::to(topic).payload(record.payload.as_ref()))
+                .send(
+                    BaseRecord::<(), str, Arc<KafkaByteLease>>::with_opaque_to(topic, lease)
+                        .payload(payload.as_ref()),
+                )
                 .err()
-                .map(|(error, _)| error),
+                .map(|(error, rejected)| {
+                    drop(rejected);
+                    error
+                }),
         };
 
         match enqueue_error {
@@ -2433,10 +2558,6 @@ fn send_batch(
                 state.metrics.record_admitted();
             }
         }
-
-        // librdkafka has copied/assumed ownership (or rejected). Release the
-        // Ferrum retained-byte lease on every path, including errors.
-        drop(record.lease.take());
     }
 
     Ok(())

@@ -1,13 +1,19 @@
 //! Shared observability byte-budget primitive tests.
 
+use ferrum_edge::_test_support::{
+    loki_logging_probe_batch_materialization_for_test,
+    otel_tracing_probe_batch_materialization_for_test,
+};
 use ferrum_edge::plugins::utils::byte_budget::{
     ByteBudget, DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
     HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES, PROCESS_MAX_RETAINED_BYTES_DEFAULT,
-    PROCESS_MAX_RETAINED_BYTES_MAX, PROCESS_MAX_RETAINED_BYTES_MIN, RetainedByteCeiling,
-    admit_byte_limits,
+    PROCESS_MAX_RETAINED_BYTES_MAX, PROCESS_MAX_RETAINED_BYTES_MIN,
+    PayloadMaterializationError, RetainedByteCeiling, admit_byte_limits,
+    materialize_reserved_payload,
 };
 use ferrum_edge::plugins::utils::summary_log_budget::serialize_under_byte_budget;
 use serde_json::json;
+use std::io::Write;
 
 #[test]
 fn admit_byte_limits_defaults_and_bounds() {
@@ -333,4 +339,233 @@ fn process_ceiling_config_bounds_are_clamped_not_silently_accepted() {
     // The default process total must admit at least one maximally configured
     // sink instance, or a single legal instance could never fill its budget.
     assert!(HARD_MAX_BUFFER_MAX_BYTES <= PROCESS_MAX_RETAINED_BYTES_DEFAULT);
+}
+
+// ---------------------------------------------------------------------------
+// Bounded batch materialization (GHSA-83h5-52mw-f33p root review).
+//
+// A queued entry's lease covers the entry. The contiguous wire payload, any
+// intermediate `serde_json::Value`, and any compressed buffer are *additional*
+// attacker-shaped copies that coexist with the still-charged queue, so they must
+// be reserved before they are materialized and released on every terminal path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_materialization_is_charged_for_the_payload_lifetime_and_released_on_drop() {
+    let ceiling = test_ceiling(64 * 1024);
+
+    let payload = materialize_reserved_payload(ceiling, 4_096, |writer| {
+        writer
+            .write_all(&b"x".repeat(1_000))
+            .map_err(|error| error.to_string())
+    })
+    .expect("payload fits the ceiling");
+
+    assert_eq!(payload.len(), 1_000);
+    // The conservative bound stays charged for the payload's whole life: the
+    // buffer handed to `Bytes` still owns its allocation, so shrinking to the
+    // written length would under-charge the ceiling.
+    assert_eq!(ceiling.used(), 4_096);
+
+    // Retries reuse the same immutable bytes rather than re-serializing.
+    let first = payload.bytes();
+    let second = payload.bytes();
+    assert_eq!(first, second);
+    assert_eq!(
+        ceiling.used(),
+        4_096,
+        "a retry handle must not add a second charge"
+    );
+    drop(first);
+    drop(second);
+    assert_eq!(ceiling.used(), 4_096);
+
+    drop(payload);
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "the materialization reservation releases exactly once, with no underflow"
+    );
+}
+
+#[test]
+fn batch_materialization_refuses_before_writing_when_the_ceiling_is_exhausted() {
+    let ceiling = test_ceiling(4_096);
+    let queued = ceiling.try_acquire(4_000).expect("queued entries fit");
+    let rejections_before = ceiling.rejections();
+
+    let refused = materialize_reserved_payload(ceiling, 2_048, |_writer| {
+        panic!("the writer must never run once the ceiling refuses the bound");
+    });
+    assert_eq!(refused.unwrap_err(), PayloadMaterializationError::CeilingExhausted);
+    assert_eq!(
+        ceiling.used(),
+        4_000,
+        "a refused materialization must not charge the ceiling"
+    );
+    assert_eq!(ceiling.rejections(), rejections_before + 1);
+
+    drop(queued);
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn batch_materialization_fails_closed_when_a_write_exceeds_its_bound() {
+    let ceiling = test_ceiling(64 * 1024);
+
+    let overrun = materialize_reserved_payload(ceiling, 512, |writer| {
+        // Hostile payload: three times the reserved bound.
+        writer
+            .write_all(&b"y".repeat(1_536))
+            .map_err(|error| error.to_string())
+    });
+    assert_eq!(overrun.unwrap_err(), PayloadMaterializationError::BoundExceeded);
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a bound overrun releases the reservation instead of leaking it"
+    );
+
+    let failed = materialize_reserved_payload(ceiling, 512, |_writer| {
+        Err("synthetic serializer failure".to_string())
+    });
+    assert_eq!(failed.unwrap_err(), PayloadMaterializationError::WriteFailed);
+    assert_eq!(ceiling.used(), 0);
+}
+
+#[test]
+fn batch_materialization_reasons_are_fixed_labels() {
+    for error in [
+        PayloadMaterializationError::BoundOverflowed,
+        PayloadMaterializationError::CeilingExhausted,
+        PayloadMaterializationError::BoundExceeded,
+        PayloadMaterializationError::WriteFailed,
+    ] {
+        let reason = error.reason();
+        assert!(!reason.is_empty());
+        assert_eq!(reason, error.to_string(), "Display must be the fixed label");
+        assert!(
+            reason.is_ascii() && !reason.contains('\n'),
+            "diagnostics must stay a single fixed ASCII label: {reason}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_instances_cannot_multiply_batch_materialization_past_the_ceiling() {
+    let ceiling = test_ceiling(32 * 1024);
+
+    let first = materialize_reserved_payload(ceiling, 24 * 1024, |writer| {
+        writer.write_all(b"first").map_err(|error| error.to_string())
+    })
+    .expect("first instance's batch fits");
+
+    // A second sink instance's batch is refused by the aggregate ceiling even
+    // though its own per-instance budget is untouched.
+    let second = materialize_reserved_payload(ceiling, 24 * 1024, |_writer| {
+        panic!("the second instance must be refused before it materializes anything");
+    });
+    assert_eq!(second.unwrap_err(), PayloadMaterializationError::CeilingExhausted);
+
+    drop(first);
+    assert_eq!(ceiling.used(), 0);
+    assert!(
+        materialize_reserved_payload(ceiling, 24 * 1024, |writer| {
+            writer
+                .write_all(b"second")
+                .map_err(|error| error.to_string())
+        })
+        .is_ok(),
+        "the second instance is admitted once the first releases"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Loki batch materialization.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loki_batch_body_is_charged_alongside_the_queued_entries() {
+    for gzip in [false, true] {
+        let ceiling = test_ceiling(8 * 1024 * 1024);
+        let (queued, peak, after_body, after_release, refused, _rejections, encoding) =
+            loki_logging_probe_batch_materialization_for_test(ceiling, 16, 4_096, gzip)
+                .expect("probe ran");
+
+        assert!(!refused, "an 8 MiB ceiling must admit a 64 KiB batch");
+        assert!(queued > 0, "queued entries must charge the ceiling");
+        assert!(
+            peak > queued,
+            "the wire body must add its own charge (queued={queued}, peak={peak}, gzip={gzip})"
+        );
+        assert_eq!(
+            after_body, queued,
+            "dropping the body releases exactly the materialization charge"
+        );
+        assert_eq!(
+            after_release, 0,
+            "releasing the queued entries drains the ceiling with no underflow"
+        );
+        assert_eq!(encoding, if gzip { Some("gzip") } else { None });
+    }
+}
+
+#[test]
+fn loki_batch_body_is_refused_rather_than_materialized_under_a_saturated_ceiling() {
+    // Enough headroom for the queued entries, far too little for the batch's
+    // own doubled-by-escaping JSON representation.
+    let ceiling = test_ceiling(200_000);
+    let (queued, peak, _after_body, after_release, refused, rejections, encoding) =
+        loki_logging_probe_batch_materialization_for_test(ceiling, 16, 8_192, false)
+            .expect("probe ran");
+
+    assert!(refused, "the batch body must be refused, not materialized");
+    assert_eq!(encoding, None);
+    assert_eq!(
+        peak, queued,
+        "a refused body must not charge the ceiling at all"
+    );
+    assert!(rejections > 0, "the refusal must be counted");
+    assert_eq!(after_release, 0);
+}
+
+// ---------------------------------------------------------------------------
+// OTel / Zipkin / Datadog trace batch materialization.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trace_batch_body_is_charged_alongside_the_queued_spans() {
+    let ceiling = test_ceiling(64 * 1024 * 1024);
+    let (queued, peak, after_body, after_release, refused, _rejections) =
+        otel_tracing_probe_batch_materialization_for_test(ceiling, 8, 2_048).expect("probe ran");
+
+    assert!(!refused);
+    assert!(queued > 0, "queued spans must charge the ceiling");
+    assert!(
+        peak > queued,
+        "the `Value` tree and serialized body must add their own charge \
+         (queued={queued}, peak={peak})"
+    );
+    assert_eq!(
+        after_body, queued,
+        "dropping the body releases exactly the materialization charge"
+    );
+    assert_eq!(after_release, 0, "no reservation leaks and none underflows");
+}
+
+#[test]
+fn trace_batch_body_is_refused_rather_than_materialized_under_a_saturated_ceiling() {
+    // Enough for the queued span, nowhere near enough for the batch's `Value`
+    // tree, and a single-span slice cannot be halved into admission either.
+    let ceiling = test_ceiling(12_000);
+    let (queued, peak, _after_body, after_release, refused, rejections) =
+        otel_tracing_probe_batch_materialization_for_test(ceiling, 1, 4_096).expect("probe ran");
+
+    assert!(refused, "the batch body must be refused, not materialized");
+    assert_eq!(
+        peak, queued,
+        "a refused body must not charge the ceiling at all"
+    );
+    assert!(rejections > 0);
+    assert_eq!(after_release, 0);
 }

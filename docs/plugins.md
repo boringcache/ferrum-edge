@@ -1213,6 +1213,38 @@ This is what stops configuration from multiplying the bound: ten sink instances
 each configured at the 256 MiB per-instance hard maximum retain at most the one
 configured process total between them, not 2.5 GiB.
 
+#### What the ceiling covers, layer by layer
+
+The ceiling is an **end-to-end** retained-byte bound, not a queue bound. Every
+representation of an attacker-shaped record that can exist at the same time as
+the queued entry is charged to it:
+
+| Layer | Owner | Charged as | Released when |
+| --- | --- | --- | --- |
+| Serialized queued entry | the sink's admission path | `max_entry_bytes` lease, shrunk to the measured size | the entry is delivered, dropped, or cancelled |
+| Contiguous batch payload for `http_logging` / `tcp_logging` / `udp_logging` / `statsd_logging` / `ws_logging` | the delivery worker | the second of the two retained copies each entry's lease already charges | the payload and its retries finish |
+| librdkafka's own copy of a `kafka_logging` record | librdkafka, until delivery resolves | the record's lease is **transferred into the librdkafka delivery opaque** rather than released at handoff | the delivery callback fires — terminal delivery, terminal failure, or purge-on-destroy — or an immediate `send` rejection hands the opaque back |
+| `loki_logging` batch JSON body, and the gzip output when compression is enabled | the delivery worker | separate ceiling reservations taken *before* the body is written or compressed, sized from a conservative escaping/compression bound | the body and its retries finish |
+| Trace exporter batch `Value` tree and serialized request body | the exporter flush loop | separate ceiling reservations taken before the tree is built and before the body is serialized | the tree is dropped right after serialization; the body when its retries finish |
+| `api_chargeback_sink` JSONEachRow insert body (live batches and spool replay chunks) | the delivery / replay worker | a ceiling reservation taken before serialization | the request finishes |
+
+Two consequences are worth calling out:
+
+- **Batch materialization is charged to the process ceiling only**, never a
+  second time to the per-instance `buffer_max_bytes` budget. That budget is
+  already committed to the queued entries, so charging it again would refuse
+  every batch a full queue produces.
+- **A refused batch representation is not materialized.** `loki_logging` and
+  `api_chargeback_sink` drop the batch with their existing loss accounting; the
+  trace exporters instead halve the slice and retry, so a large `batch_size`
+  loses spans only when even a single span's representation cannot be reserved.
+  If you see sustained `ferrum_observability_process_ceiling_rejections_total`
+  growth alongside export loss warnings, raise
+  `FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` or lower the exporter `batch_size`.
+
+Retries never deep-copy a payload: each materialized body is an immutable
+refcounted buffer, and an attempt takes a handle rather than re-serializing.
+
 Telemetry uses fixed labels only — no attacker-controlled label values:
 
 - `ferrum_observability_retained_bytes` — current process-wide retention

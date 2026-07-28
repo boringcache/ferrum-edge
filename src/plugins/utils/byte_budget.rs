@@ -9,6 +9,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use bytes::Bytes;
 use serde_json::Value;
 use tracing::warn;
 
@@ -283,6 +284,13 @@ impl ByteBudget {
         self.used_bytes.load(Ordering::Acquire)
     }
 
+    /// Ceiling this budget reserves against. Batch materialization for the same
+    /// sink charges the same ceiling, so an end-to-end guarantee holds under a
+    /// test-owned ceiling exactly as it does under the process-global one.
+    pub fn ceiling(&self) -> &'static RetainedByteCeiling {
+        self.ceiling
+    }
+
     // Read by external unit tests; the binary target compiles this shared
     // module separately and cannot observe those callers.
     #[allow(dead_code)]
@@ -421,6 +429,199 @@ impl Write for BoundedJsonWriter {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded batch materialization.
+//
+// A queued entry's lease covers the entry itself. Delivery workers additionally
+// materialize a batch into a contiguous wire payload — and, for some sinks, an
+// intermediate `serde_json::Value` tree and/or a compressed buffer — all of
+// which coexist with the still-charged queue. Those copies are attacker-shaped,
+// so they are reserved against the process ceiling *before* anything is cloned,
+// serialized, or compressed, and held until the payload and every retry that
+// reuses it are gone.
+//
+// The materialization charge goes to the process ceiling only, never to the
+// per-instance budget: that budget is already committed to the queued entries,
+// so charging it a second time would refuse every batch a full queue produces.
+// ---------------------------------------------------------------------------
+
+/// Worst-case bytes one raw string byte occupies once serialized as a JSON
+/// string value: `serde_json` escapes a control byte as `\u00XX`.
+pub const JSON_STRING_WORST_CASE_EXPANSION: usize = 6;
+
+/// Worst-case expansion for text that is *already* valid JSON being re-embedded
+/// as a JSON string value. Such text carries no raw control bytes (the inner
+/// serializer already escaped them), so only `"` and `\` can still expand, and
+/// each expands to exactly two bytes.
+pub const JSON_REEMBEDDED_WORST_CASE_EXPANSION: usize = 2;
+
+/// Initial capacity for a bounded payload buffer. Growth stays geometric but is
+/// capped at the reserved bound so the reservation covers the real allocation.
+const BOUNDED_PAYLOAD_INITIAL_CAPACITY: usize = 8_192;
+
+/// Why a bounded batch payload could not be materialized.
+///
+/// Every variant maps to a fixed label, so drop diagnostics and metrics never
+/// carry payload content or a serializer message built from one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadMaterializationError {
+    /// Computing the reserved upper bound overflowed `usize`.
+    BoundOverflowed,
+    /// The retained-byte ceiling refused the reserved upper bound.
+    CeilingExhausted,
+    /// Writing produced more bytes than the reserved upper bound allowed.
+    BoundExceeded,
+    /// The serializer or compressor itself failed.
+    WriteFailed,
+}
+
+impl PayloadMaterializationError {
+    /// Fixed label for metrics and redacted diagnostics.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::BoundOverflowed => "batch payload byte bound overflowed",
+            Self::CeilingExhausted => "process-wide observability retained-byte ceiling exhausted",
+            Self::BoundExceeded => "batch payload exceeded its reserved byte bound",
+            Self::WriteFailed => "batch payload serialization failed",
+        }
+    }
+}
+
+impl std::fmt::Display for PayloadMaterializationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.reason())
+    }
+}
+
+/// Byte sink for a bounded batch payload.
+///
+/// Fails closed once `max_bytes` would be exceeded and never grows its
+/// allocation past `max_bytes`, so the reservation taken for `max_bytes` covers
+/// the buffer's real allocation for the writer's whole life.
+#[derive(Debug)]
+pub struct BoundedPayloadWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedPayloadWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(BOUNDED_PAYLOAD_INITIAL_CAPACITY)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+
+    /// Bytes written so far.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Reserved upper bound this writer fails closed at.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+impl Write for BoundedPayloadWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "bounded observability batch payload exceeded its reserved byte bound",
+            ));
+        }
+        if self.bytes.capacity() - self.bytes.len() < buf.len() {
+            // `buf` fits inside `max_bytes` (checked above), so the target is
+            // always at least `len + buf.len()` and the subtraction cannot wrap.
+            let target = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(self.bytes.len().saturating_add(buf.len()))
+                .min(self.max_bytes);
+            self.bytes.reserve_exact(target - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An owned, immutable delivery payload whose bytes stay charged to a
+/// [`RetainedByteCeiling`] for the payload's entire lifetime.
+///
+/// Retries clone [`ReservedPayload::bytes`], which is a refcount bump, so N
+/// attempts never re-serialize or deep-copy an attacker-shaped batch.
+#[derive(Debug)]
+pub struct ReservedPayload {
+    bytes: Bytes,
+    /// Released on drop — that is, once the payload and every retry handle
+    /// derived from it are gone, on success, error, and cancellation alike.
+    _reservation: ProcessByteReservation,
+}
+
+impl ReservedPayload {
+    /// Refcounted handle for one delivery attempt. No payload bytes are copied.
+    pub fn bytes(&self) -> Bytes {
+        self.bytes.clone()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Reserve `bound` bytes against `ceiling` **before** anything is written, run
+/// `write` into a writer that fails closed at `bound`, and hand back an owned
+/// payload that keeps holding the reservation.
+///
+/// The reservation is deliberately not shrunk to the produced length: the buffer
+/// handed to `Bytes` still owns its full allocation, so holding the conservative
+/// bound for the payload's short delivery lifetime can never under-charge the
+/// ceiling. Every failure path drops the reservation exactly once.
+pub fn materialize_reserved_payload<F>(
+    ceiling: &'static RetainedByteCeiling,
+    bound: usize,
+    write: F,
+) -> Result<ReservedPayload, PayloadMaterializationError>
+where
+    F: FnOnce(&mut BoundedPayloadWriter) -> Result<(), String>,
+{
+    let reservation = ceiling
+        .try_acquire(bound)
+        .ok_or(PayloadMaterializationError::CeilingExhausted)?;
+    let mut writer = BoundedPayloadWriter::new(bound);
+    let outcome = write(&mut writer);
+    if writer.limit_exceeded {
+        return Err(PayloadMaterializationError::BoundExceeded);
+    }
+    if outcome.is_err() {
+        return Err(PayloadMaterializationError::WriteFailed);
+    }
+    Ok(ReservedPayload {
+        bytes: Bytes::from(writer.bytes),
+        _reservation: reservation,
+    })
 }
 
 /// Admitted `max_entry_bytes` / `buffer_max_bytes` pair.

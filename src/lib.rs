@@ -1226,6 +1226,84 @@ pub mod _test_support {
         crate::plugins::kafka_logging::probe_byte_budget_before_serialize_for_test(oversized).await
     }
 
+    /// Deterministic probe: the retained-byte lease must be transferred into
+    /// librdkafka's delivery-opaque state, so it is still held while librdkafka
+    /// retains its copy of a record it cannot deliver, and released exactly once
+    /// when producer destruction purges the queue.
+    ///
+    /// Returns `(instance_used_after_send, ceiling_used_after_send,
+    /// instance_used_after_destroy, ceiling_used_after_destroy)`.
+    pub fn kafka_logging_probe_downstream_lease_ownership_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        record_count: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        crate::plugins::kafka_logging::probe_downstream_lease_ownership_for_test(
+            ceiling,
+            record_count,
+        )
+    }
+
+    // ── plugins/loki_logging ────────────────────────────────────────────────
+    /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
+    /// wire body must be reserved against the retained-byte ceiling before it is
+    /// materialized, stay charged alongside the queued entries, and release on
+    /// drop. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections, content_encoding)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        entry_count: usize,
+        line_bytes: usize,
+        gzip: bool,
+    ) -> Option<(usize, usize, usize, usize, bool, u64, Option<&'static str>)> {
+        crate::plugins::loki_logging::probe_loki_batch_materialization_for_test(
+            ceiling,
+            entry_count,
+            line_bytes,
+            gzip,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+                probe.content_encoding,
+            )
+        })
+    }
+
+    // ── plugins/otel_tracing ────────────────────────────────────────────────
+    /// Deterministic probe: a trace exporter batch's intermediate `Value` tree
+    /// and serialized request body must be reserved against the retained-byte
+    /// ceiling before they are materialized, and released on every terminal
+    /// path. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections)`.
+    #[allow(clippy::type_complexity)]
+    pub fn otel_tracing_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        span_count: usize,
+        attribute_bytes: usize,
+    ) -> Option<(usize, usize, usize, usize, bool, u64)> {
+        crate::plugins::otel_tracing::probe_trace_batch_materialization_for_test(
+            ceiling,
+            span_count,
+            attribute_bytes,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+            )
+        })
+    }
+
     // ── plugins/soap_ws_security ────────────────────────────────────────────
     pub fn soap_count_wsu_id_occurrences_for_test(xml: &str, id: &str) -> Result<usize, String> {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)

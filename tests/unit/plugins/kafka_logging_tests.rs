@@ -2,6 +2,7 @@
 
 use ferrum_edge::_test_support::{
     kafka_logging_probe_byte_budget_before_serialize_for_test,
+    kafka_logging_probe_downstream_lease_ownership_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
     kafka_logging_serialize_http_with_config_for_test,
     kafka_logging_serialize_stream_with_config_for_test,
@@ -11,6 +12,7 @@ use ferrum_edge::plugins::kafka_logging::{
     DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
     HARD_MAX_ENTRY_BYTES, HARD_MAX_FLUSH_TIMEOUT_SECONDS, KafkaLogging,
 };
+use ferrum_edge::plugins::utils::byte_budget::RetainedByteCeiling;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{ALL_PROTOCOLS, Plugin, PluginFailurePolicy, plugin_failure_policy};
 use serde_json::json;
@@ -1427,4 +1429,79 @@ async fn kafka_logging_warmup_hostnames_use_the_librdkafka_grammar() {
         hostnames,
         vec!["broker-one".to_string(), "broker-two".to_string()]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Downstream (librdkafka) retained-byte ownership — GHSA-83h5-52mw-f33p.
+//
+// `ThreadedProducer::send` success only means librdkafka copied the record into
+// its own queue. Releasing the lease at that handoff would leave a stalled
+// broker's pinned queue outside both the per-instance budget and the process
+// ceiling, and multiple instances would multiply it.
+// ---------------------------------------------------------------------------
+
+fn leaked_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
+    let ceiling: &'static RetainedByteCeiling =
+        Box::leak(Box::new(RetainedByteCeiling::new(max_bytes)));
+    ceiling.set_max_unclamped_for_test(max_bytes);
+    ceiling
+}
+
+#[test]
+fn kafka_lease_is_held_while_librdkafka_retains_the_record_and_released_on_destroy() {
+    let ceiling = leaked_test_ceiling(8 * 1024 * 1024);
+    let Some((instance_after_send, ceiling_after_send, instance_after_destroy, ceiling_after_destroy)) =
+        kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 4)
+    else {
+        // A librdkafka client could not be created in this environment; the
+        // ownership contract cannot be observed, so do not assert on it.
+        return;
+    };
+
+    assert!(
+        instance_after_send > 0,
+        "the per-instance budget must still charge the record librdkafka retains"
+    );
+    assert!(
+        ceiling_after_send > 0,
+        "the process ceiling must still charge the record librdkafka retains"
+    );
+    assert_eq!(
+        instance_after_send, ceiling_after_send,
+        "the per-instance and ceiling charges stay in lockstep"
+    );
+    assert_eq!(
+        instance_after_destroy, 0,
+        "producer destruction purges the queue and releases every lease exactly once"
+    );
+    assert_eq!(
+        ceiling_after_destroy, 0,
+        "no ceiling reservation leaks or underflows across delivery callbacks"
+    );
+}
+
+#[test]
+fn kafka_downstream_leases_of_multiple_instances_share_one_ceiling() {
+    let ceiling = leaked_test_ceiling(8 * 1024 * 1024);
+    let Some((_, first_ceiling_used, _, first_after_destroy)) =
+        kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2)
+    else {
+        return;
+    };
+    assert!(first_ceiling_used > 0);
+    assert_eq!(first_after_destroy, 0);
+
+    // A second instance charges the same aggregate counter rather than getting a
+    // private allowance.
+    let Some((_, second_ceiling_used, _, second_after_destroy)) =
+        kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2)
+    else {
+        return;
+    };
+    assert_eq!(
+        second_ceiling_used, first_ceiling_used,
+        "both instances reserve against the same ceiling"
+    );
+    assert_eq!(second_after_destroy, 0);
+    assert_eq!(ceiling.used(), 0);
 }

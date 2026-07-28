@@ -34,7 +34,10 @@ use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::mesh::mesh_trace_attributes;
 use super::utils::PluginHttpClient;
-use super::utils::byte_budget::ProcessByteReservation;
+use super::utils::byte_budget::{
+    JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
+    ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
+};
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
     TransactionSummary, WsDisconnectContext,
@@ -1046,9 +1049,20 @@ pub(crate) struct TraceExporterOptions {
     retry_delay: Duration,
     service_name: String,
     deployment_environment: Option<String>,
+    /// Retained-byte ceiling every exporter built from these options charges.
+    ceiling: &'static RetainedByteCeiling,
 }
 
 impl TraceExporterOptions {
+    /// Rebind these options to an explicit ceiling. External tests use this so
+    /// batch-materialization assertions run against their own leaked ceiling.
+    // The binary target always keeps the process ceiling from `from_config`.
+    #[allow(dead_code)]
+    pub(crate) fn with_ceiling(mut self, ceiling: &'static RetainedByteCeiling) -> Self {
+        self.ceiling = ceiling;
+        self
+    }
+
     pub(crate) fn from_config(
         config: &Value,
         service_name: String,
@@ -1100,6 +1114,7 @@ impl TraceExporterOptions {
             )?),
             service_name,
             deployment_environment: optional_string_config(config, "deployment_environment")?,
+            ceiling: process_ceiling(),
         })
     }
 }
@@ -1125,6 +1140,9 @@ struct TraceHttpExporterConfig {
     service_name: String,
     deployment_environment: Option<String>,
     payload_kind: TracePayloadKind,
+    /// Ceiling the queued spans *and* every batch representation built from them
+    /// are charged to. Always the process ceiling in production.
+    ceiling: &'static RetainedByteCeiling,
 }
 
 struct QueuedSpan {
@@ -1147,6 +1165,7 @@ struct BufferedTraceExporter {
     started: AtomicBool,
     worker: OnceLock<Arc<DeliveryWorkerControl>>,
     deferred_start: Mutex<Option<(mpsc::Receiver<QueuedSpan>, TraceHttpExporterConfig)>>,
+    ceiling: &'static RetainedByteCeiling,
 }
 
 impl BufferedTraceExporter {
@@ -1159,6 +1178,7 @@ impl BufferedTraceExporter {
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
         let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let ceiling = cfg.ceiling;
         Ok(Self {
             provider_name,
             hostname,
@@ -1169,6 +1189,7 @@ impl BufferedTraceExporter {
             started: AtomicBool::new(false),
             worker: OnceLock::new(),
             deferred_start: Mutex::new(Some((receiver, cfg))),
+            ceiling,
         })
     }
 
@@ -1236,10 +1257,10 @@ impl BufferedTraceExporter {
     /// keeps release tied to the span's actual retention lifetime; a failed
     /// per-instance reservation drops it here so nothing leaks.
     fn try_reserve_queued_bytes(&self, bytes: usize) -> Result<ProcessByteReservation, String> {
-        let process = ProcessByteReservation::try_acquire(bytes).ok_or_else(|| {
+        let process = self.ceiling.try_acquire(bytes).ok_or_else(|| {
             format!(
                 "process-wide observability retained-byte ceiling exceeded (+{bytes} > {})",
-                crate::plugins::utils::byte_budget::process_max_retained_bytes()
+                self.ceiling.max()
             )
         })?;
         self.queued_bytes
@@ -1476,6 +1497,7 @@ impl TraceHttpExporterConfig {
             service_name: options.service_name.clone(),
             deployment_environment: options.deployment_environment.clone(),
             payload_kind,
+            ceiling: options.ceiling,
         })
     }
 }
@@ -1530,6 +1552,145 @@ pub(crate) fn trace_exporters_from_providers(
                 as Arc<dyn TraceExporter>),
         })
         .collect()
+}
+
+/// Observations from [`probe_trace_batch_materialization_for_test`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TraceMaterializationProbe {
+    /// Ceiling bytes held by the queued spans alone.
+    pub(crate) queued_bytes: usize,
+    /// Ceiling bytes held while the queued spans and the materialized body
+    /// coexist. Must exceed `queued_bytes` — that difference is the batch
+    /// representation the ceiling previously never saw.
+    pub(crate) peak_bytes: usize,
+    /// Ceiling bytes after the body (and every retry handle) is dropped.
+    pub(crate) after_body_dropped_bytes: usize,
+    /// Ceiling bytes after the queued spans release too. Must be zero.
+    pub(crate) after_release_bytes: usize,
+    /// `true` when the ceiling refused the batch representation.
+    pub(crate) refused: bool,
+    pub(crate) rejections: u64,
+}
+
+/// Deterministic batch-materialization probe for external unit tests.
+///
+/// Charges `span_count` synthetic spans to `ceiling` exactly as the exporter
+/// queue does, then materializes one export body while those reservations are
+/// still held, so an external test can pin that the body is charged, released on
+/// drop, and refused rather than materialized when the ceiling is exhausted.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_trace_batch_materialization_for_test(
+    ceiling: &'static RetainedByteCeiling,
+    span_count: usize,
+    attribute_bytes: usize,
+) -> Option<TraceMaterializationProbe> {
+    let cfg = TraceHttpExporterConfig {
+        provider_name: "OTLP",
+        endpoint: "http://127.0.0.1:4318/v1/traces".to_string(),
+        endpoint_for_logs: "http://127.0.0.1:4318/v1/traces".to_string(),
+        authorization: None,
+        custom_headers: Vec::new(),
+        http_client: PluginHttpClient::default(),
+        batch_size: span_count.max(1),
+        flush_interval: Duration::from_secs(3600),
+        max_retries: 0,
+        retry_delay: Duration::from_millis(1),
+        service_name: "ferrum-edge".to_string(),
+        deployment_environment: None,
+        payload_kind: TracePayloadKind::Otlp,
+        ceiling,
+    };
+
+    let mut spans = Vec::with_capacity(span_count);
+    let mut reservations = Vec::with_capacity(span_count);
+    for index in 0..span_count {
+        let span = probe_span_for_test(index, attribute_bytes);
+        reservations.push(ceiling.try_acquire(span.approx_queued_bytes())?);
+        spans.push(span);
+    }
+    let queued_bytes = ceiling.used();
+
+    match materialize_trace_body(&cfg, &spans) {
+        Ok(body) => {
+            let peak_bytes = ceiling.used();
+            drop(body);
+            let after_body_dropped_bytes = ceiling.used();
+            drop(reservations);
+            Some(TraceMaterializationProbe {
+                queued_bytes,
+                peak_bytes,
+                after_body_dropped_bytes,
+                after_release_bytes: ceiling.used(),
+                refused: false,
+                rejections: ceiling.rejections(),
+            })
+        }
+        Err(error) => {
+            let peak_bytes = ceiling.used();
+            drop(reservations);
+            Some(TraceMaterializationProbe {
+                queued_bytes,
+                peak_bytes,
+                after_body_dropped_bytes: peak_bytes,
+                after_release_bytes: ceiling.used(),
+                refused: matches!(error, PayloadMaterializationError::CeilingExhausted),
+                rejections: ceiling.rejections(),
+            })
+        }
+    }
+}
+
+#[allow(dead_code)] // reached only from the probe above
+fn probe_span_for_test(index: usize, attribute_bytes: usize) -> SpanData {
+    SpanData {
+        trace_id: format!("{index:032x}"),
+        span_id: format!("{index:016x}"),
+        parent_span_id: String::new(),
+        service_name: "ferrum-edge".to_string(),
+        span_name: "GET probe".to_string(),
+        span_kind: 2,
+        span_kind_typed: SpanKind::Server,
+        http_method: "GET".to_string(),
+        // Attacker-shaped field: escaped six-fold by the JSON body bound.
+        http_url: "\"".repeat(attribute_bytes),
+        http_status_code: Some(200),
+        grpc_status: None,
+        client_ip: "127.0.0.1".to_string(),
+        duration_ms: 10.0,
+        gateway_processing_ms: 1.0,
+        backend_ttfb_ms: 2.0,
+        backend_ms: 3.0,
+        plugin_execution_ms: 1.0,
+        gateway_overhead_ms: 1.0,
+        consumer: None,
+        timestamp_received: "2025-01-01T00:00:00Z".to_string(),
+        user_agent: None,
+        proxy_id: Some("proxy-probe".to_string()),
+        matched_route: Some("probe".to_string()),
+        namespace: Some("ferrum".to_string()),
+        server_address: Some("edge.example".to_string()),
+        server_port: Some(443),
+        backend_target: None,
+        backend_host: None,
+        backend_port: None,
+        backend_resolved_ip: None,
+        error_class: None,
+        body_error_class: None,
+        body_completed: true,
+        response_streamed: false,
+        client_disconnected: false,
+        otlp_error: false,
+        mesh_attributes: Vec::new(),
+        stream_protocol: None,
+        stream_listen_port: None,
+        stream_bytes_sent: None,
+        stream_bytes_received: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        stream_io_side: None,
+        ws_frames_client_to_backend: None,
+        ws_frames_backend_to_client: None,
+    }
 }
 
 pub(crate) fn validate_trace_provider_endpoints(
@@ -1670,9 +1831,63 @@ fn decrement_queued_spans(queued_spans: &AtomicUsize, count: usize) {
     });
 }
 
-async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
-    let total_attempts = cfg.max_retries + 1;
-    let entry_count = batch.len();
+/// Heap a `serde_json::Value` tree costs for one exported span on top of the
+/// span's own retained strings: a map or array node plus an owned key `String`
+/// for every fixed attribute, event, and envelope field the exporter emits.
+const TRACE_SPAN_VALUE_OVERHEAD_BYTES: usize = 16_384;
+/// Serialized bytes one span's fixed JSON structure costs: attribute key names,
+/// numeric fields, status and event objects, and the per-attribute wrapper around
+/// each operator-named mesh attribute.
+const TRACE_SPAN_JSON_OVERHEAD_BYTES: usize = 8_192;
+/// Fixed resource/scope envelope emitted once per request body.
+const TRACE_PAYLOAD_ENVELOPE_BYTES: usize = 4_096;
+
+/// Conservative upper bound on the intermediate `serde_json::Value` tree for
+/// `batch`. Every retained span string is cloned into the tree exactly once.
+fn trace_value_byte_bound(batch: &[SpanData]) -> Option<usize> {
+    let mut total = TRACE_PAYLOAD_ENVELOPE_BYTES;
+    for span in batch {
+        total = total
+            .checked_add(span.approx_queued_bytes())?
+            .checked_add(TRACE_SPAN_VALUE_OVERHEAD_BYTES)?;
+    }
+    Some(total)
+}
+
+/// Conservative upper bound on the serialized request body for `batch`. Span
+/// strings are raw, so JSON escaping can expand each byte six-fold.
+fn trace_body_byte_bound(batch: &[SpanData]) -> Option<usize> {
+    let mut total = TRACE_PAYLOAD_ENVELOPE_BYTES;
+    for span in batch {
+        total = total
+            .checked_add(
+                span.approx_queued_bytes()
+                    .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+            )?
+            .checked_add(TRACE_SPAN_JSON_OVERHEAD_BYTES)?;
+    }
+    Some(total)
+}
+
+/// Reserve, build, and serialize one slice's request body under `cfg.ceiling`.
+///
+/// Both attacker-shaped copies that coexist with the still-charged queued spans —
+/// the intermediate `Value` tree and the serialized body — are reserved *before*
+/// they are materialized. The tree and its reservation die before the body is
+/// delivered, so the retry loop holds exactly one bounded, immutable payload and
+/// never re-serializes.
+fn materialize_trace_body(
+    cfg: &TraceHttpExporterConfig,
+    batch: &[SpanData],
+) -> Result<ReservedPayload, PayloadMaterializationError> {
+    let value_bound =
+        trace_value_byte_bound(batch).ok_or(PayloadMaterializationError::BoundOverflowed)?;
+    let body_bound =
+        trace_body_byte_bound(batch).ok_or(PayloadMaterializationError::BoundOverflowed)?;
+    let value_reservation = cfg
+        .ceiling
+        .try_acquire(value_bound)
+        .ok_or(PayloadMaterializationError::CeilingExhausted)?;
     let payload = match cfg.payload_kind {
         TracePayloadKind::Otlp => build_otlp_payload(
             &cfg.service_name,
@@ -1682,15 +1897,65 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
         TracePayloadKind::Zipkin => build_zipkin_payload(&cfg.service_name, batch),
         TracePayloadKind::Datadog => build_datadog_payload(&cfg.service_name, batch),
     };
+    let body = materialize_reserved_payload(cfg.ceiling, body_bound, |writer| {
+        serde_json::to_writer(writer, &payload).map_err(|error| error.to_string())
+    });
+    drop(payload);
+    drop(value_reservation);
+    body
+}
+
+async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
+    // Materialize and deliver in slices small enough that each slice's reserved
+    // batch representation fits under the ceiling. Trace export has no
+    // cross-span batch semantics, so halving a refused slice preserves delivery
+    // instead of dropping every span of a large `batch_size` outright.
+    let mut start = 0usize;
+    while start < batch.len() {
+        let mut end = batch.len();
+        loop {
+            let slice = &batch[start..end];
+            match materialize_trace_body(cfg, slice) {
+                Ok(body) => {
+                    deliver_trace_payload(cfg, body, slice.len()).await;
+                    start = end;
+                    break;
+                }
+                Err(PayloadMaterializationError::CeilingExhausted) if end - start > 1 => {
+                    end = start + (end - start) / 2;
+                }
+                Err(error) => {
+                    warn!(
+                        "{} export batch discarded before materialization ({} spans lost): {}",
+                        cfg.provider_name,
+                        end - start,
+                        error.reason(),
+                    );
+                    start = end;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn deliver_trace_payload(
+    cfg: &TraceHttpExporterConfig,
+    body: ReservedPayload,
+    entry_count: usize,
+) {
+    let total_attempts = cfg.max_retries + 1;
 
     for attempt in 1..=total_attempts {
         let request = match cfg.payload_kind {
             TracePayloadKind::Datadog => cfg.http_client.get().put(&cfg.endpoint),
             _ => cfg.http_client.get().post(&cfg.endpoint),
         };
+        // One bounded serialization, reused across attempts: `bytes()` is a
+        // refcount bump on the reserved payload, not another copy.
         let mut req = request
             .header("Content-Type", "application/json")
-            .json(&payload);
+            .body(body.bytes());
 
         if let Some(auth) = &cfg.authorization {
             req = req.header("Authorization", auth);
@@ -3247,6 +3512,7 @@ mod tests {
             service_name: "ferrum-edge".to_string(),
             deployment_environment: None,
             payload_kind: TracePayloadKind::Otlp,
+            ceiling: process_ceiling(),
         }
     }
 

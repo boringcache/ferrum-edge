@@ -33,7 +33,11 @@ use tracing::warn;
 
 use crate::config::types::MAX_ID_LENGTH;
 
-use super::utils::byte_budget::ProcessByteReservation;
+use super::utils::byte_budget::{
+    BoundedPayloadWriter, JSON_REEMBEDDED_WORST_CASE_EXPANSION, JSON_STRING_WORST_CASE_EXPANSION,
+    PayloadMaterializationError, ProcessByteReservation, ReservedPayload, RetainedByteCeiling,
+    materialize_reserved_payload, process_ceiling,
+};
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
     BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome,
@@ -116,6 +120,9 @@ struct LokiFlushConfig {
     gzip: bool,
     retry: RetryPolicy,
     last_timestamp_ns: Arc<AtomicU64>,
+    /// Ceiling the batch's JSON and gzip representations are charged to. Always
+    /// the process ceiling in production; a test-owned ceiling under test.
+    ceiling: &'static RetainedByteCeiling,
 }
 
 struct LokiByteLease {
@@ -136,21 +143,27 @@ struct LokiByteBudget {
     used_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     dropped_count: AtomicU64,
+    ceiling: &'static RetainedByteCeiling,
 }
 
 impl LokiByteBudget {
     fn new(max_bytes: usize) -> Self {
+        Self::with_ceiling(max_bytes, process_ceiling())
+    }
+
+    fn with_ceiling(max_bytes: usize, ceiling: &'static RetainedByteCeiling) -> Self {
         Self {
             used_bytes: Arc::new(AtomicUsize::new(0)),
             max_bytes,
             dropped_count: AtomicU64::new(0),
+            ceiling,
         }
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<Arc<LokiByteLease>> {
         // Process ceiling first: a failed aggregate reservation must never
         // leave per-instance bytes held.
-        let Some(process) = ProcessByteReservation::try_acquire(bytes) else {
+        let Some(process) = self.ceiling.try_acquire(bytes) else {
             self.record_drop("process-wide retained-byte ceiling exhausted");
             return None;
         };
@@ -290,6 +303,21 @@ pub struct LokiLogging {
 
 impl LokiLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_ceiling(config, http_client, process_ceiling())
+    }
+
+    /// Construct an instance whose queue *and* batch materialization charge
+    /// `ceiling`. External tests pass their own leaked ceiling so end-to-end
+    /// reservation-ownership assertions stay exact while other tests in the same
+    /// binary reserve against the process-global counter.
+    // The binary target only calls `new`; external tests reach this through
+    // `_test_support`.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_ceiling(
+        config: &Value,
+        http_client: PluginHttpClient,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> Result<Self, String> {
         let Some(config_object) = config.as_object() else {
             return Err("loki_logging: config must be an object".to_string());
         };
@@ -388,6 +416,7 @@ impl LokiLogging {
             gzip,
             retry: batch_config.retry,
             last_timestamp_ns: Arc::new(AtomicU64::new(0)),
+            ceiling,
         };
         // Loki retries inside `send_batch` so we reuse the same serialized +
         // gzipped body bytes across attempts. The deferred worker therefore
@@ -404,7 +433,7 @@ impl LokiLogging {
             endpoint_hostname,
             label_config,
             schema,
-            byte_budget: Arc::new(LokiByteBudget::new(buffer_max_bytes)),
+            byte_budget: Arc::new(LokiByteBudget::with_ceiling(buffer_max_bytes, ceiling)),
             max_entry_bytes,
         })
     }
@@ -767,6 +796,101 @@ fn validate_minimum_entry_budget(
     Ok(())
 }
 
+/// Observations from [`probe_loki_batch_materialization_for_test`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LokiMaterializationProbe {
+    /// Ceiling bytes held by the queued entries alone.
+    pub(crate) queued_bytes: usize,
+    /// Ceiling bytes held while the queued entries and the wire body coexist.
+    /// Must exceed `queued_bytes`: that difference is the batch representation
+    /// the ceiling previously never saw.
+    pub(crate) peak_bytes: usize,
+    /// Ceiling bytes after the body (and every retry handle) drops.
+    pub(crate) after_body_dropped_bytes: usize,
+    /// Ceiling bytes once the queued entries release too. Must be zero.
+    pub(crate) after_release_bytes: usize,
+    /// `true` when the ceiling refused the batch representation.
+    pub(crate) refused: bool,
+    pub(crate) rejections: u64,
+    /// `Content-Encoding` chosen for the materialized body.
+    pub(crate) content_encoding: Option<&'static str>,
+}
+
+/// Deterministic batch-materialization probe for external unit tests.
+///
+/// Queues `entry_count` entries of `line_bytes` each through a real
+/// [`LokiByteBudget`] bound to `ceiling`, then materializes the wire body while
+/// those leases are still held.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_loki_batch_materialization_for_test(
+    ceiling: &'static RetainedByteCeiling,
+    entry_count: usize,
+    line_bytes: usize,
+    gzip: bool,
+) -> Option<LokiMaterializationProbe> {
+    let budget = LokiByteBudget::with_ceiling(LOKI_MAX_BUFFER_MAX_BYTES, ceiling);
+    let mut labels = BTreeMap::new();
+    labels.insert("service".to_string(), "ferrum-edge".to_string());
+    let labels = Arc::new(labels);
+    // A hostile line: already-JSON text made entirely of quotes, so every byte
+    // doubles when it is re-embedded as a JSON string value.
+    let line: Arc<str> = Arc::from("\"".repeat(line_bytes));
+
+    let mut batch = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let retained = retained_entry_bytes(line.len(), labels.as_ref())?;
+        batch.push(LokiEntry {
+            labels: Arc::clone(&labels),
+            line: Arc::clone(&line),
+            _lease: budget.try_acquire(retained)?,
+        });
+    }
+    let queued_bytes = ceiling.used();
+
+    let cfg = LokiFlushConfig {
+        endpoint_url: "http://127.0.0.1:3100/loki/api/v1/push".to_string(),
+        endpoint_url_for_logs: "http://127.0.0.1:3100/loki/api/v1/push".to_string(),
+        authorization_header: None,
+        custom_headers: Vec::new(),
+        http_client: PluginHttpClient::default(),
+        gzip,
+        retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+        last_timestamp_ns: Arc::new(AtomicU64::new(0)),
+        ceiling,
+    };
+
+    match build_loki_body(&cfg, &batch) {
+        Ok((payload, content_encoding)) => {
+            let peak_bytes = ceiling.used();
+            drop(payload);
+            let after_body_dropped_bytes = ceiling.used();
+            drop(batch);
+            Some(LokiMaterializationProbe {
+                queued_bytes,
+                peak_bytes,
+                after_body_dropped_bytes,
+                after_release_bytes: ceiling.used(),
+                refused: false,
+                rejections: ceiling.rejections(),
+                content_encoding,
+            })
+        }
+        Err(_) => {
+            let peak_bytes = ceiling.used();
+            drop(batch);
+            Some(LokiMaterializationProbe {
+                queued_bytes,
+                peak_bytes,
+                after_body_dropped_bytes: peak_bytes,
+                after_release_bytes: ceiling.used(),
+                refused: true,
+                rejections: ceiling.rejections(),
+                content_encoding: None,
+            })
+        }
+    }
+}
+
 /// Map an HTTP status code to its class string (low cardinality).
 fn status_class(status: u16) -> String {
     match status {
@@ -836,33 +960,112 @@ impl Plugin for LokiLogging {
     }
 }
 
-/// Group entries by label set and build the Loki push payload.
-fn build_loki_payload(batch: &[LokiEntry], last_timestamp_ns: &AtomicU64) -> Result<Value, String> {
-    let mut streams: HashMap<BTreeMap<String, String>, Vec<(String, String)>> = HashMap::new();
+/// Fixed `{"streams":[]}` envelope allowance.
+const LOKI_PAYLOAD_ENVELOPE_BYTES: usize = 32;
+/// Per-stream-group framing allowance: `,{"stream":`, `,"values":[`, `]}`.
+const LOKI_STREAM_FRAMING_BYTES: usize = 32;
+/// Per-entry framing allowance: `,["<20-digit ns timestamp>",` plus `]`.
+const LOKI_ENTRY_FRAMING_BYTES: usize = 32;
+/// Worst-case gzip expansion: DEFLATE falls back to stored blocks, costing five
+/// bytes of block header per 65535 input bytes, plus the fixed gzip header and
+/// trailer.
+const LOKI_GZIP_STORED_BLOCK_SPAN: usize = 65_535;
+const LOKI_GZIP_FIXED_OVERHEAD_BYTES: usize = 64;
 
+/// Conservative upper bound on the serialized Loki push payload for `batch`.
+///
+/// Every log line is already valid JSON, so re-embedding it as a JSON string
+/// value can at most double it. Label keys and values are raw strings and get
+/// the full six-byte `\u00XX` worst case. Grouping writes each label set once per
+/// group, so charging every entry for its own labels is conservative.
+fn loki_payload_byte_bound(batch: &[LokiEntry]) -> Option<usize> {
+    let mut total = LOKI_PAYLOAD_ENVELOPE_BYTES;
     for entry in batch {
-        let stream = streams.entry(entry.labels.as_ref().clone()).or_default();
-        stream.push((
-            next_loki_timestamp_ns(last_timestamp_ns)?,
-            entry.line.to_string(),
-        ));
+        let mut entry_bound = entry
+            .line
+            .len()
+            .checked_mul(JSON_REEMBEDDED_WORST_CASE_EXPANSION)?;
+        for (key, value) in entry.labels.iter() {
+            entry_bound = entry_bound.checked_add(
+                key.len()
+                    .checked_add(value.len())?
+                    .checked_mul(JSON_STRING_WORST_CASE_EXPANSION)?,
+            )?;
+        }
+        total = total
+            .checked_add(entry_bound)?
+            .checked_add(LOKI_ENTRY_FRAMING_BYTES)?
+            .checked_add(LOKI_STREAM_FRAMING_BYTES)?;
+    }
+    Some(total)
+}
+
+fn loki_gzip_byte_bound(input_len: usize) -> Option<usize> {
+    input_len
+        .checked_add((input_len / LOKI_GZIP_STORED_BLOCK_SPAN).checked_mul(5)?)?
+        .checked_add(LOKI_GZIP_FIXED_OVERHEAD_BYTES)
+}
+
+fn write_loki_str<W: Write>(out: &mut W, text: &str) -> Result<(), String> {
+    out.write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write Loki payload: {error}"))
+}
+
+/// Group entries by label set and stream the Loki push payload straight into
+/// `out`.
+///
+/// There is deliberately no intermediate `serde_json::Value`: the label maps are
+/// borrowed from the queued entries (never cloned) and each log line is written
+/// once, so the only batch-sized representation that exists is the caller's
+/// reserved output buffer.
+fn write_loki_payload<W: Write>(
+    batch: &[LokiEntry],
+    last_timestamp_ns: &AtomicU64,
+    out: &mut W,
+) -> Result<(), String> {
+    let mut groups: Vec<(&BTreeMap<String, String>, Vec<usize>)> = Vec::new();
+    let mut group_of: HashMap<&BTreeMap<String, String>, usize> = HashMap::new();
+    for (index, entry) in batch.iter().enumerate() {
+        let labels: &BTreeMap<String, String> = entry.labels.as_ref();
+        match group_of.get(labels).copied() {
+            Some(group) => match groups.get_mut(group) {
+                Some((_, indexes)) => indexes.push(index),
+                None => return Err("Loki logging: label grouping index desynchronized".to_string()),
+            },
+            None => {
+                group_of.insert(labels, groups.len());
+                groups.push((labels, vec![index]));
+            }
+        }
     }
 
-    let streams_array: Vec<Value> = streams
-        .into_iter()
-        .map(|(labels, values)| {
-            let values_array: Vec<Value> = values
-                .into_iter()
-                .map(|(timestamp, line)| serde_json::json!([timestamp, line]))
-                .collect();
-            serde_json::json!({
-                "stream": labels,
-                "values": values_array,
-            })
-        })
-        .collect();
-
-    Ok(serde_json::json!({ "streams": streams_array }))
+    write_loki_str(&mut *out, "{\"streams\":[")?;
+    for (group_index, (labels, indexes)) in groups.iter().enumerate() {
+        if group_index > 0 {
+            write_loki_str(&mut *out, ",")?;
+        }
+        write_loki_str(&mut *out, "{\"stream\":")?;
+        serde_json::to_writer(&mut *out, labels)
+            .map_err(|error| format!("Loki logging: failed to serialize labels: {error}"))?;
+        write_loki_str(&mut *out, ",\"values\":[")?;
+        for (value_index, entry_index) in indexes.iter().enumerate() {
+            let Some(entry) = batch.get(*entry_index) else {
+                return Err("Loki logging: label grouping index desynchronized".to_string());
+            };
+            if value_index > 0 {
+                write_loki_str(&mut *out, ",")?;
+            }
+            write_loki_str(&mut *out, "[\"")?;
+            write_loki_str(&mut *out, &next_loki_timestamp_ns(last_timestamp_ns)?)?;
+            write_loki_str(&mut *out, "\",")?;
+            serde_json::to_writer(&mut *out, entry.line.as_ref())
+                .map_err(|error| format!("Loki logging: failed to serialize log line: {error}"))?;
+            write_loki_str(&mut *out, "]")?;
+        }
+        write_loki_str(&mut *out, "]}")?;
+    }
+    write_loki_str(&mut *out, "]}")?;
+    Ok(())
 }
 
 fn next_loki_timestamp_ns(last_timestamp_ns: &AtomicU64) -> Result<String, String> {
@@ -892,7 +1095,7 @@ fn next_loki_timestamp_ns(last_timestamp_ns: &AtomicU64) -> Result<String, Strin
 /// Send a batch of entries to Loki.
 async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-    let (body_bytes, content_encoding) = match build_loki_body(cfg, &batch) {
+    let (payload, content_encoding) = match build_loki_body(cfg, &batch) {
         Ok(body) => body,
         Err(error) => {
             warn!(
@@ -904,10 +1107,15 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
             return Ok(());
         }
     };
+    // The reserved payload is now the only representation delivery needs, so the
+    // queued entries release their leases here instead of at the end of the
+    // retry loop. Peak retention is the queue plus one bounded payload, never
+    // the queue plus a payload plus per-attempt copies.
+    drop(batch);
     let attempts = cfg.retry.max_attempts.max(1);
 
     for attempt in 1..=attempts {
-        match send_batch_once(cfg, body_bytes.clone(), content_encoding).await {
+        match send_batch_once(cfg, payload.bytes(), content_encoding).await {
             LokiAttemptOutcome::Delivered => return Ok(()),
             LokiAttemptOutcome::Terminal(error) => {
                 warn!(
@@ -944,28 +1152,54 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
     Ok(())
 }
 
+/// Materialize the batch's wire body under the process-wide retained-byte
+/// ceiling.
+///
+/// Both representations that can coexist with the still-charged queued entries —
+/// the serialized JSON buffer and, with gzip enabled, the compressed output — are
+/// reserved before a single byte is written and stay charged for as long as the
+/// returned payload (and every retry handle taken from it) lives. A refused
+/// reservation returns an error so the batch is dropped with loss accounting
+/// instead of being materialized outside the ceiling.
 fn build_loki_body(
     cfg: &LokiFlushConfig,
     batch: &[LokiEntry],
-) -> Result<(Bytes, Option<&'static str>), String> {
-    let payload = build_loki_payload(batch, &cfg.last_timestamp_ns)?;
+) -> Result<(ReservedPayload, Option<&'static str>), String> {
+    let bound = loki_payload_byte_bound(batch).ok_or_else(|| {
+        PayloadMaterializationError::BoundOverflowed
+            .reason()
+            .to_string()
+    })?;
+    let json = materialize_reserved_payload(cfg.ceiling, bound, |writer| {
+        write_loki_payload(batch, &cfg.last_timestamp_ns, writer)
+    })
+    .map_err(|error| error.reason().to_string())?;
 
-    if cfg.gzip {
-        match gzip_json(&payload) {
-            Ok(compressed) => Ok((Bytes::from(compressed), Some("gzip"))),
-            Err(error) => {
-                warn!("Loki logging: gzip compression failed, sending uncompressed: {error}");
-                Ok((Bytes::from(json_payload_bytes(&payload)?), None))
-            }
-        }
-    } else {
-        Ok((Bytes::from(json_payload_bytes(&payload)?), None))
+    if !cfg.gzip {
+        return Ok((json, None));
     }
-}
-
-fn json_payload_bytes(payload: &Value) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(payload)
-        .map_err(|error| format!("Loki logging: failed to serialize payload: {error}"))
+    let Some(gzip_bound) = loki_gzip_byte_bound(json.len()) else {
+        return Ok((json, None));
+    };
+    // The compressed buffer coexists with the JSON buffer until `json` is
+    // dropped below, so it gets its own reservation rather than reusing one.
+    // Bound the result to a `let` so the closure's borrow of `json` ends before
+    // the uncompressed fallback moves it.
+    let compressed =
+        materialize_reserved_payload(cfg.ceiling, gzip_bound, |writer| {
+            gzip_into(json.as_slice(), writer)
+        });
+    match compressed {
+        Ok(compressed) => Ok((compressed, Some("gzip"))),
+        Err(error) => {
+            warn!(
+                plugin = "loki_logging",
+                "Loki logging: gzip compression skipped, sending uncompressed: {}",
+                error.reason(),
+            );
+            Ok((json, None))
+        }
+    }
 }
 
 enum LokiAttemptOutcome {
@@ -1059,17 +1293,22 @@ fn classify_loki_response(
     ))
 }
 
-/// Gzip-compress a JSON value.
-fn gzip_json(value: &Value) -> Result<Vec<u8>, std::io::Error> {
+/// Gzip-compress `input` straight into the caller's reserved buffer.
+///
+/// Compressing into the bounded writer means the compressed output never lives
+/// in a second uncharged `Vec`.
+fn gzip_into(input: &[u8], out: &mut BoundedPayloadWriter) -> Result<(), String> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use std::io::Write;
 
-    let json_bytes = serde_json::to_vec(value)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(&json_bytes)?;
-    encoder.finish()
+    let mut encoder = GzEncoder::new(out, Compression::fast());
+    encoder
+        .write_all(input)
+        .map_err(|error| format!("gzip write failed: {error}"))?;
+    encoder
+        .finish()
+        .map_err(|error| format!("gzip finish failed: {error}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1183,27 +1422,26 @@ mod tests {
         labels_b.insert("proxy_id".to_string(), "p-2".to_string());
 
         let budget = LokiByteBudget::new(4096);
-        let payload = build_loki_payload(
-            &[
-                LokiEntry {
-                    labels: Arc::new(labels_a.clone()),
-                    line: Arc::from(r#"{"a":1}"#),
-                    _lease: budget.try_acquire(10).expect("test byte lease"),
-                },
-                LokiEntry {
-                    labels: Arc::new(labels_a),
-                    line: Arc::from(r#"{"a":2}"#),
-                    _lease: budget.try_acquire(10).expect("test byte lease"),
-                },
-                LokiEntry {
-                    labels: Arc::new(labels_b),
-                    line: Arc::from(r#"{"b":1}"#),
-                    _lease: budget.try_acquire(10).expect("test byte lease"),
-                },
-            ],
-            &AtomicU64::new(0),
-        )
-        .expect("payload");
+        let batch = [
+            LokiEntry {
+                labels: Arc::new(labels_a.clone()),
+                line: Arc::from(r#"{"a":1}"#),
+                _lease: budget.try_acquire(10).expect("test byte lease"),
+            },
+            LokiEntry {
+                labels: Arc::new(labels_a),
+                line: Arc::from(r#"{"a":2}"#),
+                _lease: budget.try_acquire(10).expect("test byte lease"),
+            },
+            LokiEntry {
+                labels: Arc::new(labels_b),
+                line: Arc::from(r#"{"b":1}"#),
+                _lease: budget.try_acquire(10).expect("test byte lease"),
+            },
+        ];
+        let mut out: Vec<u8> = Vec::new();
+        write_loki_payload(&batch, &AtomicU64::new(0), &mut out).expect("payload");
+        let payload: Value = serde_json::from_slice(&out).expect("payload is valid JSON");
 
         let Some(streams) = payload["streams"].as_array() else {
             panic!("payload should include streams array");
