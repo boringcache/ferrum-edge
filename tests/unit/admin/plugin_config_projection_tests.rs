@@ -332,7 +332,10 @@ fn proxy_alerts_array_shaped_channels_are_projected_too() {
         projected["channels"][0]["url"],
         "https://hooks.example.com/[REDACTED_PATH]"
     );
-    assert_eq!(projected["channels"][0]["headers"]["x-routing-key"], REDACTED);
+    assert_eq!(
+        projected["channels"][0]["headers"]["x-routing-key"],
+        REDACTED
+    );
     assert_eq!(projected["channels"][0]["body_template"], REDACTED);
     assert_no_canaries(
         &projected,
@@ -532,7 +535,10 @@ fn url_userinfo_is_stripped_on_paths_no_rule_names() {
         "https://plain.example.com/mcp"
     );
     // The schema rule wins on the named path: no userinfo and no path.
-    assert_eq!(projected["upstream_url"], "https://up.example.com/[REDACTED_PATH]");
+    assert_eq!(
+        projected["upstream_url"],
+        "https://up.example.com/[REDACTED_PATH]"
+    );
     assert_no_canaries(
         &projected,
         &["userinfo-array-canary", "upstream-userinfo-canary"],

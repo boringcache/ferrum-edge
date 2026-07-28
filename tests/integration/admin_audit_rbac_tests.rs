@@ -1503,7 +1503,10 @@ async fn http_logging_endpoint_and_custom_header_credentials_are_projected() {
     let (status, raw) = get_json(&base, "/plugins/config/http-logging-redaction", &admin).await;
     assert_eq!(status, 200, "admin read failed: {raw:?}");
     assert_eq!(raw["config"]["endpoint_url"], endpoint);
-    assert_eq!(raw["config"]["custom_headers"]["x-honeycomb-team"], vendor_secret);
+    assert_eq!(
+        raw["config"]["custom_headers"]["x-honeycomb-team"],
+        vendor_secret
+    );
 
     for projection in &projections {
         let serialized = projection.to_string();

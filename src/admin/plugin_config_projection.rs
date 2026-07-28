@@ -170,7 +170,10 @@ pub const PLUGIN_SENSITIVITY_SCHEMAS: &[(&str, &[SensitivityRule])] = &[
     ("mtls_auth", NONE),
     (
         "jwks_auth",
-        &[endpoint_url(&["discovery_url"]), endpoint_url(&["jwks_uri"])],
+        &[
+            endpoint_url(&["discovery_url"]),
+            endpoint_url(&["jwks_uri"]),
+        ],
     ),
     (
         "oauth2_introspection",
