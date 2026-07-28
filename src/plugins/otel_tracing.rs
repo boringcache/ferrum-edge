@@ -37,6 +37,7 @@ use super::utils::PluginHttpClient;
 use super::utils::byte_budget::{
     JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
     ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
+    record_batch_materialization_loss,
 };
 use super::{
     Direction, DisconnectCause, Plugin, PluginResult, RequestContext, StreamTransactionSummary,
@@ -1916,10 +1917,12 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
     // remaining length would re-walk the same halving ladder — and re-count the
     // same ceiling rejections — for every span once a width has been refused.
     let mut window = batch.len().max(1);
-    // Loss is aggregated into a single line per flush. Emitting one warning per
-    // refused slice would produce up to one line per span while the ceiling is
-    // saturated, which is exactly when the process is already under memory
-    // pressure.
+    // Loss is aggregated across the whole flush and then handed to the shared
+    // fixed-label accounting helper, which counts the lost *spans* separately
+    // from the ceiling's refused-*reservation* counter and samples its warning.
+    // Emitting one warning per refused slice would produce up to one line per
+    // span while the ceiling is saturated, which is exactly when the process is
+    // already under memory pressure.
     let mut lost_spans = 0usize;
     let mut loss_reason: Option<&'static str> = None;
     while start < batch.len() {
@@ -1949,12 +1952,7 @@ async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
         }
     }
     if let Some(reason) = loss_reason {
-        warn!(
-            "{} export batch discarded before materialization ({} spans lost): {}",
-            cfg.provider_name,
-            lost_spans,
-            reason,
-        );
+        record_batch_materialization_loss(cfg.provider_name, lost_spans as u64, reason);
     }
 }
 

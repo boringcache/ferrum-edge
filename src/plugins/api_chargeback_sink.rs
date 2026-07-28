@@ -44,8 +44,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use super::chargeback::pricing::{ChargeComputation, PricingConfig, require_finite_charge};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
 use super::utils::byte_budget::{
-    JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ReservedPayload,
-    RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
+    JSON_STRING_WORST_CASE_EXPANSION, PayloadMaterializationError, ProcessByteReservation,
+    ReservedPayload, RetainedByteCeiling, materialize_reserved_payload, process_ceiling,
 };
 use super::utils::response_body::{BoundedReadError, read_response_body_bounded};
 use super::utils::{
@@ -149,7 +149,7 @@ const _: () = assert!(SPOOL_MIN_DECOMPRESSED_BYTES <= SPOOL_MAX_ARTIFACT_BYTES);
 /// it is the one managed file a same-UID actor can inflate without first
 /// deriving the owner tag. 64 KiB is orders of magnitude above the real record
 /// and keeps a planted manifest from allocating inside the billing process.
-const SPOOL_MAX_META_BYTES: u64 = 64 * 1024;
+const SPOOL_MAX_META_BYTES: usize = 64 * 1024;
 /// Bound one ClickHouse attempt so the derived cross-process claim lease remains
 /// finite and representable. Ten minutes is already substantially above the
 /// default five-second export timeout.
@@ -7043,42 +7043,200 @@ pub fn encode_spool_bytes_for_tests(
     encode_spool_bytes(bytes, compression)
 }
 
-fn decode_spool_file(path: &Path) -> Result<String, String> {
+/// Bytes one `(start, end)` entry of the spool line index or replay worklist
+/// occupies.
+const SPOOL_INDEX_ENTRY_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+/// Growth step for the bounded spool decode buffer.
+const SPOOL_DECODE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Why a spool artifact could not be decoded into a charged representation.
+enum SpoolDecodeError {
+    /// The artifact itself is unreadable, oversized, or corrupt. The caller
+    /// quarantines it so an operator can review it.
+    Unreadable(String),
+    /// The retained-byte ceiling refused the artifact *before* it was decoded.
+    /// Nothing is wrong with the file: the caller releases the claim so a later
+    /// tick replays it in order.
+    CeilingExhausted(String),
+}
+
+impl SpoolDecodeError {
+    // Only the external decode test helper flattens the variants; the binary
+    // target does not compile that caller.
+    #[allow(dead_code)]
+    fn into_message(self) -> String {
+        match self {
+            Self::Unreadable(message) | Self::CeilingExhausted(message) => message,
+        }
+    }
+}
+
+/// One decoded spool artifact plus its line index, both charged to the
+/// retained-byte ceiling for exactly as long as they are held.
+///
+/// Rows are never copied out of `text`: chunking, 413 splits, and retries all
+/// address lines by `(start, end)` byte range into the single decoded buffer.
+/// A 256 MiB artifact therefore produces one decoded representation, not one
+/// per worklist level.
+struct ReservedSpoolArtifact {
+    text: String,
+    lines: Vec<(usize, usize)>,
+    /// Charge on the decoded buffer. Reserved before the file is read, shrunk
+    /// to the buffer's real allocation, released on drop.
+    _text_reservation: ProcessByteReservation,
+    /// Charge on the line index. Reserved before the index is allocated.
+    _index_reservation: ProcessByteReservation,
+}
+
+impl ReservedSpoolArtifact {
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Borrow one indexed line. Never panics: an out-of-range or non-boundary
+    /// index is a fixed-label error rather than a slice panic.
+    fn line(&self, index: usize) -> Result<&str, String> {
+        let (start, end) = *self.lines.get(index).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: spool replay line index {index} is out of range")
+        })?;
+        self.text.get(start..end).ok_or_else(|| {
+            format!("{PLUGIN_NAME}: spool replay line index {index} is not a character boundary")
+        })
+    }
+
+    #[allow(dead_code)] // used by the external decode test helper
+    fn into_text(self) -> String {
+        self.text
+    }
+}
+
+/// Visit every non-empty JSONEachRow line of `text` as a `(start, end)` byte
+/// range, matching `str::lines` framing (`\n` separated, trailing `\r`
+/// stripped) without allocating a single row copy.
+fn for_each_spool_line(text: &str, mut visit: impl FnMut(usize, usize)) {
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    loop {
+        let Some(rest) = bytes.get(start..) else {
+            break;
+        };
+        let separator = match rest.iter().position(|byte| *byte == b'\n') {
+            Some(offset) => start.saturating_add(offset),
+            None => bytes.len(),
+        };
+        let mut end = separator;
+        if end > start && bytes.get(end.saturating_sub(1)) == Some(&b'\r') {
+            end -= 1;
+        }
+        if let Some(line) = text.get(start..end)
+            && !line.trim().is_empty()
+        {
+            visit(start, end);
+        }
+        if separator >= bytes.len() {
+            break;
+        }
+        start = separator.saturating_add(1);
+    }
+}
+
+/// Decode one spool artifact into a representation that is charged to `ceiling`
+/// for its whole life.
+///
+/// The decoded upper bound is reserved *before* the file is read, so a process
+/// already at its retained-byte ceiling refuses the artifact instead of
+/// materializing an unbounded owned copy of it.
+fn decode_spool_artifact(
+    path: &Path,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<ReservedSpoolArtifact, SpoolDecodeError> {
     let file = File::open(path).map_err(|error| {
-        format!(
+        SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: failed to open spool file '{}': {error}",
             path.display()
-        )
+        ))
     })?;
     let encoded_len = file
         .metadata()
         .map_err(|error| {
-            format!(
+            SpoolDecodeError::Unreadable(format!(
                 "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
                 path.display()
-            )
+            ))
         })?
         .len();
     if encoded_len > SPOOL_MAX_ARTIFACT_BYTES {
-        return Err(format!(
+        return Err(SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: spool file '{}' exceeds the hard {SPOOL_MAX_ARTIFACT_BYTES}-byte artifact bound",
             path.display()
-        ));
+        )));
     }
-    let decoded = if path
+    let compressed = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains(".ndjson.zst"))
-    {
-        decode_zstd_bounded(file, spool_decompression_limit(encoded_len), path)?
+        .is_some_and(|name| name.contains(".ndjson.zst"));
+    // An uncompressed artifact decodes to exactly its on-disk size; a
+    // compressed one to at most its ratio-clamped decompression bound.
+    let decoded_bound = if compressed {
+        spool_decompression_limit(encoded_len)
     } else {
-        read_spool_bytes_bounded(file, SPOOL_MAX_ARTIFACT_BYTES, path)?
+        encoded_len
     };
-    String::from_utf8(decoded).map_err(|error| {
-        format!(
+    let decoded_bound = usize::try_from(decoded_bound).map_err(|_| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool file '{}' decoded bound exceeds this platform's addressable size",
+            path.display()
+        ))
+    })?;
+    let text_reservation = ceiling.try_acquire(decoded_bound).ok_or_else(|| {
+        SpoolDecodeError::CeilingExhausted(format!(
+            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
+            path.display(),
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ))
+    })?;
+
+    let decoded = if compressed {
+        decode_zstd_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
+    } else {
+        read_spool_bytes_bounded(file, decoded_bound, path).map_err(SpoolDecodeError::Unreadable)?
+    };
+    let text = String::from_utf8(decoded).map_err(|error| {
+        SpoolDecodeError::Unreadable(format!(
             "{PLUGIN_NAME}: spool file '{}' is not valid UTF-8 JSONEachRow: {error}",
             path.display()
-        )
+        ))
+    })?;
+    // Charge only what the buffer really holds; `from_utf8` reuses the `Vec`
+    // allocation, so `capacity` is the true retained size.
+    text_reservation.shrink_to(text.capacity());
+
+    let mut line_count = 0usize;
+    for_each_spool_line(&text, |_, _| line_count = line_count.saturating_add(1));
+    let index_bytes = line_count.checked_mul(SPOOL_INDEX_ENTRY_BYTES).ok_or_else(|| {
+        SpoolDecodeError::Unreadable(format!(
+            "{PLUGIN_NAME}: spool file '{}' line index byte bound overflowed",
+            path.display()
+        ))
+    })?;
+    let index_reservation = ceiling.try_acquire(index_bytes).ok_or_else(|| {
+        SpoolDecodeError::CeilingExhausted(format!(
+            "{PLUGIN_NAME}: spool replay deferred for '{}': {}",
+            path.display(),
+            PayloadMaterializationError::CeilingExhausted.reason()
+        ))
+    })?;
+    // `with_capacity` plus exactly `line_count` pushes never grows past the
+    // reserved allocation.
+    let mut lines: Vec<(usize, usize)> = Vec::with_capacity(line_count);
+    for_each_spool_line(&text, |start, end| lines.push((start, end)));
+
+    Ok(ReservedSpoolArtifact {
+        text,
+        lines,
+        _text_reservation: text_reservation,
+        _index_reservation: index_reservation,
     })
 }
 
@@ -7095,27 +7253,64 @@ fn spool_decompression_limit(encoded_len: u64) -> u64 {
         .clamp(SPOOL_MIN_DECOMPRESSED_BYTES, SPOOL_MAX_ARTIFACT_BYTES)
 }
 
-fn read_spool_bytes_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
-    let mut decoded = Vec::new();
-    reader
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut decoded)
-        .map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
-                path.display()
-            )
-        })?;
-    if decoded.len() as u64 > limit {
-        return Err(format!(
-            "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
+/// Read at most `limit` bytes, growing geometrically but never allocating past
+/// `limit`.
+///
+/// The caller has already reserved `limit` against the retained-byte ceiling, so
+/// the buffer must not overshoot it — which rules out `read_to_end`, whose
+/// amortized growth can allocate roughly twice the bytes actually read.
+fn read_spool_bytes_bounded(
+    mut reader: impl Read,
+    limit: usize,
+    path: &Path,
+) -> Result<Vec<u8>, String> {
+    let read_error = |error: std::io::Error| {
+        format!(
+            "{PLUGIN_NAME}: failed to read spool file '{}': {error}",
             path.display()
-        ));
+        )
+    };
+    let mut decoded: Vec<u8> = Vec::new();
+    let mut filled = 0usize;
+    loop {
+        if filled == decoded.len() {
+            if filled >= limit {
+                // One probe byte past the bound: anything still readable means
+                // the artifact exceeds the reservation, so fail closed.
+                let mut probe = [0u8; 1];
+                return match reader.read(&mut probe) {
+                    Ok(0) => {
+                        decoded.truncate(filled);
+                        Ok(decoded)
+                    }
+                    Ok(_) => Err(format!(
+                        "{PLUGIN_NAME}: spool file '{}' exceeds its {limit}-byte artifact bound",
+                        path.display()
+                    )),
+                    Err(error) => Err(read_error(error)),
+                };
+            }
+            let target = filled
+                .max(SPOOL_DECODE_CHUNK_BYTES)
+                .saturating_mul(2)
+                .min(limit);
+            decoded.resize(target, 0);
+        }
+        let Some(spare) = decoded.get_mut(filled..) else {
+            break;
+        };
+        match reader.read(spare) {
+            Ok(0) => break,
+            Ok(read) => filled = filled.saturating_add(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(read_error(error)),
+        }
     }
+    decoded.truncate(filled);
     Ok(decoded)
 }
 
-fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec<u8>, String> {
+fn decode_zstd_bounded(reader: impl Read, limit: usize, path: &Path) -> Result<Vec<u8>, String> {
     let decoder = zstd::stream::read::Decoder::new(reader).map_err(|error| {
         format!(
             "{PLUGIN_NAME}: failed to open spool file '{}' for decompression: {error}",
@@ -7130,9 +7325,14 @@ fn decode_zstd_bounded(reader: impl Read, limit: u64, path: &Path) -> Result<Vec
     })
 }
 
+/// Decode-only helper for external unit tests. The returned `String` outlives
+/// its ceiling reservation, which is exactly why production never uses this
+/// shape: [`decode_spool_artifact`] keeps the charge for the buffer's life.
 #[allow(dead_code)]
 pub fn decode_spool_file_for_tests(path: &Path) -> Result<String, String> {
-    decode_spool_file(path)
+    decode_spool_artifact(path, process_ceiling())
+        .map(ReservedSpoolArtifact::into_text)
+        .map_err(SpoolDecodeError::into_message)
 }
 
 #[doc(hidden)]
@@ -7163,6 +7363,20 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
     insert_url: &str,
     batch_size: usize,
 ) -> Result<(), String> {
+    replay_spool_once_with_ceiling_for_tests(spool, insert_url, batch_size, process_ceiling()).await
+}
+
+/// Replay one tick against a test-owned retained-byte ceiling, so ownership and
+/// refusal assertions stay exact while other tests in the same binary reserve
+/// against the process-global counter.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub async fn replay_spool_once_with_ceiling_for_tests(
+    spool: &SpoolManager,
+    insert_url: &str,
+    batch_size: usize,
+    ceiling: &'static RetainedByteCeiling,
+) -> Result<(), String> {
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
@@ -7171,7 +7385,7 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
         password: None,
         timeout: Duration::from_secs(5),
         metrics: Arc::clone(&spool.metrics),
-        ceiling: process_ceiling(),
+        ceiling,
     };
     replay_spool_once(spool, &flush_config, batch_size.max(1)).await
 }
@@ -7586,9 +7800,24 @@ async fn replay_spool_once(
             }
         };
         let inflight = claim.path().to_path_buf();
-        let body = match decode_spool_file(&inflight) {
-            Ok(body) => body,
-            Err(error) => {
+        let artifact = match decode_spool_artifact(&inflight, flush_config.ceiling) {
+            Ok(artifact) => artifact,
+            Err(SpoolDecodeError::CeilingExhausted(error)) => {
+                // The artifact is fine; the process is at its retained-byte
+                // ceiling. Quarantining here would destroy a healthy record, so
+                // release the claim and stop the tick, exactly as for a
+                // retryable delivery failure.
+                spool
+                    .metrics
+                    .record_failure(FailureReason::Serialize, error.clone());
+                let _guard = spool
+                    .write_lock
+                    .lock()
+                    .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+                spool.release_claim_locked(claim.path())?;
+                return Err(error);
+            }
+            Err(SpoolDecodeError::Unreadable(error)) => {
                 spool
                     .metrics
                     .record_failure(FailureReason::Serialize, error.clone());
@@ -7615,20 +7844,16 @@ async fn replay_spool_once(
                 continue;
             }
         };
-        let lines: Vec<String> = body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(str::to_owned)
-            .collect();
-        if lines.is_empty() {
+        let line_count = artifact.line_count();
+        if line_count == 0 {
             spool.remove_delivered_claim(claim.path())?;
             continue;
         }
 
-        match replay_spool_lines(spool, &mut claim, flush_config, &lines, batch_size).await {
+        match replay_spool_lines(spool, &mut claim, flush_config, &artifact, batch_size).await {
             Ok(dead_letters) => {
                 if let Err(error) =
-                    finalize_replayed_spool_file(spool, claim.path(), lines.len(), dead_letters)
+                    finalize_replayed_spool_file(spool, claim.path(), line_count, dead_letters)
                 {
                     // Permanent rejection could not publish dead-letter metadata.
                     // Release the claim so the original record remains
@@ -7679,15 +7904,35 @@ async fn replay_spool_lines(
     spool: &SpoolManager,
     claim: &mut SpoolClaimHandle,
     flush_config: &ClickHouseFlushConfig,
-    lines: &[String],
+    artifact: &ReservedSpoolArtifact,
     batch_size: usize,
 ) -> Result<Vec<DeadLetterChunk>, String> {
     let mut dead_letters = Vec::new();
-    let mut stack: Vec<Vec<String>> = vec![lines.to_vec()];
-    while let Some(chunk) = stack.pop() {
-        if chunk.is_empty() {
+    // The worklist addresses chunks by *line index range*, so neither a chunk
+    // nor a 413 split ever copies a row: every attempt borrows straight out of
+    // the artifact's single decoded buffer. Its whole allocation is reserved
+    // before it exists — a binary split tree over N lines has at most N-1
+    // splits, so the depth-first stack never exceeds N entries and
+    // `with_capacity(N)` never grows.
+    let line_count = artifact.line_count();
+    let worklist_bytes = line_count
+        .checked_mul(SPOOL_INDEX_ENTRY_BYTES)
+        .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay worklist byte bound overflowed"))?;
+    let _worklist_reservation = flush_config
+        .ceiling
+        .try_acquire(worklist_bytes)
+        .ok_or_else(|| {
+            format!(
+                "{PLUGIN_NAME}: spool replay deferred: {}",
+                PayloadMaterializationError::CeilingExhausted.reason()
+            )
+        })?;
+    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(line_count);
+    stack.push((0, line_count));
+    while let Some((start, end)) = stack.pop() {
+        let Some(rows) = end.checked_sub(start).filter(|rows| *rows > 0) else {
             continue;
-        }
+        };
         {
             let _guard = spool
                 .write_lock
@@ -7695,56 +7940,27 @@ async fn replay_spool_lines(
                 .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
             spool.renew_claim_locked(claim)?;
         }
-        // The joined replay body is a second in-memory copy of the claimed spool
-        // lines, so it is reserved against the retained-byte ceiling before it is
-        // built. A refusal is reported as retryable, which leaves the durable
-        // claim untouched for a later attempt. Lines are written verbatim, so the
-        // bound (row bytes plus one separator each) is exact.
-        let body_bound = chunk
-            .iter()
-            .try_fold(chunk.len(), |total, line| total.checked_add(line.len()))
-            .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay body byte bound overflowed"))?;
-        let body = materialize_reserved_payload(flush_config.ceiling, body_bound, |writer| {
-            for (index, line) in chunk.iter().enumerate() {
-                if index > 0 {
-                    writer
-                        .write_all(b"\n")
-                        .map_err(|error| format!("row separator: {error}"))?;
-                }
-                writer
-                    .write_all(line.as_bytes())
-                    .map_err(|error| format!("row: {error}"))?;
-            }
-            Ok(())
-        })
-        .map_err(|error| {
-            format!(
-                "{PLUGIN_NAME}: spool replay body was not materialized: {}",
-                error.reason()
-            )
-        })?;
-        match post_json_each_row(flush_config, body, chunk.len()).await {
+        let body = materialize_spool_chunk_body(flush_config.ceiling, artifact, start, end)?;
+        match post_json_each_row(flush_config, body, rows).await {
             DeliveryOutcome::Delivered => {}
             DeliveryOutcome::Retryable { message } => return Err(message),
             DeliveryOutcome::PayloadTooLarge { .. } => {
-                if chunk.len() == 1 {
+                if rows == 1 {
                     dead_letters.push(DeadLetterChunk {
                         row_count: 1,
                         reason: DeadLetterReason::PayloadTooLarge,
                         http_status: Some(413),
                     });
                 } else {
-                    let split_at = replay_split_len(chunk.len(), batch_size);
-                    let right = chunk[split_at..].to_vec();
-                    let left = chunk[..split_at].to_vec();
+                    let split_at = start.saturating_add(replay_split_len(rows, batch_size));
                     // Stack: push right first so left is delivered first.
-                    stack.push(right);
-                    stack.push(left);
+                    stack.push((split_at, end));
+                    stack.push((start, split_at));
                 }
             }
             DeliveryOutcome::Permanent { status, .. } => {
                 dead_letters.push(DeadLetterChunk {
-                    row_count: chunk.len(),
+                    row_count: rows,
                     reason: DeadLetterReason::PermanentHttp,
                     http_status: Some(status),
                 });
@@ -7752,6 +7968,46 @@ async fn replay_spool_lines(
         }
     }
     Ok(dead_letters)
+}
+
+/// Serialize the `[start, end)` line range into a reserved-and-charged
+/// JSONEachRow body.
+///
+/// Rows are written verbatim out of the artifact's decoded buffer, so the bound
+/// (row bytes plus one separator each) is exact and no row is ever copied
+/// outside the reserved payload. A ceiling refusal is reported as a retryable
+/// error, which leaves the durable claim untouched for a later tick.
+fn materialize_spool_chunk_body(
+    ceiling: &'static RetainedByteCeiling,
+    artifact: &ReservedSpoolArtifact,
+    start: usize,
+    end: usize,
+) -> Result<ReservedPayload, String> {
+    let mut bound = end.saturating_sub(start);
+    for index in start..end {
+        bound = bound
+            .checked_add(artifact.line(index)?.len())
+            .ok_or_else(|| format!("{PLUGIN_NAME}: spool replay body byte bound overflowed"))?;
+    }
+    materialize_reserved_payload(ceiling, bound, |writer| {
+        for index in start..end {
+            if index > start {
+                writer
+                    .write_all(b"\n")
+                    .map_err(|error| format!("row separator: {error}"))?;
+            }
+            writer
+                .write_all(artifact.line(index)?.as_bytes())
+                .map_err(|error| format!("row: {error}"))?;
+        }
+        Ok(())
+    })
+    .map_err(|error| {
+        format!(
+            "{PLUGIN_NAME}: spool replay body was not materialized: {}",
+            error.reason()
+        )
+    })
 }
 
 fn finalize_replayed_spool_file(

@@ -1232,11 +1232,14 @@ pub mod _test_support {
     /// when producer destruction purges the queue.
     ///
     /// Returns `(instance_used_after_send, ceiling_used_after_send,
-    /// instance_used_after_destroy, ceiling_used_after_destroy)`.
+    /// instance_used_after_destroy, ceiling_used_after_destroy)`, or a fixed,
+    /// secret-free diagnostic. librdkafka is an unconditional dependency and the
+    /// probe's broker is a local unreachable port, so a failure here is a defect
+    /// rather than an absent environment capability — callers must assert on it.
     pub fn kafka_logging_probe_downstream_lease_ownership_for_test(
         ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
         record_count: usize,
-    ) -> Option<(usize, usize, usize, usize)> {
+    ) -> Result<(usize, usize, usize, usize), String> {
         crate::plugins::kafka_logging::probe_downstream_lease_ownership_for_test(
             ceiling,
             record_count,
@@ -1259,20 +1262,33 @@ pub mod _test_support {
     /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
     /// wire body must be reserved against the retained-byte ceiling before it is
     /// materialized, stay charged alongside the queued entries, and release on
-    /// drop. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
-    /// after_release_bytes, refused, rejections, content_encoding)`.
+    /// drop. `distinct_label_sets` is the attacker-controlled grouping
+    /// dimension. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections, content_encoding,
+    /// grouping_bytes)`.
     #[allow(clippy::type_complexity)]
     pub fn loki_logging_probe_batch_materialization_for_test(
         ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
         entry_count: usize,
         line_bytes: usize,
         gzip: bool,
-    ) -> Option<(usize, usize, usize, usize, bool, u64, Option<&'static str>)> {
+        distinct_label_sets: usize,
+    ) -> Option<(
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        u64,
+        Option<&'static str>,
+        usize,
+    )> {
         crate::plugins::loki_logging::probe_loki_batch_materialization_for_test(
             ceiling,
             entry_count,
             line_bytes,
             gzip,
+            distinct_label_sets,
         )
         .map(|probe| {
             (
@@ -1283,8 +1299,22 @@ pub mod _test_support {
                 probe.refused,
                 probe.rejections,
                 probe.content_encoding,
+                probe.grouping_bytes,
             )
         })
+    }
+
+    /// Exact Loki wire JSON for `entry_count` entries spread over
+    /// `distinct_label_sets` label sets, so grouping semantics, per-stream entry
+    /// order, and timestamp monotonicity can be pinned without a live server.
+    pub fn loki_logging_probe_payload_json_for_test(
+        entry_count: usize,
+        distinct_label_sets: usize,
+    ) -> Option<String> {
+        crate::plugins::loki_logging::probe_loki_payload_json_for_test(
+            entry_count,
+            distinct_label_sets,
+        )
     }
 
     // ── plugins/otel_tracing ────────────────────────────────────────────────

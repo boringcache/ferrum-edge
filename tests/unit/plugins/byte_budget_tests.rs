@@ -1,14 +1,17 @@
 //! Shared observability byte-budget primitive tests.
 
 use ferrum_edge::_test_support::{
-    loki_logging_probe_batch_materialization_for_test,
+    loki_logging_probe_batch_materialization_for_test, loki_logging_probe_payload_json_for_test,
     otel_tracing_probe_batch_materialization_for_test,
 };
 use ferrum_edge::plugins::utils::byte_budget::{
     ByteBudget, DEFAULT_BUFFER_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES,
     HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES, PROCESS_MAX_RETAINED_BYTES_DEFAULT,
     PROCESS_MAX_RETAINED_BYTES_MAX, PROCESS_MAX_RETAINED_BYTES_MIN, PayloadMaterializationError,
-    RetainedByteCeiling, admit_byte_limits, materialize_reserved_payload,
+    RetainedByteCeiling, admit_byte_limits, batch_materialization_fallbacks,
+    batch_materialization_loss_events, batch_materialization_lost_records,
+    materialize_reserved_payload, record_batch_materialization_fallback,
+    record_batch_materialization_loss,
 };
 use ferrum_edge::plugins::utils::summary_log_budget::serialize_under_byte_budget;
 use serde_json::json;
@@ -505,8 +508,8 @@ fn concurrent_instances_cannot_multiply_batch_materialization_past_the_ceiling()
 fn loki_batch_body_is_charged_alongside_the_queued_entries() {
     for gzip in [false, true] {
         let ceiling = test_ceiling(8 * 1024 * 1024);
-        let (queued, peak, after_body, after_release, refused, _rejections, encoding) =
-            loki_logging_probe_batch_materialization_for_test(ceiling, 16, 4_096, gzip)
+        let (queued, peak, after_body, after_release, refused, _rejections, encoding, _grouping) =
+            loki_logging_probe_batch_materialization_for_test(ceiling, 16, 4_096, gzip, 1)
                 .expect("probe ran");
 
         assert!(!refused, "an 8 MiB ceiling must admit a 64 KiB batch");
@@ -532,8 +535,8 @@ fn loki_batch_body_is_refused_rather_than_materialized_under_a_saturated_ceiling
     // Enough headroom for the queued entries, far too little for the batch's
     // own doubled-by-escaping JSON representation.
     let ceiling = test_ceiling(200_000);
-    let (queued, peak, _after_body, after_release, refused, rejections, encoding) =
-        loki_logging_probe_batch_materialization_for_test(ceiling, 16, 8_192, false)
+    let (queued, peak, _after_body, after_release, refused, rejections, encoding, _grouping) =
+        loki_logging_probe_batch_materialization_for_test(ceiling, 16, 8_192, false, 1)
             .expect("probe ran");
 
     assert!(refused, "the batch body must be refused, not materialized");
@@ -544,6 +547,177 @@ fn loki_batch_body_is_refused_rather_than_materialized_under_a_saturated_ceiling
     );
     assert!(rejections > 0, "the refusal must be counted");
     assert_eq!(after_release, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Loki label grouping — GHSA-83h5-52mw-f33p.
+//
+// A hostile client can manufacture a new dynamic label set per entry. The
+// grouping representation must therefore be charged to the ceiling like every
+// other batch-scale allocation, and must not scale with the number of *distinct*
+// label sets.
+// ---------------------------------------------------------------------------
+
+/// Entry count used by the grouping regressions. Every entry carries its own
+/// label set, which is the worst case for grouping.
+const LOKI_GROUPING_ENTRIES: usize = 256;
+
+#[test]
+fn loki_label_grouping_is_charged_to_the_ceiling() {
+    let ceiling = test_ceiling(8 * 1024 * 1024);
+    let (queued, peak, _after_body, after_release, refused, _rejections, _encoding, grouping) =
+        loki_logging_probe_batch_materialization_for_test(
+            ceiling,
+            LOKI_GROUPING_ENTRIES,
+            256,
+            false,
+            LOKI_GROUPING_ENTRIES,
+        )
+        .expect("probe ran");
+
+    assert!(!refused, "an 8 MiB ceiling must admit this batch");
+    assert!(peak > queued);
+    assert_eq!(after_release, 0);
+    // One `usize` per entry — independent of how many distinct label sets the
+    // batch contains.
+    assert_eq!(
+        grouping,
+        LOKI_GROUPING_ENTRIES * std::mem::size_of::<usize>(),
+        "grouping must scale with the entry count, not the label-set count"
+    );
+
+    // `peak` is observed after the write returns, so the grouping index is
+    // already released: a ceiling of exactly `peak` leaves room for the queued
+    // entries and the reserved body but *not* for the grouping index. The old
+    // uncharged grouping path would have sailed through this ceiling.
+    let tight = test_ceiling(peak);
+    let (_, _, _, tight_after_release, tight_refused, tight_rejections, _, _) =
+        loki_logging_probe_batch_materialization_for_test(
+            tight,
+            LOKI_GROUPING_ENTRIES,
+            256,
+            false,
+            LOKI_GROUPING_ENTRIES,
+        )
+        .expect("probe ran");
+    assert!(
+        tight_refused,
+        "the grouping representation must be reserved, not built for free"
+    );
+    assert!(tight_rejections > 0);
+    assert_eq!(tight_after_release, 0, "a refused grouping leaks nothing");
+
+    // One grouping index of extra headroom is all it takes to admit the batch.
+    let exact = test_ceiling(peak + grouping);
+    let (_, _, _, exact_after_release, exact_refused, _, _, _) =
+        loki_logging_probe_batch_materialization_for_test(
+            exact,
+            LOKI_GROUPING_ENTRIES,
+            256,
+            false,
+            LOKI_GROUPING_ENTRIES,
+        )
+        .expect("probe ran");
+    assert!(
+        !exact_refused,
+        "the reserved grouping bound must be exact, not merely conservative"
+    );
+    assert_eq!(exact_after_release, 0);
+}
+
+#[test]
+fn loki_grouping_semantics_survive_many_distinct_label_sets() {
+    // Four label sets over twelve entries: three entries per stream, and the
+    // per-stream order must be the original queue order.
+    let payload = loki_logging_probe_payload_json_for_test(12, 4).expect("payload");
+    let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+    let streams = payload["streams"].as_array().expect("streams array");
+    assert_eq!(streams.len(), 4, "one stream per distinct label set");
+
+    let mut seen_labels = std::collections::BTreeSet::new();
+    let mut timestamps: Vec<u128> = Vec::new();
+    for stream in streams {
+        let labels = stream["stream"].as_object().expect("label object");
+        assert!(
+            seen_labels.insert(serde_json::to_string(labels).expect("labels")),
+            "each label set must be emitted exactly once"
+        );
+        let values = stream["values"].as_array().expect("values array");
+        assert_eq!(values.len(), 3, "entries must not be dropped or duplicated");
+        for value in values {
+            let timestamp: u128 = value[0]
+                .as_str()
+                .expect("timestamp string")
+                .parse()
+                .expect("nanosecond timestamp");
+            timestamps.push(timestamp);
+        }
+    }
+
+    // Timestamps are assigned in write order and must be strictly increasing.
+    assert_eq!(timestamps.len(), 12);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+        "Loki requires strictly monotonic per-push timestamps: {timestamps:?}"
+    );
+
+    // A single label set still collapses into one stream.
+    let single = loki_logging_probe_payload_json_for_test(12, 1).expect("payload");
+    let single: serde_json::Value = serde_json::from_str(&single).expect("valid JSON");
+    assert_eq!(single["streams"].as_array().expect("streams").len(), 1);
+
+    // Determinism: the same batch shape produces byte-identical grouping.
+    let repeat = loki_logging_probe_payload_json_for_test(12, 4).expect("payload");
+    let repeat: serde_json::Value = serde_json::from_str(&repeat).expect("valid JSON");
+    let labels_of = |value: &serde_json::Value| -> Vec<String> {
+        value["streams"]
+            .as_array()
+            .expect("streams")
+            .iter()
+            .map(|stream| serde_json::to_string(&stream["stream"]).expect("labels"))
+            .collect()
+    };
+    assert_eq!(
+        labels_of(&payload),
+        labels_of(&repeat),
+        "stream emission order must be deterministic"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch-materialization loss accounting — GHSA-83h5-52mw-f33p.
+//
+// The counters below are process-global statics that other tests in this binary
+// touch concurrently, so every assertion is a lower-bound delta.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn batch_materialization_loss_accounting_counts_records_separately_from_events() {
+    let records_before = batch_materialization_lost_records();
+    let events_before = batch_materialization_loss_events();
+    let fallbacks_before = batch_materialization_fallbacks();
+
+    // One event that lost seven records: a reservation-rejection count could
+    // never express this, which is why the two must not be conflated.
+    record_batch_materialization_loss("probe_sink", 7, "probe reason");
+
+    assert!(
+        batch_materialization_lost_records() >= records_before + 7,
+        "the record-scale counter must advance by the records lost"
+    );
+    assert!(
+        batch_materialization_loss_events() >= events_before + 1,
+        "the event counter must advance by one, not by seven"
+    );
+
+    // A degraded-but-complete delivery is a fallback, never a loss.
+    let records_after_loss = batch_materialization_lost_records();
+    record_batch_materialization_fallback("probe_sink", "probe reason");
+    assert!(batch_materialization_fallbacks() >= fallbacks_before + 1);
+    assert!(
+        batch_materialization_lost_records() >= records_after_loss,
+        "a fallback must never decrement the loss counter"
+    );
 }
 
 // ---------------------------------------------------------------------------

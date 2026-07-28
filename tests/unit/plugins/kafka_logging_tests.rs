@@ -1450,17 +1450,12 @@ fn leaked_test_ceiling(max_bytes: usize) -> &'static RetainedByteCeiling {
 #[test]
 fn kafka_lease_is_held_while_librdkafka_retains_the_record_and_released_on_destroy() {
     let ceiling = leaked_test_ceiling(8 * 1024 * 1024);
-    let Some((
-        instance_after_send,
-        ceiling_after_send,
-        instance_after_destroy,
-        ceiling_after_destroy,
-    )) = kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 4)
-    else {
-        // A librdkafka client could not be created in this environment; the
-        // ownership contract cannot be observed, so do not assert on it.
-        return;
-    };
+    // librdkafka is an unconditional dependency and the probe's broker is a
+    // local unreachable port, so producer creation failing is evidence of a
+    // defect, not an optional environment capability. Fail, never skip.
+    let (instance_after_send, ceiling_after_send, instance_after_destroy, ceiling_after_destroy) =
+        kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 4)
+            .expect("librdkafka downstream-ownership probe must run");
 
     assert!(
         instance_after_send > 0,
@@ -1487,21 +1482,17 @@ fn kafka_lease_is_held_while_librdkafka_retains_the_record_and_released_on_destr
 #[test]
 fn kafka_downstream_leases_of_multiple_instances_share_one_ceiling() {
     let ceiling = leaked_test_ceiling(8 * 1024 * 1024);
-    let Some((_, first_ceiling_used, _, first_after_destroy)) =
+    let (_, first_ceiling_used, _, first_after_destroy) =
         kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2)
-    else {
-        return;
-    };
+            .expect("librdkafka downstream-ownership probe must run");
     assert!(first_ceiling_used > 0);
     assert_eq!(first_after_destroy, 0);
 
     // A second instance charges the same aggregate counter rather than getting a
     // private allowance.
-    let Some((_, second_ceiling_used, _, second_after_destroy)) =
+    let (_, second_ceiling_used, _, second_after_destroy) =
         kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2)
-    else {
-        return;
-    };
+            .expect("librdkafka downstream-ownership probe must run");
     assert_eq!(
         second_ceiling_used, first_ceiling_used,
         "both instances reserve against the same ceiling"

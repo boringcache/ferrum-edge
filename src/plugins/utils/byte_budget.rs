@@ -159,6 +159,83 @@ pub fn process_retained_bytes_high_water() -> usize {
     PROCESS_CEILING.high_water()
 }
 
+// ---------------------------------------------------------------------------
+// Batch-materialization loss accounting.
+//
+// `process_ceiling_rejections` counts refused *reservations*. One refusal can
+// discard anywhere from one record to a whole batch, so it must never be read
+// as a record-loss count. These counters are the record-scale companion, and
+// the diagnostics they emit are sampled so a saturated ceiling — which is
+// exactly when the process is already under memory pressure — cannot produce an
+// unbounded warning stream.
+// ---------------------------------------------------------------------------
+
+/// Sampling period for batch-materialization loss and fallback warnings.
+const BATCH_DIAGNOSTIC_WARN_EVERY: u64 = 100;
+
+/// Records (log entries / spans / rows) discarded because their batch
+/// representation could not be materialized.
+static BATCH_LOST_RECORDS: AtomicU64 = AtomicU64::new(0);
+/// Discard events, each of which lost one or more records.
+static BATCH_LOSS_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Batches delivered in a degraded-but-complete form (for example uncompressed
+/// because the compressed representation could not be reserved). No record loss.
+static BATCH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Account `records` lost by `sink` and emit a sampled, fixed-label warning.
+///
+/// `reason` must be a compiled-in label such as
+/// [`PayloadMaterializationError::reason`] — never a serializer message, and
+/// never anything derived from payload content.
+pub fn record_batch_materialization_loss(sink: &'static str, records: u64, reason: &'static str) {
+    BATCH_LOST_RECORDS.fetch_add(records, Ordering::Relaxed);
+    let events = BATCH_LOSS_EVENTS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if events == 1 || events.is_multiple_of(BATCH_DIAGNOSTIC_WARN_EVERY) {
+        warn!(
+            plugin = sink,
+            "{}: discarded a batch before delivery because {} ({} records lost in this batch; \
+             {} loss events total; logging every {} events)",
+            sink,
+            reason,
+            records,
+            events,
+            BATCH_DIAGNOSTIC_WARN_EVERY,
+        );
+    }
+}
+
+/// Account a degraded-but-complete delivery by `sink` and emit a sampled,
+/// fixed-label warning. No records are lost on this path.
+pub fn record_batch_materialization_fallback(sink: &'static str, reason: &'static str) {
+    let events = BATCH_FALLBACKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if events == 1 || events.is_multiple_of(BATCH_DIAGNOSTIC_WARN_EVERY) {
+        warn!(
+            plugin = sink,
+            "{}: delivering a batch in a degraded representation because {} ({} fallbacks total; \
+             logging every {} events)",
+            sink,
+            reason,
+            events,
+            BATCH_DIAGNOSTIC_WARN_EVERY,
+        );
+    }
+}
+
+/// Records lost to refused batch materialization since startup.
+pub fn batch_materialization_lost_records() -> u64 {
+    BATCH_LOST_RECORDS.load(Ordering::Relaxed)
+}
+
+/// Discard events (not records) since startup.
+pub fn batch_materialization_loss_events() -> u64 {
+    BATCH_LOSS_EVENTS.load(Ordering::Relaxed)
+}
+
+/// Degraded-but-complete deliveries since startup.
+pub fn batch_materialization_fallbacks() -> u64 {
+    BATCH_FALLBACKS.load(Ordering::Relaxed)
+}
+
 /// One reservation against a [`RetainedByteCeiling`].
 ///
 /// Every observability sink budget — the shared [`ByteBudget`] and the

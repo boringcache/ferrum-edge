@@ -2077,11 +2077,16 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
 /// so the lease must not have been released at handoff. The last two must be
 /// zero: producer destruction purges the queue, fires the delivery callback for
 /// every purged record, and releases each lease exactly once with no underflow.
+///
+/// Failure is an assertable `Err` with a fixed, secret-free diagnostic, never a
+/// silent "capability unavailable" skip: librdkafka is an unconditional
+/// dependency and the broker address is a local unreachable port, so a producer
+/// that cannot be created is a defect, not a missing environment feature.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_downstream_lease_ownership_for_test(
     ceiling: &'static RetainedByteCeiling,
     record_count: usize,
-) -> Option<(usize, usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize), String> {
     let metrics = Arc::new(KafkaDeliveryMetrics::new(u64::MAX - 21));
     let mut kafka_config = ClientConfig::new();
     // Unroutable broker: local enqueue succeeds, delivery never resolves within
@@ -2093,12 +2098,24 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
         .create_with_context(KafkaDeliveryContext {
             metrics: Arc::clone(&metrics),
         })
-        .ok()?;
+        // librdkafka's own error text names only the probe's fixed local
+        // configuration; it carries no credential or payload content.
+        .map_err(|error| {
+            format!(
+                "kafka_logging: downstream-ownership probe could not create a librdkafka \
+                 producer for 127.0.0.1:1: {error}"
+            )
+        })?;
 
     let byte_budget = Arc::new(KafkaByteBudget::with_ceiling(1_048_576, ceiling));
     let mut batch = Vec::with_capacity(record_count);
     for _ in 0..record_count {
-        let lease = byte_budget.try_acquire(64)?;
+        let lease = byte_budget.try_acquire(64).ok_or_else(|| {
+            format!(
+                "kafka_logging: downstream-ownership probe could not reserve a 64-byte lease \
+                 for {record_count} records; the supplied ceiling is too small"
+            )
+        })?;
         batch.push(KafkaRecord {
             payload: Arc::from("{\"probe\":true}"),
             key: None,
@@ -2123,7 +2140,7 @@ pub(crate) fn probe_downstream_lease_ownership_for_test(
     // `BaseProducer::drop` purges queue + in-flight, then flushes; the flush
     // polls until the delivery callbacks for every purged record have run.
     drop(state);
-    Some((
+    Ok((
         instance_after_send,
         ceiling_after_send,
         byte_budget.used(),

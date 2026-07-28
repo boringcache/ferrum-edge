@@ -36,7 +36,8 @@ use crate::config::types::MAX_ID_LENGTH;
 use super::utils::byte_budget::{
     BoundedPayloadWriter, JSON_REEMBEDDED_WORST_CASE_EXPANSION, JSON_STRING_WORST_CASE_EXPANSION,
     PayloadMaterializationError, ProcessByteReservation, ReservedPayload, RetainedByteCeiling,
-    materialize_reserved_payload, process_ceiling,
+    materialize_reserved_payload, process_ceiling, record_batch_materialization_fallback,
+    record_batch_materialization_loss,
 };
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
@@ -46,6 +47,9 @@ use super::utils::{
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+
+/// Fixed sink label for shared retained-byte diagnostics and metrics.
+const LOKI_PLUGIN_NAME: &str = "loki_logging";
 
 pub const LOKI_LOGGING_CONFIG_KEYS: &[&str] = &[
     "authorization_header",
@@ -806,37 +810,66 @@ pub(crate) struct LokiMaterializationProbe {
     pub(crate) rejections: u64,
     /// `Content-Encoding` chosen for the materialized body.
     pub(crate) content_encoding: Option<&'static str>,
+    /// Whole allocation of the label-grouping order index for this batch. It is
+    /// reserved *inside* the write, so it is charged on top of `peak_bytes` and
+    /// released before `peak_bytes` is observed.
+    pub(crate) grouping_bytes: usize,
+}
+
+/// Build one synthetic queued batch for the probes below.
+///
+/// `distinct_label_sets` is the attacker-controlled dimension: a hostile client
+/// can manufacture a new dynamic label set per entry, which is exactly what the
+/// old grouping representation scaled with.
+#[allow(dead_code)] // reached only from the probes below
+fn probe_loki_batch_for_test(
+    budget: &LokiByteBudget,
+    entry_count: usize,
+    line_bytes: usize,
+    distinct_label_sets: usize,
+) -> Option<Vec<LokiEntry>> {
+    // A hostile line: already-JSON text made entirely of quotes, so every byte
+    // doubles when it is re-embedded as a JSON string value.
+    let line: Arc<str> = Arc::from("\"".repeat(line_bytes));
+    let label_sets: Vec<Arc<BTreeMap<String, String>>> = (0..distinct_label_sets.max(1))
+        .map(|index| {
+            let mut labels = BTreeMap::new();
+            labels.insert("service".to_string(), "ferrum-edge".to_string());
+            // Fixed width so every label set costs the same retained bytes.
+            labels.insert("stream".to_string(), format!("{index:016x}"));
+            Arc::new(labels)
+        })
+        .collect();
+
+    let mut batch = Vec::with_capacity(entry_count);
+    for index in 0..entry_count {
+        let labels = label_sets.get(index % label_sets.len())?;
+        let retained = retained_entry_bytes(line.len(), labels.as_ref())?;
+        batch.push(LokiEntry {
+            labels: Arc::clone(labels),
+            line: Arc::clone(&line),
+            _lease: budget.try_acquire(retained)?,
+        });
+    }
+    Some(batch)
 }
 
 /// Deterministic batch-materialization probe for external unit tests.
 ///
-/// Queues `entry_count` entries of `line_bytes` each through a real
-/// [`LokiByteBudget`] bound to `ceiling`, then materializes the wire body while
-/// those leases are still held.
+/// Queues `entry_count` entries of `line_bytes` each, spread over
+/// `distinct_label_sets` label sets, through a real [`LokiByteBudget`] bound to
+/// `ceiling`, then materializes the wire body while those leases are still held.
 #[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn probe_loki_batch_materialization_for_test(
     ceiling: &'static RetainedByteCeiling,
     entry_count: usize,
     line_bytes: usize,
     gzip: bool,
+    distinct_label_sets: usize,
 ) -> Option<LokiMaterializationProbe> {
     let budget = LokiByteBudget::with_ceiling(LOKI_MAX_BUFFER_MAX_BYTES, ceiling);
-    let mut labels = BTreeMap::new();
-    labels.insert("service".to_string(), "ferrum-edge".to_string());
-    let labels = Arc::new(labels);
-    // A hostile line: already-JSON text made entirely of quotes, so every byte
-    // doubles when it is re-embedded as a JSON string value.
-    let line: Arc<str> = Arc::from("\"".repeat(line_bytes));
-
-    let mut batch = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        let retained = retained_entry_bytes(line.len(), labels.as_ref())?;
-        batch.push(LokiEntry {
-            labels: Arc::clone(&labels),
-            line: Arc::clone(&line),
-            _lease: budget.try_acquire(retained)?,
-        });
-    }
+    let batch = probe_loki_batch_for_test(&budget, entry_count, line_bytes, distinct_label_sets)?;
+    let grouping_bytes = loki_grouping_byte_bound(batch.len())?;
     let queued_bytes = ceiling.used();
 
     let cfg = LokiFlushConfig {
@@ -865,6 +898,7 @@ pub(crate) fn probe_loki_batch_materialization_for_test(
                 refused: false,
                 rejections: ceiling.rejections(),
                 content_encoding,
+                grouping_bytes,
             })
         }
         Err(_) => {
@@ -878,9 +912,26 @@ pub(crate) fn probe_loki_batch_materialization_for_test(
                 refused: true,
                 rejections: ceiling.rejections(),
                 content_encoding: None,
+                grouping_bytes,
             })
         }
     }
+}
+
+/// Deterministic grouping-semantics probe: returns the exact wire JSON a batch
+/// of `entry_count` entries spread over `distinct_label_sets` label sets
+/// produces, so an external test can pin stream grouping, per-stream entry
+/// order, and timestamp monotonicity with many distinct label sets.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_loki_payload_json_for_test(
+    entry_count: usize,
+    distinct_label_sets: usize,
+) -> Option<String> {
+    let budget = LokiByteBudget::with_ceiling(LOKI_MAX_BUFFER_MAX_BYTES, process_ceiling());
+    let batch = probe_loki_batch_for_test(&budget, entry_count, 8, distinct_label_sets)?;
+    let mut out: Vec<u8> = Vec::new();
+    write_loki_payload(&batch, &AtomicU64::new(0), process_ceiling(), &mut out).ok()?;
+    String::from_utf8(out).ok()
 }
 
 /// Map an HTTP status code to its class string (low cardinality).
@@ -1003,36 +1054,91 @@ fn write_loki_str<W: Write>(out: &mut W, text: &str) -> Result<(), String> {
         .map_err(|error| format!("failed to write Loki payload: {error}"))
 }
 
+/// Bytes one entry of the label-grouping order index occupies.
+const LOKI_GROUPING_ENTRY_BYTES: usize = std::mem::size_of::<usize>();
+
+/// Whole allocation of the label-grouping order index for `entry_count`
+/// entries. `Vec::with_capacity` never grows past this, so reserving it once
+/// covers the index for its entire (function-scoped) life.
+fn loki_grouping_byte_bound(entry_count: usize) -> Option<usize> {
+    entry_count.checked_mul(LOKI_GROUPING_ENTRY_BYTES)
+}
+
+/// Entry sitting at `position` of the grouping order index.
+fn loki_entry_at<'batch>(
+    batch: &'batch [LokiEntry],
+    order: &[usize],
+    position: usize,
+) -> Option<&'batch LokiEntry> {
+    order.get(position).and_then(|index| batch.get(*index))
+}
+
+/// Fixed diagnostic for an order-index/batch mismatch, which the construction
+/// above makes unreachable but which must not panic if it ever happens.
+fn loki_grouping_desynchronized() -> String {
+    "Loki logging: label grouping index desynchronized".to_string()
+}
+
 /// Group entries by label set and stream the Loki push payload straight into
 /// `out`.
 ///
-/// There is deliberately no intermediate `serde_json::Value`: the label maps are
-/// borrowed from the queued entries (never cloned) and each log line is written
-/// once, so the only batch-sized representation that exists is the caller's
-/// reserved output buffer.
+/// There is deliberately no intermediate `serde_json::Value` and no per-group
+/// container. Grouping is a single `usize` order index — one element per entry,
+/// independent of how many *distinct* label sets an attacker can manufacture —
+/// whose whole allocation is reserved against `ceiling` before it exists and
+/// released when this function returns. Entries are ordered by label set with
+/// ties broken by queue position, so equal label sets form one contiguous run:
+/// each stream is emitted once, per-stream entry order is the original queue
+/// order, and the output is deterministic for a given batch. The label maps
+/// themselves are borrowed from the queued entries and never cloned, so the only
+/// batch-*byte*-sized representation that exists is the caller's reserved output
+/// buffer.
 fn write_loki_payload<W: Write>(
     batch: &[LokiEntry],
     last_timestamp_ns: &AtomicU64,
+    ceiling: &'static RetainedByteCeiling,
     out: &mut W,
 ) -> Result<(), String> {
-    let mut groups: Vec<(&BTreeMap<String, String>, Vec<usize>)> = Vec::new();
-    let mut group_of: HashMap<&BTreeMap<String, String>, usize> = HashMap::new();
-    for (index, entry) in batch.iter().enumerate() {
-        let labels: &BTreeMap<String, String> = entry.labels.as_ref();
-        match group_of.get(labels).copied() {
-            Some(group) => match groups.get_mut(group) {
-                Some((_, indexes)) => indexes.push(index),
-                None => return Err("Loki logging: label grouping index desynchronized".to_string()),
-            },
-            None => {
-                group_of.insert(labels, groups.len());
-                groups.push((labels, vec![index]));
-            }
-        }
-    }
+    let grouping_bytes = loki_grouping_byte_bound(batch.len()).ok_or_else(|| {
+        PayloadMaterializationError::BoundOverflowed
+            .reason()
+            .to_string()
+    })?;
+    let _grouping_reservation = ceiling.try_acquire(grouping_bytes).ok_or_else(|| {
+        PayloadMaterializationError::CeilingExhausted
+            .reason()
+            .to_string()
+    })?;
+    let mut order: Vec<usize> = Vec::with_capacity(batch.len());
+    order.extend(0..batch.len());
+    // `sort_unstable_by` allocates nothing (the stable sort would allocate an
+    // uncharged temporary); the index tiebreak makes it stable in effect.
+    order.sort_unstable_by(|left, right| match (batch.get(*left), batch.get(*right)) {
+        (Some(first), Some(second)) => first
+            .labels
+            .as_ref()
+            .cmp(second.labels.as_ref())
+            .then_with(|| left.cmp(right)),
+        // Unreachable: `order` holds exactly `0..batch.len()`.
+        _ => std::cmp::Ordering::Equal,
+    });
 
     write_loki_str(&mut *out, "{\"streams\":[")?;
-    for (group_index, (labels, indexes)) in groups.iter().enumerate() {
+    let mut position = 0usize;
+    let mut group_index = 0usize;
+    while position < order.len() {
+        let labels = loki_entry_at(batch, &order, position)
+            .ok_or_else(loki_grouping_desynchronized)?
+            .labels
+            .as_ref();
+        let mut group_end = position.saturating_add(1);
+        while let Some(entry) = loki_entry_at(batch, &order, group_end) {
+            if entry.labels.as_ref() != labels {
+                break;
+            }
+            group_end = group_end.saturating_add(1);
+        }
+
         if group_index > 0 {
             write_loki_str(&mut *out, ",")?;
         }
@@ -1040,11 +1146,10 @@ fn write_loki_payload<W: Write>(
         serde_json::to_writer(&mut *out, labels)
             .map_err(|error| format!("Loki logging: failed to serialize labels: {error}"))?;
         write_loki_str(&mut *out, ",\"values\":[")?;
-        for (value_index, entry_index) in indexes.iter().enumerate() {
-            let Some(entry) = batch.get(*entry_index) else {
-                return Err("Loki logging: label grouping index desynchronized".to_string());
-            };
-            if value_index > 0 {
+        for value_position in position..group_end {
+            let entry = loki_entry_at(batch, &order, value_position)
+                .ok_or_else(loki_grouping_desynchronized)?;
+            if value_position > position {
                 write_loki_str(&mut *out, ",")?;
             }
             write_loki_str(&mut *out, "[\"")?;
@@ -1055,6 +1160,8 @@ fn write_loki_payload<W: Write>(
             write_loki_str(&mut *out, "]")?;
         }
         write_loki_str(&mut *out, "]}")?;
+        position = group_end;
+        group_index = group_index.saturating_add(1);
     }
     write_loki_str(&mut *out, "]}")?;
     Ok(())
@@ -1090,11 +1197,14 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
     let (payload, content_encoding) = match build_loki_body(cfg, &batch) {
         Ok(body) => body,
         Err(error) => {
-            warn!(
-                plugin = "loki_logging",
-                "Loki logging: batch discarded before delivery ({} entries lost): {}",
-                entry_count,
-                error,
+            // Fixed-label, sampled loss accounting: under a saturated ceiling
+            // this path fires once per batch, so it must not warn once per
+            // batch. The record-scale counter is separate from the ceiling's
+            // reservation-rejection counter.
+            record_batch_materialization_loss(
+                LOKI_PLUGIN_NAME,
+                entry_count as u64,
+                error.reason(),
             );
             return Ok(());
         }
@@ -1151,26 +1261,26 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
 /// the serialized JSON buffer and, with gzip enabled, the compressed output — are
 /// reserved before a single byte is written and stay charged for as long as the
 /// returned payload (and every retry handle taken from it) lives. A refused
-/// reservation returns an error so the batch is dropped with loss accounting
-/// instead of being materialized outside the ceiling.
+/// reservation returns a fixed-label error so the batch is dropped with loss
+/// accounting instead of being materialized outside the ceiling.
 fn build_loki_body(
     cfg: &LokiFlushConfig,
     batch: &[LokiEntry],
-) -> Result<(ReservedPayload, Option<&'static str>), String> {
-    let bound = loki_payload_byte_bound(batch).ok_or_else(|| {
-        PayloadMaterializationError::BoundOverflowed
-            .reason()
-            .to_string()
-    })?;
+) -> Result<(ReservedPayload, Option<&'static str>), PayloadMaterializationError> {
+    let bound =
+        loki_payload_byte_bound(batch).ok_or(PayloadMaterializationError::BoundOverflowed)?;
     let json = materialize_reserved_payload(cfg.ceiling, bound, |writer| {
-        write_loki_payload(batch, &cfg.last_timestamp_ns, writer)
-    })
-    .map_err(|error| error.reason().to_string())?;
+        write_loki_payload(batch, &cfg.last_timestamp_ns, cfg.ceiling, writer)
+    })?;
 
     if !cfg.gzip {
         return Ok((json, None));
     }
     let Some(gzip_bound) = loki_gzip_byte_bound(json.len()) else {
+        record_batch_materialization_fallback(
+            LOKI_PLUGIN_NAME,
+            PayloadMaterializationError::BoundOverflowed.reason(),
+        );
         return Ok((json, None));
     };
     // The compressed buffer coexists with the JSON buffer until `json` is
@@ -1183,11 +1293,10 @@ fn build_loki_body(
     match compressed {
         Ok(compressed) => Ok((compressed, Some("gzip"))),
         Err(error) => {
-            warn!(
-                plugin = "loki_logging",
-                "Loki logging: gzip compression skipped, sending uncompressed: {}",
-                error.reason(),
-            );
+            // Complete delivery in a degraded representation, not a loss. The
+            // diagnostic is sampled by the shared accounting helper so a
+            // saturated ceiling cannot warn once per batch indefinitely.
+            record_batch_materialization_fallback(LOKI_PLUGIN_NAME, error.reason());
             Ok((json, None))
         }
     }
@@ -1431,7 +1540,8 @@ mod tests {
             },
         ];
         let mut out: Vec<u8> = Vec::new();
-        write_loki_payload(&batch, &AtomicU64::new(0), &mut out).expect("payload");
+        write_loki_payload(&batch, &AtomicU64::new(0), process_ceiling(), &mut out)
+            .expect("payload");
         let payload: Value = serde_json::from_slice(&out).expect("payload is valid JSON");
 
         let Some(streams) = payload["streams"].as_array() else {

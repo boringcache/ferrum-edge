@@ -13,7 +13,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, probe_charge_body_materialization_for_tests, render_prometheus, render_status_json,
     replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    serialize_json_each_row, set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
+    replay_spool_once_with_ceiling_for_tests, serialize_json_each_row,
+    set_spool_write_hook_for_tests, spool_artifact_byte_limit_for_tests,
     spool_claim_lease_secs_for_tests, spool_decompression_limit_for_tests,
     write_private_file_atomically_for_tests, write_private_file_atomically_with_fault_for_tests,
 };
@@ -5718,6 +5719,164 @@ fn chargeback_insert_body_is_refused_rather_than_serialized_under_a_saturated_ce
         "a refused body must not charge the ceiling"
     );
     assert!(ceiling.rejections() > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Spool replay retained-byte ownership — GHSA-83h5-52mw-f33p.
+//
+// Replay must not create an attacker-shaped representation outside the
+// retained-byte ceiling. The decoded artifact, its line index, the replay
+// worklist, and every chunk body are each reserved *before* they exist and held
+// for their real lifetime; 413 splits address line ranges instead of deep-
+// copying rows, so splitting cannot multiply retained row bytes.
+// ---------------------------------------------------------------------------
+
+/// A replay artifact big enough that its decoded bytes dominate every fixed
+/// allowance in the accounting below.
+fn spool_replay_events(count: usize) -> Vec<ChargeEvent> {
+    (0..count)
+        .map(|index| sample_event(&format!("evt-ceiling-{index:04}")))
+        .collect()
+}
+
+#[tokio::test]
+async fn spool_replay_refuses_before_decoding_when_the_ceiling_cannot_hold_the_artifact() {
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool.write_events(&spool_replay_events(8)).unwrap();
+    let encoded_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+
+    // One byte short of the decoded artifact itself. The old replay decoded the
+    // whole file into an owned `String` before anything was charged.
+    let ceiling = leaked_chargeback_test_ceiling(encoded_len - 1);
+    let error = replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
+        .await
+        .expect_err("a ceiling below the artifact size must defer replay");
+
+    assert!(
+        error.contains("ceiling"),
+        "the refusal must name the ceiling: {error}"
+    );
+    assert!(
+        !error.to_ascii_lowercase().contains("evt-"),
+        "refusal diagnostics must not carry charge-record fields: {error}"
+    );
+    assert_eq!(
+        ceiling.high_water(),
+        0,
+        "nothing may be decoded, indexed, or serialized before the refusal"
+    );
+    assert!(ceiling.rejections() > 0, "the refusal must be counted");
+    assert_eq!(ceiling.used(), 0, "a refused replay leaks no reservation");
+    assert!(
+        path.exists(),
+        "a ceiling refusal is retryable and must leave the durable record claimable"
+    );
+}
+
+#[tokio::test]
+async fn spool_replay_413_split_does_not_multiply_retained_row_bytes() {
+    let server = MockServer::start().await;
+    // Whole 8-row file -> 413, then each half -> 413 again, then the quarters
+    // deliver. Three levels of splitting over one decoded artifact.
+    mount_status_sequence(&server, &[413, 413, 200, 200, 413, 200, 200]).await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let events = spool_replay_events(8);
+    let path = spool.write_events(&events).unwrap();
+    let encoded_len = usize::try_from(fs::metadata(&path).unwrap().len()).unwrap();
+
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 2, ceiling)
+        .await
+        .expect("split replay must succeed");
+
+    assert!(!path.exists(), "split replay consumes the original file");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "every replay reservation releases exactly once"
+    );
+    assert_eq!(ceiling.rejections(), 0);
+
+    // Peak retention is one decoded artifact + its index + the worklist + the
+    // single largest chunk body. Splitting borrows line ranges, so it never adds
+    // another artifact-sized copy: three levels of halving stay well under two
+    // artifacts plus fixed slack.
+    let artifact_scale = encoded_len * 2 + 4_096;
+    assert!(
+        ceiling.high_water() > 0,
+        "the injected ceiling must really be on the replay path"
+    );
+    assert!(
+        ceiling.high_water() <= artifact_scale,
+        "413 splitting must not multiply retained row bytes: high_water={} artifact={} bound={}",
+        ceiling.high_water(),
+        encoded_len,
+        artifact_scale
+    );
+
+    // Ordering, event identity, and dead-letter semantics are unchanged.
+    let requests = wait_for_requests(&server, 7).await;
+    let delivered: String = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for index in 0..8 {
+        assert!(
+            delivered.contains(&format!("evt-ceiling-{index:04}")),
+            "split replay must preserve every event_id"
+        );
+    }
+}
+
+#[tokio::test]
+async fn spool_replay_releases_its_reservations_on_success_and_on_retryable_failure() {
+    let ceiling = leaked_chargeback_test_ceiling(8 * 1024 * 1024);
+
+    // Retryable path: unreachable ClickHouse. The artifact, index, worklist, and
+    // body all release even though delivery never completed.
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool.write_events(&spool_replay_events(4)).unwrap();
+    replay_spool_once_with_ceiling_for_tests(&spool, "http://127.0.0.1:1/", 4, ceiling)
+        .await
+        .expect_err("unreachable ClickHouse must be retryable");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a retryable failure releases every replay reservation"
+    );
+    assert!(path.exists(), "the durable record stays claimable");
+
+    // Permanent path: the file is dead-lettered, and that too releases.
+    let server = MockServer::start().await;
+    mount_status_sequence(&server, &[400]).await;
+    replay_spool_once_with_ceiling_for_tests(&spool, &server.uri(), 4, ceiling)
+        .await
+        .expect("a permanent rejection is not a replay error");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a dead-lettered replay releases every reservation"
+    );
+    assert_rejected_sidecar(&path, 400, "permanent_http");
+
+    // Success path.
+    let success_server = MockServer::start().await;
+    mount_status_sequence(&success_server, &[200]).await;
+    let delivered = spool.write_events(&spool_replay_events(3)).unwrap();
+    replay_spool_once_with_ceiling_for_tests(&spool, &success_server.uri(), 4, ceiling)
+        .await
+        .expect("delivery must succeed");
+    assert!(!delivered.exists(), "a delivered file is removed");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "a successful replay releases every reservation"
+    );
 }
 
 // ---------------------------------------------------------------------------
