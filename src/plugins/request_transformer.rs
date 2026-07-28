@@ -519,13 +519,6 @@ impl Plugin for RequestTransformer {
         !self.body_rules.is_empty()
     }
 
-    fn requires_decoded_query_params(&self) -> bool {
-        // Query rules match on percent-decoded names. Opt H3 into the same
-        // decoded map H1/H2 already use so later plugins observing
-        // `ctx.query_params` after a transform stay coherent across protocols.
-        !self.query_rules.is_empty()
-    }
-
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,

@@ -9045,6 +9045,40 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
 }
 
 #[test]
+fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability() {
+    // Ordered query rules parse retained raw/outbound query themselves. Opting
+    // into the shared pre-auth decoded map would change key_auth/JWT/HMAC and
+    // cache/policy acceptance merely by attaching an unrelated transformer.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({
+                "rules": [
+                    {"operation": "remove", "target": "query", "key": "token"}
+                ]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
+        "request_transformer query rules must preserve HTTP/3 raw pre-auth query materialization"
+    );
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let transformer = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "request_transformer")
+        .expect("request_transformer is cached");
+    assert!(!transformer.requires_decoded_query_params());
+}
+
+#[test]
 fn test_requires_udp_datagram_hooks_flag_with_udp_rate_limiting() {
     // udp_rate_limiting returns true for requires_udp_datagram_hooks()
     let config = make_config(

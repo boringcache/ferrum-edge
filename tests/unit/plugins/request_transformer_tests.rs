@@ -2223,3 +2223,126 @@ async fn test_query_transform_does_not_log_secret_values() {
     assert_secret_absent_from_logs(&logs, "never-log-this-token");
     assert_secret_absent_from_logs(&logs, "super-secret-page");
 }
+
+#[tokio::test]
+async fn test_query_rules_do_not_opt_into_decoded_h3_query_capability() {
+    // Query matching parses the retained raw/outbound query itself, so this
+    // plugin must not flip the shared pre-auth H3 decoded-query capability.
+    let with_query = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "token"}
+        ]
+    }))
+    .unwrap();
+    assert!(
+        !with_query.requires_decoded_query_params(),
+        "request_transformer must not force H3 pre-auth decoded query materialization"
+    );
+
+    let header_only = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "add", "target": "header", "key": "X-Test", "value": "1"}
+        ]
+    }))
+    .unwrap();
+    assert!(!header_only.requires_decoded_query_params());
+}
+
+#[tokio::test]
+async fn test_h3_raw_materialized_percent_encoded_query_name_transforms() {
+    // H3 pre-auth materialization keeps percent-encoded names in
+    // `ctx.query_params`. Ordered rules must still match the decoded name from
+    // the retained raw query and publish a decoded plugin-visible map afterward.
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "api key", "new_key": "api_key"},
+            {"operation": "update", "target": "query", "key": "tag", "value": "green"}
+        ]
+    }))
+    .unwrap();
+    assert!(!plugin.requires_decoded_query_params());
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("api%20key=secret&tag=red&keep=%ZZ".to_string());
+    ctx.materialize_query_params_raw();
+    assert_eq!(
+        ctx.query_params.get("api%20key").map(String::as_str),
+        Some("secret"),
+        "H3-style raw materialization must retain the percent-encoded name"
+    );
+    assert!(!ctx.query_params.contains_key("api key"));
+    assert_eq!(ctx.query_params.get("tag").map(String::as_str), Some("red"));
+
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.outbound_query_string(),
+        Some("api_key=secret&tag=green&keep=%ZZ")
+    );
+    assert!(!ctx.query_params.contains_key("api%20key"));
+    assert!(!ctx.query_params.contains_key("api key"));
+    assert_eq!(
+        ctx.query_params.get("api_key").map(String::as_str),
+        Some("secret")
+    );
+    assert_eq!(
+        ctx.query_params.get("tag").map(String::as_str),
+        Some("green")
+    );
+    // Unmodified keep pair stays in the decoded map with its lossy decode, while
+    // the outbound wire form retains the original invalid percent triplet.
+    assert_eq!(ctx.query_params.get("keep").map(String::as_str), Some("%ZZ"));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_runtime_disabled_query_rules_preserve_h3_raw_preauth_map() {
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::request_transformer::runtime_overlay;
+    let _guard = ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock();
+    runtime_overlay::reset_for_test();
+
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "query", "key": "token"}
+        ],
+        "runtime_overlay_scope": "gated",
+        "default_enabled": true
+    }))
+    .unwrap();
+    assert!(
+        !plugin.requires_decoded_query_params(),
+        "configured (even runtime-gated) query rules must not opt into decoded H3 materialization"
+    );
+
+    let mut fields = HashMap::new();
+    fields.insert(
+        "ferrum.request_transformer.gated.enabled".to_string(),
+        RuntimeValue::Bool(false),
+    );
+    runtime_overlay::apply_overlay(&MeshRuntimeOverlay { fields });
+
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("tok%65n=secret&keep=1".to_string());
+    ctx.materialize_query_params_raw();
+    let pre_auth = ctx.query_params.clone();
+    assert_eq!(
+        pre_auth.get("tok%65n").map(String::as_str),
+        Some("secret"),
+        "pre-auth map must remain H3 raw while rules are runtime-disabled"
+    );
+    assert!(!pre_auth.contains_key("token"));
+
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(ctx.outbound_query_string(), None);
+    assert_eq!(
+        ctx.query_params, pre_auth,
+        "runtime-disabled transformer must leave the H3 raw pre-auth map untouched"
+    );
+    assert!(!ctx.metadata.contains_key("ferrum:query_params_transformed"));
+
+    runtime_overlay::reset_for_test();
+}
