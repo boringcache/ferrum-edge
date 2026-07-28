@@ -3111,7 +3111,7 @@ mod sse_buffer_tests {
     /// O(total_input).
     #[test]
     fn cursor_compaction_stays_linear_for_many_small_events() {
-        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string());
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
         let event = b"data: {\"type\":\"ping\"}\n\n";
         let mut out = String::new();
         let iterations = 4_096usize;
