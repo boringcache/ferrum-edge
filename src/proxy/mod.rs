@@ -13133,15 +13133,16 @@ where
     // closed for a message that never completes (GHSA-qq94-2gv2-phh6).
     let client_fragment_meter = Arc::new(FragmentMeter::new());
     let backend_fragment_meter = Arc::new(FragmentMeter::new());
+    let (max_frames, max_duration) = fragment_policy.bounds();
     ws_stream.set_fragment_accounting(
         Some(Arc::clone(&client_fragment_meter)),
-        fragment_policy.max_incomplete_message_frames,
-        fragment_policy.max_incomplete_message_duration,
+        max_frames,
+        max_duration,
     );
     backend_ws_stream.set_fragment_accounting(
         Some(Arc::clone(&backend_fragment_meter)),
-        fragment_policy.max_incomplete_message_frames,
-        fragment_policy.max_incomplete_message_duration,
+        max_frames,
+        max_duration,
     );
 
     // Split streams for bidirectional communication
