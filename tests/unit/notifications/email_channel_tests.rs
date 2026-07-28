@@ -519,8 +519,38 @@ fn header_injection_through_template_values_is_neutralized() {
         .expect("message builds");
     let rendered = String::from_utf8(message).expect("message is utf-8");
     let header_block = rendered.split("\r\n\r\n").next().expect("headers present");
-    assert!(
-        !header_block.to_ascii_lowercase().contains("bcc:"),
+    // The `Bcc:` text survives only as inert `Subject:` content: the CR/LF that
+    // would have started a new field is folded to a space, so the header block
+    // still carries exactly the fields the channel emits and nothing else. That
+    // — not the absence of the literal substring — is the injection invariant.
+    let field_names: Vec<String> = header_block
+        .split("\r\n")
+        // Folded continuation lines (RFC 5322 §2.2.3) start with WSP and are
+        // part of the preceding field, not a new one.
+        .filter(|line| !line.starts_with([' ', '\t']))
+        .map(|line| match line.split_once(':') {
+            Some((name, _)) => name.to_ascii_lowercase(),
+            None => format!("<not a header field: {line}>"),
+        })
+        .collect();
+    let expected_fields: Vec<String> = [
+        "date",
+        "from",
+        "to",
+        "subject",
+        "message-id",
+        "mime-version",
+        "content-type",
+        "content-transfer-encoding",
+        "auto-submitted",
+        "x-ferrum-notification-severity",
+        "x-ferrum-notification-event-action",
+    ]
+    .iter()
+    .map(|name| (*name).to_string())
+    .collect();
+    assert_eq!(
+        field_names, expected_fields,
         "injected header survived: {header_block}"
     );
     // The base64 transfer encoding means the body can never contain the
