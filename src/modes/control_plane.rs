@@ -2007,10 +2007,20 @@ pub async fn run(
             // configured it is no longer an authorization input. It is still
             // read when present so cross-cluster mesh remote discovery — which
             // mints its own audience-bound tokens — keeps working.
-            (
-                env_config.cp_dp_grpc_jwt_secret.clone().unwrap_or_default(),
-                CpDpVerifier::TrustBundle(bundle),
-            )
+            // Cross-cluster remote discovery still *mints* with this secret. An
+            // absent one leaves the minting key empty, which produces tokens no
+            // peer will accept — surface that as a warning rather than letting
+            // remote discovery fail opaquely at the peer.
+            let minting_secret = env_config.cp_dp_grpc_jwt_secret.clone().unwrap_or_default();
+            if minting_secret.is_empty() && env_config.mesh_cluster_audience.is_some() {
+                warn!(
+                    "FERRUM_MESH_CLUSTER_AUDIENCE is set but FERRUM_CP_DP_GRPC_JWT_SECRET is \
+                     absent. Cross-cluster mesh remote discovery mints its audience-bound tokens \
+                     with that secret, so peer clusters will reject them. Inbound authorization \
+                     is unaffected: it is served by FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH."
+                );
+            }
+            (minting_secret, CpDpVerifier::TrustBundle(bundle))
         }
         None => {
             let secret = match env_config.cp_dp_grpc_jwt_secret.clone() {

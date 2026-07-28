@@ -435,6 +435,18 @@ impl CpDpVerifier {
                 if alg != Algorithm::HS256 {
                     return Err(TenantAuthRejectReason::AlgorithmMismatch);
                 }
+                // Defense in depth. Startup refuses an empty
+                // FERRUM_CP_DP_GRPC_JWT_SECRET when no trust bundle is
+                // configured, and a bundle-configured CP replaces this arm
+                // outright — but every server builder still *seeds* itself
+                // with `SharedSecret(jwt_secret)`, and a trust-bundle CP
+                // threads `cp_dp_grpc_jwt_secret.unwrap_or_default()` (i.e.
+                // `""`) into those builders for token *minting*. A future
+                // call site that forgot `.verifier(..)` would otherwise
+                // verify against the empty HS256 key and accept anything.
+                if secret.is_empty() {
+                    return Err(TenantAuthRejectReason::TokenValidation);
+                }
                 let key = DecodingKey::from_secret(secret.as_bytes());
                 Ok(f(&key, Algorithm::HS256, None))
             }
@@ -507,7 +519,7 @@ struct TrustBundleDocument {
     keys: Vec<TrustBundleKeyDocument>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrustBundleKeyDocument {
     /// Selector matched against the JWS header `kid`.
@@ -532,6 +544,25 @@ struct TrustBundleKeyDocument {
     /// Path to a PEM-encoded public key.
     #[serde(default)]
     public_key_path: Option<String>,
+}
+
+/// Renders only operator-authored identifiers. The `secret` field carries raw
+/// symmetric key material, so the derived `Debug` is deliberately not used —
+/// this mirrors [`TrustedKey`]'s hand-written impl and keeps an accidental
+/// `{:?}` in an error path from printing a tenant's signing secret.
+impl std::fmt::Debug for TrustBundleKeyDocument {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustBundleKeyDocument")
+            .field("kid", &self.kid)
+            .field("algorithm", &self.algorithm)
+            .field("namespaces", &self.namespaces)
+            .field("secret", &"<redacted>")
+            .field("secret_env", &self.secret_env)
+            .field("secret_path", &self.secret_path)
+            .field("public_key_pem", &self.public_key_pem)
+            .field("public_key_path", &self.public_key_path)
+            .finish()
+    }
 }
 
 impl TrustBundleKeyDocument {

@@ -755,6 +755,36 @@ fn verifier_debug_never_renders_material() {
     );
 }
 
+/// An empty shared secret must never verify anything.
+///
+/// Every CP gRPC server builder seeds itself with
+/// `CpDpVerifier::SharedSecret(jwt_secret)` before the caller overrides it, and
+/// a trust-bundle control plane threads
+/// `cp_dp_grpc_jwt_secret.unwrap_or_default()` — an empty string — into those
+/// builders so cross-cluster remote discovery can still mint. A call site that
+/// forgot `.verifier(..)` would then verify against the empty HS256 key, which
+/// every caller can reproduce. The verifier itself refuses instead.
+#[test]
+fn empty_shared_secret_never_verifies() {
+    let empty = CpDpVerifier::SharedSecret(String::new());
+    assert!(
+        empty
+            .with_decoding_key(None, Algorithm::HS256, |_, _, _| ())
+            .is_err(),
+        "an empty shared secret must not produce a usable decoding key"
+    );
+
+    // The non-empty secret still works, so this is a guard and not a
+    // regression of the supported single-namespace legacy posture.
+    let legacy = CpDpVerifier::SharedSecret(TENANT_A_SECRET.to_string());
+    assert!(
+        legacy
+            .with_decoding_key(None, Algorithm::HS256, |_, _, _| ())
+            .is_ok(),
+        "a configured shared secret must still verify"
+    );
+}
+
 // ── Claim presence vs server-derived effective set ───────────────────────
 
 /// A trust-bundle credential with `kid` but no `ns` claim must not satisfy the
