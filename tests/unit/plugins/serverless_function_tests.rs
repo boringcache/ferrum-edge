@@ -1766,22 +1766,14 @@ fn test_status_only_terminate_response_body_lifecycle_gate() {
     // Neither is the authored empty body under a status the contract never
     // authored.
     assert!(!synthetic_response_body_hooks_apply_for_test(
-        500,
-        true,
-        b"",
-        &plugins,
-        &ctx
+        500, true, b"", &plugins, &ctx
     ));
 
     // The authored status-only representation itself still has to clear the
     // explicit zero-byte inspection gate; a plugin that only asked for ordinary
     // response-body buffering does not open it.
     assert!(!synthetic_response_body_hooks_apply_for_test(
-        200,
-        true,
-        b"",
-        &plugins,
-        &ctx
+        200, true, b"", &plugins, &ctx
     ));
 }
 
