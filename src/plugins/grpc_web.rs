@@ -491,6 +491,13 @@ pub(crate) const MAX_REQUEST_TRAILER_ENTRIES: usize = 64;
 const MAX_REQUEST_TRAILER_NAME_BYTES: usize = 128;
 /// Maximum length of a single request trailer value.
 const MAX_REQUEST_TRAILER_VALUE_BYTES: usize = 4096;
+/// Maximum base64-encoded JSON staging size for one validated trailer block.
+///
+/// JSON escaping can at most double the accepted 8 KiB wire payload; the
+/// remaining factor covers tuple punctuation and base64 expansion. Check this
+/// before decoding plugin-writable metadata so a forged staging value cannot
+/// trigger an unbounded allocation.
+const MAX_REQUEST_TRAILER_STAGING_BYTES: usize = 4 * MAX_REQUEST_TRAILER_BLOCK_BYTES;
 
 const ERR_TRAILER_COMPRESSED: &str =
     "compressed gRPC-Web request trailer frames are not defined by the protocol";
@@ -512,6 +519,7 @@ const ERR_TRAILER_VALUE_INVALID: &str = "invalid gRPC-Web request trailer value"
 const ERR_TRAILER_VALUE_TOO_LONG: &str = "gRPC-Web request trailer value is too long";
 const ERR_TRAILER_BIN_VALUE_INVALID: &str = "gRPC-Web request binary trailer value is not base64";
 const ERR_TRAILER_TOO_MANY_ENTRIES: &str = "too many gRPC-Web request trailer entries";
+const ERR_TRAILER_STAGING_FAILED: &str = "failed to stage validated gRPC-Web request trailers";
 
 /// A validated terminal trailer frame split off a gRPC-Web request body.
 pub(crate) struct RequestTrailerFrame {
@@ -682,6 +690,10 @@ fn parse_request_trailer_block(payload: &[u8]) -> Result<Vec<(String, String)>, 
 #[inline]
 fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
     name.starts_with(':')
+        // PROTOCOL-HTTP2 reserves the entire grpc-* namespace. Known request
+        // and response control fields are listed below for documentation, but
+        // an unknown future control field must fail closed too.
+        || name.starts_with("grpc-")
         || is_internal_grpc_web_bridge_header(name)
         || name == HEADER_GRPC_WEB_MODE
         // Reserved gateway assertions the gRPC header merge re-adds from
@@ -739,8 +751,12 @@ fn is_base64_metadata_value(value: &str) -> bool {
 }
 
 /// Serialize validated request trailers for owner-scoped request staging.
-fn encode_request_trailers(trailers: &[(String, String)]) -> String {
-    BASE64.encode(serde_json::to_string(trailers).unwrap_or_default())
+fn encode_request_trailers(
+    trailers: &[(String, String)],
+) -> Result<String, &'static str> {
+    serde_json::to_vec(trailers)
+        .map(|raw| BASE64.encode(raw))
+        .map_err(|_| ERR_TRAILER_STAGING_FAILED)
 }
 
 /// Decode the staged request trailer block into a native HTTP/2 trailer map.
@@ -754,18 +770,29 @@ pub(crate) fn staged_request_trailers(
     metadata: &HashMap<String, String>,
 ) -> Option<http::HeaderMap> {
     let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
+    if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {
+        return None;
+    }
     let raw = BASE64.decode(encoded).ok()?;
     let parsed: Vec<(String, String)> = serde_json::from_slice(&raw).ok()?;
     if parsed.is_empty() || parsed.len() > MAX_REQUEST_TRAILER_ENTRIES {
         return None;
     }
     let mut map = http::HeaderMap::with_capacity(parsed.len());
+    let mut reconstructed_wire_bytes = 0usize;
     for (name, value) in parsed {
+        reconstructed_wire_bytes = reconstructed_wire_bytes
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            // `: ` plus CRLF.
+            .checked_add(4)?;
         if !is_grpc_metadata_name(&name)
             || is_forbidden_grpc_web_request_trailer_name(&name)
             || name.len() > MAX_REQUEST_TRAILER_NAME_BYTES
             || value.len() > MAX_REQUEST_TRAILER_VALUE_BYTES
+            || reconstructed_wire_bytes > MAX_REQUEST_TRAILER_BLOCK_BYTES
             || !is_valid_trailer_value(&value)
+            || (name.ends_with("-bin") && !is_base64_metadata_value(&value))
         {
             return None;
         }
@@ -2887,11 +2914,12 @@ impl Plugin for GrpcWebPlugin {
             return None;
         }
 
-        // Base64 decode — gRPC-Web text mode uses standard base64.
+        // Base64 decode — gRPC-Web text mode uses standard base64 and may
+        // concatenate independently padded flush segments.
         // On failure, return the raw body unchanged; on_final_request_body will
         // reject it with a 400 after validating gRPC framing.
-        match BASE64.decode(body) {
-            Ok(decoded) => {
+        match decode_grpc_web_text_body(body) {
+            Some(decoded) => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
@@ -2901,11 +2929,10 @@ impl Plugin for GrpcWebPlugin {
                 );
                 Some(decoded)
             }
-            Err(e) => {
+            None => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
-                    error = %e,
                     "Failed to base64-decode gRPC-Web text request body"
                 );
                 // Return None to pass through; on_final_request_body will catch
@@ -2948,8 +2975,8 @@ impl Plugin for GrpcWebPlugin {
         // Decode from owner-scoped metadata, not the shared `x-grpc-web-mode`
         // staging header — siblings must never collide on that header.
         let decoded = if is_text {
-            match BASE64.decode(body) {
-                Ok(decoded) => {
+            match decode_grpc_web_text_body(body) {
+                Some(decoded) => {
                     debug!(
                         plugin = "grpc_web",
                         instance = %self.instance_id_str,
@@ -2959,11 +2986,10 @@ impl Plugin for GrpcWebPlugin {
                     );
                     Some(decoded)
                 }
-                Err(e) => {
+                None => {
                     debug!(
                         plugin = "grpc_web",
                         instance = %self.instance_id_str,
-                        error = %e,
                         "Failed to base64-decode gRPC-Web text request body"
                     );
                     // Leave the body untouched; the envelope validator rejects
@@ -3012,9 +3038,23 @@ impl Plugin for GrpcWebPlugin {
                     data_len = frame.data_end,
                     "Converted gRPC-Web request trailer frame to native gRPC trailers"
                 );
+                let encoded = match encode_request_trailers(&frame.trailers) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        ctx.metadata.insert(
+                            META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
+                            error.to_string(),
+                        );
+                        ctx.metadata.insert(
+                            META_GRPC_WEB_REQUEST_DECODED.to_string(),
+                            self.instance_id_str.clone(),
+                        );
+                        return None;
+                    }
+                };
                 ctx.metadata.insert(
                     META_GRPC_WEB_REQUEST_TRAILERS.to_string(),
-                    encode_request_trailers(&frame.trailers),
+                    encoded,
                 );
                 Some(framed[..frame.data_end].to_vec())
             }

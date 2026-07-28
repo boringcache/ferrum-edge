@@ -1048,6 +1048,15 @@ fn grpc_web_text_body(binary: &[u8]) -> Vec<u8> {
         .into_bytes()
 }
 
+fn segmented_grpc_web_text_body(message: &[u8], trailer: &[u8]) -> Vec<u8> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let mut wire = STANDARD.encode(message);
+    wire.push_str(&STANDARD.encode(trailer));
+    wire.into_bytes()
+}
+
 #[test]
 fn split_request_trailer_frame_reports_data_boundary_and_metadata() {
     let mut body = request_frame(0x00, b"hello");
@@ -1156,6 +1165,7 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
         ("forbidden framing name", b"content-length: 0\r\n"),
         ("forbidden hop-by-hop name", b"connection: close\r\n"),
         ("forbidden initial-only name", b"grpc-timeout: 1S\r\n"),
+        ("future reserved grpc name", b"grpc-future-control: value\r\n"),
         ("forbidden terminal status", b"grpc-status: 0\r\n"),
         ("forbidden credential", b"authorization: Bearer x\r\n"),
         (
@@ -1189,16 +1199,21 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
 
 #[tokio::test]
 async fn request_trailer_frame_is_staged_and_stripped_in_binary_and_text_modes() {
-    let mut body = request_frame(0x00, b"hello");
-    let message_only = body.clone();
-    body.extend_from_slice(&request_frame(
+    let message_only = request_frame(0x00, b"hello");
+    let trailer = request_frame(
         0x80,
         b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n",
-    ));
+    );
+    let mut body = message_only.clone();
+    body.extend_from_slice(&trailer);
 
     for (content_type, wire) in [
         ("application/grpc-web+proto", body.clone()),
         ("application/grpc-web-text+proto", grpc_web_text_body(&body)),
+        (
+            "application/grpc-web-text+proto",
+            segmented_grpc_web_text_body(&message_only, &trailer),
+        ),
     ] {
         let (transformed, staged, outcome) =
             run_grpc_web_request_pipeline(content_type, &wire).await;
@@ -1277,12 +1292,17 @@ async fn staged_request_trailers_reject_a_tampered_staging_block() {
     let mut ctx = create_grpc_web_context("application/grpc-web+proto");
     plugin.on_request_received(&mut ctx).await;
 
+    let oversized_value = format!("x{}", "a".repeat(9 * 1024));
+    let oversized_staging = serde_json::to_string(&vec![("x-app-id", oversized_value)])
+        .expect("test staging serializes");
     for (case, staged) in [
         ("forbidden name", r#"[["authorization","Bearer x"]]"#),
         ("pseudo header", r#"[[":method","DELETE"]]"#),
         ("CRLF value", "[[\"x-app-id\",\"4\\r\\n2\"]]"),
+        ("invalid binary value", r#"[["x-trace-bin","not base64!"]]"#),
         ("empty block", "[]"),
         ("not json", "definitely not json"),
+        ("oversized reconstructed block", oversized_staging.as_str()),
     ] {
         ctx.metadata.insert(
             "grpc_web.request_trailers".to_string(),
