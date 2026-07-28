@@ -86,13 +86,16 @@ async fn supervise_observes_ordinary_recv_loop_error() {
     .await
     .expect_err("ordinary recv-loop error must fail the listener");
 
+    // anyhow `context` keeps the source chain; Display shows only the outer
+    // message, so inspect the alternate pretty form for both layers.
+    let rendered = format!("{err:#}");
     assert!(
-        err.to_string().contains("exited with error"),
-        "failure must surface the ordinary error path; got {err}"
+        rendered.contains("exited with error"),
+        "failure must surface the ordinary error path; got {rendered}"
     );
     assert!(
-        err.to_string().contains("permanent I/O failure"),
-        "failure must preserve the recv-loop context; got {err}"
+        rendered.contains("permanent I/O failure"),
+        "failure must preserve the recv-loop source chain; got {rendered}"
     );
     assert!(
         began.elapsed() < Duration::from_secs(2),

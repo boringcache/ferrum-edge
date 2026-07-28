@@ -2888,6 +2888,7 @@ pub(crate) fn fail_dtls_listener_on_recv_loop_exit(
 /// [`start_dtls_frontend_listener`]. This seam lets external tests drive
 /// panic/error/shutdown classification with synthetic tasks without a
 /// production panic or socket fault injector.
+#[allow(dead_code)] // Intentionally exposed via library `_test_support`; unused by the binary target.
 pub(crate) async fn supervise_dtls_recv_loop_task(
     mut server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
     mut shutdown_rx: watch::Receiver<bool>,
