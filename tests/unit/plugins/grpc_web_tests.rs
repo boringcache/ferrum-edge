@@ -1165,7 +1165,10 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
         ("forbidden framing name", b"content-length: 0\r\n"),
         ("forbidden hop-by-hop name", b"connection: close\r\n"),
         ("forbidden initial-only name", b"grpc-timeout: 1S\r\n"),
-        ("future reserved grpc name", b"grpc-future-control: value\r\n"),
+        (
+            "future reserved grpc name",
+            b"grpc-future-control: value\r\n",
+        ),
         ("forbidden terminal status", b"grpc-status: 0\r\n"),
         ("forbidden credential", b"authorization: Bearer x\r\n"),
         (
@@ -1200,10 +1203,7 @@ fn split_request_trailer_frame_rejects_every_malicious_trailer_shape() {
 #[tokio::test]
 async fn request_trailer_frame_is_staged_and_stripped_in_binary_and_text_modes() {
     let message_only = request_frame(0x00, b"hello");
-    let trailer = request_frame(
-        0x80,
-        b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n",
-    );
+    let trailer = request_frame(0x80, b"x-app-id: 42\r\nx-trace-bin: AAEC\r\n");
     let mut body = message_only.clone();
     body.extend_from_slice(&trailer);
 

@@ -751,9 +751,7 @@ fn is_base64_metadata_value(value: &str) -> bool {
 }
 
 /// Serialize validated request trailers for owner-scoped request staging.
-fn encode_request_trailers(
-    trailers: &[(String, String)],
-) -> Result<String, &'static str> {
+fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'static str> {
     serde_json::to_vec(trailers)
         .map(|raw| BASE64.encode(raw))
         .map_err(|_| ERR_TRAILER_STAGING_FAILED)
@@ -3052,10 +3050,8 @@ impl Plugin for GrpcWebPlugin {
                         return None;
                     }
                 };
-                ctx.metadata.insert(
-                    META_GRPC_WEB_REQUEST_TRAILERS.to_string(),
-                    encoded,
-                );
+                ctx.metadata
+                    .insert(META_GRPC_WEB_REQUEST_TRAILERS.to_string(), encoded);
                 Some(framed[..frame.data_end].to_vec())
             }
             None => None,
