@@ -9648,7 +9648,7 @@ pub(crate) fn finalize_successful_websocket_response_headers(
 
 fn build_websocket_error_response(
     status: StatusCode,
-    body: &str,
+    body: &'static str,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> Response<ProxyBody> {
     let mut response_headers =
