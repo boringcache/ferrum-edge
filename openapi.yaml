@@ -18973,10 +18973,15 @@ components:
 
     RequestMirrorConfig:
       type: object
+      additionalProperties: false
       description: |
         Plugin: request_mirror — Duplicates live proxy traffic to a secondary
         destination for shadow testing, validation, or migration checks
-        without affecting client responses. Mirrored requests are
+        without affecting client responses. Only the properties below are
+        admitted; unknown top-level keys are rejected so misspelled sampling,
+        body, protocol, or endpoint controls cannot silently fall back to
+        security-sensitive defaults (cleartext http, 100% mirroring, body
+        mirroring enabled). Mirrored requests are
         fire-and-forget: spawned via `tokio::spawn`, the gateway never waits
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured

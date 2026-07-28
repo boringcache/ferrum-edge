@@ -159,7 +159,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -178,6 +178,28 @@ use crate::proxy::headers::{
     SecondaryRequestHostPolicy, filter_secondary_request_headers,
     synthesize_grpc_te_trailers_if_needed,
 };
+use crate::util::unknown_keys::suggest_key;
+
+/// Authoritative closed set of top-level `request_mirror` configuration keys.
+///
+/// Constructor admission, OpenAPI `RequestMirrorConfig`, and operator docs must
+/// stay in lockstep with this list so misspelled sampling, body, protocol, or
+/// endpoint controls cannot silently fall back to security-sensitive defaults.
+pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
+    "forward_sensitive_header_allowlist",
+    "forward_sensitive_headers",
+    "max_in_flight",
+    "max_response_body_bytes",
+    "max_retained_request_body_bytes",
+    "mirror_host",
+    "mirror_path",
+    "mirror_port",
+    "mirror_protocol",
+    "mirror_request_body",
+    "mirror_timeout_ms",
+    "percentage",
+    "sensitive_header_patterns",
+];
 
 /// Default cap on the size of mirror response bodies the gateway is willing
 /// to drain. The body is discarded — only its length is reported in mirror
@@ -762,9 +784,13 @@ impl RequestMirror {
         http_client: PluginHttpClient,
         plugin_config_id: Option<&str>,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("request_mirror: config must be an object".to_string());
-        }
+        let config_obj = config.as_object().ok_or_else(|| {
+            format!(
+                "request_mirror: config must be an object; allowed keys: {}",
+                REQUEST_MIRROR_CONFIG_KEYS.join(", ")
+            )
+        })?;
+        reject_unknown_request_mirror_keys(config_obj)?;
 
         let raw_mirror_host = optional_string(config, "mirror_host")?
             .filter(|s| !s.is_empty())
@@ -1074,6 +1100,30 @@ impl RequestMirror {
     pub(crate) fn should_mirror_for_test(&self) -> bool {
         self.should_mirror()
     }
+}
+
+fn reject_unknown_request_mirror_keys(object: &Map<String, Value>) -> Result<(), String> {
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .filter(|key| !REQUEST_MIRROR_CONFIG_KEYS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let details: Vec<String> = unknown
+        .into_iter()
+        .map(|key| match suggest_key(key, REQUEST_MIRROR_CONFIG_KEYS) {
+            Some(suggestion) => format!("'{key}' (did you mean '{suggestion}'?)"),
+            None => format!("'{key}'"),
+        })
+        .collect();
+    Err(format!(
+        "request_mirror: unknown configuration key(s): {}; allowed keys: {}",
+        details.join(", "),
+        REQUEST_MIRROR_CONFIG_KEYS.join(", ")
+    ))
 }
 
 fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String> {
