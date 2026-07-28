@@ -182,6 +182,72 @@ async fn request_context_debug_redacts_request_deduplication_state() {
     }
 }
 
+#[tokio::test]
+async fn dedup_lifecycle_state_never_reaches_transaction_log_metadata() {
+    use ferrum_edge::_test_support::clone_log_metadata;
+
+    let plugin = make_plugin(json!({}));
+    let mut ctx = body_ctx("POST", "/payments", br#"{"amount":100}"#);
+    let mut upstream_headers = keyed_headers("log-projection-key", "api.example.test", 14);
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut upstream_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(request_identity(&plugin, &ctx).is_some());
+
+    // Defense-in-depth: even if a hostile/custom producer reintroduces the
+    // legacy public-metadata names, the shared fail-closed filter omits them.
+    for (idx, key) in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ctx.metadata
+            .insert(key.to_string(), format!("planted-dedup-sentinel-{idx}"));
+    }
+
+    let logged = clone_log_metadata(&ctx);
+    for key in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ] {
+        assert!(
+            !logged.contains_key(key),
+            "{key} must never enter transaction-log metadata"
+        );
+    }
+    for idx in 0..4 {
+        let sentinel = format!("planted-dedup-sentinel-{idx}");
+        assert!(
+            !logged.values().any(|value| value.contains(&sentinel)),
+            "dedup lifecycle value leaked into log metadata"
+        );
+    }
+
+    // Incomplete stream termination retains typed ownership until TTL without
+    // copying it into public metadata.
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert!(request_identity(&plugin, &ctx).is_some());
+    let after_incomplete = clone_log_metadata(&ctx);
+    for key in [
+        "_dedup_key",
+        "_dedup_fingerprint",
+        "_dedup_local_inflight_token",
+        "_dedup_redis_lock_token",
+    ] {
+        assert!(!after_incomplete.contains_key(key));
+    }
+}
+
 fn keyed_headers(key: &str, host: &str, body_len: usize) -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("idempotency-key".to_string(), key.to_string());
@@ -3324,12 +3390,9 @@ async fn terminal_serverless_origin_encoded_marker_releases_dedup_owner() {
 }
 
 #[tokio::test]
-async fn terminal_serverless_query_transform_releases_dedup_owner() {
-    // A request_transformer query rule recorded a decoded-query transform that
-    // the raw-query payload cannot faithfully honor. The serverless egress fails
-    // closed before any external call, so the dedup in-flight lock is released.
-    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
-
+async fn terminal_serverless_ambiguous_query_releases_dedup_owner() {
+    // A governed query ambiguity (`+`) fails closed before any external call,
+    // so the dedup in-flight lock is released for an identical retry.
     let dedup = make_plugin(json!({}));
     let serverless = ServerlessFunction::new(
         &json!({
@@ -3342,13 +3405,8 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
     )
     .unwrap();
     let mut ctx = new_ctx("POST", "/api");
-    // Raw query is otherwise valid; the transform marker alone drives the reject.
-    ctx.set_raw_query_string("page=1&sort=asc".to_string());
-    ctx.metadata.insert(
-        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
-    let mut headers = HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+    ctx.set_raw_query_string("name=alice+bob".to_string());
+    let mut headers = HashMap::from([("idempotency-key".to_string(), "ambiguous".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::Continue
@@ -3360,21 +3418,17 @@ async fn terminal_serverless_query_transform_releases_dedup_owner() {
                 headers,
                 body,
             } => (status_code, headers, body),
-            other => panic!("transformed-query composition must reject, got {other:?}"),
+            other => panic!("ambiguous query must reject, got {other:?}"),
         };
-    assert!(body.contains("query_params_transformed"));
+    assert!(body.contains("ambiguous_query_encoding"));
     dedup
         .on_response_committed(&mut ctx, status, &response_headers, body.as_bytes())
         .await;
 
     let mut retry_ctx = new_ctx("POST", "/api");
-    retry_ctx.set_raw_query_string("page=1&sort=asc".to_string());
-    retry_ctx.metadata.insert(
-        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
-        "true".to_string(),
-    );
+    retry_ctx.set_raw_query_string("name=alice+bob".to_string());
     let mut retry_headers =
-        HashMap::from([("idempotency-key".to_string(), "transformed".to_string())]);
+        HashMap::from([("idempotency-key".to_string(), "ambiguous".to_string())]);
     assert!(matches!(
         dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await,
         PluginResult::Continue

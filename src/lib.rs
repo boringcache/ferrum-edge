@@ -3324,6 +3324,11 @@ pub mod _test_support {
         );
     }
 
+    /// Canonical backend-visible query (transformer outbound + auth strips).
+    pub fn effective_backend_query_string_for_test(ctx: &crate::plugins::RequestContext) -> String {
+        crate::proxy::effective_backend_query_string(ctx).into_owned()
+    }
+
     pub fn collect_forwardable_websocket_headers_for_test(
         raw_headers: &hyper::HeaderMap,
         proxy_headers: &HashMap<String, String>,
