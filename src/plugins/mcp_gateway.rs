@@ -3224,7 +3224,8 @@ impl McpGateway {
             return self.handle_transparent_jsonrpc_batch(ctx, headers, batch);
         }
 
-        self.handle_aggregate_jsonrpc_batch(ctx, headers, batch).await
+        self.handle_aggregate_jsonrpc_batch(ctx, headers, batch)
+            .await
     }
 
     /// Transparent batches keep one upstream and therefore Continue through the
@@ -3357,11 +3358,9 @@ impl McpGateway {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     saw_response_bearing = true;
-                    if let Err(response) = self.push_bounded_batch_response(
-                        &mut responses,
-                        &mut response_bytes,
-                        error,
-                    ) {
+                    if let Err(response) =
+                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, error)
+                    {
                         self.clear_batch_item_routing_state(ctx);
                         *headers = inbound_headers;
                         return response;
@@ -3435,17 +3434,18 @@ impl McpGateway {
                             session_header = Some((name, value));
                         }
                     }
-                    if let Err(response) = self.push_bounded_batch_response(
-                        &mut responses,
-                        &mut response_bytes,
-                        value,
-                    ) {
+                    if let Err(response) =
+                        self.push_bounded_batch_response(&mut responses, &mut response_bytes, value)
+                    {
                         self.clear_batch_item_routing_state(ctx);
                         *headers = inbound_headers;
                         return response;
                     }
                 }
-                BatchItemOutcome::UpstreamBound { id, is_notification } => {
+                BatchItemOutcome::UpstreamBound {
+                    id,
+                    is_notification,
+                } => {
                     // Never dial upstream from before_proxy: that would skip
                     // every later configured plugin phase for this member.
                     self.clear_batch_item_routing_state(ctx);
@@ -3558,9 +3558,8 @@ impl McpGateway {
                 "Invalid MCP JSON-RPC request",
             ));
         }
-        parse_mcp_envelope_value(item).map_err(|_| {
-            json_rpc_error_value(member_id, -32600, "Invalid MCP JSON-RPC request")
-        })
+        parse_mcp_envelope_value(item)
+            .map_err(|_| json_rpc_error_value(member_id, -32600, "Invalid MCP JSON-RPC request"))
     }
 
     fn push_bounded_batch_response(
@@ -3654,7 +3653,8 @@ impl McpGateway {
         ctx.metadata.remove(METADATA_RESPONSE_REWRITE_METHOD_KEY);
         ctx.metadata.remove(METADATA_RESPONSE_REWRITE_SERVER_KEY);
         ctx.metadata.remove(METADATA_RESPONSE_REWRITE_SESSION_KEY);
-        ctx.metadata.remove(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY);
+        ctx.metadata
+            .remove(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY);
     }
 
     fn batch_forbids_upstream(&self, ctx: &RequestContext) -> bool {
@@ -3930,7 +3930,6 @@ impl McpGateway {
             _ => json_rpc_error(envelope.id.clone(), -32601, "MCP method not found", None),
         }
     }
-
 }
 
 #[async_trait]
@@ -5020,7 +5019,10 @@ fn classify_batch_item_result(
             // batch propagation / final response stamping (case-insensitive).
             let session_header = headers.iter().find_map(|(name, value)| {
                 if name.eq_ignore_ascii_case(downstream_session_header) {
-                    Some((downstream_session_header.to_ascii_lowercase(), value.clone()))
+                    Some((
+                        downstream_session_header.to_ascii_lowercase(),
+                        value.clone(),
+                    ))
                 } else {
                     None
                 }

@@ -5508,7 +5508,10 @@ async fn aggregate_batch_empty_is_invalid_request() {
     let (mut ctx, mut headers) = mcp_ctx(json!([]));
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    assert!(body.is_object(), "empty batch must yield a single Response object");
+    assert!(
+        body.is_object(),
+        "empty batch must yield a single Response object"
+    );
     assert_eq!(body["error"]["code"], -32600);
     assert_eq!(body["error"]["message"], "Invalid Request");
 }
@@ -5554,7 +5557,10 @@ async fn aggregate_batch_nested_array_is_per_item_invalid() {
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], Value::Null);
     assert_eq!(responses[0]["error"]["code"], -32600);
-    assert!(responses[1].get("result").is_some(), "valid sibling must continue");
+    assert!(
+        responses[1].get("result").is_some(),
+        "valid sibling must continue"
+    );
 }
 
 #[tokio::test]
@@ -5598,8 +5604,14 @@ async fn aggregate_batch_mixed_notifications_and_requests_preserves_order_and_id
     ]));
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("mixed batch must return a response array");
-    assert_eq!(responses.len(), 2, "notifications must be omitted from the response array");
+    let responses = body
+        .as_array()
+        .expect("mixed batch must return a response array");
+    assert_eq!(
+        responses.len(),
+        2,
+        "notifications must be omitted from the response array"
+    );
     assert_eq!(responses[0]["id"], "req-a");
     assert!(responses[0].get("result").is_some());
     assert_eq!(responses[1]["id"], 7);
@@ -5621,7 +5633,9 @@ async fn aggregate_batch_partial_invalidity_keeps_valid_siblings() {
     ]));
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("partial invalidity must still return an array");
+    let responses = body
+        .as_array()
+        .expect("partial invalidity must still return an array");
     assert_eq!(responses.len(), 3);
     assert!(responses[0].get("result").is_some());
     assert_eq!(responses[1]["id"], 2);
@@ -5784,7 +5798,9 @@ async fn aggregate_batch_non_object_mixed_keeps_valid_siblings() {
     ]));
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("mixed non-object batch must return an array");
+    let responses = body
+        .as_array()
+        .expect("mixed non-object batch must return an array");
     assert_eq!(responses.len(), 3);
     assert_eq!(responses[0]["id"], Value::Null);
     assert_eq!(responses[0]["error"]["code"], -32600);
@@ -5855,8 +5871,14 @@ async fn aggregate_batch_passthrough_notification_mixed_with_ping_omits_notify()
     headers.insert("mcp-session-id".to_string(), session_id);
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("mixed batch keeps response-bearing members");
-    assert_eq!(responses.len(), 1, "notifications must never append a response element");
+    let responses = body
+        .as_array()
+        .expect("mixed batch keeps response-bearing members");
+    assert_eq!(
+        responses.len(),
+        1,
+        "notifications must never append a response element"
+    );
     assert_eq!(responses[0]["id"], 9);
     assert!(responses[0].get("result").is_some());
 }
@@ -6124,7 +6146,9 @@ async fn transparent_batch_invalid_sibling_fails_closed_without_forward() {
     ]));
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("transparent invalid sibling must be synthetic array");
+    let responses = body
+        .as_array()
+        .expect("transparent invalid sibling must be synthetic array");
     assert_eq!(responses.len(), 3);
     assert_eq!(responses[0]["error"]["code"], -32600);
     assert_eq!(responses[1]["id"], Value::Null);
