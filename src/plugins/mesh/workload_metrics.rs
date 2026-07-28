@@ -2030,7 +2030,8 @@ mod tests {
         }));
         assert!(
             invalid
-                .expect_err("invalid env var name")
+                .err()
+                .expect("invalid env var name")
                 .contains("invalid environment variable name")
         );
 
@@ -2039,7 +2040,8 @@ mod tests {
         }));
         assert!(
             sensitive
-                .expect_err("sensitive env var name")
+                .err()
+                .expect("sensitive env var name")
                 .contains("cannot copy sensitive environment variable")
         );
 
@@ -2052,7 +2054,8 @@ mod tests {
             let error = WorkloadMetrics::new(&json!({
                 "custom_env_tags": invalid
             }))
-            .expect_err("invalid custom_env_tags shape must fail closed");
+            .err()
+            .expect("invalid custom_env_tags shape must fail closed");
             assert!(
                 error.contains("custom_env_tags"),
                 "expected field-specific custom_env_tags error, got {error}"

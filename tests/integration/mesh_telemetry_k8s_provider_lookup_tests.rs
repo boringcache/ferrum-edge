@@ -762,7 +762,9 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
             "cluster": ENV_VAR
         },
     }));
-    let oversized_err = oversized.expect_err("oversized resolved env value fails closed");
+    let oversized_err = oversized
+        .err()
+        .expect("oversized resolved env value fails closed");
     assert!(
         oversized_err.contains("exceeds 1024 bytes"),
         "got {oversized_err}"
