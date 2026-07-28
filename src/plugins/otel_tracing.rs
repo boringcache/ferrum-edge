@@ -1556,6 +1556,7 @@ pub(crate) fn trace_exporters_from_providers(
 
 /// Observations from [`probe_trace_batch_materialization_for_test`].
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // field reads happen only in `_test_support` wrappers
 pub(crate) struct TraceMaterializationProbe {
     /// Ceiling bytes held by the queued spans alone.
     pub(crate) queued_bytes: usize,

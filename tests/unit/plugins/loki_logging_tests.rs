@@ -6,6 +6,7 @@ use ferrum_edge::plugins::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
         LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LokiLogging,
     },
+    utils::byte_budget::process_retained_bytes,
 };
 use serde_json::json;
 use std::io::{self, Read};
@@ -82,6 +83,27 @@ async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("Loki mock did not receive {expected} requests in time");
+}
+
+/// Poll until the process-wide retained-byte ceiling drops back to `baseline`.
+///
+/// Mock request receipt is not a delivery-completion boundary: the reserved
+/// batch payload stays charged until the HTTP round-trip finishes.
+async fn wait_for_process_retained_bytes_at_most(baseline: usize, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if process_retained_bytes() <= baseline {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "process retained bytes did not drop to {baseline} within {:?}; still {}",
+                timeout,
+                process_retained_bytes()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -909,6 +931,7 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
     plugin.start_background_tasks().expect("live start");
 
     plugin.commit_background_tasks();
+    let retained_baseline = process_retained_bytes();
     let large_path = "x".repeat(1800);
     let mut first = create_test_transaction_summary();
     first.request_path = format!("/first-budget-canary/{large_path}");
@@ -919,7 +942,9 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
     rejected_while_reserved.request_path = format!("/rejected-budget-canary/{large_path}");
     plugin.log(&rejected_while_reserved).await;
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The mock response is delayed; the reserved delivery payload stays charged
+    // until the HTTP round-trip completes, not when the request is recorded.
+    wait_for_process_retained_bytes_at_most(retained_baseline, Duration::from_secs(2)).await;
     let mut admitted_after_release = first;
     admitted_after_release.request_path = format!("/released-budget-canary/{large_path}");
     plugin.log(&admitted_after_release).await;
