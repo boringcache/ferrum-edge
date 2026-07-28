@@ -94,12 +94,13 @@ pub enum FieldSensitivity {
 
 /// One schema-declared sensitive path.
 ///
-/// `path` segments are matched case-insensitively with `-`/`.`/`_` treated as
-/// equivalent, so `customHeaders`, `custom-headers`, and `custom_headers` all
-/// match one rule. A `*` segment matches every key of an object. Arrays are
-/// traversed transparently, so a rule addresses `channels.*.url` whether
-/// `channels` is an object keyed by channel name or an array of channel
-/// objects.
+/// `path` segments are matched through [`normalize_config_key`], so camelCase,
+/// snake_case, kebab-case, dotted, uppercase, and compact spellings of the
+/// same segment are equivalent (`customHeaders`, `custom-headers`,
+/// `custom.headers`, `custom_headers`, and `customheaders` all match one
+/// rule). A `*` segment matches every key of an object. Arrays are traversed
+/// transparently, so a rule addresses `channels.*.url` whether `channels` is
+/// an object keyed by channel name or an array of channel objects.
 pub struct SensitivityRule {
     pub path: &'static [&'static str],
     pub sensitivity: FieldSensitivity,
@@ -421,10 +422,23 @@ pub fn sensitivity_rules_for(plugin_name: &str) -> &'static [SensitivityRule] {
         .unwrap_or(NONE)
 }
 
-/// Normalize a config key for matching: lowercase, with `-` and `.` folded onto
-/// `_` so `customHeaders` / `custom-headers` / `custom.headers` are one key.
+/// Normalize a config key for matching.
+///
+/// Lowercases ASCII letters and strips `-`, `.`, and `_` so camelCase,
+/// snake_case, kebab-case, dotted, uppercase, and compact spellings of the
+/// same schema key compare equal. For example `customHeaders`,
+/// `custom-headers`, `custom.headers`, `custom_headers`, `CUSTOMHEADERS`, and
+/// `customheaders` all normalize to `customheaders`.
+///
+/// Matching stays exact on the normalized form: unrelated keys such as
+/// `custom_headers_enabled` / `customheader` do not collapse onto
+/// `custom_headers`. Normalization may only add redaction relative to a
+/// previously redacted spelling; it must never make one visible.
 pub fn normalize_config_key(key: &str) -> String {
-    key.to_ascii_lowercase().replace(['-', '.'], "_")
+    key.chars()
+        .filter(|c| *c != '-' && *c != '.' && *c != '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// Apply the full projection contract to a plugin `config` value in place.
@@ -609,8 +623,9 @@ pub fn redact_sensitive_plugin_config_fields(value: &mut Value) {
 
 /// Name-substring sensitivity floor.
 ///
-/// Matching is on the delimiter-collapsed lowercase key, so `apiKey`,
-/// `api-key`, `API_KEY`, and `api.key` all match one pattern.
+/// Matching is on the fully delimiter-stripped lowercase key from
+/// [`normalize_config_key`], so `apiKey`, `api-key`, `API_KEY`, `api.key`,
+/// and `apikey` all match one pattern.
 pub fn is_sensitive_plugin_config_key(key: &str) -> bool {
     if is_sensitive_metadata_key(key) {
         return true;
@@ -621,19 +636,18 @@ pub fn is_sensitive_plugin_config_key(key: &str) -> bool {
         // HMAC signing material for Redis cache envelopes (`ai_semantic_cache`
         // `redis_integrity_key`). Substring match so any future
         // `*_integrity_key` signing secret is covered without another edit; the
-        // segment is only ever used for signing/authenticity keys. Also match
-        // the delimiter-collapsed form (`integrityKey` → `integritykey`) the
-        // same way `api_key`/`apikey` already does.
-        || normalized.contains("integrity_key")
+        // segment is only ever used for signing/authenticity keys. Patterns are
+        // the compact normalized forms (`integrityKey` / `integrity_key` →
+        // `integritykey`), matching the same way `apiKey` / `api_key` →
+        // `apikey` already does.
         || normalized.contains("integritykey")
-        || normalized.contains("api_key")
         || normalized.contains("apikey")
-        || normalized.contains("access_key")
-        || normalized.contains("function_key")
-        || normalized.contains("client_secret")
+        || normalized.contains("accesskey")
+        || normalized.contains("functionkey")
+        || normalized.contains("clientsecret")
         || normalized.contains("credential")
-        || normalized.contains("private_key")
-        || normalized.contains("service_account_json")
+        || normalized.contains("privatekey")
+        || normalized.contains("serviceaccountjson")
         || normalized.contains("webhook")
 }
 
@@ -643,12 +657,12 @@ pub fn is_sensitive_plugin_config_key(key: &str) -> bool {
 ///
 /// These are deliberately not wholesale-redacted: `docs/admin_api.md` documents
 /// that scheme, host, port, and database number stay visible as the diagnostics
-/// an operator needs from a Viewer/Operator read or an audit diff. Also match
-/// the delimiter-collapsed form (`redisUrl` → `redisurl`) so a nested camelCase
-/// field cannot bypass projection.
+/// an operator needs from a Viewer/Operator read or an audit diff. Matching uses
+/// the compact normalized form (`redisUrl` / `redis_url` / `redis-url` →
+/// `redisurl`) so a nested camelCase or compact spelling cannot bypass
+/// projection.
 pub fn is_credential_bearing_url_config_key(key: &str) -> bool {
-    let normalized = normalize_config_key(key);
-    normalized == "redis_url" || normalized == "redisurl"
+    normalize_config_key(key) == "redisurl"
 }
 
 /// Remove userinfo from every URL-shaped string left in the tree.

@@ -6,8 +6,10 @@
 //! `tests/integration/admin_audit_rbac_tests.rs`.
 
 use ferrum_edge::admin::plugin_config_projection::{
-    KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS, is_safe_kafka_producer_property,
-    project_plugin_config, redact_endpoint_url, sensitivity_rules_for,
+    KAFKA_SAFE_PRODUCER_PROPERTIES, PLUGIN_SENSITIVITY_SCHEMAS,
+    is_credential_bearing_url_config_key, is_safe_kafka_producer_property,
+    is_sensitive_plugin_config_key, normalize_config_key, project_plugin_config,
+    redact_endpoint_url, sensitivity_rules_for,
 };
 use ferrum_edge::plugins::builtin_parity::BUILTIN_PLUGIN_PARITY_META;
 use serde_json::{Value, json};
@@ -440,6 +442,36 @@ fn kafka_non_object_producer_config_fails_closed() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn normalize_config_key_equates_case_delimiter_and_compact_spellings() {
+    let expected = "customheaders";
+    for spelling in [
+        "custom_headers",
+        "custom-headers",
+        "customHeaders",
+        "CUSTOM_HEADERS",
+        "custom.headers",
+        "customheaders",
+        "CUSTOMHEADERS",
+        "Custom_Headers",
+    ] {
+        assert_eq!(
+            normalize_config_key(spelling),
+            expected,
+            "spelling {spelling} did not compact to {expected}"
+        );
+    }
+
+    // Exact normalized matching: nearby safe spellings stay distinct.
+    assert_ne!(normalize_config_key("custom_headers_enabled"), expected);
+    assert_ne!(normalize_config_key("customheader"), expected);
+    assert_ne!(normalize_config_key("headers"), expected);
+    assert_eq!(normalize_config_key("redisUrl"), "redisurl");
+    assert_eq!(normalize_config_key("redis_url"), "redisurl");
+    assert_eq!(normalize_config_key("endpointUrl"), "endpointurl");
+    assert_ne!(normalize_config_key("redis_username"), "redisurl");
+}
+
+#[test]
 fn schema_paths_match_case_and_delimiter_variants() {
     for spelling in [
         "custom_headers",
@@ -447,19 +479,202 @@ fn schema_paths_match_case_and_delimiter_variants() {
         "customHeaders",
         "CUSTOM_HEADERS",
         "custom.headers",
+        "customheaders",
     ] {
         let mut config = serde_json::Map::new();
         config.insert(
             spelling.to_string(),
             json!({"x-scope-orgid": "loki-variant-canary"}),
         );
+        // Safe sibling that must not collapse onto the sensitive map rule.
+        config.insert(
+            "custom_headers_enabled".to_string(),
+            json!(true),
+        );
+        config.insert("batch_size".to_string(), json!(10));
         let projected = project("loki_logging", Value::Object(config));
         assert_eq!(
             projected[spelling]["x-scope-orgid"], REDACTED,
             "spelling {spelling} bypassed the schema"
         );
+        assert_eq!(projected["custom_headers_enabled"], true);
+        assert_eq!(projected["batch_size"], 10);
         assert_no_canaries(&projected, &["loki-variant-canary"]);
     }
+}
+
+/// CamelCase / compact spellings must match schema paths at every depth, for
+/// both arbitrary header-value maps and structural URL leaves.
+#[test]
+fn camelcase_and_compact_schema_paths_redact_at_nested_depths() {
+    // Nested sink map: camelCase container + camelCase URL leaf.
+    let projected = project(
+        "ai_transcript_audit",
+        json!({
+            "sink": {
+                "type": "http",
+                "endpointUrl": "https://audit.example.com/ingest/nested-url-canary?token=nested-query-canary",
+                "customHeaders": {"X-Audit-Token": "nested-header-canary"},
+                "batch_size": 25
+            },
+            // Flat legacy aliases under compact spellings.
+            "customheaders": {"Authorization": "flat-header-canary"},
+            "endpointurl": "https://audit.example.com/flat-url-canary"
+        }),
+    );
+    assert_eq!(
+        projected["sink"]["endpointUrl"],
+        "https://audit.example.com/[REDACTED_PATH]?[REDACTED_QUERY]"
+    );
+    assert_eq!(
+        projected["sink"]["customHeaders"]["X-Audit-Token"],
+        REDACTED
+    );
+    assert_eq!(projected["customheaders"]["Authorization"], REDACTED);
+    assert_eq!(
+        projected["endpointurl"],
+        "https://audit.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["sink"]["type"], "http");
+    assert_eq!(projected["sink"]["batch_size"], 25);
+    assert_no_canaries(
+        &projected,
+        &[
+            "nested-url-canary",
+            "nested-query-canary",
+            "nested-header-canary",
+            "flat-header-canary",
+            "flat-url-canary",
+        ],
+    );
+
+    // OTel headers map under compact spelling; endpoint under camelCase.
+    let projected = project(
+        "otel_tracing",
+        json!({
+            "endpoint": "https://otel.example.com/v1/traces/otel-path-canary",
+            "Headers": {"x-honeycomb-team": "otel-header-canary"},
+            "service_name": "edge"
+        }),
+    );
+    assert_eq!(
+        projected["endpoint"],
+        "https://otel.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["Headers"]["x-honeycomb-team"], REDACTED);
+    assert_eq!(projected["service_name"], "edge");
+    assert_no_canaries(&projected, &["otel-path-canary", "otel-header-canary"]);
+}
+
+/// Unrelated safe fields must not normalize onto a sensitive schema segment.
+#[test]
+fn normalization_does_not_collapse_safe_fields_onto_sensitive_rules() {
+    let projected = project(
+        "http_logging",
+        json!({
+            "endpoint_url": "https://logs.example.com/ingest/http-path-canary",
+            "custom_headers": {"X-Api-Key": "http-header-canary"},
+            // Nearby names that share a prefix/suffix with sensitive segments.
+            "custom_headers_enabled": true,
+            "customheader": "safe-customheader-value",
+            "headers_count": 3,
+            "endpoint_url_timeout_ms": 1500,
+            "batch_size": 50
+        }),
+    );
+    assert_eq!(
+        projected["endpoint_url"],
+        "https://logs.example.com/[REDACTED_PATH]"
+    );
+    assert_eq!(projected["custom_headers"]["X-Api-Key"], REDACTED);
+    assert_eq!(projected["custom_headers_enabled"], true);
+    assert_eq!(projected["customheader"], "safe-customheader-value");
+    assert_eq!(projected["headers_count"], 3);
+    assert_eq!(projected["endpoint_url_timeout_ms"], 1500);
+    assert_eq!(projected["batch_size"], 50);
+    assert_no_canaries(
+        &projected,
+        &["http-path-canary", "http-header-canary"],
+    );
+}
+
+/// Direct heuristic / Redis-URL callers must honor the compact normalization.
+#[test]
+fn heuristic_and_redis_url_callers_match_compact_normalized_spellings() {
+    for spelling in [
+        "api_key",
+        "api-key",
+        "apiKey",
+        "API_KEY",
+        "api.key",
+        "apikey",
+    ] {
+        assert!(
+            is_sensitive_plugin_config_key(spelling),
+            "heuristic missed sensitive spelling {spelling}"
+        );
+    }
+    for spelling in [
+        "redis_integrity_key",
+        "redisIntegrityKey",
+        "redisintegritykey",
+        "client_secret",
+        "clientSecret",
+        "azure_function_key",
+        "service_account_json",
+        "serviceAccountJson",
+    ] {
+        assert!(
+            is_sensitive_plugin_config_key(spelling),
+            "heuristic missed sensitive spelling {spelling}"
+        );
+    }
+    // Negative controls: safe neighbors must not trip the substring floor.
+    assert!(!is_sensitive_plugin_config_key("batch_size"));
+    assert!(!is_sensitive_plugin_config_key("redis_username"));
+    assert!(!is_sensitive_plugin_config_key("integrity_status"));
+    assert!(!is_sensitive_plugin_config_key("ttl_seconds"));
+    assert!(!is_sensitive_plugin_config_key("api_version"));
+    assert!(!is_sensitive_plugin_config_key("keyboard_layout"));
+
+    for spelling in [
+        "redis_url",
+        "redis-url",
+        "redisUrl",
+        "REDIS_URL",
+        "redis.url",
+        "redisurl",
+    ] {
+        assert!(
+            is_credential_bearing_url_config_key(spelling),
+            "redis URL detector missed spelling {spelling}"
+        );
+    }
+    assert!(!is_credential_bearing_url_config_key("redis_username"));
+    assert!(!is_credential_bearing_url_config_key("redis_url_template"));
+    assert!(!is_credential_bearing_url_config_key("url"));
+
+    // End-to-end through the heuristic layer on a custom plugin (no schema).
+    let projected = project(
+        "some_custom_plugin",
+        json!({
+            "apiKey": "custom-apikey-canary",
+            "redisUrl": "redis://cacheuser:custom-redis-canary@cache.internal:6379/2",
+            "redisUsername": "cacheuser",
+            "batchSize": 9
+        }),
+    );
+    assert_eq!(projected["apiKey"], REDACTED);
+    assert_eq!(
+        projected["redisUrl"],
+        "redis://redacted@cache.internal:6379/2"
+    );
+    assert_eq!(projected["redisUsername"], "cacheuser");
+    assert_eq!(projected["batchSize"], 9);
+    assert_no_canaries(
+        &projected,
+        &["custom-apikey-canary", "custom-redis-canary"],
+    );
 }
 
 #[test]
