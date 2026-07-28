@@ -6128,7 +6128,10 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
         "batch completion must clear sibling routing overrides"
     );
     assert!(ctx.metadata.get("mcp.server_id").is_none());
-    assert!(ctx.mcp_trusted_tool_name_rewrite.is_none());
+    assert!(
+        ferrum_edge::_test_support::mcp_trusted_tool_name_rewrite_is_none_for_test(&ctx),
+        "batch completion must clear private trusted tool-name rewrites"
+    );
 }
 
 #[tokio::test]

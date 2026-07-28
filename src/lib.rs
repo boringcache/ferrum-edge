@@ -171,6 +171,14 @@ pub mod _test_support {
         ctx.compression_ownership_for_test()
     }
 
+    /// Confirm that private MCP routing identity was cleared without exposing
+    /// the trusted rewrite through public request metadata.
+    pub fn mcp_trusted_tool_name_rewrite_is_none_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.mcp_trusted_tool_name_rewrite.is_none()
+    }
+
     pub fn take_compression_response_buffer_permit_for_test(
         ctx: &mut crate::plugins::RequestContext,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
