@@ -182,35 +182,62 @@ fn enabled_producers_increment_and_render_bounded_labels() {
 fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
     node_waypoint_observability::set_enabled(true);
     let registry = MetricsRegistry::new();
-    // Keep the registry body cached across the producer increment.
+    // Keep the registry body cached across the producer increment. A non-empty
+    // namespace also exercises gateway_namespace label append on the live series.
     registry.configure(5, 3600, 60_000, "ferrum");
 
+    // Series selector omits the closing `}` so optional `,gateway_namespace=…`
+    // after the required labels still matches.
+    const INBOUND_TLS_FAILURE: &str =
+        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"";
+
     let before_output = registry.render();
-    let before_failure = prometheus_counter_value(
-        &before_output,
-        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}",
+    let before_failure = prometheus_counter_value(&before_output, INBOUND_TLS_FAILURE);
+    let before_snap = node_waypoint_observability::snapshot()
+        .hbone_handshakes
+        .inbound_tls_failure;
+    assert_eq!(
+        before_failure, before_snap,
+        "pre-increment /metrics must match the live process-static snapshot"
     );
 
+    node_waypoint_observability::set_enabled(true);
     node_waypoint_observability::record_hbone_handshake(
         NodeWaypointHboneHandshakePhase::InboundTls,
         false,
     );
 
+    let after_snap = node_waypoint_observability::snapshot()
+        .hbone_handshakes
+        .inbound_tls_failure;
+    assert!(
+        after_snap > before_snap,
+        "producer must increment inbound_tls failure (was {before_snap}, now {after_snap})"
+    );
+
     let after_output = registry.render();
-    let after_failure = prometheus_counter_value(
-        &after_output,
-        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}",
+    let after_failure = prometheus_counter_value(&after_output, INBOUND_TLS_FAILURE);
+    assert_eq!(
+        after_failure, after_snap,
+        "cached /metrics render must still reflect a fresh inbound_tls failure \
+         (snapshot {after_snap}, rendered {after_failure})"
     );
     assert!(
-        after_failure >= before_failure + 1,
+        after_failure > before_failure,
         "cached /metrics render must still reflect a fresh inbound_tls failure \
          (was {before_failure}, now {after_failure})"
     );
 }
 
+/// Parse a Prometheus counter whose required labels may be followed by extra
+/// bounded labels (e.g. `gateway_namespace`) before the closing `}`.
 fn prometheus_counter_value(output: &str, series_prefix: &str) -> u64 {
     for line in output.lines() {
         if line.starts_with('#') || !line.starts_with(series_prefix) {
+            continue;
+        }
+        let rest = &line[series_prefix.len()..];
+        if !(rest.starts_with('}') || rest.starts_with(',')) {
             continue;
         }
         let Some(value) = line.rsplit_once(' ').map(|(_, v)| v) else {

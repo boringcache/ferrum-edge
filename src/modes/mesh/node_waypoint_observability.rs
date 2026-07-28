@@ -321,39 +321,39 @@ outbound_dial is independent on the source).\n",
     output.push_str("# TYPE ferrum_mesh_node_waypoint_hbone_handshakes_total counter\n");
     for (phase, result, value) in [
         (
-            "inbound_tls",
+            NodeWaypointHboneHandshakePhase::InboundTls,
             "success",
             snap.hbone_handshakes.inbound_tls_success,
         ),
         (
-            "inbound_tls",
+            NodeWaypointHboneHandshakePhase::InboundTls,
             "failure",
             snap.hbone_handshakes.inbound_tls_failure,
         ),
         (
-            "inbound_connect",
+            NodeWaypointHboneHandshakePhase::InboundConnect,
             "success",
             snap.hbone_handshakes.inbound_connect_success,
         ),
         (
-            "inbound_connect",
+            NodeWaypointHboneHandshakePhase::InboundConnect,
             "failure",
             snap.hbone_handshakes.inbound_connect_failure,
         ),
         (
-            "outbound_dial",
+            NodeWaypointHboneHandshakePhase::OutboundDial,
             "success",
             snap.hbone_handshakes.outbound_dial_success,
         ),
         (
-            "outbound_dial",
+            NodeWaypointHboneHandshakePhase::OutboundDial,
             "failure",
             snap.hbone_handshakes.outbound_dial_failure,
         ),
     ] {
         output.push_str(&format!(
             "ferrum_mesh_node_waypoint_hbone_handshakes_total{{phase=\"{}\",result=\"{}\"{}}} {}\n",
-            escape_label_value(phase),
+            escape_label_value(phase.as_str()),
             escape_label_value(result),
             gateway_ns_label,
             value
@@ -366,38 +366,43 @@ Asserted source-identity decisions on inbound NodeWaypoint HBONE. Rejection \
 reasons are compile-time-bounded; SPIFFE IDs never appear as labels.\n",
     );
     output.push_str("# TYPE ferrum_mesh_node_waypoint_asserted_identity_total counter\n");
-    for (result, reason, value) in [
-        ("accepted", "honored", snap.asserted_identity.accepted),
-        (
-            "rejected",
-            "untrusted_assertor",
-            snap.asserted_identity.rejected_untrusted_assertor,
-        ),
-        (
-            "rejected",
-            "trust_domain_mismatch",
-            snap.asserted_identity.rejected_trust_domain_mismatch,
-        ),
-        (
-            "rejected",
-            "unauthenticated_hbone",
-            snap.asserted_identity.rejected_unauthenticated_hbone,
-        ),
-        (
-            "rejected",
-            "malformed",
-            snap.asserted_identity.rejected_malformed,
-        ),
-        (
-            "rejected",
-            "stale_or_unknown",
-            snap.asserted_identity.rejected_stale_or_unknown,
-        ),
+    output.push_str(&format!(
+        "ferrum_mesh_node_waypoint_asserted_identity_total{{result=\"accepted\",reason=\"honored\"{}}} {}\n",
+        gateway_ns_label, snap.asserted_identity.accepted
+    ));
+    // Emit every ADR-bounded reject reason (including reserved Malformed /
+    // StaleOrUnknown) so scrapes keep a stable zero baseline. Those two
+    // variants are constructed here for label export; mesh_authz currently
+    // only produces UntrustedAssertor / TrustDomainMismatch /
+    // UnauthenticatedHbone, and collapses malformed principal parse / slice
+    // unknowns into existing fail-closed paths until dedicated producers land.
+    for reason in [
+        NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor,
+        NodeWaypointAssertedIdentityRejectReason::TrustDomainMismatch,
+        NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone,
+        NodeWaypointAssertedIdentityRejectReason::Malformed,
+        NodeWaypointAssertedIdentityRejectReason::StaleOrUnknown,
     ] {
+        let value = match reason {
+            NodeWaypointAssertedIdentityRejectReason::UntrustedAssertor => {
+                snap.asserted_identity.rejected_untrusted_assertor
+            }
+            NodeWaypointAssertedIdentityRejectReason::TrustDomainMismatch => {
+                snap.asserted_identity.rejected_trust_domain_mismatch
+            }
+            NodeWaypointAssertedIdentityRejectReason::UnauthenticatedHbone => {
+                snap.asserted_identity.rejected_unauthenticated_hbone
+            }
+            NodeWaypointAssertedIdentityRejectReason::Malformed => {
+                snap.asserted_identity.rejected_malformed
+            }
+            NodeWaypointAssertedIdentityRejectReason::StaleOrUnknown => {
+                snap.asserted_identity.rejected_stale_or_unknown
+            }
+        };
         output.push_str(&format!(
-            "ferrum_mesh_node_waypoint_asserted_identity_total{{result=\"{}\",reason=\"{}\"{}}} {}\n",
-            escape_label_value(result),
-            escape_label_value(reason),
+            "ferrum_mesh_node_waypoint_asserted_identity_total{{result=\"rejected\",reason=\"{}\"{}}} {}\n",
+            escape_label_value(reason.as_str()),
             gateway_ns_label,
             value
         ));
@@ -410,24 +415,29 @@ NodeWaypoint. Distinct from asserted-identity rejections.\n",
     );
     output
         .push_str("# TYPE ferrum_mesh_node_waypoint_destination_policy_rejections_total counter\n");
-    for (reason, value) in [
-        ("authz_deny", snap.destination_policy_rejections.authz_deny),
-        (
-            "scope_missing",
-            snap.destination_policy_rejections.scope_missing,
-        ),
-        (
-            "destination_scope_missing",
-            snap.destination_policy_rejections.destination_scope_missing,
-        ),
-        (
-            "relay_destination_denied",
-            snap.destination_policy_rejections.relay_destination_denied,
-        ),
+    for reason in [
+        NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+        NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
+        NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
+        NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
     ] {
+        let value = match reason {
+            NodeWaypointDestinationPolicyRejectReason::AuthzDeny => {
+                snap.destination_policy_rejections.authz_deny
+            }
+            NodeWaypointDestinationPolicyRejectReason::ScopeMissing => {
+                snap.destination_policy_rejections.scope_missing
+            }
+            NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing => {
+                snap.destination_policy_rejections.destination_scope_missing
+            }
+            NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied => {
+                snap.destination_policy_rejections.relay_destination_denied
+            }
+        };
         output.push_str(&format!(
             "ferrum_mesh_node_waypoint_destination_policy_rejections_total{{reason=\"{}\"{}}} {}\n",
-            escape_label_value(reason),
+            escape_label_value(reason.as_str()),
             gateway_ns_label,
             value
         ));
