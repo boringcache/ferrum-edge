@@ -277,8 +277,9 @@ fn rejects_non_utf8_bytes() {
 
 /// Confirmation must track governed `serde_json::Value` acceptance, not the
 /// looser `IgnoredAny` ignore-path: valid documents and syntactically valid
-/// duplicates are distinguished from UTF-8 / surrogate / nesting / trailing
-/// failures that `Value` also rejects.
+/// duplicates are distinguished from ordinary UTF-8 / surrogate / trailing
+/// grammar failures that `Value` also rejects. Explicit resource-budget
+/// failures remain fail-closed independently.
 #[test]
 fn confirmation_matches_serde_json_value_acceptance() {
     let backslash = '\\';
@@ -324,8 +325,8 @@ fn confirmation_matches_serde_json_value_acceptance() {
     assert!(serde_json::from_slice::<serde_json::Value>(non_utf8).is_err());
     assert!(slice_ambiguity(non_utf8).is_none());
 
-    // Deep nesting past serde's recursion limit: not an ambiguity, and must
-    // not stack-overflow on confirmation.
+    // Deep nesting past the scanner's explicit resource budget fails closed
+    // without a recursive confirmation pass.
     let depth = 100_000usize;
     let mut deep = String::with_capacity(depth * 2);
     for _ in 0..depth {
@@ -335,7 +336,10 @@ fn confirmation_matches_serde_json_value_acceptance() {
         deep.push(']');
     }
     assert!(serde_json::from_str::<serde_json::Value>(&deep).is_err());
-    assert!(slice_ambiguity(deep.as_bytes()).is_none());
+    assert_eq!(
+        slice_ambiguity(deep.as_bytes()),
+        Some(JsonScanReject::DepthExceeded.reason())
+    );
 }
 
 /// A leading BOM is not stripped by the screen: callers must pass exactly the
@@ -370,9 +374,54 @@ fn deep_nesting_exhausts_the_depth_budget_without_stack_overflow() {
         scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
         Err(JsonScanReject::DepthExceeded)
     );
-    // `serde_json` also refuses it (128-level recursion limit), so this is not
-    // reported to callers as an ambiguity.
-    assert!(slice_ambiguity(body.as_bytes()).is_none());
+    // Resource-budget exhaustion is itself a fail-closed result; relying on
+    // serde's lower recursive Value limit would let a more-permissive
+    // downstream parser receive bytes this gateway never fully screened.
+    assert_eq!(
+        slice_ambiguity(body.as_bytes()),
+        Some(JsonScanReject::DepthExceeded.reason())
+    );
+}
+
+/// A complete, valid document with a duplicate remains ambiguous even when
+/// unrelated nesting makes `serde_json::Value` hit its recursive depth limit.
+/// The security screen is non-recursive and must not downgrade that duplicate
+/// to "malformed" merely because the later policy parse cannot materialize it.
+#[test]
+fn duplicate_is_preserved_past_serde_value_depth_limit() {
+    let depth = 200usize;
+    let mut body = String::from(r#"{"tool":"danger","tool":"safe","padding":"#);
+    for _ in 0..depth {
+        body.push('[');
+    }
+    for _ in 0..depth {
+        body.push(']');
+    }
+    body.push('}');
+
+    assert!(serde_json::from_str::<serde_json::Value>(&body).is_err());
+    assert_eq!(
+        scan(body.as_bytes(), &GOVERNED_JSON_LIMITS),
+        Err(JsonScanReject::DuplicateKey)
+    );
+    assert_eq!(
+        slice_ambiguity(body.as_bytes()),
+        Some(JsonScanReject::DuplicateKey.reason())
+    );
+}
+
+/// A duplicate seen before a later syntax error is not enough: `scan` finishes
+/// validating the document before reporting DuplicateKey, preserving ordinary
+/// malformed-body handling.
+#[test]
+fn duplicate_followed_by_malformed_input_is_not_reported_as_ambiguity() {
+    let body = br#"{"tool":"danger","tool":"safe","padding":[}"#;
+    assert_eq!(
+        scan(body, &GOVERNED_JSON_LIMITS),
+        Err(JsonScanReject::Malformed)
+    );
+    assert!(serde_json::from_slice::<serde_json::Value>(body).is_err());
+    assert!(slice_ambiguity(body).is_none());
 }
 
 /// A document within `serde_json`'s recursion limit stays inside the governed

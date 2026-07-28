@@ -199,8 +199,8 @@ forwarded ungoverned:
   Member names are compared after JSON escapes are decoded, so a literal name
   and a `\uXXXX`-escaped spelling of the same code point are one member. The
   screen is non-recursive and bounded by explicit depth, token, member-count,
-  member-name, and body-size budgets; exhausting a budget on a document a JSON
-  parser would accept is treated as ambiguity and fails closed identically.
+  member-name, and body-size budgets; exhausting any budget fails closed without
+  an unbounded confirmation pass.
   Bytes that are not valid JSON at all keep their existing uninspectable
   handling. Rejection details use a fixed set of reasons and never echo any
   byte of the governed body.

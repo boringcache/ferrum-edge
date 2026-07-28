@@ -30,22 +30,21 @@
 //! Governed call sites care about a narrower question than "did the scan
 //! succeed": *are these bytes something a downstream parser would accept, but
 //! that this gateway cannot faithfully evaluate?* [`slice_ambiguity`] answers
-//! exactly that — it reports a reason ONLY when `serde_json` itself accepts the
-//! document, with one explicit resource-bound exception: [`JsonScanReject::TooLarge`]
-//! fails closed immediately with its fixed reason and never runs confirmation.
-//! An over-budget body may be arbitrarily larger than [`JsonScanLimits::max_bytes`],
-//! and walking it (or allocating a decoded scratch string for an attacker-
-//! controlled escape sequence) would violate the scanner's O(max_bytes) contract.
-//! At that boundary, bounded rejection takes precedence over preserving the
-//! narrower "only when serde accepts" classification.
+//! exactly that. A duplicate is reported only after this non-recursive scanner
+//! has validated the complete document, so a duplicate followed by malformed
+//! trailing input keeps its existing malformed-body handling even when
+//! `serde_json` rejects for a non-grammar reason such as its recursive `Value`
+//! depth limit. Explicit resource-budget exhaustion also fails closed
+//! immediately: walking or materializing input beyond a configured bound merely
+//! to classify it would defeat the bound.
 //!
-//! For every other scanner rejection, confirmation makes the screen fail-safe
-//! against grammar divergence between this scanner and `serde_json`: bytes the
-//! scanner mis-parses but `serde_json` accepts are reported as ambiguous (fail
-//! closed), and bytes both reject keep their existing "malformed body" handling.
-//! The confirmation parse runs only on those rejection paths, so the success
-//! path stays a single pass. It uses the same `deserialize_any` acceptance path
-//! as `serde_json::Value` (not `serde::de::IgnoredAny`, whose `ignore_value`
+//! For a grammar rejection, confirmation makes the screen fail-safe against
+//! divergence between this scanner and `serde_json`: bytes the scanner
+//! mis-parses but `serde_json` accepts are reported as ambiguous (fail closed),
+//! and bytes both reject keep their existing malformed-body handling. The
+//! confirmation parse runs only on that rejection path, so the success path
+//! stays a single pass. It uses the same `deserialize_any` acceptance path as
+//! `serde_json::Value` (not `serde::de::IgnoredAny`, whose `ignore_value`
 //! shortcut skips UTF-8 / surrogate validation and the recursion limit).
 //!
 //! Reasons are fixed-cardinality `&'static str` values and never echo any byte
@@ -97,8 +96,9 @@ impl JsonScanReject {
 }
 
 /// Explicit budgets for one scan. Every one of these bounds an allocation or a
-/// loop, so a hostile document costs at most `O(max_bytes)` time and
-/// `O(max_depth * max_object_members)`-bounded key storage.
+/// loop, so a hostile document costs at most `O(max_bytes)` time and bounded
+/// key storage. Hash tables allocate entries for member names; only escaped
+/// member names require separate decoded-string allocations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JsonScanLimits {
     /// Largest document the scanner will look at at all.
@@ -116,12 +116,12 @@ pub struct JsonScanLimits {
 /// Budgets used by every governed JSON surface.
 ///
 /// Depth is deliberately far ABOVE `serde_json`'s own 128-level recursion limit
-/// so a legitimate deeply-nested body is never refused by this screen before
-/// `serde_json` has had its say: anything deeper than 128 is rejected by the
-/// parser itself and keeps its existing malformed handling. The remaining
-/// budgets are similarly sized above any realistic governed payload — every
-/// caller already applies its own, much tighter, body-size cap before reaching
-/// the screen (for example `ai_tool_governor`'s 4 MiB inspection window and
+/// so ordinary parser-accepted documents remain inside the screen budget.
+/// Explicit budget exhaustion still fails closed: otherwise a downstream parser
+/// with a higher depth limit could receive bytes the gateway never completely
+/// screened. The remaining budgets are similarly sized above realistic governed
+/// payloads — callers generally apply tighter body-size caps before this screen
+/// (for example `ai_tool_governor`'s 4 MiB inspection window and
 /// `openapi_validator`'s configured `max_body_bytes`).
 pub const GOVERNED_JSON_LIMITS: JsonScanLimits = JsonScanLimits {
     max_bytes: 64 * 1024 * 1024,
@@ -142,9 +142,9 @@ enum Frame {
 /// Walk `bytes` once and prove that every object member name in the document is
 /// unique, within `limits`.
 ///
-/// This is a validator, not a parser: it produces no `Value` and allocates only
-/// the bounded per-object member-name sets (and only for member names that
-/// actually carry escape sequences).
+/// This is a validator, not a parser: it produces no `Value`. It allocates
+/// bounded per-object member-name sets, while separate decoded strings are
+/// allocated only for names that actually carry escape sequences.
 pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScanReject> {
     if bytes.len() > limits.max_bytes {
         return Err(JsonScanReject::TooLarge);
@@ -152,9 +152,11 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
     let mut index = 0usize;
     let mut tokens = 0usize;
     let mut frames: Vec<Frame> = Vec::new();
+    let mut duplicate_found = false;
     // Member-name sets are pooled and cleared on reuse so a document that opens
     // and closes many sibling objects does not allocate a set per object.
     let mut sets: Vec<HashSet<Cow<'a, str>>> = Vec::new();
+    let mut member_counts: Vec<usize> = Vec::new();
     let mut live_sets = 0usize;
 
     skip_whitespace(bytes, &mut index);
@@ -173,8 +175,10 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
                 }
                 if live_sets == sets.len() {
                     sets.push(HashSet::new());
+                    member_counts.push(0);
                 } else {
                     sets[live_sets].clear();
+                    member_counts[live_sets] = 0;
                 }
                 frames.push(Frame::Object(live_sets));
                 live_sets += 1;
@@ -188,7 +192,13 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
                     if tokens > limits.max_tokens {
                         return Err(JsonScanReject::TokenBudgetExceeded);
                     }
-                    read_member_name(bytes, &mut index, &mut sets[live_sets - 1], limits)?;
+                    duplicate_found |= read_member_name(
+                        bytes,
+                        &mut index,
+                        &mut sets[live_sets - 1],
+                        &mut member_counts[live_sets - 1],
+                        limits,
+                    )?;
                     continue 'value;
                 }
             }
@@ -244,7 +254,13 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
                         if tokens > limits.max_tokens {
                             return Err(JsonScanReject::TokenBudgetExceeded);
                         }
-                        read_member_name(bytes, &mut index, &mut sets[set_index], limits)?;
+                        duplicate_found |= read_member_name(
+                            bytes,
+                            &mut index,
+                            &mut sets[set_index],
+                            &mut member_counts[set_index],
+                            limits,
+                        )?;
                         continue 'value;
                     }
                     Some(b'}') => {
@@ -264,18 +280,21 @@ pub fn scan<'a>(bytes: &'a [u8], limits: &JsonScanLimits) -> Result<(), JsonScan
         // Trailing data. `serde_json::from_slice` rejects this too.
         return Err(JsonScanReject::Malformed);
     }
-    Ok(())
+    if duplicate_found {
+        Err(JsonScanReject::DuplicateKey)
+    } else {
+        Ok(())
+    }
 }
 
 /// Screen `bytes` for policy-relevant JSON ambiguity under
 /// [`GOVERNED_JSON_LIMITS`].
 ///
-/// Returns `Some(reason)` when the bytes are a document `serde_json` accepts
-/// but this scanner cannot prove unambiguous, or when the body exceeds
-/// [`JsonScanLimits::max_bytes`] (see [`slice_ambiguity_with`] for that
-/// resource-bound exception). Bytes that `serde_json` also rejects return
-/// `None` so callers keep their existing malformed-body handling instead of
-/// reclassifying every parse error as an ambiguity.
+/// Returns `Some(reason)` when this scanner validates a complete document with
+/// a duplicate member, when any explicit scan budget is exhausted, or when
+/// `serde_json` accepts bytes whose grammar this scanner could not vouch for.
+/// Ordinary malformed bytes that both parsers reject return `None` so callers
+/// keep their existing malformed-body handling.
 ///
 /// The caller must pass exactly the bytes it will hand to `serde_json` (BOM
 /// already stripped, body already decoded), or the two verdicts describe
@@ -286,19 +305,23 @@ pub fn slice_ambiguity(bytes: &[u8]) -> Option<&'static str> {
 
 /// [`slice_ambiguity`] with explicit budgets.
 ///
-/// [`JsonScanReject::TooLarge`] is special-cased: confirmation must not parse or
-/// scan past `limits.max_bytes`, so an over-budget body fails closed immediately
-/// with that reject's fixed [`JsonScanReject::reason`] regardless of whether
-/// `serde_json` would accept or reject the content. Every other rejection still
-/// confirms against governed `serde_json::Value` acceptance before reporting a
-/// reason.
+/// Explicit budget failures are never followed by an unbounded confirmation
+/// pass, so they fail closed with their fixed [`JsonScanReject::reason`].
+/// [`JsonScanReject::DuplicateKey`] is also definitive because [`scan`] reports
+/// it only after validating the complete document. Only a grammar rejection
+/// needs confirmation against governed `serde_json::Value` acceptance.
 pub fn slice_ambiguity_with(bytes: &[u8], limits: &JsonScanLimits) -> Option<&'static str> {
     match scan(bytes, limits) {
         Ok(()) => None,
-        // Resource bound takes precedence: do not walk or decode an over-budget
-        // body just to classify it as malformed vs ambiguity.
-        Err(JsonScanReject::TooLarge) => Some(JsonScanReject::TooLarge.reason()),
-        Err(reject) => {
+        Err(
+            reject @ (JsonScanReject::DuplicateKey
+                | JsonScanReject::DepthExceeded
+                | JsonScanReject::TokenBudgetExceeded
+                | JsonScanReject::MemberBudgetExceeded
+                | JsonScanReject::KeyTooLong
+                | JsonScanReject::TooLarge),
+        ) => Some(reject.reason()),
+        Err(reject @ JsonScanReject::Malformed) => {
             // Confirmation parse, rejection path only. `SerdeJsonAccept` matches
             // governed `serde_json::Value` acceptance (UTF-8, paired surrogates,
             // trailing data, default recursion limit) without building a value
@@ -496,8 +519,9 @@ fn read_member_name<'a>(
     bytes: &'a [u8],
     index: &mut usize,
     names: &mut HashSet<Cow<'a, str>>,
+    member_count: &mut usize,
     limits: &JsonScanLimits,
-) -> Result<(), JsonScanReject> {
+) -> Result<bool, JsonScanReject> {
     let (raw, has_escape) = read_string(bytes, index)?;
     if raw.len() > limits.max_key_bytes {
         return Err(JsonScanReject::KeyTooLong);
@@ -508,15 +532,13 @@ fn read_member_name<'a>(
     }
     *index += 1;
     skip_whitespace(bytes, index);
-    if names.len() >= limits.max_object_members {
+    if *member_count >= limits.max_object_members {
         return Err(JsonScanReject::MemberBudgetExceeded);
     }
+    *member_count += 1;
     // Compare DECODED names: `"a"` and `"a"` are the same member and must
     // collide here, exactly as they do in every JSON object model.
-    if !names.insert(decode_member_name(raw, has_escape)) {
-        return Err(JsonScanReject::DuplicateKey);
-    }
-    Ok(())
+    Ok(!names.insert(decode_member_name(raw, has_escape)))
 }
 
 /// Validate one JSON string starting at `bytes[*index] == b'"'` and return its

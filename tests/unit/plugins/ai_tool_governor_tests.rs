@@ -9771,6 +9771,44 @@ async fn duplicate_members_in_buffered_response_fail_closed() {
     );
 }
 
+/// The duplicate-key verdict cannot depend on `serde_json::Value` accepting the
+/// entire body. A valid document can exceed serde's recursive materialization
+/// limit while remaining acceptable to a downstream parser; extra nesting must
+/// not turn a root duplicate tool name into an unparseable-response bypass.
+#[tokio::test]
+async fn duplicate_response_stays_fail_closed_past_serde_value_depth_limit() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    let depth = 200usize;
+    let mut body = String::from(concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"padding":"#
+    ));
+    for _ in 0..depth {
+        body.push('[');
+    }
+    for _ in 0..depth {
+        body.push(']');
+    }
+    body.push('}');
+
+    assert!(
+        serde_json::from_str::<Value>(&body).is_err(),
+        "fixture must exceed serde_json::Value's recursive depth limit"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
 /// Dry-run forwards the same body untouched.
 #[tokio::test]
 async fn duplicate_members_in_buffered_response_are_forwarded_in_dry_run() {
