@@ -1,4 +1,35 @@
 //! AI token-budget rate limiting with shared local/Redis/failover storage.
+//!
+//! ## Protocol scope (HTTP only)
+//!
+//! This limiter is registered for `ProxyProtocol::Http` only
+//! (`HTTP_ONLY_PROTOCOLS`). Its whole accounting lifecycle — prompt estimation,
+//! pre-reservation, and post-response reconciliation — is defined over bare
+//! JSON request bodies and JSON/SSE response bodies. Native gRPC carries
+//! length-prefixed, optionally compressed protobuf frames with no
+//! gateway-known usage schema, so there is no bounded, explicitly configured
+//! descriptor-based extraction that could charge those calls. Advertising
+//! `ProxyProtocol::Grpc` therefore meant an operator could attach an
+//! enforcement plugin to native gRPC AI traffic that charged nothing at all:
+//! every call re-checked an empty window and passed (GHSA-8f27-23x9-f825).
+//!
+//! Because native gRPC is never pinned in proxy configuration (a single
+//! `http`/`https` proxy serves REST, gRPC, and WebSocket by runtime
+//! content-type detection — see `BackendScheme` in `docs/routing.md`), the
+//! protocol contract *is* the admission boundary: `PluginCache` builds one
+//! plugin list per `ProxyProtocol` from `supported_protocols()`, so a native
+//! gRPC request resolves a `ProxyProtocol::Grpc` view that this plugin is not
+//! part of. Every configuration path — admin API, file mode, CP validation,
+//! and DP full/incremental config application — goes through that same shared
+//! cache build, so none of them can install this limiter on native gRPC.
+//!
+//! gRPC-Web is likewise unsupported, but it rides the HTTP (and composed H3
+//! gRPC-Web) view, so this plugin can still observe it. Framed
+//! `application/grpc-web*` bodies — including the `+json` variants that
+//! `is_json_content_type` matches — are never buffered, never parsed as a
+//! bare JSON AI request, and never treated as a JSON usage document on the
+//! response side. They are classified as non-AI traffic and left untouched
+//! rather than being charged zero tokens against a budget.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -1432,7 +1463,14 @@ impl Plugin for AiRateLimiter {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        // HTTP only. Native gRPC protobuf frames have no supported usage
+        // schema here, so every hook of the accounting lifecycle would be
+        // inert and the budget would never advance — an operator must not be
+        // able to attach this as an enforcement control on native gRPC AI
+        // traffic (GHSA-8f27-23x9-f825). See the module-level "Protocol scope"
+        // notes: this declaration is the admission boundary, because gRPC is
+        // detected per request rather than pinned in proxy config.
+        super::HTTP_ONLY_PROTOCOLS
     }
 
     fn modifies_request_headers(&self) -> bool {
@@ -1455,11 +1493,15 @@ impl Plugin for AiRateLimiter {
         if has_non_identity_content_encoding(&ctx.headers) {
             return false;
         }
+        // Framed gRPC-Web bodies reach the HTTP view (native gRPC does not —
+        // see `supported_protocols`). Their `+json` media types match
+        // `is_json_content_type` but the payload is a length-prefixed wire
+        // frame, which `before_proxy` refuses to classify, so buffering one
+        // would spend memory for an estimate this plugin will never compute.
         ctx.method == "POST"
-            && ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|content_type| is_json_content_type(content_type))
+            && ctx.headers.get("content-type").is_some_and(|content_type| {
+                is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+            })
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -1538,6 +1580,15 @@ impl Plugin for AiRateLimiter {
             && headers.get("content-type").is_some_and(|content_type| {
                 is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
             });
+        // A framed request is never an AI candidate on any branch below, even if
+        // a co-located plugin left a JSON-parseable `request_body` in metadata:
+        // the wire body is a length-prefixed frame sequence, so estimating over
+        // it would attribute another representation's tokens to this request.
+        // Native gRPC never reaches here (HTTP-only protocol view); this covers
+        // gRPC-Web, which rides the HTTP view.
+        let is_framed_grpc = headers
+            .get("content-type")
+            .is_some_and(|content_type| is_framed_grpc_content_type(content_type));
         let still_compressed = has_non_identity_content_encoding(headers);
         // Detect the decompressed-by-`compression` (Case A) path from the
         // compression-owned metadata, NOT a client-settable header. See
@@ -1547,7 +1598,10 @@ impl Plugin for AiRateLimiter {
                 .metadata
                 .contains_key(COMPRESSION_REQUEST_ENCODING_METADATA_KEY);
         let defer_compressed_classification = decompressed_by_compression && is_post_json;
-        let (is_ai_request, reserved_tokens) = if still_compressed {
+        let (is_ai_request, reserved_tokens) = if is_framed_grpc {
+            // Framed gRPC-Web: out of scope for this JSON policy entirely.
+            (false, 0)
+        } else if still_compressed {
             // Case B: uninspectable compressed body — fail closed for POST JSON.
             (is_post_json, 0)
         } else if defer_compressed_classification {
@@ -1724,11 +1778,20 @@ impl Plugin for AiRateLimiter {
         // present (no `transform_request_body` decoded it) or the content-type was
         // relabeled to non-JSON, the body cannot be inspected — fail closed so a
         // usage-less compressed AI 2xx still cannot bypass the unmetered policy.
+        // A relabel to a framed gRPC / gRPC-Web media type counts as
+        // uninspectable too: the `+json` suffix satisfies `is_json_content_type`
+        // but the payload is a length-prefixed wire frame, so parsing it as a
+        // bare JSON document would silently exempt a deferred AI candidate.
+        // Genuine gRPC-Web traffic never reaches here — `before_proxy` refuses
+        // to defer a framed content-type in the first place.
         let content_type = headers
             .get("content-type")
             .map(String::as_str)
             .unwrap_or("");
-        if has_non_identity_content_encoding(headers) || !is_json_content_type(content_type) {
+        if has_non_identity_content_encoding(headers)
+            || !is_json_content_type(content_type)
+            || is_framed_grpc_content_type(content_type)
+        {
             ctx.metadata
                 .insert(AI_REQUEST_METADATA_KEY.to_string(), "true".to_string());
             ctx.metadata.insert(
@@ -1971,6 +2034,19 @@ impl Plugin for AiRateLimiter {
         let tokens = metadata_tokens.or_else(|| {
             if body.is_empty() {
                 unmetered_detail = "empty_body";
+                return None;
+            }
+
+            // Framed gRPC-Web responses (`application/grpc-web*`, including the
+            // `+json` variants) are length-prefixed wire frames, not a bare
+            // JSON usage document. Screen them out before the JSON branch so a
+            // framed body is never parsed as JSON — and, when the request was
+            // an identified AI call, so the response is routed through the
+            // explicit `on_unmetered_response` policy instead of silently
+            // reconciling as if the provider had reported zero usage. Native
+            // gRPC cannot reach this hook at all (HTTP-only protocol view).
+            if is_framed_grpc_content_type(content_type) {
+                unmetered_detail = "framed_grpc_content_type";
                 return None;
             }
 

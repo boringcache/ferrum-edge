@@ -753,6 +753,7 @@ async fn test_proxy_grpc_request_from_bytes_error_on_unreachable_backend() {
         hyper::Method::POST,
         headers,
         body,
+        None,
         &proxy,
         "http://127.0.0.1:1/test.Service/Method",
         &pool,

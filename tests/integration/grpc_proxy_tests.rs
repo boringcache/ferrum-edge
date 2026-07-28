@@ -1116,6 +1116,381 @@ async fn grpc_web_request_envelopes_are_validated_on_h1_and_h2_binary_and_text()
     }
 }
 
+/// gRPC backend that reports what it actually received on the wire: the
+/// request-body byte count and the request TRAILERS block, echoed back as one
+/// gRPC DATA message. That is the only way to prove the gateway converted a
+/// gRPC-Web body trailer frame into native HTTP/2 request trailers rather than
+/// forwarding it as message bytes or dropping it.
+async fn start_grpc_backend_echoing_request_trailers() -> (SocketAddr, tokio::task::JoinHandle<()>)
+{
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |req: Request<Incoming>| async move {
+                    let collected = req.into_body().collect().await;
+                    let (body_len, request_trailers) = match collected {
+                        Ok(collected) => {
+                            let trailers = collected.trailers().cloned();
+                            (collected.to_bytes().len(), trailers)
+                        }
+                        Err(_) => (0, None),
+                    };
+                    let mut echoed: Vec<String> = Vec::new();
+                    if let Some(trailers) = request_trailers {
+                        for (name, value) in trailers.iter() {
+                            echoed.push(format!(
+                                "{}={}",
+                                name.as_str(),
+                                String::from_utf8_lossy(value.as_bytes())
+                            ));
+                        }
+                    }
+                    echoed.sort();
+                    let payload = format!("body={body_len};trailers=[{}]", echoed.join(","));
+                    let mut message = Vec::with_capacity(5 + payload.len());
+                    message.push(0u8);
+                    message.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                    message.extend_from_slice(payload.as_bytes());
+
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("grpc-status"),
+                        hyper::header::HeaderValue::from_static("0"),
+                    );
+                    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+                        Ok(Frame::data(Bytes::from(message))),
+                        Ok(Frame::trailers(trailers)),
+                    ];
+
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(StreamBody::new(tokio_stream::iter(frames)))
+                            .unwrap(),
+                    )
+                });
+
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+
+    (addr, handle)
+}
+
+/// Send a gRPC-Web request whose body is delivered as several wire chunks, so
+/// the trailer frame can be split across frame boundaries.
+async fn send_grpc_web_request_in_chunks(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    path: &str,
+    content_type: &str,
+    chunks: Vec<Bytes>,
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
+    stream.set_nodelay(true)?;
+    let io = TokioIo::new(stream);
+
+    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = chunks
+        .into_iter()
+        .map(|chunk| Ok(Frame::data(chunk)))
+        .collect();
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header("host", "localhost")
+        .header("content-type", content_type)
+        .body(StreamBody::new(tokio_stream::iter(frames)))?;
+
+    let response = match version {
+        TestHttpVersion::H1 => {
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender.send_request(request).await?
+        }
+        TestHttpVersion::H2 => {
+            let (mut sender, conn) =
+                hyper::client::conn::http2::handshake(TokioExecutor::new(), io).await?;
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            sender.send_request(request).await?
+        }
+    };
+
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes().to_vec())
+        .unwrap_or_default();
+    Ok((status, headers, body))
+}
+
+/// Decode a gRPC-Web response body to its binary frame representation.
+fn decode_grpc_web_response(body: &[u8], text_mode: bool) -> Vec<u8> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    if text_mode {
+        BASE64
+            .decode(body)
+            .expect("gRPC-Web text response must be base64")
+    } else {
+        body.to_vec()
+    }
+}
+
+fn body_contains(haystack: &[u8], needle: &str) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_bytes())
+}
+
+/// Build a `flag`-tagged length-prefixed gRPC frame.
+fn grpc_request_frame(flag: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(flag);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_request_trailer_frames_become_native_grpc_trailers_on_h1_and_h2() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let (backend_addr, _backend_handle) = start_grpc_backend_echoing_request_trailers().await;
+    let mut proxy = create_grpc_proxy("grpc-web-trailers", "/grpc-trailers", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    attach_test_plugin(&mut proxy, "grpc-web-trailers-plugin");
+    let plugin = test_plugin_config(
+        "grpc-web-trailers-plugin",
+        "grpc_web",
+        "grpc-web-trailers",
+        serde_json::json!({}),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let message = grpc_request_frame(0x00, b"hello");
+    let mut valid = message.clone();
+    valid.extend_from_slice(&grpc_request_frame(
+        0x80,
+        b"x-app-id: 42\r\nx-trace-bin: AAEC\r\nx-app-id: 43\r\n",
+    ));
+
+    // Every rejected shape must fail closed BEFORE dispatch, so the backend
+    // echo never appears in the response.
+    let mut trailer_then_data = message.clone();
+    trailer_then_data.extend_from_slice(&grpc_request_frame(0x80, b"x-app-id: 42\r\n"));
+    trailer_then_data.extend_from_slice(&message);
+    let mut two_trailers = message.clone();
+    two_trailers.extend_from_slice(&grpc_request_frame(0x80, b"x-app-id: 42\r\n"));
+    two_trailers.extend_from_slice(&grpc_request_frame(0x80, b"x-app-id: 43\r\n"));
+    let mut compressed_trailer = message.clone();
+    compressed_trailer.extend_from_slice(&grpc_request_frame(0x81, b"x-app-id: 42\r\n"));
+    let mut forbidden_name = message.clone();
+    forbidden_name.extend_from_slice(&grpc_request_frame(0x80, b"grpc-timeout: 1S\r\n"));
+    let mut pseudo_header = message.clone();
+    pseudo_header.extend_from_slice(&grpc_request_frame(0x80, b":method: DELETE\r\n"));
+    let mut smuggled_value = message.clone();
+    smuggled_value.extend_from_slice(&grpc_request_frame(
+        0x80,
+        b"x-app-id: 42\nauthorization: Bearer stolen\r\n",
+    ));
+    let mut unterminated = message.clone();
+    unterminated.extend_from_slice(&grpc_request_frame(0x80, b"x-app-id: 42"));
+    let trailer_only = grpc_request_frame(0x80, b"x-app-id: 42\r\n");
+    let mut oversized = message.clone();
+    let huge = format!(
+        "x-app-id: {}\r\n",
+        "a".repeat(ferrum_edge::_test_support::MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES)
+    );
+    oversized.extend_from_slice(&grpc_request_frame(0x80, huge.as_bytes()));
+    let mut too_many = message.clone();
+    let entries = (0..=ferrum_edge::_test_support::MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES)
+        .map(|index| format!("x-app-{index}: v\r\n"))
+        .collect::<String>();
+    too_many.extend_from_slice(&grpc_request_frame(0x80, entries.as_bytes()));
+
+    let rejected = [
+        ("trailer then data", trailer_then_data),
+        ("two trailer frames", two_trailers),
+        ("compressed trailer frame", compressed_trailer),
+        ("forbidden trailer name", forbidden_name),
+        ("pseudo header trailer", pseudo_header),
+        ("bare LF value smuggling", smuggled_value),
+        ("unterminated trailer line", unterminated),
+        ("trailer without message frame", trailer_only),
+        ("oversized trailer block", oversized),
+        ("too many trailer entries", too_many),
+    ];
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (content_type, text_mode) in [
+            ("application/grpc-web+proto", false),
+            ("application/grpc-web-text+proto", true),
+        ] {
+            let wire = if text_mode {
+                Bytes::from(BASE64.encode(&valid))
+            } else {
+                Bytes::from(valid.clone())
+            };
+
+            // Success path: the backend must observe the trailer metadata as
+            // real HTTP/2 trailers, and the message stream must be exactly the
+            // DATA frame — the trailer frame's bytes are gone from the body.
+            let mut echoed = None;
+            for _attempt in 0..5 {
+                let (status, headers, body) = send_http_request_with_body_and_accept(
+                    gateway_addr,
+                    version,
+                    Method::POST,
+                    "/grpc-trailers/my.Service/Unary",
+                    content_type,
+                    None,
+                    wire.clone(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{version:?} {content_type} trailer request failed: {error}")
+                });
+                if status == 200
+                    && headers.get("content-type").map(String::as_str) == Some(content_type)
+                {
+                    let framed = decode_grpc_web_response(&body, text_mode);
+                    if body_contains(&framed, "trailers=[") {
+                        echoed = Some(framed);
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let framed = echoed
+                .unwrap_or_else(|| panic!("{version:?} {content_type} never reached backend"));
+            let rendered = String::from_utf8_lossy(&framed).into_owned();
+            assert!(
+                body_contains(&framed, "x-app-id=42"),
+                "{version:?} {content_type} lost request trailer metadata: {rendered}"
+            );
+            assert!(
+                body_contains(&framed, "x-app-id=43"),
+                "{version:?} {content_type} dropped a duplicate trailer entry: {rendered}"
+            );
+            assert!(
+                body_contains(&framed, "x-trace-bin=AAEC"),
+                "{version:?} {content_type} lost binary trailer metadata: {rendered}"
+            );
+            assert!(
+                body_contains(&framed, &format!("body={}", message.len())),
+                "{version:?} {content_type} forwarded the trailer frame as message bytes: \
+                 {rendered}"
+            );
+            assert_integration_grpc_web_status(&HashMap::new(), &framed, false, 0);
+
+            for (case, body) in &rejected {
+                let wire = if text_mode {
+                    Bytes::from(BASE64.encode(body))
+                } else {
+                    Bytes::from(body.clone())
+                };
+                let (status, headers, body) = send_http_request_with_body_and_accept(
+                    gateway_addr,
+                    version,
+                    Method::POST,
+                    "/grpc-trailers/my.Service/Unary",
+                    content_type,
+                    None,
+                    wire,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{version:?} {case} request failed: {error}"));
+                assert_eq!(status, 200, "{version:?} {case}");
+                assert_eq!(
+                    headers.get("content-type").map(String::as_str),
+                    Some(content_type),
+                    "{version:?} {case}"
+                );
+                let framed = decode_grpc_web_response(&body, text_mode);
+                assert!(
+                    !body_contains(&framed, "trailers=["),
+                    "{version:?} {case} reached the backend instead of failing closed"
+                );
+                assert_integration_grpc_web_status(&headers, &body, text_mode, 3);
+            }
+        }
+
+        // A trailer frame split across wire chunks must reassemble before
+        // validation rather than being judged on a partial buffer.
+        let split_at = valid.len() - 12;
+        let mut split_ok = false;
+        let mut last_split_body = Vec::new();
+        for _attempt in 0..5 {
+            let (status, headers, body) = send_grpc_web_request_in_chunks(
+                gateway_addr,
+                version,
+                "/grpc-trailers/my.Service/Unary",
+                "application/grpc-web+proto",
+                vec![
+                    Bytes::copy_from_slice(&valid[..split_at]),
+                    Bytes::copy_from_slice(&valid[split_at..]),
+                ],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} split-frame request failed: {error}"));
+            last_split_body = body;
+            if status == 200
+                && headers.get("content-type").map(String::as_str)
+                    == Some("application/grpc-web+proto")
+                && body_contains(&last_split_body, "x-app-id=42")
+            {
+                split_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            split_ok,
+            "{version:?} split trailer frame lost request trailers: {}",
+            String::from_utf8_lossy(&last_split_body)
+        );
+    }
+}
+
 fn test_plugin_config(
     id: &str,
     plugin_name: &str,
