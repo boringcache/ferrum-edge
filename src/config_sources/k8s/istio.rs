@@ -3446,10 +3446,11 @@ fn route_rewrite_value(http: &Value) -> Option<Value> {
 /// `RouteRedirectConfig` JSON shape consumed by `mesh_route_dispatch`.
 ///
 /// Maps `redirect.uri` -> `uri`, `redirect.authority` -> `authority`,
-/// `redirect.scheme` -> `scheme`, and `redirect.redirectCode` -> `redirect_code`
-/// (default 301). Istio's `redirect.port` / `derivePort` are NOT representable
-/// and are rejected fail-closed (the operator must express a target port via
-/// `redirect.authority` as `host:port`). Returns `None` when the block has no
+/// `redirect.scheme` -> `scheme`, `redirect.port` -> `port`,
+/// `redirect.derivePort` -> `derive_port`, and `redirect.redirectCode` ->
+/// `redirect_code` (default 301). `port` and `derivePort` are mutually
+/// exclusive (Istio oneof); invalid or unrepresentable values fail closed with
+/// field-specific diagnostics. Returns `None` when the block has no
 /// target-changing field so an inert `redirect: {}` does not short-circuit
 /// every request with an unchanged Location.
 fn route_redirect_value(
@@ -3459,23 +3460,15 @@ fn route_redirect_value(
     let Some(redirect) = http.get("redirect").and_then(Value::as_object) else {
         return Ok(None);
     };
-    // `redirect.port` and `redirect.derivePort` are not representable in the
-    // per-rule redirect projection: `derivePort` needs the request's port at
-    // runtime (FROM_REQUEST_PORT / FROM_PROTOCOL_DEFAULT) which the translator
-    // does not have, and an explicit `port` would need to be folded into the
-    // `Location` authority. Rather than silently emit a `Location` without the
-    // requested port — a wrong, query-/auth-breaking redirect — fail closed so
-    // the K8s status writer surfaces the limitation to `kubectl` instead of
-    // translating it incorrectly.
     let has_port = redirect.get("port").is_some_and(|v| !v.is_null());
     let has_derive_port = redirect.get("derivePort").is_some_and(|v| !v.is_null());
-    if has_port || has_derive_port {
+    if has_port && has_derive_port {
         return Err(invalid_resource(
             object,
-            "VirtualService http[].redirect.port / derivePort is not supported; \
-             remove the field or set the target port via redirect.authority (host:port)",
+            "VirtualService http[].redirect.port and derivePort are mutually exclusive",
         ));
     }
+
     let mut out = serde_json::Map::new();
     if let Some(uri) = redirect.get("uri").and_then(Value::as_str)
         && !uri.is_empty()
@@ -3494,6 +3487,44 @@ fn route_redirect_value(
         && !scheme.is_empty()
     {
         out.insert("scheme".to_string(), Value::String(scheme.to_string()));
+    }
+    if let Some(port_value) = redirect.get("port").filter(|v| !v.is_null()) {
+        let Some(port) = port_value.as_u64() else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].redirect.port must be an integer in the 1-65535 range",
+            ));
+        };
+        if port == 0 || port > u64::from(u16::MAX) {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].redirect.port must be in the 1-65535 range",
+            ));
+        }
+        out.insert("port".to_string(), serde_json::json!(port));
+    }
+    if has_derive_port {
+        let Some(derive) = redirect.get("derivePort").and_then(Value::as_str) else {
+            return Err(invalid_resource(
+                object,
+                "VirtualService http[].redirect.derivePort must be \
+                 FROM_PROTOCOL_DEFAULT or FROM_REQUEST_PORT",
+            ));
+        };
+        match derive {
+            "FROM_PROTOCOL_DEFAULT" | "FROM_REQUEST_PORT" => {
+                out.insert("derive_port".to_string(), Value::String(derive.to_string()));
+            }
+            other => {
+                return Err(invalid_resource(
+                    object,
+                    format!(
+                        "VirtualService http[].redirect.derivePort must be \
+                         FROM_PROTOCOL_DEFAULT or FROM_REQUEST_PORT, got {other:?}"
+                    ),
+                ));
+            }
+        }
     }
     // `redirectCode` defaults to 301 in Istio. Carry it explicitly only when
     // the operator set a value; the plugin defaults the field otherwise.
@@ -9421,8 +9452,8 @@ extensionProviders:
     }
 
     #[test]
-    fn virtual_service_redirect_rejects_port_field() {
-        let err = translate_k8s_objects(
+    fn virtual_service_redirect_projects_explicit_port() {
+        let result = translate_k8s_objects(
             &[object(
                 "VirtualService",
                 serde_json::json!({
@@ -9435,16 +9466,85 @@ extensionProviders:
             )],
             options(),
         )
-        .expect_err("redirect.port must fail closed");
-        assert!(
-            err.to_string()
-                .contains("redirect.port / derivePort is not supported"),
-            "unexpected error: {err}"
-        );
+        .expect("redirect.port must translate");
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let redirect = rules
+            .iter()
+            .find_map(|r| r.get("redirect"))
+            .expect("redirect action present");
+        assert_eq!(redirect["uri"].as_str(), Some("/new"));
+        assert_eq!(redirect["port"].as_u64(), Some(8443));
+        assert!(redirect.get("derive_port").is_none());
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        MeshRouteDispatch::new(&plugin.config).expect("redirect dispatch config is valid");
     }
 
     #[test]
-    fn virtual_service_redirect_rejects_derive_port_field() {
+    fn virtual_service_redirect_projects_derive_port_from_request_port() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"derivePort": "FROM_REQUEST_PORT", "scheme": "https"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("redirect.derivePort must translate");
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let redirect = rules
+            .iter()
+            .find_map(|r| r.get("redirect"))
+            .expect("redirect action present");
+        assert_eq!(redirect["derive_port"].as_str(), Some("FROM_REQUEST_PORT"));
+        assert_eq!(redirect["scheme"].as_str(), Some("https"));
+        assert!(redirect.get("port").is_none());
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        MeshRouteDispatch::new(&plugin.config).expect("redirect dispatch config is valid");
+    }
+
+    #[test]
+    fn virtual_service_redirect_projects_derive_port_from_protocol_default() {
+        let result = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {
+                            "uri": "/secure",
+                            "scheme": "https",
+                            "derivePort": "FROM_PROTOCOL_DEFAULT"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("FROM_PROTOCOL_DEFAULT must translate");
+        let plugin = dispatch_plugin(&result);
+        let rules = dispatch_rules(plugin);
+        let redirect = rules
+            .iter()
+            .find_map(|r| r.get("redirect"))
+            .expect("redirect action present");
+        assert_eq!(
+            redirect["derive_port"].as_str(),
+            Some("FROM_PROTOCOL_DEFAULT")
+        );
+        use crate::plugins::mesh_route_dispatch::MeshRouteDispatch;
+        MeshRouteDispatch::new(&plugin.config).expect("redirect dispatch config is valid");
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_port_and_derive_port_together() {
         let err = translate_k8s_objects(
             &[object(
                 "VirtualService",
@@ -9452,17 +9552,134 @@ extensionProviders:
                     "hosts": ["api.example.com"],
                     "http": [{
                         "match": [{"uri": {"prefix": "/old"}}],
-                        "redirect": {"derivePort": "FROM_REQUEST_PORT"}
+                        "redirect": {"port": 8443, "derivePort": "FROM_REQUEST_PORT"}
                     }]
                 }),
             )],
             options(),
         )
-        .expect_err("redirect.derivePort must fail closed");
+        .expect_err("port + derivePort must fail closed");
         assert!(
             err.to_string()
-                .contains("redirect.port / derivePort is not supported"),
+                .contains("port and derivePort are mutually exclusive"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_invalid_port() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "port": 0}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("port 0 must fail closed");
+        assert!(
+            err.to_string()
+                .contains("redirect.port must be in the 1-65535 range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_rejects_unknown_derive_port() {
+        let err = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"derivePort": "FROM_X_FORWARDED_PORT"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("unknown derivePort must fail closed");
+        assert!(
+            err.to_string().contains("redirect.derivePort must be"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn virtual_service_redirect_port_update_and_delete() {
+        // Create → update → delete across successive translations, matching the
+        // K8s controller's full re-translate ownership model.
+        let with_port = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "port": 8443}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("create with port");
+        let redirect = dispatch_rules(dispatch_plugin(&with_port))
+            .iter()
+            .find_map(|r| r.get("redirect").cloned())
+            .expect("redirect present after create");
+        assert_eq!(redirect["port"].as_u64(), Some(8443));
+
+        let with_derive = translate_k8s_objects(
+            &[object(
+                "VirtualService",
+                serde_json::json!({
+                    "hosts": ["api.example.com"],
+                    "http": [{
+                        "match": [{"uri": {"prefix": "/old"}}],
+                        "redirect": {"uri": "/new", "derivePort": "FROM_REQUEST_PORT"}
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("update to derivePort");
+        let redirect = dispatch_rules(dispatch_plugin(&with_derive))
+            .iter()
+            .find_map(|r| r.get("redirect").cloned())
+            .expect("redirect present after update");
+        assert_eq!(redirect["derive_port"].as_str(), Some("FROM_REQUEST_PORT"));
+        assert!(redirect.get("port").is_none());
+
+        let deleted = translate_k8s_objects(&[], options()).expect("delete VirtualService");
+        assert!(
+            deleted
+                .config
+                .plugin_configs
+                .iter()
+                .filter(|p| p.plugin_name == "mesh_route_dispatch")
+                .all(|p| {
+                    p.config
+                        .get("rules")
+                        .and_then(|r| r.as_array())
+                        .into_iter()
+                        .flatten()
+                        .all(|rule| rule.get("redirect").is_none())
+                }),
+            "delete must drop redirect-bearing dispatch rules"
+        );
+        assert!(
+            !deleted
+                .config
+                .proxies
+                .iter()
+                .any(|p| p.listen_path.as_deref() == Some("/old")),
+            "delete must drop the redirect proxy"
         );
     }
 
