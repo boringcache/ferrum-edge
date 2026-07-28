@@ -16394,6 +16394,16 @@ pub(crate) async fn run_after_proxy_hooks(
     // request on non-AI proxies. When no reservation exists the keep/release
     // decision is moot anyway (`should_release_gateway_rejection` requires a
     // non-zero reservation), so the status is only useful when the marker is set.
+    //
+    // Independently, record the same genuine status as private typed provenance
+    // on `RequestContext` and notify every plugin once. That path is
+    // non-spoofable by public metadata and lets origin-success side effects
+    // (notably `response_caching` invalidation) run even when an earlier
+    // `after_proxy` hook replaces the client-visible response.
+    ctx.record_origin_http_response_status(response_status);
+    for plugin in plugins {
+        plugin.observe_origin_http_response_status(ctx, response_status);
+    }
     if ctx.metadata.contains_key(RESERVED_TOKENS_METADATA_KEY) {
         ctx.metadata.insert(
             BACKEND_STATUS_METADATA_KEY.to_string(),
