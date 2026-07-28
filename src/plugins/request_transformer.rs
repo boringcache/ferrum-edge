@@ -25,12 +25,16 @@
 //! ## Query mutation contract
 //!
 //! Query rules mutate an ordered, duplicate-aware representation derived from
-//! the retained raw wire query (not the single-value `query_params` map). The
-//! serialized result is published on
-//! [`RequestContext::publish_transformed_query`] so every primary dispatch
-//! surface and `request_mirror` compose the same canonical outbound query with
-//! authentication-owned strips. Unmodified pairs keep their original encoding;
-//! the ordinary no-query-rule path allocates nothing and leaves the raw query
+//! the retained raw wire query (not the single-value `query_params` map).
+//! Authentication-owned credential pairs marked under
+//! `auth.strip_query_param.*` are removed from that representation **before**
+//! any query rules run, so a rename/update/duplicate cannot relocate or
+//! re-encode an authenticated secret onto a new outbound name. The serialized
+//! result is published on [`RequestContext::publish_transformed_query`] so
+//! every primary dispatch surface and `request_mirror` share the same
+//! canonical outbound query; the proxy still applies a final strip pass as
+//! defense in depth. Unmodified pairs keep their original encoding; the
+//! ordinary no-query-rule path allocates nothing and leaves the raw query
 //! untouched.
 //!
 //! Duplicate-name semantics (decoded names):
@@ -73,7 +77,7 @@
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -615,7 +619,22 @@ fn apply_query_rules(plugin: &RequestTransformer, ctx: &mut RequestContext) {
         OrderedQuery::new()
     };
 
-    let mut query_mutated = false;
+    // Fail-closed: strip authentication-owned credentials from the transform
+    // input before any query rules run. A rename/update of a marked name must
+    // not relocate or re-encode the authenticated secret onto the outbound
+    // query or the plugin-visible map. The proxy still applies a final strip
+    // pass as defense in depth.
+    let strip_names: HashSet<&str> = ctx
+        .metadata
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(
+                crate::plugins::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX,
+            )
+        })
+        .collect();
+    let mut query_mutated = ordered.remove_matching_names(&strip_names);
+
     for rule in &plugin.query_rules {
         match rule.operation {
             QueryOp::Add => {

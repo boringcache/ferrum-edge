@@ -8,7 +8,7 @@
 //! encodings byte-for-byte.
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Characters that must be percent-encoded in query names/values we author.
 /// Unreserved characters (RFC 3986) stay literal; space becomes `%20` (never
@@ -218,6 +218,24 @@ impl OrderedQuery {
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.pairs.len();
         self.pairs.retain(|pair| pair.decoded_name != name);
+        self.pairs.len() != before
+    }
+
+    /// Drop every pair whose raw or decoded name is in `names`.
+    ///
+    /// Used to remove authentication-owned credential pairs before ordered
+    /// query mutations so a later rename/update/add cannot relocate or
+    /// re-encode an authenticated secret onto the outbound query. Matches the
+    /// same raw-or-decoded name contract as
+    /// [`crate::proxy::query_string_after_plugin_strips`].
+    pub fn remove_matching_names(&mut self, names: &HashSet<&str>) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        let before = self.pairs.len();
+        self.pairs.retain(|pair| {
+            !names.contains(pair.raw_name.as_str()) && !names.contains(pair.decoded_name.as_str())
+        });
         self.pairs.len() != before
     }
 

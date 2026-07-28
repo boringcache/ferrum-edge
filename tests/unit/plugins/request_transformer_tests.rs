@@ -2154,12 +2154,53 @@ async fn test_query_transform_composes_with_auth_strip_helper() {
     );
     let mut headers = HashMap::new();
     let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_eq!(
-        ctx.outbound_query_string(),
-        Some("api_key=secret&page=2&keep=1")
-    );
+    // Auth-marked credentials are stripped from the transform input before
+    // query rules run, so the published outbound query never retains them.
+    assert_eq!(ctx.outbound_query_string(), Some("page=2&keep=1"));
+    assert!(!ctx.query_params.contains_key("api_key"));
     let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
     assert_eq!(effective, "page=2&keep=1");
+}
+
+#[tokio::test]
+async fn test_auth_marked_credential_cannot_survive_rename() {
+    let plugin = RequestTransformer::new(&json!({
+        "rules": [
+            {"operation": "rename", "target": "query", "key": "access_token", "new_key": "moved"},
+            {"operation": "add", "target": "query", "key": "page", "value": "2"}
+        ]
+    }))
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.set_raw_query_string("access_token=never-forward-this&keep=1".to_string());
+    ctx.materialize_query_params();
+    assert_eq!(
+        ctx.query_params.get("access_token").map(String::as_str),
+        Some("never-forward-this")
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.access_token".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = HashMap::new();
+    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    // Renaming an auth-marked credential must not move the secret to a new
+    // outbound name, nor leave it in the plugin-visible map.
+    assert_eq!(ctx.outbound_query_string(), Some("keep=1&page=2"));
+    assert!(!ctx.query_params.contains_key("access_token"));
+    assert!(!ctx.query_params.contains_key("moved"));
+    assert!(
+        !ctx.query_params
+            .values()
+            .any(|value| value == "never-forward-this")
+    );
+
+    let effective = ferrum_edge::_test_support::effective_backend_query_string_for_test(&ctx);
+    assert_eq!(effective, "keep=1&page=2");
+    assert!(!effective.contains("never-forward-this"));
+    assert!(!effective.contains("moved="));
+    assert!(!effective.contains("access_token"));
 }
 
 #[tokio::test]

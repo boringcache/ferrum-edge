@@ -5,7 +5,8 @@ use super::auth_flow::ExtractedCredential;
 
 /// Metadata-key prefix marking a query parameter that carried the auth token and
 /// must be stripped from the URL forwarded upstream. It is shared by every auth
-/// plugin that supports query-param token locations and is consumed by the proxy
+/// plugin that supports query-param token locations and is consumed by
+/// `request_transformer` (pre-rule input strip) and the proxy
 /// (`effective_backend_query_string` / `query_string_after_plugin_strips`),
 /// which compose authentication strips onto the transformer outbound query or
 /// retained raw wire query. Per-plugin prefixes would be silently ignored

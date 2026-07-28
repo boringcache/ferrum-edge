@@ -16927,8 +16927,12 @@ components:
             rename: rename every matching pair, preserving value encoding
             and key-without-equals shape; existing destination names stay.
             Mutations apply to an ordered, duplicate-aware representation of
-            the retained raw query and are published as the outbound query
-            for every primary backend URL builder and request_mirror.
+            the retained raw query after authentication-owned credential
+            pairs (`auth.strip_query_param.*`) are removed from that input,
+            and are published as the outbound query for every primary
+            backend URL builder and request_mirror. The proxy still applies
+            a final strip pass as defense in depth. A rename/update of a
+            marked credential name therefore cannot relocate the secret.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.

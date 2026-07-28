@@ -29862,8 +29862,11 @@ pub(crate) fn query_string_after_plugin_strips<'a>(
 
 /// Canonical backend-visible query: transformer-published outbound query when
 /// present (including empty), otherwise the retained raw wire query, then
-/// authentication-owned credential strips. Ordinary no-transform / no-strip
-/// requests borrow the raw string with no allocation.
+/// authentication-owned credential strips. Transformers already strip marked
+/// credentials from their input before query rules run; this final pass is
+/// defense in depth for the no-transform path and any residual marked names.
+/// Ordinary no-transform / no-strip requests borrow the raw string with no
+/// allocation.
 pub(crate) fn effective_backend_query_string<'a>(ctx: &'a RequestContext) -> Cow<'a, str> {
     let base = match ctx.outbound_query_string() {
         Some(q) => q,

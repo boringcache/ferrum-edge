@@ -1820,7 +1820,9 @@ pub struct RequestContext {
     /// `None` means "use [`Self::raw_query_string`] unchanged" (ordinary
     /// no-transform hot path). `Some("")` is an explicit empty outbound query
     /// after a transform removed every pair. Authentication-owned strips are
-    /// composed later by [`crate::proxy::query_string_after_plugin_strips`].
+    /// removed from the transformer input before query rules run, and the
+    /// proxy applies [`crate::proxy::query_string_after_plugin_strips`] again
+    /// as defense in depth when composing the canonical backend-visible query.
     outbound_query_string: Option<String>,
     /// Whether either decoded or raw query-param materialization has already
     /// populated `query_params`. Keeps materialization one-shot while preserving
