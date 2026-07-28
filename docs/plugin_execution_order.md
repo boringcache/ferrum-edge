@@ -229,13 +229,15 @@ deterministic sampler once and, on selection, takes the instance's
 `max_in_flight` permit plus a `max_retained_request_body_bytes` reservation.
 `should_buffer_request_body` is then a pure read of that decision, so a
 `percentage: 0`, sampled-out, or saturated request keeps streaming and never
-allocates a mirror body. Because the hook runs at the end of the authorization
-phase, authentication and every real authorization plugin still reject first,
-and the sampler is never advanced for a request they refuse. Instances with
-`mirror_request_body: false` or a zero-quantized `percentage` declare no body
-capability at all and stay out of the authorize list. The staged decision is
-left behind as a consumed marker after `before_proxy` takes the lease, so the
-buffering predicate answers consistently for the whole request.
+allocates a mirror body. Its built-in priority follows the built-in rejecting
+authorization hooks. If an operator priority override or custom plugin places a
+rejecting hook later, the proxy still waits for the complete authorization
+phase before collecting the body; that rejection drops the staged permit and
+reservation without reading the upload, though it may consume a sampling slot.
+Instances with `mirror_request_body: false` or a zero-quantized `percentage`
+declare no body capability at all and stay out of the authorize list. The staged
+decision is left behind as a consumed marker after `before_proxy` takes the
+lease, so the buffering predicate answers consistently for the whole request.
 
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across

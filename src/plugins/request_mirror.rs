@@ -117,9 +117,12 @@
 //!    deterministic sampler once and, when the request is selected, acquires
 //!    the `max_in_flight` permit and reserves retained bytes from the aggregate
 //!    budget. A sampled-out or refused request stages a non-admitting decision
-//!    and keeps streaming — nothing is buffered, copied, or retained. This runs
-//!    after authentication and after every real authorization plugin, so an
-//!    earlier rejection short-circuits before the sampler advances.
+//!    and keeps streaming — nothing is buffered, copied, or retained. The
+//!    built-in priority places this after the built-in rejecting authorization
+//!    hooks. Even when an operator priority override or custom plugin runs a
+//!    rejecting hook later, the proxy does not collect the body until the
+//!    complete authorization phase succeeds; rejection drops the staged permit
+//!    and reservation without reading the upload.
 //! 3. **Per-request buffering follows admission.** `should_buffer_request_body`
 //!    is a pure read of that staged decision (it is evaluated several times per
 //!    request), so only admitted requests buffer.
@@ -1824,18 +1827,20 @@ impl Plugin for RequestMirror {
 
     /// Decide sampling and bounded mirror admission BEFORE body collection.
     ///
-    /// Runs at the end of the authorization phase — after authentication and
-    /// after every real authorization plugin, and immediately before the
-    /// pre-`before_proxy` body buffer is collected. A request that is not
-    /// selected, or that cannot get a concurrency permit and a retained-byte
-    /// reservation, stages a non-admitting decision and stays streaming.
+    /// The built-in priority places this after the built-in rejecting
+    /// authorization hooks. Operator priority overrides and custom plugins can
+    /// place another authorization hook later, but body collection still waits
+    /// for the complete authorization phase to succeed. A later rejection
+    /// therefore drops this staged decision without reading the upload. A
+    /// request that is not selected, or that cannot get a concurrency permit
+    /// and a retained-byte reservation, stages a non-admitting decision and
+    /// stays streaming.
     ///
     /// The sampler advances here rather than in `before_proxy`. Requests
-    /// rejected earlier in the pipeline still never advance it, so configured
-    /// sampling remains evenly spaced over admitted traffic. The one
-    /// behavioral consequence is that a request later claimed by
-    /// `ai_stream_router` consumes a sampling slot without dispatching a
-    /// mirror; its permit and reservation are released immediately.
+    /// rejected before this hook do not advance it. A later custom or
+    /// priority-overridden authorization rejection can consume a sampling slot,
+    /// as can a request later claimed by `ai_stream_router`; in both cases the
+    /// permit and reservation are released without dispatching a mirror.
     async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
         if !self.body_admission_enabled() {
             return PluginResult::Continue;
