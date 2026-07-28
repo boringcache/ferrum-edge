@@ -4510,9 +4510,8 @@ mod tests {
                 } else {
                     GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
                 };
-                let verifier = crate::grpc::cp_trust::CpDpVerifier::SharedSecret(
-                    secret.as_str().to_string(),
-                );
+                let verifier =
+                    crate::grpc::cp_trust::CpDpVerifier::SharedSecret(secret.as_str().to_string());
                 verify_grpc_jwt_metadata_with_audience(
                     request.metadata(),
                     &verifier,

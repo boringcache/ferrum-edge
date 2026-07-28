@@ -25,8 +25,8 @@ use crate::FERRUM_VERSION;
 use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
 use crate::grpc::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
-use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
+use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 

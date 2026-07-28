@@ -4661,7 +4661,10 @@ impl EnvConfig {
         // Whenever a secret *is* configured it still has to clear the minimum
         // length, on every mode — the macro used to enforce that only where it
         // was required.
-        if let Some(secret) = self.cp_dp_grpc_jwt_secret.as_deref().filter(|s| !s.is_empty())
+        if let Some(secret) = self
+            .cp_dp_grpc_jwt_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
             && secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH
         {
             return Err(format!(
@@ -4677,16 +4680,20 @@ impl EnvConfig {
         match &self.mode {
             OperatingMode::ControlPlane => {
                 if !has_cp_dp_secret && self.cp_dp_grpc_trust_bundle_path.is_none() {
-                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode unless \
+                    return Err(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET is required in cp mode unless \
                                 FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH is configured"
-                        .into());
+                            .into(),
+                    );
                 }
             }
             OperatingMode::DataPlane => {
                 if !has_cp_dp_secret && self.dp_cp_grpc_token_file.is_none() {
-                    return Err("FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
+                    return Err(
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET is required in dp mode unless \
                                 FERRUM_DP_CP_GRPC_TOKEN_FILE supplies an externally issued token"
-                        .into());
+                            .into(),
+                    );
                 }
             }
             _ => {}

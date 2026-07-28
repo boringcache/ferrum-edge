@@ -96,8 +96,12 @@ fn mint(
     }
     let mut header = Header::new(Algorithm::HS256);
     header.kid = kid.map(str::to_string);
-    encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
-        .expect("test JWT must encode")
+    encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .expect("test JWT must encode")
 }
 
 // ── Config fixtures ──────────────────────────────────────────────────────

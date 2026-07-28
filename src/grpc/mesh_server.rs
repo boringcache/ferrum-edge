@@ -522,7 +522,11 @@ impl MeshConfigSync for MeshGrpcServer {
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
         let remote_discovery = request.get_ref().remote_discovery;
-        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions(), remote_discovery) {
+        let allowed = match self.verify_jwt_metadata(
+            request.metadata(),
+            request.extensions(),
+            remote_discovery,
+        ) {
             Ok(allowed) => allowed,
             Err((status, audience_reason)) => {
                 let req = request.get_ref();

@@ -52,8 +52,8 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
-use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
+use super::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;

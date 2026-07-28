@@ -361,14 +361,18 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     validation.validate_aud = false;
 
     let (decoded, bound_namespaces) = verifier
-        .with_decoding_key(header.kid.as_deref(), header.alg, |key, algorithm, bound| {
-            // `algorithm` is the credential's configured algorithm, which
-            // `with_decoding_key` already proved equal to the header's. Pin the
-            // validation to it rather than to the header so a future selection
-            // change cannot silently widen the accepted algorithm set.
-            validation.algorithms = vec![algorithm];
-            (decode::<Value>(token, key, &validation), bound.cloned())
-        })
+        .with_decoding_key(
+            header.kid.as_deref(),
+            header.alg,
+            |key, algorithm, bound| {
+                // `algorithm` is the credential's configured algorithm, which
+                // `with_decoding_key` already proved equal to the header's. Pin the
+                // validation to it rather than to the header so a future selection
+                // change cannot silently widen the accepted algorithm set.
+                validation.algorithms = vec![algorithm];
+                (decode::<Value>(token, key, &validation), bound.cloned())
+            },
+        )
         .map_err(|reason| {
             (
                 Status::unauthenticated(reason.as_status_message()),
