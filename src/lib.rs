@@ -283,6 +283,43 @@ pub mod _test_support {
         crate::proxy::udp_proxy::take_udp_last_client_if_live(last_client, client_addr, is_expired)
     }
 
+    /// Frontend-DTLS / UDP idle-expiry predicate on virtual monotonic timestamps.
+    pub fn udp_idle_expired_for_test(
+        now_mono_ms: u64,
+        last_activity_ms: u64,
+        idle_timeout_ms: u64,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_idle_expired(now_mono_ms, last_activity_ms, idle_timeout_ms)
+    }
+
+    /// Whether an application-datagram outcome should refresh the shared idle
+    /// watermark (policy-admitted + successful forward/delivery).
+    pub fn udp_idle_activity_should_refresh_for_test(
+        policy_admitted: bool,
+        forward_or_deliver_succeeded: bool,
+    ) -> bool {
+        crate::proxy::udp_proxy::udp_idle_activity_should_refresh(
+            policy_admitted,
+            forward_or_deliver_succeeded,
+        )
+    }
+
+    /// Apply the production idle-watermark refresh decision against a virtual
+    /// clock instant (used by frontend-DTLS relay regression coverage).
+    pub fn maybe_touch_udp_idle_activity_for_test(
+        activity_ms: &std::sync::atomic::AtomicU64,
+        now_ms: u64,
+        policy_admitted: bool,
+        forward_or_deliver_succeeded: bool,
+    ) {
+        crate::proxy::udp_proxy::maybe_touch_udp_idle_activity(
+            activity_ms,
+            now_ms,
+            policy_admitted,
+            forward_or_deliver_succeeded,
+        )
+    }
+
     pub fn plugin_cache_with_real_ip_header_for_test(
         config: &crate::config::types::GatewayConfig,
         real_ip_header: Option<&str>,
@@ -1225,7 +1262,6 @@ pub mod _test_support {
         pub recomputed_key_bytes: usize,
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
-        pub last_forced_candidates: usize,
         pub max_maintenance_entries: usize,
     }
 
@@ -1267,7 +1303,6 @@ pub mod _test_support {
                 recomputed_key_bytes: snapshot.recomputed_key_bytes,
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
-                last_forced_candidates: snapshot.last_forced_candidates,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
             })
         }
@@ -2172,6 +2207,16 @@ pub mod _test_support {
                 .seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_rate_limiting_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.rate_limiting
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_rate_limiting_periodic(&self) {
             self.rate_limiting.arm_periodic_eviction_for_test();
         }
@@ -2208,6 +2253,16 @@ pub mod _test_support {
             self.ai.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_ai_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ai
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_ai_periodic(&self) {
             self.ai.arm_periodic_eviction_for_test();
         }
@@ -2237,6 +2292,16 @@ pub mod _test_support {
 
         pub fn seed_graphql(&self, key: &str, now: std::time::Instant) {
             self.graphql.seed_key_at_for_test(key.to_string(), now);
+        }
+
+        pub fn seed_graphql_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.graphql
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
         }
 
         pub fn arm_graphql_periodic(&self) {
@@ -2270,6 +2335,16 @@ pub mod _test_support {
             self.grpc.seed_key_at_for_test(key.to_string(), now);
         }
 
+        pub fn seed_grpc_with_cap(
+            &self,
+            key: &str,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.grpc
+                .seed_key_at_with_cap_for_test(key.to_string(), now, max_entries)
+        }
+
         pub fn arm_grpc_periodic(&self) {
             self.grpc.arm_periodic_eviction_for_test();
         }
@@ -2299,6 +2374,16 @@ pub mod _test_support {
 
         pub fn seed_ws(&self, connection_id: u64, now: std::time::Instant) {
             self.ws.seed_connection_at_for_test(connection_id, now);
+        }
+
+        pub fn seed_ws_with_cap(
+            &self,
+            connection_id: u64,
+            now: std::time::Instant,
+            max_entries: usize,
+        ) -> bool {
+            self.ws
+                .seed_connection_at_with_cap_for_test(connection_id, now, max_entries)
         }
 
         pub fn arm_ws_periodic(&self) {
@@ -4445,6 +4530,66 @@ pub mod _test_support {
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
+
+    // ── K8s controller shutdown supervision (#3220) ─────────────────────────
+
+    pub use crate::k8s_controller::{
+        K8sControllerHandle, K8sControllerShutdownOutcome, K8sControllerTaskFailure,
+    };
+
+    /// Test-only view of the crate-private controller task registry.
+    ///
+    /// External tests register synthetic tasks through the **production**
+    /// `spawn_named` — the same lifecycle wrapper that records the shutdown
+    /// watch at each task's own completion boundary, and the same
+    /// close-on-shutdown ownership transfer the CRD reprobe loop races — rather
+    /// than through a parallel mock classifier. A regression in either would
+    /// therefore fail them.
+    #[derive(Clone)]
+    pub struct K8sControllerRegistryForTest(Arc<crate::k8s_controller::ControllerTaskRegistry>);
+
+    impl K8sControllerRegistryForTest {
+        /// Register a synthetic controller task exactly as the CRD watchers,
+        /// the reconciler, and the CRD reprobe loop do. The resulting task name
+        /// is `{label}#{registration sequence}`.
+        ///
+        /// Returns `false` when shutdown has already closed the registry, in
+        /// which case the future is dropped and never spawned. Must be called
+        /// from within a tokio runtime.
+        pub fn spawn<F>(
+            &self,
+            label: &str,
+            shutdown: tokio::sync::watch::Receiver<bool>,
+            fut: F,
+        ) -> bool
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            self.0.spawn_named(label, fut, shutdown)
+        }
+
+        /// `true` once a `shutdown()` has taken ownership of the task set.
+        pub fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+
+        /// The handle control-plane mode owns, over this exact registry, so
+        /// tasks registered after this call are still drained by `shutdown()`.
+        pub fn handle(&self) -> K8sControllerHandle {
+            K8sControllerHandle::new(
+                Arc::new(crate::k8s_controller::metrics::ControllerMetrics::new()),
+                self.0.clone(),
+            )
+        }
+    }
+
+    /// Fresh controller task registry for external shutdown-supervision tests
+    /// (delayed exit, panic propagation, grace-period abort, early exit,
+    /// dynamic registration) without a live Kubernetes API server and without
+    /// making the task set a production-public field.
+    pub fn k8s_controller_registry_for_test() -> K8sControllerRegistryForTest {
+        K8sControllerRegistryForTest(crate::k8s_controller::ControllerTaskRegistry::new())
+    }
 
     /// Thin wrapper over the production CP full-reload publication so external
     /// tests can drive it against real broadcast channels.

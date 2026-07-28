@@ -5,37 +5,32 @@ federation and cross-cluster endpoint discovery. It is the operator and CI
 companion to `docs/mesh.md` sections "Trust Federation" and
 "Cross-Cluster Endpoint Discovery".
 
-## Current Validation Report
+## Current Validation Status
 
-Date: 2026-06-21.
+Authoritative validation for bidirectional two-cluster federation is the
+repository harness and its GitHub Actions workflows — not a one-off local
+Docker/kind install report.
 
-Local workspace validation could not create real clusters because Docker was
-not running and neither `kind` nor `k3d` was installed:
+| Mode | Entry | Workflow / job |
+|---|---|---|
+| Live datapath (SPIRE-federated two kind clusters, bidirectional traffic + negatives) | `tests/k8s/multicluster-federation/run.sh` | `.github/workflows/multicluster-federation-live.yml` (requires `FERRUM_MULTICLUSTER_LIVE_ACK_DISPOSABLE=true`) |
+| Deploy-only smoke (rollouts, no traffic) | same script with `FERRUM_MULTICLUSTER_DEPLOY_ONLY=1` | PR `Mesh Multicluster Federation` job in `.github/workflows/ci.yml` (path-filtered; `workflow_dispatch` forces) |
 
-```text
-docker info: Cannot connect to the Docker daemon at unix:///Users/jeremyjustus/.docker/run/docker.sock
-kind: not found
-k3d: not found
-```
+In-process federation/discovery unit and integration coverage remains necessary
+but is not a substitute for the two-cluster harness. Preflight requires
+`docker`, `kind`, `kubectl`, `curl`, and `python3`; a skipped local run is not
+validation evidence.
 
-Existing repository coverage before this run was not enough to stop remediation:
-it covered in-process federation/discovery behavior and a single-kind Helm
-chart install, but not a bidirectional two-control-plane deployment over two
-real clusters.
+**Residual:** poller-driven partition / last-good-retention live coverage is
+still owed — the current file-config fixture does not run federation/remote
+discovery pollers ([#3331](https://github.com/ferrum-edge/ferrum-edge/issues/3331)).
 
-Remediation in this change makes federation activation bidirectional and
-observable:
-
-- the effective trust-bundle set is used by outbound mTLS and inbound SPIFFE
-  peer verification;
-- `FERRUM_MESH_FEDERATION_FAIL_OPEN=false` blocks CP-supplied fallback bundles
-  for remotes with `federation_endpoint` until the poller installs a last-good
-  bundle;
-- `FERRUM_MESH_FEDERATION_FAIL_OPEN=true` allows the CP fallback during
-  bootstrap;
-- transient poll failures preserve last-good bundles in both modes;
-- `GET /mesh/remote-clusters` reports discovery state, outbound trust, inbound
-  trust, trust source, and polled-bundle freshness per configured remote.
+Remediation that made federation activation bidirectional and observable
+(effective trust-bundle set for outbound mTLS and inbound SPIFFE verification;
+`FERRUM_MESH_FEDERATION_FAIL_OPEN` bootstrap/fail-closed semantics; last-good
+preservation on transient poll failure; `GET /mesh/remote-clusters` discovery
+and trust freshness) is part of the current product contract documented in
+`docs/mesh.md` and exercised by the harness above.
 
 ## Required Topology
 
@@ -142,7 +137,7 @@ as validation evidence. The live mode also runs two Stage-3 failure-injection
 scenarios (gated): peer-trust revocation (drop the federated bundle from the dest
 slice + reload → A→B fails closed → restore → recover) and dest endpoint
 black-hole (scale `svc` to 0 → A→B fails fast → scale up + re-render gateway →
-recover). Network-partition / last-good retention is deferred: it is a
+recover). Network-partition / last-good retention is deferred (#3331): it is a
 federation/remote-discovery POLLER property, which this static file-config
 fixture does not run (it needs a separate poller-driven fixture; kind also has no
 NetworkPolicy enforcement for a clean in-cluster partition).

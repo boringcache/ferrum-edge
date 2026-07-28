@@ -1,7 +1,7 @@
 //! Tests for response_size_limiting plugin
 
 use ferrum_edge::plugins::response_size_limiting::ResponseSizeLimiting;
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext};
+use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -49,6 +49,57 @@ async fn test_invalid_require_buffered_check_type_returns_error() {
     }));
     assert!(result.is_err());
     assert!(result.err().unwrap().contains("require_buffered_check"));
+}
+
+#[test]
+fn test_unknown_config_keys_rejected_with_spelling_suggestion() {
+    let err = ResponseSizeLimiting::new(&json!({
+        "max_bytes": 1024,
+        "require_buffered_checks": true
+    }))
+    .err()
+    .expect("misspelled strict-check key must be rejected");
+    assert!(err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("require_buffered_checks"), "{err}");
+    assert!(
+        err.contains("did you mean 'require_buffered_check'?"),
+        "{err}"
+    );
+
+    let shared = validate_plugin_config(
+        "response_size_limiting",
+        &json!({
+            "max_bytes": 1024,
+            "require_buffered_checks": true
+        }),
+    )
+    .expect_err("shared admission must reject the same typo");
+    assert!(shared.contains("require_buffered_checks"), "{shared}");
+}
+
+#[test]
+fn test_explicit_null_require_buffered_check_rejected() {
+    let err = ResponseSizeLimiting::new(&json!({
+        "max_bytes": 1024,
+        "require_buffered_check": null
+    }))
+    .err()
+    .expect("explicit null must be rejected");
+    assert!(
+        err.contains("'require_buffered_check' must be a boolean"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("unknown configuration key"),
+        "recognized-field null must not be mislabeled as unknown: {err}"
+    );
+}
+
+#[test]
+fn test_omitted_require_buffered_check_defaults_false() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024}))
+        .expect("omitted strict-check flag must keep default");
+    assert!(!plugin.requires_response_body_buffering());
 }
 
 // === Content-Length fast path (after_proxy) ===

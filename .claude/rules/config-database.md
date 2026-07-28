@@ -71,10 +71,14 @@ paths:
 - Admin config-database writes fail closed while the active pool is on a
   failover URL unless `FERRUM_DB_FAILOVER_ALLOW_WRITES=true` (opt-in only for
   operator-asserted synchronously replicated multi-primary topologies).
-  Polling/reads stay available. Opt-in allows automatic primary failback and
-  emits one bounded process-local divergence-risk marker for the failover
-  window (not a durable fence; cleared by restart). Topology/divergence
-  signals use redacted URLs only. Config-database mutation handlers admit under
+  Polling/reads stay available. After an opt-in Admin mutation is admitted,
+  a process-local automatic-primary-failback fence remains armed until the
+  process is restarted after operator reconciliation or confirmed replication
+  catch-up, so a stale primary cannot replace failover-side configuration. The
+  fence is exposed on authenticated `/health`, does not
+  suppress healthy failover reconnect candidates, and is not coordinated
+  across gateway replicas. Topology/divergence signals use redacted URLs only.
+  Config-database mutation handlers admit under
   a write-topology pin (SQL reconnect `RwLock` read / Mongo distinct
   `admin_write_topology` `RwLock` read) retained for the full persistence
   lifetime so a reconnect cannot redirect an already-admitted write; Mongo

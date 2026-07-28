@@ -183,6 +183,9 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   post-response reconciliation is also fail-closed: an `enforcement_unavailable`
   charge on a 2xx returns the same generic 503 as admission. A non-2xx response
   keeps its status (a failed charge/release there only over-counts).
+- Local and explicit Redis-fallback maps reserve hard cardinality atomically:
+  existing keys retain their active budgets at capacity, while previously unseen
+  keys fail closed until idle-state pruning frees a slot.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
 

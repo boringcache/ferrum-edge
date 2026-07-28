@@ -283,7 +283,7 @@ impl ResponseTransformer {
                         // reintroduced header — silently dropping it from a
                         // synthesized DEADLINE_EXCEEDED response.
                         if emit_debug {
-                            debug!("response_transformer: added header {}={}", rule.key, value);
+                            debug!("response_transformer: added header {}", rule.key);
                         }
                         slot.insert(value.clone());
                         if let Some(sink) = fired_write_keys.as_mut() {
@@ -295,7 +295,7 @@ impl ResponseTransformer {
                     if let Some(value) = rule.value.as_ref() {
                         response_headers.insert(rule.key.clone(), value.clone());
                         if emit_debug {
-                            debug!("response_transformer: set header {}={}", rule.key, value);
+                            debug!("response_transformer: set header {}", rule.key);
                         }
                     }
                 }

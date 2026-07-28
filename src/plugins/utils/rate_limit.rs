@@ -400,6 +400,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub fn check(&self, key: K, op: &A::Op) -> RateLimitOutcome {
         self.check_at(key, op, Instant::now())
     }
@@ -456,35 +457,19 @@ where
         });
     }
 
-    /// Enforce the hard entry cap after first pruning idle state.
+    /// Reclaim idle state under capacity pressure.
     ///
-    /// Idle entries are always evaluated — even when the map is already at or
-    /// below `max_entries` — so callers that route both periodic sweeps and
-    /// over-cap pressure through this helper reclaim stale keys. Only when
-    /// active state still exceeds the cap are live keys force-evicted.
+    /// Hard cardinality is enforced by atomic reservation on admission
+    /// ([`Self::check_at_with_capacity`] /
+    /// [`RateLimitBackend::check_with_redis_key_and_local_capacity`]). This
+    /// helper only prunes idle entries — it never deletes still-active
+    /// budgets, which would reset consumed windows and weaken enforcement
+    /// (GHSA-3xxf-5m26-c8pv). `max_entries` is retained for call-site
+    /// compatibility with shared cleanup wrappers; admission already refuses
+    /// previously unseen local/fallback keys at the configured cap.
     pub fn enforce_capacity(&self, max_entries: usize, now: Instant) {
+        let _ = max_entries;
         self.prune_stale_at(now);
-
-        let len = self.tracked_keys_count();
-        if len <= max_entries {
-            return;
-        }
-
-        let remove_count = len.saturating_sub(max_entries);
-        // DashMap iteration order is intentionally arbitrary here. Rate-limit
-        // state is already window-bounded, so after stale entries are pruned
-        // any remaining key can be evicted to enforce the hard cap.
-        let keys: Vec<K> = self
-            .state
-            .iter()
-            .take(remove_count)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for key in keys {
-            if self.state.remove(&key).is_some() {
-                self.release_entry_slot();
-            }
-        }
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -718,6 +703,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
         if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
@@ -963,31 +949,6 @@ where
         }
     }
 
-    pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
-        match self {
-            Self::Local(local) => local.check(local_key, op),
-            Self::Failover(failover) => failover.check(local_key, redis_key, op).await,
-        }
-    }
-
-    pub async fn check_with_redis_key<F>(
-        &self,
-        local_key: K,
-        redis_key: F,
-        op: &A::Op,
-    ) -> RateLimitOutcome
-    where
-        F: FnOnce() -> String,
-    {
-        match self {
-            Self::Local(local) => local.check(local_key, op),
-            Self::Failover(failover) => {
-                let redis_key = redis_key();
-                failover.check(local_key, &redis_key, op).await
-            }
-        }
-    }
-
     /// Check through Redis when available, or reserve a bounded local/fallback
     /// entry slot atomically. None denies only a previously unseen local key.
     pub async fn check_with_redis_key_and_local_capacity<F>(
@@ -1082,7 +1043,7 @@ where
 
     /// All-shard `DashMap::len()` call counter for hot-path regression tests.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
-    pub(crate) fn all_shard_len_calls_for_test(&self) -> usize {
+    pub fn all_shard_len_calls_for_test(&self) -> usize {
         match self {
             Self::Local(local) => local.all_shard_len_calls_for_test(),
             Self::Failover(failover) => failover.all_shard_len_calls_for_test(),
@@ -1127,11 +1088,13 @@ where
     }
 }
 
-/// Shared consumer cleanup branch: below-cap prune vs over-cap force eviction.
+/// Shared consumer cleanup branch: below-cap prune vs over-cap stale reclaim.
 ///
 /// Every rate-limit consumer wrapper routes through this helper so omitted or
 /// reversed `prune_stale_at` / `enforce_capacity` wiring is a single shared
-/// failure mode rather than six divergent copies.
+/// failure mode rather than six divergent copies. Both arms only drop idle
+/// state — live budgets are never force-evicted. Hard cardinality is enforced
+/// by atomic admission reservation, not by deleting active keys.
 #[inline]
 pub fn apply_rate_limit_cleanup<K, A>(
     limiter: &RateLimitBackend<K, A>,
@@ -2300,13 +2263,73 @@ pub struct WsFrameRateAlgorithm {
     burst_size: f64,
 }
 
-/// Upper bound on the Redis sliding-window length, in seconds. With
-/// pathological-but-legal configs (`burst_size=10_000_000, frames_per_second=1`)
-/// the derived window would otherwise span ~115 days, leaving per-connection
-/// Redis keys alive for ~230 days. Capping turns those configs into a lower-
-/// resolution counter (still safe — admission stays bounded by `burst_size`)
-/// instead of a multi-month TTL.
-const REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
+/// Upper bound on the Redis sliding-window length used to approximate the
+/// local token bucket for `ws_rate_limiting`, in seconds.
+///
+/// Redis mode enforces `burst_size` admissions over a fixed window of
+/// `burst_size / frames_per_second` seconds. Windows longer than this bound
+/// would force multi-hour (or multi-day) per-connection key TTLs. Configs that
+/// need a longer refill period are rejected at construction rather than
+/// clamping the window while retaining the full burst limit — that clamp
+/// previously over-admitted the configured sustained rate by orders of
+/// magnitude (GHSA-cjcm-546w-696v).
+pub const WS_FRAME_REDIS_MAX_WINDOW_SECONDS: u64 = 3600;
+
+/// Validate `ws_rate_limiting` capacity/refill so local token-bucket and Redis
+/// two-window enforcement share the same sustained rate and burst ceiling.
+///
+/// Accepted configs must:
+/// - keep both values in `1..=MAX_RATE_LIMIT_MAX_REQUESTS`
+/// - keep `burst_size >= frames_per_second`
+/// - make `burst_size` an integer multiple of `frames_per_second` (exact
+///   Redis window length; non-integral ratios under-admit on Redis)
+/// - keep the derived refill window
+///   (`burst_size / frames_per_second`) in `1..=WS_FRAME_REDIS_MAX_WINDOW_SECONDS`
+///
+/// Rejecting unrepresentable configs is fail-closed: Redis never silently
+/// raises the configured frame rate, and Redis failure/recovery cannot change
+/// the effective sustained-rate policy for an accepted config.
+pub fn validate_ws_frame_rate_params(
+    frames_per_second: u64,
+    burst_size: u64,
+) -> Result<(), String> {
+    if frames_per_second == 0 {
+        return Err("ws_rate_limiting: 'frames_per_second' must be greater than zero".to_string());
+    }
+    if burst_size == 0 {
+        return Err("ws_rate_limiting: 'burst_size' must be greater than zero".to_string());
+    }
+    if frames_per_second > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: 'frames_per_second' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {frames_per_second}"
+        ));
+    }
+    if burst_size > MAX_RATE_LIMIT_MAX_REQUESTS {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' must be <= {MAX_RATE_LIMIT_MAX_REQUESTS}, got: {burst_size}"
+        ));
+    }
+    if burst_size < frames_per_second {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' ({burst_size}) must be >= 'frames_per_second' ({frames_per_second})"
+        ));
+    }
+    if !burst_size.is_multiple_of(frames_per_second) {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' ({burst_size}) must be an integer multiple of \
+             'frames_per_second' ({frames_per_second}) so Redis and local sustained rates match"
+        ));
+    }
+    let window_seconds = burst_size / frames_per_second;
+    if window_seconds > WS_FRAME_REDIS_MAX_WINDOW_SECONDS {
+        return Err(format!(
+            "ws_rate_limiting: 'burst_size' / 'frames_per_second' refill window \
+             ({window_seconds}s) exceeds the Redis-representable maximum of \
+             {WS_FRAME_REDIS_MAX_WINDOW_SECONDS} seconds"
+        ));
+    }
+    Ok(())
+}
 
 impl WsFrameRateAlgorithm {
     pub fn new(frames_per_second: f64, burst_size: f64) -> Self {
@@ -2317,23 +2340,36 @@ impl WsFrameRateAlgorithm {
     }
 
     /// Returns `(window_seconds, limit)` for the Redis sliding-window
-    /// approximation. The window length is the bucket's full-refill period
-    /// (`ceil(burst_size / frames_per_second)`); the cap at
-    /// [`REDIS_MAX_WINDOW_SECONDS`] bounds Redis TTLs.
+    /// approximation of the local token bucket.
     ///
-    /// `ws_rate_limiting::new` rejects `frames_per_second == 0` and
-    /// `burst_size < frames_per_second` at construction, so the derived
-    /// window is always at least 1 second and the average sustained rate
-    /// matches `frames_per_second` for all configs that reach this code.
+    /// For configs admitted by [`validate_ws_frame_rate_params`], the window
+    /// is exactly `burst_size / frames_per_second` and the limit is
+    /// `burst_size`, so the average sustained rate matches
+    /// `frames_per_second`.
+    ///
+    /// Defense in depth for unvalidated inputs: never raise the sustained
+    /// rate above `frames_per_second`. A window that would exceed
+    /// [`WS_FRAME_REDIS_MAX_WINDOW_SECONDS`] is capped and the limit is scaled
+    /// down with it (`fps * window`), never left at the full burst (the
+    /// GHSA-cjcm-546w-696v over-admit). Non-integral ratios still ceil the
+    /// window and keep `limit <= burst`, which can only under-admit.
     fn redis_window_derivation(&self) -> (u64, u64) {
-        debug_assert!(
-            self.frames_per_second > 0.0,
-            "WsFrameRateAlgorithm: frames_per_second must be > 0; \
-             enforced by optional_positive_u64 at plugin construction"
-        );
-        let limit = self.burst_size as u64;
-        let window_seconds = ((self.burst_size / self.frames_per_second).ceil() as u64)
-            .clamp(1, REDIS_MAX_WINDOW_SECONDS);
+        let fps = self.frames_per_second as u64;
+        let burst = self.burst_size as u64;
+        if fps == 0 {
+            // Unreachable after plugin construction validation; deny all.
+            return (1, 0);
+        }
+        if burst >= fps && burst.is_multiple_of(fps) {
+            let window = burst / fps;
+            if (1..=WS_FRAME_REDIS_MAX_WINDOW_SECONDS).contains(&window) {
+                return (window, burst);
+            }
+        }
+
+        let raw_window = burst.div_ceil(fps).max(1);
+        let window_seconds = raw_window.min(WS_FRAME_REDIS_MAX_WINDOW_SECONDS);
+        let limit = fps.saturating_mul(window_seconds).min(burst);
         (window_seconds, limit)
     }
 }
@@ -2735,20 +2771,64 @@ mod tests {
         // burst = 4 * fps → 4-second window
         let alg = WsFrameRateAlgorithm::new(5.0, 20.0);
         assert_eq!(alg.redis_window_derivation(), (4, 20));
-        // Non-integer ratio → ceil
+        // Max representable refill window (validated at construction)
+        let alg = WsFrameRateAlgorithm::new(1.0, WS_FRAME_REDIS_MAX_WINDOW_SECONDS as f64);
+        assert_eq!(
+            alg.redis_window_derivation(),
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
+        );
+    }
+
+    #[test]
+    fn ws_frame_rate_redis_window_derivation_fail_closed_for_unvalidated_inputs() {
+        // GHSA-cjcm-546w-696v: never clamp the window while retaining a limit
+        // that raises the configured sustained rate. Unvalidated pathological
+        // inputs scale the limit down with the capped window.
+        let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
+        assert_eq!(
+            alg.redis_window_derivation(),
+            (
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS,
+                WS_FRAME_REDIS_MAX_WINDOW_SECONDS
+            )
+        );
+        // Non-integral ratio: ceil window, keep limit <= burst (under-admit).
+        // Construction rejects these; derivation must not over-admit if reached.
         let alg = WsFrameRateAlgorithm::new(3.0, 10.0);
         assert_eq!(alg.redis_window_derivation(), (4, 10));
     }
 
     #[test]
-    fn ws_frame_rate_redis_window_derivation_caps_pathological_configs() {
-        // Without the cap, `burst=10_000_000, fps=1` would produce a
-        // ~115-day window and ~230-day Redis TTL on per-connection keys.
-        let alg = WsFrameRateAlgorithm::new(1.0, 10_000_000.0);
-        assert_eq!(
-            alg.redis_window_derivation(),
-            (REDIS_MAX_WINDOW_SECONDS, 10_000_000)
+    fn validate_ws_frame_rate_params_rejects_unrepresentable_ratios() {
+        assert!(validate_ws_frame_rate_params(100, 100).is_ok());
+        assert!(validate_ws_frame_rate_params(50, 100).is_ok());
+        assert!(validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS).is_ok());
+
+        let err = validate_ws_frame_rate_params(50, 75).unwrap_err();
+        assert!(err.contains("integer multiple"), "{err}");
+
+        let err =
+            validate_ws_frame_rate_params(1, WS_FRAME_REDIS_MAX_WINDOW_SECONDS + 1).unwrap_err();
+        assert!(err.contains("Redis-representable maximum"), "{err}");
+
+        let err = validate_ws_frame_rate_params(1, 10_000_000).unwrap_err();
+        assert!(
+            err.contains("must be <=") || err.contains("Redis-representable"),
+            "{err}"
         );
+
+        let err = validate_ws_frame_rate_params(100, 50).unwrap_err();
+        assert!(err.contains("must be >="), "{err}");
+
+        let err = validate_ws_frame_rate_params(
+            MAX_RATE_LIMIT_MAX_REQUESTS + 1,
+            MAX_RATE_LIMIT_MAX_REQUESTS + 1,
+        )
+        .unwrap_err();
+        assert!(err.contains("frames_per_second"), "{err}");
     }
 
     #[test]
@@ -3451,7 +3531,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_enforce_capacity_removes_excess_entries() {
+    fn local_limiter_enforce_capacity_preserves_active_entries() {
         let limiter = LocalLimiter::new(
             TestAlgorithm {
                 redis_ok: Arc::new(AtomicBool::new(true)),
@@ -3459,15 +3539,31 @@ mod tests {
             crate::util::sharding::pool_shard_amount(0),
         );
         let op = TestOp;
+        let now = Instant::now();
 
         for idx in 0..5 {
             let key = format!("key:{idx}");
-            assert!(limiter.check(key, &op).allowed);
+            assert!(
+                limiter
+                    .check_at_with_capacity(key, &op, now, 5)
+                    .expect("admit within cap")
+                    .allowed
+            );
         }
         assert_eq!(limiter.tracked_keys_count(), 5);
+        assert!(
+            limiter
+                .check_at_with_capacity("key:new".to_string(), &op, now, 5)
+                .is_none(),
+            "previously unseen keys must deny at capacity"
+        );
 
-        limiter.enforce_capacity(3, Instant::now());
-        assert!(limiter.tracked_keys_count() <= 3);
+        // Cleanup must not delete still-active budgets to make room.
+        limiter.enforce_capacity(3, now);
+        assert_eq!(limiter.tracked_keys_count(), 5);
+        for idx in 0..5 {
+            assert!(limiter.contains_key(&format!("key:{idx}")));
+        }
     }
 
     #[test]
@@ -3899,7 +3995,7 @@ mod tests {
     }
 
     #[test]
-    fn local_limiter_entry_count_matches_map_under_concurrent_insert_prune_evict() {
+    fn local_limiter_entry_count_matches_map_under_concurrent_capped_insert_prune() {
         use std::sync::Arc;
         use std::thread;
 
@@ -3921,12 +4017,13 @@ mod tests {
                 let mut i = 0u64;
                 while !stop.load(Ordering::Relaxed) {
                     let key = format!("w{worker}:{i}");
-                    let _ = limiter.check(key, &op);
+                    let _ = limiter.check_at_with_capacity(key, &op, Instant::now(), max_entries);
                     i = i.wrapping_add(1);
                     if i.is_multiple_of(17) {
                         limiter.prune_stale_at(Instant::now() + Duration::from_secs(30));
                     }
                     if i.is_multiple_of(23) {
+                        // Over-cap cleanup must only prune idle state.
                         limiter.enforce_capacity(max_entries, Instant::now());
                     }
                 }
@@ -3939,8 +4036,6 @@ mod tests {
             handle.join().expect("worker joins");
         }
 
-        // Final cold-path enforcement must leave both the atomic count and the
-        // map at or below the hard cap with matching bookkeeping.
         limiter.enforce_capacity(max_entries, Instant::now());
         let tracked = limiter.tracked_keys_count();
         let map_len = limiter.map_len_for_test();
@@ -3950,7 +4045,7 @@ mod tests {
         );
         assert!(
             tracked <= max_entries,
-            "hard cap must hold after concurrent insert/prune/evict (tracked={tracked})"
+            "hard cap must hold via atomic admission reservation (tracked={tracked})"
         );
     }
 

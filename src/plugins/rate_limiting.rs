@@ -20,8 +20,9 @@ use crate::util::unknown_keys::reject_unknown_keys;
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
 /// Bounds below-cap full-map scans under high RPS. Sampled over-cap
-/// enforcement skips this cooldown so a sampled observation of pressure
-/// still force-reclaims without waiting for the next cool-down window.
+/// reclaim skips this cooldown so a sampled observation of pressure can
+/// drop idle keys without waiting for the next cool-down window. Live
+/// budgets are never force-evicted.
 const EVICTION_COOLDOWN_SECS: u64 = 1;
 const RATE_LIMIT_IDENTITY_HEADER: &str = "x-ratelimit-identity";
 
@@ -196,6 +197,20 @@ impl RateLimiting {
         let _ = self.limiter.check_local_at(key, &self.default_limit, now);
     }
 
+    /// Attempt to seed one local/fallback key through the production atomic
+    /// capacity gate. Returns false only for a previously unseen key at cap.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn seed_key_at_with_cap_for_test(
+        &self,
+        key: String,
+        now: Instant,
+        max_entries: usize,
+    ) -> bool {
+        self.limiter
+            .check_local_at_with_capacity(key, &self.default_limit, now, max_entries)
+            .is_some()
+    }
+
     /// Arm the sampled below-cap gate without spinning 1024 requests. Test-only.
     #[allow(dead_code)] // used only by external tests; dead in binary test target
     pub(crate) fn arm_periodic_eviction_for_test(&self) {
@@ -253,9 +268,10 @@ impl RateLimiting {
         }
         let now_secs = now.saturating_duration_since(self.epoch_base).as_secs();
 
-        // Sampled over-cap observation force-enforces after pruning idle keys.
-        // The below-cap cooldown must not suppress this branch once pressure
-        // is seen on a sampled pass.
+        // Sampled over-cap observation reclaims idle keys after prune. Live
+        // budgets are never force-evicted; hard cardinality is enforced by
+        // atomic admission reservation. The below-cap cooldown must not
+        // suppress this branch once pressure is seen on a sampled pass.
         if len > MAX_STATE_ENTRIES {
             apply_rate_limit_cleanup(&self.limiter, MAX_STATE_ENTRIES, now, true);
             self.last_periodic_sweep_secs
@@ -401,14 +417,42 @@ impl RateLimiting {
         }
     }
 
+    fn reject_capacity(&self) -> PluginResult {
+        // Capacity denial is fail-closed for previously unseen local/fallback
+        // keys. Do not reflect limiter identity back to the client or emit an
+        // attacker-rate warning for every new key; the counter is the bounded
+        // operational signal.
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
+        PluginResult::Reject {
+            status_code: 429,
+            body: r#"{"error":"Rate limit exceeded"}"#.into(),
+            headers: HashMap::new(),
+        }
+    }
+
     async fn check_rate(
         &self,
         key: String,
         limit_op: &DynamicRateLimitOp,
         ctx: &mut RequestContext,
     ) -> PluginResult {
-        let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
+        // Run sampled idle reclamation before admission. Capacity denial must
+        // still advance the cleanup schedule; otherwise an exactly-full map of
+        // expired keys could remain pinned closed when only new identities
+        // arrive. Cleanup never removes live budgets.
         self.maybe_evict_stale_entries();
+        let Some(outcome) = self
+            .limiter
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                limit_op,
+                MAX_STATE_ENTRIES,
+            )
+            .await
+        else {
+            return self.reject_capacity();
+        };
         if !outcome.allowed {
             if outcome.enforcement_unavailable {
                 // The shared failover backend emits one bounded operational
@@ -426,8 +470,19 @@ impl RateLimiting {
     }
 
     async fn check_rate_stream(&self, key: String, limit_op: &DynamicRateLimitOp) -> PluginResult {
-        let outcome = self.limiter.check(key.clone(), &key, limit_op).await;
         self.maybe_evict_stale_entries();
+        let Some(outcome) = self
+            .limiter
+            .check_with_redis_key_and_local_capacity(
+                key.clone(),
+                || key.clone(),
+                limit_op,
+                MAX_STATE_ENTRIES,
+            )
+            .await
+        else {
+            return self.reject_capacity();
+        };
         if !outcome.allowed {
             if outcome.enforcement_unavailable {
                 // See `check_rate`: the backend owns bounded outage
