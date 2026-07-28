@@ -236,8 +236,8 @@ labels.
 
 | Contract signal | Exact metric / admin field | Label set | Producer path | Unit / integration coverage | Live assertion / dashboard | Status |
 |---|---|---|---|---|---|---|
-| HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via`) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success`; mesh-overview NW panels | **Implemented** |
-| Asserted source identity accepted/rejected | `ferrum_mesh_node_waypoint_asserted_identity_total` + admin `asserted_identity.*` | `result` ∈ {`accepted`,`rejected`}, `reason` ∈ {`honored`,`untrusted_assertor`,`trust_domain_mismatch`,`unauthenticated_hbone`,`malformed`,`stale_or_unknown`} | `mesh_authz` when `per_pod_policy_scoping` | unit observability tests + existing mesh_authz plugin tests | `node_waypoint.observability.asserted_identity_rejected` | **Implemented** |
+| HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via`) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | mesh-overview NW panels; reserved live IDs `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success` (not yet wired — see "Reserved observability IDs") | **Implemented** |
+| Asserted source identity accepted/rejected | `ferrum_mesh_node_waypoint_asserted_identity_total` + admin `asserted_identity.*` | `result` ∈ {`accepted`,`rejected`}, `reason` ∈ {`honored`,`untrusted_assertor`,`trust_domain_mismatch`,`unauthenticated_hbone`,`malformed`,`stale_or_unknown`} | `mesh_authz` when `per_pod_policy_scoping` | unit observability tests + existing mesh_authz plugin tests | reserved live ID `node_waypoint.observability.asserted_identity_rejected` (not yet wired — see "Reserved observability IDs") | **Implemented** |
 | Destination policy rejection | `ferrum_mesh_node_waypoint_destination_policy_rejections_total` + admin `destination_policy_rejections.*` | `reason` ∈ {`authz_deny`,`scope_missing`,`destination_scope_missing`,`relay_destination_denied`} | `mesh_authz` / open-relay guard (mutually exclusive with asserted-identity reject for one decision) | unit observability tests | Live deny paths exercise authz; counter panels on mesh-overview | **Implemented** |
 | Missing destination NodeWaypoint metadata | `ferrum_mesh_node_waypoint_missing_destination_metadata_total` + admin field | none | `build_outbound_mesh_targets` skip when identity-backed posture requires metadata | `mesh_outbound_node_waypoint_identity_backed_missing_metadata_fails_closed` + observability unit tests | Dashboard panel; live profile always publishes metadata so counter stays observational in H2 | **Implemented** |
 | Prohibited plaintext fallback attempt | `ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total` + admin field | none | Same fail-closed skip (blocked plaintext retention) | same as missing-metadata | Dashboard panel | **Implemented** |
@@ -305,9 +305,6 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.identity.unauthenticated_hbone_rejected`
 - `node_waypoint.identity.forged_assertion_rejected`
 - `node_waypoint.identity.spire_restart_recovery`
-- `node_waypoint.observability.hbone_handshake_inbound_tls_failure`
-- `node_waypoint.observability.asserted_identity_rejected`
-- `node_waypoint.observability.hbone_handshake_outbound_success`
 - `node_waypoint.ipv6.pod_ip_fail_closed` (historical pre-admission evidence;
   retained as a non-required artifact once IPv6 admission is enabled)
 - `node_waypoint.ipv6.service_fail_closed` (historical pre-admission evidence;
@@ -320,6 +317,36 @@ NodeWaypoint beyond Experimental:
 
 Future H2 PRs should extend this list instead of renaming these IDs so artifacts
 remain comparable across commits.
+
+### Reserved observability IDs (specified, not yet wired)
+
+These IDs are the required Beta gate for ADR counter movement. They are **not**
+recorded by the harness yet:
+
+- `node_waypoint.observability.hbone_handshake_inbound_tls_failure` — scrape
+  ambient `/metrics` before and after the plaintext-HBONE rejection check and
+  require `ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}`
+  to increase.
+- `node_waypoint.observability.asserted_identity_rejected` — after the forged
+  assertor check and **before** assertor restore (restart resets the
+  process-static counters), require
+  `ferrum_mesh_node_waypoint_asserted_identity_total{result="rejected",reason="untrusted_assertor"}`
+  to be non-zero.
+- `node_waypoint.observability.hbone_handshake_outbound_success` — after the
+  cross-node Service allow, require
+  `ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}`
+  to be non-zero.
+
+Wiring them requires editing `tests/k8s/node_waypoint_ebpf_live/run.sh`, which
+is a Cross-sensitive automation file: `.github/scripts/verify_cross_build_policy.py`
+compares a whole-file digest between the trusted `main` tip and the proposed
+tree, so **any** byte change fails the required `Trusted Cross Build Policy`
+check from a pull request. The harness edit must therefore land on `main`
+out-of-PR (same resolution as precedent `1cdc98d84`). The producer contract they
+gate is already pinned by
+`tests/unit/gateway_core/node_waypoint_observability_tests.rs`, including the
+`/metrics` render-cache bypass and the optional `gateway_namespace` label
+append that the live selectors would have to tolerate.
 
 ## Promotion gates
 
@@ -335,9 +362,10 @@ All of the following must be true:
    NodeWaypoint as Experimental until Beta criteria close.
 2. **Live assertion IDs (required).** Every ID listed under the SPIRE
    production profile in `tests/k8s/node_waypoint_ebpf_live/run.sh`
-   `REQUIRED_LIVE_ASSERTIONS`, including the three
-   `node_waypoint.observability.*` counter-movement IDs, passes on the
-   platform profile `kind-dual-stack-node-waypoint-ebpf`.
+   `REQUIRED_LIVE_ASSERTIONS` passes on the platform profile
+   `kind-dual-stack-node-waypoint-ebpf`, **and** the three reserved
+   `node_waypoint.observability.*` counter-movement IDs have been added to that
+   list (out-of-PR, per "Reserved observability IDs") and pass there too.
 3. **Platform profiles.** At least one dual-stack kind profile with IPv4 +
    IPv6 capture admission and SPIRE production identity.
 4. **Restart evidence.** `node_waypoint.identity.spire_restart_recovery`
@@ -347,7 +375,8 @@ All of the following must be true:
    `docs/mesh_supported_matrix.md`).
 6. **Release-blocking failures for Beta candidacy.** Any fail-open plaintext
    fallback under identity-backed posture, any unbounded identity label on NW
-   ADR metrics, or loss of the observability live assertion IDs blocks Beta.
+   ADR metrics, or loss of the reserved observability live assertion IDs once
+   wired, blocks Beta.
 
 ### Beta → GA
 

@@ -200,8 +200,7 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
 
     // Live harness passes closed selectors; optional gateway_namespace may be
     // appended before the closing `}` when the Prometheus plugin is configured.
-    const INBOUND_TLS_FAILURE: &str =
-        "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}";
+    const INBOUND_TLS_FAILURE: &str = "ferrum_mesh_node_waypoint_hbone_handshakes_total{phase=\"inbound_tls\",result=\"failure\"}";
 
     let before_output = registry.render();
     let before_failure = prometheus_counter_value(&before_output, INBOUND_TLS_FAILURE);

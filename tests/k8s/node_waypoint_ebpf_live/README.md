@@ -46,14 +46,7 @@ The production SPIRE pass also restarts the SPIRE Agent DaemonSet and the
 NodeWaypoint ambient DaemonSet, then waits for new Workload API SVID metrics,
 registry/mesh-slice readiness, fresh source admission, allow/deny traffic, and
 plaintext/no-client-SVID HBONE rejection before recording
-`node_waypoint.identity.spire_restart_recovery`. It also asserts ADR
-observability counter movement:
-`node_waypoint.observability.hbone_handshake_inbound_tls_failure` (after
-plaintext HBONE rejection),
-`node_waypoint.observability.asserted_identity_rejected` (after forged
-assertor rejection), and
-`node_waypoint.observability.hbone_handshake_outbound_success` (after
-cross-node Service allow).
+`node_waypoint.identity.spire_restart_recovery`.
 On dual-stack clusters it also requires the IPv6 pod-netns ready
 markers, IPv6 Service allow/deny behavior, and an IPv6 direct Pod-IP bypass
 guard.
