@@ -567,8 +567,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 4200,
         active_phases: "before_proxy, after_proxy, on_response_body",
-        matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Parses JSON response bodies for token counts",
+        matrix_protocols: HTTP_ONLY_PROTOCOLS,
+        protocol_rationale: "HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge",
     },
     BuiltinPluginParityMeta {
         name: "stdout_logging",
