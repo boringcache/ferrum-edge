@@ -355,6 +355,36 @@ pub mod _test_support {
         crate::PluginCache::with_http_client(config, http_client)
     }
 
+    /// Whether an incremental rebuild of `proxy_ids_to_rebuild` / globals would
+    /// reconstruct an active `ai_response_guard` with a node-local descriptor.
+    pub fn ai_response_guard_descriptor_preload_required_for_test(
+        cache: &crate::PluginCache,
+        config: &crate::config::types::GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<crate::config::db_backend::NamespacedResourceId>,
+        rebuild_globals: bool,
+    ) -> bool {
+        cache.ai_response_guard_descriptor_preload_required(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        )
+    }
+
+    /// Whether an incremental rebuild would reconstruct an active
+    /// `body_validator` with a node-local descriptor (parity helper for tests).
+    pub fn body_validator_descriptor_preload_required_for_test(
+        cache: &crate::PluginCache,
+        config: &crate::config::types::GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<crate::config::db_backend::NamespacedResourceId>,
+        rebuild_globals: bool,
+    ) -> bool {
+        cache.body_validator_descriptor_preload_required(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        )
+    }
+
     /// Prepend a plugin onto one proxy's resolved list for external tests.
     ///
     /// Used to inject a gated `on_stream_connect` admission seam into a live

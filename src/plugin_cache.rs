@@ -1445,6 +1445,72 @@ fn body_validator_descriptor_preload_required_for_scope(
     })
 }
 
+fn ai_response_guard_descriptor_is_active(
+    config: &GatewayConfig,
+    plugin_config: &PluginConfig,
+) -> bool {
+    if !plugin_config.enabled
+        || plugin_config.plugin_name != "ai_response_guard"
+        || plugin_config
+            .config
+            .get("grpc")
+            .and_then(|grpc| grpc.get("descriptor_path"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .is_none()
+    {
+        return false;
+    }
+    match &plugin_config.scope {
+        PluginScope::Global => true,
+        PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+            config.proxies.iter().any(|proxy| {
+                proxy.namespace == plugin_config.namespace
+                    && &proxy.id == proxy_id
+                    && proxy
+                        .plugins
+                        .iter()
+                        .any(|association| association.plugin_config_id == plugin_config.id)
+            })
+        }),
+        PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+            proxy.namespace == plugin_config.namespace
+                && proxy
+                    .plugins
+                    .iter()
+                    .any(|association| association.plugin_config_id == plugin_config.id)
+        }),
+    }
+}
+
+fn ai_response_guard_descriptor_preload_required_for_scope(
+    config: &GatewayConfig,
+    proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
+    rebuild_globals: bool,
+) -> bool {
+    config.plugin_configs.iter().any(|plugin_config| {
+        ai_response_guard_descriptor_is_active(config, plugin_config)
+            && match &plugin_config.scope {
+                PluginScope::Global => rebuild_globals,
+                PluginScope::Proxy => plugin_config.proxy_id.as_ref().is_some_and(|proxy_id| {
+                    proxy_ids_to_rebuild.contains(&NamespacedResourceId::new(
+                        plugin_config.namespace.as_str(),
+                        proxy_id.as_str(),
+                    ))
+                }),
+                PluginScope::ProxyGroup => config.proxies.iter().any(|proxy| {
+                    proxy.namespace == plugin_config.namespace
+                        && proxy_ids_to_rebuild.contains(&proxy_namespaced_id(proxy))
+                        && proxy
+                            .plugins
+                            .iter()
+                            .any(|association| association.plugin_config_id == plugin_config.id)
+                }),
+            }
+    })
+}
+
 fn country_mmdb_plugin_is_in_rebuild_scope(
     config: &GatewayConfig,
     plugin_config: &PluginConfig,
@@ -4540,6 +4606,27 @@ impl PluginCache {
             rebuild_globals,
         );
         body_validator_descriptor_preload_required_for_scope(
+            config,
+            &expanded_proxy_ids,
+            rebuild_globals,
+        )
+    }
+
+    /// Whether the exact delta-build scope, including adaptive-concurrency
+    /// route-definition expansion, reconstructs an active `ai_response_guard`
+    /// with a node-local `grpc.descriptor_path` dependency.
+    pub(crate) fn ai_response_guard_descriptor_preload_required(
+        &self,
+        config: &GatewayConfig,
+        proxy_ids_to_rebuild: &HashSet<NamespacedResourceId>,
+        rebuild_globals: bool,
+    ) -> bool {
+        let (expanded_proxy_ids, rebuild_globals) = self.expanded_file_dependency_rebuild_scope(
+            config,
+            proxy_ids_to_rebuild,
+            rebuild_globals,
+        );
+        ai_response_guard_descriptor_preload_required_for_scope(
             config,
             &expanded_proxy_ids,
             rebuild_globals,

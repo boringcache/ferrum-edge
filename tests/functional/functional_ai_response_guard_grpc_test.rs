@@ -661,3 +661,39 @@ async fn grpc_guard_redacts_and_reencodes_the_protobuf_response() {
     );
     harness.shutdown();
 }
+
+#[tokio::test]
+#[ignore]
+async fn grpc_guard_rejects_pii_split_across_streaming_frames() {
+    let harness = Harness::start("reject", "").await;
+    let mut body = grpc_frame(&encode_hello_response("ops@"));
+    body.extend_from_slice(&grpc_frame(&encode_hello_response("example.com")));
+    let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &body, &[])
+        .await
+        .expect("gRPC call");
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "a blocked email split across frames must still terminate the call",
+    );
+    harness.shutdown();
+}
+
+#[tokio::test]
+#[ignore]
+async fn grpc_guard_redact_fails_closed_on_cross_frame_only_match() {
+    let harness = Harness::start("redact", "").await;
+    let mut body = grpc_frame(&encode_hello_response("ops@"));
+    body.extend_from_slice(&grpc_frame(&encode_hello_response("example.com")));
+    let call = send_grpc_request(&harness.addr, "/test.Greeter/SayHello", &body, &[])
+        .await
+        .expect("gRPC call");
+    assert_nonzero_terminal_grpc_status(
+        &call,
+        "redact mode must fail closed when a match exists only across frame boundaries",
+    );
+    assert!(
+        call.body.is_empty(),
+        "cross-frame-only redaction residual must be trailers-only, not original frames"
+    );
+    harness.shutdown();
+}

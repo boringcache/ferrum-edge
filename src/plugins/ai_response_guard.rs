@@ -1557,11 +1557,16 @@ impl AiResponseGuard {
     }
 
     /// Whether this plugin's redaction transform owns this response's bytes.
-    fn grpc_transform_applies(&self, ctx: &RequestContext, content_type: Option<&str>) -> bool {
+    ///
+    /// Matches the inspection/enrollment gate rather than the response
+    /// `Content-Type`: a successfully inspected framed response whose response
+    /// type is absent or relabeled must still be rewritten. gRPC-Web
+    /// translated responses remain excluded because `grpc_web` re-frames the
+    /// body before this transform could run.
+    fn grpc_transform_applies(&self, ctx: &RequestContext, _content_type: Option<&str>) -> bool {
         self.needs_body_transform
             && self.grpc_inspection_applies(ctx)
             && !crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
-            && content_type.is_some_and(is_native_grpc_content_type)
     }
 
     /// Inspect a buffered native-gRPC response body for an enrolled method.
@@ -1617,7 +1622,7 @@ impl AiResponseGuard {
         }
 
         let encoding = grpc_message_encoding(response_headers);
-        let scan = match scan_grpc_body(body, method, grpc, encoding) {
+        let scan = match scan_grpc_body(body, method, grpc, encoding, self.max_scan_bytes) {
             Ok(scan) => scan,
             Err(error) => {
                 let (reason, detail) = error.describe();
@@ -1625,7 +1630,14 @@ impl AiResponseGuard {
             }
         };
 
-        if let Some(reason) = self.check_completion_length(&scan.scanned) {
+        // Length policy covers the ordered aggregate of governed selected
+        // strings as well as each fragment, so a limit cannot be split across
+        // server-streaming frames.
+        let mut length_texts: Vec<&str> = scan.scanned.iter().map(String::as_str).collect();
+        if !scan.aggregate.is_empty() {
+            length_texts.push(scan.aggregate.as_str());
+        }
+        if let Some(reason) = self.check_completion_length(&length_texts) {
             match self.action {
                 GuardAction::Reject | GuardAction::Redact => {
                     Self::mark_rejected(ctx, reason.clone());
@@ -1645,9 +1657,7 @@ impl AiResponseGuard {
             }
         }
 
-        let mut candidates: Vec<&str> = scan.scanned.iter().map(String::as_str).collect();
-        candidates.extend(scan.map_keys.iter().map(String::as_str));
-        let detected = self.detect_matches(&candidates);
+        let detected = self.detect_grpc_matches(&scan);
         if detected.is_empty() {
             return PluginResult::Continue;
         }
@@ -1663,11 +1673,12 @@ impl AiResponseGuard {
                     "gRPC-Web translated responses cannot be redacted in protobuf form",
                 );
             }
-            // Map keys are matchable but not rewritable, and a rewrite that
-            // does not survive the re-encode round trip is not a redaction.
+            // Map keys and matches that exist only across string/frame
+            // boundaries are matchable but not rewritable in any one scalar.
             let key_match = !self.detect_matches(&scan.map_keys).is_empty();
+            let cross_boundary_only = self.grpc_match_only_across_boundaries(&scan);
             let rewritten = self.redacted_grpc_body(ctx, response_headers, body);
-            if key_match || rewritten.is_none() {
+            if key_match || cross_boundary_only || rewritten.is_none() {
                 debug!(
                     "ai_response_guard: gRPC redaction leaves residual content \
                      (types: {:?}), rejecting response",
@@ -1692,13 +1703,39 @@ impl AiResponseGuard {
         self.respond_to_detection(ctx, response_status, &detected)
     }
 
+    /// Detect matches against each governed string and the ordered aggregate of
+    /// selected strings (plus matchable-but-unrewritable map keys).
+    fn detect_grpc_matches(&self, scan: &GrpcScan) -> Vec<String> {
+        let mut candidates: Vec<&str> = scan.scanned.iter().map(String::as_str).collect();
+        if !scan.aggregate.is_empty() {
+            candidates.push(scan.aggregate.as_str());
+        }
+        candidates.extend(scan.map_keys.iter().map(String::as_str));
+        self.detect_matches(&candidates)
+    }
+
+    /// True when detection fires only on the ordered aggregate of selected
+    /// strings — a match that cannot be rewritten inside any one scalar.
+    fn grpc_match_only_across_boundaries(&self, scan: &GrpcScan) -> bool {
+        if scan.aggregate.is_empty() {
+            return false;
+        }
+        let aggregate_hits = self.detect_matches(&[scan.aggregate.as_str()]);
+        if aggregate_hits.is_empty() {
+            return false;
+        }
+        self.detect_matches(&scan.scanned).is_empty()
+    }
+
     /// Produce the redacted gRPC wire body, or `None` when the redaction could
     /// not be applied and *verified* end to end.
     ///
     /// Verification is deliberately a full round trip: rewrite, re-encode
     /// (re-compressing frames that arrived compressed), re-parse the produced
-    /// wire bytes, re-decode, and re-scan. Only a body that comes back clean is
-    /// returned, so a partial rewrite can never be reported as redacted.
+    /// wire bytes, re-decode, and re-scan with the same selected-field and
+    /// aggregate semantics used at inspection time. Only a body that comes
+    /// back clean is returned, so a partial rewrite can never be reported as
+    /// redacted.
     fn redacted_grpc_body(
         &self,
         ctx: &RequestContext,
@@ -1712,7 +1749,9 @@ impl AiResponseGuard {
         }
         let encoding = grpc_message_encoding(response_headers);
         let max_bytes = grpc.max_message_bytes;
-        let frames = parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages).ok()?;
+        let frames =
+            parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages, self.max_scan_bytes)
+                .ok()?;
 
         let mut rewritten = Vec::with_capacity(body.len());
         let mut changed = false;
@@ -1736,21 +1775,13 @@ impl AiResponseGuard {
             return None;
         }
 
-        // Re-verify against the exact bytes the client would receive.
-        let clean = {
-            let verify =
-                parse_grpc_frames(&rewritten, encoding, max_bytes, grpc.max_messages).ok()?;
-            let mut strings = GrpcStrings::default();
-            for frame in &verify {
-                let payload = frame.payload.as_ref();
-                let message = DynamicMessage::decode(method.descriptor.clone(), payload).ok()?;
-                let mut budget = GrpcWalkBudget::default();
-                collect_strings(&message, &mut strings, &mut budget).ok()?;
-            }
-            let residual = strings.all();
-            self.detect_matches(&residual).is_empty()
-        };
-        clean.then_some(rewritten)
+        // Re-verify against the exact bytes the client would receive, using the
+        // same selected-field surface and aggregate matching as inspection.
+        let verify_scan =
+            scan_grpc_body(&rewritten, method, grpc, encoding, self.max_scan_bytes).ok()?;
+        self.detect_grpc_matches(&verify_scan)
+            .is_empty()
+            .then_some(rewritten)
     }
 }
 
@@ -1821,8 +1852,13 @@ impl GrpcStrings {
 
 /// Everything one buffered gRPC response contributed to the scan.
 struct GrpcScan {
-    /// Strings the configured contract actually scans and may rewrite.
+    /// Strings the configured contract actually scans and may rewrite, in
+    /// encounter order across frames.
     scanned: Vec<String>,
+    /// Ordered concatenation of [`Self::scanned`]. Detection and length policy
+    /// treat this as a second surface so a match or limit split across frames
+    /// cannot hide between scalars.
+    aggregate: String,
     /// Protobuf map keys, which detection covers but redaction cannot rewrite.
     map_keys: Vec<String>,
 }
@@ -1860,15 +1896,17 @@ impl GrpcScanError {
 ///
 /// The structural walk always covers the whole message tree — bounding it and
 /// proving there are no undecodable unknown fields — even when `text_fields`
-/// narrows what is scanned and rewritten.
+/// narrows what is scanned and rewritten. Known extension values are walked
+/// exactly like ordinary known fields.
 fn scan_grpc_body(
     body: &[u8],
     method: &GrpcMethodInspection,
     grpc: &GrpcInspection,
     encoding: GrpcMessageEncoding,
+    max_scan_bytes: usize,
 ) -> Result<GrpcScan, GrpcScanError> {
     let max_bytes = grpc.max_message_bytes;
-    let frames = parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages)
+    let frames = parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages, max_scan_bytes)
         .map_err(GrpcScanError::Framing)?;
 
     let mut strings = GrpcStrings::default();
@@ -1897,8 +1935,10 @@ fn scan_grpc_body(
         None => strings.texts,
         Some(_) => selected,
     };
+    let aggregate = scanned.concat();
     Ok(GrpcScan {
         scanned,
+        aggregate,
         map_keys: strings.map_keys,
     })
 }
@@ -1926,6 +1966,7 @@ enum GrpcMessageEncoding {
 enum GrpcFramingError {
     Malformed,
     MessageTooLarge,
+    DecodedTooLarge,
     TooManyMessages,
     UnsupportedEncoding,
 }
@@ -1940,6 +1981,10 @@ impl GrpcFramingError {
             Self::MessageTooLarge => (
                 "grpc_message_too_large",
                 "a gRPC message exceeds the configured max_message_bytes",
+            ),
+            Self::DecodedTooLarge => (
+                "grpc_decoded_exceeds_max_scan_bytes",
+                "aggregate decoded gRPC payload exceeds max_scan_bytes",
             ),
             Self::TooManyMessages => (
                 "grpc_too_many_messages",
@@ -1971,16 +2016,19 @@ fn grpc_message_encoding(response_headers: &HashMap<String, String>) -> GrpcMess
 ///
 /// Every frame must be complete: a truncated trailing frame, a stray trailing
 /// byte, or an unrecognized compressed-flag value is malformed rather than
-/// "inspect what we have". Both the per-message and per-response bounds are
-/// enforced before any decompression allocates.
+/// "inspect what we have". The per-message ceiling, the frame-count cap, and
+/// an aggregate decoded/decompressed payload ceiling (`max_scan_bytes`) are
+/// all enforced before any further inspection work.
 fn parse_grpc_frames(
     body: &[u8],
     encoding: GrpcMessageEncoding,
     max_message_bytes: usize,
     max_messages: usize,
+    max_scan_bytes: usize,
 ) -> Result<Vec<GrpcFrame<'_>>, GrpcFramingError> {
     let mut frames = Vec::new();
     let mut offset = 0usize;
+    let mut decoded_total = 0usize;
     while offset < body.len() {
         if body.len() - offset < 5 {
             return Err(GrpcFramingError::Malformed);
@@ -2019,6 +2067,10 @@ fn parse_grpc_frames(
         } else {
             Cow::Borrowed(raw)
         };
+        decoded_total = decoded_total.saturating_add(payload.len());
+        if decoded_total > max_scan_bytes {
+            return Err(GrpcFramingError::DecodedTooLarge);
+        }
         frames.push(GrpcFrame {
             compressed: flag == 1,
             payload,
@@ -2028,25 +2080,35 @@ fn parse_grpc_frames(
 }
 
 /// Bounded gzip inflate for one gRPC message. The ceiling is enforced while
-/// reading so a compression bomb cannot allocate past it.
+/// reading so a compression bomb cannot allocate past it. The compressed
+/// payload must be exactly one fully consumed gzip member: trailing garbage
+/// and concatenated additional members are rejected.
 fn decompress_grpc_gzip(
     payload: &[u8],
     max_message_bytes: usize,
 ) -> Result<Vec<u8>, GrpcFramingError> {
-    let mut decoder = GzDecoder::new(payload);
+    let mut input: &[u8] = payload;
     let mut decompressed = Vec::with_capacity(payload.len().min(max_message_bytes));
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = decoder
-            .read(&mut buffer)
-            .map_err(|_| GrpcFramingError::Malformed)?;
-        if read == 0 {
-            break;
+    {
+        let mut decoder = GzDecoder::new(&mut input);
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = decoder
+                .read(&mut buffer)
+                .map_err(|_| GrpcFramingError::Malformed)?;
+            if read == 0 {
+                break;
+            }
+            if decompressed.len().saturating_add(read) > max_message_bytes {
+                return Err(GrpcFramingError::MessageTooLarge);
+            }
+            decompressed.extend_from_slice(&buffer[..read]);
         }
-        if decompressed.len().saturating_add(read) > max_message_bytes {
-            return Err(GrpcFramingError::MessageTooLarge);
-        }
-        decompressed.extend_from_slice(&buffer[..read]);
+    }
+    // `GzDecoder` stops after the first member; any unread input is trailing
+    // garbage or another concatenated member and must not be silently ignored.
+    if !input.is_empty() {
+        return Err(GrpcFramingError::Malformed);
     }
     Ok(decompressed)
 }
@@ -2069,7 +2131,8 @@ fn encode_grpc_frame(payload: &[u8], compress: bool) -> Option<Vec<u8>> {
     Some(frame)
 }
 
-/// Collect every string value and string map key reachable from `message`.
+/// Collect every string value and string map key reachable from `message`,
+/// including known extension values.
 fn collect_strings(
     message: &DynamicMessage,
     strings: &mut GrpcStrings,
@@ -2077,6 +2140,9 @@ fn collect_strings(
 ) -> Result<(), ()> {
     budget.enter()?;
     for (_, value) in message.fields() {
+        collect_value(value, strings, budget)?;
+    }
+    for (_, value) in message.extensions() {
         collect_value(value, strings, budget)?;
     }
     budget.leave();
@@ -2113,7 +2179,9 @@ fn collect_value(
 /// Whether any message in the tree carries fields outside the descriptor.
 ///
 /// Budget exhaustion answers "cannot prove absence", which keeps the caller
-/// fail-closed rather than optimistic.
+/// fail-closed rather than optimistic. Known extension values are recursed
+/// exactly like ordinary fields so an unknown nested under an extension cannot
+/// hide.
 fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> bool {
     if budget.enter().is_err() {
         return true;
@@ -2122,6 +2190,11 @@ fn has_unknown_fields(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> 
         return true;
     }
     for (_, value) in message.fields() {
+        if value_has_unknown_fields(value, budget) {
+            return true;
+        }
+    }
+    for (_, value) in message.extensions() {
         if value_has_unknown_fields(value, budget) {
             return true;
         }
@@ -2205,7 +2278,8 @@ fn collect_path_value(
     Ok(())
 }
 
-/// Rewrite every string value in the tree. Returns whether anything changed.
+/// Rewrite every string value in the tree, including known extensions.
+/// Returns whether anything changed.
 fn redact_strings(
     message: &mut DynamicMessage,
     budget: &mut GrpcWalkBudget,
@@ -2214,6 +2288,9 @@ fn redact_strings(
     budget.enter()?;
     let mut changed = false;
     for (_, value) in message.fields_mut() {
+        changed |= redact_value(value, budget, redact)?;
+    }
+    for (_, value) in message.extensions_mut() {
         changed |= redact_value(value, budget, redact)?;
     }
     budget.leave();
@@ -2399,6 +2476,12 @@ fn parse_grpc_shape(config: &Value) -> Result<Option<GrpcShape>, String> {
 
 /// Normalize a configured method key to the `/package.Service/Method` form the
 /// request path and `grpc_full_method` metadata both resolve to.
+///
+/// Every dotted service segment and the method identifier must be a real
+/// protobuf/gRPC identifier (`[A-Za-z_][A-Za-z0-9_]*`). Whitespace,
+/// percent/query syntax, empty segments, invalid leading characters, and
+/// extra slashes are rejected. An optional leading slash is normalized; a
+/// duplicate after normalization is rejected by the caller.
 fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
     let trimmed = method_path.trim();
     if trimmed.is_empty() {
@@ -2406,21 +2489,57 @@ fn normalize_grpc_method_path(method_path: &str) -> Result<String, String> {
             "ai_response_guard: a 'grpc.methods' key must be a non-empty method path".to_string(),
         );
     }
+    // Reject whitespace interior to the path (trim only clears the edges) and
+    // any percent/query/fragment syntax that is not part of a gRPC method path.
+    if trimmed.chars().any(|ch| {
+        ch.is_whitespace() || matches!(ch, '%' | '?' | '#' | '&' | '=' | '+' | ';')
+    }) {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    }
     let normalized = if trimmed.starts_with('/') {
         trimmed.to_string()
     } else {
         format!("/{trimmed}")
     };
-    let valid = normalized.matches('/').count() == 2
-        && !normalized.starts_with("//")
-        && !normalized.ends_with('/');
-    if !valid {
+    let rest = &normalized[1..];
+    let Some((service, method_name)) = rest.split_once('/') else {
+        return Err(
+            "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
+                .to_string(),
+        );
+    };
+    if service.is_empty()
+        || method_name.is_empty()
+        || method_name.contains('/')
+        || !is_valid_grpc_service(service)
+        || !is_valid_grpc_identifier(method_name)
+    {
         return Err(
             "ai_response_guard: a 'grpc.methods' key must be a '/package.Service/Method' path"
                 .to_string(),
         );
     }
     Ok(normalized)
+}
+
+fn is_valid_grpc_service(service: &str) -> bool {
+    service
+        .split('.')
+        .all(|segment| !segment.is_empty() && is_valid_grpc_identifier(segment))
+}
+
+fn is_valid_grpc_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 /// Parse and pre-split the optional `text_fields` dotted paths.

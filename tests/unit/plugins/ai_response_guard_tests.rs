@@ -4029,3 +4029,481 @@ async fn grpc_empty_and_non_success_bodies_are_not_governed() {
         PluginResult::Continue
     ));
 }
+
+// ══════════════════════════════════════════════════════════════════════
+//  PR #3398 repair regressions
+// ══════════════════════════════════════════════════════════════════════
+
+const EXT_PB_LABEL_OPTIONAL: u64 = 1;
+const EXT_PB_TYPE_STRING: u64 = 9;
+const EXT_PB_TYPE_MESSAGE: u64 = 11;
+
+fn ext_pb_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn ext_pb_tag(out: &mut Vec<u8>, field: u32, wire: u64) {
+    ext_pb_varint(out, (u64::from(field) << 3) | wire);
+}
+
+fn ext_pb_len_field(field: u32, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    ext_pb_tag(&mut out, field, 2);
+    ext_pb_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn ext_pb_str_field(field: u32, value: &str) -> Vec<u8> {
+    ext_pb_len_field(field, value.as_bytes())
+}
+
+fn ext_pb_varint_field(field: u32, value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    ext_pb_tag(&mut out, field, 0);
+    ext_pb_varint(&mut out, value);
+    out
+}
+
+fn ext_pb_field(name: &str, number: u32, label: u64, kind: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(ext_pb_str_field(1, name));
+    out.extend(ext_pb_varint_field(3, u64::from(number)));
+    out.extend(ext_pb_varint_field(4, label));
+    out.extend(ext_pb_varint_field(5, kind));
+    out
+}
+
+fn ext_pb_extension_field(
+    name: &str,
+    number: u32,
+    label: u64,
+    kind: u64,
+    extendee: &str,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend(ext_pb_str_field(1, name));
+    out.extend(ext_pb_str_field(2, extendee));
+    out.extend(ext_pb_varint_field(3, u64::from(number)));
+    out.extend(ext_pb_varint_field(4, label));
+    out.extend(ext_pb_varint_field(5, kind));
+    out
+}
+
+fn ext_pb_extension_message_field(
+    name: &str,
+    number: u32,
+    label: u64,
+    ty: &str,
+    extendee: &str,
+) -> Vec<u8> {
+    let mut out = ext_pb_extension_field(name, number, label, EXT_PB_TYPE_MESSAGE, extendee);
+    out.extend(ext_pb_str_field(6, ty));
+    out
+}
+
+/// proto2 FileDescriptorSet:
+/// ```proto
+/// package ext;
+/// message Carrier { optional string base = 1; extensions 100 to 199; }
+/// message Nested  { optional string inner = 1; }
+/// extend Carrier {
+///   optional string note = 100;
+///   optional Nested nest = 101;
+/// }
+/// ```
+fn extension_descriptor_set() -> Vec<u8> {
+    let base = ext_pb_field("base", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut carrier = ext_pb_str_field(1, "Carrier");
+    carrier.extend(ext_pb_len_field(2, &base));
+    let mut range = Vec::new();
+    range.extend(ext_pb_varint_field(1, 100));
+    range.extend(ext_pb_varint_field(2, 200));
+    carrier.extend(ext_pb_len_field(5, &range));
+
+    let inner = ext_pb_field("inner", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut nested = ext_pb_str_field(1, "Nested");
+    nested.extend(ext_pb_len_field(2, &inner));
+
+    let note = ext_pb_extension_field(
+        "note",
+        100,
+        EXT_PB_LABEL_OPTIONAL,
+        EXT_PB_TYPE_STRING,
+        ".ext.Carrier",
+    );
+    let nest = ext_pb_extension_message_field(
+        "nest",
+        101,
+        EXT_PB_LABEL_OPTIONAL,
+        ".ext.Nested",
+        ".ext.Carrier",
+    );
+
+    let mut file = ext_pb_str_field(1, "ext.proto");
+    file.extend(ext_pb_str_field(2, "ext"));
+    file.extend(ext_pb_len_field(4, &carrier));
+    file.extend(ext_pb_len_field(4, &nested));
+    file.extend(ext_pb_len_field(7, &note));
+    file.extend(ext_pb_len_field(7, &nest));
+    ext_pb_len_field(1, &file)
+}
+
+fn extension_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("ext.bin"), extension_descriptor_set()).expect("write");
+    dir
+}
+
+fn extension_guard(dir: &tempfile::TempDir, action: &str) -> AiResponseGuard {
+    make_plugin(json!({
+        "action": action,
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": dir.path().join("ext.bin").to_string_lossy(),
+            "methods": {
+                "/ext.Svc/Run": {"response_type": "ext.Carrier"}
+            }
+        }
+    }))
+}
+
+fn carrier_with_note(note: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let extension = pool.get_extension_by_name("ext.note").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("base", Value::String("clean".into()));
+    msg.set_extension(extension, Value::String(note.to_string()));
+    msg.encode_to_vec()
+}
+
+fn carrier_with_nested_unknown() -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, Value};
+
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let nested_desc = pool.get_message_by_name("ext.Nested").unwrap();
+    let extension = pool.get_extension_by_name("ext.nest").unwrap();
+    let mut nested = DynamicMessage::new(nested_desc.clone());
+    nested.set_field_by_name("inner", Value::String("clean".into()));
+    let mut nested_bytes = nested.encode_to_vec();
+    // Append unknown field 99 (varint 1) outside Nested's descriptor so the
+    // extension walk must recurse into the nested message to prove absence.
+    ext_pb_tag(&mut nested_bytes, 99, 0);
+    ext_pb_varint(&mut nested_bytes, 1);
+    let nested = DynamicMessage::decode(nested_desc, nested_bytes.as_slice()).unwrap();
+    assert!(
+        nested.unknown_fields().next().is_some(),
+        "fixture must carry a nested unknown field"
+    );
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_extension(extension, Value::Message(nested));
+    msg.encode_to_vec()
+}
+
+#[tokio::test]
+async fn grpc_string_extension_is_scanned_for_reject_and_redact() {
+    let dir = extension_descriptor_dir();
+    let reject = extension_guard(&dir, "reject");
+    let body = grpc_frame(&carrier_with_note("mail ops@example.com"));
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        reject
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let redact = extension_guard(&dir, "redact");
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        redact
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    let transformed = redact
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc"),
+            &grpc_headers(),
+        )
+        .await
+        .expect("extension redaction must rewrite");
+    use prost_reflect::{DescriptorPool, DynamicMessage};
+    let pool = DescriptorPool::decode(extension_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("ext.Carrier").unwrap();
+    let extension = pool.get_extension_by_name("ext.note").unwrap();
+    let payloads = grpc_frame_payloads(&transformed);
+    let msg = DynamicMessage::decode(descriptor, payloads[0].as_slice()).unwrap();
+    let note = msg.get_extension(&extension);
+    let note = note.as_str().unwrap();
+    assert!(!note.contains("ops@example.com"), "PII survived: {note}");
+    assert!(note.contains("[REDACTED:pii:email]"), "unexpected: {note}");
+}
+
+#[tokio::test]
+async fn grpc_unknown_fields_nested_under_extension_fail_closed() {
+    let dir = extension_descriptor_dir();
+    let plugin = extension_guard(&dir, "reject");
+    let body = grpc_frame(&carrier_with_nested_unknown());
+    let mut ctx = grpc_ctx("/ext.Svc/Run");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_split_frame_pii_is_detected_and_redact_fails_closed() {
+    let plugin = grpc_guard("reject");
+    let mut body = grpc_frame(&hello_response_bytes("ops@"));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("example.com")));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "email split across frames must still reject"
+    );
+
+    let redact = grpc_guard("redact");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(
+        matches!(
+            redact
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "cross-frame-only match must fail closed in redact mode"
+    );
+    assert!(
+        redact
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &grpc_headers(),
+            )
+            .await
+            .is_none(),
+        "cross-frame-only match cannot be rewritten in any one scalar"
+    );
+}
+
+#[tokio::test]
+async fn grpc_aggregate_completion_length_covers_selected_stream() {
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "max_completion_length": 10,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }));
+    // Each fragment is under the limit; the ordered aggregate is not.
+    let mut body = grpc_frame(&hello_response_bytes("hello "));
+    body.extend_from_slice(&grpc_frame(&hello_response_bytes("world!!!")));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_redact_transform_ignores_mislabeled_response_content_type() {
+    let plugin = grpc_guard("redact");
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.contains_key("ai_response_guard_redacted"));
+
+    // Absent or relabeled response Content-Type must not skip the rewrite after
+    // a successful framed inspection on an enrolled native-gRPC request.
+    for content_type in [None, Some("application/json"), Some("text/plain")] {
+        let transformed = plugin
+            .transform_response_body_with_context(&mut ctx, &body, content_type, &grpc_headers())
+            .await
+            .expect("transform gate must follow enrollment, not response Content-Type");
+        let text = hello_response_text(&grpc_frame_payloads(&transformed)[0]);
+        assert!(
+            !text.contains("ops@example.com"),
+            "PII leaked under content-type {content_type:?}: {text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grpc_gzip_rejects_trailing_garbage_and_concatenated_members() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = grpc_guard("reject");
+    let payload = hello_response_bytes("clean");
+
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&payload).unwrap();
+    let mut with_trailer = encoder.finish().unwrap();
+    with_trailer.extend_from_slice(b"trailing-garbage");
+    let mut frame = Vec::with_capacity(5 + with_trailer.len());
+    frame.push(1);
+    frame.extend_from_slice(&(with_trailer.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&with_trailer);
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+
+    let mut first = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    first.write_all(&payload).unwrap();
+    let mut concatenated = first.finish().unwrap();
+    let mut second = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    second.write_all(&payload).unwrap();
+    concatenated.extend_from_slice(&second.finish().unwrap());
+    let mut frame = Vec::with_capacity(5 + concatenated.len());
+    frame.push(1);
+    frame.extend_from_slice(&(concatenated.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&concatenated);
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[tokio::test]
+async fn grpc_aggregate_decoded_budget_bounds_compressed_amplification() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    // Small wire body, but decompressed aggregate exceeds max_scan_bytes.
+    let plugin = make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "max_scan_bytes": 64,
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "max_message_bytes": 4096,
+            "methods": {"/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}}
+        }
+    }));
+    let large = hello_response_bytes(&"x".repeat(1024));
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&large).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut frame = Vec::with_capacity(5 + compressed.len());
+    frame.push(1);
+    frame.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&compressed);
+    assert!(
+        frame.len() <= 64,
+        "fixture must amplify under the wire budget: frame {} vs limit 64",
+        frame.len()
+    );
+    assert!(
+        large.len() > 64,
+        "decompressed payload must exceed max_scan_bytes"
+    );
+    let mut headers = grpc_headers();
+    headers.insert("grpc-encoding".to_string(), "gzip".to_string());
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut headers, &frame)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+}
+
+#[test]
+fn grpc_method_path_requires_protobuf_identifier_grammar() {
+    for invalid in [
+        "/a.B/C?x=1",
+        "/a.B/C%2F",
+        "/a. B/C",
+        "/a..B/C",
+        "/.B/C",
+        "/a.B/",
+        "//a.B/C",
+        "/a.B/C/extra",
+        "/1Service/Method",
+        "/a.B/9bad",
+        "/a-B/C",
+        "not-a-path",
+        "",
+    ] {
+        let mut methods = serde_json::Map::new();
+        methods.insert(invalid.to_string(), json!({"response_type": "x"}));
+        let config = json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/tmp/x.bin",
+                "methods": methods
+            }
+        });
+        assert!(
+            AiResponseGuard::new(&config).is_err(),
+            "must reject method path {invalid:?}"
+        );
+    }
+
+    // Optional leading slash still normalizes.
+    let config = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+    assert!(AiResponseGuard::new(&config).is_ok());
+
+    // Duplicate after normalization is rejected.
+    let dup = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "test.Greeter/SayHello": {"response_type": "test.HelloResponse"},
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+    assert!(AiResponseGuard::new(&dup).is_err());
+}

@@ -21089,7 +21089,11 @@ components:
           type: integer
           minimum: 1
           default: 1048576
-          description: Maximum governed buffered response size. Reject/redact and structural rules fail closed above this limit; warn-only content rules record a bounded warning and pass through.
+          description: >-
+            Maximum governed buffered response size, including the aggregate
+            decoded/decompressed native-gRPC payload across frames.
+            Reject/redact and structural rules fail closed above this limit;
+            warn-only content rules record a bounded warning and pass through.
         require_json:
           type: boolean
           default: false
@@ -21129,13 +21133,22 @@ components:
               description: >-
                 Node-local path to a compiled protobuf FileDescriptorSet.
                 Validated shape-only at Admin/CP admission and against the real
-                descriptor by mode-aware file-dependency validation.
+                descriptor by mode-aware file-dependency validation. A readable
+                but invalid descriptor rejects the candidate configuration; an
+                absent or unreadable descriptor retains enrollment and fails
+                closed for enforcing actions at request time.
             methods:
               type: object
               minProperties: 1
               description: >-
                 Map of "/package.Service/Method" to that method's response
                 inspection contract. Only these methods are inspected.
+                Leading/trailing whitespace and one optional leading slash are
+                normalized by the runtime; every dotted service segment and the
+                method identifier must be a protobuf/gRPC identifier. Duplicate
+                normalized forms are rejected at runtime.
+              propertyNames:
+                pattern: '^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$'
               additionalProperties:
                 type: object
                 additionalProperties: false
@@ -21155,14 +21168,16 @@ components:
                       Dotted field paths restricting what is scanned and
                       rewritten. Each path must end at a string field and may
                       not traverse a map field. Omit to cover every string
-                      field recursively.
+                      field and known extension value recursively.
             max_message_bytes:
               type: integer
               minimum: 1
               default: 1048576
               description: >-
                 Per-message ceiling, applied to the declared frame length and
-                enforced while inflating a gzip-compressed frame.
+                enforced while inflating a gzip-compressed frame. Aggregate
+                decoded payload across frames is additionally capped by
+                max_scan_bytes.
             max_messages:
               type: integer
               minimum: 1

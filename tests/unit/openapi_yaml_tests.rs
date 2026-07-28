@@ -7804,6 +7804,10 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     );
     assert_eq!(schema["properties"]["max_scan_bytes"]["minimum"], 1);
     assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
+    assert_eq!(
+        schema["properties"]["grpc"]["properties"]["methods"]["propertyNames"]["pattern"],
+        json!(r"^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$")
+    );
     for pointer in [
         "/properties/blocked_phrases/items/minLength",
         "/properties/required_fields/items/minLength",
@@ -7909,6 +7913,34 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
                 "descriptor_path": "/d.bin",
                 "max_messages": 0,
                 "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a..B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/1Service/Method": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C?x=1": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"not-a-path": {"response_type": "a.R"}}
             }
         }),
     ] {
