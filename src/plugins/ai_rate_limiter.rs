@@ -1728,8 +1728,10 @@ impl Plugin for AiRateLimiter {
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             let usage = outcome.usage.unwrap_or(0);
+            // The rate-limit key embeds the identity dimension (consumer,
+            // authenticated identity, SPIFFE ID, or client IP) and is never
+            // logged; the bounded counters below stay.
             warn!(
-                rate_limit_key = %key,
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",

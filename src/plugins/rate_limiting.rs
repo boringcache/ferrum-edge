@@ -474,7 +474,11 @@ impl RateLimiting {
                 return self.reject(&outcome);
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(rate_limit_key = %key, plugin = "rate_limiting", "Rate limit exceeded");
+            // The rate-limit key embeds the identity dimension (consumer
+            // username, authenticated identity, SPIFFE ID, or client IP), so it
+            // is never logged. Enforcement outcomes are attributed through the
+            // transaction summary, which applies metadata redaction.
+            warn!(plugin = "rate_limiting", "Rate limit exceeded");
             return self.reject(&outcome);
         }
 
@@ -503,11 +507,8 @@ impl RateLimiting {
                 return self.reject(&outcome);
             }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
-            warn!(
-                rate_limit_key = %key,
-                plugin = "rate_limiting",
-                "Rate limit exceeded (stream)"
-            );
+            // Identity-bearing key deliberately omitted (see `check_rate`).
+            warn!(plugin = "rate_limiting", "Rate limit exceeded (stream)");
             return self.reject(&outcome);
         }
 

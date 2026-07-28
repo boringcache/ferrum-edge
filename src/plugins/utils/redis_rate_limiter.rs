@@ -109,11 +109,22 @@
 //!
 //! # Connection pool
 //!
-//! `redis_pool_size` sizes a bounded set of multiplexed
-//! [`redis::aio::ConnectionManager`] instances. Slots are established lazily on
+//! `redis_pool_size` sizes a bounded set of
+//! [`redis::aio::MultiplexedConnection`] slots. Slots are established lazily on
 //! first use, selected round-robin on the hot path (lock-free atomic counter),
-//! and cleared together on reconnect failure so TLS/DNS screening and
-//! availability state stay coherent across the pool.
+//! and cleared together on failure so TLS/DNS screening and availability state
+//! stay coherent across the pool.
+//!
+//! The pooled type is deliberately *not* [`redis::aio::ConnectionManager`].
+//! That type reconnects transparently inside redis-rs, so a screened endpoint
+//! could disconnect and silently acquire a brand-new physical socket without
+//! re-running Ferrum's DNS resolution, egress screen, or `INFO CLUSTER`
+//! topology screen. A [`redis::aio::MultiplexedConnection`] surfaces the I/O
+//! failure instead: the operation fails, `clear_connection` drops every cached
+//! slot, and the next operation (or the recovery checker)
+//! establishes a fresh connection through the full resolve → build → connect →
+//! screen path. Every physical connection this client ever uses is therefore
+//! screened before it can carry a policy command.
 
 use crate::dns::DnsCache;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
@@ -138,7 +149,7 @@ fn expire_seconds(ttl_seconds: u64) -> i64 {
     i64::try_from(ttl_seconds).unwrap_or(i64::MAX).max(1)
 }
 
-/// Operational upper bound for Redis ConnectionManager pool slots per plugin.
+/// Operational upper bound for Redis multiplexed-connection pool slots per plugin.
 ///
 /// Each slot owns an ArcSwap, a Tokio mutex, and may lazily establish one
 /// multiplexed Redis TCP connection, so configuration must keep this value a
@@ -196,13 +207,13 @@ pub struct RedisConfig {
     /// plugin type never share counters. An explicit `redis_key_prefix` is the
     /// documented opt-in for a deliberately shared budget.
     pub key_prefix: String,
-    /// Bounded pool size: number of multiplexed [`redis::aio::ConnectionManager`]
+    /// Bounded pool size: number of [`redis::aio::MultiplexedConnection`]
     /// instances established lazily and selected round-robin on the hot path.
     pub pool_size: usize,
     /// Effective Redis connection-attempt timeout in seconds.
     ///
-    /// Passed into redis-rs [`redis::aio::ConnectionManagerConfig`] /
-    /// [`redis::AsyncConnectionConfig`] (not only an outer `tokio::time::timeout`)
+    /// Passed into the redis-rs [`redis::AsyncConnectionConfig`] used by every
+    /// connection path (not only an outer `tokio::time::timeout`)
     /// so values above the crate's one-second default take effect. Covers TCP
     /// connect, TLS handshake when enabled, and Redis protocol handshake on
     /// cached, dedicated, and health-check paths. Gateway `DnsCache` screening
@@ -436,7 +447,7 @@ impl RedisConfig {
     /// implies control of the gateway's resolver). Literal-IP `rediss://` and all
     /// `redis://` (plaintext) endpoints ARE pinned/screened. Closing the TLS-
     /// hostname gap requires a custom pinned TLS connector (abandoning the crate's
-    /// ConnectionManager) and is deliberately out of scope — see PR #1933.
+    /// own connection establishment) and is deliberately out of scope — see PR #1933.
     pub(crate) fn url_with_resolved_ip(&self, resolved_ip: std::net::IpAddr) -> String {
         let url = self.effective_url();
 
@@ -585,17 +596,11 @@ fn parse_optional_u64(
         .transpose()
 }
 
-/// A Redis-backed rate limiter client shared across plugin instances.
-///
-/// Provides atomic counter operations for rate limiting using native Redis
-/// commands (no Lua scripts). Automatically falls back to local mode when
-/// Redis is unreachable and recovers when connectivity is restored.
-///
-/// When a `DnsCache` is provided, Redis hostnames are resolved through the
 /// Outcome of screening + resolving the Redis endpoint through the gateway DNS
 /// cache. The client NEVER dials an address the egress policy hasn't cleared, so
-/// any screen failure fails closed to the in-memory limiter rather than handing
-/// an unscreened host to the Redis crate's own resolver.
+/// any screen failure leaves centralized Redis unavailable — the consumer's
+/// configured failure policy then decides — rather than handing an unscreened
+/// host to the Redis crate's own resolver.
 enum RedisEndpoint {
     /// A policy-screened URL to dial.
     Url(String),
@@ -963,13 +968,17 @@ impl EnforcementAvailability {
     }
 }
 
-/// One lazily-established multiplexed ConnectionManager slot in the pool.
+/// One lazily-established [`redis::aio::MultiplexedConnection`] slot in the pool.
 ///
 /// Hot-path reads are lock-free via [`ArcSwap`]. Slow-path establishment is
 /// serialized per slot so distinct slots can connect in parallel without a
 /// global mutex, while same-slot racers still double-check under the lock.
+///
+/// The stored type must stay a non-reconnecting multiplexed connection: a
+/// [`redis::aio::ConnectionManager`] would replace its physical socket inside
+/// redis-rs, publishing an unscreened connection into this cache.
 struct ConnectionSlot {
-    connection: ArcSwap<Option<redis::aio::ConnectionManager>>,
+    connection: ArcSwap<Option<redis::aio::MultiplexedConnection>>,
     connect_mutex: tokio::sync::Mutex<()>,
 }
 
@@ -1015,11 +1024,23 @@ pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrange
     isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
 }
 
-/// gateway's shared DNS cache. On connection failure, every pool slot is cleared
-/// so the next attempt re-resolves DNS (handling IP changes gracefully).
+/// A Redis-backed limiter/store client shared across plugin instances.
+///
+/// Provides atomic counter and key-value operations using native Redis commands
+/// (no Lua scripts). It does NOT fall back on its own: an unreachable endpoint
+/// simply reports unavailable, and each consumer's `redis_failure_policy` (or
+/// `request_deduplication`'s `on_redis_unavailable`) decides between failing
+/// closed — the default — and an explicit local fallback.
+///
+/// When a `DnsCache` is provided, Redis hostnames are resolved through the
+/// gateway's shared DNS cache. On any connection or command failure, every pool
+/// slot is cleared so the next attempt re-resolves DNS (handling IP changes
+/// gracefully), re-screens egress, and re-runs the `INFO CLUSTER` topology
+/// screen before a command can reach the new socket.
 pub struct RedisRateLimitClient {
-    /// Bounded pool of multiplexed ConnectionManagers (`redis_pool_size`).
-    /// Each slot is established lazily on first selection.
+    /// Bounded pool of non-reconnecting multiplexed connections
+    /// (`redis_pool_size`). Each slot is established lazily on first selection
+    /// and only through the screened establishment path.
     pool: Box<[ConnectionSlot]>,
     /// Round-robin counter for deterministic, low-overhead slot selection.
     /// `fetch_add` + `% pool.len()` — no locks, no hashing on the hot path.
@@ -1195,7 +1216,7 @@ impl RedisRateLimitClient {
         self.pool.len()
     }
 
-    /// Number of pool slots that currently hold an established ConnectionManager.
+    /// Number of pool slots that currently hold an established connection.
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_cardinality_for_test(&self) -> usize {
         self.pool
@@ -1228,10 +1249,22 @@ impl RedisRateLimitClient {
         self.clear_connection();
     }
 
-    /// Establish (or reuse) one round-robin ConnectionManager for tests.
+    /// Establish (or reuse) one round-robin pooled connection for tests.
     #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_cached_for_test(&self) -> bool {
         self.get_connection().await.is_some()
+    }
+
+    /// Type name of the concrete connection cached in the hot-path pool.
+    ///
+    /// External tests assert this equals
+    /// `type_name::<redis::aio::MultiplexedConnection>()` and does not name
+    /// `ConnectionManager`. The pooled helper's return type is the compile-time
+    /// pin; reintroducing a transparently reconnecting manager fails either this
+    /// string check or the `slot.connection.store(..)` assignment.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn cached_pool_connection_type_name_for_test() -> &'static str {
+        std::any::type_name::<redis::aio::MultiplexedConnection>()
     }
 
     /// Establish a dedicated non-reconnecting multiplexed connection for tests.
@@ -1245,7 +1278,7 @@ impl RedisRateLimitClient {
     /// External tests assert this equals
     /// `type_name::<redis::aio::MultiplexedConnection>()` and does not name
     /// `ConnectionManager`. The production helper's return type is the
-    /// compile-time pin; changing it back to ConnectionManager fails either
+    /// compile-time pin; changing it to a reconnecting manager fails either
     /// this string check or the assignment in `get_dedicated_connection`.
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn dedicated_watch_connection_type_name_for_test() -> &'static str {
@@ -1288,12 +1321,6 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_timeout_for_test(&self) -> Duration {
         self.connect_timeout()
-    }
-
-    /// Manager-config connection timeout observed by redis-rs (tests).
-    #[allow(dead_code)] // public support used by the external integration-test target
-    pub fn connection_manager_timeout_for_test(&self) -> Option<Duration> {
-        self.connection_manager_config().connection_timeout()
     }
 
     /// Deterministic round-robin index into the connection pool.
@@ -1383,50 +1410,24 @@ impl RedisRateLimitClient {
         Duration::from_secs(self.config.connect_timeout_seconds)
     }
 
-    /// redis-rs manager config carrying Ferrum's connection-attempt timeout.
-    ///
-    /// The crate default is one second; without this, outer `tokio::time::timeout`
-    /// wrappers cannot extend attempts past that inner cap.
-    fn connection_manager_config(&self) -> redis::aio::ConnectionManagerConfig {
-        redis::aio::ConnectionManagerConfig::new()
-            .set_connection_timeout(Some(self.connect_timeout()))
-    }
-
     /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
     ///
-    /// Used by the health-check path and by WATCH-transaction dedicated
-    /// connections (plain [`redis::aio::MultiplexedConnection`], never a
-    /// reconnecting [`redis::aio::ConnectionManager`]).
+    /// The crate default is one second; without this, outer `tokio::time::timeout`
+    /// wrappers cannot extend attempts past that inner cap. Used by *every*
+    /// connection path — pooled, dedicated, and health-check — because all three
+    /// dial a plain [`redis::aio::MultiplexedConnection`] and never a
+    /// transparently reconnecting [`redis::aio::ConnectionManager`].
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
         redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
-    }
-
-    /// Establish a ConnectionManager with Ferrum's timeout on both the inner
-    /// redis-rs config and a defensive outer `tokio::time::timeout` bound.
-    async fn connect_manager(
-        &self,
-        client: redis::Client,
-    ) -> Result<redis::aio::ConnectionManager, ConnectAttemptError> {
-        let connect_timeout = self.connect_timeout();
-        let manager_config = self.connection_manager_config();
-        match tokio::time::timeout(
-            connect_timeout,
-            redis::aio::ConnectionManager::new_with_config(client, manager_config),
-        )
-        .await
-        {
-            Ok(Ok(manager)) => Ok(manager),
-            Ok(Err(error)) => Err(ConnectAttemptError::Redis(error)),
-            Err(_) => Err(ConnectAttemptError::Timeout),
-        }
     }
 
     /// Establish a non-reconnecting multiplexed connection with Ferrum's timeout
     /// on both the inner redis-rs config and a defensive outer bound.
     ///
-    /// Unlike [`Self::connect_manager`], this connection cannot transparently
-    /// replace its physical TCP session mid-sequence, so connection-local
-    /// `WATCH` state remains bound to the socket that observed it.
+    /// This connection cannot transparently replace its physical TCP session, so
+    /// connection-local `WATCH` state remains bound to the socket that observed
+    /// it, and a broken pooled connection surfaces its I/O error to Ferrum
+    /// instead of being silently replaced by an unscreened socket.
     async fn connect_multiplexed(
         &self,
         client: redis::Client,
@@ -1449,13 +1450,17 @@ impl RedisRateLimitClient {
     ///
     /// Fast path (hot): round-robin slot pick + lock-free `ArcSwap::load()`.
     /// Slow path (cold): per-slot `Mutex`-guarded establishment with double-check.
-    async fn get_connection(&self) -> Option<redis::aio::ConnectionManager> {
+    ///
+    /// The returned connection never reconnects on its own: when it breaks, the
+    /// command fails, [`Self::note_command_failure`] clears every slot, and the
+    /// next call re-runs the full resolve/build/connect/screen path.
+    async fn get_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
         let idx = self.select_slot_index();
         self.get_or_connect_slot(idx).await
     }
 
-    /// Establish (or reuse) the ConnectionManager for a specific pool slot.
-    async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::ConnectionManager> {
+    /// Establish (or reuse) the multiplexed connection for a specific pool slot.
+    async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::MultiplexedConnection> {
         // A rejected topology is terminal: never redial it, so no command can
         // succeed against an endpoint this client cannot enforce against.
         if self.is_topology_unsupported() {
@@ -1514,11 +1519,11 @@ impl RedisRateLimitClient {
             }
         };
 
-        match self.connect_manager(client).await {
-            Ok(mut manager) => {
+        match self.connect_multiplexed(client).await {
+            Ok(mut conn) => {
                 // Screen topology before the connection is published to the hot
                 // path: a Cluster endpoint must never serve a policy operation.
-                if !self.screen_topology(&mut manager).await {
+                if !self.screen_topology(&mut conn).await {
                     return None;
                 }
                 // Re-check at the publication boundary: another task may have
@@ -1536,8 +1541,8 @@ impl RedisRateLimitClient {
                     "Redis rate limiting connected"
                 );
                 self.start_health_checker_if_needed();
-                slot.connection.store(Arc::new(Some(manager.clone())));
-                Some(manager)
+                slot.connection.store(Arc::new(Some(conn.clone())));
+                Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
@@ -1569,14 +1574,15 @@ impl RedisRateLimitClient {
     ///
     /// Redis transactions that rely on connection-local state (`WATCH`/`MULTI`/
     /// `EXEC`) must:
-    /// 1. Not share a cached [`redis::aio::ConnectionManager`] with unrelated
-    ///    concurrent commands (another sequence on that manager can interleave
+    /// 1. Not share a pooled connection with unrelated concurrent commands
+    ///    (another sequence multiplexed onto that socket can interleave
     ///    `UNWATCH`/`EXEC` and break the optimistic transaction boundary).
     /// 2. Not use [`redis::aio::ConnectionManager`] at all for the sequence —
     ///    that type owns an `ArcSwap`-backed connection and can transparently
     ///    reconnect (including after a RESP3 disconnect push). A reconnect
     ///    between `WATCH` and `EXEC` yields a fresh physical socket with no
-    ///    watch state, so `EXEC` can become unconditional.
+    ///    watch state, so `EXEC` can become unconditional. (The hot-path pool
+    ///    avoids that type for the same reason, plus the screening invariant.)
     ///
     /// This helper therefore returns a freshly dialed
     /// [`redis::aio::MultiplexedConnection`] against the already
@@ -1660,7 +1666,11 @@ impl RedisRateLimitClient {
     }
 
     /// Clear every cached pool slot so the next `get_connection()` call
-    /// re-resolves DNS and creates fresh connections.
+    /// re-resolves DNS, re-screens egress, and re-runs the `INFO CLUSTER`
+    /// topology screen before any command can run on a new physical socket.
+    ///
+    /// This is the *only* way a pooled connection is ever replaced — the cached
+    /// [`redis::aio::MultiplexedConnection`] cannot re-dial by itself.
     fn clear_connection(&self) {
         for slot in self.pool.iter() {
             slot.connection.store(Arc::new(None));
@@ -1926,9 +1936,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "INCR+EXPIRE",
                     error = %e,
-                    "Redis INCR+EXPIRE failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -1970,10 +1981,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    previous_key = %previous_key,
-                    current_key = %current_key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "GET+INCR+EXPIRE",
                     error = %e,
-                    "Redis sliding-window GET+INCR+EXPIRE transaction failed"
+                    "Redis sliding-window transaction failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2013,9 +2024,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "INCRBY+EXPIRE",
                     error = %e,
-                    "Redis INCRBY+EXPIRE failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2078,7 +2090,8 @@ impl RedisRateLimitClient {
             // it is observable rather than silently undercounting.
             Err(()) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "INCRBY floor compensation",
                     "Redis floor compensation failed after negative INCRBY accepted; \
                      window counter left negative until TTL — centralized enforcement unavailable"
                 );
@@ -2123,10 +2136,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    count_key = %count_key,
-                    total_key = %total_key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "INCR+INCRBY+EXPIRE",
                     error = %e,
-                    "Redis INCR+INCRBY+EXPIRE pipeline failed"
+                    "Redis pipeline failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2156,8 +2169,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
+                    redis_url = %self.config.redacted_url(),
+                    operation = "GET+GET",
                     error = %e,
-                    "Redis GET+GET pipeline failed"
+                    "Redis pipeline failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2182,9 +2197,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "GET",
                     error = %e,
-                    "Redis GET failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2253,7 +2269,8 @@ impl RedisRateLimitClient {
                 };
                 if prefix.len() > max_prefix {
                     warn!(
-                        key = %key,
+                        redis_url = %self.config.redacted_url(),
+                        operation = "GETRANGE",
                         prefix_len = prefix.len(),
                         max_bytes,
                         "Redis GETRANGE returned more bytes than the requested bound; failing closed"
@@ -2274,9 +2291,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "EXISTS+STRLEN+GETRANGE",
                     error = %e,
-                    "Redis EXISTS+STRLEN+GETRANGE failed"
+                    "Redis pipeline failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2299,9 +2317,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "DEL",
                     error = %e,
-                    "Redis DEL failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2341,9 +2360,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET+EXPIRE",
                     error = %e,
-                    "Redis SET+EXPIRE failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2379,9 +2399,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "SET NX EX",
                     error = %e,
-                    "Redis SET NX EX failed"
+                    "Redis command failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2395,10 +2416,10 @@ impl RedisRateLimitClient {
     /// RESP-compatible Redis backends that do not support scripting can still
     /// use ownership-token lock release.
     ///
-    /// The transaction runs on a freshly dialed, non-reconnecting
-    /// [`redis::aio::MultiplexedConnection`] (never a
-    /// [`redis::aio::ConnectionManager`]) so connection-local `WATCH` state
-    /// cannot be silently dropped by a transparent reconnect. Any I/O failure
+    /// The transaction runs on a freshly dialed, *dedicated* (never pooled,
+    /// never shared) non-reconnecting [`redis::aio::MultiplexedConnection`] so
+    /// connection-local `WATCH` state can neither be interleaved by another
+    /// command nor silently dropped by a transparent reconnect. Any I/O failure
     /// at `WATCH`, `GET`, `UNWATCH`, or `EXEC` fails closed as `Err(())`.
     pub async fn delete_if_value_matches(&self, key: &str, expected: &[u8]) -> Result<bool, ()> {
         // Owned for the duration of the transaction; never cloned or shared.
@@ -2408,9 +2429,10 @@ impl RedisRateLimitClient {
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
         if let Err(e) = watch_result {
             warn!(
-                key = %key,
+                redis_url = %self.config.redacted_url(),
+                operation = "WATCH",
                 error = %e,
-                "Redis WATCH failed"
+                "Redis command failed"
             );
             self.note_command_failure(&e);
             return Err(());
@@ -2425,9 +2447,10 @@ impl RedisRateLimitClient {
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
                 if let Err(e) = unwatch {
                     warn!(
-                        key = %key,
+                        redis_url = %self.config.redacted_url(),
+                        operation = "UNWATCH",
                         error = %e,
-                        "Redis UNWATCH failed"
+                        "Redis command failed"
                     );
                     self.note_command_failure(&e);
                     return Err(());
@@ -2437,9 +2460,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-delete GET",
                     error = %e,
-                    "Redis compare-delete GET failed"
+                    "Redis command failed"
                 );
                 // WATCH already succeeded: attempt UNWATCH before failing closed.
                 // A failed UNWATCH is itself a failure; never retry on a new conn.
@@ -2447,9 +2471,10 @@ impl RedisRateLimitClient {
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
                 if let Err(unwatch_err) = unwatch {
                     warn!(
-                        key = %key,
+                        redis_url = %self.config.redacted_url(),
+                        operation = "UNWATCH",
                         error = %unwatch_err,
-                        "Redis UNWATCH failed"
+                        "Redis command failed"
                     );
                 }
                 self.note_command_failure(&e);
@@ -2475,9 +2500,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-delete EXEC",
                     error = %e,
-                    "Redis compare-delete transaction failed"
+                    "Redis transaction failed"
                 );
                 self.note_command_failure(&e);
                 Err(())
@@ -2523,9 +2549,10 @@ impl RedisRateLimitClient {
             redis::cmd("WATCH").arg(key).query_async(&mut conn).await;
         if let Err(e) = watch_result {
             warn!(
-                key = %key,
+                redis_url = %self.config.redacted_url(),
+                operation = "WATCH",
                 error = %e,
-                "Redis WATCH failed"
+                "Redis command failed"
             );
             self.note_command_failure(&e);
             return Err(());
@@ -2540,9 +2567,10 @@ impl RedisRateLimitClient {
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
                 if let Err(e) = unwatch {
                     warn!(
-                        key = %key,
+                        redis_url = %self.config.redacted_url(),
+                        operation = "UNWATCH",
                         error = %e,
-                        "Redis UNWATCH failed"
+                        "Redis command failed"
                     );
                     self.note_command_failure(&e);
                     return Err(());
@@ -2552,9 +2580,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-and-set GET",
                     error = %e,
-                    "Redis compare-and-set GET failed"
+                    "Redis command failed"
                 );
                 // WATCH already succeeded: attempt UNWATCH before failing closed.
                 // A failed UNWATCH is itself a failure; never retry on a new conn.
@@ -2562,9 +2591,10 @@ impl RedisRateLimitClient {
                     redis::cmd("UNWATCH").query_async(&mut conn).await;
                 if let Err(unwatch_err) = unwatch {
                     warn!(
-                        key = %key,
+                        redis_url = %self.config.redacted_url(),
+                        operation = "UNWATCH",
                         error = %unwatch_err,
-                        "Redis UNWATCH failed"
+                        "Redis command failed"
                     );
                 }
                 self.note_command_failure(&e);
@@ -2596,9 +2626,10 @@ impl RedisRateLimitClient {
             }
             Err(e) => {
                 warn!(
-                    key = %key,
+                    redis_url = %self.config.redacted_url(),
+                    operation = "compare-and-set EXEC",
                     error = %e,
-                    "Redis compare-and-set transaction failed"
+                    "Redis transaction failed"
                 );
                 self.note_command_failure(&e);
                 Err(())

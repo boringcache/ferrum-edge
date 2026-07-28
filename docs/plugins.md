@@ -2717,7 +2717,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -2792,7 +2792,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"`. Must be non-empty when supplied. Sibling instances stay isolated under a shared default/explicit prefix via stable `plugin_config_id` in logical keys, and matched proxy namespaces remain isolated even when an explicit prefix is shared across namespaces |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout (must be > 0) |
 | `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable (must be > 0) |
 | `redis_username` | String (optional) | — | Redis ACL username |
@@ -3999,7 +3999,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:graphql:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -4115,7 +4115,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:grpc_method_router:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake), and as the deadline for the proactive `INFO CLUSTER` topology screen on those connections. Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -4963,7 +4963,7 @@ Caches LLM responses keyed by family-correct prompts across Ferrum's recognized 
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`). URL-embedded userinfo (`redis://user:pass@host`) is accepted but never disclosed: connection/health-check logs and non-admin/audit projections keep only the scheme, host, port, and database, replace the userinfo, and remove query/fragment data. Unparseable values and non-`redis`/`rediss` schemes fail closed to `[REDACTED]` |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:ai_cache"` | Redis key namespace prefix. Defaults to `ferrum:ai_cache` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | -- | Redis ACL username (Redis 6+) |
@@ -5189,7 +5189,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:ai_rate_limiter:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -5636,7 +5636,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:ws_rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -5722,7 +5722,7 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:udp_rate_limiting:{plugin-config-id}` | Redis key namespace prefix. Defaults to the gateway namespace, the plugin name, and this plugin config's stable resource id (for example `ferrum:udp_rate_limiting:rl-public-api`), so two independent policies of this type in one namespace never share counters. Must be non-empty when set; setting it explicitly is the documented opt-in for a deliberately shared budget. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Sizes a bounded pool of non-reconnecting `MultiplexedConnection` slots selected round-robin on the hot path; a broken slot is never silently re-dialed by redis-rs — it is cleared and re-established through Ferrum's DNS/egress/`INFO CLUSTER` screening path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |

@@ -342,13 +342,15 @@ fn test_from_plugin_config_accepts_exact_max_redis_pool_size() {
 
 // ── Connection-attempt timeout wiring (issue #2310) ───────────────────────
 //
-// redis-rs 1.2.1 defaults ConnectionManager/AsyncConnectionConfig timeouts to
-// one second. Ferrum must install `redis_connect_timeout_seconds` into those
-// inner configs so values above one second are effective. Assertions below are
-// outcome-based (success/failure / config equality), not wall-clock ranges.
+// redis-rs 1.2.1 defaults `AsyncConnectionConfig` timeouts to one second.
+// Ferrum must install `redis_connect_timeout_seconds` into that inner config so
+// values above one second are effective. `AsyncConnectionConfig` exposes no
+// getter, so the wiring is pinned by source text plus the outer-bound value.
+// Assertions below are outcome-based (success/failure / config equality), not
+// wall-clock ranges.
 
 #[test]
-fn connect_timeout_is_installed_into_redis_manager_config_above_and_below_one_second() {
+fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one_second() {
     for seconds in [1_u64, 2, 5, 30] {
         let mut config = make_config("redis://127.0.0.1:6379/0", false);
         config.connect_timeout_seconds = seconds;
@@ -357,12 +359,15 @@ fn connect_timeout_is_installed_into_redis_manager_config_above_and_below_one_se
             client.connection_timeout_for_test(),
             Duration::from_secs(seconds)
         );
-        assert_eq!(
-            client.connection_manager_timeout_for_test(),
-            Some(Duration::from_secs(seconds)),
-            "inner ConnectionManagerConfig must carry Ferrum timeout ({seconds}s), not the crate 1s default"
-        );
     }
+
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains(
+            "redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))"
+        ),
+        "inner AsyncConnectionConfig must carry Ferrum's timeout, not the crate 1s default"
+    );
 }
 
 /// Accept TCP, optionally delay, then answer every RESP array command with +OK.
@@ -524,8 +529,8 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
         assert_eq!(config.key_prefix, prefix);
         let client = redis_rate_limit_client_for_test(config);
         assert_eq!(
-            client.connection_manager_timeout_for_test(),
-            Some(Duration::from_secs(seconds))
+            client.connection_timeout_for_test(),
+            Duration::from_secs(seconds)
         );
     }
 }
@@ -533,8 +538,8 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
 // ── redis_pool_size cardinality / selection (issue #2304) ─────────────────
 //
 // Before the fix, `redis_pool_size` was parsed and validated but every instance
-// cached exactly one ConnectionManager. These tests prove configured pool size
-// controls runtime cardinality and round-robin selection — not merely parsing.
+// cached exactly one connection. These tests prove configured pool size controls
+// runtime cardinality and round-robin selection — not merely parsing.
 
 #[test]
 fn pool_size_controls_client_cardinality_for_named_consumers() {
@@ -603,7 +608,7 @@ async fn pool_size_one_establishes_single_tcp_connection() {
         "pool_size=1 must open exactly one multiplexed TCP connection"
     );
 
-    // Re-warming must reuse the cached manager, not dial again.
+    // Re-warming must reuse the cached connection, not dial again.
     assert_eq!(client.warm_pool_for_test().await, 1);
     assert_eq!(accepts.load(Ordering::Relaxed), 1);
 
@@ -1103,7 +1108,7 @@ fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
         let impl_body = &body[brace..];
         assert!(
             !impl_body.contains("get_connection()"),
-            "{marker} must not use the pooled ConnectionManager path"
+            "{marker} must not use the shared pooled connection path"
         );
         assert!(
             !impl_body.contains("ConnectionManager"),
@@ -1621,7 +1626,14 @@ enum InfoBehavior {
     Raw(&'static str),
     /// Accept and authenticate the connection, then never answer `INFO`.
     Never,
+    /// Answer the FIRST screen with this text, then report Cluster topology on
+    /// every later screen. Models an endpoint that is re-pointed at a Cluster
+    /// node after Ferrum already screened and cached a connection to it, so the
+    /// re-screen on the post-disconnect reconnect is what must catch it.
+    PayloadThenCluster(&'static str),
 }
+
+const CLUSTER_INFO: &str = "# Cluster\r\ncluster_enabled:1\r\n";
 
 struct ScreenedServer {
     port: u16,
@@ -1650,6 +1662,19 @@ async fn spawn_screened_redis_server(
     info_delay: Duration,
     get_delay: Duration,
 ) -> ScreenedServer {
+    spawn_screened_redis_server_with_drop(info, info_delay, get_delay, None).await
+}
+
+/// As [`spawn_screened_redis_server`], plus `drop_after_gets`: once a connection
+/// has answered that many `GET`s, the server closes the socket instead of
+/// replying. That is the physical disconnect a transparently reconnecting
+/// redis-rs `ConnectionManager` would paper over without re-screening.
+async fn spawn_screened_redis_server_with_drop(
+    info: InfoBehavior,
+    info_delay: Duration,
+    get_delay: Duration,
+    drop_after_gets: Option<usize>,
+) -> ScreenedServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let accepts = Arc::new(AtomicUsize::new(0));
@@ -1671,6 +1696,9 @@ async fn spawn_screened_redis_server(
                     let gets = Arc::clone(&gets_task);
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
+                        // Per-connection GET count, so the drop applies to each
+                        // physical socket independently.
+                        let mut conn_gets = 0usize;
                         loop {
                             let n = match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
@@ -1679,10 +1707,20 @@ async fn spawn_screened_redis_server(
                             let chunk = &buf[..n];
                             let mut reply: Vec<u8> = Vec::new();
                             if chunk_contains(chunk, INFO_CMD) {
-                                infos.fetch_add(1, Ordering::Relaxed);
+                                let screen_index = infos.fetch_add(1, Ordering::Relaxed);
                                 tokio::time::sleep(info_delay).await;
                                 match info {
                                     InfoBehavior::Payload(text) => {
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::PayloadThenCluster(first) => {
+                                        let text = if screen_index == 0 {
+                                            first
+                                        } else {
+                                            CLUSTER_INFO
+                                        };
                                         let len = text.len();
                                         let bulk = format!("${len}\r\n{text}\r\n");
                                         reply.extend_from_slice(bulk.as_bytes());
@@ -1695,6 +1733,11 @@ async fn spawn_screened_redis_server(
                                 }
                             } else if chunk_contains(chunk, GET_CMD) {
                                 gets.fetch_add(1, Ordering::Relaxed);
+                                conn_gets += 1;
+                                if drop_after_gets.is_some_and(|limit| conn_gets > limit) {
+                                    // Physical disconnect: no reply, socket closed.
+                                    break;
+                                }
                                 tokio::time::sleep(get_delay).await;
                                 reply.extend_from_slice(b"$-1\r\n");
                             } else {
@@ -1968,4 +2011,292 @@ async fn a_recovery_probe_completing_after_a_rejection_advertises_no_recovery() 
     assert!(client.is_topology_unsupported());
 
     let _ = server.shutdown.send(());
+}
+
+// ── Cached pool must not transparently reconnect (GHSA-87rq root review) ──
+//
+// redis-rs `ConnectionManager` re-establishes its physical socket internally.
+// Ferrum screens DNS, egress, and `INFO CLUSTER` only when it creates a
+// connection itself, so a manager in the hot-path pool could replace a screened
+// socket with an unscreened one after any blip. The pool therefore caches plain
+// `MultiplexedConnection`s: a broken connection surfaces its I/O error, the pool
+// is cleared, and the next operation re-establishes through the screened path.
+
+/// Static + type pin: the hot-path pool caches a non-reconnecting
+/// `MultiplexedConnection`, never a `ConnectionManager`, and no connection
+/// helper constructs one.
+#[test]
+fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+
+    assert!(
+        source.contains("connection: ArcSwap<Option<redis::aio::MultiplexedConnection>>"),
+        "pool slots must cache MultiplexedConnection"
+    );
+    assert!(
+        !source.contains("ArcSwap<Option<redis::aio::ConnectionManager>>"),
+        "pool slots must not cache a transparently reconnecting ConnectionManager"
+    );
+    assert!(
+        source.contains(
+            "async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::MultiplexedConnection>"
+        ),
+        "pooled establishment must return MultiplexedConnection"
+    );
+    assert!(
+        source.contains("async fn get_connection(&self) -> Option<redis::aio::MultiplexedConnection>"),
+        "pooled accessor must return MultiplexedConnection"
+    );
+
+    // No code path may construct a manager or its config any more.
+    for banned in [
+        "redis::aio::ConnectionManager::new",
+        "redis::aio::ConnectionManagerConfig",
+        "fn connect_manager",
+    ] {
+        assert!(
+            !source.contains(banned),
+            "obsolete ConnectionManager construction still present: {banned}"
+        );
+    }
+
+    let type_name = RedisRateLimitClient::cached_pool_connection_type_name_for_test();
+    assert_eq!(
+        type_name,
+        std::any::type_name::<redis::aio::MultiplexedConnection>()
+    );
+    assert!(
+        !type_name.contains("ConnectionManager"),
+        "pooled connection type must not be ConnectionManager: {type_name}"
+    );
+
+    // Both connect helpers dial multiplexed connections directly, and the
+    // pooled path screens topology before publishing into the ArcSwap slot.
+    let publish = source
+        .find("slot.connection.store(Arc::new(Some(conn.clone())))")
+        .expect("pooled publication site");
+    let establish = source
+        .find("match self.connect_multiplexed(client).await {")
+        .expect("pooled establishment site");
+    let screen = source[establish..publish]
+        .find("self.screen_topology(&mut conn)")
+        .expect("pooled path must screen topology before publishing");
+    assert!(
+        screen > 0,
+        "topology screen must sit between connect and publication"
+    );
+}
+
+/// A pooled connection that is physically disconnected must not be silently
+/// replaced by redis-rs. The failing command fails, the pool is cleared, and the
+/// re-established connection is screened again (`INFO CLUSTER` per socket).
+#[tokio::test]
+async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let server =
+        spawn_screened_redis_server_with_drop(info, Duration::ZERO, Duration::ZERO, Some(1)).await;
+    let client = screened_client(server.port, 5);
+
+    // First operation establishes and screens exactly one physical connection.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(server.accepts.load(Ordering::Relaxed), 1);
+    assert_eq!(server.infos.load(Ordering::Relaxed), 1);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 1);
+
+    // Second operation hits the server's disconnect. It must FAIL (not silently
+    // ride a redis-rs reconnect) and must drop the cached slot.
+    assert_eq!(
+        client.get_bytes("{ferrum%3Atest:probe}").await,
+        Err(()),
+        "a disconnected pooled connection must fail the operation, not auto-reconnect"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "an I/O failure must clear the cached pool"
+    );
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        1,
+        "redis-rs must not have dialled a replacement connection on its own"
+    );
+
+    // Third operation re-establishes — through the full screened path.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        2,
+        "recovery must open a new physical connection"
+    );
+    assert_eq!(
+        server.infos.load(Ordering::Relaxed),
+        2,
+        "every newly established pooled connection must be topology-screened"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        1,
+        "the pool stays bounded at redis_pool_size across reconnects"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The topology-after-disconnect seam: an endpoint that screened clean, then
+/// disconnected, then came back reporting Cluster topology must be caught by the
+/// re-screen and refused terminally. A transparent reconnect would have skipped
+/// that screen entirely and kept serving policy operations.
+#[tokio::test]
+async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen() {
+    let info = InfoBehavior::PayloadThenCluster("# Cluster\r\ncluster_enabled:0\r\n");
+    let server =
+        spawn_screened_redis_server_with_drop(info, Duration::ZERO, Duration::ZERO, Some(1)).await;
+    let client = screened_client(server.port, 5);
+
+    // Screened clean, serving normally.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert!(!client.is_topology_unsupported());
+
+    // Disconnect fails the in-flight operation and clears the pool.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert!(
+        !client.is_topology_unsupported(),
+        "an ordinary disconnect is an outage, never proof of Cluster topology"
+    );
+
+    // The reconnect re-screens and now sees cluster_enabled:1 — terminal refusal.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert!(
+        client.is_topology_unsupported(),
+        "the post-disconnect re-screen must catch a Cluster endpoint"
+    );
+    assert!(!client.is_available());
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+
+    // Terminal: no further dialling of the refused endpoint.
+    let accepts_at_rejection = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        accepts_at_rejection,
+        "a refused topology must never be redialled"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Every slot of a multi-slot pool is screened on establishment, and the pool
+/// never exceeds `redis_pool_size` physical connections.
+#[tokio::test]
+async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.pool_size = 3;
+    config.health_check_interval_seconds = 3600;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+    assert_eq!(server.accepts.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        server.infos.load(Ordering::Relaxed),
+        3,
+        "each pool slot must be screened on establishment"
+    );
+
+    // Many more operations than slots must reuse the bounded pool, not dial.
+    for _ in 0..12 {
+        assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    }
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        3,
+        "the round-robin pool must stay bounded at redis_pool_size"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), 3);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Identity-bearing keys must never reach operational logs (GHSA-87rq) ───
+//
+// Redis/rate-limit keys embed the enforcement identity dimension: internal
+// consumer usernames, `ctx.authenticated_identity`, and SPIFFE IDs. Emitting
+// them in a warning writes those identities into every configured log sink at
+// attacker-influenced rates. Diagnostics keep only bounded, non-identifying
+// context (operation name, redacted endpoint, pool slot, plugin name, static
+// topology reason, Redis error). Hashes/encodings are NOT an acceptable
+// substitute — they are still per-identity correlators.
+
+/// Static canary over the limiter surfaces that talk to the shared Redis client.
+#[test]
+fn limiter_log_statements_never_carry_identity_bearing_keys() {
+    let sources: [(&str, &str); 6] = [
+        (
+            "src/plugins/utils/redis_rate_limiter.rs",
+            include_str!("../../../src/plugins/utils/redis_rate_limiter.rs"),
+        ),
+        (
+            "src/plugins/utils/rate_limit.rs",
+            include_str!("../../../src/plugins/utils/rate_limit.rs"),
+        ),
+        (
+            "src/plugins/rate_limiting.rs",
+            include_str!("../../../src/plugins/rate_limiting.rs"),
+        ),
+        (
+            "src/plugins/ai_rate_limiter.rs",
+            include_str!("../../../src/plugins/ai_rate_limiter.rs"),
+        ),
+        (
+            "src/plugins/ws_rate_limiting.rs",
+            include_str!("../../../src/plugins/ws_rate_limiting.rs"),
+        ),
+        (
+            "src/plugins/udp_rate_limiting.rs",
+            include_str!("../../../src/plugins/udp_rate_limiting.rs"),
+        ),
+    ];
+
+    // `tracing` field syntax for an identity-bearing key, in every spelling the
+    // limiter surfaces have used. The `%`/`?` sigils are required so an ordinary
+    // `let previous_key = ...` binding is not a false positive — only a value
+    // actually recorded into a log event matches.
+    let banned_fields = [
+        "rate_limit_key = %",
+        "rate_limit_key = ?",
+        "previous_key = %",
+        "previous_key = ?",
+        "current_key = %",
+        "current_key = ?",
+        "count_key = %",
+        "count_key = ?",
+        "total_key = %",
+        "total_key = ?",
+        "curr_key = %",
+        "prev_key = %",
+        "redis_key = %",
+        "key = %key",
+        "key = ?key",
+        "key = %curr",
+        "key = %prev",
+        "key = %redis_key",
+        "key = %self.make",
+        // Reversible encodings / digests are not an acceptable substitute.
+        "key_hash = %",
+        "key_digest = %",
+        "key_b64 = %",
+    ];
+
+    for (path, source) in sources {
+        for banned in banned_fields {
+            assert!(
+                !source.contains(banned),
+                "{path} logs an identity-bearing rate-limit key field: {banned}"
+            );
+        }
+    }
 }

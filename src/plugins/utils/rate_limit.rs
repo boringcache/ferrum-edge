@@ -1057,7 +1057,7 @@ where
         }
     }
 
-    /// Configured Redis ConnectionManager pool size when this backend uses Redis.
+    /// Configured Redis multiplexed-connection pool size when this backend uses Redis.
     ///
     /// Test-support only: proves `redis_pool_size` flowed from plugin config into
     /// the shared [`RedisRateLimitClient`] (issue #2304).
@@ -2138,8 +2138,9 @@ impl RateLimitAlgorithm for AiTokenRateAlgorithm {
                         .incrby_with_expire_floor_zero(&curr_key, -increment, ttl)
                         .await
                     {
+                        // `curr_key` embeds the caller-supplied identity
+                        // dimension, so it is not logged.
                         warn!(
-                            key = %curr_key,
                             "ai_rate_limiter: failed to roll back denied Redis token reservation; \
                              estimate stays charged until the window TTL expires"
                         );
