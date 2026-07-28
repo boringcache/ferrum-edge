@@ -4178,8 +4178,12 @@ fn test_request_mirror_rejects_multiple_unknown_keys_sorted() {
 const ADVISORY_DEFAULT_MIRROR_BODY_CEILING: u64 = 10 * 1024 * 1024;
 
 fn advisory_plugin(config: serde_json::Value) -> RequestMirror {
-    RequestMirror::new_with_config_id(&config, PluginHttpClient::default(), Some("advisory-mirror"))
-        .expect("advisory test config must construct")
+    RequestMirror::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        Some("advisory-mirror"),
+    )
+    .expect("advisory test config must construct")
 }
 
 /// An unauthenticated request context with a declared body length.
@@ -4234,7 +4238,10 @@ async fn advisory_percentage_zero_disables_every_request_body_capability() {
     assert_eq!(metrics.concurrency_drops, 0);
     assert_eq!(metrics.budget_drops, 0);
     assert_eq!(request_mirror_sample_phase_for_test(&plugin), 0);
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
 }
 
 #[tokio::test]
@@ -4338,11 +4345,17 @@ async fn advisory_saturated_permits_keep_the_request_streaming() {
             .is_some_and(|error| error.contains("max_in_flight")),
         "unexpected drop metadata: {meta:?}"
     );
-    assert_eq!(request_mirror_metrics_snapshot_for_test(&plugin).dispatched, 0);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        0
+    );
 
     // Releasing the admitted context returns both the permit and the bytes.
     drop(admitted);
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
     let mut next = advisory_ctx(Some(2048));
     plugin_utils::assert_continue(plugin.authorize(&mut next).await);
     assert!(
@@ -4421,7 +4434,10 @@ async fn advisory_reservation_reconciles_to_the_observed_body_length() {
     ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'x'; 128]));
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_eq!(request_mirror_metrics_snapshot_for_test(&plugin).dispatched, 1);
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        1
+    );
     assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
         128,
@@ -4458,8 +4474,14 @@ async fn advisory_cancelled_request_releases_admission_without_dispatch() {
     );
     drop(ctx);
 
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
-    assert_eq!(request_mirror_metrics_snapshot_for_test(&plugin).dispatched, 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
+    assert_eq!(
+        request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+        0
+    );
 
     // A response-side context clone must not release a live request's lease.
     let mut live = advisory_ctx(Some(4096));
@@ -4476,7 +4498,10 @@ async fn advisory_cancelled_request_releases_admission_without_dispatch() {
         "a clone carries no admission of its own"
     );
     drop(live);
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
 }
 
 #[tokio::test]
@@ -4503,7 +4528,10 @@ async fn advisory_oversized_declared_body_stays_streaming_and_unmirrored() {
     let mut headers = HashMap::new();
     plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(ctx.collect_mirror_results().await.is_empty());
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
 }
 
 #[test]
@@ -4621,7 +4649,10 @@ fn advisory_max_mirrored_request_body_bytes_validation() {
     )
     .err()
     .expect("a ceiling above the aggregate budget could never be admitted");
-    assert!(err.contains("max_mirrored_request_body_bytes"), "got: {err}");
+    assert!(
+        err.contains("max_mirrored_request_body_bytes"),
+        "got: {err}"
+    );
 
     assert!(
         RequestMirror::new(
@@ -4720,5 +4751,8 @@ async fn advisory_bodyless_request_reserves_no_retained_bytes() {
     );
     drop(chunked);
     drop(live);
-    assert_eq!(request_mirror_retained_request_body_bytes_for_test(&plugin), 0);
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0
+    );
 }
