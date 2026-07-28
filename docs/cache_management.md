@@ -112,7 +112,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the 100,000 hard cap. When the entry count exceeds 100,000, over-cap force eviction runs immediately (no sample/cooldown gate) and reclaims space after that stale prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune / over-cap force-eviction rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
+**Cleanup mechanism:** Sampled piggyback sweeps during normal request processing (every 1,024 requests, cooldown-gated to at most once per second) prune idle keys even while the map is below the 100,000 hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed. Cleanup never force-evicts still-active budgets (that would reset consumed windows). When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback (subject to the same below-cap stale prune and atomic admission rules). `sync_mode` supports only `local` and `redis`; database-backed counters are intentionally unsupported.
 
 ### AI Rate Limiter
 
@@ -122,7 +122,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Same as rate limiting — sampled below-cap stale pruning (every 1,024 requests, cooldown-gated to at most once per second) plus immediate over-cap force eviction after prune. When using `sync_mode: "redis"`, token counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Same as rate limiting — sampled below-cap stale pruning (every 1,024 requests, cooldown-gated to at most once per second) plus atomic admission that denies previously unseen local/fallback keys at the hard cap without deleting active budgets. When using `sync_mode: "redis"`, token counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### WebSocket Rate Limiting
 
@@ -132,7 +132,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 frame hooks, cooldown-gated to at most once per second) prune idle connection state below the 50,000 hard cap; exceeding the cap force-evicts immediately after that prune. When using `sync_mode: "redis"`, frame counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 frame hooks, cooldown-gated to at most once per second) prune idle connection state below the 50,000 hard cap. Hard cardinality is enforced by atomic reservation on admission: existing connections continue at capacity, and previously unseen local/fallback connection keys are denied fail-closed (policy close) without deleting active budgets. When using `sync_mode: "redis"`, frame counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### UDP Rate Limiting
 
@@ -142,7 +142,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 datagram hooks, cooldown-gated to once per second) prune idle client state below the 100,000 hard cap. An over-cap observation keeps strict new-IP admission closed and may force-evict after pruning, but the shared atomic gate permits at most one full-map scan per second. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled periodic sweeps (every 100,000 datagram hooks, cooldown-gated to once per second) prune idle client state below the 100,000 hard cap. Hard cardinality is enforced by atomic reservation on admission: existing client IPs continue at capacity, and previously unseen local/fallback IPs are dropped fail-closed. An over-cap observation keeps new-IP admission closed and may reclaim idle keys, but the shared atomic gate permits at most one full-map scan per second and never deletes still-active budgets. When using `sync_mode: "redis"`, datagram and byte counters are stored in Redis and the local DashMap is only used as a fallback.
 
 ### GraphQL Rate Limiting
 
@@ -152,7 +152,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled piggyback sweeps (every 1,024 rate checks, cooldown-gated to at most once per second) prune idle keys below the hard cap; exceeding 100,000 force-evicts immediately after that prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled piggyback sweeps (every 1,024 rate checks, cooldown-gated to at most once per second) prune idle keys below the hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed without deleting active budgets. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### gRPC Method Router Rate Limiting
 
@@ -162,7 +162,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (hardcoded constant).
 
-**Cleanup mechanism:** Sampled piggyback sweeps (every 1,024 rate checks, cooldown-gated to at most once per second) prune idle keys below the hard cap; exceeding 100,000 force-evicts immediately after that prune. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
+**Cleanup mechanism:** Sampled piggyback sweeps (every 1,024 rate checks, cooldown-gated to at most once per second) prune idle keys below the hard cap. Hard cardinality is enforced by atomic reservation on admission: existing keys continue at capacity, and previously unseen local/fallback keys are denied fail-closed without deleting active budgets. When using `sync_mode: "redis"`, counters are stored in Redis with TTL-based key expiration and the local DashMap is only used as a fallback.
 
 ### Response Caching
 

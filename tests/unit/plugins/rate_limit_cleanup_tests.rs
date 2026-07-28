@@ -3,6 +3,8 @@
 //! These tests invoke each plugin's sampled/cooldown cleanup path through
 //! `_test_support` hooks — not `LocalLimiter::prune_stale_at` directly — so an
 //! omitted or reversed `prune_stale_at`/`enforce_capacity` branch fails.
+//! Over-cap cleanup must reclaim idle keys only; live budgets survive
+//! (GHSA-3xxf-5m26-c8pv).
 
 use ferrum_edge::_test_support::RateLimitCleanupHarness;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
@@ -38,7 +40,7 @@ fn udp_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
 }
 
 #[test]
-fn udp_over_cap_path_keeps_strict_admission_and_rate_limits_full_scans() {
+fn udp_over_cap_path_keeps_strict_admission_without_live_eviction() {
     let h = RateLimitCleanupHarness::new();
     let epoch = h.udp_epoch_base();
     h.seed_udp("10.0.0.1", epoch);
@@ -53,13 +55,18 @@ fn udp_over_cap_path_keeps_strict_admission_and_rate_limits_full_scans() {
     assert!(h.maybe_evict_udp_at_with_cap(now, 1));
     assert_eq!(h.udp_tracked(), Some(3));
 
-    // The next second admits exactly one enforcing scan. The current caller
-    // still observes strict admission even though cleanup reaches the cap.
+    // The next second admits exactly one reclaim scan. Active keys survive;
+    // over-cap admission remains closed for previously unseen keys.
     let next = now + Duration::from_secs(1);
     assert!(h.maybe_evict_udp_at_with_cap(next, 1));
-    assert!(h.udp_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.udp_tracked(), Some(3));
+    assert!(h.udp_contains("10.0.0.1"));
+    assert!(h.udp_contains("10.0.0.2"));
+    assert!(h.udp_contains("10.0.0.3"));
+    assert!(!h.seed_udp_with_cap("10.0.0.4", next, 1));
 
     // New active entries in the same second cannot retrigger another scan.
+    // Uncapped test seeds model legacy/repair pressure only.
     h.seed_udp("10.0.0.4", next);
     h.seed_udp("10.0.0.5", next);
     let before = h.udp_tracked();
@@ -68,7 +75,7 @@ fn udp_over_cap_path_keeps_strict_admission_and_rate_limits_full_scans() {
 }
 
 #[test]
-fn rate_limiting_wrapper_prunes_stale_and_force_evicts_over_cap() {
+fn rate_limiting_wrapper_prunes_stale_and_preserves_active_over_cap() {
     let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
     h.seed_rate_limiting("ip:1", t0);
@@ -93,11 +100,14 @@ fn rate_limiting_wrapper_prunes_stale_and_force_evicts_over_cap() {
     h.seed_rate_limiting("ip:b", active_at);
     h.seed_rate_limiting("ip:c", active_at);
     h.rate_limiting_apply_branch(active_at, true, 1);
-    assert!(h.rate_limiting_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.rate_limiting_tracked(), Some(4));
+    assert!(h.rate_limiting_contains("ip:3"));
+    assert!(h.rate_limiting_contains("ip:a"));
+    assert!(!h.seed_rate_limiting_with_cap("ip:new", active_at, 1));
 }
 
 #[test]
-fn ai_wrapper_prunes_stale_and_force_evicts_over_cap() {
+fn ai_wrapper_prunes_stale_and_preserves_active_over_cap() {
     let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
     h.seed_ai("consumer:a", t0);
@@ -116,11 +126,13 @@ fn ai_wrapper_prunes_stale_and_force_evicts_over_cap() {
     h.seed_ai("consumer:x", active_at);
     h.seed_ai("consumer:y", active_at);
     h.ai_apply_branch(active_at, true, 1);
-    assert!(h.ai_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.ai_tracked(), Some(3));
+    assert!(h.ai_contains("consumer:c"));
+    assert!(!h.seed_ai_with_cap("consumer:new", active_at, 1));
 }
 
 #[test]
-fn graphql_wrapper_prunes_stale_and_force_evicts_over_cap() {
+fn graphql_wrapper_prunes_stale_and_preserves_active_over_cap() {
     let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
     h.seed_graphql("gql:1", t0);
@@ -139,11 +151,13 @@ fn graphql_wrapper_prunes_stale_and_force_evicts_over_cap() {
     h.seed_graphql("gql:a", active_at);
     h.seed_graphql("gql:b", active_at);
     h.graphql_apply_branch(active_at, true, 1);
-    assert!(h.graphql_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.graphql_tracked(), Some(3));
+    assert!(h.graphql_contains("gql:3"));
+    assert!(!h.seed_graphql_with_cap("gql:new", active_at, 1));
 }
 
 #[test]
-fn grpc_wrapper_prunes_stale_and_force_evicts_over_cap() {
+fn grpc_wrapper_prunes_stale_and_preserves_active_over_cap() {
     let h = RateLimitCleanupHarness::new();
     let t0 = Instant::now();
     h.seed_grpc("grpc:1", t0);
@@ -162,7 +176,9 @@ fn grpc_wrapper_prunes_stale_and_force_evicts_over_cap() {
     h.seed_grpc("grpc:a", active_at);
     h.seed_grpc("grpc:b", active_at);
     h.grpc_apply_branch(active_at, true, 1);
-    assert!(h.grpc_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.grpc_tracked(), Some(3));
+    assert!(h.grpc_contains("grpc:3"));
+    assert!(!h.seed_grpc_with_cap("grpc:new", active_at, 1));
 }
 
 #[test]
@@ -191,7 +207,9 @@ fn ws_sampled_cooldown_path_prunes_stale_preserves_active_below_cap() {
     h.seed_ws(10, active_at);
     h.seed_ws(11, active_at);
     h.ws_apply_branch(active_at, true, 1);
-    assert!(h.ws_tracked().unwrap_or(0) <= 1);
+    assert_eq!(h.ws_tracked(), Some(3));
+    assert!(h.ws_contains(3));
+    assert!(!h.seed_ws_with_cap(12, active_at, 1));
 }
 
 #[test]

@@ -76,6 +76,7 @@ mod plugin_integration_tests;
 mod plugin_utils_core_tests;
 mod prometheus_metrics_tests;
 mod proxy_alerts_tests;
+mod rate_limit_capacity_tests;
 mod rate_limit_cleanup_tests;
 mod rate_limit_policy_hardening_tests;
 mod rate_limiting_tests;
