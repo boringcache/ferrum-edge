@@ -2132,45 +2132,37 @@ async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
 #[tokio::test]
 async fn test_normalizer_cumulative_body_exhaustion() {
     let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
-    let event = b"data: {\"type\":\"ping\"}\n\n";
-    let mut sent = 0usize;
-    loop {
-        if sent.saturating_add(event.len()) > MAX_SSE_NORMALIZED_BODY_BYTES {
-            match inspector.on_chunk(event).await {
-                ResponseStreamAction::Terminate(Some(bytes)) => {
-                    let text = String::from_utf8(bytes.to_vec()).unwrap();
-                    assert_bound_termination(&text, "cumulative size limit");
-                    break;
-                }
-                other => panic!("crossing cumulative body cap must terminate: {other:?}"),
-            }
+    const EVENT_BYTES: usize = 512 * 1024;
+    let prefix = b"data: {\"type\":\"ping\",\"padding\":\"";
+    let suffix = b"\"}\n\n";
+    let mut event = Vec::with_capacity(EVENT_BYTES);
+    event.extend_from_slice(prefix);
+    event.resize(EVENT_BYTES - suffix.len(), b'a');
+    event.extend_from_slice(suffix);
+    assert_eq!(event.len(), EVENT_BYTES);
+    assert!(event.len() < MAX_SSE_EVENT_BYTES);
+    assert_eq!(MAX_SSE_NORMALIZED_BODY_BYTES, 8 * 1024 * 1024);
+
+    // Sixteen valid ~512 KiB frames exactly fill the 8 MiB plaintext budget.
+    // The seventeenth must trip that budget specifically, well before either
+    // the per-event or event-count limits.
+    for index in 0..16 {
+        match inspector.on_chunk(&event).await {
+            ResponseStreamAction::Forward(bytes) => assert!(
+                bytes.is_empty(),
+                "valid ping frame {index} should produce no normalized output"
+            ),
+            other => panic!("in-budget valid frame {index} must continue: {other:?}"),
         }
-        match inspector.on_chunk(event).await {
-            ResponseStreamAction::Forward(_) => sent += event.len(),
-            ResponseStreamAction::Terminate(Some(bytes)) => {
-                let text = String::from_utf8(bytes.to_vec()).unwrap();
-                // Event-count may trip first depending on constants; either
-                // bound is a valid fail-closed outcome under the body flood.
-                assert!(
-                    text.contains("cumulative size limit") || text.contains("event count limit"),
-                    "{text}"
-                );
-                assert_bound_termination(
-                    &text,
-                    if text.contains("event count") {
-                        "event count limit"
-                    } else {
-                        "cumulative size limit"
-                    },
-                );
-                break;
-            }
-            other => panic!("unexpected action under body flood: {other:?}"),
+    }
+    match inspector.on_chunk(&event).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "cumulative size limit");
+            assert!(!text.contains("event count limit"), "{text}");
+            assert!(!text.contains("oversized"), "{text}");
         }
-        assert!(
-            sent <= MAX_SSE_NORMALIZED_BODY_BYTES,
-            "test must not allocate past the documented body ceiling"
-        );
+        other => panic!("seventeenth valid frame must cross the cumulative cap: {other:?}"),
     }
 }
 

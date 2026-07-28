@@ -2221,6 +2221,11 @@ struct AnthropicSseNormalizer {
     buf: Vec<u8>,
     /// Index of the first unread byte in `buf`.
     cursor: usize,
+    /// Absolute index where the next delimiter scan may resume. When a chunk
+    /// ends without a boundary this retains only the three-byte overlap needed
+    /// for a split `\r\n\r\n`, so one-byte provider chunks cannot repeatedly
+    /// rescan the full partial event.
+    scan_cursor: usize,
     /// Total plaintext SSE bytes offered to this normalizer.
     bytes_ingested: usize,
     /// Complete SSE frames accepted (including ignored comment/control frames).
@@ -2249,6 +2254,7 @@ impl AnthropicSseNormalizer {
         Self {
             buf: Vec::new(),
             cursor: 0,
+            scan_cursor: 0,
             bytes_ingested: 0,
             events_seen: 0,
             normalized_out_bytes: 0,
@@ -2280,6 +2286,7 @@ impl AnthropicSseNormalizer {
     fn clear_buffer(&mut self) {
         self.buf.clear();
         self.cursor = 0;
+        self.scan_cursor = 0;
         if self.buf.capacity() > 64 * 1024 {
             self.buf.shrink_to(4096);
         }
@@ -2295,7 +2302,9 @@ impl AnthropicSseNormalizer {
             return;
         }
         if self.cursor >= SSE_BUFFER_COMPACT_THRESHOLD && self.cursor * 2 >= self.buf.len() {
-            self.buf.drain(..self.cursor);
+            let consumed = self.cursor;
+            self.buf.drain(..consumed);
+            self.scan_cursor = self.scan_cursor.saturating_sub(consumed);
             self.cursor = 0;
         }
     }
@@ -2610,13 +2619,20 @@ impl AnthropicSseNormalizer {
     /// whether the stream should terminate immediately.
     fn drain_complete(&mut self, out: &mut String) -> bool {
         loop {
-            let end_rel = {
-                let unread = self.unread();
-                match next_event_boundary(unread) {
-                    Some(end) => end,
-                    None => break,
+            let end = {
+                let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
+                match next_event_boundary(&self.buf[scan_start..]) {
+                    Some(end_rel) => scan_start + end_rel,
+                    None => {
+                        // `\r\n\r\n` is the longest delimiter. Retain its
+                        // three-byte prefix so a boundary split across the next
+                        // chunk is still found without rescanning older bytes.
+                        self.scan_cursor = self.buf.len().saturating_sub(3).max(self.cursor);
+                        break;
+                    }
                 }
             };
+            let end_rel = end.saturating_sub(self.cursor);
             // Enforce the advertised per-event hard limit before any copy,
             // UTF-8 conversion, JSON parse, or transcode of this frame.
             if end_rel > MAX_SSE_EVENT_BYTES {
@@ -2635,9 +2651,9 @@ impl AnthropicSseNormalizer {
             }
 
             let start = self.cursor;
-            let end = self.cursor + end_rel;
             let outcome = Self::interpret_sse_frame(&self.buf[start..end]);
             self.cursor = end;
+            self.scan_cursor = end;
             self.events_seen = self.events_seen.saturating_add(1);
 
             let terminate = self.apply_frame_outcome(outcome, out);
@@ -3109,6 +3125,7 @@ mod sse_buffer_tests {
         assert_eq!(normalizer.events_seen, iterations);
         assert_eq!(normalizer.unread_len(), 0);
         assert_eq!(normalizer.cursor, 0);
+        assert_eq!(normalizer.scan_cursor, 0);
         // Compaction reclaims the consumed prefix; capacity must stay far below
         // the quadratic alternative of retaining every prior event.
         assert!(
