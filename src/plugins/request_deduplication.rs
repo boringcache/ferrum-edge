@@ -46,7 +46,13 @@
 //!   effective presentation policy could not be established, is retained
 //!   nowhere — not in Redis and not in the local map. Its bytes belong to no
 //!   provable policy. In-flight ownership is untouched, so concurrent-duplicate
-//!   protection still holds; only the finalized replay is given up.
+//!   protection still holds; only the finalized replay is given up. When the
+//!   request already performed a protected external operation (a terminate-mode
+//!   `serverless_function` invocation, an `ai_federation` provider call), giving
+//!   up the replay is not enough: the bounded in-flight lease is replaced by the
+//!   fixed non-replayable 409 execution barrier through the same fenced
+//!   ownership transition, so the operation cannot become executable again when
+//!   `inflight_ttl_seconds` elapses (GHSA-8cr6-rw38-7j59).
 //! - **Legacy/malformed payloads**: a Redis record without complete, decodable
 //!   provenance is rejected. It can never be replayed on the strength of an
 //!   assumed policy.
@@ -121,9 +127,43 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 /// run.
 const CLEANUP_NEVER: u64 = u64::MAX;
 
-const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v3";
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v4";
 const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v2";
-const REDIS_INFLIGHT_KEY_COMPONENT: &str = "inflight";
+/// Version stamped into every Redis operation record. A peer running an older
+/// or newer record format is treated as a conflict rather than being parsed
+/// optimistically, so a rolling upgrade can never publish through a fence the
+/// other side does not implement.
+const DEDUP_REDIS_RECORD_VERSION: u32 = 1;
+const DEDUP_RECORD_STATE_INFLIGHT: &str = "inflight";
+const DEDUP_RECORD_STATE_COMPLETED: &str = "completed";
+/// Deterministic body for a fail-closed refusal when the centralized
+/// idempotency store cannot be consulted.
+const REDIS_UNAVAILABLE_BODY: &str = r#"{"error":"Idempotency coordination store is unavailable"}"#;
+/// Deterministic refusal while the bounded per-key execution-barrier budget is
+/// saturated. One process-global deadline covers any additional completed
+/// operations fail-closed without allocating attacker-amplified per-key state.
+const EXECUTION_BARRIER_CAPACITY_BODY: &str =
+    r#"{"error":"Idempotency execution-barrier capacity is saturated"}"#;
+/// Deterministic body for a completion that must never be replayed: the
+/// protected operation already ran externally and has no safe replay value.
+const NON_REPLAYABLE_COMPLETION_BODY: &str = r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
+/// Transient per-request marker, set only while
+/// [`RequestDeduplication::publish_external_operation_tombstone`] drives the
+/// final-body hook, and carrying the publishing instance id so sibling
+/// instances cannot claim one another's publication.
+///
+/// The value published under it is the fixed [`NON_REPLAYABLE_COMPLETION_BODY`]
+/// refusal, not a transformed backend representation, so it asserts nothing
+/// about the response-side presentation policy. The replay-provenance gates in
+/// `on_final_response_body` therefore do not apply: withholding this tombstone
+/// because the live policy is unprovable would leave an already-performed
+/// external operation re-executable the moment its in-flight lease expires,
+/// which is exactly the exposure GHSA-8cr6-rw38-7j59 closes.
+const EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY: &str =
+    "request_deduplication.publishing_external_operation_tombstone";
+/// Bounded retries for the acquire/observe loop, covering the narrow window
+/// where an observed record expires between `SET NX` and the follow-up `GET`.
+const REDIS_ADMISSION_ATTEMPTS: usize = 3;
 const DEFAULT_INSTANCE_ID: &str = "standalone";
 const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 100 * 1024 * 1024;
@@ -148,10 +188,73 @@ const SCOPED_CREDENTIAL_FINGERPRINT_EXCLUSIONS: &[&str] = &[
     "x-goog-api-key",
     "x-forwarded-authorization",
 ];
+/// Plugin-specific root config keys, excluding the shared Redis fields.
+#[allow(dead_code)] // Used by external unit tests that verify OpenAPI/allowlist parity.
+pub const REQUEST_DEDUPLICATION_POLICY_CONFIG_KEYS: &[&str] = &[
+    "header_name",
+    "ttl_seconds",
+    "inflight_ttl_seconds",
+    "max_entries",
+    "max_entry_size_bytes",
+    "max_total_size_bytes",
+    "applicable_methods",
+    "scope_by_consumer",
+    "enforce_required",
+    "on_redis_unavailable",
+];
+
+/// Closed top-level key set for `request_deduplication` plugin config.
+///
+/// Must stay aligned with OpenAPI `RequestDeduplicationConfig`,
+/// `REDIS_PLUGIN_CONFIG_KEYS`, and `docs/plugins.md`. Unknown root keys fail
+/// closed so a typo cannot silently replace an idempotency-enforcement,
+/// scoping, retention, or synchronization decision with a permissive default.
+pub const REQUEST_DEDUPLICATION_CONFIG_KEYS: &[&str] = &[
+    "header_name",
+    "ttl_seconds",
+    "inflight_ttl_seconds",
+    "max_entries",
+    "max_entry_size_bytes",
+    "max_total_size_bytes",
+    "applicable_methods",
+    "scope_by_consumer",
+    "enforce_required",
+    "on_redis_unavailable",
+    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    "sync_mode",
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+];
+
+/// Keys that only have meaning under `sync_mode: "redis"`. Supplying any of
+/// them in local mode is rejected: the usual cause is a misspelled `sync_mode`,
+/// which would otherwise leave the deployment silently process-local.
+const REDIS_ONLY_CONFIG_KEYS: &[&str] = &[
+    "redis_url",
+    "redis_tls",
+    "redis_key_prefix",
+    "redis_pool_size",
+    "redis_connect_timeout_seconds",
+    "redis_health_check_interval_seconds",
+    "redis_username",
+    "redis_password",
+    "on_redis_unavailable",
+];
+
 /// Monotonic seconds since process start. Immune to wall-clock steps, matching
 /// the `Instant`-based entry expiry.
 fn monotonic_secs() -> u64 {
     PROCESS_START.elapsed().as_secs()
+}
+
+fn monotonic_millis() -> u64 {
+    u64::try_from(PROCESS_START.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Whether a full cleanup scan is due, given the last scan's recorded monotonic
@@ -246,8 +349,8 @@ pub fn validate_composition(
     // the pair is actually effective together. Two properties of that merge are
     // load-bearing here:
     //
-    // - Globals are namespace-partitioned: a global instance is merged only
-    //   into proxies in its own namespace.
+    // - Globals are gateway-wide: every global instance is merged into every
+    //   proxy unless a scoped instance of the same plugin name shadows it.
     // - Shadowing is decided by the outer `enabled` flag alone. An instance
     //   whose *inner* switch is off is still constructed and still replaces the
     //   same-named global for that proxy, so the effective set has to be
@@ -280,7 +383,6 @@ pub fn validate_composition(
                 .iter()
                 .filter(|plugin| {
                     plugin.enabled
-                        && plugin.namespace == proxy.namespace
                         && plugin.scope == PluginScope::Global
                         && plugin.plugin_name == name
                 })
@@ -334,6 +436,18 @@ struct CachedResponse {
     headers: HashMap<String, String>,
     body: Bytes,
     inserted_at: Instant,
+    /// How long this completion stays authoritative, measured from
+    /// `inserted_at`.
+    ///
+    /// An ordinary replayable completion uses `ttl_seconds`: once it expires the
+    /// key is legitimately re-executable. A completion published only to
+    /// *refuse* re-execution — the non-replayable external-operation tombstone —
+    /// uses [`RequestDeduplication::execution_barrier_retention`] instead,
+    /// because it replaces an in-flight marker that would have blocked for
+    /// `inflight_ttl_seconds`. Reusing `ttl_seconds` there would make a
+    /// deployment with `inflight_ttl_seconds > ttl_seconds` re-execute an
+    /// already-performed billable operation *sooner* than the bare marker did.
+    retention: Duration,
     /// Response-side presentation policy this representation was produced
     /// under. Replay is admitted only while it still equals the live policy.
     response_policy: ResponsePolicyProvenance,
@@ -373,16 +487,41 @@ enum DeduplicationEntry {
         fingerprint: String,
         owner_token: String,
     },
+    /// The protected operation completed, but no replayable response bytes can
+    /// remain in the bounded local cache.
+    ///
+    /// This state is deliberately fixed-size: the key and fingerprint are
+    /// already bounded digests, the owner token is process-generated, and no
+    /// response bytes or attacker-controlled headers are retained. It replaces
+    /// an existing owned entry in place, so publishing a barrier never adds a
+    /// second per-key allocation. Its own retention is authoritative; unlike an
+    /// `InFlight` marker it must not fall back to `inflight_ttl_seconds` after a
+    /// completion established a longer deadline.
+    ExecutionBarrier {
+        inserted_at: Instant,
+        retention: Duration,
+        fingerprint: String,
+        /// Kept solely to fence removal after a distributed publication says
+        /// this local publisher was stale. Ordinary in-flight cleanup never
+        /// matches this variant.
+        owner_token: String,
+    },
     /// Response has been cached.
     Completed {
         cached: CachedResponse,
         sequence: u64,
         fingerprint: String,
-        /// Replace this replay with a short-lived in-flight tombstone instead
-        /// of removing it when capacity pressure makes retention impossible.
-        /// This is set for externally executing terminal responses until a
-        /// distributed replay is known to be visible.
-        retain_inflight_on_eviction: bool,
+        /// Exact local publisher whose in-flight entry became this completion.
+        /// If concurrent eviction converts the completion to a barrier while a
+        /// Redis compare-and-set is awaiting, a `NotOwner` result can remove
+        /// that exact barrier without touching a successor.
+        publisher_owner_token: String,
+        /// Replace this replay with a fixed-size execution barrier carrying the
+        /// completion's original retention clock instead of removing it when
+        /// capacity pressure makes response retention impossible. This is set
+        /// for externally executing terminal responses until a distributed
+        /// replay is known to be visible.
+        retain_barrier_on_eviction: bool,
     },
 }
 
@@ -397,28 +536,98 @@ enum DeduplicationConflict {
     FingerprintMismatch,
 }
 
-enum RedisDeduplicationAction {
-    Miss,
+/// Outcome of the single-key Redis admission step.
+enum RedisAdmission {
+    /// This request now owns the operation record.
+    Acquired(RedisOwnership),
+    /// A completed record carries a replayable response for this fingerprint.
     Replay(CachedResponse),
-    Conflict,
+    /// A completed record exists for this fingerprint but was published
+    /// without a safe replay value (oversized response or an external
+    /// operation with no replayable representation).
+    CompletedNonReplayable,
     /// A record exists for this key but carries no usable replay provenance
     /// (legacy payload, corrupted value, or malformed digests). It can neither
     /// be replayed — that would skip the live presentation policy — nor be
     /// treated as a miss, which would re-execute a non-safe request whose
     /// original side effect may already have completed.
     UnprovableRecord,
-}
-
-enum RedisInFlightAction {
-    Acquired(String),
     Conflict(DeduplicationConflict),
+    /// Redis could not be consulted. The caller applies the configured
+    /// unavailability policy; it must not silently take a purely local
+    /// ownership decision unless the operator asked for that.
     Unavailable,
 }
 
-enum RedisStoreAction {
-    Stored,
-    SkippedSize,
-    Failed,
+/// Parsed view of the operation record stored under one logical key.
+enum RedisRecordState {
+    Absent,
+    /// An owner holds the operation. Carries the owner's request fingerprint.
+    InFlight(String),
+    /// The operation completed. Carries the fingerprint and, when the
+    /// completion is safe to replay, its stored response. A completed record
+    /// without a response is a deliberate non-replayable tombstone.
+    Completed(String, Option<CachedResponse>),
+    /// Present but not parseable as a current-version record. Treated as a
+    /// conflict so an unknown peer format fails closed.
+    Unreadable,
+    /// A current-version completed record whose retained replay carries no
+    /// decodable response-policy provenance. It can neither be replayed — that
+    /// would skip the live presentation policy — nor be treated as a miss,
+    /// which would re-execute a non-safe request whose original side effect may
+    /// already have completed.
+    Unprovable,
+    Unavailable,
+}
+
+/// Fenced publication outcome.
+enum RedisPublication {
+    /// The operation record atomically transitioned from this request's
+    /// in-flight ownership to a completed record. `replayable` is false when
+    /// only a non-replayable tombstone could be published.
+    Published {
+        replayable: bool,
+    },
+    /// The still-current record is not this request's ownership token: the
+    /// lease expired, a successor owns the operation, or the record is already
+    /// completed. Nothing was written.
+    NotOwner,
+    Unavailable,
+}
+
+/// Redis in-flight ownership for one request.
+///
+/// The exact serialized in-flight record is retained alongside the token
+/// because it is the compare operand for both fenced publication and fenced
+/// release. Recomputing those bytes at completion time would make the fence
+/// silently ineffective if the record representation ever drifted.
+#[derive(Clone)]
+pub(crate) struct RedisOwnership {
+    record: Arc<Vec<u8>>,
+}
+
+impl RedisOwnership {
+    fn new(fingerprint: &str, token: &str) -> Option<Self> {
+        let record = SerializableDedupRecord::inflight(fingerprint, token);
+        let bytes = serde_json::to_vec(&record).ok()?;
+        Some(Self {
+            record: Arc::new(bytes),
+        })
+    }
+}
+
+/// How Redis mode behaves when the centralized store cannot be consulted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RedisUnavailablePolicy {
+    /// Refuse the request with 503 rather than making an ownership decision
+    /// that only this process can see. Default: an operator who asked for
+    /// centralized idempotency gets centralized idempotency or an error, never
+    /// silently split per-process ownership.
+    FailClosed,
+    /// Explicitly accept process-local-only deduplication during a Redis
+    /// outage. Availability is preserved at the cost of one execution per
+    /// gateway process for the same idempotency key.
+    LocalOnly,
 }
 
 enum RedisPayloadAdmission {
@@ -449,8 +658,10 @@ struct LocalCompletionCandidate<'a> {
     status_code: u16,
     headers: HashMap<String, String>,
     body: &'a [u8],
-    retain_inflight_on_skip: bool,
-    retain_inflight_on_eviction: bool,
+    publish_execution_barrier_on_skip: bool,
+    retain_barrier_on_eviction: bool,
+    /// See [`CachedResponse::retention`].
+    retention: Duration,
     response_policy: ResponsePolicyProvenance,
 }
 
@@ -477,7 +688,7 @@ pub(crate) struct RequestDeduplicationRequestState {
     key: String,
     fingerprint: String,
     local_inflight_owner_token: String,
-    redis_lock_token: Option<String>,
+    redis_lock_token: Option<RedisOwnership>,
 }
 
 impl fmt::Debug for RequestDeduplicationRequestState {
@@ -508,7 +719,8 @@ pub(crate) fn set_request_state_for_test(
             key: key.to_string(),
             fingerprint: fingerprint.to_string(),
             local_inflight_owner_token: local_inflight_owner_token.to_string(),
-            redis_lock_token: redis_lock_token.map(str::to_string),
+            redis_lock_token: redis_lock_token
+                .and_then(|token| RedisOwnership::new(fingerprint, token)),
         },
     );
 }
@@ -559,11 +771,21 @@ pub struct RequestDeduplication {
     scope_by_consumer: bool,
     /// Whether to require the idempotency header (reject if missing).
     enforce_required: bool,
+    /// Behavior when `sync_mode: "redis"` is configured but Redis cannot be
+    /// consulted. Only meaningful in Redis mode.
+    on_redis_unavailable: RedisUnavailablePolicy,
     /// Local in-memory cache.
     local_cache: Arc<DashMap<String, DeduplicationEntry>>,
     completed_count: AtomicUsize,
     completed_size_bytes: AtomicUsize,
     inflight_count: AtomicUsize,
+    /// Number of explicit per-key execution barriers. Unlike active in-flight
+    /// work, this durable security state is hard-capped at `max_entries`.
+    execution_barrier_count: AtomicUsize,
+    /// Process-relative monotonic deadline for a single bounded fail-closed
+    /// overflow barrier. When the per-key barrier budget is full, this one
+    /// scalar protects every displaced key without retaining their identities.
+    execution_barrier_overflow_until_ms: AtomicU64,
     local_inflight_sequence: AtomicU64,
     completed_sequence: AtomicU64,
     next_completed_evict_sequence: AtomicU64,
@@ -589,8 +811,44 @@ impl RequestDeduplication {
         http_client: PluginHttpClient,
         config_id: &str,
     ) -> Result<Self, String> {
-        if !config.is_object() {
-            return Err("request_deduplication: config must be an object".to_string());
+        let object = config
+            .as_object()
+            .ok_or_else(|| "request_deduplication: config must be an object".to_string())?;
+
+        // Unknown root keys fail closed. A misspelled `enforce_required` would
+        // otherwise leave the idempotency header optional, and a misspelled
+        // `sync_mode` would leave centralized enforcement silently process-local
+        // while admission reported the policy as loaded.
+        crate::util::unknown_keys::reject_unknown_keys(
+            object,
+            "config",
+            REQUEST_DEDUPLICATION_CONFIG_KEYS,
+            "request_deduplication: ",
+        )?;
+
+        // Redis-only fields outside Redis mode are a configuration error rather
+        // than inert data: the most common way to reach that state is a typo in
+        // `sync_mode` itself, which is exactly the mistake that silently
+        // downgrades cross-gateway enforcement to per-process state.
+        let sync_mode = optional_string(config, "sync_mode")?.map(str::to_ascii_lowercase);
+        if sync_mode.as_deref() != Some("redis") {
+            let mut supplied: Vec<&str> = REDIS_ONLY_CONFIG_KEYS
+                .iter()
+                .copied()
+                .filter(|key| object.contains_key(*key))
+                .collect();
+            if !supplied.is_empty() {
+                supplied.sort_unstable();
+                let rendered: Vec<String> = supplied
+                    .into_iter()
+                    .map(|key| format!("'config.{key}'"))
+                    .collect();
+                return Err(format!(
+                    "request_deduplication: Redis-only configuration key(s) {} require \
+                     sync_mode='redis' (did you mean to set sync_mode?)",
+                    rendered.join(", ")
+                ));
+            }
         }
 
         // Stable plugin-config identity partitions Redis ownership across
@@ -626,6 +884,19 @@ impl RequestDeduplication {
         let applicable_methods = parse_applicable_methods(config)?;
         let scope_by_consumer = optional_bool(config, "scope_by_consumer")?.unwrap_or(true);
         let enforce_required = optional_bool(config, "enforce_required")?.unwrap_or(false);
+        let on_redis_unavailable = match optional_string(config, "on_redis_unavailable")? {
+            None => RedisUnavailablePolicy::FailClosed,
+            Some("fail_closed") => RedisUnavailablePolicy::FailClosed,
+            Some("local_only") => RedisUnavailablePolicy::LocalOnly,
+            Some(_) => {
+                // Value-redacted: the rejected string can be a mistyped secret.
+                return Err(
+                    "request_deduplication: 'on_redis_unavailable' must be exactly \
+                     'fail_closed' or 'local_only'"
+                        .to_string(),
+                );
+            }
+        };
         let shard_amount = http_client.pool_shard_amount();
 
         // Build optional Redis client
@@ -657,10 +928,13 @@ impl RequestDeduplication {
             applicable_methods,
             scope_by_consumer,
             enforce_required,
+            on_redis_unavailable,
             local_cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             completed_count: AtomicUsize::new(0),
             completed_size_bytes: AtomicUsize::new(0),
             inflight_count: AtomicUsize::new(0),
+            execution_barrier_count: AtomicUsize::new(0),
+            execution_barrier_overflow_until_ms: AtomicU64::new(0),
             local_inflight_sequence: AtomicU64::new(0),
             completed_sequence: AtomicU64::new(0),
             next_completed_evict_sequence: AtomicU64::new(0),
@@ -670,6 +944,62 @@ impl RequestDeduplication {
             redis_client,
             last_cleanup: AtomicU64::new(CLEANUP_NEVER),
         })
+    }
+
+    /// Lifetime of a completion that exists only to refuse re-execution rather
+    /// than to serve a representation of the real response: the non-replayable
+    /// external-operation tombstone, and any Redis record published without a
+    /// replay payload.
+    ///
+    /// Such a completion replaces an in-flight record that would otherwise have
+    /// blocked duplicates for `inflight_ttl_seconds`, so it must never expire
+    /// sooner than that. `inflight_ttl_seconds` may legitimately exceed
+    /// `ttl_seconds` (a long-running backend with a short replay-retention
+    /// window); publishing the barrier for only `ttl_seconds` there would make
+    /// an already-performed billable operation executable again *earlier* than
+    /// the bare marker did — the exposure GHSA-8cr6-rw38-7j59 closes.
+    ///
+    /// Ordinary replayable completions are unaffected and keep `ttl_seconds`:
+    /// they answer a retry by replaying, and expiring on schedule is the
+    /// documented meaning of `ttl_seconds`.
+    fn execution_barrier_retention(&self) -> Duration {
+        self.ttl.max(self.inflight_ttl)
+    }
+
+    fn try_reserve_execution_barrier(&self) -> bool {
+        self.execution_barrier_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current < self.max_entries).then_some(current + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_execution_barrier(&self) {
+        decrement_atomic(&self.execution_barrier_count);
+    }
+
+    /// Extend the one bounded overflow barrier to cover this completion's
+    /// authoritative deadline.
+    ///
+    /// The deadline is derived from the original insertion instant, not from
+    /// overflow detection time, so eviction cannot restart or shorten the
+    /// completion clock. `fetch_max` composes concurrent displaced barriers
+    /// without storing their keys.
+    fn extend_execution_barrier_overflow(&self, inserted_at: Instant, retention: Duration) {
+        let inserted_ms = inserted_at
+            .checked_duration_since(*PROCESS_START)
+            .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+        self.execution_barrier_overflow_until_ms
+            .fetch_max(inserted_ms.saturating_add(retention_ms), Ordering::SeqCst);
+    }
+
+    fn execution_barrier_overflow_active(&self) -> bool {
+        monotonic_millis()
+            < self
+                .execution_barrier_overflow_until_ms
+                .load(Ordering::SeqCst)
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -707,7 +1037,8 @@ impl RequestDeduplication {
             .iter()
             .map(|entry| match entry.value() {
                 DeduplicationEntry::Completed { cached, .. } => cached.retained_size(),
-                DeduplicationEntry::InFlight { .. } => 0,
+                DeduplicationEntry::InFlight { .. }
+                | DeduplicationEntry::ExecutionBarrier { .. } => 0,
             })
             .sum()
     }
@@ -734,12 +1065,14 @@ impl RequestDeduplication {
     #[allow(dead_code)]
     pub(crate) fn expire_completed_entries_for_tests(&self) {
         let _guard = self.accounting_guard();
-        let expired_at = Instant::now()
-            .checked_sub(self.ttl.saturating_add(Duration::from_secs(1)))
-            .unwrap_or_else(Instant::now);
+        let now = Instant::now();
         for mut entry in self.local_cache.iter_mut() {
             if let DeduplicationEntry::Completed { cached, .. } = entry.value_mut() {
-                cached.inserted_at = expired_at;
+                // Per-entry retention: an execution-barrier tombstone outlives
+                // `ttl_seconds`, so back-date past its own retention window.
+                cached.inserted_at = now
+                    .checked_sub(cached.retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
             }
         }
         self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
@@ -759,22 +1092,50 @@ impl RequestDeduplication {
         self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn expire_execution_barriers_for_tests(&self) {
+        let _guard = self.accounting_guard();
+        let now = Instant::now();
+        for mut entry in self.local_cache.iter_mut() {
+            if let DeduplicationEntry::ExecutionBarrier {
+                inserted_at,
+                retention,
+                ..
+            } = entry.value_mut()
+            {
+                *inserted_at = now
+                    .checked_sub(retention.saturating_add(Duration::from_secs(1)))
+                    .unwrap_or(now);
+            }
+        }
+        self.execution_barrier_overflow_until_ms
+            .store(0, Ordering::SeqCst);
+        self.last_cleanup.store(CLEANUP_NEVER, Ordering::Relaxed);
+    }
+
     /// Build the logical deduplication key from unambiguous framed fields.
     ///
     /// The returned key intentionally contains only a versioned digest so
     /// Redis keys and request metadata never expose idempotency values or
     /// authenticated identities.
     fn build_key(&self, ctx: &RequestContext, idempotency_value: &str) -> String {
-        let proxy_id = ctx
-            .matched_proxy
-            .as_ref()
-            .map(|p| p.id.as_str())
-            .unwrap_or("_");
-
         let mut hasher = Sha256::new();
         hash_framed(&mut hasher, "version", DEDUP_LOGICAL_KEY_VERSION.as_bytes());
         hash_framed(&mut hasher, "plugin_config_id", self.config_id.as_bytes());
-        hash_framed(&mut hasher, "proxy_id", proxy_id.as_bytes());
+        // The Redis prefix is operator-configurable and may deliberately be
+        // shared across namespaces. Namespace therefore belongs in the
+        // authenticated logical identity itself, not only in the default
+        // prefix, so equal resource IDs in separate namespaces cannot claim or
+        // replay one another's operation.
+        if let Some(proxy) = ctx.matched_proxy.as_ref() {
+            hash_framed(&mut hasher, "matched_proxy", b"1");
+            hash_framed(&mut hasher, "proxy_namespace", proxy.namespace.as_bytes());
+            hash_framed(&mut hasher, "proxy_id", proxy.id.as_bytes());
+        } else {
+            // Frame presence explicitly rather than reserving a sentinel that
+            // could collide with a valid namespace/resource identifier.
+            hash_framed(&mut hasher, "matched_proxy", b"0");
+        }
         if self.scope_by_consumer
             && let Some(identity) = ctx.effective_identity()
         {
@@ -790,7 +1151,7 @@ impl RequestDeduplication {
         hash_framed(&mut hasher, "idempotency_key", idempotency_value.as_bytes());
 
         let mut key = String::with_capacity(67);
-        key.push_str("v3:");
+        key.push_str("v4:");
         key.push_str(&hex::encode(hasher.finalize()));
         key
     }
@@ -906,9 +1267,26 @@ impl RequestDeduplication {
                         fingerprint: cached_fingerprint,
                         ..
                     } => {
-                        if now.duration_since(cached.inserted_at) < self.ttl {
+                        if now.duration_since(cached.inserted_at) < cached.retention {
                             if cached_fingerprint == fingerprint {
                                 return LocalDeduplicationAction::Replay(cached.clone());
+                            }
+                            return LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            );
+                        }
+                    }
+                    DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention,
+                        fingerprint: cached_fingerprint,
+                        ..
+                    } => {
+                        if now.duration_since(*inserted_at) < *retention {
+                            if cached_fingerprint == fingerprint {
+                                return LocalDeduplicationAction::Conflict(
+                                    DeduplicationConflict::InFlight,
+                                );
                             }
                             return LocalDeduplicationAction::Conflict(
                                 DeduplicationConflict::FingerprintMismatch,
@@ -939,7 +1317,7 @@ impl RequestDeduplication {
                     }
                 }
                 drop(entry);
-                self.replace_expired_completed_with_inflight(key, fingerprint, now, owner_token)
+                self.replace_expired_entry_with_inflight(key, fingerprint, now, owner_token)
             }
         }
     }
@@ -960,7 +1338,7 @@ impl RequestDeduplication {
                 return None;
             };
             if cached_fingerprint == fingerprint
-                && now.duration_since(cached.inserted_at) < self.ttl
+                && now.duration_since(cached.inserted_at) < cached.retention
             {
                 Some(cached.clone())
             } else {
@@ -969,7 +1347,7 @@ impl RequestDeduplication {
         })
     }
 
-    fn replace_expired_completed_with_inflight(
+    fn replace_expired_entry_with_inflight(
         &self,
         key: &str,
         fingerprint: &str,
@@ -994,7 +1372,7 @@ impl RequestDeduplication {
                     fingerprint: cached_fingerprint,
                     ..
                 } => {
-                    if now.duration_since(cached.inserted_at) < self.ttl {
+                    if now.duration_since(cached.inserted_at) < cached.retention {
                         if cached_fingerprint == fingerprint {
                             LocalDeduplicationAction::Replay(cached.clone())
                         } else {
@@ -1008,6 +1386,32 @@ impl RequestDeduplication {
                         self.sub_completed_size_locked(retained_size);
                         decrement_atomic(&self.completed_count);
                         self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                        entry.insert(DeduplicationEntry::InFlight {
+                            started_at: now,
+                            fingerprint: fingerprint.to_string(),
+                            owner_token: owner_token.to_string(),
+                        });
+                        LocalDeduplicationAction::Fresh
+                    }
+                }
+                DeduplicationEntry::ExecutionBarrier {
+                    inserted_at,
+                    retention,
+                    fingerprint: cached_fingerprint,
+                    ..
+                } => {
+                    if now.duration_since(*inserted_at) < *retention {
+                        if cached_fingerprint == fingerprint {
+                            LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight)
+                        } else {
+                            LocalDeduplicationAction::Conflict(
+                                DeduplicationConflict::FingerprintMismatch,
+                            )
+                        }
+                    } else {
+                        // A barrier is accounted with the in-flight/fixed-state
+                        // counter. Replacing it in place preserves cardinality.
+                        self.release_execution_barrier();
                         entry.insert(DeduplicationEntry::InFlight {
                             started_at: now,
                             fingerprint: fingerprint.to_string(),
@@ -1040,110 +1444,141 @@ impl RequestDeduplication {
         }
     }
 
-    /// Try to retrieve a cached response from Redis.
-    async fn redis_get(&self, key: &str, fingerprint: &str) -> RedisDeduplicationAction {
+    /// Read and classify the single operation record for a logical key.
+    ///
+    /// Ownership and completion share one Redis key so that publishing a result
+    /// *is* the ownership transition. A peer therefore never observes a state
+    /// where both the in-flight marker and the completed response are missing,
+    /// and never observes a completed response while a successor still owns the
+    /// operation.
+    async fn redis_read_record(
+        &self,
+        redis: &RedisRateLimitClient,
+        redis_key: &str,
+    ) -> RedisRecordState {
+        let data = match redis.get_bytes(redis_key).await {
+            Ok(Some(data)) => data,
+            Ok(None) => return RedisRecordState::Absent,
+            Err(()) => return RedisRecordState::Unavailable,
+        };
+
+        let Ok(record) = serde_json::from_slice::<SerializableDedupRecord>(&data) else {
+            return RedisRecordState::Unreadable;
+        };
+        if !record.has_valid_current_shape() {
+            return RedisRecordState::Unreadable;
+        }
+        match record.state.as_str() {
+            DEDUP_RECORD_STATE_INFLIGHT => RedisRecordState::InFlight(record.fingerprint),
+            DEDUP_RECORD_STATE_COMPLETED => {
+                let fingerprint = record.fingerprint;
+                let replay = match record.replay {
+                    // A retained replay is only usable while its response-policy
+                    // provenance decodes. Malformed digests can never be shown
+                    // compatible with the live presentation policy, so the whole
+                    // record fails closed rather than replaying on an assumed
+                    // policy or being mistaken for a miss.
+                    Some(replay) => {
+                        let Some(response_policy) = replay.response_policy.decode() else {
+                            debug!(
+                                "request_deduplication: Redis idempotency record carries \
+                                 malformed replay provenance; refusing replay"
+                            );
+                            return RedisRecordState::Unprovable;
+                        };
+                        Some(CachedResponse {
+                            status_code: replay.status_code,
+                            headers: replay.headers,
+                            body: Bytes::from(replay.body),
+                            // Neither field is meaningful for a Redis-sourced
+                            // record: expiry is enforced by the key TTL, and
+                            // this value is only ever replayed, never inserted
+                            // into the local map.
+                            inserted_at: Instant::now(),
+                            retention: self.ttl,
+                            response_policy,
+                        })
+                    }
+                    // A deliberate non-replayable tombstone carries no bytes and
+                    // therefore makes no presentation-policy claim.
+                    None => None,
+                };
+                RedisRecordState::Completed(fingerprint, replay)
+            }
+            _ => RedisRecordState::Unreadable,
+        }
+    }
+
+    /// Acquire the operation record for this request, or classify whoever
+    /// currently owns or completed it.
+    async fn redis_admit(&self, key: &str, fingerprint: &str) -> RedisAdmission {
         let Some(redis) = self.redis_client.as_ref() else {
-            return RedisDeduplicationAction::Miss;
+            return RedisAdmission::Unavailable;
         };
         if !redis.is_available() {
-            return RedisDeduplicationAction::Miss;
+            return RedisAdmission::Unavailable;
         }
 
         let redis_key = redis.make_key(&[key]);
-        let data = match redis.get_bytes(&redis_key).await {
-            Ok(Some(d)) => d,
-            Ok(None) => return RedisDeduplicationAction::Miss,
-            Err(()) => return RedisDeduplicationAction::Miss,
-        };
-
-        let stored = match serde_json::from_slice::<SerializableCachedResponse>(&data) {
-            Ok(stored) => stored,
-            // A record we cannot parse is a record whose provenance we cannot
-            // establish. Legacy payloads written before replay provenance
-            // existed land here (the provenance field is required, not
-            // defaulted), as does any corrupted or foreign value. Fail closed
-            // with a conflict: replaying it would skip the live presentation
-            // policy, and treating it as a miss would re-execute a non-safe
-            // request whose original side effect may already have happened.
-            Err(_) => {
-                debug!(
-                    "request_deduplication: Redis idempotency record is unreadable or carries no \
-                     replay provenance; refusing replay"
-                );
-                return RedisDeduplicationAction::UnprovableRecord;
-            }
-        };
-        if stored.fingerprint != fingerprint {
-            return RedisDeduplicationAction::Conflict;
-        }
-        let Some(response_policy) = stored.response_policy.decode() else {
-            debug!(
-                "request_deduplication: Redis idempotency record carries malformed replay \
-                 provenance; refusing replay"
-            );
-            return RedisDeduplicationAction::UnprovableRecord;
-        };
-        RedisDeduplicationAction::Replay(CachedResponse {
-            status_code: stored.status_code,
-            headers: stored.headers,
-            body: Bytes::from(stored.body),
-            inserted_at: Instant::now(), // Not meaningful for Redis entries
-            response_policy,
-        })
-    }
-
-    async fn redis_mark_inflight(&self, key: &str, fingerprint: &str) -> RedisInFlightAction {
-        let Some(redis) = self.redis_client.as_ref() else {
-            return RedisInFlightAction::Unavailable;
-        };
-        if !redis.is_available() {
-            return RedisInFlightAction::Unavailable;
-        }
-
-        let redis_key = redis.make_key(&[REDIS_INFLIGHT_KEY_COMPONENT, key]);
-        for _ in 0..2 {
+        let inflight_ttl_seconds = self.inflight_ttl.as_secs().max(1);
+        for _ in 0..REDIS_ADMISSION_ATTEMPTS {
             let token = uuid::Uuid::new_v4().to_string();
-            let lock = SerializableInFlightLock {
-                fingerprint: fingerprint.to_string(),
-                token: token.clone(),
-            };
-            let lock_bytes = match serde_json::to_vec(&lock) {
-                Ok(bytes) => bytes,
-                Err(_) => return RedisInFlightAction::Unavailable,
+            let Some(ownership) = RedisOwnership::new(fingerprint, &token) else {
+                return RedisAdmission::Unavailable;
             };
 
             match redis
-                .set_bytes_nx_with_expire(
-                    &redis_key,
-                    &lock_bytes,
-                    self.inflight_ttl.as_secs().max(1),
-                )
+                .set_bytes_nx_with_expire(&redis_key, &ownership.record, inflight_ttl_seconds)
                 .await
             {
-                Ok(true) => return RedisInFlightAction::Acquired(token),
+                Ok(true) => return RedisAdmission::Acquired(ownership),
                 Ok(false) => {}
-                Err(()) => return RedisInFlightAction::Unavailable,
+                Err(()) => return RedisAdmission::Unavailable,
             }
 
-            let existing = match redis.get_bytes(&redis_key).await {
-                Ok(Some(existing)) => existing,
-                Ok(None) => continue,
-                Err(()) => return RedisInFlightAction::Unavailable,
-            };
-
-            return match serde_json::from_slice::<SerializableInFlightLock>(&existing) {
-                Ok(existing_lock) if existing_lock.fingerprint == fingerprint => {
-                    RedisInFlightAction::Conflict(DeduplicationConflict::InFlight)
+            match self.redis_read_record(redis, &redis_key).await {
+                // Expired inside the acquire/observe window; try to take it.
+                RedisRecordState::Absent => continue,
+                RedisRecordState::InFlight(current) => {
+                    return RedisAdmission::Conflict(if current == fingerprint {
+                        DeduplicationConflict::InFlight
+                    } else {
+                        DeduplicationConflict::FingerprintMismatch
+                    });
                 }
-                Ok(_) => RedisInFlightAction::Conflict(DeduplicationConflict::FingerprintMismatch),
-                Err(_) => RedisInFlightAction::Conflict(DeduplicationConflict::InFlight),
-            };
+                RedisRecordState::Completed(current, replay) => {
+                    if current != fingerprint {
+                        return RedisAdmission::Conflict(
+                            DeduplicationConflict::FingerprintMismatch,
+                        );
+                    }
+                    return match replay {
+                        Some(cached) => RedisAdmission::Replay(cached),
+                        None => RedisAdmission::CompletedNonReplayable,
+                    };
+                }
+                // An unknown record format is another writer's state. Fail
+                // closed rather than overwriting or ignoring it.
+                RedisRecordState::Unreadable => {
+                    return RedisAdmission::Conflict(DeduplicationConflict::InFlight);
+                }
+                // A completed record whose replay provenance cannot be decoded
+                // is refused explicitly: it is neither replayable under the live
+                // presentation policy nor safe to re-execute.
+                RedisRecordState::Unprovable => return RedisAdmission::UnprovableRecord,
+                RedisRecordState::Unavailable => return RedisAdmission::Unavailable,
+            }
         }
 
-        RedisInFlightAction::Conflict(DeduplicationConflict::InFlight)
+        RedisAdmission::Conflict(DeduplicationConflict::InFlight)
     }
 
-    async fn redis_release_inflight(&self, key: &str, fingerprint: &str, token: &str) {
+    /// Release this request's in-flight ownership, if and only if the record is
+    /// still byte-for-byte this request's own in-flight record.
+    ///
+    /// A stale owner whose lease already expired — or whose record was replaced
+    /// by a successor — deletes nothing.
+    async fn redis_release_inflight(&self, key: &str, ownership: &RedisOwnership) {
         let Some(redis) = self.redis_client.as_ref() else {
             return;
         };
@@ -1151,49 +1586,239 @@ impl RequestDeduplication {
             return;
         }
 
-        let lock = SerializableInFlightLock {
-            fingerprint: fingerprint.to_string(),
-            token: token.to_string(),
-        };
-        let lock_bytes = match serde_json::to_vec(&lock) {
-            Ok(bytes) => bytes,
-            Err(_) => return,
-        };
-        let redis_key = redis.make_key(&[REDIS_INFLIGHT_KEY_COMPONENT, key]);
-        if let Err(()) = redis.delete_if_value_matches(&redis_key, &lock_bytes).await {
+        let redis_key = redis.make_key(&[key]);
+        if let Err(()) = redis
+            .delete_if_value_matches(&redis_key, &ownership.record)
+            .await
+        {
             debug!("request_deduplication: Redis in-flight lock release failed");
         }
     }
 
-    /// Store a cached response in Redis with TTL.
-    async fn redis_set(
+    /// Atomically transition this request's in-flight record into a completed
+    /// record, fenced on the still-current ownership token.
+    ///
+    /// This is the fix for the stale-owner overwrite: an owner whose
+    /// `inflight_ttl_seconds` lease expired can neither resurrect the key (the
+    /// compare operand is absent) nor overwrite a successor's in-flight or
+    /// completed record (the compare operand differs). Both completion orders
+    /// therefore preserve the first authoritative completion.
+    ///
+    /// When `response` is absent, or its serialized payload exceeds
+    /// `max_entry_size_bytes`, a small non-replayable completed tombstone is
+    /// published instead. That still transitions ownership, so peers receive a
+    /// deterministic conflict rather than being freed to re-execute the
+    /// operation once the raw in-flight lease expires.
+    ///
+    /// `execution_barrier` marks a publication whose only purpose is refusing
+    /// re-execution — the fixed external-operation tombstone. Together with a
+    /// record that carries no replay payload at all, it selects
+    /// [`Self::execution_barrier_retention`] as the record TTL so the barrier
+    /// can never expire sooner than the in-flight lease it replaced.
+    async fn redis_publish_completed(
         &self,
         key: &str,
         fingerprint: &str,
-        response: &CachedResponse,
-    ) -> RedisStoreAction {
+        ownership: &RedisOwnership,
+        response: Option<&CachedResponse>,
+        execution_barrier: bool,
+    ) -> RedisPublication {
         let Some(redis) = self.redis_client.as_ref() else {
-            return RedisStoreAction::Failed;
+            return RedisPublication::Unavailable;
         };
         if !redis.is_available() {
-            return RedisStoreAction::Failed;
+            return RedisPublication::Unavailable;
         }
 
-        let data = match self.redis_payload_for_response(fingerprint, response) {
-            RedisPayloadAdmission::Admitted(data) => data,
-            RedisPayloadAdmission::Rejected => return RedisStoreAction::SkippedSize,
+        let replay = response.and_then(|response| {
+            // A retained replay must carry complete provenance: `Rejected`
+            // already covers an incomplete value, and the digests are read from
+            // the same provenance the admission check validated.
+            let (gate, presentation) = response.response_policy.complete()?;
+            match self.redis_payload_for_response(fingerprint, response) {
+                RedisPayloadAdmission::Admitted(_) => Some(SerializableCachedResponse {
+                    fingerprint: fingerprint.to_string(),
+                    response_policy: SerializableResponsePolicyProvenance::encode(
+                        gate,
+                        presentation,
+                    ),
+                    status_code: response.status_code,
+                    headers: response.headers.clone(),
+                    body: response.body.to_vec(),
+                }),
+                RedisPayloadAdmission::Rejected => None,
+            }
+        });
+        let replayable = replay.is_some();
+        // A record with no replay payload, and the fixed external-operation
+        // tombstone, exist only to refuse re-execution. Publishing either for
+        // `ttl_seconds` when `inflight_ttl_seconds` is longer would free the key
+        // earlier than the in-flight record it replaces.
+        let record_ttl = if replayable && !execution_barrier {
+            self.ttl
+        } else {
+            self.execution_barrier_retention()
+        };
+        let record = SerializableDedupRecord::completed(fingerprint, replay);
+        let Ok(record_bytes) = serde_json::to_vec(&record) else {
+            return RedisPublication::Unavailable;
         };
 
         let redis_key = redis.make_key(&[key]);
-        let ttl_seconds = self.ttl.as_secs().max(1);
-        if let Err(()) = redis
-            .set_bytes_with_expire(&redis_key, &data, ttl_seconds)
+        match redis
+            .set_bytes_with_expire_if_value_matches(
+                &redis_key,
+                &ownership.record,
+                &record_bytes,
+                record_ttl.as_secs().max(1),
+            )
             .await
         {
-            debug!("request_deduplication: Redis SET failed");
-            return RedisStoreAction::Failed;
+            Ok(true) => RedisPublication::Published { replayable },
+            Ok(false) => {
+                debug!(
+                    "request_deduplication: refusing stale-owner Redis publication; a successor \
+                     or completed record owns this idempotency key"
+                );
+                RedisPublication::NotOwner
+            }
+            Err(()) => {
+                debug!("request_deduplication: fenced Redis publication failed");
+                RedisPublication::Unavailable
+            }
         }
-        RedisStoreAction::Stored
+    }
+
+    /// Whether this instance's ownership covers a synthetic response whose own
+    /// execution already performed the protected external operation.
+    ///
+    /// This is the synthetic-response provenance contract: a short-circuit that
+    /// merely fabricated a representation (mock, fault, cache hit) is safe to
+    /// release, while a short-circuit that spent money or mutated remote state
+    /// (`serverless_function` terminate mode, an `ai_federation` provider call)
+    /// must leave a completion behind. See
+    /// `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY` in `src/plugins/mod.rs`.
+    fn owns_completed_external_operation(&self, ctx: &RequestContext) -> bool {
+        let key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
+        let owns_state = ctx
+            .request_deduplication_states
+            .contains_key(&self.instance_id);
+        let serverless_owner = ctx
+            .serverless_external_side_effect_owners
+            .contains(&self.instance_id);
+        owns_state && (serverless_owner || ctx.metadata.contains_key(key))
+    }
+
+    /// Publish a durable, non-replayable completion for an external operation
+    /// that has no safe replay value.
+    ///
+    /// The stored value is a small deterministic 409 so an identical retry is
+    /// refused for [`Self::execution_barrier_retention`] instead of re-running
+    /// the operation once the raw in-flight lease expires. Interrupted delivery
+    /// of a synthetic externally-executed response therefore cannot silently
+    /// repeat a charge.
+    async fn publish_external_operation_tombstone(&self, ctx: &mut RequestContext) {
+        let external_key = super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY;
+        let synthetic_key = crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
+        if !ctx
+            .request_deduplication_states
+            .contains_key(&self.instance_id)
+        {
+            return;
+        }
+        // Consume only this instance's provenance; sibling instances publish
+        // their own tombstones from their own hooks.
+        ctx.serverless_external_side_effect_owners
+            .remove(&self.instance_id);
+        // The publication path must run instead of the retain-and-return
+        // synthetic guard, so the synthetic marker is cleared around the call
+        // and restored for any later hook that observes it.
+        let synthetic_marker = ctx.metadata.remove(synthetic_key);
+        let had_external_marker = ctx.metadata.contains_key(external_key);
+        if !had_external_marker {
+            ctx.metadata
+                .insert(external_key.to_string(), "true".to_string());
+        }
+
+        let headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("cache-control".to_string(), "no-store".to_string()),
+        ]);
+        let body = NON_REPLAYABLE_COMPLETION_BODY.as_bytes();
+        // Exempt this fixed refusal from the replay-provenance gates; see
+        // `EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY`.
+        ctx.metadata.insert(
+            EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY.to_string(),
+            self.instance_id.to_string(),
+        );
+        let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
+        ctx.metadata
+            .remove(EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY);
+
+        if !had_external_marker {
+            ctx.metadata.remove(external_key);
+        }
+        if let Some(marker) = synthetic_marker {
+            ctx.metadata.insert(synthetic_key.to_string(), marker);
+        }
+    }
+
+    /// Park the in-flight ownership `on_final_response_body` consumed back into
+    /// the request so a durable execution barrier can still be published for it.
+    ///
+    /// `on_final_response_body` takes the request state before its first await,
+    /// so a later refusal to persist a replayable representation — a straddled
+    /// response-policy publication, or provenance that is incomplete/`Dynamic` —
+    /// would otherwise leave an already-performed external operation protected by
+    /// nothing but the raw `inflight_ttl_seconds` lease. Once that lease expires
+    /// the operation becomes executable again, which is exactly the window
+    /// GHSA-8cr6-rw38-7j59 closes.
+    ///
+    /// Parking the *same* ownership (same key, fingerprint, local token and Redis
+    /// lock token) is the lifecycle signal the committed hook reads: state still
+    /// present after a publication attempt means the representation was refused,
+    /// and the fixed non-replayable 409 tombstone must take the key through the
+    /// ordinary fenced transition instead. Nothing is published here, so sibling
+    /// instances and successor-owner fencing are untouched.
+    ///
+    /// Only owners of an external operation park. An ordinary request that merely
+    /// gives up its replay is safe to retry, and holding a barrier for it would
+    /// turn unprovable provenance into a hard 409 lockout.
+    fn park_ownership_for_execution_barrier(
+        &self,
+        ctx: &mut RequestContext,
+        owns_external_operation: bool,
+        state: RequestDeduplicationRequestState,
+    ) {
+        if !owns_external_operation {
+            return;
+        }
+        ctx.request_deduplication_states
+            .insert(self.instance_id, state);
+    }
+
+    /// Drop a completed entry this request published but that the distributed
+    /// fence rejected, so a non-authoritative result is never replayed locally.
+    fn remove_local_completed(&self, key: &str, fingerprint: &str, sequence: u64) {
+        let _guard = self.accounting_guard();
+        let Entry::Occupied(entry) = self.local_cache.entry(key.to_string()) else {
+            return;
+        };
+        let retained_size = match entry.get() {
+            DeduplicationEntry::Completed {
+                cached,
+                sequence: current,
+                fingerprint: current_fingerprint,
+                ..
+            } if *current == sequence && current_fingerprint.as_str() == fingerprint => {
+                cached.retained_size()
+            }
+            _ => return,
+        };
+        entry.remove();
+        self.mark_completed_sequence_pruned(sequence);
+        self.sub_completed_size_locked(retained_size);
+        decrement_atomic(&self.completed_count);
     }
 
     fn redis_payload_for_response(
@@ -1267,6 +1892,34 @@ impl RequestDeduplication {
             .map(|_| decrement_atomic(&self.inflight_count))
     }
 
+    /// Remove only the execution barrier published by this exact local owner.
+    ///
+    /// Used when Redis's compare-and-set reports that this publisher is stale.
+    /// If the barrier expired and a successor acquired the key, the successor is
+    /// an `InFlight` entry with a different token and is therefore untouched.
+    fn remove_matching_local_execution_barrier(
+        &self,
+        key: &str,
+        fingerprint: &str,
+        owner_token: &str,
+    ) -> Option<usize> {
+        self.local_cache
+            .remove_if(key, |_, entry| {
+                matches!(
+                    entry,
+                    DeduplicationEntry::ExecutionBarrier {
+                        fingerprint: current,
+                        owner_token: current_owner_token,
+                        ..
+                    } if current == fingerprint && current_owner_token == owner_token
+                )
+            })
+            .map(|_| {
+                self.release_execution_barrier();
+                decrement_atomic(&self.inflight_count)
+            })
+    }
+
     /// Build the Redis payload a completed response would produce.
     ///
     /// `presentation_digest` is the effective static response-presentation
@@ -1292,6 +1945,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            retention: self.ttl,
             response_policy: ctx.response_policy_provenance(),
         };
         match self.redis_payload_for_response("test-fingerprint", &response) {
@@ -1311,11 +1965,17 @@ impl RequestDeduplication {
             status_code,
             headers,
             body,
-            retain_inflight_on_skip,
-            retain_inflight_on_eviction,
+            publish_execution_barrier_on_skip,
+            retain_barrier_on_eviction,
+            retention,
             response_policy,
         } = candidate;
         let entry_size = cached_response_retained_size(body.len(), &headers);
+        // A size-admission failure replaces the in-flight owner with a
+        // non-replayable execution barrier. Never let that replacement expire
+        // before the lease it supersedes, even when the replayable response
+        // itself would have used the shorter configured TTL.
+        let execution_barrier_retention = retention.max(self.inflight_ttl);
         let _guard = self.accounting_guard();
         let mut entry = match self.local_cache.entry(key.to_string()) {
             Entry::Occupied(entry) => entry,
@@ -1332,7 +1992,21 @@ impl RequestDeduplication {
         }
 
         if entry_size > self.max_entry_size_bytes {
-            let inflight_count = if retain_inflight_on_skip {
+            let inflight_count = if publish_execution_barrier_on_skip {
+                let inserted_at = Instant::now();
+                if self.try_reserve_execution_barrier() {
+                    entry.insert(DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention: execution_barrier_retention,
+                        fingerprint: fingerprint.to_string(),
+                        owner_token: owner_token.to_string(),
+                    });
+                } else {
+                    self.extend_execution_barrier_overflow(
+                        inserted_at,
+                        execution_barrier_retention,
+                    );
+                }
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 entry.remove();
@@ -1347,21 +2021,38 @@ impl RequestDeduplication {
 
         let current_total = self.completed_size_bytes.load(Ordering::Relaxed);
         if current_total.saturating_add(entry_size) > self.max_total_size_bytes {
+            if publish_execution_barrier_on_skip {
+                let inserted_at = Instant::now();
+                if self.try_reserve_execution_barrier() {
+                    entry.insert(DeduplicationEntry::ExecutionBarrier {
+                        inserted_at,
+                        retention: execution_barrier_retention,
+                        fingerprint: fingerprint.to_string(),
+                        owner_token: owner_token.to_string(),
+                    });
+                } else {
+                    self.extend_execution_barrier_overflow(
+                        inserted_at,
+                        execution_barrier_retention,
+                    );
+                }
+            }
             let redis_candidate = if self.redis_client.is_some() {
                 Some(CachedResponse {
                     status_code,
                     headers,
                     body: Bytes::copy_from_slice(body),
                     inserted_at: Instant::now(),
+                    retention,
                     response_policy,
                 })
             } else {
-                if !retain_inflight_on_skip {
+                if !publish_execution_barrier_on_skip {
                     entry.remove();
                 }
                 None
             };
-            let inflight_count = if redis_candidate.is_some() || retain_inflight_on_skip {
+            let inflight_count = if redis_candidate.is_some() || publish_execution_barrier_on_skip {
                 self.inflight_count.load(Ordering::Relaxed)
             } else {
                 decrement_atomic(&self.inflight_count)
@@ -1384,6 +2075,7 @@ impl RequestDeduplication {
             headers,
             body: Bytes::copy_from_slice(body),
             inserted_at: Instant::now(),
+            retention,
             response_policy,
         };
         let redis_copy = cached.clone();
@@ -1391,7 +2083,8 @@ impl RequestDeduplication {
             cached,
             sequence,
             fingerprint: fingerprint.to_string(),
-            retain_inflight_on_eviction,
+            publisher_owner_token: owner_token.to_string(),
+            retain_barrier_on_eviction,
         });
         self.add_completed_size_locked(entry_size);
         self.completed_order
@@ -1404,7 +2097,7 @@ impl RequestDeduplication {
         }
     }
 
-    fn set_completed_inflight_retention(
+    fn set_completed_barrier_retention(
         &self,
         key: &str,
         fingerprint: &str,
@@ -1417,13 +2110,13 @@ impl RequestDeduplication {
         if let DeduplicationEntry::Completed {
             sequence: current_sequence,
             fingerprint: current_fingerprint,
-            retain_inflight_on_eviction,
+            retain_barrier_on_eviction,
             ..
         } = entry.value_mut()
             && *current_sequence == sequence
             && current_fingerprint.as_str() == fingerprint
         {
-            *retain_inflight_on_eviction = retain;
+            *retain_barrier_on_eviction = retain;
         }
     }
 
@@ -1474,12 +2167,24 @@ impl RequestDeduplication {
             DeduplicationEntry::Completed {
                 cached, sequence, ..
             } => {
-                let keep = now.duration_since(cached.inserted_at) < self.ttl;
+                let keep = now.duration_since(cached.inserted_at) < cached.retention;
                 if !keep {
                     let retained_size = cached.retained_size();
                     self.mark_completed_sequence_pruned(*sequence);
                     self.sub_completed_size_locked(retained_size);
                     decrement_atomic(&self.completed_count);
+                }
+                keep
+            }
+            DeduplicationEntry::ExecutionBarrier {
+                inserted_at,
+                retention,
+                ..
+            } => {
+                let keep = now.duration_since(*inserted_at) < *retention;
+                if !keep {
+                    self.release_execution_barrier();
+                    decrement_atomic(&self.inflight_count);
                 }
                 keep
             }
@@ -1572,8 +2277,19 @@ impl RequestDeduplication {
         while to_remove > 0 && sequence < limit {
             let current_sequence = sequence;
             match self.remove_completed_sequence_locked(sequence) {
-                CompletedSequenceRemoval::Removed | CompletedSequenceRemoval::Tombstoned => {
+                CompletedSequenceRemoval::Removed => {
                     to_remove -= 1;
+                    sequence += 1;
+                    self.next_completed_evict_sequence
+                        .store(sequence, Ordering::Relaxed);
+                    self.remove_pruned_completed_order(current_sequence);
+                }
+                CompletedSequenceRemoval::Tombstoned => {
+                    // Replacing a byte-heavy completion with a fixed-size
+                    // execution barrier releases the response-byte budget but
+                    // not a map slot. Keep trimming so a later unprotected
+                    // completion is removed and the cardinality target is met
+                    // whenever doing so does not discard live security state.
                     sequence += 1;
                     self.next_completed_evict_sequence
                         .store(sequence, Ordering::Relaxed);
@@ -1618,16 +2334,27 @@ impl RequestDeduplication {
                 return CompletedSequenceRemoval::Stale;
             }
         };
-        let (retained_size, fingerprint, retain_inflight_on_eviction) = match entry.get() {
+        let (
+            retained_size,
+            barrier_inserted_at,
+            barrier_retention,
+            fingerprint,
+            publisher_owner_token,
+            retain_barrier_on_eviction,
+        ) = match entry.get() {
             DeduplicationEntry::Completed {
                 cached,
                 sequence: current,
                 fingerprint,
-                retain_inflight_on_eviction,
+                publisher_owner_token,
+                retain_barrier_on_eviction,
             } if *current == sequence => (
                 cached.retained_size(),
+                cached.inserted_at,
+                cached.retention,
                 fingerprint.clone(),
-                *retain_inflight_on_eviction,
+                publisher_owner_token.clone(),
+                *retain_barrier_on_eviction,
             ),
             _ => {
                 drop(entry);
@@ -1638,18 +2365,29 @@ impl RequestDeduplication {
 
         self.sub_completed_size_locked(retained_size);
         decrement_atomic(&self.completed_count);
-        let result = if retain_inflight_on_eviction {
+        let result = if retain_barrier_on_eviction {
             // A distributed lock may still be the only cross-gateway guard for
             // an externally executed response. If the replay cannot remain in
             // the bounded local cache, retain a small local tombstone so Redis
             // loss cannot turn an identical retry into another side effect.
-            entry.insert(DeduplicationEntry::InFlight {
-                started_at: Instant::now(),
-                fingerprint,
-                owner_token: self.next_local_inflight_owner_token(),
-            });
-            self.inflight_count.fetch_add(1, Ordering::Relaxed);
-            CompletedSequenceRemoval::Tombstoned
+            if self.try_reserve_execution_barrier() {
+                entry.insert(DeduplicationEntry::ExecutionBarrier {
+                    inserted_at: barrier_inserted_at,
+                    retention: barrier_retention,
+                    fingerprint,
+                    owner_token: publisher_owner_token,
+                });
+                self.inflight_count.fetch_add(1, Ordering::Relaxed);
+                CompletedSequenceRemoval::Tombstoned
+            } else {
+                // The per-key security-state budget is full. Collapse this
+                // completion into the one bounded process-global refusal
+                // deadline rather than allocating another attacker-influenced
+                // map entry or reopening the operation.
+                self.extend_execution_barrier_overflow(barrier_inserted_at, barrier_retention);
+                entry.remove();
+                CompletedSequenceRemoval::Removed
+            }
         } else {
             entry.remove();
             CompletedSequenceRemoval::Removed
@@ -1792,10 +2530,80 @@ fn decode_digest_hex(value: &str) -> Option<[u8; 32]> {
     Some(digest)
 }
 
+/// The single Redis record that owns one logical idempotency key.
+///
+/// Ownership (`state = "inflight"`, with the owner token) and completion
+/// (`state = "completed"`, with an optional replay payload) are the same key,
+/// so publication and the ownership transition are one atomic compare-and-set.
+///
+/// Field order is the serialization order and `skip_serializing_if` keeps
+/// absent fields out of the document, so the in-flight bytes a request writes
+/// at acquisition are reproducible as the compare operand at completion.
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SerializableInFlightLock {
+struct SerializableDedupRecord {
+    record_version: u32,
+    state: String,
     fingerprint: String,
-    token: String,
+    /// Owner token; present only while `state == "inflight"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_token: Option<String>,
+    /// Replay payload; present only for a replayable completed record. A
+    /// completed record without one is a deliberate non-replayable tombstone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay: Option<SerializableCachedResponse>,
+}
+
+impl SerializableDedupRecord {
+    /// Validate the state-dependent wire shape before any field is trusted.
+    ///
+    /// Serde defaults make forward-compatible parsing convenient, but they
+    /// must not turn a partially written or attacker-controlled record into a
+    /// valid ownership/completion state. In particular, an in-flight record
+    /// always carries a nonempty fencing token and no replay, while a completed
+    /// record carries no owner and any replay must bind to the outer request
+    /// fingerprint.
+    fn has_valid_current_shape(&self) -> bool {
+        if self.record_version != DEDUP_REDIS_RECORD_VERSION || self.fingerprint.is_empty() {
+            return false;
+        }
+
+        match self.state.as_str() {
+            DEDUP_RECORD_STATE_INFLIGHT => {
+                self.owner_token
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty())
+                    && self.replay.is_none()
+            }
+            DEDUP_RECORD_STATE_COMPLETED => {
+                self.owner_token.is_none()
+                    && self
+                        .replay
+                        .as_ref()
+                        .is_none_or(|replay| replay.fingerprint == self.fingerprint)
+            }
+            _ => false,
+        }
+    }
+
+    fn inflight(fingerprint: &str, token: &str) -> Self {
+        Self {
+            record_version: DEDUP_REDIS_RECORD_VERSION,
+            state: DEDUP_RECORD_STATE_INFLIGHT.to_string(),
+            fingerprint: fingerprint.to_string(),
+            owner_token: Some(token.to_string()),
+            replay: None,
+        }
+    }
+
+    fn completed(fingerprint: &str, replay: Option<SerializableCachedResponse>) -> Self {
+        Self {
+            record_version: DEDUP_REDIS_RECORD_VERSION,
+            state: DEDUP_RECORD_STATE_COMPLETED.to_string(),
+            fingerprint: fingerprint.to_string(),
+            owner_token: None,
+            replay,
+        }
+    }
 }
 
 fn serialize_cached_response_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>
@@ -2007,6 +2815,22 @@ pub(crate) fn redis_cached_response_payload_is_valid_for_test(data: &[u8]) -> bo
         .ok()
         .and_then(|stored| stored.response_policy.decode())
         .is_some()
+}
+
+// External tests reach this through `crate::_test_support`; the binary target
+// still sees the crate-private helper itself as unused.
+#[allow(dead_code)]
+pub(crate) fn redis_record_payload_is_valid_for_test(data: &[u8]) -> bool {
+    let Ok(record) = serde_json::from_slice::<SerializableDedupRecord>(data) else {
+        return false;
+    };
+    if !record.has_valid_current_shape() {
+        return false;
+    }
+    record
+        .replay
+        .as_ref()
+        .is_none_or(|replay| replay.response_policy.decode().is_some())
 }
 
 fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
@@ -2224,13 +3048,36 @@ impl Plugin for RequestDeduplication {
         // Periodic cleanup
         self.cleanup_local_cache();
 
+        // Per-key execution barriers are hard-capped at `max_entries`. If
+        // completed external operations overflowed that budget, one bounded
+        // process-global deadline fails every applicable idempotency-key request
+        // closed until the longest displaced completion deadline. Completed
+        // replays are intentionally not consulted here: their key might not be
+        // one of the displaced operations, and selecting by attacker-controlled
+        // request order would make the overflow state unsafe.
+        if self.execution_barrier_overflow_active() {
+            return PluginResult::Reject {
+                status_code: 503,
+                body: EXECUTION_BARRIER_CAPACITY_BODY.to_string(),
+                headers: HashMap::new(),
+            };
+        }
+
         // Check Redis first (centralized dedup across instances), then acquire
         // a Redis in-flight lock before any gateway instance can dispatch the
         // fresh request to the backend.
         let mut redis_lock_token = None;
         if self.redis_client.is_some() {
-            match self.redis_get(&key, &fingerprint).await {
-                RedisDeduplicationAction::Replay(cached) => {
+            // One atomic admission against the single operation record. There
+            // is no read-then-lock-then-read window: acquisition and
+            // observation are the same `SET NX` / `GET` pair on one key, so a
+            // peer can never see the completed value and the ownership marker
+            // disagree.
+            match self.redis_admit(&key, &fingerprint).await {
+                RedisAdmission::Acquired(ownership) => {
+                    redis_lock_token = Some(ownership);
+                }
+                RedisAdmission::Replay(cached) => {
                     debug!("request_deduplication: Redis cache hit, replaying response");
                     // Defense-in-depth: re-sanitize on replay even though insert
                     // already strips. A stored entry written before this fix landed,
@@ -2238,15 +3085,30 @@ impl Plugin for RequestDeduplication {
                     // could still carry session-bearing headers.
                     return self.replay_response(ctx, &cached);
                 }
-                RedisDeduplicationAction::Conflict => {
+                RedisAdmission::CompletedNonReplayable => {
+                    // The distributed record proves the operation completed but
+                    // carries no safe replay — typically because the response
+                    // exceeded the Redis payload cap. The publishing gateway
+                    // still holds the real completion locally, so prefer that
+                    // authoritative replay over the deterministic refusal.
+                    // Peers without it stay refused for the completed TTL.
+                    if let Some(cached) =
+                        self.matching_local_completed(&key, &fingerprint, Instant::now())
+                    {
+                        return self.replay_response(ctx, &cached);
+                    }
                     return PluginResult::Reject {
                         status_code: 409,
-                        body: r#"{"error":"Idempotency key was reused for a different request"}"#
-                            .to_string(),
+                        body: NON_REPLAYABLE_COMPLETION_BODY.to_string(),
                         headers: HashMap::new(),
                     };
                 }
-                RedisDeduplicationAction::UnprovableRecord => {
+                RedisAdmission::UnprovableRecord => {
+                    // GHSA-8cr6 / replay provenance: the record proves an
+                    // operation under this key but cannot be shown compatible
+                    // with the live response policy. Refuse deterministically
+                    // rather than replaying a superseded representation or
+                    // re-executing a possibly completed side effect.
                     return PluginResult::Reject {
                         status_code: 409,
                         body:
@@ -2255,44 +3117,20 @@ impl Plugin for RequestDeduplication {
                         headers: HashMap::new(),
                     };
                 }
-                RedisDeduplicationAction::Miss => {}
-            }
-
-            match self.redis_mark_inflight(&key, &fingerprint).await {
-                RedisInFlightAction::Acquired(token) => {
-                    match self.redis_get(&key, &fingerprint).await {
-                        RedisDeduplicationAction::Replay(cached) => {
-                            self.redis_release_inflight(&key, &fingerprint, &token)
-                                .await;
-                            return self.replay_response(ctx, &cached);
-                        }
-                        RedisDeduplicationAction::Conflict => {
-                            self.redis_release_inflight(&key, &fingerprint, &token)
-                                .await;
-                            return PluginResult::Reject {
-                                status_code: 409,
-                                body:
-                                    r#"{"error":"Idempotency key was reused for a different request"}"#
-                                        .to_string(),
-                                headers: HashMap::new(),
-                            };
-                        }
-                        RedisDeduplicationAction::UnprovableRecord => {
-                            self.redis_release_inflight(&key, &fingerprint, &token)
-                                .await;
-                            return PluginResult::Reject {
-                                status_code: 409,
-                                body:
-                                    r#"{"error":"The stored idempotent response cannot be proven compatible with the current response policy"}"#
-                                        .to_string(),
-                                headers: HashMap::new(),
-                            };
-                        }
-                        RedisDeduplicationAction::Miss => {}
+                RedisAdmission::Unavailable => match self.on_redis_unavailable {
+                    // Refuse rather than fall back to an ownership decision only
+                    // this process can see: a local-only decision during an
+                    // outage lets one idempotency key execute once per gateway.
+                    RedisUnavailablePolicy::FailClosed => {
+                        return PluginResult::Reject {
+                            status_code: 503,
+                            body: REDIS_UNAVAILABLE_BODY.to_string(),
+                            headers: HashMap::new(),
+                        };
                     }
-                    redis_lock_token = Some(token);
-                }
-                RedisInFlightAction::Conflict(DeduplicationConflict::InFlight) => {
+                    RedisUnavailablePolicy::LocalOnly => {}
+                },
+                RedisAdmission::Conflict(DeduplicationConflict::InFlight) => {
                     // An owned terminal response can fit the local cache while
                     // its base64 Redis representation exceeds the same entry
                     // limit. In that case publication deliberately retains the
@@ -2314,7 +3152,7 @@ impl Plugin for RequestDeduplication {
                         headers: HashMap::new(),
                     };
                 }
-                RedisInFlightAction::Conflict(DeduplicationConflict::FingerprintMismatch) => {
+                RedisAdmission::Conflict(DeduplicationConflict::FingerprintMismatch) => {
                     return PluginResult::Reject {
                         status_code: 409,
                         body: r#"{"error":"Idempotency key was reused for a different request"}"#
@@ -2322,7 +3160,6 @@ impl Plugin for RequestDeduplication {
                         headers: HashMap::new(),
                     };
                 }
-                RedisInFlightAction::Unavailable => {}
             }
         }
 
@@ -2337,8 +3174,8 @@ impl Plugin for RequestDeduplication {
             &local_inflight_owner_token,
         ) {
             LocalDeduplicationAction::Replay(cached) => {
-                if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&key, ownership).await;
                 }
                 debug!("request_deduplication: local cache hit, replaying response");
                 // Defense-in-depth: re-sanitize on replay even though insert
@@ -2348,8 +3185,8 @@ impl Plugin for RequestDeduplication {
                 return self.replay_response(ctx, &cached);
             }
             LocalDeduplicationAction::Conflict(DeduplicationConflict::InFlight) => {
-                if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&key, ownership).await;
                 }
                 return PluginResult::Reject {
                     status_code: 409,
@@ -2360,8 +3197,8 @@ impl Plugin for RequestDeduplication {
                 };
             }
             LocalDeduplicationAction::Conflict(DeduplicationConflict::FingerprintMismatch) => {
-                if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&key, ownership).await;
                 }
                 return PluginResult::Reject {
                     status_code: 409,
@@ -2411,11 +3248,19 @@ impl Plugin for RequestDeduplication {
         //   would let that retry re-execute a side-effecting backend operation
         //   with no replay/tombstone protection, so keep the local marker and
         //   Redis lock until `inflight_ttl` expires as the backstop.
-        if ctx
-            .serverless_external_side_effect_owners
-            .contains(&self.instance_id)
-            || !outcome.body_completed
-        {
+        //
+        // The first case is stronger than a bare in-flight retention: an
+        // external operation that already executed must not become re-executable
+        // simply because `inflight_ttl_seconds` elapsed. Publish a durable
+        // non-replayable completion tombstone instead, so an identical retry is
+        // refused for the full `ttl_seconds` on this gateway and — in Redis mode
+        // — on every peer, through the same fenced ownership transition the
+        // buffered path uses.
+        if self.owns_completed_external_operation(ctx) {
+            self.publish_external_operation_tombstone(ctx).await;
+            return;
+        }
+        if !outcome.body_completed {
             return;
         }
 
@@ -2428,9 +3273,8 @@ impl Plugin for RequestDeduplication {
             &state.fingerprint,
             &state.local_inflight_owner_token,
         );
-        if let Some(token) = state.redis_lock_token.as_deref() {
-            self.redis_release_inflight(&state.key, &state.fingerprint, token)
-                .await;
+        if let Some(ownership) = state.redis_lock_token.as_ref() {
+            self.redis_release_inflight(&state.key, ownership).await;
         }
     }
 
@@ -2452,14 +3296,13 @@ impl Plugin for RequestDeduplication {
         {
             return PluginResult::Continue;
         }
-        // Retain both in-flight locks (rather than fail open) when configured
-        // capacity is too small even to store an owned terminal response or a
-        // non-replayable external-operation tombstone. Serverless owns its
+        // Publish a fixed-size execution barrier (rather than fail open) when
+        // configured response-byte capacity is too small even to store an owned
+        // terminal response or the 409 tombstone bytes. Serverless owns its
         // publication through the typed marker above; `ai_federation` signals
         // the same intent for its committed provider call through
-        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`, so a storage skip there
-        // must keep the marker instead of letting a retry re-run the operation.
-        let retain_inflight_on_storage_skip = ctx.serverless_owned_dedup_publication
+        // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`.
+        let requires_execution_barrier = ctx.serverless_owned_dedup_publication
             == Some(self.instance_id)
             || ctx
                 .metadata
@@ -2500,9 +3343,8 @@ impl Plugin for RequestDeduplication {
         // `ai_federation` provider call, which marks
         // `EXTERNAL_OPERATION_COMPLETED_METADATA_KEY`): that operation has no
         // replayable response, so a same-key retry must not immediately
-        // re-execute it. Retain both in-flight locks until `inflight_ttl` in
-        // that case, mirroring the terminate-mode serverless side-effect owner
-        // handling above.
+        // re-execute it. Park the exact ownership until the committed hook can
+        // publish its authoritative completion barrier.
         if ctx
             .metadata
             .contains_key(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
@@ -2532,8 +3374,8 @@ impl Plugin for RequestDeduplication {
                 return PluginResult::Continue;
             }
             self.remove_matching_local_inflight(&key, &fingerprint, &local_inflight_owner_token);
-            if let Some(token) = redis_lock_token.as_deref() {
-                self.redis_release_inflight(&key, &fingerprint, token).await;
+            if let Some(ownership) = redis_lock_token.as_ref() {
+                self.redis_release_inflight(&key, ownership).await;
             }
             return PluginResult::Continue;
         }
@@ -2552,15 +3394,37 @@ impl Plugin for RequestDeduplication {
         // request is still treated as a straddle. The gate content read by the
         // transforms that shaped these bytes is then unknown, and the
         // representation belongs to no provable policy.
-        if !ctx.response_policy_stamp_stable() {
+        //
+        // The one exemption is the external-operation tombstone: its bytes are
+        // a fixed refusal that claims no presentation policy, and withholding
+        // it would restore the re-execution window GHSA-8cr6-rw38-7j59 closes.
+        // See `EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY`.
+        let publishing_external_tombstone = ctx
+            .metadata
+            .get(EXTERNAL_OPERATION_TOMBSTONE_PUBLICATION_KEY)
+            .and_then(|owner| owner.parse::<u64>().ok())
+            == Some(self.instance_id);
+        if !publishing_external_tombstone && !ctx.response_policy_stamp_stable() {
             // The final representation may have straddled a policy
             // publication, so it is unsafe to persist. Keep the in-flight
-            // ownership until its bounded TTL rather than allowing a retry to
-            // repeat a possibly completed external side effect.
+            // ownership rather than allowing a retry to repeat a possibly
+            // completed external side effect. An owner of an already-performed
+            // external operation parks that ownership so the committed hook can
+            // replace the bounded lease with a durable execution barrier.
+            self.park_ownership_for_execution_barrier(
+                ctx,
+                requires_execution_barrier,
+                RequestDeduplicationRequestState {
+                    key,
+                    fingerprint,
+                    local_inflight_owner_token,
+                    redis_lock_token,
+                },
+            );
             return PluginResult::Continue;
         }
         let response_policy = ctx.response_policy_provenance();
-        if response_policy.complete().is_none() {
+        if !publishing_external_tombstone && response_policy.complete().is_none() {
             // The effective response-side presentation policy could not be
             // established — no plugin-cache view, or this proxy carries a
             // plugin whose response rewrite comes from live runtime state
@@ -2571,12 +3435,24 @@ impl Plugin for RequestDeduplication {
             // unprovable policy would otherwise be served them.
             //
             // Concurrent-duplicate protection is unaffected — the in-flight
-            // marking already happened and is kept until its bounded TTL, so a
-            // retry cannot repeat a possibly completed external side effect.
-            // Only the finalized *replay* is given up.
+            // marking already happened and is kept, so a retry cannot repeat a
+            // possibly completed external side effect. Only the finalized
+            // *replay* is given up; an owner of an already-performed external
+            // operation parks its ownership so the committed hook can replace
+            // the bounded lease with a durable execution barrier.
             debug!(
                 "request_deduplication: response-side presentation policy could not be \
                  established for this request; retaining no replayable representation"
+            );
+            self.park_ownership_for_execution_barrier(
+                ctx,
+                requires_execution_barrier,
+                RequestDeduplicationRequestState {
+                    key,
+                    fingerprint,
+                    local_inflight_owner_token,
+                    redis_lock_token,
+                },
             );
             return PluginResult::Continue;
         }
@@ -2591,6 +3467,16 @@ impl Plugin for RequestDeduplication {
         // sanitization on store. See [`super::utils::cache_headers`].
         let safe_headers = sanitize_cached_headers(response_headers);
 
+        // The external-operation tombstone is an execution barrier, not a
+        // representation of the real response: it replaces an in-flight marker
+        // that blocked duplicates for `inflight_ttl_seconds`, so it must live at
+        // least that long. Ordinary completions keep `ttl_seconds`.
+        let retention = if publishing_external_tombstone {
+            self.execution_barrier_retention()
+        } else {
+            self.ttl
+        };
+
         let (cached, sequence, completed, inflight) = match self.local_publish_completed(
             &key,
             &fingerprint,
@@ -2599,9 +3485,10 @@ impl Plugin for RequestDeduplication {
                 status_code: response_status,
                 headers: safe_headers,
                 body,
-                retain_inflight_on_skip: retain_inflight_on_storage_skip,
-                retain_inflight_on_eviction: retain_inflight_on_storage_skip
+                publish_execution_barrier_on_skip: requires_execution_barrier,
+                retain_barrier_on_eviction: requires_execution_barrier
                     || redis_lock_token.is_some(),
+                retention,
                 response_policy,
             },
         ) {
@@ -2638,88 +3525,119 @@ impl Plugin for RequestDeduplication {
                         );
                     }
                 }
-                if let Some(cached) = redis_candidate {
-                    match self.redis_set(&key, &fingerprint, &cached).await {
-                        RedisStoreAction::Stored => {
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    // Transition the distributed ownership through the fence: a
+                    // replayable record when the payload fits, otherwise a
+                    // non-replayable tombstone. An external operation also keeps
+                    // the fixed-size local barrier created above. Peers get a
+                    // deterministic answer instead of being released to
+                    // re-execute once the raw lease expires; a record with no
+                    // replay is held for `execution_barrier_retention()`, so it
+                    // never expires sooner than the lease it replaced.
+                    match self
+                        .redis_publish_completed(
+                            &key,
+                            &fingerprint,
+                            ownership,
+                            redis_candidate.as_ref(),
+                            publishing_external_tombstone,
+                        )
+                        .await
+                    {
+                        // The completed Redis record now owns the distributed
+                        // key. Remove only a raw local in-flight marker; an
+                        // external operation's explicit local barrier survives.
+                        RedisPublication::Published { .. } => {
                             self.remove_matching_local_inflight(
                                 &key,
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
-                            if let Some(token) = redis_lock_token.as_deref() {
-                                self.redis_release_inflight(&key, &fingerprint, token).await;
-                            }
                         }
-                        RedisStoreAction::SkippedSize if !retain_inflight_on_storage_skip => {
+                        RedisPublication::NotOwner => {
+                            // A stale publisher must discard either provisional
+                            // local state, but exact variant/token matching must
+                            // not clear a successor that acquired after expiry.
                             self.remove_matching_local_inflight(
                                 &key,
                                 &fingerprint,
                                 &local_inflight_owner_token,
                             );
-                            if let Some(token) = redis_lock_token.as_deref() {
-                                self.redis_release_inflight(&key, &fingerprint, token).await;
-                            }
+                            self.remove_matching_local_execution_barrier(
+                                &key,
+                                &fingerprint,
+                                &local_inflight_owner_token,
+                            );
                         }
-                        // Nothing was retained locally. If Redis publication
-                        // fails too (or an owned terminal response cannot fit
-                        // the Redis payload limit), keep both in-flight locks
-                        // until `inflight_ttl` so retries cannot immediately
-                        // re-run an external side effect with no replay value.
-                        RedisStoreAction::SkippedSize | RedisStoreAction::Failed => {}
+                        // Redis could not be reached. Keep the provisional local
+                        // state — an ordinary in-flight lease or an external
+                        // operation's execution barrier. The Redis record
+                        // expires on its own lease.
+                        RedisPublication::Unavailable => {}
                     }
-                    return PluginResult::Continue;
-                }
-                if !retain_inflight_on_storage_skip && let Some(token) = redis_lock_token.as_deref()
-                {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
                 }
                 return PluginResult::Continue;
             }
             LocalCompletionAction::Stale => {
-                if let Some(token) = redis_lock_token.as_deref() {
-                    self.redis_release_inflight(&key, &fingerprint, token).await;
+                if let Some(ownership) = redis_lock_token.as_ref() {
+                    self.redis_release_inflight(&key, ownership).await;
                 }
                 return PluginResult::Continue;
             }
         };
-        // Also store in Redis if available. Release the distributed in-flight
-        // lock only after the completed response is visible in Redis, so a peer
-        // cannot miss both the lock and the replayable response.
+        // Publish to Redis through the ownership fence. There is no separate
+        // "release the lock afterwards" step: the compare-and-set replaces this
+        // request's in-flight record with the completed record in one
+        // transaction, so peers never observe a completed value while a
+        // successor owns the operation, and never observe the operation as
+        // unowned-and-uncompleted in between.
         let mut preserve_local_completion =
-            self.redis_client.is_none() && retain_inflight_on_storage_skip;
-        if self.redis_client.is_some() {
-            match self.redis_set(&key, &fingerprint, &cached).await {
-                RedisStoreAction::Stored => {
+            self.redis_client.is_none() && requires_execution_barrier;
+        if let Some(ownership) = redis_lock_token.as_ref() {
+            match self
+                .redis_publish_completed(
+                    &key,
+                    &fingerprint,
+                    ownership,
+                    Some(&cached),
+                    publishing_external_tombstone,
+                )
+                .await
+            {
+                RedisPublication::Published { replayable: true } => {
                     // Redis now carries the replay, so ordinary LRU eviction is
                     // safe even for an externally executing terminal response.
-                    self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
-                    if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token).await;
-                    }
+                    self.set_completed_barrier_retention(&key, &fingerprint, sequence, false);
                 }
-                // The local replay is available, but a peer cannot see it. For
-                // an externally executing terminal response, retain the
-                // distributed lock until its TTL instead of allowing a peer to
-                // re-execute the side effect immediately.
-                RedisStoreAction::SkippedSize if retain_inflight_on_storage_skip => {
+                // The response fits local retention but not the Redis payload
+                // cap, so a non-replayable tombstone owns the distributed key.
+                // Peers get a deterministic conflict; this gateway keeps the
+                // richer local replay and protects it from eviction.
+                RedisPublication::Published { replayable: false } => {
                     preserve_local_completion = true;
                 }
-                RedisStoreAction::SkippedSize => {
-                    self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
-                    if let Some(token) = redis_lock_token.as_deref() {
-                        self.redis_release_inflight(&key, &fingerprint, token).await;
-                    }
+                RedisPublication::NotOwner => {
+                    // This owner's lease expired or a successor owns the
+                    // operation. The completion is not authoritative: refusing
+                    // the distributed write while keeping a local replay would
+                    // make this gateway answer retries with a result the rest of
+                    // the deployment does not recognize. Drop it and let the
+                    // next request re-read the authoritative record.
+                    self.remove_local_completed(&key, &fingerprint, sequence);
+                    self.remove_matching_local_execution_barrier(
+                        &key,
+                        &fingerprint,
+                        &local_inflight_owner_token,
+                    );
+                    return PluginResult::Continue;
                 }
-                RedisStoreAction::Failed => {
-                    // If this response owns a terminal side effect or a Redis
-                    // in-flight lock, no distributed replay is known to exist.
-                    // Keep the local replay when possible and retain a local
-                    // tombstone if later capacity pressure must evict it.
-                    preserve_local_completion =
-                        retain_inflight_on_storage_skip || redis_lock_token.is_some();
-                    if !preserve_local_completion {
-                        self.set_completed_inflight_retention(&key, &fingerprint, sequence, false);
-                    }
+                RedisPublication::Unavailable => {
+                    // No distributed replay is known to exist. Keep the local
+                    // replay and retain a local tombstone if later capacity
+                    // pressure must evict it. The Redis in-flight record is left
+                    // to expire on its own lease, so peers stay blocked instead
+                    // of splitting ownership.
+                    preserve_local_completion = true;
                 }
             }
         }
@@ -2730,7 +3648,8 @@ impl Plugin for RequestDeduplication {
         // safety state. When no distributed replay exists, retain one completed
         // replay even if active in-flight requests temporarily push the cache
         // over max_entries; later pressure converts older protected replays to
-        // bounded-TTL in-flight tombstones rather than dropping them.
+        // fixed-size barriers with their original retention clocks rather than
+        // dropping them or restarting `inflight_ttl`.
         self.evict_completed_over_capacity(completed, inflight, preserve_local_completion);
 
         PluginResult::Continue
@@ -2759,9 +3678,8 @@ impl Plugin for RequestDeduplication {
                 &state.fingerprint,
                 &state.local_inflight_owner_token,
             );
-            if let Some(token) = state.redis_lock_token.as_deref() {
-                self.redis_release_inflight(&state.key, &state.fingerprint, token)
-                    .await;
+            if let Some(ownership) = state.redis_lock_token.as_ref() {
+                self.redis_release_inflight(&state.key, ownership).await;
             }
             return;
         }
@@ -2782,6 +3700,25 @@ impl Plugin for RequestDeduplication {
             let _ = self
                 .on_final_response_body(ctx, response_status, response_headers, body)
                 .await;
+            // The publication path refuses a replayable completion when this
+            // response's policy provenance straddled a publication or could not
+            // be established at all (no plugin-cache view, or a `Dynamic`
+            // response-presentation policy). It parks this instance's exact
+            // ownership back into the request to say so
+            // (`park_ownership_for_execution_barrier`). The serverless operation
+            // already ran, so leaving only the raw in-flight lease would make it
+            // executable again once `inflight_ttl_seconds` elapsed. Transition
+            // that same ownership through the fixed non-replayable 409
+            // external-operation tombstone instead — the same fenced path, with
+            // `execution_barrier_retention()` so the barrier outlives the lease
+            // it replaces. A capacity or Redis rejection there still fails
+            // closed on the retained in-flight markers.
+            if ctx
+                .request_deduplication_states
+                .contains_key(&self.instance_id)
+            {
+                self.publish_external_operation_tombstone(ctx).await;
+            }
             ctx.serverless_owned_dedup_publication = previous_publication_owner;
             if let Some(marker) = synthetic_marker {
                 ctx.metadata.insert(
@@ -2805,27 +3742,13 @@ impl Plugin for RequestDeduplication {
         // the publication path runs instead of the retain-and-return synthetic
         // guard, then restored for any later hook that observes it. If capacity
         // is too small even for the tombstone, `local_publish_completed` keeps
-        // the in-flight locks (see `retain_inflight_on_storage_skip`) rather than
-        // failing open to an immediate duplicate.
+        // the fixed-size execution barrier rather than failing open to an
+        // immediate duplicate.
         if ctx
             .metadata
             .contains_key(super::EXTERNAL_OPERATION_COMPLETED_METADATA_KEY)
         {
-            let synthetic_marker = ctx
-                .metadata
-                .remove(crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY);
-            let headers = HashMap::from([
-                ("content-type".to_string(), "application/json".to_string()),
-                ("cache-control".to_string(), "no-store".to_string()),
-            ]);
-            let body = br#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
-            let _ = self.on_final_response_body(ctx, 409, &headers, body).await;
-            if let Some(marker) = synthetic_marker {
-                ctx.metadata.insert(
-                    crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
-                    marker,
-                );
-            }
+            self.publish_external_operation_tombstone(ctx).await;
             return;
         }
 
@@ -2862,9 +3785,8 @@ impl Plugin for RequestDeduplication {
                 &state.fingerprint,
                 &state.local_inflight_owner_token,
             );
-            if let Some(token) = state.redis_lock_token.as_deref() {
-                self.redis_release_inflight(&state.key, &state.fingerprint, token)
-                    .await;
+            if let Some(ownership) = state.redis_lock_token.as_ref() {
+                self.redis_release_inflight(&state.key, ownership).await;
             }
         }
     }

@@ -483,7 +483,12 @@ fn default_buffering_predicate_inputs_have_not_drifted() {
 /// are the only names it is allowed to special-case.
 #[test]
 fn screen_special_cases_stay_minimal() {
-    let no_construct = ["geo_restriction", "oidc_relying_party", "udp_logging"];
+    let no_construct = [
+        "geo_restriction",
+        "oidc_relying_party",
+        "transaction_log_schema",
+        "udp_logging",
+    ];
     let shape_only = ["body_validator"];
     let actual = REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT;
     assert_eq!(actual, no_construct.as_slice());

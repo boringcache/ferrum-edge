@@ -442,16 +442,26 @@ println!("✓ Test description");
 
 ## Future Enhancements
 
-- [x] Add PostgreSQL/MySQL backend testing — required CI matrix in this doc + `functional_database_parity_test` / admin CRUD / namespace entry points
-- [x] Add TLS configuration testing — see [Database TLS Testing](database_tls.md#functional-testing); hosted data-plane provisions SQL + Mongo TLS fixtures inline with `FERRUM_DB_TLS_REQUIRED=1`
-- [ ] Add metrics verification (check actual metric values)
-- [x] Add concurrent request testing — `run_concurrent_admin_mutations` in the admin CRUD matrix
-- [ ] Add large payload testing
-- [ ] Add WebSocket proxy testing
-- [x] Add plugin execution verification — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
-- [x] Add consumer authentication testing — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
-- [ ] Add rate limiting verification
-- [ ] Add performance benchmarking
+Broad "add X testing" bullets from the original checklist are reconciled against
+current functional coverage. Retain only exact residuals.
+
+### Covered (do not reopen as missing database-mode work)
+
+- [x] PostgreSQL/MySQL backend testing — required CI matrix in this doc + `functional_database_parity_test` / admin CRUD / namespace entry points
+- [x] TLS configuration testing — see [Database TLS Testing](database_tls.md#functional-testing); hosted data-plane provisions SQL + Mongo TLS fixtures inline with `FERRUM_DB_TLS_REQUIRED=1`
+- [x] Metrics verification (endpoint + selected metric values) — `functional_database_test` hits `/admin/metrics`; value-level asserts live in `functional_admin_observability_test` / `functional_admin_connection_limit_test`
+- [x] Concurrent request testing — `run_concurrent_admin_mutations` in the admin CRUD matrix
+- [x] Large / bounded payload testing — `functional_body_size_limits_test` (request/response Content-Length and streaming limits)
+- [x] WebSocket proxy testing — `functional_websocket_*` / `functional_ws_*` suites
+- [x] Plugin execution verification — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
+- [x] Consumer authentication testing — see [Auth & ACL Functional Testing](functional_testing_auth_acl.md)
+- [x] Rate limiting verification — `functional_redis_rate_limiting_test` + plugin network suites
+- [x] Performance / scale stress — `tests/performance/multi_protocol/` plus scheduled `.github/workflows/scaling-regression.yml` (30k/10k suites excluded from PR shards by design)
+
+### Exact residuals (live trackers)
+
+- [ ] MongoDB replica-set **change-stream-triggered** config wakeups (polling remains the authoritative backstop) — [#3330](https://github.com/ferrum-edge/ferrum-edge/issues/3330)
+- [ ] Live OIDC relying-party / OAuth2 introspection service-integration coverage — [#3333](https://github.com/ferrum-edge/ferrum-edge/issues/3333)
 
 ## Testing with MongoDB
 

@@ -78,6 +78,8 @@ const SPOOL_OWNER_DIGEST_DOMAIN: &[u8] = b"ferrum-edge/api_chargeback_sink/spool
 const SPOOL_OWNER_DIGEST_LEN: usize = 32;
 /// Hex characters of the ownership digest embedded in every managed filename.
 const SPOOL_OWNER_TAG_LEN: usize = 32;
+/// Owner-tag length written by the original version-1 spool format.
+const SPOOL_LEGACY_OWNER_TAG_LEN: usize = 16;
 const SPOOL_INFLIGHT_SUFFIX: &str = ".inflight";
 const SPOOL_CLAIM_MARKER: &str = ".claim-";
 const SPOOL_WRITE_MARKER: &str = ".write-";
@@ -2327,9 +2329,10 @@ impl ApiChargebackSink {
                     "{PLUGIN_NAME}: refusing new snapshot generation while pending finalization recovery budget is exhausted ({SNAPSHOT_FINALIZATION_RECOVERY_POLICY})"
                 ));
             }
-            let accumulator = Arc::new(SnapshotAccumulator::with_limits(
+            let accumulator = Arc::new(SnapshotAccumulator::with_limits_and_shards(
                 self.config.snapshot.max_entries,
                 self.config.snapshot.max_retained_bytes,
+                self.http_client.pool_shard_amount(),
             ));
             let emission_lock = Arc::new(Mutex::new(()));
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -4213,7 +4216,16 @@ fn build_clickhouse_http_client(
         return Ok(ClickHouseHttpClient::Shared(Box::new(shared.clone())));
     }
 
+    // Ignore ambient `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`
+    // process state (matches the shared PluginHttpClient builders). reqwest
+    // enables system-proxy discovery by default. With a proxy selected, the
+    // connector dials and screens the *proxy* while the proxy resolves and
+    // connects to the configured ClickHouse host, so the ultimate destination
+    // address never passes the `DnsCacheResolver` egress screen installed
+    // below. Inherited proxy environment must not be able to override the
+    // gateway's documented outbound address boundary.
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_millis(cfg.timeout_ms))
         .timeout(Duration::from_millis(cfg.timeout_ms))
         // Do not follow redirects: a 3xx from an allowed ClickHouse host could
@@ -4290,6 +4302,38 @@ fn build_clickhouse_http_client(
 pub struct SpoolStats {
     pub files: u64,
     pub bytes: u64,
+}
+
+/// One owned spool artifact with the size used for quota accounting.
+#[derive(Debug, Clone)]
+struct OwnedSpoolEntry {
+    path: PathBuf,
+    len: u64,
+}
+
+/// Single walk/sort/stat snapshot of owned spool usage.
+#[derive(Debug, Clone, Default)]
+struct OwnedSpoolInventory {
+    entries: Vec<OwnedSpoolEntry>,
+    stats: SpoolStats,
+}
+
+/// Deterministic report from one quota-eviction admission attempt.
+///
+/// External tests use this to prove multi-file reclaim is planned from a single
+/// inventory/sort rather than rescanning after every deletion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuotaEvictionReport {
+    /// How many times owned spool metadata was inventoried/sorted.
+    pub inventory_passes: u64,
+    /// Owned files present in that inventory snapshot.
+    pub files_inventoried: u64,
+    /// Owned bytes observed before deletions.
+    pub bytes_before: u64,
+    /// Files successfully unlinked during the pass.
+    pub files_deleted: u64,
+    /// Bytes freed according to the inventory snapshot sizes.
+    pub bytes_freed: u64,
 }
 
 /// Versioned durable ownership record for one managed chargeback spool namespace.
@@ -4385,13 +4429,18 @@ impl SpoolOwner {
     fn matches_meta(&self, meta: &SpoolNamespaceMeta) -> bool {
         meta.version == SPOOL_FORMAT_VERSION
             && meta.owner_digest == self.digest.as_ref()
-            && meta.owner_tag == self.tag.as_ref()
+            && self.matches_tag(&meta.owner_tag)
             && meta.plugin_config_id == self.plugin_config_id.as_ref()
             && meta.ferrum_namespace == self.ferrum_namespace.as_ref()
             && meta.destination_endpoint == self.destination_endpoint.as_ref()
             && meta.database == self.database.as_ref()
             && meta.table == self.table.as_ref()
             && meta.node_id == self.node_id.as_ref()
+    }
+
+    fn matches_tag(&self, tag: &str) -> bool {
+        tag == self.tag.as_ref()
+            || (tag.len() == SPOOL_LEGACY_OWNER_TAG_LEN && self.tag.starts_with(tag))
     }
 }
 
@@ -5163,6 +5212,23 @@ impl SpoolManager {
         self.list_owned_spool_files()
     }
 
+    /// Run quota eviction under the writer lock and return the planning report.
+    ///
+    /// External tests use this to assert multi-file reclaim is driven by one
+    /// inventory/sort pass rather than a per-deletion rescan.
+    #[doc(hidden)]
+    #[allow(dead_code)] // external unit tests only
+    pub fn evict_until_can_admit_for_tests(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.evict_until_can_admit_with_report(incoming_len)
+    }
+
     #[doc(hidden)]
     #[allow(dead_code)] // external unit tests only
     pub fn list_owned_spool_files_with_entry_limit_for_tests(
@@ -5230,9 +5296,9 @@ impl SpoolManager {
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
         // Optional test seam: runs under the writer lock so injected stalls
         // model real compression/write/fsync latency without changing the
-        // request-path enqueue contract.
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::BeforeWrite);
-        let _after_hook = SpoolWriteHookAfterGuard;
+        // request-path enqueue contract. Snapshot the hook once so AfterWrite
+        // cannot observe a different (later-installed) hook than BeforeWrite.
+        let _after_hook = SpoolWriteHookAfterGuard::enter();
         self.prepare_live_storage_locked()?;
         let body = serialize_json_each_row(events)?;
         if body.len() as u64 > SPOOL_MAX_ARTIFACT_BYTES {
@@ -5496,16 +5562,29 @@ impl SpoolManager {
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
+        Ok(self.inventory_owned_spool_files()?.stats)
+    }
+
+    /// Collect owned `(path, size)` metadata once, sorted oldest-first.
+    ///
+    /// Quota eviction plans from this snapshot so reclaiming K files never
+    /// repeats a full directory walk/sort per deletion.
+    fn inventory_owned_spool_files(&self) -> Result<OwnedSpoolInventory, String> {
         let files = self.list_owned_spool_files()?;
-        let mut stats = SpoolStats::default();
+        let mut inventory = OwnedSpoolInventory {
+            entries: Vec::with_capacity(files.len()),
+            stats: SpoolStats::default(),
+        };
         for file in files {
             match fs::symlink_metadata(&file) {
                 Ok(meta) => {
                     if meta.file_type().is_symlink() {
                         continue;
                     }
-                    stats.files = stats.files.saturating_add(1);
-                    stats.bytes = stats.bytes.saturating_add(meta.len());
+                    let len = meta.len();
+                    inventory.stats.files = inventory.stats.files.saturating_add(1);
+                    inventory.stats.bytes = inventory.stats.bytes.saturating_add(len);
+                    inventory.entries.push(OwnedSpoolEntry { path: file, len });
                 }
                 Err(error) => {
                     return Err(format!(
@@ -5515,7 +5594,7 @@ impl SpoolManager {
                 }
             }
         }
-        Ok(stats)
+        Ok(inventory)
     }
 
     /// Drop oldest evictable owned spool files until
@@ -5529,61 +5608,98 @@ impl SpoolManager {
     /// destroy another owner's or another delivery's billing data. When only
     /// such files remain the write fails closed instead of over-admitting or
     /// stealing them.
+    ///
+    /// Planning inventories and sorts the owned set once, then deletes enough
+    /// eligible files from that snapshot in a single bounded pass.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
+        self.evict_until_can_admit_with_report(incoming_len)
+            .map(|_| ())
+    }
+
+    fn evict_until_can_admit_with_report(
+        &self,
+        incoming_len: u64,
+    ) -> Result<QuotaEvictionReport, String> {
         if incoming_len > self.cfg.max_bytes {
             return Err(format!(
                 "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
                 self.cfg.max_bytes
             ));
         }
-        loop {
-            let stats = self.scan_stats()?;
-            if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
-                return Ok(());
+        let inventory = self.inventory_owned_spool_files()?;
+        let mut report = QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: inventory.stats.files,
+            bytes_before: inventory.stats.bytes,
+            files_deleted: 0,
+            bytes_freed: 0,
+        };
+        let mut remaining_bytes = inventory.stats.bytes;
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+
+        let wall_clock = SystemTime::now();
+        let mut protected = 0u64;
+        let mut warned = false;
+        for entry in &inventory.entries {
+            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                return Ok(report);
             }
-            let owned = self.list_owned_spool_files()?;
-            let wall_clock = SystemTime::now();
-            let Some(oldest) = owned
-                .iter()
-                .find(|path| self.is_evictable_owned_file(path.as_path(), wall_clock))
-                .cloned()
-            else {
-                let protected = owned.len();
-                return Err(format!(
-                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
-                    self.cfg.max_bytes
-                ));
-            };
-            self.assert_managed_path(&oldest)?;
-            match fs::remove_file(&oldest) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
+                protected = protected.saturating_add(1);
+                continue;
+            }
+            self.assert_managed_path(&entry.path)?;
+            match fs::remove_file(&entry.path) {
+                Ok(()) => {
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.files_deleted = report.files_deleted.saturating_add(1);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                    self.metrics
+                        .spool_drops_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !warned {
+                        let now = unix_timestamp_seconds();
+                        let last = self.last_drop_warn_at.load(Ordering::Relaxed);
+                        if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
+                            && self
+                                .last_drop_warn_at
+                                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                        {
+                            warn!(
+                                plugin = PLUGIN_NAME,
+                                max_bytes = self.cfg.max_bytes,
+                                incoming_bytes = incoming_len,
+                                "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
+                            );
+                            warned = true;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone: credit the snapshot size so admission can
+                    // continue from this one inventory without rescanning.
+                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                }
                 Err(error) => {
                     return Err(format!(
                         "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
-                        oldest.display()
+                        entry.path.display()
                     ));
                 }
             }
-            self.metrics
-                .spool_drops_total
-                .fetch_add(1, Ordering::Relaxed);
-            let now = unix_timestamp_seconds();
-            let last = self.last_drop_warn_at.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
-                && self
-                    .last_drop_warn_at
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                warn!(
-                    plugin = PLUGIN_NAME,
-                    max_bytes = self.cfg.max_bytes,
-                    incoming_bytes = incoming_len,
-                    "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
-                );
-            }
         }
+
+        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+            return Ok(report);
+        }
+        Err(format!(
+            "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
+            self.cfg.max_bytes
+        ))
     }
 
     /// Whether one owned file may be dropped to make room for a new batch.
@@ -5606,7 +5722,7 @@ impl SpoolManager {
             // Untagged retained artifacts (legacy temps, dead-letter metadata for
             // pre-tag files) belong to this namespace and stay evictable.
             None => true,
-            Some(tag) => tag == self.owner.tag.as_ref(),
+            Some(tag) => self.owner.matches_tag(tag),
         }
     }
 
@@ -5798,10 +5914,9 @@ impl SpoolManager {
         self.validate_namespace_meta()?;
         let mut candidates = Vec::new();
         self.collect(&mut candidates, SpoolFileClass::Replayable)?;
-        let mine = self.owner.tag.as_ref();
         let mut files = Vec::new();
         for path in candidates {
-            if spool_file_owner_tag(&path).is_some_and(|tag| tag == mine) {
+            if spool_file_owner_tag(&path).is_some_and(|tag| self.owner.matches_tag(tag)) {
                 files.push(path);
             }
         }
@@ -5822,10 +5937,9 @@ impl SpoolManager {
         if self.collect(&mut candidates, class).is_err() {
             return 0;
         }
-        let mine = self.owner.tag.as_ref();
         let mut foreign = 0u64;
         for path in &candidates {
-            if !spool_file_owner_tag(path).is_some_and(|tag| tag == mine) {
+            if !spool_file_owner_tag(path).is_some_and(|tag| self.owner.matches_tag(tag)) {
                 foreign = foreign.saturating_add(1);
             }
         }
@@ -5853,7 +5967,7 @@ impl SpoolManager {
             ));
         }
         match spool_file_owner_tag(path) {
-            Some(tag) if tag == self.owner.tag.as_ref() => {}
+            Some(tag) if self.owner.matches_tag(tag) => {}
             _ => {
                 return Err(format!(
                     "{PLUGIN_NAME}: refusing to claim spool file '{}' owned by another identity",
@@ -6196,7 +6310,9 @@ fn spool_owner_tag_of_name(name: &str) -> Option<&str> {
         .strip_suffix(".ndjson.zst")
         .or_else(|| rest.strip_suffix(".ndjson"))?;
     let (_, tag) = stem.rsplit_once('.')?;
-    if tag.len() == SPOOL_OWNER_TAG_LEN && tag.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if matches!(tag.len(), SPOOL_LEGACY_OWNER_TAG_LEN | SPOOL_OWNER_TAG_LEN)
+        && tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         Some(tag)
     } else {
         None
@@ -6727,23 +6843,39 @@ pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
     }
 }
 
-fn run_spool_write_hook_for_tests(point: SpoolWriteHookPoint) {
-    let hook = spool_write_hook_slot()
+fn snapshot_spool_write_hook_for_tests() -> Option<SpoolWriteHookForTests> {
+    spool_write_hook_slot()
         .lock()
         .ok()
-        .and_then(|slot| slot.clone());
-    if let Some(hook) = hook {
-        hook(point);
-    }
+        .and_then(|slot| slot.clone())
 }
 
 /// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
-/// exit path after [`SpoolWriteHookPoint::BeforeWrite`] has been observed.
-struct SpoolWriteHookAfterGuard;
+/// exit path with the same hook instance that observed `BeforeWrite`.
+///
+/// Re-reading the process-global slot on drop would let a write that entered
+/// under hook A publish `AfterWrite` to a later-installed hook B — breaking
+/// tests that deliberately stall one generation's write while asserting that
+/// generation has not finished.
+struct SpoolWriteHookAfterGuard {
+    hook: Option<SpoolWriteHookForTests>,
+}
+
+impl SpoolWriteHookAfterGuard {
+    fn enter() -> Self {
+        let hook = snapshot_spool_write_hook_for_tests();
+        if let Some(ref hook) = hook {
+            hook(SpoolWriteHookPoint::BeforeWrite);
+        }
+        Self { hook }
+    }
+}
 
 impl Drop for SpoolWriteHookAfterGuard {
     fn drop(&mut self) {
-        run_spool_write_hook_for_tests(SpoolWriteHookPoint::AfterWrite);
+        if let Some(hook) = self.hook.take() {
+            hook(SpoolWriteHookPoint::AfterWrite);
+        }
     }
 }
 
@@ -7663,9 +7795,28 @@ impl SnapshotAccumulator {
     }
 
     pub fn with_limits(max_entries: usize, max_retained_bytes: usize) -> Self {
+        Self::with_limits_and_shards(
+            max_entries,
+            max_retained_bytes,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    /// Build an accumulator whose hot-path maps use `shard_amount` shards.
+    ///
+    /// `shard_amount` must already be normalized (production passes
+    /// `PluginHttpClient::pool_shard_amount()`, which applies
+    /// `FERRUM_POOL_SHARD_AMOUNT` exactly once). Both maps are written from the
+    /// request path under attacker-shaped key cardinality, so they must not
+    /// keep DashMap's default shard count.
+    pub fn with_limits_and_shards(
+        max_entries: usize,
+        max_retained_bytes: usize,
+        shard_amount: usize,
+    ) -> Self {
         Self {
-            entries: DashMap::new(),
-            last_emitted: DashMap::new(),
+            entries: DashMap::with_shard_amount(shard_amount),
+            last_emitted: DashMap::with_shard_amount(shard_amount),
             next_generation: AtomicU64::new(1),
             max_entries: max_entries.max(1),
             max_retained_bytes: max_retained_bytes.max(1),
@@ -7771,11 +7922,11 @@ impl SnapshotAccumulator {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(proxy_name, MAX_FIELD_LEN),
+            proxy_id: bound_key_field(proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(proxy_name, MAX_FIELD_LEN),
             route_id: metadata_value(&summary.metadata, &["route_id"]),
             status_code: outcome.status_code,
             http_status_code: Some(outcome.http_status_code),
@@ -7792,11 +7943,11 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(
+            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(
                 summary.proxy_name.as_deref().unwrap_or("unknown"),
                 MAX_FIELD_LEN,
             ),
@@ -7804,7 +7955,7 @@ impl SnapshotAccumulator {
             status_code: STREAM_STATUS_SENTINEL,
             http_status_code: None,
             grpc_status: None,
-            protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
+            protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
         };
         self.record(meta, charge)
     }
@@ -7816,11 +7967,11 @@ impl SnapshotAccumulator {
         charge: ChargeComputation,
     ) -> SnapshotRecordOutcome {
         let meta = SnapshotMetadata {
-            namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-            consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+            namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+            consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
             consumer_name: metadata_value(&summary.metadata, &["consumer_name"]),
-            proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-            proxy_name: bound_string(
+            proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+            proxy_name: bound_key_field(
                 summary.proxy_name.as_deref().unwrap_or("unknown"),
                 MAX_FIELD_LEN,
             ),
@@ -8592,14 +8743,14 @@ fn event_from_http_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(
+        proxy_id: bound_key_field(
             summary.proxy_id.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
-        proxy_name: bound_string(
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8651,11 +8802,11 @@ fn event_from_stream_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-        proxy_name: bound_string(
+        proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8663,7 +8814,7 @@ fn event_from_stream_summary(
         status_code: STREAM_STATUS_SENTINEL,
         http_status_code: None,
         grpc_status: None,
-        protocol: bound_string(&summary.protocol, MAX_FIELD_LEN),
+        protocol: bound_key_field(&summary.protocol, MAX_FIELD_LEN),
         call_count: u64::from(charge.call_count),
         charge_call: charge.charge_call,
         bytes_sent: charge.bytes_sent,
@@ -8707,11 +8858,11 @@ fn event_from_ws_summary(
         event_id: new_ulid(),
         received_at: unix_timestamp_nanos(),
         node_id: bound_string(node_id, MAX_FIELD_LEN),
-        namespace: bound_string(&summary.namespace, MAX_FIELD_LEN),
-        consumer_id: bound_string(consumer, MAX_FIELD_LEN),
+        namespace: bound_key_field(&summary.namespace, MAX_FIELD_LEN),
+        consumer_id: bound_key_field(consumer, MAX_FIELD_LEN),
         consumer_name: metadata_value(metadata, &["consumer_name"]),
-        proxy_id: bound_string(&summary.proxy_id, MAX_FIELD_LEN),
-        proxy_name: bound_string(
+        proxy_id: bound_key_field(&summary.proxy_id, MAX_FIELD_LEN),
+        proxy_name: bound_key_field(
             summary.proxy_name.as_deref().unwrap_or("unknown"),
             MAX_FIELD_LEN,
         ),
@@ -8793,7 +8944,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
         .get("request_protocol")
         .or_else(|| summary.metadata.get("mesh.request_protocol"))
     {
-        return bound_string(protocol, MAX_FIELD_LEN);
+        return bound_key_field(protocol, MAX_FIELD_LEN);
     }
     if summary.response_status_code == 101 {
         "ws".to_string()
@@ -8805,7 +8956,7 @@ fn infer_http_protocol(summary: &TransactionSummary) -> String {
 fn metadata_value(metadata: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| metadata.get(*key))
-        .map(|value| bound_string(value, MAX_METADATA_FIELD_LEN))
+        .map(|value| bound_key_field(value, MAX_METADATA_FIELD_LEN))
         .filter(|value| !value.is_empty())
 }
 
@@ -8953,15 +9104,30 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
     invalidate_status_cache();
 }
 
+/// Bound a **display-only** field. Never use this for a value that
+/// participates in a snapshot key or an exported billing identity — see
+/// [`bound_key_field`].
 fn bound_string(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        return value.to_string();
-    }
-    let mut end = max_len;
-    while !value.is_char_boundary(end) && end > 0 {
-        end -= 1;
-    }
-    value[..end].to_string()
+    crate::plugins::chargeback::bounded_display(value, max_len).to_string()
+}
+
+/// Bound a field that is part of the snapshot accumulator key or the exported
+/// billing identity.
+///
+/// Prefix truncation here would merge two distinct authenticated principals
+/// (or two distinct routes/proxies) that share a prefix into one exported row
+/// and, in snapshot mode, into one accumulator entry that combines both
+/// parties' calls, bytes, and charges (GHSA-m28c-f3v5-26qg). Oversized values
+/// therefore keep a readable prefix plus a domain-separated digest of the
+/// complete value, which is stable, collision-resistant, and still bounded.
+///
+/// Authenticated external identities are additionally capped at the
+/// authentication boundary
+/// ([`crate::plugins::utils::auth_flow::MAX_AUTHENTICATED_IDENTITY_BYTES`]), so
+/// in practice this path is reached only by long operator-configured Consumer
+/// usernames, display names, or route identifiers.
+fn bound_key_field(value: &str, max_len: usize) -> String {
+    crate::plugins::chargeback::bounded_billing_identity(value, max_len).into_owned()
 }
 
 fn normalize_snapshot_grpc_status(status: u32) -> u32 {

@@ -52,6 +52,31 @@ impl Http3Client {
         Self::from_rustls(client_tls, Some(stream_receive_window))
     }
 
+    /// Build a client that accepts any TLS certificate **and** presents the
+    /// given client certificate chain, for frontend H3 mTLS coverage.
+    ///
+    /// `cert_chain_pem` / `key_pem` are PEM blobs; the leaf must come first.
+    pub fn insecure_with_client_auth(
+        cert_chain_pem: &str,
+        key_pem: &str,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut cert_chain_pem.as_bytes()).collect::<Result<Vec<_>, _>>()?;
+        if certs.is_empty() {
+            return Err("client certificate chain is empty".into());
+        }
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())?
+            .ok_or("client private key not found")?;
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = Arc::new(DangerousAcceptAnyServer);
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(certs, key)?;
+        Self::from_rustls(client_tls, None)
+    }
+
     fn from_rustls(
         mut client_tls: rustls::ClientConfig,
         stream_receive_window: Option<u32>,

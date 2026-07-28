@@ -8,8 +8,13 @@
 //! and uses a separate ALPN advertisement (`h3`). 0-RTT is controlled by
 //! `FERRUM_TLS_EARLY_DATA_METHODS` — when configured, quinn's `into_0rtt()` is
 //! used to detect early data connections and enforce per-method filtering.
-//! Stateless session ticket resumption is always enabled (saves 1 RTT on
-//! reconnects).
+//! The 0.5-RTT accept path is refused when the listener is configured for
+//! frontend client-certificate authentication, because materializing the
+//! connection before the peer's `Certificate` flight would leave
+//! `peer_identity()` unknowable (see [`crate::http3::peer_identity`]).
+//! Session resumption is always enabled (saves 1 RTT on reconnects). Ordinary
+//! listeners use stateless rotating tickets; non-mTLS listeners with early data
+//! enabled use the bounded stateful cache rustls requires for server 0-RTT.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -24,6 +29,10 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{debug, error, info, warn};
 
 use super::config::Http3ServerConfig;
+use super::peer_identity::{
+    H3ConnectionIdentity, quic_max_early_data_size, server_0rtt_handshake_succeeded,
+    zero_rtt_admitted,
+};
 use crate::config::types::{HttpFlavor, Proxy, UpstreamTarget};
 use crate::consumer_index::ConsumerIndex;
 use crate::load_balancer::LoadBalancerCache;
@@ -396,25 +405,39 @@ fn build_h3_quinn_server_config(
 
     server_tls_config.alpn_protocols = vec![b"h3".to_vec()];
     // 0-RTT early data: controlled by FERRUM_TLS_EARLY_DATA_METHODS.
-    // When 0 (default), 0-RTT is disabled — early data is replayable, which is
-    // dangerous for non-idempotent operations proxied through an API gateway.
-    // When non-zero, the gateway accepts 0-RTT and enforces per-method filtering
-    // via quinn's into_0rtt() detection in handle_h3_connection().
-    server_tls_config.max_early_data_size = tls_policy.early_data_max_size;
+    // When the policy reports 0 (default), 0-RTT is disabled — early data is
+    // replayable, which is dangerous for non-idempotent operations proxied
+    // through an API gateway. When the policy reports any non-zero value
+    // (methods configured) on a non-mTLS listener, QUIC/rustls requires
+    // max_early_data_size to be exactly u32::MAX (2^32-1). A finite TLS
+    // early-data byte cap is not expressible on QUIC; Ferrum's method allowlist
+    // in handle_h3_connection() remains the application-layer admission
+    // control. Client-authenticated listeners use 0 so the TLS advertisement
+    // and the 0.5-RTT application accept path are both disabled. Mapping here
+    // keeps startup and live reload fail-closed: quinn rejects any other size,
+    // so we never pass the policy's finite aspirational value through.
+    server_tls_config.max_early_data_size = quic_max_early_data_size(
+        tls_policy.early_data_max_size > 0,
+        client_ca_bundle_path.is_some(),
+    );
 
-    // Enable TLS 1.3 session resumption for QUIC connections.
-    // Stateless tickets allow clients to resume sessions without a full handshake,
-    // saving 1 RTT on reconnections. This is safe (no replay risk — 0-RTT is still
-    // disabled separately via max_early_data_size=0).
-    match rustls::crypto::ring::Ticketer::new() {
-        Ok(ticketer) => {
-            server_tls_config.ticketer = ticketer;
-        }
-        Err(e) => {
-            warn!(
-                "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
-                e
-            );
+    // Rustls accepts server early data only with stateful resumption, because
+    // the stored session record carries the freshness/anti-replay inputs. Keep
+    // that cache bounded by FERRUM_TLS_SESSION_CACHE_SIZE. When early data is
+    // disabled (including every mTLS listener), prefer the ordinary stateless
+    // rotating ticketer; if construction fails, the same bounded stateful cache
+    // remains as the fail-safe resumption fallback.
+    if server_tls_config.max_early_data_size == 0 {
+        match rustls::crypto::ring::Ticketer::new() {
+            Ok(ticketer) => {
+                server_tls_config.ticketer = ticketer;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to create QUIC session ticket rotator, resumption will use stateful cache only: {}",
+                    e
+                );
+            }
         }
     }
     server_tls_config.session_storage =
@@ -597,6 +620,22 @@ pub async fn start_http3_listener_with_signal(
     // the same QUIC handshake bound without reading `state.env_config` per-conn.
     // `Duration::ZERO` preserves the documented "0 disables" semantic.
     let handshake_timeout = h3_config.handshake_timeout;
+    // Frontend client-certificate authentication is a property of the listener,
+    // not of an individual connection: `build_h3_quinn_server_config` installs a
+    // client-cert verifier exactly when `client_ca_bundle_path` is set, and the
+    // reload path rebuilds with the same path. When it is set, the 0.5-RTT
+    // accept path is refused for every connection so peer identity is only ever
+    // read after handshake completion (issue #2938).
+    let client_auth_configured = client_ca_bundle_path.is_some();
+    if client_auth_configured && !state.early_data_methods.is_empty() {
+        warn!(
+            "HTTP/3 0-RTT is disabled on this listener because frontend mTLS \
+             (FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH) is configured. QUIC TLS early data and \
+             the pre-authentication 0.5-RTT accept path are both disabled, so \
+             FERRUM_TLS_EARLY_DATA_METHODS has no effect for HTTP/3 here; ordinary 1-RTT mTLS \
+             requests are unaffected."
+        );
+    }
     let drain_seconds = state.env_config.shutdown_drain_seconds;
     let overload_state = state.overload.clone();
 
@@ -649,6 +688,7 @@ pub async fn start_http3_listener_with_signal(
                                 state,
                                 handshake_timeout,
                                 frontend_listen_port,
+                                client_auth_configured,
                             )
                             .await
                             {
@@ -782,25 +822,50 @@ where
     }
 }
 
+/// Extract the peer certificate chain from a fully handshaken QUIC connection.
+///
+/// Quinn returns `peer_identity()` as `Box<dyn Any>` containing
+/// `Vec<rustls::pki_types::CertificateDer>`. Only meaningful **after** the TLS
+/// handshake has completed — during the 0.5-RTT window it always yields `None`,
+/// which is exactly why the H3 accept path must not snapshot it there.
+fn quinn_peer_cert_chain(connection: &quinn::Connection) -> Option<Vec<Vec<u8>>> {
+    connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
     state: Arc<ProxyState>,
     handshake_timeout: Duration,
     frontend_listen_port: Option<u16>,
+    client_auth_configured: bool,
 ) -> Result<(), anyhow::Error> {
-    let early_data_enabled = !state.early_data_methods.is_empty();
+    // 0-RTT is opt-in via `FERRUM_TLS_EARLY_DATA_METHODS` *and* is refused
+    // outright when this listener does frontend client-certificate
+    // authentication: the 0.5-RTT accept path would materialize the connection
+    // before the peer's certificate is known (issue #2938), and the TLS builder
+    // disables client early data for the same listener posture.
+    let early_data_enabled =
+        zero_rtt_admitted(!state.early_data_methods.is_empty(), client_auth_configured);
 
-    // When 0-RTT is enabled in the TLS config, attempt to accept early data
-    // via quinn's into_0rtt(). This returns the connection immediately if the
-    // client sent 0-RTT data (before the handshake completes).
-    //
-    // IMPORTANT: Only requests arriving BEFORE the TLS handshake completes are
-    // 0-RTT early data. Once ZeroRttAccepted resolves (handshake done), new
-    // requests on the same connection are NOT early data. We use an AtomicBool
-    // that starts true and flips to false when the handshake completes, so each
-    // request checks the current state — not the connection-level flag.
-    let in_early_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Single coherent per-connection identity slot. Requests take one lock-free
+    // snapshot, so the early-data flag and the peer certificate can never be
+    // observed out of step. Starts with NO identity and `is_early_data = true`;
+    // the post-handshake identity is published exactly once after successful
+    // handshake completion and after already-ready early streams are accepted.
+    let peer_identity = Arc::new(H3ConnectionIdentity::pre_handshake());
+    // On the 0.5-RTT branch the completion task reports handshake outcome back
+    // to the request accept loop. That loop polls ready request streams first,
+    // so buffered early data is snapshotted before a successful handshake can
+    // publish the established identity and clear replay gating.
+    let mut handshake_completion_rx = None;
 
     // Bound the QUIC handshake so a peer that completes the UDP path-MTU
     // probe / Initial packets but never finishes TLS 1.3 cannot hold a
@@ -818,29 +883,49 @@ async fn handle_h3_connection(
                     "HTTP/3 0-RTT connection accepted from {}",
                     conn.remote_address()
                 );
-                in_early_data.store(true, std::sync::atomic::Ordering::Release);
                 // Spawn a task that waits for the handshake to complete, then
-                // clears the early-data flag. Requests dispatched after this
-                // point will see is_early_data = false. The handshake bound
-                // also applies here: if the peer never completes TLS, the
-                // ZeroRttAccepted future never resolves and the connection
-                // would otherwise sit consuming a slot forever. Closing the
-                // connection on timeout fails any in-flight 0.5-RTT streams.
-                let flag = in_early_data.clone();
+                // reports the outcome to the accept loop. The accept loop owns
+                // identity publication so it can drain every already-ready
+                // early request before clearing the replay flag. Requests
+                // dispatched after publication see `is_early_data = false`
+                // together with the established identity; requests dispatched
+                // before it keep seeing the pre-handshake snapshot, which
+                // carries no identity at all.
+                // The handshake bound also applies here: if the peer never
+                // completes TLS, the ZeroRttAccepted future never resolves and
+                // the connection would otherwise sit consuming a slot forever.
+                // Closing the connection on timeout fails any in-flight 0.5-RTT
+                // streams and deliberately leaves the slot pre-handshake — a
+                // failed or cancelled handshake must never expose an identity.
+                let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                handshake_completion_rx = Some(completion_rx);
                 let conn_for_close = conn.clone();
                 let remote = conn.remote_address();
                 tokio::spawn(async move {
-                    match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout).await {
-                        Ok(_accepted) => {
-                            flag.store(false, std::sync::atomic::Ordering::Release);
-                        }
-                        Err(_elapsed) => {
-                            warn!(
-                                "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
-                                remote, handshake_timeout
-                            );
-                            conn_for_close.close(quinn::VarInt::from_u32(0), b"handshake timeout");
-                        }
+                    let handshake_succeeded =
+                        match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
+                            .await
+                        {
+                            Ok(zero_rtt_accepted) => server_0rtt_handshake_succeeded(
+                                zero_rtt_accepted,
+                                conn_for_close.close_reason().is_none(),
+                            ),
+                            Err(_elapsed) => {
+                                warn!(
+                                    "HTTP/3 handshake timed out from {} after {:?} (0-RTT path)",
+                                    remote, handshake_timeout
+                                );
+                                conn_for_close
+                                    .close(quinn::VarInt::from_u32(0), b"handshake timeout");
+                                false
+                            }
+                        };
+                    let _ = completion_tx.send(handshake_succeeded);
+                    if !handshake_succeeded {
+                        debug!(
+                            "HTTP/3 handshake did not complete from {} (0-RTT path)",
+                            remote
+                        );
                     }
                 });
                 conn
@@ -880,35 +965,16 @@ async fn handle_h3_connection(
     let remote_addr = connection.remote_address();
     debug!("HTTP/3 connection established from {}", remote_addr);
 
-    // Extract peer certificate and chain from the QUIC connection (mTLS).
-    // Quinn returns peer_identity() as Box<dyn Any> containing Vec<rustls::pki_types::CertificateDer>.
-    // Arc-shared so multiplexed streams avoid per-request cert cloning.
-    let peer_certs: Option<Vec<Vec<u8>>> = connection
-        .peer_identity()
-        .and_then(|identity| {
-            identity
-                .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
-                .ok()
-        })
-        .map(|certs| certs.iter().map(|c| c.to_vec()).collect());
-    let client_cert_der: Option<Arc<Vec<u8>>> = peer_certs
-        .as_ref()
-        .and_then(|certs| certs.first())
-        .map(|cert| Arc::new(cert.clone()));
-    // Capture intermediate/CA certs (index 1+) for per-proxy CA filtering in mtls_auth.
-    let client_cert_chain_der: Option<Arc<Vec<Vec<u8>>>> = peer_certs
-        .as_ref()
-        .filter(|certs| certs.len() > 1)
-        .map(|certs| Arc::new(certs[1..].to_vec()));
-    let mtls_auth_connection_cache = client_cert_der
-        .as_ref()
-        .map(|_| Arc::new(crate::plugins::mtls_auth::MtlsAuthConnectionCache::new()));
-    // Connection-scoped SPIFFE extraction cache: the peer cert is fixed for
-    // the QUIC connection, so `spiffe_identity` derives its outcome once and
-    // every multiplexed request stream reuses it without re-parsing the DER.
-    let peer_spiffe_extraction_cache = client_cert_der.as_ref().map(|_| {
-        Arc::new(crate::plugins::mesh::spiffe_identity::SpiffeIdentityConnectionCache::new())
-    });
+    // Publish the peer certificate and chain from the QUIC connection (mTLS).
+    // Every branch that reaches here except the 0-RTT one has already awaited
+    // handshake completion, so `peer_identity()` is meaningful now and the
+    // established snapshot (identity + `is_early_data = false`) is installed
+    // before the accept loop can hand a single stream to a request task. The
+    // 0-RTT branch deliberately does NOT publish here — its completion signal
+    // is consumed in the accept loop after already-ready early streams.
+    if handshake_completion_rx.is_none() {
+        peer_identity.publish_handshake_result(true, quinn_peer_cert_chain(&connection));
+    }
     let frontend_sni_hostname = connection
         .handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
@@ -939,7 +1005,39 @@ async fn handle_h3_connection(
     let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
 
     loop {
-        match h3_conn.accept().await {
+        // A QUIC early-data request and the TLS Connected event can become
+        // ready in the same scheduler turn. Poll request acceptance first so a
+        // buffered replayable stream snapshots the pre-handshake state. Only
+        // after accept is Pending may successful handshake completion publish
+        // the established identity for later 1-RTT streams.
+        let (accepted, handshake_succeeded) =
+            if let Some(completion_rx) = handshake_completion_rx.as_mut() {
+                tokio::select! {
+                    biased;
+                    accepted = h3_conn.accept() => (Some(accepted), None),
+                    completed = completion_rx => {
+                        (None, Some(completed.unwrap_or_default()))
+                    }
+                }
+            } else {
+                (Some(h3_conn.accept().await), None)
+            };
+
+        if let Some(handshake_succeeded) = handshake_succeeded {
+            handshake_completion_rx = None;
+            let peer_certs = if handshake_succeeded {
+                quinn_peer_cert_chain(&quinn_conn)
+            } else {
+                None
+            };
+            peer_identity.publish_handshake_result(handshake_succeeded, peer_certs);
+            continue;
+        }
+
+        let Some(accepted) = accepted else {
+            continue;
+        };
+        match accepted {
             Ok(Some(resolver)) => {
                 // Detect QUIC connection migration: compare SocketAddr (two integer
                 // fields) — zero allocation. Only re-format the IP string when the
@@ -955,16 +1053,20 @@ async fn handle_h3_connection(
                 }
 
                 let state = Arc::clone(&state);
-                let cert = client_cert_der.clone();
-                let chain = client_cert_chain_der.clone();
-                let mtls_auth_connection_cache = mtls_auth_connection_cache.clone();
-                let peer_spiffe_extraction_cache = peer_spiffe_extraction_cache.clone();
                 let frontend_sni_hostname = frontend_sni_hostname.clone();
                 let socket_ip = Arc::clone(&socket_ip);
-                // Snapshot the early-data flag NOW — before spawning the task.
-                // This captures whether the handshake has completed at the moment
-                // this request stream was accepted. Single atomic load (~1ns).
-                let is_early_data = in_early_data.load(std::sync::atomic::Ordering::Acquire);
+                // Take ONE lock-free identity snapshot NOW — before spawning
+                // the task — so the early-data flag and the peer certificate
+                // this stream sees come from the same point in the connection
+                // lifecycle. A single `ArcSwap::load_full()`: no lock, no
+                // allocation beyond the refcount bumps the per-request cert
+                // handles already cost.
+                let identity = peer_identity.snapshot();
+                let cert = identity.client_cert_der.clone();
+                let chain = identity.client_cert_chain_der.clone();
+                let mtls_auth_connection_cache = identity.mtls_auth_connection_cache.clone();
+                let peer_spiffe_extraction_cache = identity.peer_spiffe_extraction_cache.clone();
+                let is_early_data = identity.is_early_data;
                 tokio::spawn(async move {
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
@@ -1618,7 +1720,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Keep recognized gRPC-Web on its ordinary HTTP protocol key. The request
     // view below composes only grpc_method_router and grpc_deadline into that
@@ -1634,9 +1736,12 @@ async fn handle_h3_request(
     // gRPC-Web is promoted only for gRPC policy selection above and must not
     // become native gRPC merely because its policy chain is gRPC-scoped.
     ctx.set_request_http_flavor(detected_http_flavor);
+    // Namespace-composed lookup: the protocol snapshot is keyed by
+    // `namespace|proxy_id`, so a bare `proxy.id` would miss every proxy entry
+    // and fall back to the global policy chain.
     let initial_response_header_policy_plugins = epoch
         .plugin_cache
-        .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
+        .initial_response_header_policy_plugins(&proxy.namespace, &proxy.id, request_protocol);
 
     // Per-proxy HTTP method filtering (checked before plugins to save work).
     // Ordinary request hooks stay skipped, but terminal transaction logging
@@ -1682,9 +1787,13 @@ async fn handle_h3_request(
             .await?;
         }
         let logging_view = if grpc_web_response_content_type.is_some() {
-            epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+            epoch
+                .plugin_cache
+                .grpc_web_request_view(&proxy.namespace, &proxy.id)
         } else {
-            epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+            epoch
+                .plugin_cache
+                .request_view(&proxy.namespace, &proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
         log_pre_backend_rejected_request(
@@ -1731,9 +1840,13 @@ async fn handle_h3_request(
     // capability bitset, and buffering flag below is derived from the same
     // cache generation without retaining the full cache across awaits.
     let plugin_cache_view = if grpc_web_response_content_type.is_some() {
-        epoch.plugin_cache.grpc_web_request_view(&proxy.id)
+        epoch
+            .plugin_cache
+            .grpc_web_request_view(&proxy.namespace, &proxy.id)
     } else {
-        epoch.plugin_cache.request_view(&proxy.id, request_protocol)
+        epoch
+            .plugin_cache
+            .request_view(&proxy.namespace, &proxy.id, request_protocol)
     };
 
     // Get pre-resolved plugins filtered by protocol (O(1) lookup)
@@ -3040,7 +3153,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(proxy.id.as_str());
+        .proxy_lifecycle_generation(&proxy.namespace, &proxy.id);
 
     // Preserve the client's original request path for access logging — the
     // transaction summaries below source `request_path` from this, not the
@@ -3182,7 +3295,7 @@ async fn handle_h3_request(
     ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
     ctx.proxy_lifecycle_generation = epoch
         .plugin_cache
-        .proxy_lifecycle_generation(selected_base_proxy.id.as_str());
+        .proxy_lifecycle_generation(&selected_base_proxy.namespace, &selected_base_proxy.id);
 
     let has_deferred_routing_header_hooks = backend_path_is_policy_bound
         && capabilities
@@ -6362,6 +6475,7 @@ async fn handle_h3_request(
                 // as a transport-level failure for CB tripping.
                 if let Some(cb_config) = &proxy.circuit_breaker {
                     let cb = state.circuit_breaker_cache.get_or_create(
+                        &proxy.namespace,
                         &proxy.id,
                         current_cb_target_key.as_deref(),
                         cb_config,
@@ -6408,8 +6522,7 @@ async fn handle_h3_request(
                 }
 
                 // Re-screen the rotated retry target BEFORE admission/dispatch:
-                // the native-H3 pool's `resolve_backend_addr_cached` fast-path
-                // returns IP literals without going through `DnsCache`, so a
+                // the native-H3 pool's cached resolver accepts IP literals, so a
                 // rotated denied literal / `dns_override` target (e.g. a warn-only
                 // DB/DP config carrying `169.254.169.254`) would otherwise be
                 // admitted and dialed here, bypassing the pre-loop screen that only
@@ -7317,9 +7430,12 @@ fn release_h3_circuit_breaker_probe_on_admission_reject(
         return;
     }
     if let Some(cb_config) = &proxy.circuit_breaker {
-        let cb = state
-            .circuit_breaker_cache
-            .get_or_create(&proxy.id, target_key, cb_config);
+        let cb = state.circuit_breaker_cache.get_or_create(
+            &proxy.namespace,
+            &proxy.id,
+            target_key,
+            cb_config,
+        );
         cb.record_neutral(true);
     }
 }
@@ -7555,7 +7671,11 @@ pub(crate) fn inject_sticky_cookie(
             target,
         );
         if let crate::load_balancer::HashOnStrategy::Cookie(ref cookie_name) = strategy {
-            let upstream = LoadBalancerCache::get_upstream_from(&epoch.load_balancer, upstream_id);
+            let upstream = LoadBalancerCache::get_upstream_from(
+                &epoch.load_balancer,
+                &proxy.namespace,
+                upstream_id,
+            );
             let default_cc = crate::config::types::HashOnCookieConfig::default();
             let cookie_config = upstream
                 .as_ref()
@@ -13164,6 +13284,7 @@ mod build_h3_backend_headers_tests {
             frontend_tls_namespace_sources: Vec::new(),
             trust_bundles: None,
             mesh: None,
+            mesh_revision: None,
         };
         ProxyState::new(config, dns_cache, EnvConfig::default(), None, None)
             .expect("minimal ProxyState should construct")

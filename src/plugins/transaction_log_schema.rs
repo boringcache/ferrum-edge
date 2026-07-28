@@ -49,8 +49,31 @@ pub struct TransactionLogSchema {
     schemas: HashMap<String, Arc<SummarySchema>>,
 }
 
+type CompiledSchemaEntry = (String, Arc<Value>, Arc<SummarySchema>);
+
 impl TransactionLogSchema {
+    /// Shape-only validation for admin/CP admission and the buffering screen.
+    /// Compiles every schema entry without staging anything in the process-global
+    /// registry.
+    pub(crate) fn validate_config(config: &Value) -> Result<(), String> {
+        Self::validate_and_compile_entries(config)?;
+        Ok(())
+    }
+
     pub fn new(config: &Value) -> Result<Self, String> {
+        let mut schemas: HashMap<String, Arc<SummarySchema>> = HashMap::new();
+        for (name, raw, compiled) in Self::validate_and_compile_entries(config)? {
+            schemas.insert(name.clone(), compiled.clone());
+            // Register into the active staging area. Isolated constructor
+            // validation is a no-op; graph validation and cache reloads open
+            // explicit abort/commit brackets respectively.
+            registry::register_named(&name, raw, compiled)?;
+        }
+
+        Ok(Self { schemas })
+    }
+
+    fn validate_and_compile_entries(config: &Value) -> Result<Vec<CompiledSchemaEntry>, String> {
         let config_object = config.as_object().ok_or_else(|| {
             "transaction_log_schema: config must be an object containing 'schemas'".to_string()
         })?;
@@ -75,10 +98,16 @@ impl TransactionLogSchema {
             );
         }
 
-        let mut schemas: HashMap<String, Arc<SummarySchema>> = HashMap::with_capacity(obj.len());
+        let mut entries = Vec::with_capacity(obj.len());
+        let mut seen_names = BTreeSet::new();
         for (name, schema_value) in obj {
             if name.is_empty() {
                 return Err("transaction_log_schema: schema names must be non-empty".to_string());
+            }
+            if !seen_names.insert(name.clone()) {
+                return Err(format!(
+                    "transaction_log_schema: duplicate schema name '{name}' within the same plugin config"
+                ));
             }
             // Compile (validates everything). Plugin name uses the schema
             // entry name so error messages point at the offending entry.
@@ -92,27 +121,10 @@ impl TransactionLogSchema {
             let plugin_label = format!("transaction_log_schema[{name}]");
             let compiled =
                 SummarySchema::compile(schema_value, &plugin_label, SchemaCapabilities::BASE)?;
-            let raw = Arc::new(schema_value.clone());
-
-            // Stage the local map FIRST so a defensive duplicate check can
-            // short-circuit before the process-global registry is mutated.
-            // `serde_json::Map` deduplicates keys before this point so the
-            // branch is unreachable in practice, but ordering it this way
-            // keeps the registry consistent with the plugin instance even
-            // if the precondition ever changes.
-            if schemas.insert(name.clone(), compiled.clone()).is_some() {
-                return Err(format!(
-                    "transaction_log_schema: duplicate schema name '{name}' within the same plugin config"
-                ));
-            }
-
-            // Register into the active staging area. Isolated constructor
-            // validation is a no-op; graph validation and cache reloads open
-            // explicit abort/commit brackets respectively.
-            registry::register_named(name, raw, compiled)?;
+            entries.push((name.clone(), Arc::new(schema_value.clone()), compiled));
         }
 
-        Ok(Self { schemas })
+        Ok(entries)
     }
 
     /// All schemas declared by this plugin instance. Used by tests; future
@@ -187,11 +199,7 @@ pub(crate) fn validate_config_graph(
                 ));
                 continue;
             }
-            if let Err(error) = super::validate_plugin_config_with_http_client(
-                &plugin.plugin_name,
-                &plugin.config,
-                http_client.clone(),
-            ) {
+            if let Err(error) = TransactionLogSchema::new(&plugin.config) {
                 errors.push(format!(
                     "Plugin '{}' (id={}, namespace={}): {}",
                     plugin.plugin_name, plugin.id, namespace, error

@@ -37,7 +37,7 @@ use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -45,6 +45,7 @@ use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectCo
 use crate::plugins::chargeback::pricing::{
     PricingConfig, checked_add_charge, checked_mul_quantity, require_finite_charge,
 };
+use crate::plugins::chargeback::{bounded_billing_identity, bounded_display};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 /// Closed top-level config key set for `api_chargeback` admission.
@@ -62,14 +63,111 @@ pub const API_CHARGEBACK_CONFIG_KEYS: &[&str] = &[
     "stale_entry_ttl_seconds",
     "cache_invalidation_min_age_ms",
     "cleanup_interval_seconds",
+    "max_entries",
+    "max_retained_bytes",
 ];
+
+/// Maximum bytes of a billing identity retained in a registry key.
+///
+/// Authenticated external identities are already rejected above
+/// [`crate::plugins::utils::auth_flow::MAX_AUTHENTICATED_IDENTITY_BYTES`] at the
+/// authentication boundary; this second bound keeps an operator-configured
+/// Consumer username from making a single registry entry arbitrarily large.
+/// Oversized values are represented collision-resistantly (prefix + digest of
+/// the complete identity), never by a lossy prefix, so two distinct principals
+/// can never share one registry entry (GHSA-m28c-f3v5-26qg).
+const MAX_REGISTRY_IDENTITY_BYTES: usize = 512;
+
+/// Consumer label used for the fixed-cardinality aggregate row that absorbs
+/// charges once the retained-entry (`max_entries`) budget is exhausted.
+///
+/// This is an *internal* registry representation, not a reserved username.
+/// It lives in the digest-form class used by
+/// [`bounded_billing_identity`](crate::plugins::chargeback::bounded_billing_identity)
+/// (it contains the `~sha256:` marker), so that helper never returns it
+/// verbatim for an external identity claim or operator-configured Consumer
+/// username. The suffix after the marker is deliberately *not* a 64-hex
+/// digest, so a genuine digest-form identity cannot equal this sentinel
+/// either. The human-looking label `__cardinality_overflow__` is therefore an
+/// ordinary principal that stays on its own row.
+///
+/// Charges folded here keep their proxy, status, protocol family, currency,
+/// namespace, and price dimensions, so billable totals survive admission
+/// refusal — only the per-identity attribution is lost, and the refusal is
+/// counted and exported.
+pub const OVERFLOW_CONSUMER_SENTINEL: &str =
+    "__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1";
+
+/// Default maximum number of retained registry entry keys (complete billing
+/// rows). One authenticated principal can occupy many slots because the key
+/// also includes proxy, status, protocol family, currency, namespace, and prices.
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+/// Default maximum retained registry bytes (64 MiB).
+pub const DEFAULT_MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Fixed per-entry accounting overhead charged on top of the owned key and
+/// metadata strings: the `ChargebackEntry` struct, its atomics, the `Arc<str>`
+/// headers, and DashMap's own per-slot bookkeeping.
+const ENTRY_FIXED_OVERHEAD_BYTES: usize = 256;
+
+/// How often, at most, an admission refusal or drop is logged.
+const ADMISSION_WARN_INTERVAL_NANOS: u64 = 60_000_000_000;
+/// Sentinel meaning no admission warning has been emitted yet.
+const NO_ADMISSION_WARN_NANOS: u64 = u64::MAX;
 
 /// Global chargeback registry (singleton per process).
 static CHARGEBACK_REGISTRY: OnceLock<Arc<ChargebackRegistry>> = OnceLock::new();
 
+#[allow(dead_code)] // Used by external tests; production uses try_global_registry / global_registry_with_shard_amount.
 pub fn global_registry() -> Arc<ChargebackRegistry> {
+    global_registry_with_shard_amount(crate::util::sharding::pool_shard_amount(0))
+}
+
+/// Non-owning view of the process-global registry.
+///
+/// Returns `None` when no `api_chargeback` instance (and no other owning caller)
+/// has created the singleton yet. Admin `GET /charges` must use this so an
+/// authenticated scrape before the plugin is configured cannot claim the
+/// `OnceLock` with auto sharding and permanently prevent a later accepted
+/// generation from honoring `PluginHttpClient::pool_shard_amount()`.
+pub fn try_global_registry() -> Option<Arc<ChargebackRegistry>> {
+    CHARGEBACK_REGISTRY.get().cloned()
+}
+
+/// Smallest shard count accepted by `DashMap::with_shard_amount` (power of two
+/// and strictly greater than one). Ephemeral empty `/charges` renders use this
+/// so the non-owning path never panics before any plugin owns the registry.
+const EMPTY_CHARGES_RENDER_SHARD_AMOUNT: usize = 2;
+const _: () = assert!(EMPTY_CHARGES_RENDER_SHARD_AMOUNT.is_power_of_two());
+const _: () = assert!(EMPTY_CHARGES_RENDER_SHARD_AMOUNT > 1);
+
+/// Authenticated empty `/charges` JSON shape used when the registry has never
+/// been created. Allocates only an ephemeral local registry — it does **not**
+/// claim [`CHARGEBACK_REGISTRY`].
+pub fn empty_charges_json() -> Result<String, String> {
+    ChargebackRegistry::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT).render_json_uncached()
+}
+
+/// Authenticated empty `/charges` Prometheus shape used when the registry has
+/// never been created. Does **not** claim [`CHARGEBACK_REGISTRY`].
+pub fn empty_charges_prometheus() -> Result<String, String> {
+    ChargebackRegistry::with_shard_amount(EMPTY_CHARGES_RENDER_SHARD_AMOUNT)
+        .render_prometheus_uncached()
+}
+
+/// Resolve the process-global registry, creating it with `shard_amount` shards
+/// if this is the first access.
+///
+/// The registry's entry map is written from the request path with
+/// attacker-shaped key cardinality, so it must use Ferrum's configured shard
+/// count rather than DashMap's default. `shard_amount` must already be
+/// normalized (production passes `PluginHttpClient::pool_shard_amount()`, which
+/// applies `FERRUM_POOL_SHARD_AMOUNT` exactly once). Later callers observe the
+/// already-created registry; the shard count is fixed for the process lifetime.
+pub fn global_registry_with_shard_amount(shard_amount: usize) -> Arc<ChargebackRegistry> {
     CHARGEBACK_REGISTRY
-        .get_or_init(|| Arc::new(ChargebackRegistry::new()))
+        .get_or_init(|| Arc::new(ChargebackRegistry::with_shard_amount(shard_amount)))
         .clone()
 }
 
@@ -79,16 +177,13 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
     let Some(registry) = CHARGEBACK_REGISTRY.get() else {
         return;
     };
-    let names = config
-        .proxies
-        .iter()
-        .map(|proxy| {
-            (
-                proxy.id.clone(),
-                proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
-            )
-        })
-        .collect();
+    let mut names: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for proxy in &config.proxies {
+        names.entry(proxy.namespace.clone()).or_default().insert(
+            proxy.id.clone(),
+            proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
+        );
+    }
     registry.set_active_proxy_names(names);
 }
 
@@ -149,32 +244,31 @@ type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>
 /// (finding #24).
 ///
 /// The chargeback registry is a process-global singleton shared by every
-/// `api_chargeback` instance, but currency and namespace are properties of the
-/// individual instance (global / proxy / proxy_group scope), not of the
-/// process. Each instance holds an `InstanceScope` and passes it (alongside the
-/// per-request consumer) into the registry's `record_*` methods. The cold path
-/// (first record per unique key) stamps these `Arc<str>` onto the new
-/// [`ChargebackEntry`] with a cheap `Arc` clone; the hot path (cache hit)
-/// touches none of them, preserving the zero-allocation recording path.
-/// Multiple effective instances on one proxy are rejected (issue #2564).
+/// `api_chargeback` instance. Currency belongs to the individual instance
+/// (global / proxy / proxy_group scope), while namespace comes from the matched
+/// proxy. Each instance passes its `InstanceScope` and the transaction's proxy
+/// namespace into the registry's `record_*` methods. The cold path stamps
+/// immutable render metadata onto the new [`ChargebackEntry`]; the hot path
+/// touches none of it, preserving zero-allocation recording. Multiple effective
+/// instances on one proxy are rejected (issue #2564).
 #[derive(Clone)]
 pub struct InstanceScope {
     /// Instance currency label (e.g. "USD"). Emitted per-row at render time.
     pub currency: Arc<str>,
-    /// Pre-rendered Prometheus namespace label fragment, e.g.
-    /// `,namespace="ferrum"` (empty string when the namespace is empty). This is
-    /// the only namespace representation the renderers need: Prometheus appends
-    /// it verbatim and the JSON output does not carry a namespace field.
-    pub namespace_label: Arc<str>,
+    /// Instance namespace. Direct registry calls use this as the proxy namespace;
+    /// production hooks pass the matched proxy's namespace explicitly so a
+    /// gateway-wide global instance cannot conflate same-id tenant proxies.
+    #[allow(dead_code)]
+    // Read by external registry tests; production passes matched namespaces.
+    pub namespace: Arc<str>,
 }
 
 impl InstanceScope {
-    /// Build an instance scope from a currency and namespace, pre-rendering the
-    /// Prometheus label fragment once at construction.
+    /// Build an instance scope from a currency and owner namespace.
     pub fn new(currency: &str, namespace: &str) -> Self {
         Self {
             currency: Arc::from(currency),
-            namespace_label: Arc::from(Self::namespace_label_for(namespace).as_str()),
+            namespace: Arc::from(namespace),
         }
     }
 
@@ -190,9 +284,42 @@ impl InstanceScope {
     }
 }
 
+/// Estimated bytes one registry entry retains.
+///
+/// Covers the owned `String` key, the `Arc<str>` metadata the entry clones
+/// (consumer, proxy id, proxy namespace, proxy name, currency, namespace
+/// label), and a fixed allowance for the struct, its atomics, and DashMap's
+/// per-slot bookkeeping.
+/// The value is an accounting estimate, not an allocator measurement; it is
+/// deliberately conservative so the configured ceiling is never exceeded in
+/// real terms.
+fn entry_retained_bytes(
+    key_len: usize,
+    consumer_len: usize,
+    proxy_id_len: usize,
+    proxy_namespace_len: usize,
+    proxy_name_len: usize,
+    namespace_label_len: usize,
+    scope: &InstanceScope,
+) -> usize {
+    key_len
+        .saturating_add(consumer_len)
+        .saturating_add(proxy_id_len)
+        .saturating_add(proxy_namespace_len)
+        .saturating_add(proxy_name_len)
+        .saturating_add(scope.currency.len())
+        .saturating_add(namespace_label_len)
+        .saturating_add(ENTRY_FIXED_OVERHEAD_BYTES)
+}
+
+// Keep the hot-path key fields as borrowed scalars: wrapping them in an
+// aggregate would add ceremony without reducing the call-site data flow, and
+// this helper deliberately writes directly into a reused thread-local buffer.
+#[allow(clippy::too_many_arguments)]
 fn write_chargeback_key(
     buf: &mut String,
     consumer: &str,
+    proxy_namespace: &str,
     proxy_id: &str,
     status_code: u16,
     protocol_family: ProtocolFamily,
@@ -206,11 +333,11 @@ fn write_chargeback_key(
         buf,
         "{}|{}|{}|{}|{}|{}|{:016x}|{:016x}|{:016x}",
         consumer,
+        proxy_namespace,
         proxy_id,
         status_code,
         protocol_family.label(),
         scope.currency,
-        scope.namespace_label,
         prices.call.to_bits(),
         prices.bandwidth_sent.to_bits(),
         prices.bandwidth_received.to_bits()
@@ -230,30 +357,28 @@ fn write_chargeback_key(
 /// (`call_price`, `bw_price_sent`, `bw_price_received`) are config-derived
 /// constants fixed at entry creation.
 ///
-/// **Per-instance scoping (finding #24)**: `currency` and `namespace_label` are
-/// stored per entry (set from the constructing plugin instance) rather than in
-/// a single process-global, last-writer-wins registry field. A single process
-/// may host multiple `api_chargeback` instances on **different** proxies with
-/// different currencies/namespaces, so each exported row carries the currency
-/// and namespace of the instance that recorded it. Multiple effective instances
-/// on one proxy are rejected (issue #2564) because this registry has no
-/// ledger/instance dimension and would double-count the same client transaction.
+/// **Per-instance scoping (finding #24)**: `currency` is stored per entry from
+/// the constructing plugin instance rather than in a process-global,
+/// last-writer-wins registry field. Namespace is taken from the matched proxy,
+/// not the plugin owner, so a gateway-wide global instance keeps same-id tenant
+/// proxies distinct. Multiple effective instances on one proxy are rejected
+/// (issue #2564) because this registry has no ledger/instance dimension and
+/// would double-count the same client transaction.
 ///
-/// The `consumer`, `proxy_id`, `status_code`, `protocol_family`, prices,
-/// `currency`, and `namespace_label` fields are set once on creation and read
-/// during render. They are included in the DashMap key string so config reloads
-/// that change pricing create fresh entries instead of adding new traffic to
-/// stale prices, and so HTTP-family status-0 WebSocket bandwidth cannot share an
-/// entry with a stream session. The key is still a plain `String`, which lets
-/// the hot-path `get()` use a borrowed `&str` from a thread-local buffer with
-/// zero allocation.
+/// The `consumer`, proxy namespace/id, `status_code`, `protocol_family`, prices,
+/// and `currency` are set once on creation and read during render. They are
+/// included in the DashMap key string so config reloads that change pricing
+/// create fresh entries instead of adding new traffic to stale prices, and so
+/// HTTP-family status-0 WebSocket bandwidth cannot share an entry with a stream
+/// session. The key remains a plain `String`, which lets the hot-path `get()`
+/// use a borrowed `&str` from a thread-local buffer with zero allocation.
 ///
 /// **`proxy_name` is live display metadata (issue #2572)**: it is deliberately
 /// omitted from the registry key so a name-only reload keeps counter continuity
-/// under the stable `proxy_id`. Entries retain their admission-time name for a
-/// deterministic fallback after deletion, while renderers use the separately
-/// published current-proxy metadata snapshot. Late completions from a retired
-/// cache generation therefore cannot restore an old exported name.
+/// under the stable `(namespace, proxy_id)`. Entries retain their admission-time
+/// name for a deterministic fallback after deletion, while renderers use the
+/// separately published current-proxy metadata snapshot. Late completions from
+/// a retired cache generation therefore cannot restore an old exported name.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
 /// per `(consumer, proxy_id, protocol_family=stream)` (streams have no HTTP
@@ -278,6 +403,8 @@ pub struct ChargebackEntry {
     // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
+    /// Raw matched proxy namespace for JSON output and live-name lookup.
+    pub proxy_namespace: Arc<str>,
     /// Admission-time fallback name for `proxy_id`. Active exports use the
     /// authoritative published metadata snapshot instead (issue #2572).
     pub proxy_name: Arc<str>,
@@ -288,9 +415,17 @@ pub struct ChargebackEntry {
     /// misattribute one another's charges.
     pub currency: Arc<str>,
     /// Pre-rendered Prometheus namespace label fragment, e.g.
-    /// `,namespace="ferrum"` (empty string when no namespace), of the instance
-    /// that created the entry.
+    /// `,namespace="ferrum"` (empty string when no namespace), of the matched
+    /// proxy that created the entry.
     pub namespace_label: Arc<str>,
+    /// Bytes this entry reserved against the registry's retained-byte budget.
+    /// Released verbatim on eviction so the counter stays exact.
+    retained_bytes: usize,
+    /// Whether this entry consumed one of the `max_entries` retained-row slots.
+    /// Aggregate overflow rows do not (their cardinality is bounded by
+    /// configuration — proxy × status × family × currency/namespace × prices —
+    /// not by attacker-chosen principals).
+    counts_against_identity_budget: bool,
 }
 
 impl ChargebackEntry {
@@ -299,6 +434,7 @@ impl ChargebackEntry {
         epoch: Instant,
         consumer: Arc<str>,
         proxy_id: Arc<str>,
+        proxy_namespace: Arc<str>,
         proxy_name: Arc<str>,
         status_code: u16,
         protocol_family: ProtocolFamily,
@@ -307,6 +443,8 @@ impl ChargebackEntry {
         bw_price_received: f64,
         currency: Arc<str>,
         namespace_label: Arc<str>,
+        retained_bytes: usize,
+        counts_against_identity_budget: bool,
     ) -> Self {
         Self {
             call_count: AtomicU64::new(0),
@@ -318,11 +456,14 @@ impl ChargebackEntry {
             bw_price_received,
             consumer,
             proxy_id,
+            proxy_namespace,
             proxy_name,
             status_code,
             protocol_family,
             currency,
             namespace_label,
+            retained_bytes,
+            counts_against_identity_budget,
         }
     }
 
@@ -404,6 +545,16 @@ pub struct SharedRegistryTunables {
     pub stale_entry_ttl_secs: u64,
     pub cache_invalidation_min_age_ms: u64,
     pub cleanup_interval_seconds: u64,
+    /// Hard ceiling on retained billing rows (complete registry entry keys) in
+    /// the shared registry. A new row that cannot be admitted is folded into
+    /// the fixed-cardinality aggregate instead of being dropped — invoice
+    /// totals still reconcile, only per-identity attribution is lost. One
+    /// principal can occupy many slots because keys also include proxy, status,
+    /// protocol family, currency, namespace, and prices.
+    pub max_entries: usize,
+    /// Hard ceiling on retained registry bytes, covering ordinary billing rows
+    /// and the aggregate overflow rows together.
+    pub max_retained_bytes: usize,
 }
 
 impl SharedRegistryTunables {
@@ -430,8 +581,31 @@ impl SharedRegistryTunables {
                 "cleanup_interval_seconds",
                 DEFAULT_CLEANUP_INTERVAL_SECS,
             )?,
+            max_entries: required_positive_usize(config, "max_entries", DEFAULT_MAX_ENTRIES)?,
+            max_retained_bytes: required_positive_usize(
+                config,
+                "max_retained_bytes",
+                DEFAULT_MAX_RETAINED_BYTES,
+            )?,
         })
     }
+}
+
+/// Read a positive `usize` budget key, rejecting `0` and non-integers.
+///
+/// `0` is rejected rather than treated as "unlimited": an unbounded process-
+/// global registry is exactly the exhaustion primitive this budget exists to
+/// remove (GHSA-wxmv-8mwr-92xf).
+fn required_positive_usize(config: &Value, key: &str, default: usize) -> Result<usize, String> {
+    let value = optional_u64(config, key, default as u64)?;
+    if value == 0 {
+        return Err(format!(
+            "api_chargeback: '{key}' must be greater than 0; the shared /charges registry has no \
+             unlimited mode"
+        ));
+    }
+    usize::try_from(value)
+        .map_err(|_| format!("api_chargeback: '{key}' ({value}) exceeds this platform's usize"))
 }
 
 /// Resolve the enabled `api_chargeback` configs that the plugin cache would
@@ -447,10 +621,13 @@ fn effective_api_chargeback_plugins_by_proxy(
 )> {
     use crate::config::types::PluginScope;
 
-    let plugin_by_id: HashMap<&str, &crate::config::types::PluginConfig> = config
+    // Association plugin_config_id values are namespace-local to the proxy. A
+    // bare-id index would bind a proxy to another tenant's same-id
+    // api_chargeback config (mirrors effective_mtls_auth_plugins_by_proxy).
+    let plugin_by_key: HashMap<(&str, &str), &crate::config::types::PluginConfig> = config
         .plugin_configs
         .iter()
-        .map(|plugin| (plugin.id.as_str(), plugin))
+        .map(|plugin| ((plugin.namespace.as_str(), plugin.id.as_str()), plugin))
         .collect();
     let global_chargeback: Vec<&crate::config::types::PluginConfig> = config
         .plugin_configs
@@ -470,14 +647,23 @@ fn effective_api_chargeback_plugins_by_proxy(
                 .plugins
                 .iter()
                 .filter_map(|association| {
-                    let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    let plugin = *plugin_by_key.get(&(
+                        proxy.namespace.as_str(),
+                        association.plugin_config_id.as_str(),
+                    ))?;
                     let scope_applies = match plugin.scope {
-                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                        PluginScope::Proxy => {
+                            plugin.namespace == proxy.namespace
+                                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+                        }
                         // Config validation already requires proxy-group
                         // instances to omit proxy_id. Applicability here mirrors
                         // the runtime merge, which is driven by scope plus the
-                        // proxy's explicit plugin association.
-                        PluginScope::ProxyGroup => true,
+                        // proxy's explicit plugin association — still
+                        // namespace-local so same-id group configs stay isolated.
+                        PluginScope::ProxyGroup => {
+                            plugin.namespace == proxy.namespace && plugin.proxy_id.is_none()
+                        }
                         PluginScope::Global => false,
                     };
                     (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
@@ -485,6 +671,10 @@ fn effective_api_chargeback_plugins_by_proxy(
                 })
                 .collect();
             let effective = if local_chargeback.is_empty() {
+                // Globals are gateway-wide at runtime (`PluginCache` merges the
+                // single global list into every proxy in every namespace), so
+                // this must NOT be namespace-filtered — only the association
+                // lookup above is namespace-local.
                 global_chargeback.clone()
             } else {
                 local_chargeback
@@ -510,7 +700,8 @@ fn effective_api_chargeback_plugins_by_proxy(
 /// 3. Across the whole process, every enabled `api_chargeback` instance must
 ///    resolve to identical shared tunables
 ///    (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
-///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`). Since every
+///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`,
+///    `max_entries`, `max_retained_bytes`). Since every
 ///    constructor applies the same values, construction order cannot change
 ///    registry behavior. Pricing and currency may still differ per proxy.
 pub fn validate_composition(
@@ -573,7 +764,8 @@ pub fn validate_composition(
                     "api_chargeback shared render/cleanup tunables must match across all enabled \
                      instances; '{}' disagrees with '{}'. \
                      Align render_cache_ttl_seconds, stale_entry_ttl_seconds, \
-                     cache_invalidation_min_age_ms, and cleanup_interval_seconds",
+                     cache_invalidation_min_age_ms, cleanup_interval_seconds, \
+                     max_entries, and max_retained_bytes",
                     reference.id, sibling.id
                 )),
                 Err(error) => errors.push(format!(
@@ -601,7 +793,7 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 /// Chargeback registry holding per-consumer, per-proxy charge accumulators.
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
-/// `"consumer|proxy_id|status_code|protocol_family|currency|namespace_label|price_bits..."`.
+/// `"consumer|proxy_namespace|proxy_id|status_code|protocol_family|currency|price_bits..."`.
 /// Render metadata (consumer, proxy_id, status_code, protocol_family) is stored
 /// in the `ChargebackEntry` value and `protocol_family` is also part of the key
 /// so immutable family attribution cannot be fixed by insertion order.
@@ -616,8 +808,12 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
-    /// Current display names from the published gateway configuration.
-    active_proxy_names: ArcSwap<HashMap<String, String>>,
+    /// Shard count the entry map was built with. Fixed for the process-global
+    /// singleton's lifetime; recorded so tests can assert the accepted
+    /// generation's `PluginHttpClient::pool_shard_amount()` reached the map.
+    shard_amount: usize,
+    /// Current display names keyed by raw proxy namespace and proxy id.
+    active_proxy_names: ArcSwap<HashMap<String, HashMap<String, String>>>,
     /// Advances whenever `active_proxy_names` is replaced. Render caches carry
     /// this generation so an overlapping reload cannot publish stale labels.
     proxy_metadata_generation: AtomicU64,
@@ -631,6 +827,28 @@ pub struct ChargebackRegistry {
     cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
+    /// Hard ceiling on retained billing rows / complete entry keys
+    /// (GHSA-wxmv-8mwr-92xf). Not a distinct-principal ceiling: one identity
+    /// can consume many slots across proxy/status/family/currency/namespace/
+    /// price dimensions.
+    max_entries: AtomicUsize,
+    /// Hard ceiling on retained bytes across ordinary and aggregate rows.
+    max_retained_bytes: AtomicUsize,
+    /// Entry-key slots reserved before a new billing row is published. Reserved
+    /// atomically so concurrent cold-path inserts cannot publish state above
+    /// `max_entries`.
+    reserved_entries: AtomicUsize,
+    /// Retained bytes reserved by every live entry, ordinary and aggregate.
+    retained_bytes: AtomicUsize,
+    /// Charges that were admitted to the fixed-cardinality aggregate row
+    /// because the retained-entry budget was exhausted. Billable state is
+    /// preserved; only per-identity attribution is lost.
+    identity_overflow_total: AtomicU64,
+    /// Charges that could not be retained at all because even the aggregate row
+    /// could not reserve bytes. This is real billing loss and is exported.
+    dropped_charges_total: AtomicU64,
+    /// Rate limiter for admission warnings (nanos since `epoch`).
+    last_admission_warn_at: AtomicU64,
 }
 
 impl Default for ChargebackRegistry {
@@ -641,9 +859,17 @@ impl Default for ChargebackRegistry {
 
 impl ChargebackRegistry {
     pub fn new() -> Self {
+        Self::with_shard_amount(crate::util::sharding::pool_shard_amount(0))
+    }
+
+    /// Build a registry whose entry map uses `shard_amount` shards. The value
+    /// must already be normalized by
+    /// [`crate::util::sharding::pool_shard_amount`].
+    pub fn with_shard_amount(shard_amount: usize) -> Self {
         Self {
             epoch: Instant::now(),
-            entries: DashMap::new(),
+            entries: DashMap::with_shard_amount(shard_amount),
+            shard_amount,
             active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
             proxy_metadata_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
@@ -656,13 +882,20 @@ impl ChargebackRegistry {
             cleanup_interval_seconds: AtomicU64::new(0),
             cleanup_interval_changed: tokio::sync::Notify::new(),
             cleanup_task_started: AtomicBool::new(false),
+            max_entries: AtomicUsize::new(DEFAULT_MAX_ENTRIES),
+            max_retained_bytes: AtomicUsize::new(DEFAULT_MAX_RETAINED_BYTES),
+            reserved_entries: AtomicUsize::new(0),
+            retained_bytes: AtomicUsize::new(0),
+            identity_overflow_total: AtomicU64::new(0),
+            dropped_charges_total: AtomicU64::new(0),
+            last_admission_warn_at: AtomicU64::new(NO_ADMISSION_WARN_NANOS),
         }
     }
 
     /// Replace live display metadata after a gateway configuration is
     /// published. This is a reload cold-path operation.
     #[doc(hidden)]
-    pub fn set_active_proxy_names(&self, names: HashMap<String, String>) {
+    pub fn set_active_proxy_names(&self, names: HashMap<String, HashMap<String, String>>) {
         let unchanged = {
             let current = self.active_proxy_names.load();
             current.as_ref() == &names
@@ -692,7 +925,18 @@ impl ChargebackRegistry {
         render_cache_ttl_secs: u64,
         stale_entry_ttl_secs: u64,
         cache_invalidation_min_age_ms: u64,
+        max_entries: usize,
+        max_retained_bytes: usize,
     ) {
+        // Budgets are raised or lowered in place. Lowering never deletes
+        // already-retained billable state: existing entries keep their
+        // reservations and are released by ordinary TTL eviction, while new
+        // identities are refused (and folded into the aggregate row) until the
+        // counters fall back under the new ceiling.
+        self.max_entries
+            .store(max_entries.max(1), Ordering::Release);
+        self.max_retained_bytes
+            .store(max_retained_bytes.max(1), Ordering::Release);
         self.render_cache_ttl_secs
             .store(render_cache_ttl_secs, Ordering::Relaxed);
         self.stale_entry_ttl_nanos.store(
@@ -769,6 +1013,7 @@ impl ChargebackRegistry {
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
     /// WebSocket upgrade). Status code is the response status.
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_http(
         &self,
@@ -783,8 +1028,39 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_http_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            status_code,
+            call_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_http_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -803,6 +1079,7 @@ impl ChargebackRegistry {
     /// have no HTTP status code; entries are keyed by
     /// `(consumer, proxy_id, ProtocolFamily::Stream)` with the
     /// [`STREAM_STATUS_SENTINEL`].
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_stream(
         &self,
@@ -816,8 +1093,37 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_stream_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            connection_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_stream_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        connection_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -832,6 +1138,7 @@ impl ChargebackRegistry {
         );
     }
 
+    #[allow(dead_code)] // External-test convenience wrapper; production supplies proxy namespace.
     #[allow(clippy::too_many_arguments)]
     pub fn record_websocket_bandwidth(
         &self,
@@ -844,8 +1151,35 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
     ) {
+        self.record_websocket_bandwidth_in_namespace(
+            scope,
+            scope.namespace.as_ref(),
+            consumer,
+            proxy_id,
+            proxy_name,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_websocket_bandwidth_in_namespace(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+    ) {
         self.record_inner(
             scope,
+            proxy_namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -869,18 +1203,31 @@ impl ChargebackRegistry {
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
     /// the owned `String` key and a new `ChargebackEntry`. This runs once per unique
-    /// `(consumer, proxy, status_code, protocol_family, currency, namespace, prices)`
-    /// combination. The currency/namespace come from the recording plugin
-    /// instance's [`InstanceScope`], and are part of the key so multiple
-    /// instances never reuse an entry stamped with another instance's render
-    /// scope. `protocol_family` is part of the key so HTTP-family WebSocket
+    /// `(consumer, proxy namespace, proxy id, status_code, protocol_family,
+    /// currency, prices)` combination. Currency comes from the recording plugin
+    /// instance; namespace comes from the matched proxy. Both are part of the
+    /// key so global instances and same-id tenant proxies cannot reuse an entry
+    /// stamped with another scope. `protocol_family` is part of the key so HTTP-family WebSocket
     /// bandwidth and stream sessions stay distinct even when both use status
     /// `0` and identical prices. `proxy_name` is intentionally omitted from the
     /// key (issue #2572).
+    ///
+    /// **Admission (GHSA-wxmv-8mwr-92xf)**: the cold path reserves one retained
+    /// entry-key slot and its retained bytes against the process-global budget
+    /// before publishing a new key. A refusal does not discard the charge — it
+    /// is re-recorded under the fixed-cardinality
+    /// [`OVERFLOW_CONSUMER_SENTINEL`] row, which keeps every non-identity
+    /// dimension (proxy, status, family, currency, namespace, prices) and
+    /// therefore preserves the billable totals an operator invoices from.
+    /// Per-identity attribution is what is lost when a new row cannot be
+    /// admitted. The budget counts complete registry keys, not distinct
+    /// principals — one identity across multiple statuses/proxies/prices can
+    /// consume many slots.
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
         scope: &InstanceScope,
+        proxy_namespace: &str,
         consumer: &str,
         proxy_id: &str,
         proxy_name: &str,
@@ -892,6 +1239,61 @@ impl ChargebackRegistry {
         bw_price_sent: f64,
         bw_price_received: f64,
         count_call: bool,
+    ) {
+        // Bound the billing identity collision-resistantly: within the bound
+        // this borrows and allocates nothing, and an oversized identity keeps a
+        // digest of its complete value so two principals sharing a prefix stay
+        // distinct entries (GHSA-m28c-f3v5-26qg). Marker-bearing values —
+        // including any identity equal to [`OVERFLOW_CONSUMER_SENTINEL`] — are
+        // always digested, so a real principal can never share the internal
+        // overflow row's consumer label.
+        let consumer = bounded_billing_identity(consumer, MAX_REGISTRY_IDENTITY_BYTES);
+        debug_assert_ne!(
+            consumer.as_ref(),
+            OVERFLOW_CONSUMER_SENTINEL,
+            "bounded billing identity must never equal the internal overflow sentinel"
+        );
+        let proxy_id = bounded_billing_identity(proxy_id, MAX_REGISTRY_IDENTITY_BYTES);
+        let proxy_name = bounded_display(proxy_name, MAX_REGISTRY_IDENTITY_BYTES);
+        self.record_admitted(
+            scope,
+            proxy_namespace,
+            &consumer,
+            &proxy_id,
+            proxy_name,
+            status_code,
+            protocol_family,
+            call_price,
+            bytes_sent,
+            bytes_received,
+            bw_price_sent,
+            bw_price_received,
+            count_call,
+            true,
+        );
+    }
+
+    /// Record one charge against an already-bounded identity.
+    ///
+    /// `identity_admission` is `true` for an ordinary billing row (consumes one
+    /// `max_entries` slot) and `false` for the aggregate overflow row.
+    #[allow(clippy::too_many_arguments)]
+    fn record_admitted(
+        &self,
+        scope: &InstanceScope,
+        proxy_namespace: &str,
+        consumer: &str,
+        proxy_id: &str,
+        proxy_name: &str,
+        status_code: u16,
+        protocol_family: ProtocolFamily,
+        call_price: f64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        bw_price_sent: f64,
+        bw_price_received: f64,
+        count_call: bool,
+        identity_admission: bool,
     ) {
         thread_local! {
             static KEY_BUF: std::cell::RefCell<String> =
@@ -906,6 +1308,7 @@ impl ChargebackRegistry {
             write_chargeback_key(
                 &mut buf,
                 consumer,
+                proxy_namespace,
                 proxy_id,
                 status_code,
                 protocol_family,
@@ -926,20 +1329,17 @@ impl ChargebackRegistry {
 
         if !hit {
             // Cold path: allocate owned key + metadata for DashMap insertion.
-            // Currency/namespace come from the recording instance's scope so the
-            // entry is attributed to the instance that created it (finding #24).
+            // Currency comes from the recording instance; namespace comes from
+            // the matched proxy so global instances preserve tenant identity.
             // Capacity covers separators, status, protocol_family label
             // ("stream" is longest), and three 16-hex price bit fields.
             let mut owned_key = String::with_capacity(
-                consumer.len()
-                    + proxy_id.len()
-                    + scope.currency.len()
-                    + scope.namespace_label.len()
-                    + 74,
+                consumer.len() + proxy_namespace.len() + proxy_id.len() + scope.currency.len() + 74,
             );
             write_chargeback_key(
                 &mut owned_key,
                 consumer,
+                proxy_namespace,
                 proxy_id,
                 status_code,
                 protocol_family,
@@ -950,25 +1350,188 @@ impl ChargebackRegistry {
                     bandwidth_received: bw_price_received,
                 },
             );
-            let entry = self.entries.entry(owned_key).or_insert_with(|| {
-                ChargebackEntry::new(
-                    self.epoch,
-                    Arc::from(consumer),
-                    Arc::from(proxy_id),
-                    Arc::from(proxy_name),
-                    status_code,
-                    protocol_family,
-                    if count_call { call_price } else { 0.0 },
-                    bw_price_sent,
-                    bw_price_received,
-                    Arc::clone(&scope.currency),
-                    Arc::clone(&scope.namespace_label),
-                )
-            });
-            entry.record(bytes_sent, bytes_received, count_call, self.epoch);
+            // Reserve the entry-key slot and its retained bytes BEFORE the key is
+            // published, so concurrent cold-path inserts can never publish state
+            // above the configured ceilings.
+            let namespace_label = InstanceScope::namespace_label_for(proxy_namespace);
+            let entry_bytes = entry_retained_bytes(
+                owned_key.len(),
+                consumer.len(),
+                proxy_id.len(),
+                proxy_namespace.len(),
+                proxy_name.len(),
+                namespace_label.len(),
+                scope,
+            );
+            if !self.try_reserve(entry_bytes, identity_admission) {
+                // Budget exhausted. Fold the charge into the fixed-cardinality
+                // aggregate row rather than losing billable state. If even that
+                // row cannot be admitted, the loss is counted and surfaced.
+                self.maybe_invalidate_caches();
+                if identity_admission {
+                    self.identity_overflow_total.fetch_add(1, Ordering::Relaxed);
+                    self.warn_on_admission("entry budget exhausted");
+                    self.record_admitted(
+                        scope,
+                        proxy_namespace,
+                        OVERFLOW_CONSUMER_SENTINEL,
+                        proxy_id,
+                        proxy_name,
+                        status_code,
+                        protocol_family,
+                        call_price,
+                        bytes_sent,
+                        bytes_received,
+                        bw_price_sent,
+                        bw_price_received,
+                        count_call,
+                        false,
+                    );
+                } else {
+                    self.dropped_charges_total.fetch_add(1, Ordering::Relaxed);
+                    self.warn_on_admission("retained-byte budget exhausted");
+                }
+                return;
+            }
+
+            let mut created = false;
+            {
+                let entry = self.entries.entry(owned_key).or_insert_with(|| {
+                    created = true;
+                    ChargebackEntry::new(
+                        self.epoch,
+                        Arc::from(consumer),
+                        Arc::from(proxy_id),
+                        Arc::from(proxy_namespace),
+                        Arc::from(proxy_name),
+                        status_code,
+                        protocol_family,
+                        if count_call { call_price } else { 0.0 },
+                        bw_price_sent,
+                        bw_price_received,
+                        Arc::clone(&scope.currency),
+                        Arc::from(namespace_label),
+                        entry_bytes,
+                        identity_admission,
+                    )
+                });
+                entry.record(bytes_sent, bytes_received, count_call, self.epoch);
+            }
+            if !created {
+                // Lost the publish race: the winner owns the single reservation
+                // for this key. Release ours exactly once so the budget stays
+                // exact.
+                self.release_reservation(entry_bytes, identity_admission);
+            }
         }
 
         self.maybe_invalidate_caches();
+    }
+
+    /// Reserve one entry's retained bytes, and a retained-row slot when the
+    /// entry is an ordinary billing row (not the aggregate overflow).
+    ///
+    /// Aggregate overflow rows deliberately skip the `max_entries` ceiling:
+    /// their cardinality is bounded by configuration (proxy × status × protocol
+    /// family × currency/namespace × price set), not by attacker-selectable
+    /// principals. They still reserve bytes, so the retained-byte ceiling stays
+    /// a hard bound on total registry footprint.
+    fn try_reserve(&self, entry_bytes: usize, identity_admission: bool) -> bool {
+        if identity_admission {
+            let max_entries = self.max_entries.load(Ordering::Acquire);
+            if self
+                .reserved_entries
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                    (count < max_entries).then_some(count + 1)
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
+        let max_bytes = self.max_retained_bytes.load(Ordering::Acquire);
+        let reserved = self
+            .retained_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let next = used.checked_add(entry_bytes)?;
+                (next <= max_bytes).then_some(next)
+            })
+            .is_ok();
+        if !reserved && identity_admission {
+            self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+        }
+        reserved
+    }
+
+    /// Release a reservation taken by [`Self::try_reserve`].
+    fn release_reservation(&self, entry_bytes: usize, identity_admission: bool) {
+        if identity_admission {
+            self.reserved_entries.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.retained_bytes.fetch_sub(entry_bytes, Ordering::AcqRel);
+    }
+
+    /// Log at most one admission warning per
+    /// [`ADMISSION_WARN_INTERVAL_NANOS`]. The message carries no identity, only
+    /// the fixed reason and the current budget occupancy.
+    fn warn_on_admission(&self, reason: &'static str) {
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        let last = self.last_admission_warn_at.load(Ordering::Relaxed);
+        if (last != NO_ADMISSION_WARN_NANOS
+            && now.saturating_sub(last) < ADMISSION_WARN_INTERVAL_NANOS)
+            || self
+                .last_admission_warn_at
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        tracing::warn!(
+            plugin = "api_chargeback",
+            reason,
+            entries = self.reserved_entries.load(Ordering::Relaxed),
+            max_entries = self.max_entries.load(Ordering::Relaxed),
+            retained_bytes = self.retained_bytes.load(Ordering::Relaxed),
+            max_retained_bytes = self.max_retained_bytes.load(Ordering::Relaxed),
+            "api_chargeback registry admission budget reached; charges are being aggregated under the overflow row"
+        );
+    }
+
+    /// Billing rows (complete registry entry keys) currently reserved against
+    /// `max_entries`.
+    #[doc(hidden)]
+    #[allow(dead_code)] // asserted by external adversarial tests
+    pub fn reserved_entries_for_tests(&self) -> usize {
+        self.reserved_entries.load(Ordering::Acquire)
+    }
+
+    /// Bytes currently reserved across ordinary and aggregate rows.
+    #[doc(hidden)]
+    #[allow(dead_code)] // asserted by external adversarial tests
+    pub fn retained_bytes_for_tests(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    /// Configured retained-row ceiling. Lifecycle tests assert that construction
+    /// leaves it untouched and only an accepted generation publishes it.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn max_entries_for_test(&self) -> usize {
+        self.max_entries.load(Ordering::Acquire)
+    }
+
+    /// Configured retained-byte ceiling.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn max_retained_bytes_for_test(&self) -> usize {
+        self.max_retained_bytes.load(Ordering::Acquire)
+    }
+
+    /// Shard count the entry map was built with.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn shard_amount_for_tests(&self) -> usize {
+        self.shard_amount
     }
 
     fn maybe_invalidate_caches(&self) {
@@ -993,6 +1556,10 @@ impl ChargebackRegistry {
             let keep = v.nanos_since_update(self.epoch) < ttl_nanos;
             if !keep {
                 evicted += 1;
+                // Release the evicted entry's reservation so capacity recovers
+                // exactly. `retain` holds the shard lock, so no concurrent
+                // insert can observe the slot before the release.
+                self.release_reservation(v.retained_bytes, v.counts_against_identity_budget);
             }
             keep
         });
@@ -1067,7 +1634,8 @@ impl ChargebackRegistry {
         for entry in self.entries.iter() {
             let v = entry.value();
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
             match v.protocol_family {
@@ -1203,7 +1771,8 @@ impl ChargebackRegistry {
         for entry in self.entries.iter() {
             let v = entry.value();
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
             let agg = bw_aggregates
@@ -1296,7 +1865,73 @@ impl ChargebackRegistry {
             ));
         }
 
+        // --- Registry saturation. Fixed cardinality and identity-free, so an
+        //     operator can alert on admission pressure without the diagnostics
+        //     themselves becoming an exhaustion vector.
+        output.push_str(
+            "# HELP ferrum_api_chargeback_registry_entries Billing rows (complete registry entry keys) currently retained against max_entries.\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_registry_entries gauge\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_registry_entries {}\n",
+            self.reserved_entries.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_registry_max_entries Configured ceiling on retained billing rows (complete registry entry keys).\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_registry_max_entries gauge\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_registry_max_entries {}\n",
+            self.max_entries.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_registry_retained_bytes Estimated bytes retained by the shared registry.\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_registry_retained_bytes gauge\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_registry_retained_bytes {}\n",
+            self.retained_bytes.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_registry_max_retained_bytes Configured ceiling on retained registry bytes.\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_registry_max_retained_bytes gauge\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_registry_max_retained_bytes {}\n",
+            self.max_retained_bytes.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_identity_overflow_total Charges folded into the aggregate overflow row because a new billing row could not be admitted under max_entries (per-identity attribution lost).\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_identity_overflow_total counter\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_identity_overflow_total {}\n",
+            self.identity_overflow_total.load(Ordering::Relaxed)
+        ));
+        output.push_str(
+            "# HELP ferrum_api_chargeback_dropped_charges_total Charges lost because neither an ordinary billing row nor the aggregate row could be admitted.\n",
+        );
+        output.push_str("# TYPE ferrum_api_chargeback_dropped_charges_total counter\n");
+        output.push_str(&format!(
+            "ferrum_api_chargeback_dropped_charges_total {}\n",
+            self.dropped_charges_total.load(Ordering::Relaxed)
+        ));
+
         Ok(output)
+    }
+
+    /// Fixed-cardinality registry saturation snapshot shared by the JSON
+    /// renderer and the status surfaces. Contains no identity values.
+    fn registry_status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "entries": self.reserved_entries.load(Ordering::Relaxed),
+            "max_entries": self.max_entries.load(Ordering::Relaxed),
+            "retained_bytes": self.retained_bytes.load(Ordering::Relaxed),
+            "max_retained_bytes": self.max_retained_bytes.load(Ordering::Relaxed),
+            "identity_overflow_total": self.identity_overflow_total.load(Ordering::Relaxed),
+            "dropped_charges_total": self.dropped_charges_total.load(Ordering::Relaxed),
+            "overflow_consumer_id": OVERFLOW_CONSUMER_SENTINEL,
+        })
     }
 
     /// Render as JSON with caching.
@@ -1377,7 +2012,8 @@ impl ChargebackRegistry {
             let bw_sent = v.bandwidth_charge_sent()?;
             let bw_received = v.bandwidth_charge_received()?;
             let proxy_name = active_proxy_names
-                .get(v.proxy_id.as_ref())
+                .get(v.proxy_namespace.as_ref())
+                .and_then(|namespace| namespace.get(v.proxy_id.as_ref()))
                 .map(String::as_str)
                 .unwrap_or(v.proxy_name.as_ref());
 
@@ -1396,7 +2032,7 @@ impl ChargebackRegistry {
                 .entry((
                     v.proxy_id.to_string(),
                     Arc::clone(&v.currency),
-                    Arc::clone(&v.namespace_label),
+                    Arc::clone(&v.proxy_namespace),
                 ))
                 .or_insert_with(|| ProxyAggregate {
                     proxy_name: proxy_name.to_string(),
@@ -1476,7 +2112,7 @@ impl ChargebackRegistry {
                 *proxy_id_counts.entry(proxy_id.as_str()).or_default() += 1;
             }
 
-            for ((proxy_id, _, namespace_label), agg) in proxies {
+            for ((proxy_id, _, proxy_namespace), agg) in proxies {
                 let mut proxy_per_call_charges = 0.0f64;
                 let mut proxy_calls = 0u64;
                 let mut status_objects = serde_json::Map::new();
@@ -1535,6 +2171,7 @@ impl ChargebackRegistry {
 
                 let mut proxy_obj = serde_json::json!({
                     "proxy_id": proxy_id,
+                    "namespace": proxy_namespace.as_ref(),
                     "proxy_name": agg.proxy_name,
                     "currency": agg.currency.as_ref(),
                     "protocol_family": protocol_family,
@@ -1561,10 +2198,10 @@ impl ChargebackRegistry {
                 let output_key = if proxy_id_counts.get(proxy_id.as_str()).copied().unwrap_or(0) > 1
                 {
                     format!(
-                        "{}|currency={}{}",
+                        "{}|currency={}|namespace={}",
                         proxy_id,
                         agg.currency.as_ref(),
-                        namespace_label.as_ref()
+                        proxy_namespace.as_ref()
                     )
                 } else {
                     proxy_id.clone()
@@ -1643,6 +2280,7 @@ impl ChargebackRegistry {
         let result = serde_json::json!({
             "currency": currency,
             "generated_at": chrono::Utc::now().to_rfc3339(),
+            "registry": self.registry_status(),
             "consumers": serde_json::Value::Object(consumer_objects),
         });
 
@@ -1658,6 +2296,9 @@ pub struct ApiChargeback {
     /// records so multiple instances never misattribute one another's charges
     /// (finding #24).
     scope: InstanceScope,
+    /// Process-global registry knobs resolved at construction and applied only
+    /// once this instance's generation is accepted.
+    tunables: SharedRegistryTunables,
 }
 
 fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> {
@@ -1670,7 +2311,26 @@ fn optional_u64(config: &Value, key: &str, default: u64) -> Result<u64, String> 
 }
 
 impl ApiChargeback {
+    #[allow(dead_code)] // Used by external tests; production uses new_with_shard_amount.
     pub fn new(config: &Value, namespace: &str) -> Result<Self, String> {
+        Self::new_with_shard_amount(
+            config,
+            namespace,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    /// Construct an instance, sizing the process-global registry's entry map
+    /// with `shard_amount` shards on first use.
+    ///
+    /// `shard_amount` must already be normalized — production passes
+    /// `PluginHttpClient::pool_shard_amount()` so `FERRUM_POOL_SHARD_AMOUNT` is
+    /// applied exactly once.
+    pub fn new_with_shard_amount(
+        config: &Value,
+        namespace: &str,
+        shard_amount: usize,
+    ) -> Result<Self, String> {
         let object = config
             .as_object()
             .ok_or_else(|| "api_chargeback: config must be an object".to_string())?;
@@ -1687,7 +2347,7 @@ impl ApiChargeback {
             "api_chargeback: ",
         )?;
 
-        let registry = global_registry();
+        let registry = global_registry_with_shard_amount(shard_amount);
 
         let currency = match config.get("currency") {
             Some(value) => {
@@ -1722,25 +2382,29 @@ impl ApiChargeback {
             );
         }
 
-        // Validation passed — now safe to configure the shared registry. Only
-        // the process-global render/cleanup knobs are set here; currency and
-        // namespace are scoped per entry via this instance's `InstanceScope`
-        // (finding #24). Admission requires every enabled instance to resolve
-        // to the same tunables so construction order cannot change ownership.
-        registry.configure(
-            tunables.render_cache_ttl_secs,
-            tunables.stale_entry_ttl_secs,
-            tunables.cache_invalidation_min_age_ms,
-        );
-        registry.start_cleanup_task(tunables.cleanup_interval_seconds);
-
+        // Construction stays side-effect free on the process-global registry.
+        // Admin validation and a staged plugin-cache generation both build an
+        // instance, and a candidate that is later rejected must not have
+        // repointed the shared budgets, render TTLs, or cleanup schedule that
+        // the live generation is still using. The resolved tunables are applied
+        // in `commit_background_tasks`, which runs only after the generation is
+        // atomically installed.
         let scope = InstanceScope::new(currency, namespace);
 
         Ok(Self {
             registry,
             pricing,
             scope,
+            tunables,
         })
+    }
+
+    /// Shard count the process-global entry map was built with when this
+    /// instance resolved it (or the already-created singleton's fixed count).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn registry_shard_amount_for_tests(&self) -> usize {
+        self.registry.shard_amount_for_tests()
     }
 }
 
@@ -1757,6 +2421,26 @@ impl Plugin for ApiChargeback {
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         // Stream protocols (TCP/UDP/DTLS) are now supported via on_stream_disconnect.
         super::ALL_PROTOCOLS
+    }
+
+    /// Publish this generation's process-global registry knobs.
+    ///
+    /// Infallible and idempotent, and reached only after the plugin cache has
+    /// atomically installed the generation — so validation and a rejected
+    /// candidate never mutate the shared registry. Every enabled instance must
+    /// already agree on these values (see [`validate_composition`]), so commit
+    /// order cannot change registry behavior. Currency and namespace stay
+    /// per-entry via this instance's [`InstanceScope`].
+    fn commit_background_tasks(&self) {
+        self.registry.configure(
+            self.tunables.render_cache_ttl_secs,
+            self.tunables.stale_entry_ttl_secs,
+            self.tunables.cache_invalidation_min_age_ms,
+            self.tunables.max_entries,
+            self.tunables.max_retained_bytes,
+        );
+        self.registry
+            .start_cleanup_task(self.tunables.cleanup_interval_seconds);
     }
 
     async fn log(&self, summary: &TransactionSummary) {
@@ -1784,8 +2468,9 @@ impl Plugin for ApiChargeback {
         let proxy_id = summary.proxy_id.as_deref().unwrap_or("unknown");
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
-        self.registry.record_http(
+        self.registry.record_http_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             proxy_id,
             proxy_name,
@@ -1813,8 +2498,9 @@ impl Plugin for ApiChargeback {
 
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
 
-        self.registry.record_stream(
+        self.registry.record_stream_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             &summary.proxy_id,
             proxy_name,
@@ -1846,8 +2532,9 @@ impl Plugin for ApiChargeback {
             return;
         }
         let proxy_name = summary.proxy_name.as_deref().unwrap_or("unknown");
-        self.registry.record_websocket_bandwidth(
+        self.registry.record_websocket_bandwidth_in_namespace(
             &self.scope,
+            &summary.namespace,
             consumer,
             &summary.proxy_id,
             proxy_name,

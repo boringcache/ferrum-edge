@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
-    SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault, SpoolManager,
-    SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
+    QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
+    SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
     clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
     new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
@@ -1414,6 +1414,115 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
     let after = spool.scan_stats().unwrap();
     assert_eq!(after.files, 1);
     assert_eq!(after.bytes, encoded_len);
+}
+
+#[test]
+fn quota_eviction_reclaims_multiple_files_in_one_inventory_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    // Keep room for two resident files after reclaim; admitting one more
+    // file_len requires deleting eight oldest files from one snapshot.
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!(
+            "000000000000000000000000{index:02}"
+        )));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+    let before = spool.scan_stats().unwrap();
+    assert_eq!(before.files, file_count);
+    assert_eq!(before.bytes, file_len.saturating_mul(file_count));
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("multi-file reclaim must succeed from one inventory");
+    assert_eq!(
+        report,
+        QuotaEvictionReport {
+            inventory_passes: 1,
+            files_inventoried: file_count,
+            bytes_before: file_len.saturating_mul(file_count),
+            files_deleted: 8,
+            bytes_freed: file_len.saturating_mul(8),
+        },
+        "eviction must inventory/sort once and delete enough files in that pass"
+    );
+
+    for (index, path) in planted.iter().enumerate() {
+        if index < 8 {
+            assert!(
+                !path.exists(),
+                "oldest planted file {index} must be reclaimed"
+            );
+        } else {
+            assert!(
+                path.exists(),
+                "newest planted file {index} must be retained"
+            );
+        }
+    }
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 2);
+    assert_eq!(after.bytes, file_len.saturating_mul(2));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "remaining owned bytes must leave room for the incoming batch"
+    );
+}
+
+#[test]
+fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 32u64;
+    // Large enough to prove reclaim work is not O(K) inventory passes, small
+    // enough for deterministic CI unit coverage (not a local benchmark).
+    let file_count = 1_024u64;
+    let max_bytes = file_len.saturating_mul(4);
+    // remaining + incoming <= max_bytes => remaining <= 3 * file_len.
+    let retain_after = 3u64;
+    let expected_deleted = file_count.saturating_sub(retain_after);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    for index in 0..file_count {
+        let path = day.join(owned_data_name(&format!(
+            "01ARZ3NDEKTSV4RRFFQ69G{index:05}"
+        )));
+        fs::write(&path, vec![b'y'; file_len as usize]).unwrap();
+    }
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("large spool reclaim must succeed");
+    assert_eq!(
+        report.inventory_passes, 1,
+        "large file-count eviction must still be one inventory/sort planning pass"
+    );
+    assert_eq!(report.files_inventoried, file_count);
+    assert_eq!(report.bytes_before, file_len.saturating_mul(file_count));
+    assert_eq!(report.files_deleted, expected_deleted);
+    assert_eq!(
+        report.bytes_freed,
+        file_len.saturating_mul(expected_deleted)
+    );
+
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, retain_after);
+    assert_eq!(after.bytes, file_len.saturating_mul(retain_after));
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "post-eviction usage must admit the planned incoming batch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3008,29 +3117,39 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     let entered = Arc::new((Mutex::new(false), Condvar::new()));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let finished = Arc::new((Mutex::new(false), Condvar::new()));
+    // Count writers currently parked inside BeforeWrite so the assertion below
+    // proves the gated write is still blocked, not merely that AfterWrite has
+    // not yet been observed on some other unpaired completion.
+    let parked_before_write = Arc::new(AtomicUsize::new(0));
     let _clear_hook = ClearSpoolWriteHookOnDrop {
         release: Arc::clone(&release),
     };
-    let block_first = Arc::new(AtomicBool::new(true));
 
     let entered_for_hook = Arc::clone(&entered);
     let release_for_hook = Arc::clone(&release);
     let finished_for_hook = Arc::clone(&finished);
+    let parked_for_hook = Arc::clone(&parked_before_write);
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => {
-            if block_first.swap(false, Ordering::SeqCst) {
-                {
-                    let (lock, cv) = &*entered_for_hook;
-                    let mut guard = lock.lock().expect("entered gate lock");
-                    *guard = true;
-                    cv.notify_all();
-                }
-                let (lock, cv) = &*release_for_hook;
-                let mut guard = lock.lock().expect("release gate lock");
-                while !*guard {
-                    guard = cv.wait(guard).expect("release gate wait");
+            // Hold the release lock before publishing `entered` so the test
+            // cannot race past this point until we are on the condvar wait.
+            // Every write that arrives while the gate is closed parks here, so
+            // a peer SpoolManager cannot publish AfterWrite early.
+            let (lock, cv) = &*release_for_hook;
+            let mut guard = lock.lock().expect("release gate lock");
+            {
+                let (entered_lock, entered_cv) = &*entered_for_hook;
+                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
+                if !*entered_guard {
+                    *entered_guard = true;
+                    entered_cv.notify_all();
                 }
             }
+            parked_for_hook.fetch_add(1, Ordering::SeqCst);
+            while !*guard {
+                guard = cv.wait(guard).expect("release gate wait");
+            }
+            parked_for_hook.fetch_sub(1, Ordering::SeqCst);
         }
         SpoolWriteHookPoint::AfterWrite => {
             let (lock, cv) = &*finished_for_hook;
@@ -3100,6 +3219,10 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     assert_eq!(
         lost_after_hook, lost_baseline,
         "bounded overflow enqueue must not drop while the delivery queue has capacity"
+    );
+    assert!(
+        parked_before_write.load(Ordering::SeqCst) > 0,
+        "gated spool write must still be parked in BeforeWrite before release"
     );
     assert!(
         !*finished.0.lock().expect("finished gate lock"),
@@ -3355,6 +3478,44 @@ fn spool_metadata_owner_mismatch_fails_closed_without_mutating_records() {
     fs::write(&meta_path, raw).unwrap();
     let replayable = spool.list_replayable_spool_files_for_tests().unwrap();
     assert_eq!(replayable, vec![record]);
+}
+
+#[test]
+fn version_one_spool_replays_legacy_owner_tags() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = spool_settings(temp.path(), 1024 * 1024);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let current_record = spool
+        .write_events(&[sample_event("evt-legacy-owner-tag")])
+        .unwrap();
+    let current_tag = spool.owner_tag_for_tests();
+    let legacy_tag = &current_tag[..16];
+
+    let meta_path = spool.namespace_root_for_tests().join("spool.meta.json");
+    let mut meta: Value = serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
+    assert_eq!(meta["version"], json!(1));
+    meta["owner_tag"] = json!(legacy_tag);
+    fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let legacy_name = current_record
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .replace(current_tag, legacy_tag);
+    let legacy_record = current_record.with_file_name(legacy_name);
+    fs::rename(&current_record, &legacy_record).unwrap();
+
+    assert_eq!(
+        spool.list_replayable_spool_files_for_tests().unwrap(),
+        vec![legacy_record.clone()],
+        "version-1 records with the original 16-character tag remain replayable"
+    );
+    let claim = spool
+        .claim_replay_file_for_tests(&legacy_record)
+        .unwrap()
+        .expect("a legacy-tagged record remains claimable by its digest owner");
+    assert!(claim.exists());
+    assert!(!legacy_record.exists());
 }
 
 #[test]
@@ -5411,4 +5572,91 @@ fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() 
     );
     assert!(accumulator.entry_count() <= MAX_ENTRIES);
     assert!(accumulator.retained_bytes_for_tests() <= MAX_BYTES);
+}
+
+// --- Billing identity integrity (GHSA-m28c-f3v5-26qg) ---
+
+/// Two authenticated identities sharing a 512-byte prefix must produce two
+/// snapshot accumulator entries and two exported `consumer_id` values. A
+/// prefix-only bound merged their calls, bytes, and charges into one billed
+/// principal.
+#[test]
+fn snapshot_keeps_shared_prefix_identities_separate() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.25,
+        charge_total: 0.25,
+        ..ChargeComputation::default()
+    };
+
+    let prefix = "p".repeat(512);
+    let alice = format!("{prefix}alice");
+    let bob = format!("{prefix}bob");
+    let summary = grpc_summary("shared-prefix", "0");
+    accumulator.record_http_for_test(&summary, &alice, charge);
+    accumulator.record_http_for_test(&summary, &bob, charge);
+
+    assert_eq!(
+        accumulator.entry_count(),
+        2,
+        "shared-prefix identities must not share one accumulator entry"
+    );
+
+    let events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-identity")
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    let mut consumer_ids: Vec<&str> = events
+        .iter()
+        .map(|event| event.consumer_id.as_str())
+        .collect();
+    consumer_ids.sort_unstable();
+    assert_ne!(
+        consumer_ids[0], consumer_ids[1],
+        "distinct principals must export distinct consumer_id values"
+    );
+    for consumer_id in &consumer_ids {
+        assert!(consumer_id.len() <= 512, "consumer_id exceeded the bound");
+        assert!(
+            consumer_id.contains("~sha256:"),
+            "oversized identity must carry a digest of the complete value"
+        );
+    }
+    for event in &events {
+        assert_eq!(event.call_count, 1, "charges must not be merged");
+    }
+}
+
+/// A 512-byte identity is exactly at the bound and must be exported verbatim.
+#[test]
+fn snapshot_exports_at_limit_identity_verbatim() {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = ChargeComputation {
+        call_count: 1,
+        charge_call: 0.25,
+        charge_total: 0.25,
+        ..ChargeComputation::default()
+    };
+
+    let consumer = "u".repeat(512);
+    accumulator.record_http_for_test(&grpc_summary("at-limit", "0"), &consumer, charge);
+
+    let events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-at-limit")
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].consumer_id, consumer);
 }
