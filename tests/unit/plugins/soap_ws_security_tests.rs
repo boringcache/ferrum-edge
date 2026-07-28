@@ -13,6 +13,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
+/// The fixed PasswordDigest nonce claim retention, in seconds, on both the
+/// process and the shared path:
+/// `MAX_UT_CREATED_MAX_AGE_SECONDS (86400) + 2 × MAX_CLOCK_SKEW_SECONDS (3600) + 1`.
+///
+/// This is the *global* maximum admissible acceptance horizon — the widest span
+/// over which any configuration the schema admits can accept an unchanged
+/// UsernameToken — not a value derived from the configured window. It is not
+/// operator-tunable; `nonce.cache_ttl_seconds` no longer exists.
+const CLAIM_RETENTION_SECONDS: u64 = 93_601;
+
 // ── Helper functions ────────────────────────────────────────────────────────
 
 fn make_ctx_with_soap_body(body: &str) -> RequestContext {
@@ -2936,7 +2946,7 @@ fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
     let max_size: usize = 20;
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": max_size, "cache_ttl_seconds": 300 },
+        "nonce": { "max_cache_size": max_size },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -2972,7 +2982,7 @@ fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
 fn test_nonce_replay_detected_via_direct_api() {
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 300 },
+        "nonce": { "max_cache_size": 100 },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -2983,14 +2993,14 @@ fn test_nonce_replay_detected_via_direct_api() {
 
 #[test]
 fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
-    // Once the TTL has elapsed, the atomic entry path must refresh inserted_at
-    // instead of treating reuse as a live replay. This covers the post-TTL
-    // Occupied insert branch used by successful PasswordDigest authentication.
-    // The external harness supplies deterministic monotonic instants, so no
-    // wall-clock sleep is required.
+    // Once the fixed retention horizon has elapsed, the atomic entry path must
+    // refresh inserted_at instead of treating reuse as a live replay. This
+    // covers the post-retention Occupied insert branch used by successful
+    // PasswordDigest authentication. The external harness supplies
+    // deterministic monotonic instants, so no wall-clock sleep is required.
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 1 },
+        "nonce": { "max_cache_size": 100 },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -3002,13 +3012,19 @@ fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     );
     assert!(
         harness
-            .claim_at("ttl-expired-nonce", Duration::from_millis(999))
+            .claim_at(
+                "ttl-expired-nonce",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+            )
             .is_err(),
-        "a repeat inside the TTL window is a live replay"
+        "a repeat inside the retention horizon is a live replay"
     );
     assert!(
         harness
-            .claim_at("ttl-expired-nonce", Duration::from_secs(1))
+            .claim_at(
+                "ttl-expired-nonce",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS)
+            )
             .is_ok(),
         "expired Occupied nonce must be refreshed, not rejected as a live replay"
     );
@@ -4285,7 +4301,10 @@ fn test_non_string_cert_path_entry_is_rejected() {
 
 #[test]
 fn test_zero_nonce_cache_controls_are_rejected() {
-    for key in ["cache_ttl_seconds", "max_cache_size"] {
+    // `cache_ttl_seconds` is intentionally absent: retention is fixed, so the
+    // key is no longer part of the schema at all (see
+    // `the_removed_retention_key_is_rejected_rather_than_ignored`).
+    for key in ["max_cache_size"] {
         let mut nonce = serde_json::Map::new();
         nonce.insert(key.to_string(), json!(0));
         let config = json!({
@@ -4338,7 +4357,6 @@ fn test_nonce_cache_is_bounded_by_total_retained_bytes() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 64,
             "max_total_cache_bytes": 4_096
         },
@@ -4506,7 +4524,6 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 3,
-            "cache_ttl_seconds": 10,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4527,7 +4544,7 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
         harness
             .claim_at("nonce-c-00000003", Duration::from_secs(3))
             .is_err(),
-        "same-key in-TTL claim must be a replay"
+        "same-key claim inside the retention horizon must be a replay"
     );
 
     let before = harness.snapshot().expect("snapshot");
@@ -4538,8 +4555,13 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(before.shared_key_entries, 3);
     assert_eq!(before.last_expired_removals, 0);
 
+    // One second past the fixed horizon, so the oldest entry — and only the
+    // oldest, because reclamation stops as soon as there is room — is expired.
     harness
-        .claim_at("nonce-d-00000004", Duration::from_secs(11))
+        .claim_at(
+            "nonce-d-00000004",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS + 1),
+        )
         .expect("one exact-oldest expiry must make room");
     let after_expiry = harness.snapshot().expect("snapshot");
     assert_eq!(after_expiry.entry_count, 3);
@@ -4550,7 +4572,10 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(after_expiry.last_expired_removals, 1);
 
     harness
-        .claim_at("nonce-b-00000002", Duration::from_secs(11))
+        .claim_at(
+            "nonce-b-00000002",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS + 1),
+        )
         .expect("expired same-key claim must refresh in place");
     let after_refresh = harness.snapshot().expect("snapshot");
     assert_eq!(after_refresh.entry_count, 3);
@@ -4563,9 +4588,10 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
 
 // ── Live entries are never evicted (GHSA-54mh-v348-j878) ───────────────────
 //
-// The remediation these tests pin is deliberate: replay coverage promised for
-// `cache_ttl_seconds` is honoured for the whole window. Capacity exhaustion is
-// a *rejection*, never a licence to unprotect an already-claimed nonce.
+// The remediation these tests pin is deliberate: the replay coverage a claim is
+// promised — the full fixed `CLAIM_RETENTION_SECONDS` horizon — is honoured for
+// the whole window. Capacity exhaustion is a *rejection*, never a licence to
+// unprotect an already-claimed nonce.
 
 #[test]
 fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
@@ -4573,7 +4599,6 @@ fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 3,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4629,7 +4654,6 @@ fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4676,12 +4700,12 @@ fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
 
 #[test]
 fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
-    const TTL: u64 = 60;
+    // Retention is fixed, not configured; drive the timeline off the constant.
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4726,12 +4750,11 @@ fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
 
 #[test]
 fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
-    const TTL: u64 = 10;
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 4,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4743,18 +4766,19 @@ fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
     for (nonce, seconds) in [
         ("nonce-a-00000001", 0),
         ("nonce-b-00000002", 1),
-        ("nonce-c-00000003", 8),
-        ("nonce-d-00000004", 9),
+        ("nonce-c-00000003", TTL - 2),
+        ("nonce-d-00000004", TTL - 1),
     ] {
         harness
             .claim_at(nonce, Duration::from_secs(seconds))
             .expect("fresh nonce must admit");
     }
 
-    // At t=11 only the first two entries are past the 10s TTL. Admitting one
-    // nonce needs exactly one slot, so exactly one expired entry is reclaimed.
+    // At t=TTL+1 only the first two entries are past the retention horizon.
+    // Admitting one nonce needs exactly one slot, so exactly one expired entry
+    // is reclaimed.
     harness
-        .claim_at("nonce-e-00000005", Duration::from_secs(11))
+        .claim_at("nonce-e-00000005", Duration::from_secs(TTL + 1))
         .expect("an expired entry must make room");
     let snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(snapshot.last_expired_removals, 1);
@@ -4767,7 +4791,7 @@ fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
     for nonce in ["nonce-c-00000003", "nonce-d-00000004", "nonce-e-00000005"] {
         assert_eq!(
             harness
-                .claim_at(nonce, Duration::from_secs(12))
+                .claim_at(nonce, Duration::from_secs(TTL + 2))
                 .expect_err("live nonce must remain replay-protected"),
             "WS-Security: nonce replay detected",
             "{nonce} lost replay protection"
@@ -4783,7 +4807,6 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 1_000_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4841,13 +4864,12 @@ fn test_nonce_reclaim_over_bounded_budget_rejects_then_retries_to_success() {
     const ENTRY_LEN: usize = 16;
     const MAX_BYTES: usize = 4_096;
     const ENTRY_COUNT: usize = MAX_BYTES / ENTRY_LEN;
-    const TTL: u64 = 30;
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
 
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 1_000_000,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": MAX_BYTES,
             "max_total_cache_bytes": MAX_BYTES
         },
@@ -4990,8 +5012,7 @@ fn test_nonce_inconsistent_age_index_fails_closed() {
     let err = soap_nonce_inconsistent_state_outcome_for_test(&json!({
         "timestamp": { "require": true },
         "nonce": {
-            "max_cache_size": 10,
-            "cache_ttl_seconds": 300
+            "max_cache_size": 10
         },
         "reject_missing_security_header": false
     }))
@@ -5015,7 +5036,6 @@ fn test_concurrent_nonce_admission_saturates_without_unprotecting_live_claims() 
             "timestamp": { "require": true },
             "nonce": {
                 "max_cache_size": MAX_ENTRIES,
-                "cache_ttl_seconds": 86_400,
                 "max_encoded_length": NONCE_LEN,
                 "max_total_cache_bytes": MAX_BYTES
             },
@@ -5109,7 +5129,6 @@ fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
             "timestamp": { "require": true },
             "nonce": {
                 "max_cache_size": 8,
-                "cache_ttl_seconds": 86_400,
                 "max_encoded_length": 32,
                 "max_total_cache_bytes": 4_096
             },
@@ -5485,7 +5504,7 @@ fn misspelled_redis_root_keys_still_fail_closed() {
 
 #[test]
 fn zero_replay_bounds_remain_rejected_for_password_digest() {
-    for (key, value) in [("cache_ttl_seconds", 0), ("max_cache_size", 0)] {
+    for (key, value) in [("max_cache_size", 0)] {
         let mut config = username_token_digest_config();
         config["nonce"][key] = json!(value);
         let err = SoapWsSecurity::new(&config)
@@ -5652,9 +5671,6 @@ async fn an_invalid_digest_flood_cannot_displace_a_captured_live_nonce() {
     // legitimate claim, and the legitimate nonce stays replay-protected.
     let mut config = username_token_digest_config();
     config["nonce"]["max_cache_size"] = json!(2);
-    // 300 + 2 × 300 + 1: the minimum retention this policy's `Created` window
-    // admits. Anything shorter is now refused at admission.
-    config["nonce"]["cache_ttl_seconds"] = json!(901);
     let plugin = SoapWsSecurity::new(&config).unwrap();
 
     let victim = password_digest_token("alice", "secret123", b"victim-nonce-01!");
@@ -5687,15 +5703,21 @@ async fn an_invalid_digest_flood_cannot_displace_a_captured_live_nonce() {
     );
 }
 
-// ── The claim must outlive the token (GHSA-54mh-v348-j878) ──────────────────
+// ── The claim must outlive the token, and every future token (GHSA-54mh) ────
 //
 // Binding the outer Timestamp stops a captured UsernameToken from being paired
 // with a freshly minted one. It does nothing once the *claim* has expired: the
 // captured request is then replayable unchanged, both of its instants still
-// inside their windows. These tests pin the arithmetic that closes that: the
-// nonce claim is retained for at least
-// `created_max_age_seconds + 2 × created_clock_skew_seconds + 1` seconds, which
-// strictly exceeds the longest span over which the same bytes stay acceptable.
+// inside their windows.
+//
+// Deriving retention from the *configured* window is not enough either. Replay
+// state outlives the generation that wrote it, so a claim has to cover every
+// window a later admitted generation may open — including a widening that lands
+// long after a per-generation retention would already have let the entry be
+// reclaimed or refreshed, at which point nothing can resurrect it. These tests
+// pin the contract that closes that: every claim, in both scopes, is retained
+// for the fixed `CLAIM_RETENTION_SECONDS` horizon — the widest acceptance span
+// the schema admits anywhere — with no operator knob able to shorten it.
 
 /// A PasswordDigest policy with an explicit inner `Created` window.
 fn digest_config_with_created_window(max_age: u64, skew: u64) -> Value {
@@ -5715,88 +5737,60 @@ fn retention_seconds_of(config: &Value) -> u64 {
 }
 
 #[test]
-fn default_retention_covers_the_default_created_acceptance_window() {
-    // Defaults: 300s max age, 300s skew. The old default retention was 300s —
-    // a 600s window in which the same token was accepted with no live claim.
-    assert_eq!(retention_seconds_of(&username_token_digest_config()), 901);
+fn retention_is_the_fixed_global_horizon_for_every_admissible_window() {
+    // Not derived from the configured window: the narrowest and the widest
+    // admissible policies retain claims for exactly the same span, so no
+    // reload from any one of them to any other can leave a gap.
+    assert_eq!(
+        retention_seconds_of(&username_token_digest_config()),
+        CLAIM_RETENTION_SECONDS,
+        "the default policy"
+    );
+    for (max_age, skew) in [(1, 0), (1, 3_600), (300, 300), (86_400, 0), (86_400, 3_600)] {
+        assert_eq!(
+            retention_seconds_of(&digest_config_with_created_window(max_age, skew)),
+            CLAIM_RETENTION_SECONDS,
+            "created_max_age_seconds = {max_age}, created_clock_skew_seconds = {skew}"
+        );
+    }
 }
 
 #[test]
-fn a_retention_shorter_than_the_created_window_is_refused_at_admission() {
-    for ttl in [1, 300, 900] {
+fn the_removed_retention_key_is_rejected_rather_than_ignored() {
+    // `nonce.cache_ttl_seconds` cannot shorten retention any more, so it is gone
+    // from the schema entirely rather than accepted and silently ignored — an
+    // accepted-but-inert knob would misdescribe the guarantee. Per the build-out
+    // policy there is no compatibility shim.
+    for value in [json!(1), json!(901), json!(93_601), json!(200_000)] {
         let mut config = username_token_digest_config();
-        config["nonce"]["cache_ttl_seconds"] = json!(ttl);
+        config["nonce"]["cache_ttl_seconds"] = value.clone();
         let err = SoapWsSecurity::new(&config)
             .err()
-            .unwrap_or_else(|| panic!("cache_ttl_seconds = {ttl} must be refused"));
-        assert!(err.contains("cache_ttl_seconds"), "{err}");
-        assert!(err.contains("901"), "the required minimum must be stated: {err}");
+            .unwrap_or_else(|| panic!("nonce.cache_ttl_seconds = {value} must be rejected"));
+        assert!(
+            err.contains("cache_ttl_seconds"),
+            "the rejected key must be named: {err}"
+        );
     }
-
-    let mut exact = username_token_digest_config();
-    exact["nonce"]["cache_ttl_seconds"] = json!(901);
-    assert_eq!(retention_seconds_of(&exact), 901, "the exact minimum admits");
-
-    let mut longer = username_token_digest_config();
-    longer["nonce"]["cache_ttl_seconds"] = json!(3_600);
-    assert_eq!(
-        retention_seconds_of(&longer),
-        3_600,
-        "a longer retention is always allowed — it can only over-protect"
-    );
 }
 
 #[test]
-fn minimum_created_window_admits_the_minimum_retention() {
-    // The smallest admissible window: 1s max age, 0s skew → 2s retention.
-    let minimum = digest_config_with_created_window(1, 0);
-    assert_eq!(retention_seconds_of(&minimum), 2);
-
-    let mut too_short = digest_config_with_created_window(1, 0);
-    too_short["nonce"]["cache_ttl_seconds"] = json!(1);
-    let err = SoapWsSecurity::new(&too_short)
-        .err()
-        .expect("even the smallest window needs more than a 1s claim");
-    assert!(
-        err.contains("cache_ttl_seconds") && err.contains("at least 2"),
-        "{err}"
-    );
-
-    let mut exact = digest_config_with_created_window(1, 0);
-    exact["nonce"]["cache_ttl_seconds"] = json!(2);
-    assert_eq!(retention_seconds_of(&exact), 2);
-}
-
-#[test]
-fn maximum_created_window_remains_configurable() {
-    // The coupling must not make the maximum acceptance settings impossible:
-    // 86400 + 2 × 3600 + 1 = 93601 is exactly the `cache_ttl_seconds` ceiling.
+fn the_maximum_created_window_remains_admissible() {
+    // The fixed horizon is derived from the schema ceilings, so the widest
+    // acceptance settings stay configurable and are still covered.
     let maximum = digest_config_with_created_window(86_400, 3_600);
-    assert_eq!(retention_seconds_of(&maximum), 93_601);
-
-    let mut exact = digest_config_with_created_window(86_400, 3_600);
-    exact["nonce"]["cache_ttl_seconds"] = json!(93_601);
-    assert_eq!(retention_seconds_of(&exact), 93_601);
-
-    let mut one_short = digest_config_with_created_window(86_400, 3_600);
-    one_short["nonce"]["cache_ttl_seconds"] = json!(93_600);
-    let err = SoapWsSecurity::new(&one_short)
-        .err()
-        .expect("one second short of the window must be refused");
-    assert!(err.contains("93601"), "{err}");
-
-    let mut past_ceiling = digest_config_with_created_window(86_400, 3_600);
-    past_ceiling["nonce"]["cache_ttl_seconds"] = json!(93_602);
-    let err = SoapWsSecurity::new(&past_ceiling)
-        .err()
-        .expect("the range ceiling still applies");
-    assert!(err.contains("cache_ttl_seconds"), "{err}");
+    assert_eq!(retention_seconds_of(&maximum), CLAIM_RETENTION_SECONDS);
+    assert_eq!(
+        CLAIM_RETENTION_SECONDS,
+        86_400 + 2 * 3_600 + 1,
+        "the horizon is MAX_UT_CREATED_MAX_AGE + 2 × MAX_CLOCK_SKEW + 1"
+    );
 }
 
 #[test]
 fn a_password_text_policy_is_not_forced_to_size_a_replay_cache() {
-    // Replay state is unreachable without PasswordDigest, so the coupling must
-    // not force a retention on a policy that never claims a nonce.
+    // Replay state is unreachable without PasswordDigest. The policy still
+    // admits with no nonce configuration at all.
     let config = json!({
         "timestamp": { "require": false },
         "username_token": {
@@ -5804,10 +5798,9 @@ fn a_password_text_policy_is_not_forced_to_size_a_replay_cache() {
             "password_type": "PasswordText",
             "credentials": [{"username": "alice", "password": "secret123"}]
         },
-        "nonce": { "cache_ttl_seconds": 1 },
         "reject_missing_security_header": true
     });
-    assert_eq!(retention_seconds_of(&config), 1);
+    assert_eq!(retention_seconds_of(&config), CLAIM_RETENTION_SECONDS);
 }
 
 #[test]
@@ -5845,140 +5838,243 @@ fn the_created_acceptance_interval_has_exactly_the_span_the_retention_covers() {
             .contains("too old")
     );
 
-    // The span an unchanged token can be accepted over, and the retention that
-    // must strictly exceed it.
+    // The span an unchanged token can be accepted over under this policy, and
+    // the widest span any admissible policy could ever accept it over. The
+    // fixed retention strictly exceeds both, which is what makes a later
+    // widening safe rather than merely improbable.
     let acceptance_span = (latest - earliest).num_seconds() as u64;
     assert_eq!(acceptance_span, (MAX_AGE + 2 * SKEW) as u64);
+    let widest_admissible_span = 86_400 + 2 * 3_600;
     assert!(
-        retention_seconds_of(&config) > acceptance_span,
-        "the claim must outlive every instant at which the token is accepted"
+        CLAIM_RETENTION_SECONDS > acceptance_span
+            && CLAIM_RETENTION_SECONDS > widest_admissible_span,
+        "the claim must outlive every instant at which any admissible generation \
+         would accept the token"
     );
 }
 
 #[test]
-fn a_claim_covers_the_last_acceptable_instant_and_expires_only_after_it() {
-    // Same window as above: acceptance spans 20s from the earliest claim, and
-    // the claim is retained for 21s.
-    let config = digest_config_with_created_window(10, 5);
-    let harness = SoapNonceReplayHarness::new(&config).expect("config must admit");
-    assert_eq!(harness.snapshot().expect("snapshot").retention_seconds, 21);
+fn a_claim_covers_the_widest_acceptable_instant_and_expires_only_after_it() {
+    // The widest admissible acceptance span, measured from the earliest instant
+    // a claim can be made, is 86400 + 2 × 3600 = 93600s. The claim is live
+    // through that instant and reclaimable exactly one second later.
+    let harness = SoapNonceReplayHarness::new(&digest_config_with_created_window(86_400, 3_600))
+        .expect("config must admit");
+    assert_eq!(
+        harness.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS
+    );
 
     harness
         .claim_at("boundary-nonce-01", Duration::ZERO)
         .expect("the earliest possible claim admits");
     assert_eq!(
         harness
-            .claim_at("boundary-nonce-01", Duration::from_secs(20))
+            .claim_at(
+                "boundary-nonce-01",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+            )
             .expect_err("the last acceptable instant must still be protected"),
         "WS-Security: nonce replay detected"
     );
-    // At 21s the entry expires — and the token itself stopped being acceptable
-    // a second earlier, so nothing is left to replay.
+    // One second later the entry expires — and the token itself stopped being
+    // acceptable at that same instant, so nothing is left to replay.
     harness
-        .claim_at("boundary-nonce-01", Duration::from_secs(21))
-        .expect("past the acceptance window the entry may be reclaimed");
+        .claim_at(
+            "boundary-nonce-01",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS),
+        )
+        .expect("past the widest acceptance window the entry may be reclaimed");
+}
+
+// ── The residual this PR closes: retention across future generations ────────
+
+/// A time comfortably past the retention a *narrow* generation would have
+/// derived for itself (300 + 2 × 300 + 1 = 901s) and equally comfortably inside
+/// the fixed horizon.
+const PAST_NARROW_GENERATION_RETENTION: u64 = 2_000;
+
+#[tokio::test]
+async fn a_claim_stays_live_past_the_retention_its_own_generation_would_have_derived() {
+    // Under a per-generation retention this nonce was expired at t=901 and the
+    // repeat below was an in-place *refresh* — i.e. the captured token admitted
+    // a second time. The fixed horizon keeps it a replay.
+    let harness = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(300, 300),
+        "soap-future-generation-liveness",
+        std::time::Instant::now(),
+    )
+    .expect("narrow generation must admit");
+
+    harness
+        .claim_at("future-gen-nonce-01", Duration::ZERO)
+        .expect("the claim is admitted");
+    assert_eq!(
+        harness
+            .claim_at(
+                "future-gen-nonce-01",
+                Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+            )
+            .expect_err("the claim must still be live"),
+        "WS-Security: nonce replay detected"
+    );
 }
 
 #[tokio::test]
-async fn a_narrower_generation_cannot_expire_or_refresh_a_wider_generations_claim() {
-    // Replay state is process-global and shared across reload generations. If
-    // expiry used the *calling* generation's retention, a reload to a narrower
-    // policy — or a still in-flight retired one — would hand back a nonce that
-    // is still protected, as a refresh rather than a replay.
-    let scope = "soap-retention-generation-a";
+async fn capacity_pressure_cannot_reclaim_a_claim_a_later_generation_still_needs() {
+    // The other way a claim used to disappear: once past the narrow
+    // generation's own retention it became reclaimable, so ordinary capacity
+    // pressure removed it — and a high-water mark cannot resurrect a removed
+    // entry. With a one-entry cap, the second nonce must be refused rather than
+    // allowed to evict the first.
+    let mut config = digest_config_with_created_window(300, 300);
+    config["nonce"]["max_cache_size"] = json!(1);
+    let harness = SoapNonceReplayHarness::with_scope(
+        &config,
+        "soap-future-generation-capacity",
+        std::time::Instant::now(),
+    )
+    .expect("narrow generation must admit");
+
+    harness
+        .claim_at("capacity-nonce-01", Duration::ZERO)
+        .expect("the first claim is admitted");
+    assert_eq!(
+        harness
+            .claim_at(
+                "capacity-nonce-02",
+                Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+            )
+            .expect_err("a live claim must never be evicted to make room"),
+        "WS-Security: replay protection state is at capacity"
+    );
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.last_expired_removals, 0);
+}
+
+#[tokio::test]
+async fn a_later_maximally_widened_generation_still_detects_the_replay() {
+    // The advisory's residual, end to end. A narrow generation claims a nonce.
+    // Well past the retention that generation would have derived for itself, a
+    // reload widens the acceptance window to the schema maximum — which is
+    // exactly when the captured token becomes acceptable again. The claim is
+    // still there, and stays there through the widened window's last acceptable
+    // instant.
+    let scope = "soap-future-generation-widening";
     let epoch = std::time::Instant::now();
-    let wide = SoapNonceReplayHarness::with_scope(
-        &digest_config_with_created_window(100, 50),
+    let narrow = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(300, 300),
         scope,
         epoch,
     )
-    .expect("wide generation must admit");
-    assert_eq!(wide.snapshot().expect("snapshot").retention_seconds, 201);
-
-    wide.claim_at("generation-nonce-01", Duration::ZERO)
-        .expect("the wide generation claims the nonce");
-
-    let narrow =
-        SoapNonceReplayHarness::with_scope(&digest_config_with_created_window(10, 5), scope, epoch)
-            .expect("narrow generation must admit");
-    assert_eq!(
-        narrow.snapshot().expect("snapshot").retention_seconds,
-        201,
-        "the scope keeps the longest retention any generation declared"
-    );
-
-    // 30s is well past the narrow generation's own 21s retention.
-    assert_eq!(
-        narrow
-            .claim_at("generation-nonce-01", Duration::from_secs(30))
-            .expect_err("a narrower generation must not expire a live claim"),
-        "WS-Security: nonce replay detected"
-    );
-    assert_eq!(
-        wide.claim_at("generation-nonce-01", Duration::from_secs(30))
-            .expect_err("and the claim is unchanged for the claiming generation"),
-        "WS-Security: nonce replay detected"
-    );
-}
-
-#[tokio::test]
-async fn a_widening_generation_extends_the_claims_already_recorded() {
-    // The other direction: a generation that widens the acceptance window makes
-    // already-claimed tokens acceptable for longer, so their claims have to grow
-    // with it or the widening itself opens a replay window.
-    let scope = "soap-retention-generation-b";
-    let epoch = std::time::Instant::now();
-    let narrow =
-        SoapNonceReplayHarness::with_scope(&digest_config_with_created_window(10, 5), scope, epoch)
-            .expect("narrow generation must admit");
+    .expect("narrow generation must admit");
     narrow
         .claim_at("widening-nonce-01", Duration::ZERO)
         .expect("the narrow generation claims the nonce");
 
+    // The reload lands after the old per-generation retention would have
+    // elapsed, so there is nothing left to extend — only what was never allowed
+    // to expire.
     let wide = SoapNonceReplayHarness::with_scope(
-        &digest_config_with_created_window(100, 50),
+        &digest_config_with_created_window(86_400, 3_600),
+        scope,
+        epoch,
+    )
+    .expect("widened generation must admit");
+    assert_eq!(
+        wide.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS,
+        "retention is the fixed horizon in every generation"
+    );
+
+    assert_eq!(
+        wide.claim_at(
+            "widening-nonce-01",
+            Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+        )
+        .expect_err("the widened generation must still see a replay"),
+        "WS-Security: nonce replay detected"
+    );
+    // And through the last instant the widened window itself would accept the
+    // unchanged token.
+    assert_eq!(
+        wide.claim_at(
+            "widening-nonce-01",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+        )
+        .expect_err("the widened acceptance window must be fully covered"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[tokio::test]
+async fn no_generation_can_expire_or_refresh_another_generations_claim() {
+    // Both directions at once: neither a narrower nor a wider generation has a
+    // retention of its own to impose, so a claim behaves identically whichever
+    // generation observes it.
+    let scope = "soap-generation-symmetry";
+    let epoch = std::time::Instant::now();
+    let wide = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(86_400, 3_600),
         scope,
         epoch,
     )
     .expect("wide generation must admit");
-    assert_eq!(wide.snapshot().expect("snapshot").retention_seconds, 201);
+    wide.claim_at("symmetry-nonce-01", Duration::ZERO)
+        .expect("the wide generation claims the nonce");
 
-    // Under the narrow generation's own 21s retention this entry was expired.
+    let narrow =
+        SoapNonceReplayHarness::with_scope(&digest_config_with_created_window(1, 0), scope, epoch)
+            .expect("narrow generation must admit");
     assert_eq!(
-        wide.claim_at("widening-nonce-01", Duration::from_secs(100))
-            .expect_err("widening the window must extend the existing claim"),
-        "WS-Security: nonce replay detected"
+        narrow.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS,
+        "the narrowest admissible generation reads the same fixed horizon"
     );
+
+    for (label, harness) in [("narrow", &narrow), ("wide", &wide)] {
+        assert_eq!(
+            harness
+                .claim_at(
+                    "symmetry-nonce-01",
+                    Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+                )
+                .expect_err("no generation may expire or refresh the claim"),
+            "WS-Security: nonce replay detected",
+            "{label} generation"
+        );
+    }
 }
 
 // Constructs a Redis client like every other shared-backend test, so it runs
 // on a runtime.
 #[tokio::test]
-async fn a_shared_claim_is_written_with_the_declared_retention() {
-    // The Redis `SET NX EX` TTL is the declared, admission-checked retention,
-    // so a shared claim outlives its token exactly like a process one. Observed
-    // through a pure seam — no live server is involved.
-    let mut config = shared_scope_config("redis://soap-nonce.invalid:6379");
-    config["username_token"]["created_max_age_seconds"] = json!(600);
-    config["username_token"]["created_clock_skew_seconds"] = json!(120);
-    assert_eq!(
-        soap_shared_claim_retention_seconds_for_test(&config).expect("shared scope seam"),
-        841,
-        "600 + 2 × 120 + 1"
-    );
+async fn the_shared_claim_ttl_is_the_fixed_future_safe_horizon() {
+    // `SET NX EX` cannot extend a key it did not create, so a per-generation TTL
+    // would be unfixable in the widening direction: keys written under the old
+    // value expire early whatever a later generation declares, and "raise,
+    // drain, then widen" is operator procedure rather than enforcement. Every
+    // replica and every generation therefore writes the same fixed horizon, so
+    // an existing key `SET NX` declines to touch already carries the full span.
+    // Observed through a pure seam — no live server is involved.
+    for (max_age, skew) in [(1, 0), (300, 300), (600, 120), (86_400, 3_600)] {
+        let mut config = shared_scope_config("redis://soap-nonce.invalid:6379");
+        config["username_token"]["created_max_age_seconds"] = json!(max_age);
+        config["username_token"]["created_clock_skew_seconds"] = json!(skew);
+        assert_eq!(
+            soap_shared_claim_retention_seconds_for_test(&config).expect("shared scope seam"),
+            CLAIM_RETENTION_SECONDS,
+            "created_max_age_seconds = {max_age}, created_clock_skew_seconds = {skew}"
+        );
+    }
 
+    // The keyspace retention is not declarable either, on this path or any
+    // other: the removed key fails admission closed.
     let mut declared = shared_scope_config("redis://soap-nonce.invalid:6379");
     declared["nonce"]["cache_ttl_seconds"] = json!(7_200);
-    assert_eq!(
-        soap_shared_claim_retention_seconds_for_test(&declared).expect("shared scope seam"),
-        7_200,
-        "an explicitly declared keyspace retention is used verbatim"
-    );
-
-    let mut too_short = shared_scope_config("redis://soap-nonce.invalid:6379");
-    too_short["nonce"]["cache_ttl_seconds"] = json!(600);
-    assert!(
-        SoapWsSecurity::new(&too_short).is_err(),
-        "a shared keyspace may not be declared shorter than the acceptance window"
-    );
+    let err = SoapWsSecurity::new(&declared)
+        .err()
+        .expect("a declared keyspace retention must be refused");
+    assert!(err.contains("cache_ttl_seconds"), "{err}");
 }

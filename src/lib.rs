@@ -1263,9 +1263,10 @@ pub mod _test_support {
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
         pub max_maintenance_entries: usize,
-        /// The scope's monotone retention high-water mark in seconds — what
-        /// entries are actually expired against, which is not necessarily the
-        /// calling generation's configured `nonce.cache_ttl_seconds`.
+        /// The fixed claim-retention horizon in seconds that entries are
+        /// expired against. Not configurable and not per-generation: it is the
+        /// widest acceptance window the schema admits, so no later reload can
+        /// outlive a claim.
         pub retention_seconds: u64,
     }
 
