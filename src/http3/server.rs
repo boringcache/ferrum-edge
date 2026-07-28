@@ -886,6 +886,24 @@ fn quinn_peer_cert_chain(connection: &quinn::Connection) -> Option<Vec<Vec<u8>>>
         .map(|certs| certs.iter().map(|c| c.to_vec()).collect())
 }
 
+/// Derive the HTTP/3 client-identity pair for a QUIC peer address.
+///
+/// Returns the canonical typed peer and the pre-formatted canonical IP string
+/// that every stream on the connection shares. Both come from one fold of the
+/// same address, so an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) and the same
+/// host arriving natively over IPv4 are one principal for per-IP request
+/// limits, IP/GeoIP policy, and logs (GHSA-vjwj-657f-5w9g).
+///
+/// Called once per connection and again on every observed QUIC connection
+/// migration, so a client that migrates onto a dual-stack path cannot acquire a
+/// second identity mid-connection.
+pub(crate) fn h3_client_identity(addr: SocketAddr) -> (SocketAddr, Arc<str>) {
+    (
+        crate::util::client_identity::canonical_socket_addr(addr),
+        crate::util::client_identity::canonical_ip_arc(addr.ip()),
+    )
+}
+
 /// Handle a single HTTP/3 connection (may carry multiple streams/requests).
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
@@ -926,10 +944,9 @@ async fn handle_h3_connection(
         let connecting = connecting.accept()?.into_0rtt();
         match connecting {
             Ok((conn, zero_rtt_accepted)) => {
-                debug!(
-                    "HTTP/3 0-RTT connection accepted from {}",
-                    conn.remote_address()
-                );
+                let remote =
+                    crate::util::client_identity::canonical_socket_addr(conn.remote_address());
+                debug!("HTTP/3 0-RTT connection accepted from {}", remote);
                 // Spawn a task that waits for the handshake to complete, then
                 // reports the outcome to the accept loop. The accept loop owns
                 // identity publication so it can drain every already-ready
@@ -947,7 +964,6 @@ async fn handle_h3_connection(
                 let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
                 handshake_completion_rx = Some(completion_rx);
                 let conn_for_close = conn.clone();
-                let remote = conn.remote_address();
                 tokio::spawn(async move {
                     let handshake_succeeded =
                         match await_with_optional_timeout(zero_rtt_accepted, handshake_timeout)
@@ -1010,7 +1026,10 @@ async fn handle_h3_connection(
     };
 
     let remote_addr = connection.remote_address();
-    debug!("HTTP/3 connection established from {}", remote_addr);
+    debug!(
+        "HTTP/3 connection established from {}",
+        crate::util::client_identity::canonical_socket_addr(remote_addr)
+    );
 
     // Publish the peer certificate and chain from the QUIC connection (mTLS).
     // Every branch that reaches here except the 0-RTT one has already awaited
@@ -1056,8 +1075,14 @@ async fn handle_h3_connection(
     // Pre-format socket IP string once per connection — shared across all streams
     // to avoid per-request String allocation from SocketAddr::ip().to_string().
     // Updated in-place when QUIC connection migration is detected.
+    // `cached_addr` stays RAW: it is only ever compared against
+    // `quinn_conn.remote_address()` to detect migration, and folding one side of
+    // that comparison would report a migration on every request from a mapped
+    // peer. The identity pair derived from it is refreshed as a unit whenever it
+    // changes, so the typed peer and its string always describe the same address
+    // (GHSA-vjwj-657f-5w9g).
     let mut cached_addr = quinn_conn.remote_address();
-    let mut socket_ip: Arc<str> = Arc::from(cached_addr.ip().to_canonical().to_string());
+    let (mut canonical_peer, mut socket_ip) = h3_client_identity(cached_addr);
 
     loop {
         // A QUIC early-data request and the TLS Connected event can become
@@ -1099,12 +1124,17 @@ async fn handle_h3_connection(
                 // address actually changes, which is rare (mobile network handoff).
                 let current_addr = quinn_conn.remote_address();
                 if current_addr != cached_addr {
+                    let previous_peer = canonical_peer;
+                    cached_addr = current_addr;
+                    // The post-migration address is a fresh identity boundary and is
+                    // folded on the same terms as the initial one — a client that
+                    // migrates onto a mapped IPv4 path keeps one per-IP budget and one
+                    // GeoIP principal (GHSA-vjwj-657f-5w9g).
+                    (canonical_peer, socket_ip) = h3_client_identity(current_addr);
                     info!(
                         "HTTP/3 connection migration detected: {} -> {}",
-                        cached_addr, current_addr
+                        previous_peer, canonical_peer
                     );
-                    cached_addr = current_addr;
-                    socket_ip = Arc::from(current_addr.ip().to_canonical().to_string());
                 }
 
                 let state = Arc::clone(&state);
@@ -1130,7 +1160,7 @@ async fn handle_h3_connection(
                                 req,
                                 stream,
                                 state,
-                                current_addr,
+                                canonical_peer,
                                 &socket_ip,
                                 frontend_listen_port,
                                 frontend_sni_hostname,
@@ -1153,11 +1183,11 @@ async fn handle_h3_connection(
                 });
             }
             Ok(None) => {
-                debug!("HTTP/3 connection closed from {}", remote_addr);
+                debug!("HTTP/3 connection closed from {}", canonical_peer);
                 break;
             }
             Err(e) => {
-                warn!("HTTP/3 connection error from {}: {}", remote_addr, e);
+                warn!("HTTP/3 connection error from {}: {}", canonical_peer, e);
                 break;
             }
         }
@@ -1195,6 +1225,11 @@ impl crate::plugins::PeerConnectionWatch for QuicPeerConnectionWatch {
 }
 
 /// Handle a single HTTP/3 request stream.
+///
+/// `remote_addr` is the connection's current (post-migration) QUIC peer already
+/// folded through `client_identity::canonical_socket_addr`, and `socket_ip` is
+/// the pre-formatted string for that same address — so the typed and textual
+/// client identities always describe one principal (GHSA-vjwj-657f-5w9g).
 #[allow(clippy::too_many_arguments)]
 async fn handle_h3_request(
     req: http::Request<()>,

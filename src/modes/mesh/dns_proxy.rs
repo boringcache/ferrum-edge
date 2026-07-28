@@ -525,13 +525,7 @@ fn parse_routable_mesh_dns_ip(addr: &str) -> Option<IpAddr> {
 }
 
 fn canonicalize_mesh_dns_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(addr) => addr
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(addr)),
-    }
+    crate::util::client_identity::canonical_ip(ip)
 }
 
 fn is_routable_mesh_dns_ip(ip: &IpAddr) -> bool {

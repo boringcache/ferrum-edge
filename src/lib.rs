@@ -137,6 +137,32 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
     }
 
+    /// Classify an unexpected DTLS recv-loop JoinHandle result the same way
+    /// production does when the accept loop observes recv-task exit.
+    pub fn classify_dtls_recv_loop_exit_for_test(
+        join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        crate::proxy::udp_proxy::classify_dtls_recv_loop_exit(join_result)
+    }
+
+    /// Drive DTLS recv-loop vs shutdown supervision with synthetic tasks.
+    pub async fn supervise_dtls_recv_loop_task_for_test(
+        server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        global_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_shutdown: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::udp_proxy::supervise_dtls_recv_loop_task(
+            server_task,
+            shutdown_rx,
+            global_shutdown_rx,
+            started,
+            on_shutdown,
+        )
+        .await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -3276,6 +3302,49 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
+    pub const GRPC_FRAME_TRAILER_COMPRESSED: u8 =
+        crate::plugins::grpc_web::GRPC_FRAME_TRAILER_COMPRESSED;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_BLOCK_BYTES;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_ENTRIES;
+
+    /// Wire-level view of the request-side gRPC-Web trailer-frame split.
+    ///
+    /// Returns `Ok(None)` when the body carries no trailer frame, the
+    /// `(data_end, trailers)` split when it carries a valid one, and the
+    /// field-specific diagnostic when the frame is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn split_grpc_web_request_trailer_frame(
+        data: &[u8],
+    ) -> Result<Option<(usize, Vec<(String, String)>)>, &'static str> {
+        crate::plugins::grpc_web::split_request_trailer_frame(data)
+            .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
+    }
+
+    /// The request trailers a gRPC dispatch would send, read back from
+    /// owner-scoped request staging exactly as the dispatch paths read them.
+    ///
+    /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
+    /// the sort is stable, so repeated values of one name keep wire order.
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String)>> {
+        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
+            let mut entries: Vec<(String, String)> = map
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        })
+    }
+
     pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
@@ -4994,5 +5063,30 @@ pub mod _test_support {
             drain_timeout,
         )
         .await
+    }
+
+    /// The exact client identity the HTTP-family accept loop installs for one
+    /// accepted connection, including node-agent source-IP restoration.
+    ///
+    /// This is the production function `run_accept_loop` calls, not a mirror of
+    /// it, so external coverage of the ingress canonicalization boundary
+    /// (GHSA-vjwj-657f-5w9g) cannot drift away from the served path.
+    pub fn accept_peer_identity_for_test(
+        accepted: std::net::SocketAddr,
+        source_ip_override: Option<std::net::IpAddr>,
+    ) -> std::net::SocketAddr {
+        crate::proxy::resolve_accept_peer_identity(accepted, source_ip_override)
+    }
+
+    /// The canonical `(typed peer, pre-formatted IP string)` pair the HTTP/3
+    /// connection loop derives for a QUIC peer, at connection start and again on
+    /// every observed connection migration.
+    ///
+    /// Production function, not a mirror — see
+    /// [`accept_peer_identity_for_test`].
+    pub fn h3_client_identity_for_test(
+        addr: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<str>) {
+        crate::http3::server::h3_client_identity(addr)
     }
 }
