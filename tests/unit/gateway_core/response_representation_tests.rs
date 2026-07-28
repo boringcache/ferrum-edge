@@ -111,7 +111,14 @@ async fn run_backend_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body.to_vec(), reason)
+    (
+        replaced,
+        transformed,
+        status,
+        headers,
+        body.to_vec(),
+        reason,
+    )
 }
 
 /// The secret must not survive in the bytes the client would receive.
@@ -2697,7 +2704,14 @@ async fn run_backend_transform_with_request_headers(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body.to_vec(), reason)
+    (
+        replaced,
+        transformed,
+        status,
+        headers,
+        body.to_vec(),
+        reason,
+    )
 }
 
 /// The bypass itself: an SSE-accepting request whose response another plugin
