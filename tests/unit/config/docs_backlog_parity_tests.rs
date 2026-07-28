@@ -8,7 +8,6 @@ const PRODUCTION_READINESS: &str = include_str!("../../../PRODUCTION_READINESS.m
 const RESPONSE_BODY_STREAMING: &str = include_str!("../../../docs/response_body_streaming.md");
 const MESH_SUPPORTED_MATRIX: &str = include_str!("../../../docs/mesh_supported_matrix.md");
 const SPIRE_DEPLOYMENT: &str = include_str!("../../../docs/spire_deployment.md");
-const MESH_PERF_README: &str = include_str!("../../../tests/performance/mesh/README.md");
 const PROTOCOL_PERF_REGRESSION: &str = include_str!("../../../docs/protocol_perf_regression.md");
 const ISSUE_2110_REGISTER: &str = include_str!("../../../docs/backlog/issue_2110_register.md");
 const MULTICLUSTER_RUNBOOK: &str =
@@ -88,22 +87,6 @@ fn spire_dashboard_checklist_references_shipped_assets() {
 }
 
 #[test]
-fn mesh_perf_readme_points_at_existing_e2e_harnesses() {
-    assert!(
-        !MESH_PERF_README.contains("Benches deferred (not yet implemented)"),
-        "HBONE/DNS E2E harnesses exist; deferred heading is stale"
-    );
-    assert!(
-        MESH_PERF_README.contains("mesh-hbone-e2e") && MESH_PERF_README.contains("mesh-dns-e2e"),
-        "README must point operators at the existing E2E harness directories"
-    );
-    assert!(
-        MESH_PERF_README.contains("#3332"),
-        "baseline-publication residual must cite #3332"
-    );
-}
-
-#[test]
 fn protocol_perf_regression_documents_mesh_e2e_status() {
     assert!(
         PROTOCOL_PERF_REGRESSION.contains("Mesh in-process vs E2E suites"),
@@ -117,6 +100,11 @@ fn protocol_perf_regression_documents_mesh_e2e_status() {
     assert!(
         PROTOCOL_PERF_REGRESSION.contains("#3332"),
         "runbook must cite the baseline-publication tracker"
+    );
+    assert!(
+        PROTOCOL_PERF_REGRESSION.contains("frozen Trusted Cross automation")
+            && PROTOCOL_PERF_REGRESSION.contains("Benches deferred (not yet implemented)"),
+        "runbook must state the protected mesh README is frozen historical prose"
     );
 }
 
@@ -147,6 +135,13 @@ fn issue_2110_register_maps_completed_work_and_live_trackers() {
     assert!(
         !ISSUE_2110_REGISTER.contains("TLS-SNI L4 routing “on roadmap”"),
         "completed TLS-SNI support must not remain a roadmap deferral"
+    );
+    assert!(
+        ISSUE_2110_REGISTER.contains("frozen")
+            && ISSUE_2110_REGISTER.contains("tests/performance/mesh/README.md")
+            && ISSUE_2110_REGISTER.contains("mesh-hbone-e2e")
+            && ISSUE_2110_REGISTER.contains("mesh-dns-e2e"),
+        "register must explain the protected mesh README stays historical while naming live suites"
     );
 }
 

@@ -1,7 +1,9 @@
 # Issue #2110 — historical deferral register
 
-**Captured:** 2026-07-12 production-readiness epic (umbrella register).  
-**Role:** Historical snapshot only — not the live product backlog.  
+**Captured:** 2026-07-12 production-readiness epic (umbrella register).
+
+**Role:** Historical snapshot only — not the live product backlog.
+
 **Current source of truth:** [`PRODUCTION_READINESS.md`](../../PRODUCTION_READINESS.md)
 (Current residual map) and the dedicated issues cited below.
 
@@ -9,6 +11,14 @@ GitHub issue [#2110](https://github.com/ferrum-edge/ferrum-edge/issues/2110)
 remains open as the historical register; use this file plus
 `PRODUCTION_READINESS.md` when screening agents or docs against the 2026-07-12
 checkbox list.
+
+Protected automation note: `tests/performance/mesh/README.md` is a frozen
+Trusted Cross surface (every path under `tests/performance/` is protected,
+including Markdown). Its historical "Benches deferred (not yet implemented)"
+prose is **not** the current backlog source of truth and must stay unchanged.
+Current mesh HBONE/DNS perf status lives in
+[`docs/protocol_perf_regression.md`](../protocol_perf_regression.md)
+(`mesh-hbone-e2e` / `mesh-dns-e2e` suites; residual [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332)).
 
 ## Completed or superseded (do not reopen from #2110 alone)
 

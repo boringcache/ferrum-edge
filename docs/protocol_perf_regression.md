@@ -123,10 +123,15 @@ as live E2E harnesses that spin up `ferrum-edge` plus stub peers:
 | HBONE gateway overhead | `tests/performance/mesh-hbone-e2e/` | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS | Provenance-complete `baseline.md` rows still `_TBD_` — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
 | Mesh DNS proxy | `tests/performance/mesh-dns-e2e/` | Transparent mesh DNS proxy latency/QPS over UDP and TCP | Same baseline-publication residual — [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332) |
 
-Trusted Cross automation policy freezes executable prose in
-`tests/performance/**/README.md` files. Reconcile mesh suite status here and in
-[`tests/performance/mesh/README.md`](../tests/performance/mesh/README.md)
-without rewriting fenced benchmark command blocks.
+`tests/performance/mesh/README.md` is a **frozen Trusted Cross automation
+surface**: every path under `tests/performance/` is treated as protected
+executable/configuration prose, including Markdown. Its historical
+"Benches deferred (not yet implemented)" section is **not** the current
+backlog source of truth and must remain unchanged. Live suite status,
+`mesh-hbone-e2e` / `mesh-dns-e2e` pointers, and the [#3332](https://github.com/ferrum-edge/ferrum-edge/issues/3332)
+baseline-publication residual are documented here (and in
+[`docs/backlog/issue_2110_register.md`](backlog/issue_2110_register.md))
+instead of rewriting that protected README.
 
 ## Related surfaces
 
