@@ -48,7 +48,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, wait_until_committed, wait_until_committed_or_closed,
+    RetryPolicy, redacted_endpoint_url, redacted_endpoint_url_str, wait_until_committed,
+    wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -2022,7 +2023,15 @@ impl LatencyHistogram {
 #[derive(Clone)]
 struct ClickHouseFlushConfig {
     http: ClickHouseHttpClient,
+    /// Complete INSERT URL, including the `database`/`query` parameters and
+    /// every operator `insert_query_params` pair. Used **only** to build the
+    /// outbound request.
     insert_url: String,
+    /// Structurally redacted rendering of [`Self::insert_url`] for every
+    /// diagnostic surface. Credential-bearing `insert_query_params` names are
+    /// already rejected at validation, but arbitrary values remain admitted, so
+    /// no diagnostic ever renders the query string.
+    redacted_insert_url: String,
     username: Option<String>,
     password: Option<String>,
     timeout: Duration,
@@ -2036,12 +2045,25 @@ enum ClickHouseHttpClient {
 }
 
 impl ClickHouseHttpClient {
+    /// Send the INSERT while keeping the complete URL out of diagnostics.
+    ///
+    /// The shared-client arm routes through `execute_with_redacted_url` so the
+    /// literal-IP egress denial, retry, and slow-call warnings emitted inside
+    /// `PluginHttpClient` record `redacted_url` instead of the INSERT URL. The
+    /// dedicated custom-TLS arm emits no diagnostics of its own; its
+    /// `reqwest::Error` is reduced to a fixed [`FailureReason`] by the caller
+    /// and never rendered, so the URL cannot reach a log line there either.
     async fn execute(
         &self,
         request: reqwest::RequestBuilder,
+        redacted_url: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         match self {
-            ClickHouseHttpClient::Shared(client) => client.execute(request, PLUGIN_NAME).await,
+            ClickHouseHttpClient::Shared(client) => {
+                client
+                    .execute_with_redacted_url(request, PLUGIN_NAME, redacted_url)
+                    .await
+            }
             ClickHouseHttpClient::Dedicated(_) => request.send().await,
         }
     }
@@ -2138,6 +2160,9 @@ impl ApiChargebackSink {
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
+        // Structural, not substring: nothing from the INSERT query string is
+        // copied into the diagnostic rendering.
+        let redacted_insert_url = redacted_endpoint_url(&parsed_url);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
         // Build the spool-replay client before staging so a TLS/file failure
@@ -2181,6 +2206,7 @@ impl ApiChargebackSink {
         let flush_config = ClickHouseFlushConfig {
             http,
             insert_url: insert_url.clone(),
+            redacted_insert_url: redacted_insert_url.clone(),
             username: self.config.clickhouse.username.clone(),
             password,
             timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -2312,6 +2338,7 @@ impl ApiChargebackSink {
                 ClickHouseFlushConfig {
                     http: replay_http,
                     insert_url,
+                    redacted_insert_url,
                     username: self.config.clickhouse.username.clone(),
                     password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
@@ -3618,7 +3645,7 @@ async fn post_json_each_row(
     if let Some(username) = cfg.username.as_deref() {
         request = request.basic_auth(username, cfg.password.clone());
     }
-    let result = cfg.http.execute(request).await;
+    let result = cfg.http.execute(request, &cfg.redacted_insert_url).await;
     match result {
         Ok(response) => {
             let status = response.status();
@@ -4099,11 +4126,58 @@ fn validate_clickhouse_identifier(value: &str, field: &str) -> Result<(), String
     Ok(())
 }
 
+/// ClickHouse parameter names that carry a reusable credential.
+///
+/// ClickHouse accepts `user`/`password`/`access_token` as HTTP query
+/// parameters, so an operator could authenticate that way. Ferrum does not
+/// support it: `clickhouse.username` and `clickhouse.password_ref` are the
+/// dedicated channel and send the credential as an HTTP Basic header, which is
+/// never rendered in diagnostics and never appended to a URL. Admitting the
+/// query form would put a reusable database credential into the configured
+/// `insert_query_params` map — a value that admin projections and config
+/// exports treat as ordinary tuning.
+///
+/// This list is exact-match and lowercase; it is deliberately bounded rather
+/// than a substring screen so that legitimate ClickHouse settings are never
+/// refused by accident.
+const CREDENTIAL_QUERY_PARAM_NAMES: &[&str] = &["access_token", "password", "session_id", "user"];
+
+/// Substrings that mark an operator-invented credential-bearing parameter name.
+///
+/// ClickHouse has no settings containing these tokens, so a name that does is
+/// far more likely to be a hand-rolled secret than a tuning knob. Kept short
+/// and explicit for the same reason as [`CREDENTIAL_QUERY_PARAM_NAMES`].
+const CREDENTIAL_QUERY_PARAM_MARKERS: &[&str] = &[
+    "apikey",
+    "api_key",
+    "credential",
+    "passwd",
+    "secret",
+    "token",
+];
+
 fn validate_query_params(params: &HashMap<String, String>) -> Result<(), String> {
     for (key, value) in params {
         if key.is_empty() || key.len() > 128 || key.chars().any(char::is_control) {
             return Err(format!(
                 "{PLUGIN_NAME}: clickhouse.insert_query_params contains invalid key"
+            ));
+        }
+        // Reject credential-bearing *names* outright. Values stay arbitrary
+        // (bounded length, no control characters) and are protected instead by
+        // never rendering the INSERT query string in any diagnostic — see
+        // `ClickHouseFlushConfig::redacted_insert_url`.
+        let lowered = key.to_ascii_lowercase();
+        if CREDENTIAL_QUERY_PARAM_NAMES.contains(&lowered.as_str())
+            || CREDENTIAL_QUERY_PARAM_MARKERS
+                .iter()
+                .any(|marker| lowered.contains(marker))
+        {
+            return Err(format!(
+                "{PLUGIN_NAME}: clickhouse.insert_query_params['{key}'] names a credential; \
+                 ClickHouse credentials belong in clickhouse.username and \
+                 clickhouse.password_ref, which are sent as an HTTP Basic header rather than \
+                 appended to the INSERT URL"
             ));
         }
         if value.len() > 512 || value.chars().any(char::is_control) {
@@ -7011,6 +7085,7 @@ pub async fn replay_spool_once_with_batch_size_for_tests(
     let flush_config = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: insert_url.to_string(),
+        redacted_insert_url: redacted_endpoint_url_str(insert_url),
         username: None,
         password: None,
         timeout: Duration::from_secs(5),
@@ -7062,6 +7137,7 @@ pub fn classify_clickhouse_acknowledgement_for_tests(
     let cfg = ClickHouseFlushConfig {
         http: ClickHouseHttpClient::Dedicated(reqwest::Client::new()),
         insert_url: "http://127.0.0.1/".to_string(),
+        redacted_insert_url: "http://127.0.0.1/redacted".to_string(),
         username: None,
         password: None,
         timeout: Duration::from_secs(1),

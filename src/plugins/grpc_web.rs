@@ -20,6 +20,10 @@
 //! 2. Negotiate the response media type from `Accept` (see below)
 //! 3. Rewrite content-type to `application/grpc` for the backend
 //! 4. Text mode: base64-decode the request body
+//! 5. Split a terminal body trailer frame (`0x80`) off the message frames,
+//!    validate it, and stage it for conversion into native HTTP/2 request
+//!    trailers at the end of the backend-bound body (see
+//!    [`split_request_trailer_frame`])
 //!
 //! ## Response path (native gRPC → gRPC-Web)
 //!
@@ -100,7 +104,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::debug;
 
 use crate::proxy::headers::{
-    is_backend_response_strip_header, parse_connection_listed_from_str_map,
+    is_backend_response_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map,
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -187,8 +192,22 @@ pub(crate) fn reject_headers_mark_accept_not_acceptable(
 /// for this request. Present only after a successful `on_request_received`
 /// claim — never inferred from plugin-writable client input.
 const META_GRPC_WEB_OWNER: &str = "grpc_web.owner";
-/// Set after the owner base64-decodes a text-mode request body once.
+/// Set after the owner performed request-body translation once: text-mode
+/// base64 decode, terminal trailer-frame split, or both. Also set when the
+/// trailer frame was rejected, so a second pass cannot re-run the parse and
+/// overwrite the staged diagnostic.
 const META_GRPC_WEB_REQUEST_DECODED: &str = "grpc_web.request_decoded";
+/// Base64-encoded JSON array of `[name, value]` request trailer pairs split
+/// off the request body by the translation owner. Consumed by the gRPC
+/// dispatch paths via [`staged_request_trailers`], which re-validates every
+/// entry (`ctx.metadata` is plugin-writable, so being present is not proof of
+/// provenance).
+const META_GRPC_WEB_REQUEST_TRAILERS: &str = "grpc_web.request_trailers";
+/// Diagnostic recorded when the request trailer frame failed validation.
+/// `transform_request_body_with_context` cannot reject, so the owner's
+/// `on_final_request_body_with_context` reads this and fails the request
+/// closed with the field-specific message before backend dispatch.
+const META_GRPC_WEB_REQUEST_TRAILER_ERROR: &str = "grpc_web.request_trailer_error";
 /// Set after the owner appends the trailer frame (and base64-encodes in text
 /// mode) once. Prevents sibling instances from re-framing the body.
 const META_GRPC_WEB_RESPONSE_TRANSLATED: &str = "grpc_web.response_translated";
@@ -345,9 +364,13 @@ fn binary_frames_are_complete(data: &[u8], trailer_frame_allowed: bool) -> bool 
 
 /// Validate the complete backend-bound gRPC-Web request envelope.
 ///
-/// Request bodies may contain one or more native gRPC DATA frames. Ferrum does
-/// not translate body-encoded gRPC-Web request trailers into native HTTP/2
-/// trailers, so `0x80`/`0x81` are rejected instead of being forwarded as data.
+/// Request bodies may contain one or more native gRPC DATA frames. By the time
+/// this runs on the owner path, any terminal gRPC-Web trailer frame has already
+/// been split off by [`split_request_trailer_frame`] and staged as native
+/// HTTP/2 request trailers, so a `0x80`/`0x81` byte still present here is a
+/// duplicate, misordered, or unclaimable trailer frame and is rejected rather
+/// than forwarded as message bytes. The legacy no-context hook has nowhere to
+/// stage trailers and therefore rejects every trailer frame outright.
 /// A compressed DATA frame is valid only when the request declares one
 /// non-identity `grpc-encoding`; uncompressed frames remain legal when an
 /// encoding is declared because compression is selected per message.
@@ -374,7 +397,7 @@ fn validate_grpc_web_request_frames(
                 return Err("compressed gRPC frame requires a non-identity grpc-encoding");
             }
             GRPC_FRAME_TRAILER | GRPC_FRAME_TRAILER_COMPRESSED => {
-                return Err("request-side gRPC-Web trailer frames are unsupported");
+                return Err("unexpected gRPC-Web trailer frame in the message stream");
             }
             _ => return Err("unsupported gRPC frame flag"),
         }
@@ -431,12 +454,361 @@ fn grpc_encoding_allows_compressed_frames(headers: &HashMap<String, String>) -> 
         })
 }
 
-fn invalid_grpc_web_request(error: &'static str) -> PluginResult {
+fn invalid_grpc_web_request(error: &str) -> PluginResult {
+    // The diagnostics are gateway-authored constants, but the trailer-frame
+    // failure travels through plugin-writable `ctx.metadata` before it lands
+    // here — escape unconditionally so no reachable path can inject JSON.
+    let error = crate::plugins::utils::json_escape::escape_json_string(error);
     PluginResult::Reject {
         status_code: 400,
         body: format!("{{\"error\":\"Invalid gRPC-Web request: {error}\"}}"),
         headers: grpc_content_type_header(),
     }
+}
+
+// ── Request-side trailer frames ─────────────────────────────────────────────
+//
+// gRPC-Web clients encode end-of-stream metadata as a final `0x80` frame in the
+// request body, because a browser transport cannot emit HTTP/2 trailers. Ferrum
+// splits that frame off the message frames, validates it, and re-emits it as a
+// real HTTP/2 TRAILERS block at the end of the backend-bound request body, so
+// the backend sees the native gRPC representation. Nothing is folded into the
+// initial HEADERS block: request metadata that arrives at end-of-stream is not
+// interchangeable with metadata the gateway already authenticated, authorized,
+// and forwarded, and quietly promoting it would let a trailer contradict a
+// decision that has already been made.
+
+/// Maximum accepted payload length of a request-side gRPC-Web trailer frame.
+///
+/// The frame rides inside the request body, so it is already bounded by the
+/// gRPC receive ceiling (`FERRUM_MAX_GRPC_RECV_SIZE_BYTES`) and by request-body
+/// buffering. This second, much smaller bound exists because the block does not
+/// stay body bytes: it becomes an HTTP/2 header block the backend must hold
+/// decoded, so a client must not be able to spend the whole body budget there.
+pub(crate) const MAX_REQUEST_TRAILER_BLOCK_BYTES: usize = 8 * 1024;
+/// Maximum number of trailer entries accepted from one request trailer frame.
+pub(crate) const MAX_REQUEST_TRAILER_ENTRIES: usize = 64;
+/// Maximum length of a single request trailer name.
+const MAX_REQUEST_TRAILER_NAME_BYTES: usize = 128;
+/// Maximum length of a single request trailer value.
+const MAX_REQUEST_TRAILER_VALUE_BYTES: usize = 4096;
+/// Maximum base64-encoded JSON staging size for one validated trailer block.
+///
+/// JSON escaping can at most double the accepted 8 KiB wire payload; the
+/// remaining factor covers tuple punctuation and base64 expansion. Check this
+/// before decoding plugin-writable metadata so a forged staging value cannot
+/// trigger an unbounded allocation.
+const MAX_REQUEST_TRAILER_STAGING_BYTES: usize = 4 * MAX_REQUEST_TRAILER_BLOCK_BYTES;
+
+const ERR_TRAILER_COMPRESSED: &str =
+    "compressed gRPC-Web request trailer frames are not defined by the protocol";
+const ERR_TRAILER_WITHOUT_MESSAGE: &str =
+    "gRPC-Web request trailer frame without a preceding message frame";
+const ERR_TRAILER_NOT_FINAL: &str =
+    "gRPC-Web request trailer frame must be the last frame in the body";
+const ERR_TRAILER_BLOCK_TOO_LARGE: &str = "gRPC-Web request trailer block is too large";
+const ERR_TRAILER_BLOCK_EMPTY: &str = "gRPC-Web request trailer frame carries no trailer metadata";
+const ERR_TRAILER_LINE_UNTERMINATED: &str = "gRPC-Web request trailer line is not CRLF-terminated";
+const ERR_TRAILER_LINE_MALFORMED: &str = "malformed gRPC-Web request trailer line";
+const ERR_TRAILER_PSEUDO_HEADER: &str =
+    "gRPC-Web request trailer frame must not carry a pseudo-header";
+const ERR_TRAILER_NAME_INVALID: &str = "invalid gRPC-Web request trailer name";
+const ERR_TRAILER_NAME_FORBIDDEN: &str =
+    "gRPC-Web request trailer name is not allowed at end of stream";
+const ERR_TRAILER_NAME_TOO_LONG: &str = "gRPC-Web request trailer name is too long";
+const ERR_TRAILER_VALUE_INVALID: &str = "invalid gRPC-Web request trailer value";
+const ERR_TRAILER_VALUE_TOO_LONG: &str = "gRPC-Web request trailer value is too long";
+const ERR_TRAILER_BIN_VALUE_INVALID: &str = "gRPC-Web request binary trailer value is not base64";
+const ERR_TRAILER_TOO_MANY_ENTRIES: &str = "too many gRPC-Web request trailer entries";
+const ERR_TRAILER_STAGING_FAILED: &str = "failed to stage validated gRPC-Web request trailers";
+
+/// A validated terminal trailer frame split off a gRPC-Web request body.
+pub(crate) struct RequestTrailerFrame {
+    /// Offset where the trailer frame starts — i.e. the exclusive end of the
+    /// backend-bound message-frame bytes.
+    pub(crate) data_end: usize,
+    /// Validated `(lowercase name, value)` pairs in wire order. Duplicate names
+    /// are preserved as separate entries (gRPC multi-value metadata).
+    pub(crate) trailers: Vec<(String, String)>,
+}
+
+/// Split and validate a terminal gRPC-Web trailer frame from a decoded request
+/// body.
+///
+/// Returns `Ok(None)` when the body carries no trailer frame, including when it
+/// is structurally malformed in a way that is not trailer-specific (short
+/// header, truncated payload, unknown flag). Those defects stay the property of
+/// [`validate_grpc_web_request_frames`], which owns their diagnostics and runs
+/// on the same bytes immediately afterwards — reporting them twice, in two
+/// wordings, is how the two validators would drift.
+///
+/// Everything trailer-specific fails closed here with a field-specific message:
+///
+/// * `0x81` (`Compressed-Flag` set on a trailer frame) has no meaning in the
+///   gRPC-Web wire format — the trailer block is never message-encoded — so it
+///   is refused rather than guessed at.
+/// * A trailer frame that is not the FINAL frame is refused. This is the single
+///   check that covers DATA-after-trailers and a second trailer frame: after a
+///   valid trailer frame the parse must land exactly on the end of the buffer.
+/// * A trailer frame with no preceding message frame is refused, keeping the
+///   pre-existing "a request body is at least one message" contract intact
+///   rather than dispatching a trailers-only upload the envelope validator
+///   would then reject as an empty body.
+pub(crate) fn split_request_trailer_frame(
+    data: &[u8],
+) -> Result<Option<RequestTrailerFrame>, &'static str> {
+    let mut pos = 0usize;
+    let mut data_frames = 0usize;
+    while pos < data.len() {
+        if data.len() - pos < 5 {
+            return Ok(None);
+        }
+        let flag = data[pos];
+        let declared =
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]]);
+        let Ok(payload_len) = usize::try_from(declared) else {
+            return Ok(None);
+        };
+        let header_end = pos + 5;
+        // Compare against the REMAINING bytes so a 4 GiB declared length cannot
+        // wrap on a 32-bit target.
+        if payload_len > data.len() - header_end {
+            return Ok(None);
+        }
+        match flag {
+            GRPC_FRAME_DATA | GRPC_FRAME_DATA_COMPRESSED => {
+                data_frames += 1;
+                pos = header_end + payload_len;
+                continue;
+            }
+            GRPC_FRAME_TRAILER_COMPRESSED => return Err(ERR_TRAILER_COMPRESSED),
+            GRPC_FRAME_TRAILER => {}
+            _ => return Ok(None),
+        }
+        if data_frames == 0 {
+            return Err(ERR_TRAILER_WITHOUT_MESSAGE);
+        }
+        if payload_len > MAX_REQUEST_TRAILER_BLOCK_BYTES {
+            return Err(ERR_TRAILER_BLOCK_TOO_LARGE);
+        }
+        if header_end + payload_len != data.len() {
+            return Err(ERR_TRAILER_NOT_FINAL);
+        }
+        let trailers = parse_request_trailer_block(&data[header_end..])?;
+        return Ok(Some(RequestTrailerFrame {
+            data_end: pos,
+            trailers,
+        }));
+    }
+    Ok(None)
+}
+
+/// Parse the `name: value\r\n` block carried by a request trailer frame.
+///
+/// The grammar is total and strict: every line must be CRLF-terminated, must
+/// contain a colon, and must survive the gRPC Custom-Metadata name charset and
+/// ASCII-Value checks the response direction already applies. A bare CR or LF,
+/// a leading `:`, whitespace around the name, an over-long name/value, or more
+/// than [`MAX_REQUEST_TRAILER_ENTRIES`] entries fails the whole frame — a
+/// partially accepted trailer block is exactly the shape a smuggling attempt
+/// wants.
+fn parse_request_trailer_block(payload: &[u8]) -> Result<Vec<(String, String)>, &'static str> {
+    if payload.is_empty() {
+        return Err(ERR_TRAILER_BLOCK_EMPTY);
+    }
+    let mut trailers: Vec<(String, String)> = Vec::new();
+    let mut rest = payload;
+    while !rest.is_empty() {
+        let Some(eol) = rest.windows(2).position(|window| window == b"\r\n") else {
+            return Err(ERR_TRAILER_LINE_UNTERMINATED);
+        };
+        let (line, tail) = rest.split_at(eol);
+        rest = &tail[2..];
+        if line.is_empty() {
+            return Err(ERR_TRAILER_LINE_MALFORMED);
+        }
+        // A bare CR or LF inside a line would let one wire line present itself
+        // as two field lines to a lenient downstream parser.
+        if line.iter().any(|byte| *byte == b'\r' || *byte == b'\n') {
+            return Err(ERR_TRAILER_LINE_MALFORMED);
+        }
+        if line[0] == b':' {
+            return Err(ERR_TRAILER_PSEUDO_HEADER);
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return Err(ERR_TRAILER_LINE_MALFORMED);
+        };
+        let (raw_name, raw_value) = line.split_at(colon);
+        let raw_value = &raw_value[1..];
+        if raw_name.len() > MAX_REQUEST_TRAILER_NAME_BYTES {
+            return Err(ERR_TRAILER_NAME_TOO_LONG);
+        }
+        if raw_value.len() > MAX_REQUEST_TRAILER_VALUE_BYTES {
+            return Err(ERR_TRAILER_VALUE_TOO_LONG);
+        }
+        let Ok(name) = std::str::from_utf8(raw_name) else {
+            return Err(ERR_TRAILER_NAME_INVALID);
+        };
+        // `name : value` is a smuggling shape, not a field line (RFC 9110 §5.1).
+        if name.bytes().any(|byte| byte == b' ' || byte == b'\t') {
+            return Err(ERR_TRAILER_NAME_INVALID);
+        }
+        let name = name.to_ascii_lowercase();
+        if !is_grpc_metadata_name(&name) {
+            return Err(ERR_TRAILER_NAME_INVALID);
+        }
+        if is_forbidden_grpc_web_request_trailer_name(&name) {
+            return Err(ERR_TRAILER_NAME_FORBIDDEN);
+        }
+        let Ok(value) = std::str::from_utf8(raw_value) else {
+            return Err(ERR_TRAILER_VALUE_INVALID);
+        };
+        let value = value.trim_matches(|ch| ch == ' ' || ch == '\t');
+        if !is_valid_trailer_value(value) {
+            return Err(ERR_TRAILER_VALUE_INVALID);
+        }
+        if name.ends_with("-bin") && !is_base64_metadata_value(value) {
+            return Err(ERR_TRAILER_BIN_VALUE_INVALID);
+        }
+        trailers.push((name, value.to_string()));
+        if trailers.len() > MAX_REQUEST_TRAILER_ENTRIES {
+            return Err(ERR_TRAILER_TOO_MANY_ENTRIES);
+        }
+    }
+    if trailers.is_empty() {
+        return Err(ERR_TRAILER_BLOCK_EMPTY);
+    }
+    Ok(trailers)
+}
+
+/// Request-side counterpart to [`is_forbidden_grpc_web_trailer_name`].
+///
+/// End-of-stream metadata must not be able to restate anything the gateway has
+/// already decided or forwarded: connection/framing control, initial-only gRPC
+/// call parameters, response terminal status, credentials and gateway identity
+/// assertions that authentication and authorization already consumed from the
+/// header block, or Ferrum-owned forwarding identity (`X-Forwarded-*` and RFC
+/// 7239 `Forwarded`). The initial header block already carries the
+/// gateway-authored forwarding identity; a trailer must not restate or
+/// contradict it for backends that read trailing metadata. `Forwarded` is
+/// rejected unconditionally (`is_proxy_owned_forwarding_header(name, true)`)
+/// even when primary generation is disabled on a route — trailer parsing has
+/// no config object, and failing closed is correct.
+#[inline]
+fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
+    name.starts_with(':')
+        // PROTOCOL-HTTP2 reserves the entire grpc-* namespace. Known request
+        // and response control fields are listed below for documentation, but
+        // an unknown future control field must fail closed too.
+        || name.starts_with("grpc-")
+        || is_internal_grpc_web_bridge_header(name)
+        || name == HEADER_GRPC_WEB_MODE
+        // Reserved gateway assertions the gRPC header merge re-adds from
+        // trusted plugin state only.
+        || name.starts_with("x-consumer-")
+        || name.starts_with("x-ferrum-")
+        // Gateway-owned forwarding identity: reuse the canonical strip
+        // predicate so this list cannot drift from primary dispatch.
+        || is_proxy_owned_forwarding_header(name, true)
+        || matches!(
+            name,
+            // Framing / connection control.
+            "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+                | "trailer"
+                | "content-length"
+                | "content-type"
+                | "content-encoding"
+                | "host"
+                // Initial-metadata-only gRPC call parameters. Honoring these at
+                // end of stream is always too late and lets a trailer
+                // contradict the validated header block.
+                | "grpc-timeout"
+                | "grpc-encoding"
+                | "grpc-accept-encoding"
+                | "grpc-message-type"
+                | "user-agent"
+                | "x-grpc-web"
+                // Response-side terminal metadata has no request meaning.
+                | "grpc-status"
+                | "grpc-message"
+                | "grpc-status-details-bin"
+                // Credentials and gateway-authoritative results.
+                | "authorization"
+                | "cookie"
+                | "x-api-key"
+                | "x-geo-country"
+        )
+}
+
+/// Whether a `-bin` gRPC metadata value is base64, with or without padding.
+///
+/// The gRPC wire spec permits producers to omit padding on binary metadata, so
+/// both dialects are accepted; anything else is refused rather than forwarded
+/// as an unreadable binary field.
+fn is_base64_metadata_value(value: &str) -> bool {
+    !value.is_empty()
+        && (BASE64.decode(value).is_ok()
+            || base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(value)
+                .is_ok())
+}
+
+/// Serialize validated request trailers for owner-scoped request staging.
+fn encode_request_trailers(trailers: &[(String, String)]) -> Result<String, &'static str> {
+    serde_json::to_vec(trailers)
+        .map(|raw| BASE64.encode(raw))
+        .map_err(|_| ERR_TRAILER_STAGING_FAILED)
+}
+
+/// Decode the staged request trailer block into a native HTTP/2 trailer map.
+///
+/// Called by the gRPC dispatch paths with the request metadata map. Every entry
+/// is re-validated: `ctx.metadata` is writable by any plugin, so the staged
+/// block being present is not evidence that this plugin wrote it. Any anomaly
+/// answers `None` (dispatch without trailers) rather than forwarding a block
+/// this function cannot prove is the one the owner validated.
+pub(crate) fn staged_request_trailers(
+    metadata: &HashMap<String, String>,
+) -> Option<http::HeaderMap> {
+    let encoded = metadata.get(META_GRPC_WEB_REQUEST_TRAILERS)?;
+    if encoded.len() > MAX_REQUEST_TRAILER_STAGING_BYTES {
+        return None;
+    }
+    let raw = BASE64.decode(encoded).ok()?;
+    let parsed: Vec<(String, String)> = serde_json::from_slice(&raw).ok()?;
+    if parsed.is_empty() || parsed.len() > MAX_REQUEST_TRAILER_ENTRIES {
+        return None;
+    }
+    let mut map = http::HeaderMap::with_capacity(parsed.len());
+    let mut reconstructed_wire_bytes = 0usize;
+    for (name, value) in parsed {
+        reconstructed_wire_bytes = reconstructed_wire_bytes
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            // `: ` plus CRLF.
+            .checked_add(4)?;
+        if !is_grpc_metadata_name(&name)
+            || is_forbidden_grpc_web_request_trailer_name(&name)
+            || name.len() > MAX_REQUEST_TRAILER_NAME_BYTES
+            || value.len() > MAX_REQUEST_TRAILER_VALUE_BYTES
+            || reconstructed_wire_bytes > MAX_REQUEST_TRAILER_BLOCK_BYTES
+            || !is_valid_trailer_value(&value)
+            || (name.ends_with("-bin") && !is_base64_metadata_value(&value))
+        {
+            return None;
+        }
+        let header_name = HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let header_value = http::HeaderValue::from_str(&value).ok()?;
+        map.append(header_name, header_value);
+    }
+    Some(map)
 }
 
 /// Whether `data` is a gRPC-Web **text**-mode body: standard base64 whose decoded
@@ -2550,11 +2922,12 @@ impl Plugin for GrpcWebPlugin {
             return None;
         }
 
-        // Base64 decode — gRPC-Web text mode uses standard base64.
+        // Base64 decode — gRPC-Web text mode uses standard base64 and may
+        // concatenate independently padded flush segments.
         // On failure, return the raw body unchanged; on_final_request_body will
         // reject it with a 400 after validating gRPC framing.
-        match BASE64.decode(body) {
-            Ok(decoded) => {
+        match decode_grpc_web_text_body(body) {
+            Some(decoded) => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
@@ -2564,11 +2937,10 @@ impl Plugin for GrpcWebPlugin {
                 );
                 Some(decoded)
             }
-            Err(e) => {
+            None => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
-                    error = %e,
                     "Failed to base64-decode gRPC-Web text request body"
                 );
                 // Return None to pass through; on_final_request_body will catch
@@ -2588,49 +2960,126 @@ impl Plugin for GrpcWebPlugin {
         if !self.is_translation_owner(ctx) {
             return None;
         }
-        // Exactly-once decode across the effective instance chain.
+        // Exactly-once translation across the effective instance chain.
         if ctx.metadata.contains_key(META_GRPC_WEB_REQUEST_DECODED) {
             return None;
         }
-        let Some(mode) = self.owned_translation_mode(ctx) else {
-            debug!(
-                plugin = "grpc_web",
-                instance = %self.instance_id_str,
-                "Fail closed: refusing request-body decode without valid mode staging"
-            );
-            return None;
+        // Copy the mode out before touching `ctx.metadata` below.
+        let is_text = match self.owned_translation_mode(ctx) {
+            Some(mode) => mode == "text",
+            None => {
+                debug!(
+                    plugin = "grpc_web",
+                    instance = %self.instance_id_str,
+                    "Fail closed: refusing request-body decode without valid mode staging"
+                );
+                return None;
+            }
         };
-        if mode != "text" || body.is_empty() {
+        if body.is_empty() {
             return None;
         }
 
         // Decode from owner-scoped metadata, not the shared `x-grpc-web-mode`
         // staging header — siblings must never collide on that header.
-        match BASE64.decode(body) {
-            Ok(decoded) => {
+        let decoded = if is_text {
+            match decode_grpc_web_text_body(body) {
+                Some(decoded) => {
+                    debug!(
+                        plugin = "grpc_web",
+                        instance = %self.instance_id_str,
+                        original_len = body.len(),
+                        decoded_len = decoded.len(),
+                        "Base64-decoded gRPC-Web text request body"
+                    );
+                    Some(decoded)
+                }
+                None => {
+                    debug!(
+                        plugin = "grpc_web",
+                        instance = %self.instance_id_str,
+                        "Failed to base64-decode gRPC-Web text request body"
+                    );
+                    // Leave the body untouched; the envelope validator rejects
+                    // the undecodable bytes with a 400 before dispatch.
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let framed = decoded.as_deref().unwrap_or(body);
+
+        // Split the terminal trailer frame, if any, off the message frames. The
+        // backend-bound body keeps only DATA; the trailer block is staged for
+        // conversion into a real HTTP/2 TRAILERS frame at dispatch.
+        let split = match split_request_trailer_frame(framed) {
+            Ok(split) => split,
+            Err(error) => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
-                    original_len = body.len(),
-                    decoded_len = decoded.len(),
-                    "Base64-decoded gRPC-Web text request body"
+                    reason = error,
+                    "Rejecting gRPC-Web request trailer frame"
+                );
+                // This hook cannot reject. Stage the diagnostic and mark the
+                // request translated so `on_final_request_body_with_context`
+                // fails it closed with a field-specific message.
+                ctx.metadata.insert(
+                    META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
+                    error.to_string(),
                 );
                 ctx.metadata.insert(
                     META_GRPC_WEB_REQUEST_DECODED.to_string(),
                     self.instance_id_str.clone(),
                 );
-                Some(decoded)
+                return None;
             }
-            Err(e) => {
+        };
+
+        let stripped = match split {
+            Some(frame) => {
                 debug!(
                     plugin = "grpc_web",
                     instance = %self.instance_id_str,
-                    error = %e,
-                    "Failed to base64-decode gRPC-Web text request body"
+                    trailer_count = frame.trailers.len(),
+                    data_len = frame.data_end,
+                    "Converted gRPC-Web request trailer frame to native gRPC trailers"
                 );
-                None
+                let encoded = match encode_request_trailers(&frame.trailers) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        ctx.metadata.insert(
+                            META_GRPC_WEB_REQUEST_TRAILER_ERROR.to_string(),
+                            error.to_string(),
+                        );
+                        ctx.metadata.insert(
+                            META_GRPC_WEB_REQUEST_DECODED.to_string(),
+                            self.instance_id_str.clone(),
+                        );
+                        return None;
+                    }
+                };
+                ctx.metadata
+                    .insert(META_GRPC_WEB_REQUEST_TRAILERS.to_string(), encoded);
+                Some(framed[..frame.data_end].to_vec())
             }
-        }
+            None => None,
+        };
+        // `framed` borrows `decoded`; that borrow ends above so the text-mode
+        // decode can be moved out below.
+        let output = match stripped {
+            Some(output) => output,
+            // Nothing to strip: forward the decoded bytes in text mode, and
+            // leave a binary body untouched.
+            None => decoded?,
+        };
+
+        ctx.metadata.insert(
+            META_GRPC_WEB_REQUEST_DECODED.to_string(),
+            self.instance_id_str.clone(),
+        );
+        Some(output)
     }
 
     async fn on_final_request_body(
@@ -2673,6 +3122,12 @@ impl Plugin for GrpcWebPlugin {
         };
         if mode != "text" && mode != "binary" {
             return PluginResult::Continue;
+        }
+        // A trailer frame that failed validation in the body transform is a
+        // terminal client error: reject with its field-specific diagnostic
+        // before the request can reach the backend without its trailers.
+        if let Some(error) = ctx.metadata.get(META_GRPC_WEB_REQUEST_TRAILER_ERROR) {
+            return invalid_grpc_web_request(error);
         }
         validate_grpc_web_request_frames(body, headers)
             .map_or_else(invalid_grpc_web_request, |()| PluginResult::Continue)

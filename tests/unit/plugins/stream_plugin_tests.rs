@@ -988,12 +988,9 @@ fn test_http_family_and_stream_plugins_complete_coverage() {
 fn test_http_grpc_plugins_complete_coverage() {
     // AI plugins missing from the base test. ai_request_guard now rejects
     // configs with no policies, so we configure max_messages to satisfy
-    // its no-op rejection check. ai_prompt_shield is HTTP-only (see
-    // test_http_only_plugins_complete_coverage).
-    let plugins = vec![
-        ("ai_request_guard", json!({"max_messages": 100})),
-        ("ai_rate_limiter", json!({"token_limit": 1000})),
-    ];
+    // its no-op rejection check. ai_prompt_shield and ai_rate_limiter are
+    // HTTP-only (see test_http_only_plugins_complete_coverage).
+    let plugins = vec![("ai_request_guard", json!({"max_messages": 100}))];
 
     for (name, config) in plugins {
         let plugin = make_plugin(name, config);
@@ -1028,6 +1025,7 @@ fn test_http_only_plugins_complete_coverage() {
         ("response_caching", json!({"ttl_seconds": 60})),
         ("ai_token_metrics", json!({})),
         ("ai_prompt_shield", json!({})),
+        ("ai_rate_limiter", json!({"token_limit": 1000})),
         (
             "ai_semantic_firewall",
             json!({

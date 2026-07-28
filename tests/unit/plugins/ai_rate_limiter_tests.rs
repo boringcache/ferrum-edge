@@ -65,10 +65,10 @@ async fn test_plugin_name_and_priority() {
         AiRateLimiter::new(&json!({"token_limit": 1000}), PluginHttpClient::default()).unwrap();
     assert_eq!(plugin.name(), "ai_rate_limiter");
     assert_eq!(plugin.priority(), 4200);
-    assert_eq!(
-        plugin.supported_protocols(),
-        &[ProxyProtocol::Http, ProxyProtocol::Grpc]
-    );
+    // GHSA-8f27-23x9-f825: the accounting lifecycle is HTTP JSON/SSE only, so
+    // the plugin must not advertise (and must not be attachable to) native gRPC.
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
+    assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
     assert!(plugin.requires_response_body_buffering());
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type(
@@ -4367,5 +4367,211 @@ async fn local_fallback_reconcile_charges_local_state_instead_of_refusing() {
             .map(String::as_str),
         Some("100"),
         "local_fallback must reconcile actual usage on per-process state"
+    );
+}
+
+// ─── GHSA-8f27-23x9-f825: HTTP-only protocol contract ────────────────────
+
+/// Framed native-gRPC and gRPC-Web request bodies must never be buffered,
+/// classified as a JSON AI request, or given a token reservation. Native gRPC
+/// cannot reach these hooks at all under the HTTP-only protocol view; gRPC-Web
+/// does ride the HTTP view, so the request-side screen is what keeps a
+/// length-prefixed frame from being mistaken for a bare JSON AI document.
+#[tokio::test]
+async fn framed_grpc_requests_are_never_ai_candidates_or_reserved() {
+    let plugin = AiRateLimiter::new(
+        &json!({"token_limit": 1000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    // Unary, client/server/bidi-streaming (multiple concatenated frames),
+    // compressed-message flag, and malformed/truncated framing — none of them
+    // may produce a protected state.
+    let cases: &[(&str, &str)] = &[
+        // Unary frame whose payload happens to be an OpenAI-shaped AI request.
+        (
+            "application/grpc",
+            "\u{0}\u{0}\u{0}\u{0}\u{2a}{\"model\":\"gpt-4o\",\"messages\":[],\"max_tokens\":500}",
+        ),
+        (
+            "application/grpc+proto",
+            "\u{0}\u{0}\u{0}\u{0}\u{6}\u{a}\u{4}chat",
+        ),
+        // `+json` variants satisfy the ordinary JSON content-type screen.
+        (
+            "application/grpc+json",
+            "\u{0}\u{0}\u{0}\u{0}\u{2a}{\"model\":\"gpt-4o\",\"messages\":[],\"max_tokens\":500}",
+        ),
+        (
+            "application/grpc-web+json",
+            "\u{0}\u{0}\u{0}\u{0}\u{2a}{\"model\":\"gpt-4o\",\"messages\":[],\"max_tokens\":500}",
+        ),
+        ("application/grpc-web-text", "AAAAACp7Im1vZGVsIjoiZ3B0In0="),
+        // Two concatenated frames (client-streaming shape).
+        (
+            "application/grpc+json",
+            "\u{0}\u{0}\u{0}\u{0}\u{7}{\"a\":1}\u{0}\u{0}\u{0}\u{0}\u{7}{\"b\":1}",
+        ),
+        // Compressed-message flag set: payload is opaque to this plugin.
+        ("application/grpc", "\u{1}\u{0}\u{0}\u{0}\u{8}\u{1f}\u{8b}"),
+        // Malformed / truncated length prefix.
+        ("application/grpc", "\u{0}\u{0}\u{0}"),
+    ];
+
+    for (content_type, body) in cases {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), (*content_type).to_string());
+        ctx.metadata
+            .insert("request_body".to_string(), (*body).to_string());
+
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "framed body must not be buffered for {content_type}"
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            !ctx.metadata.contains_key("ai_ratelimit_request"),
+            "framed body must not be classified as an AI request for {content_type}"
+        );
+        assert_eq!(
+            reserved_tokens(&ctx),
+            0,
+            "framed body must not reserve tokens for {content_type}"
+        );
+        assert!(
+            !ctx.metadata.contains_key("ai_ratelimit_reservation_id"),
+            "framed body must not hold a reservation for {content_type}"
+        );
+
+        // The final-body hook is likewise inert: nothing was deferred, so it
+        // must not retro-classify a framed body as an AI call.
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+        );
+        assert!(!ctx.metadata.contains_key("ai_ratelimit_request"));
+    }
+}
+
+/// A gRPC-Web framed response must not be parsed as a JSON usage document,
+/// even when its media type ends in `+json` and its bytes happen to contain a
+/// valid provider usage object. It is routed through the explicit
+/// `on_unmetered_response` policy instead of being reconciled as if the
+/// provider had reported usage.
+#[tokio::test]
+async fn framed_grpc_web_response_is_not_charged_as_json_usage() {
+    // `observed_usage` reads `ai_ratelimit_usage` from metadata, which
+    // `store_metadata` only writes when headers are exposed.
+    let plugin = AiRateLimiter::new(
+        &json!({
+            "token_limit": 1000,
+            "window_seconds": 60,
+            "limit_by": "ip",
+            "expose_headers": true
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = ai_request_ctx(120, "hello");
+    let mut headers = ctx.headers.clone();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(ctx.metadata.contains_key("ai_ratelimit_request"));
+    let reserved = reserved_tokens(&ctx);
+    assert!(reserved > 0, "an ordinary JSON AI POST must still reserve");
+
+    // Body is byte-for-byte a valid OpenAI usage document; only the framed
+    // content-type distinguishes it.
+    let body = openai_response(400, 300);
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+json".to_string(),
+    );
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &body)
+            .await,
+    );
+    assert!(
+        !ctx.metadata.contains_key("ai_ratelimit_actual_tokens"),
+        "a framed gRPC-Web body must never be reconciled as provider-reported usage"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_ratelimit_unmetered_action")
+            .map(String::as_str),
+        Some("charge_estimate"),
+        "framed gRPC-Web must take the unmetered policy path, not JSON usage extract"
+    );
+    // Default `charge_estimate` keeps the reservation rather than charging 0
+    // or the embedded OpenAI usage total (700).
+    assert_eq!(observed_usage(&plugin).await, reserved);
+}
+
+/// The framed-response screen is content-type scoped: ordinary HTTP JSON and
+/// SSE AI responses keep their existing reconciliation behavior.
+#[tokio::test]
+async fn ordinary_json_and_sse_responses_remain_eligible() {
+    let json_plugin = AiRateLimiter::new(
+        &json!({"token_limit": 10_000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut ctx = ai_request_ctx(120, "hello");
+    assert!(
+        json_plugin.should_buffer_request_body(&ctx),
+        "bare JSON AI POSTs must still be buffered"
+    );
+    let mut headers = ctx.headers.clone();
+    assert_continue(json_plugin.before_proxy(&mut ctx, &mut headers).await);
+    let mut response_headers = json_headers();
+    let json_body = openai_response(400, 300);
+    assert_continue(
+        json_plugin
+            .on_response_body(&mut ctx, 200, &mut response_headers, &json_body)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_ratelimit_actual_tokens")
+            .map(String::as_str),
+        Some("700"),
+        "an ordinary JSON usage block must still be charged"
+    );
+
+    let sse_plugin = AiRateLimiter::new(
+        &json!({"token_limit": 10_000, "window_seconds": 60, "limit_by": "ip"}),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut sse_ctx = ai_request_ctx(120, "hello");
+    let mut sse_request_headers = sse_ctx.headers.clone();
+    assert_continue(
+        sse_plugin
+            .before_proxy(&mut sse_ctx, &mut sse_request_headers)
+            .await,
+    );
+    let sse_body =
+        b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
+    let mut sse_response_headers = sse_headers();
+    assert_continue(
+        sse_plugin
+            .on_response_body(&mut sse_ctx, 200, &mut sse_response_headers, sse_body)
+            .await,
+    );
+    assert_eq!(
+        sse_ctx
+            .metadata
+            .get("ai_ratelimit_actual_tokens")
+            .map(String::as_str),
+        Some("15"),
+        "SSE usage extraction must be unchanged"
     );
 }

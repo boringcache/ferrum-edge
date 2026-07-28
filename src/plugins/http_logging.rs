@@ -25,14 +25,21 @@ use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema
 use super::utils::{
     BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
     QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
-    assemble_json_array, build_batch_config, handle_http_batch_response, parse_custom_headers,
-    parse_http_endpoint, validate_batch_config,
+    assemble_json_array, build_batch_config, handle_http_batch_response_redacted,
+    parse_custom_headers, parse_http_endpoint, redacted_endpoint_url_str, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
 #[derive(Clone)]
 struct HttpFlushConfig {
+    /// Complete configured URL. Used **only** to build the outbound request —
+    /// vendor integrations such as Sumo Logic (path token) and Mezmo (`apikey`
+    /// query parameter) legitimately carry a reusable credential here.
     endpoint_url: String,
+    /// Structurally redacted rendering of [`Self::endpoint_url`] for every
+    /// diagnostic surface: egress denial, DNS/TLS/connect failure, retry,
+    /// slow-call, and batch-failure error strings.
+    endpoint_url_for_logs: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
 }
@@ -73,6 +80,7 @@ impl HttpLogging {
 
         let schema = resolve_schema(config, "http_logging", SchemaCapabilities::BASE)?;
         let flush_config = HttpFlushConfig {
+            endpoint_url_for_logs: redacted_endpoint_url_str(&endpoint_url),
             endpoint_url,
             custom_headers,
             http_client,
@@ -157,10 +165,16 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedSummaryPayload>) -> 
         req = req.header(name.clone(), value.clone());
     }
 
-    handle_http_batch_response(
+    // `execute_redacted`, not `execute`: the configured endpoint may embed a
+    // collector credential in its path or query, and the shared client's
+    // egress-denial, retry, and slow-call diagnostics would otherwise record
+    // the complete URL. The request itself still goes to `endpoint_url`.
+    handle_http_batch_response_redacted(
         "HTTP logging",
         entry_count,
-        cfg.http_client.execute(req, "http_logging").await,
+        cfg.http_client
+            .execute_redacted(req, "http_logging", &cfg.endpoint_url_for_logs)
+            .await,
     )
     .await
 }
