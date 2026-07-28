@@ -1097,6 +1097,69 @@ async fn test_kafka_logging_constructor_error_omits_rejected_property_value() {
     );
 }
 
+/// GHSA-4988-2wph-67g2: `producer_config` is an open escape hatch forwarded to
+/// librdkafka. Inline private-key material must be refused by *shape*, not only
+/// under the one property name librdkafka happens to call `ssl.key.pem` today,
+/// and the rejection must never echo the key back into an error, an audit
+/// record, or a log line.
+#[tokio::test]
+async fn test_kafka_logging_rejects_inline_private_key_material_in_producer_config() {
+    const PEM_CANARY: &str = "kafka-inline-pem-canary";
+    let pems = [
+        format!("-----BEGIN PRIVATE KEY-----\n{PEM_CANARY}\n-----END PRIVATE KEY-----"),
+        format!("-----BEGIN RSA PRIVATE KEY-----\n{PEM_CANARY}\n-----END RSA PRIVATE KEY-----"),
+        format!("-----BEGIN EC PRIVATE KEY-----\n{PEM_CANARY}\n-----END EC PRIVATE KEY-----"),
+        format!(
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\n{PEM_CANARY}\n-----END ENCRYPTED PRIVATE KEY-----"
+        ),
+        format!("-----begin private key-----\n{PEM_CANARY}\n-----end private key-----"),
+    ];
+    // A property name that is on no deny-list at all, to prove the check is by
+    // value shape rather than by property name.
+    for property in ["ssl.key.pem", "some.future.inline.material"] {
+        for pem in &pems {
+            let result = kafka_logging_validate_producer_admission_for_test(
+                &json!({
+                    "broker_list": "localhost:9092",
+                    "topic": "test",
+                    "security_protocol": "ssl",
+                    "producer_config": { property: pem }
+                }),
+                &default_http_client(),
+            );
+            match result {
+                Err(e) => assert!(
+                    !e.contains(PEM_CANARY) && !e.contains("BEGIN"),
+                    "rejection echoed private-key material: {e}"
+                ),
+                Ok(()) => panic!("producer_config.{property} inline PEM must be rejected"),
+            }
+        }
+    }
+}
+
+/// Safe-value control for the check above: certificates and public keys are not
+/// credentials and must still be admissible.
+#[tokio::test]
+async fn test_kafka_logging_admits_non_private_key_pem_material() {
+    let result = kafka_logging_validate_producer_admission_for_test(
+        &json!({
+            "broker_list": "localhost:9092",
+            "topic": "test",
+            "security_protocol": "ssl",
+            "producer_config": {
+                "some.future.public.material":
+                    "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
+            }
+        }),
+        &default_http_client(),
+    );
+    assert!(
+        result.is_ok(),
+        "certificate material must not be refused as a private key: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_kafka_logging_rejects_producer_config_security_aliases_case_insensitive() {
     let cases = [

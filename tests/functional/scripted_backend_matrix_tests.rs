@@ -58,6 +58,17 @@ use crate::scaffolding::matrix::{BackendKind, FrontendKind};
 //   backend_refuses_returns_502__h2_to_tcp
 //   backend_refuses_returns_502__grpc_to_grpc
 //
+// The gRPC cell is also the regression guard for #3422. On a refused
+// backend connect the gateway synthesizes a Trailers-Only UNAVAILABLE —
+// one HEADERS frame carrying `grpc-status: 14` with END_STREAM (hyper's
+// h2 server calls `send_response(res, true)` because `ProxyBody::empty()`
+// reports `is_end_stream()`) — and h2 then sends the RFC 9113 §8.1
+// `RST_STREAM(NO_ERROR)` that cancels the client's unread upload. The
+// response is complete and terminal on the wire; the flake was the raw
+// test client reading END_STREAM back out of h2's mutable per-stream recv
+// state, which that same reset overwrites. See
+// `scaffolding::clients::grpc::InboundResponseFraming`.
+//
 // Cross-protocol skips: gRPC clients can only target gRPC backends
 // in the demo (the gateway routes by content-type and a non-gRPC
 // backend would respond with a regular HTTP body that the gRPC
