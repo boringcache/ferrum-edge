@@ -1895,8 +1895,8 @@ fn status_only_full_terminate_trailers() -> HashMap<String, String> {
 #[test]
 fn test_status_only_terminate_preserves_omitted_grpc_message() {
     use ferrum_edge::_test_support::{
-        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
-        status_only_grpc_terminate_signal_for_test,
+        h3_reject_log_signal_for_test, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test, status_only_grpc_terminate_signal_for_test,
     };
     use http::StatusCode;
 
@@ -1938,6 +1938,15 @@ fn test_status_only_terminate_preserves_omitted_grpc_message() {
         let shared = shared.unwrap();
         assert_eq!(shared.0, status);
         assert_eq!(shared.1, None, "the shared emitter result omits it too");
+
+        let (log_status, logged_grpc_status, logged_grpc_message) =
+            h3_reject_log_signal_for_test(&mut ctx, StatusCode::OK, b"", &headers);
+        assert_eq!(log_status, 200);
+        assert_eq!(logged_grpc_status, Some(status.to_string()));
+        assert_eq!(
+            logged_grpc_message, None,
+            "H3 logging must preserve the same message omission as the wire"
+        );
     }
 }
 
@@ -2027,8 +2036,8 @@ fn test_status_only_terminate_restores_complete_authored_metadata() {
 #[test]
 fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
     use ferrum_edge::_test_support::{
-        normalize_reject_response_with_context, set_serverless_grpc_terminate_frame_for_test,
-        status_only_grpc_terminate_signal_for_test,
+        h3_reject_log_signal_for_test, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test, status_only_grpc_terminate_signal_for_test,
     };
     use http::StatusCode;
 
@@ -2073,6 +2082,16 @@ fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
 
     let invalidated = status_only_grpc_terminate_signal_for_test(&ctx, StatusCode::OK, &injected);
     assert!(invalidated.is_none());
+
+    let (log_status, logged_grpc_status, logged_grpc_message) =
+        h3_reject_log_signal_for_test(&mut ctx, StatusCode::OK, &injected, &headers);
+    assert_eq!(log_status, 200);
+    assert_eq!(logged_grpc_status.as_deref(), Some("13"));
+    assert_eq!(
+        logged_grpc_message.as_deref(),
+        Some("gateway: authorized gRPC terminate response was invalidated"),
+        "H3 logging must record the fail-closed wire signal, not the stale authored success"
+    );
 }
 
 /// The same complete removal applies when a FRAMED contract is invalidated: at

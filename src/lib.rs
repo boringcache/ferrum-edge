@@ -4072,6 +4072,28 @@ pub mod _test_support {
         Some((authored.grpc_status, authored.grpc_message, additional))
     }
 
+    /// Run the production H3 reject logging normalization and return the
+    /// resulting HTTP log status plus gRPC status/message metadata.
+    pub fn h3_reject_log_signal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> (u16, Option<String>, Option<String>) {
+        let log_status = crate::http3::server::h3_reject_log_status_and_metadata(
+            ctx,
+            crate::config::types::HttpFlavor::Grpc,
+            status,
+            body,
+            headers,
+        );
+        (
+            log_status,
+            ctx.metadata.get("grpc_status").cloned(),
+            ctx.metadata.get("grpc_message").cloned(),
+        )
+    }
+
     /// The emitter-side decision every gRPC reject writer shares: `Some` means
     /// "write DATA and then these terminal trailers", `None` means
     /// "trailers-only". Exercises the production predicate, so a writer that
