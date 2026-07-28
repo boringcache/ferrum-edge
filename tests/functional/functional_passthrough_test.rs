@@ -340,10 +340,6 @@ struct PortRaced(String);
 ///     window, retries the scenario with fresh ports instead of reporting a
 ///     product failure that did not happen.
 async fn try_passthrough_circuit_breaker_scenario(attempt: u32) -> Result<(), PortRaced> {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     // Reserve a backend port and release it: the first gateway dial must get a
     // real ECONNREFUSED so the breaker trips on a connection error. This
     // release/rebind window is inherent to the scenario; everything below
@@ -414,15 +410,21 @@ upstreams: []
 
     // ── Step 2: the breaker transition must be observable BEFORE the port is
     // rebound, so the failed dial provably precedes the backend listener ──
-    assert!(
-        wait_for_gateway_log(dir.path(), "Circuit breaker opening", Duration::from_secs(10)).await,
-        "the gateway never reported the circuit breaker opening after the first \
-         passthrough dial failed; the connection-error path did not record a \
-         failure against the breaker. (If the log instead shows the dial \
-         succeeding, another process was listening on backend port \
-         {backend_port} during the refusal window.) Gateway log:\n{}",
-        gateway_logs(dir.path())
-    );
+    if !wait_for_gateway_log(
+        dir.path(),
+        "Circuit breaker opening",
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        return Err(PortRaced(format!(
+            "the first connection ended but the gateway never reported the \
+             circuit breaker opening (backend port {backend_port} may have been \
+             accepted and closed by another process during the refusal window). \
+             Gateway log:\n{}",
+            gateway_logs(dir.path())
+        )));
+    }
 
     // ── Step 3: install the backend listener now that the breaker is open ──
     let backend_listener = match TcpListener::bind(format!("127.0.0.1:{backend_port}")).await {
@@ -434,33 +436,6 @@ upstreams: []
             )));
         }
     };
-    let accepted = Arc::new(AtomicU32::new(0));
-    let payloads: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-    let accepted_for_task = accepted.clone();
-    let payloads_for_task = payloads.clone();
-    let backend_task = tokio::spawn(async move {
-        while let Ok((mut stream, _)) = backend_listener.accept().await {
-            accepted_for_task.fetch_add(1, Ordering::SeqCst);
-            let payloads = payloads_for_task.clone();
-            tokio::spawn(async move {
-                // Capture whatever the peer sends so the accept can be
-                // attributed. A gateway dial relays the client's already-buffered
-                // bytes immediately; an unrelated probe sends nothing.
-                let mut probe = vec![0u8; 512];
-                let observed =
-                    match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut probe))
-                        .await
-                    {
-                        Ok(Ok(n)) => probe[..n].to_vec(),
-                        _ => Vec::new(),
-                    };
-                if let Ok(mut guard) = payloads.lock() {
-                    guard.push(observed);
-                }
-            });
-        }
-    });
-
     // ── Step 4: the second connection must be rejected before any dial ──
     let mut second = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
         .await
@@ -492,44 +467,40 @@ upstreams: []
     );
 
     // ── Step 5: no backend dial happened ──
-    // The gateway's decision is final by now (the client saw EOF and the
-    // rejection is logged), so any accept the listener will ever see has
-    // already happened. Only the classification of those accepts can still be
-    // in flight, so wait on that state rather than on a fixed sleep.
-    let accepted_count = accepted.load(Ordering::SeqCst) as usize;
-    if accepted_count > 0 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let classified = payloads.lock().map(|g| g.len()).unwrap_or(0);
-            if classified >= accepted_count || tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
+    // A successful TCP connect is queued in this listener's kernel backlog
+    // even if this task has not yet been scheduled to call `accept()`. Awaiting
+    // the listener directly therefore closes the old false-green window where
+    // an atomically sampled counter could still be zero while the accept task
+    // had not run. The bounded quiet window is the negative assertion itself,
+    // not a scheduling sleep.
+    match tokio::time::timeout(Duration::from_secs(2), backend_listener.accept()).await {
+        Err(_) => {}
+        Ok(Err(e)) => panic!(
+            "backend listener on port {backend_port} failed while checking for \
+             a forbidden gateway dial: {e}"
+        ),
+        Ok(Ok((mut stream, peer))) => {
+            let mut probe = vec![0u8; 512];
+            let observed =
+                match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut probe)).await {
+                    Ok(Ok(n)) => probe[..n].to_vec(),
+                    _ => Vec::new(),
+                };
+            let relayed = observed
+                .windows(second_marker.len())
+                .any(|window| window == second_marker.as_bytes());
+            assert!(
+                !relayed,
+                "open passthrough circuit breaker must reject before backend dial, but \
+                 the backend received this client's payload from {peer}. Gateway log:\n{}",
+                gateway_logs(dir.path())
+            );
+            return Err(PortRaced(format!(
+                "backend port {backend_port} received an unattributable connection \
+                 from {peer} that did not carry this attempt's marker: {:?}",
+                String::from_utf8_lossy(&observed)
+            )));
         }
-    }
-    let observed = payloads.lock().map(|g| g.clone()).unwrap_or_default();
-    backend_task.abort();
-
-    let relayed = observed.iter().any(|payload| {
-        payload
-            .windows(second_marker.len())
-            .any(|window| window == second_marker.as_bytes())
-    });
-    assert!(
-        !relayed,
-        "open passthrough circuit breaker must reject before backend dial, but \
-         the backend received this client's payload. Gateway log:\n{}",
-        gateway_logs(dir.path())
-    );
-    if accepted_count > 0 {
-        return Err(PortRaced(format!(
-            "backend port {backend_port} received {accepted_count} connection(s) that did \
-             not carry this attempt's marker: {:?}",
-            observed
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect::<Vec<_>>()
-        )));
     }
     Ok(())
 }
