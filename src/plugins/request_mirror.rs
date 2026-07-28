@@ -682,11 +682,11 @@ impl RequestMirrorAdmissions {
     /// same instance so a repeated evaluation cannot accumulate two leases.
     pub(crate) fn stage(&mut self, admission: RequestMirrorAdmission) {
         let instance_id = admission.instance_id();
-        if let Some(first) = self.first.as_mut() {
-            if first.instance_id() == instance_id {
-                *first = admission;
-                return;
-            }
+        if let Some(first) = self.first.as_mut()
+            && first.instance_id() == instance_id
+        {
+            *first = admission;
+            return;
         }
         if let Some(slot) = self
             .overflow
@@ -706,10 +706,10 @@ impl RequestMirrorAdmissions {
     /// Whether the given instance was admitted and therefore needs the request
     /// body buffered. Read-only and idempotent.
     pub(crate) fn body_admitted(&self, instance_id: u64) -> bool {
-        if let Some(first) = self.first.as_ref() {
-            if first.instance_id() == instance_id {
-                return first.is_admitted();
-            }
+        if let Some(first) = self.first.as_ref()
+            && first.instance_id() == instance_id
+        {
+            return first.is_admitted();
         }
         self.overflow
             .iter()
