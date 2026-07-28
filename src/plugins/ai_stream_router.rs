@@ -48,10 +48,43 @@
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
 //!
-//! Fallback across providers after the first downstream byte is intentionally
-//! out of scope: once response headers/bytes have streamed to the client the
-//! provider cannot be switched. `ai_stream_router.fallback_attempts` is always
-//! `0` in this MVP.
+//! ## Provider fallback is rejected, not stored
+//!
+//! This plugin does **not** implement provider fallback, and a `fallback`
+//! config block is rejected at admission rather than parsed into an inert
+//! policy (issue #3328). Post-first-byte provider switching remains prohibited
+//! for the obvious reason — once response headers/bytes have streamed to the
+//! client the provider cannot be changed — but *pre*-first-byte fallback is
+//! also unimplementable at this layer, because the routing decision this plugin
+//! makes is committed exactly once and then consumed by the ordinary dispatch
+//! path:
+//!
+//! - `before_proxy` writes the provider's scheme/host/port/path/authority and
+//!   `route_override_resolved_tls` into [`RequestContext`]; the proxy bakes
+//!   those into a single effective `Arc<Proxy>` (`apply_route_overrides*`)
+//!   before any backend attempt.
+//! - The provider credential, `Host`, `anthropic-version`, and
+//!   `Accept-Encoding` policy are written into one request header map that the
+//!   dispatch loop borrows immutably for every attempt.
+//! - The provider-specific request body (Anthropic Messages translation vs.
+//!   OpenAI passthrough) is produced once by
+//!   `transform_request_body_with_context` and verified once by
+//!   `on_final_request_body_with_context`; the proxy guards that pipeline with
+//!   `request_body_prepared` so it cannot re-run.
+//! - The dispatch retry loop replays those exact prepared bytes and headers
+//!   against the same effective proxy, rotating only the load-balancer target
+//!   within one upstream. It has no per-attempt re-preparation boundary.
+//!
+//! A second provider needs a different endpoint/authority, different
+//! credentials, a different backend TLS resolution, a different translated
+//! body, and a different response-normalization decision — none of which are
+//! per-attempt today. Nor can the plugin retry internally: [`PluginResult`] can
+//! only short-circuit with a fully materialized body, so a plugin-owned
+//! fallback loop would have to buffer the entire SSE response and destroy the
+//! streaming contract this plugin exists to provide. Accepting a `fallback`
+//! block would therefore be worse than rejecting it: an operator could submit
+//! valid-looking failover policy and silently receive none. Admission fails
+//! closed instead.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -83,7 +116,6 @@ pub const AI_STREAM_ROUTER_CONFIG_KEYS: &[&str] = &[
     "inject_usage_options",
     "normalize_response_stream",
     "providers",
-    "fallback",
 ];
 
 /// Accepted keys for each `providers[]` entry.
@@ -99,13 +131,12 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "inherit_backend_tls",
 ];
 
-/// Accepted keys for the optional `fallback` object.
-pub const AI_STREAM_ROUTER_FALLBACK_KEYS: &[&str] = &[
-    "enabled",
-    "on_connect_error",
-    "on_5xx_before_first_byte",
-    "max_attempts",
-];
+/// Admission diagnostic for the rejected `fallback` block (issue #3328).
+///
+/// The plugin never switches providers, so storing a fallback policy could only
+/// ever be runtime-inert. See the module docs for why pre-first-byte fallback
+/// cannot be expressed at this layer.
+pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
 
 // ---------------------------------------------------------------------------
 // Metadata keys
@@ -121,7 +152,6 @@ const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
-const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
 /// Request-local only: the response normalizer fails closed if the provider
@@ -242,27 +272,6 @@ impl StreamProvider {
     }
 }
 
-/// Parsed `fallback` block. Stored for admin/observability parity; MVP does not
-/// switch providers after the first downstream byte.
-#[derive(Debug, Clone)]
-struct FallbackConfig {
-    enabled: bool,
-    on_connect_error: bool,
-    on_5xx_before_first_byte: bool,
-    max_attempts: u32,
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            on_connect_error: true,
-            on_5xx_before_first_byte: true,
-            max_attempts: 2,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Plugin struct
 // ---------------------------------------------------------------------------
@@ -274,8 +283,6 @@ pub struct AiStreamRouter {
     inject_usage_options: bool,
     normalize_response_stream: bool,
     providers: Vec<StreamProvider>,
-    #[allow(dead_code)]
-    fallback: FallbackConfig,
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
@@ -292,8 +299,8 @@ impl AiStreamRouter {
             .ok_or_else(|| "ai_stream_router: config must be an object".to_string())?;
 
         // Reject ambiguous fields that belong to `ai_federation`'s flat config
-        // shape, so an operator does not silently mix a non-streaming fallback
-        // config into this plugin (which uses a nested `fallback` block).
+        // shape, plus the `fallback` block this plugin cannot honor, BEFORE the
+        // generic unknown-key sweep so both get a specific diagnostic.
         reject_ambiguous_fields(config)?;
         reject_unknown_keys(
             config_object,
@@ -417,8 +424,6 @@ impl AiStreamRouter {
         // Ascending priority — lowest value is tried first.
         providers.sort_by_key(|p| p.priority);
 
-        let fallback = parse_fallback(config)?;
-
         let response_stream_hooks = enabled
             && normalize_response_stream
             && providers
@@ -432,7 +437,6 @@ impl AiStreamRouter {
             inject_usage_options,
             normalize_response_stream,
             providers,
-            fallback,
             response_stream_hooks,
         })
     }
@@ -448,7 +452,13 @@ impl AiStreamRouter {
 }
 
 /// Fields that belong to `ai_federation`'s flat config surface and would be
-/// silently ignored (or misinterpreted) here.
+/// silently ignored (or misinterpreted) here, plus the `fallback` block this
+/// plugin refuses to store (issue #3328).
+///
+/// The `fallback` rejection is deliberately a *separate*, more specific
+/// diagnostic than the generic unknown-key path: an operator submitting a
+/// well-formed failover policy needs to be told the capability does not exist,
+/// not that they made a typo.
 fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     const AMBIGUOUS: &[&str] = &[
         "stream",
@@ -462,37 +472,16 @@ fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     for field in AMBIGUOUS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and configures fallback under the nested 'fallback' block"
+                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and does not implement provider fallback"
             ));
         }
     }
+    // Any presence at all — object, empty object, `null`, or scalar — is
+    // refused. A policy that cannot be honored must never be admitted.
+    if config.get("fallback").is_some() {
+        return Err(AI_STREAM_ROUTER_FALLBACK_REJECTION.to_string());
+    }
     Ok(())
-}
-
-fn parse_fallback(config: &Value) -> Result<FallbackConfig, String> {
-    let Some(fb) = config.get("fallback") else {
-        return Ok(FallbackConfig::default());
-    };
-    let fallback_object = fb
-        .as_object()
-        .ok_or_else(|| "ai_stream_router: 'fallback' must be an object".to_string())?;
-    reject_unknown_keys(
-        fallback_object,
-        "config.fallback",
-        AI_STREAM_ROUTER_FALLBACK_KEYS,
-        "ai_stream_router: ",
-    )?;
-    let defaults = FallbackConfig::default();
-    Ok(FallbackConfig {
-        enabled: optional_bool(fb, "enabled")?.unwrap_or(defaults.enabled),
-        on_connect_error: optional_bool(fb, "on_connect_error")?
-            .unwrap_or(defaults.on_connect_error),
-        on_5xx_before_first_byte: optional_bool(fb, "on_5xx_before_first_byte")?
-            .unwrap_or(defaults.on_5xx_before_first_byte),
-        max_attempts: optional_u64(fb, "max_attempts")?
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
-            .unwrap_or(defaults.max_attempts),
-    })
 }
 
 fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
@@ -1684,8 +1673,9 @@ impl Plugin for AiStreamRouter {
         ctx.metadata.insert(META_MODEL.to_string(), model);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
-        ctx.metadata
-            .insert(META_FALLBACK_ATTEMPTS.to_string(), "0".to_string());
+        // No `ai_stream_router.fallback_attempts` key: this plugin never
+        // attempts a second provider, so a permanently-zero counter would only
+        // advertise a capability that does not exist (issue #3328).
 
         debug!(
             provider = %provider.name,

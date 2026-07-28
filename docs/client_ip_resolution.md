@@ -5,6 +5,7 @@ When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP s
 ## Table of Contents
 
 - [How It Works](#how-it-works)
+- [Canonical Client Identity](#canonical-client-identity)
 - [Original Request Scheme](#original-request-scheme)
 - [Configuration](#configuration)
 - [Security Model](#security-model)
@@ -47,6 +48,31 @@ X-Forwarded-For: 1.1.1.1, <real-client-ip>
 ```
 
 Only the **rightmost** entries -- those appended by your own infrastructure -- are trustworthy. Walking right-to-left and skipping known proxies ensures you find the first IP that wasn't added by your own infrastructure.
+
+## Canonical Client Identity
+
+A client is **one security principal regardless of how its address is represented on the wire**. A dual-stack listener (bound to `[::]` or `::`) reports an IPv4 peer as the IPv4-mapped IPv6 form `::ffff:a.b.c.d`, and a trusted proxy can assert the same host in either form through `X-Forwarded-For`, the configured real-IP header, or a PROXY v2 `AF_INET6` address block. Ferrum folds IPv4-mapped IPv6 addresses to their native IPv4 form **once, at the ingress boundary**, before any plugin, policy key, log field, metric label, or GeoIP lookup sees the value.
+
+The fold is applied at every boundary that can supply a client identity:
+
+| Boundary | Notes |
+|---|---|
+| HTTP/1.1 and HTTP/2 sockets | Applied at accept, before the request context is built |
+| HTTP/3 (QUIC) | Applied per connection and refreshed on every observed connection migration, so a migrated client keeps one identity |
+| WebSocket handshakes | Inherit the canonical identity of the H1/H2/H3 request that upgraded |
+| Trusted `X-Forwarded-For` / real-IP header | The resolved forwarded address is folded before it replaces the socket identity |
+| PROXY protocol v1 / v2 | Both the forwarded source and the direct socket peer are folded |
+| Plain TCP and TCP+TLS | Applied at accept, before the stream plugin chain runs |
+| UDP and DTLS | Applied at session admission, before rate-limit and session keys are built |
+| Mesh capture (inbound, egress, UDP) and node-agent restored source IPs | Applied when the captured or restored address becomes the connection identity |
+
+Consequently `192.0.2.10` and `::ffff:192.0.2.10` share one per-IP request/connection/datagram/byte budget, receive one `ip_restriction` and `geo_restriction` decision, produce one consistent-hash load-balancing key, and appear as one value in transaction logs and metric labels.
+
+**True IPv6 semantics are preserved.** Only the `::ffff:0:0/96` mapped range is folded. A genuine IPv6 client keeps its own identity, and so do the deprecated IPv4-*compatible* form (`::a.b.c.d`) and NAT64 translation addresses (`64:ff9b::/96`) — those denote different network identities than the IPv4 address whose bits they embed, and treating them as the same host would let an attacker inherit another client's policy decision.
+
+For GeoIP specifically, the fold is what makes a mapped client's lookup descend the MaxMind database's IPv4 tree. Without it, an IPv4-only database rejects the query and a combined database searches the mapped IPv6 range instead of the IPv4 country record; either outcome falls through to `geo_restriction`'s `on_lookup_failure` policy, whose default is `allow`.
+
+CIDR configuration is unaffected and continues to accept mapped notation: `::ffff:10.0.0.0/104` in `FERRUM_TRUSTED_PROXIES` matches the equivalent IPv4 rule.
 
 ## Original Request Scheme
 
@@ -226,7 +252,7 @@ services:
 
 ## How Client IP Is Used
 
-The resolved client IP (`ctx.client_ip`) is used throughout the gateway:
+The resolved client IP (`ctx.client_ip`) is used throughout the gateway. It is always the [canonical identity](#canonical-client-identity), so every consumer below keys on one value per client host:
 
 | Feature | How IP Is Used |
 |---|---|

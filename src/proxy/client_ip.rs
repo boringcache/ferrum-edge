@@ -57,6 +57,7 @@
 //! used — which is the secure default for edge deployments.
 
 use crate::util::cidr::CidrSet;
+use crate::util::client_identity::canonical_ip_string;
 use std::net::IpAddr;
 use tracing::debug;
 
@@ -252,7 +253,7 @@ pub fn resolve_client_ip(
 
     // Fast path: no trusted proxies configured — always use socket IP.
     if trusted_proxies.is_empty() {
-        return socket_addr.to_canonical().to_string();
+        return canonical_ip_string(socket_addr);
     }
 
     resolve_client_ip_parsed(socket_ip, &socket_addr, xff_header, trusted_proxies)
@@ -270,7 +271,7 @@ pub fn resolve_client_ip_parsed(
     // No XFF header — use socket IP
     let xff = match xff_header {
         Some(h) if !h.trim().is_empty() => h,
-        _ => return socket_addr.to_canonical().to_string(),
+        _ => return canonical_ip_string(*socket_addr),
     };
 
     // If the direct connection is NOT from a trusted proxy, the XFF header
@@ -280,7 +281,7 @@ pub fn resolve_client_ip_parsed(
             socket_ip = socket_ip,
             "Direct connection not from trusted proxy; ignoring X-Forwarded-For"
         );
-        return socket_addr.to_canonical().to_string();
+        return canonical_ip_string(*socket_addr);
     }
 
     // Walk XFF entries right-to-left without collecting into a Vec.
@@ -294,7 +295,7 @@ pub fn resolve_client_ip_parsed(
             Ok(ip) => {
                 if !trusted_proxies.contains(&ip) {
                     // First untrusted IP = real client
-                    return ip.to_canonical().to_string();
+                    return canonical_ip_string(ip);
                 }
                 // This is a trusted proxy, keep walking left
             }
@@ -314,7 +315,7 @@ pub fn resolve_client_ip_parsed(
     }
 
     // All XFF entries were trusted proxies — fall back to socket IP
-    socket_addr.to_canonical().to_string()
+    canonical_ip_string(*socket_addr)
 }
 
 /// Outcome of evaluating every field-line of the configured real-IP header.
@@ -386,7 +387,7 @@ pub fn resolve_real_ip_header_field_lines<'a>(
     }
 
     match parse_single_real_ip_field_line(first) {
-        Some(ip) => RealIpHeaderOutcome::Accepted(ip.to_canonical().to_string()),
+        Some(ip) => RealIpHeaderOutcome::Accepted(canonical_ip_string(ip)),
         None => {
             debug!(
                 socket_ip = socket_ip,
