@@ -717,7 +717,8 @@ async fn test_route_override_and_metadata_set_for_openai() {
     // plugin never attempts a second provider, so the key would only advertise
     // a capability that does not exist.
     assert!(
-        !ctx.metadata.contains_key("ai_stream_router.fallback_attempts"),
+        !ctx.metadata
+            .contains_key("ai_stream_router.fallback_attempts"),
         "claimed requests must not stamp an inert fallback_attempts counter"
     );
 }

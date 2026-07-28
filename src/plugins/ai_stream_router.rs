@@ -136,8 +136,7 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
 /// The plugin never switches providers, so storing a fallback policy could only
 /// ever be runtime-inert. See the module docs for why pre-first-byte fallback
 /// cannot be expressed at this layer.
-pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str =
-    "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
+pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
 
 // ---------------------------------------------------------------------------
 // Metadata keys
