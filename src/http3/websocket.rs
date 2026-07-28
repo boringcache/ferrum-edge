@@ -426,8 +426,9 @@ async fn send_h3_reject_body<S>(
 }
 
 /// Finalize a failed RFC 9220 handshake immediately before its HEADERS frame is
-/// built. Response hooks and policy overlays run before this boundary, so none
-/// can leak H1 Upgrade or WebSocket negotiation fields onto a non-upgrade H3
+/// built. Response hooks, policy overlays, and ordinary Content-Length repair
+/// run before this boundary, so none can leak H1 Upgrade, WebSocket negotiation
+/// fields, or transport-managed `Content-Length` onto a non-upgrade H3
 /// response. Content-Type is seeded before those hooks run, so its absence here
 /// is an authoritative policy removal and must not be defaulted back.
 pub(crate) fn finalize_h3_websocket_reject_headers(headers: &mut HashMap<String, String>) {
@@ -451,6 +452,21 @@ async fn write_h3_finalized_reject_body<S>(
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    // Match the flavor-aware open-circuit reject writer: hop-by-hop /
+    // Connection-listed sanitization (and any ExactBody length repair) first,
+    // then strip transport-managed handshake fields so Content-Length cannot
+    // reach the failed Extended CONNECT response.
+    let framing = if body.is_empty() {
+        crate::proxy::headers::ClientResponseFraming::Streaming {
+            status: status.as_u16(),
+        }
+    } else {
+        crate::proxy::headers::ClientResponseFraming::ExactBody {
+            status: status.as_u16(),
+            len: body.len() as u64,
+        }
+    };
+    crate::proxy::headers::sanitize_client_response_headers_for_wire(&mut headers, framing);
     finalize_h3_websocket_reject_headers(&mut headers);
     let builder =
         crate::proxy::headers::apply_response_headers(Response::builder().status(status), &headers);

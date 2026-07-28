@@ -5282,7 +5282,6 @@ async fn handle_h3_request(
             &mut response_headers,
             ClientResponseFraming::Streaming {
                 status: response_status,
-                is_head: false,
             },
         );
 
@@ -6997,7 +6996,6 @@ async fn handle_h3_request(
         let framing = if ctx.method.eq_ignore_ascii_case("HEAD") {
             ClientResponseFraming::Streaming {
                 status: response_status,
-                is_head: true,
             }
         } else {
             ClientResponseFraming::ExactBody {
@@ -8535,7 +8533,6 @@ async fn stream_h3_open_response_to_client(
         &mut response_headers,
         ClientResponseFraming::Streaming {
             status: response_status,
-            is_head: false,
         },
     );
 
@@ -9477,7 +9474,6 @@ async fn dispatch_grpc_native_h3(
         &mut response_headers,
         ClientResponseFraming::Streaming {
             status: response_status,
-            is_head: false,
         },
     );
 
@@ -10496,7 +10492,6 @@ async fn proxy_to_backend_h3_streaming(
         &mut response_headers,
         ClientResponseFraming::Streaming {
             status: response_status,
-            is_head: false,
         },
     );
 
@@ -11097,7 +11092,6 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
     let framing = if body.is_empty() {
         ClientResponseFraming::Streaming {
             status: status.as_u16(),
-            is_head: false,
         }
     } else {
         ClientResponseFraming::ExactBody {
@@ -11106,8 +11100,25 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
         }
     };
     sanitize_client_response_headers_for_wire(&mut headers, framing);
+    send_h3_pre_sanitized_reject_response_with_recv_halt(
+        stream, status, body, &headers, halt_recv,
+    )
+    .await
+}
+
+/// Send an already protocol-sanitized reject. Callers that must strip
+/// additional transport-managed fields (failed H3 WebSocket handshake) run
+/// that strip after length repair and invoke this helper so ExactBody cannot
+/// reintroduce `Content-Length` on the wire.
+async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
+    stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    halt_recv: bool,
+) -> Result<(), anyhow::Error> {
     let mut builder = Response::builder().status(status);
-    builder = apply_response_headers(builder, &headers);
+    builder = apply_response_headers(builder, headers);
     let resp = builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 reject response: {}", e))?;
@@ -11623,7 +11634,6 @@ async fn send_h3_grpc_error_with_recv_halt(
         &mut headers,
         ClientResponseFraming::Streaming {
             status: StatusCode::OK.as_u16(),
-            is_head: false,
         },
     );
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)
@@ -11981,12 +11991,28 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     if !matches!(flavor, HttpFlavor::Grpc) {
         if matches!(flavor, HttpFlavor::WebSocket) {
             let mut finalized_headers = headers.clone();
-            crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
             if !headers_finalized && !reject_response_sets_content_type(&finalized_headers) {
                 finalized_headers
                     .insert("content-type".to_string(), "application/json".to_string());
             }
-            return send_h3_finalized_reject_response_with_recv_halt(
+            // Final protocol-aware boundary for a failed Extended CONNECT
+            // handshake: hop-by-hop / Connection-listed strip and body-length
+            // repair first, then remove transport-managed handshake fields
+            // (including Content-Length) so ExactBody cannot reintroduce them
+            // immediately before the H3 builder.
+            let framing = if http_body.is_empty() {
+                ClientResponseFraming::Streaming {
+                    status: http_status.as_u16(),
+                }
+            } else {
+                ClientResponseFraming::ExactBody {
+                    status: http_status.as_u16(),
+                    len: http_body.len() as u64,
+                }
+            };
+            sanitize_client_response_headers_for_wire(&mut finalized_headers, framing);
+            crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
+            return send_h3_pre_sanitized_reject_response_with_recv_halt(
                 stream,
                 http_status,
                 http_body,
@@ -12036,7 +12062,6 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         &mut sanitized_headers,
         ClientResponseFraming::Streaming {
             status: StatusCode::OK.as_u16(),
-            is_head: false,
         },
     );
     let headers = &sanitized_headers;

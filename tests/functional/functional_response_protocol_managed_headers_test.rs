@@ -194,7 +194,7 @@ fn assert_no_protocol_managed(headers: &http::HeaderMap, label: &str) {
 async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     let hits = Arc::new(AtomicUsize::new(0));
     let backend_port = start_scripted_backend(Arc::clone(&hits)).await;
-    let (mut gateway, https_port) = spawn_gateway(backend_port).await;
+    let (gateway, https_port) = spawn_gateway(backend_port).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await

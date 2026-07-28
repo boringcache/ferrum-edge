@@ -16729,7 +16729,6 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     let framing = if is_grpc_error || reject.body.is_empty() {
         headers_mod::ClientResponseFraming::Streaming {
             status,
-            is_head: false,
         }
     } else {
         headers_mod::ClientResponseFraming::ExactBody {
@@ -23551,7 +23550,6 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     headers_mod::ClientResponseFraming::Streaming {
                         status: grpc_streaming.status,
-                        is_head: false,
                     },
                 );
 
@@ -24426,7 +24424,6 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     headers_mod::ClientResponseFraming::Streaming {
                         status: response_status,
-                        is_head: false,
                     },
                 );
                 let resp_builder = headers_mod::apply_response_headers(
@@ -26270,7 +26267,6 @@ async fn handle_proxy_request_inner(
         // Content-Length: 0 from the empty wire body.
         ResponseBody::Buffered(_) if is_head => headers_mod::ClientResponseFraming::Streaming {
             status: response_status,
-            is_head: true,
         },
         ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
             status: response_status,
@@ -26280,7 +26276,6 @@ async fn handle_proxy_request_inner(
         | ResponseBody::StreamingH2(_)
         | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming {
             status: response_status,
-            is_head,
         },
     };
     resp_builder =

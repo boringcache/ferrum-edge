@@ -6745,7 +6745,6 @@ where
     // needed so the common clean map stays allocation-free on this path.
     let framing = ClientResponseFraming::Streaming {
         status,
-        is_head: false,
     };
     let mut owned_headers;
     let headers =
@@ -7038,7 +7037,6 @@ where
     let framing = if body.is_empty() {
         ClientResponseFraming::Streaming {
             status: status.as_u16(),
-            is_head: false,
         }
     } else {
         ClientResponseFraming::ExactBody {
@@ -7392,7 +7390,6 @@ where
         &mut headers,
         ClientResponseFraming::Streaming {
             status: reject.http_status.as_u16(),
-            is_head: false,
         },
     );
     let mut resp_builder = Response::builder().status(reject.http_status);
@@ -7747,7 +7744,6 @@ where
         &mut headers,
         ClientResponseFraming::Streaming {
             status: StatusCode::OK.as_u16(),
-            is_head: false,
         },
     );
     let resp = apply_response_headers(Response::builder().status(StatusCode::OK), &headers)

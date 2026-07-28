@@ -687,20 +687,16 @@ pub fn is_protocol_managed_plugin_response_destination(name: &str) -> bool {
 pub enum ClientResponseFraming {
     /// Buffered / synthetic body whose wire length is known. Sets
     /// `Content-Length` to `len` unless the status forbids a body (then
-    /// strips it). Not for `HEAD` — use [`Self::HeadRepresentation`].
+    /// strips it). Not for `HEAD` — use [`Self::Streaming`] so a backend
+    /// representation length is preserved instead of inventing `0` from an
+    /// empty wire body.
     ExactBody { status: u16, len: u64 },
-    /// `HEAD` response: preserve representation metadata length without
-    /// implying a message body. Statuses that forbid a body still strip
-    /// `Content-Length`.
-    HeadRepresentation {
-        status: u16,
-        representation_len: u64,
-    },
-    /// Streaming / unknown final length. Preserves a valid decimal
-    /// `Content-Length` (backend-authored) when the status may carry a body;
+    /// Streaming / unknown final length, trailers-only gRPC, or `HEAD`.
+    /// Preserves a valid decimal `Content-Length` (backend-authored
+    /// representation length for `HEAD`) when the status may carry a body;
     /// strips invalid values and strips entirely when the status forbids a
-    /// body. `HEAD` streaming keeps a valid representation length.
-    Streaming { status: u16, is_head: bool },
+    /// body.
+    Streaming { status: u16 },
 }
 
 /// Whether a plugin-produced map needs the full wire sanitizer for `framing`.
@@ -727,18 +723,7 @@ pub fn needs_client_response_wire_sanitization(
                 headers.get("content-length").map(String::as_str) != Some(&len.to_string())
             }
         }
-        ClientResponseFraming::HeadRepresentation {
-            status,
-            representation_len,
-        } => {
-            if status_forbids_response_body(status) {
-                headers.contains_key("content-length")
-            } else {
-                headers.get("content-length").map(String::as_str)
-                    != Some(&representation_len.to_string())
-            }
-        }
-        ClientResponseFraming::Streaming { status, .. } => {
+        ClientResponseFraming::Streaming { status } => {
             if status_forbids_response_body(status) {
                 headers
                     .keys()
@@ -858,17 +843,7 @@ pub fn sanitize_client_response_headers_for_wire(
                 set_content_length_header(headers, len);
             }
         }
-        ClientResponseFraming::HeadRepresentation {
-            status,
-            representation_len,
-        } => {
-            if status_forbids_response_body(status) {
-                remove_content_length_header(headers);
-            } else {
-                set_content_length_header(headers, representation_len);
-            }
-        }
-        ClientResponseFraming::Streaming { status, .. } => {
+        ClientResponseFraming::Streaming { status } => {
             if status_forbids_response_body(status) {
                 remove_content_length_header(headers);
             } else {
@@ -1822,10 +1797,7 @@ mod tests {
         )]);
         sanitize_client_response_headers_for_wire(
             &mut bad,
-            ClientResponseFraming::Streaming {
-                status: 200,
-                is_head: false,
-            },
+            ClientResponseFraming::Streaming { status: 200 },
         );
         assert!(!bad.contains_key("content-length"));
 
@@ -1833,10 +1805,7 @@ mod tests {
             std::collections::HashMap::from([("content-length".to_string(), "42".to_string())]);
         sanitize_client_response_headers_for_wire(
             &mut good,
-            ClientResponseFraming::Streaming {
-                status: 200,
-                is_head: true,
-            },
+            ClientResponseFraming::Streaming { status: 200 },
         );
         assert_eq!(good.get("content-length").map(String::as_str), Some("42"));
     }
@@ -1847,10 +1816,7 @@ mod tests {
             std::collections::HashMap::from([("Content-Length".to_string(), " 42 ".to_string())]);
         sanitize_client_response_headers_for_wire(
             &mut mixed,
-            ClientResponseFraming::Streaming {
-                status: 200,
-                is_head: false,
-            },
+            ClientResponseFraming::Streaming { status: 200 },
         );
         assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
         assert!(!mixed.contains_key("Content-Length"));
@@ -1861,10 +1827,7 @@ mod tests {
         ]);
         sanitize_client_response_headers_for_wire(
             &mut duplicates,
-            ClientResponseFraming::Streaming {
-                status: 200,
-                is_head: false,
-            },
+            ClientResponseFraming::Streaming { status: 200 },
         );
         assert!(
             !duplicates

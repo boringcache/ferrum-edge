@@ -2377,7 +2377,6 @@ pub fn build_grpc_error_response_with_policy(
         &mut response_headers,
         crate::proxy::headers::ClientResponseFraming::Streaming {
             status: StatusCode::OK.as_u16(),
-            is_head: false,
         },
     );
     crate::proxy::headers::apply_response_headers(
