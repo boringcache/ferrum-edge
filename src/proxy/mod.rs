@@ -13739,6 +13739,7 @@ pub(crate) fn create_proxy_socket(
     backlog: i32,
     tcp_fastopen_queue_len: Option<u16>,
     reuse_port: bool,
+    transparent: bool,
 ) -> Result<TcpListener, anyhow::Error> {
     let socket = socket2::Socket::new(
         if addr.is_ipv6() {
@@ -13759,6 +13760,47 @@ pub(crate) fn create_proxy_socket(
     #[cfg(unix)]
     if reuse_port {
         socket.set_reuse_port(true)?;
+    }
+
+    // IP_TRANSPARENT / IPV6_TRANSPARENT for the NodeWaypoint inbound relay
+    // listener when the eBPF tc ingress redirect is installed (issue #3287).
+    //
+    // The redirect never rewrites addresses: `bpf_sk_assign` hands the packet
+    // to this listener with the workload's real `podIP:appPort` intact. That is
+    // what preserves the original destination metadata, but it also means the
+    // accepted socket's local address is NOT configured on this host, so its
+    // replies can only be routed if the socket is transparent (the kernel needs
+    // `FLOWI_FLAG_ANYSRC` to accept a non-local source). Without this the
+    // redirect delivers inbound SYNs and then silently fails to send SYN-ACKs.
+    //
+    // Set BEFORE bind, and only for the one listener that opts in — a
+    // transparent socket may bind non-local addresses, so this is deliberately
+    // not a global default.
+    #[cfg(target_os = "linux")]
+    if transparent {
+        use std::os::unix::io::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let result = if addr.is_ipv6() {
+            crate::socket_opts::set_ipv6_transparent(fd)
+        } else {
+            crate::socket_opts::set_ip_transparent(fd)
+        };
+        // Fatal, not a warning: the caller only asks for a transparent bind
+        // when the tc ingress redirect is installed, and a non-transparent
+        // listener there accepts connections it can never answer.
+        result.map_err(|e| {
+            anyhow::anyhow!(
+                "failed to enable IP_TRANSPARENT on the NodeWaypoint inbound listener \
+                 {addr}, which the eBPF tc ingress redirect requires in order to reply \
+                 from captured pod addresses: {e}"
+            )
+        })?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if transparent {
+        anyhow::bail!(
+            "a transparent listener bind was requested for {addr}, but IP_TRANSPARENT is Linux-only"
+        );
     }
 
     socket.set_nonblocking(true)?;
@@ -14403,7 +14445,13 @@ async fn start_proxy_listener_with_tls_source_and_signal(
     };
 
     // Create the first listener — this one validates that the port is available.
-    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+    // The NodeWaypoint inbound relay listener binds transparent when the eBPF
+    // tc ingress redirect is installed, so it can answer from the captured pod
+    // address. Every other listener binds exactly as before.
+    let transparent = mesh_direction
+        .is_some_and(|direction| direction == crate::modes::mesh::MeshTrafficDirection::Inbound)
+        && crate::modes::node_agent::node_waypoint_ingress_redirect_configured();
+    let first_listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, transparent)?;
 
     // Optional connection limit. Shared across all accept threads so the global
     // max_connections limit is enforced regardless of which thread accepted.
@@ -14429,7 +14477,7 @@ async fn start_proxy_listener_with_tls_source_and_signal(
 
         // Spawn additional listeners (threads 1..N-1)
         for i in 1..accept_threads {
-            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port)?;
+            let listener = create_proxy_socket(addr, backlog, tfo_queue, reuse_port, transparent)?;
             let state = Arc::clone(&state);
             let tls_source = tls_source.clone();
             let semaphore = conn_semaphore.clone();

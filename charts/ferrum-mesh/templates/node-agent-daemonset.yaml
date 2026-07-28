@@ -85,6 +85,7 @@
   "FERRUM_NODE_AGENT_NODE_NAME"
   "FERRUM_NODE_AGENT_NODE_IP"
   "FERRUM_NODE_AGENT_NODE_IPS"
+  "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES"
   "FERRUM_NODE_AGENT_CNI_ENABLED"
   "FERRUM_NODE_AGENT_CNI_SOCKET_PATH"
 -}}
@@ -235,6 +236,13 @@ spec:
             {{- if .Values.nodeAgent.trustedKubeletProbeSourceIps }}
             - name: FERRUM_NODE_AGENT_NODE_IPS
               value: {{ .Values.nodeAgent.trustedKubeletProbeSourceIps | quote }}
+            {{- end }}
+            {{- if .Values.nodeAgent.ingressRedirectIfaces }}
+            {{- if ne .Values.nodeAgent.proxyMode "node_waypoint" }}
+            {{- fail "nodeAgent.ingressRedirectIfaces requires nodeAgent.proxyMode=node_waypoint; only NodeWaypoint has an inbound HBONE relay to steer captured traffic into" }}
+            {{- end }}
+            - name: FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES
+              value: {{ .Values.nodeAgent.ingressRedirectIfaces | quote }}
             {{- end }}
             {{- if and $cni $cni.enabled }}
             - name: FERRUM_NODE_AGENT_CNI_ENABLED

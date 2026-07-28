@@ -353,6 +353,111 @@ HTTP/TCP/gRPC liveness, readiness, or startup probe. Keep
 the host-network relay and kubelet probes; other host traffic still needs the
 trusted relay mark or follows the UDP/extension-header fail-closed behavior.
 
+### Inbound TC ingress redirect (issue #3287)
+
+Attaching `ferrum_tc_inbound` to the pod veth *guards* direct-to-pod traffic but
+does not steer it anywhere: without a redirect, obtaining a fully eBPF-owned
+inbound path meant falling back to a node-global `nat PREROUTING -j REDIRECT`.
+`ferrum_tc_ingress_redirect` closes that gap.
+
+Set `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` to a comma-separated list of the
+node's capture interfaces (typically the node uplink, e.g. `eth0`). **Unset is
+the default and the whole datapath stays inert** — the capture config publishes
+a zero redirect mark and the classifier returns every packet untouched before it
+performs a single map lookup, so an existing node behaves exactly as it did
+before. The variable is NodeWaypoint-only; setting it in `local_pod` proxy mode
+is a startup error, because there is no inbound relay to steer traffic into.
+
+The classifier is attached **per node interface, once at startup** — not per pod
+— on the tc **ingress** hook only (`bpf_sk_assign` is ingress-only). Off-node
+traffic to a pod is only visible on a tc ingress hook before routing decides to
+forward it, which is why the attach point is a node interface rather than a pod
+veth. Scoping is done per packet by the BPF maps, not by the attach point:
+
+1. the destination must be an enrolled pod (`FERRUM_POD_IPS` / `FERRUM_POD_IPS6`)
+   carrying `POD_CAPTURE_FLAG_INBOUND_REDIRECT`, **and**
+2. the exact `(pod address, destination port)` pair must be present in
+   `FERRUM_POD_INBOUND_PORTS` / `FERRUM_POD_INBOUND_PORTS6`.
+
+Those port entries are derived from the pod's declared TCP `containerPorts` at
+enrollment. Kubernetes probe ports are deliberately *not* folded in — they keep
+their existing direct-to-pod exemption through `FERRUM_NODE_PROBE_PORTS`, so
+kubelet health checking never depends on the relay being up. A pod that declares
+no inbound TCP port is never flagged, and traffic to an enrolled pod on an
+undeclared port is left to the direct-pod guard.
+
+**No NAT, and original destination metadata is preserved for free.** The packet's
+addresses are never rewritten. The classifier resolves a relay socket and
+attaches it to the skb with `bpf_sk_assign()`, so the relay's accepted socket
+reports the workload's real `podIP:appPort` from `getsockname()` — no conntrack
+table, no reverse NAT, no checksum rewriting. An already-established flow is
+assigned back to its own socket before the listener is considered, so mid-flow
+packets are never re-dispatched.
+
+Because the accepted socket's local address is the pod's (not an address
+configured on the host), the NodeWaypoint inbound relay listener binds
+`IP_TRANSPARENT` / `IPV6_TRANSPARENT` whenever this variable is set — the kernel
+otherwise refuses to route a reply from a non-local source. The mesh proxy reads
+the same operator variable the node-agent does, so there is no IPC to keep in
+sync.
+
+Assigned packets still need to be classified as locally deliverable, so the
+node-agent installs a Ferrum-owned policy route per family:
+
+```
+ip [-6] rule add priority 101 fwmark 0x735 lookup 33134
+ip [-6] route replace local <default> dev lo table 33134
+```
+
+Priority `101` sits **below** the kernel `main` rule (32766); above it, `main`
+would resolve the marked packet first and the redirect would black-hole. Table
+`33134` is distinct from the UDP TPROXY table `33133`, so tearing one path down
+never reaps the other, and deletion always names the exact priority and table
+rather than flushing. Routing is installed **before** the classifier is attached
+and removed **after** it is detached, so neither ordering can strand an assigned
+packet with no local route. A failure to install routing, or to attach on any
+one interface, is fatal: the node-agent unwinds what it installed, reports
+`ferrum_mesh_node_topology_degraded{reason="node_waypoint_ingress_redirect_unavailable"}`,
+and refuses readiness rather than serving a half-installed redirect. The image
+therefore needs `iproute2` (`ip`) and `NET_ADMIN` — the same capability the
+existing tc and cgroup attachments already require. No new privilege is added.
+
+**Loop and self-capture prevention** — three independent guards, any of which
+returns the packet untouched:
+
+| Guard | Why |
+|---|---|
+| `skb->mark == 0x734` (relay auth mark) | The relay's own authorized dial down to the local backend pod; redirecting it would feed the relay its own traffic. |
+| `skb->mark == 0x735` (redirect mark) | Already redirected by this program; never redirect twice. |
+| `dst_port == hbone_redirect_port` | Already addressed to the relay listener (peer-to-peer HBONE included). |
+
+**Fail-closed.** A packet that IS in scope but for which no relay socket
+resolves is dropped, not delivered — delivering it would silently bypass
+`mesh_authz` for exactly the traffic the operator asked to capture. Out-of-scope
+packets are never dropped by this program.
+
+**Lifecycle.** Scope entries are written *before* the pod-IP map carries the
+redirect flag (flagging first would open a window where in-scope traffic fails
+closed with no reachable port), and cleared *after* the pod-IP entry is removed
+on teardown (the pod-IP removal alone already disables the redirect). A
+`containerPorts` edit on a live pod converges by wholesale replacement, so a
+*narrowed* spec never leaves a removed port redirectable. Removal is keyed by
+pod address rather than an enumerated list, because a Kubernetes delete event
+carries no spec snapshot.
+
+This does **not** remove the node-global iptables fallback: that path exists for
+kernels which cannot run eBPF at all
+(`FERRUM_NODE_AGENT_FALLBACK_MODE=iptables`, see *Kernel Fallback* below) and is
+a separate concern from the covered eBPF path. What changes is that an
+eBPF-capable node no longer has to accept node-global REDIRECT semantics to get
+an inbound capture path.
+
+Like the rest of the in-netns datapath this is Linux-only and gated by
+live-kernel CI: the `ebpf-live` job load/verifies the program on a real kernel
+and drives IPv4 and IPv6 redirects through a veth pair, covering enrolled
+redirect, unenrolled pass-through, undeclared-port pass-through, the
+loop-prevention mark, and detach cleanup.
+
 Because the relay dials backend pods from a node-local source address, at least
 one trusted node source IP (`FERRUM_NODE_AGENT_NODE_IP` /
 `FERRUM_NODE_AGENT_NODE_IPS`, surfaced as `FERRUM_NODE_IPS` / `FERRUM_NODE_IPS6`)

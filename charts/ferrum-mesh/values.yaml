@@ -330,6 +330,23 @@ nodeAgent:
   # than silently dropping all inbound to enrolled pods. Leave empty only for
   # non-NodeWaypoint proxy modes.
   trustedKubeletProbeSourceIps: ""
+  # Node capture interfaces that carry the NodeWaypoint inbound tc INGRESS
+  # redirect (ferrum_tc_ingress_redirect, issue #3287). Comma-separated, e.g.
+  # "eth0" — typically the node uplink, since off-node traffic to a pod is only
+  # visible on a tc ingress hook before routing forwards it.
+  #
+  # Empty (the default) disables the redirect entirely: the capture config
+  # publishes a zero redirect mark, the kernel program returns every packet
+  # untouched, and inbound behavior is exactly as before. Set it to give
+  # enrolled workloads a fully eBPF-owned inbound capture path instead of
+  # node-global iptables REDIRECT semantics.
+  #
+  # NodeWaypoint proxy mode only (a startup error in local_pod mode). Requires
+  # iproute2 (`ip`) in the node-agent image and NET_ADMIN, which the existing tc
+  # attachments already need — this adds no new privilege. Redirection is scoped
+  # per packet to an enrolled, opted-in pod address on one of its declared
+  # containerPorts, so unenrolled traffic is never captured.
+  ingressRedirectIfaces: ""
   # Shared host-path directory for the per-pod (uid -> cgroup) registry the
   # node-agent publishes. Consumed by (a) the ambient NodeWaypoint proxy to open
   # per-pod in-netns TCP capture listeners (proxyMode=node_waypoint), and (b) the

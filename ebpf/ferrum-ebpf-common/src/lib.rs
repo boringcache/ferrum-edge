@@ -181,12 +181,153 @@ pub struct PodInfo {
 
 pub const POD_CAPTURE_FLAG_UDP_ENABLED: u32 = 1 << 0;
 pub const POD_CAPTURE_FLAG_UDP_READY: u32 = 1 << 1;
+/// Per-pod opt-in for the NodeWaypoint inbound tc ingress redirect.
+///
+/// Set by the node-agent only for a pod that is fully enrolled for NodeWaypoint
+/// inbound capture: its identity is known, its inbound application ports are
+/// installed in `FERRUM_POD_INBOUND_PORTS` / `FERRUM_POD_INBOUND_PORTS6`, and
+/// the destination NodeWaypoint relay is the authorized owner of its inbound
+/// traffic. The tc ingress program redirects nothing for a pod without this
+/// flag, so an un-enrolled or partially-enrolled pod is never captured.
+pub const POD_CAPTURE_FLAG_INBOUND_REDIRECT: u32 = 1 << 2;
 
 impl PodInfo {
     pub const fn udp_capture_not_ready(&self) -> bool {
         self.capture_flags & POD_CAPTURE_FLAG_UDP_ENABLED != 0
             && self.capture_flags & POD_CAPTURE_FLAG_UDP_READY == 0
     }
+
+    /// `true` when this pod opted in to the inbound tc ingress redirect.
+    pub const fn inbound_redirect_enabled(&self) -> bool {
+        self.capture_flags & POD_CAPTURE_FLAG_INBOUND_REDIRECT != 0
+    }
+}
+
+/// Key for `FERRUM_POD_INBOUND_PORTS`: an enrolled pod IPv4 address (network
+/// byte order) plus one inbound TCP application port that the NodeWaypoint
+/// relay is authorized to terminate on that pod's behalf.
+///
+/// The tc ingress redirect requires an exact `(pod address, destination port)`
+/// hit, so redirection is scoped to the ports the workload actually declares.
+/// Traffic to an enrolled pod on an undeclared port is left to the existing
+/// direct-pod guard and is never steered into the waypoint.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundRedirectKey4 {
+    pub addr: u32,
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl InboundRedirectKey4 {
+    pub const fn new(addr: u32, port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// IPv6 counterpart to [`InboundRedirectKey4`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InboundRedirectKey6 {
+    pub addr: [u32; 4],
+    pub port: u16,
+    pub _pad: u16,
+}
+
+impl InboundRedirectKey6 {
+    pub const fn new(addr: [u32; 4], port: u16) -> Self {
+        Self {
+            addr,
+            port,
+            _pad: 0,
+        }
+    }
+}
+
+/// What `ferrum_tc_ingress_redirect` must do with one inbound packet.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IngressRedirectAction {
+    /// Out of scope. Return the packet untouched (`TC_ACT_OK`) and leave the
+    /// pre-existing direct-pod guard as the only inbound control.
+    Pass = 0,
+    /// In scope. Steer the packet into the local NodeWaypoint relay with
+    /// `bpf_sk_assign()`, or **drop** it if no relay socket resolves — never
+    /// deliver an in-scope packet to the pod unredirected.
+    Steer = 1,
+}
+
+impl IngressRedirectAction {
+    pub const fn is_steer(self) -> bool {
+        matches!(self, Self::Steer)
+    }
+}
+
+/// The per-packet facts the redirect decision is made from. Deliberately a
+/// plain value type with no kernel dependencies so the decision table can be
+/// exercised deterministically from host-side unit tests — the kernel program
+/// only parses the packet and looks maps up, it does not re-implement policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngressRedirectPacket {
+    /// `skb->mark` as it arrived.
+    pub skb_mark: u32,
+    /// TCP destination port in host byte order.
+    pub dst_port: u16,
+    /// `true` when the IP payload is TCP. `bpf_sk_assign()` is TCP-only here,
+    /// so anything else passes.
+    pub protocol_is_tcp: bool,
+    /// `true` when the destination address is an enrolled pod carrying
+    /// [`POD_CAPTURE_FLAG_INBOUND_REDIRECT`]. Proof of verified ownership: the
+    /// node-agent sets the flag only for a pod whose identity it resolved and
+    /// whose inbound ports it already installed.
+    pub destination_pod_opted_in: bool,
+    /// `true` when `(destination address, dst_port)` is present in
+    /// `FERRUM_POD_INBOUND_PORTS` / `FERRUM_POD_INBOUND_PORTS6`.
+    pub destination_port_declared: bool,
+}
+
+impl IngressRedirectPacket {
+    /// A packet that is in scope on every axis. Tests flip one field at a time
+    /// off this baseline so a new gate cannot be added without a test noticing.
+    pub const fn fully_in_scope(dst_port: u16) -> Self {
+        Self {
+            skb_mark: 0,
+            dst_port,
+            protocol_is_tcp: true,
+            destination_pod_opted_in: true,
+            destination_port_declared: true,
+        }
+    }
+}
+
+/// The single source of truth for the inbound tc redirect decision.
+///
+/// Every gate is a conjunction, so the kernel program may evaluate them in any
+/// order (it short-circuits the cheap mark/port guards before spending a map
+/// lookup) without diverging from this table:
+///
+/// `Steer` ⟺ armed ∧ TCP ∧ ¬bypass ∧ pod opted in ∧ port declared.
+pub const fn ingress_redirect_action(
+    config: &BpfCaptureConfig,
+    packet: &IngressRedirectPacket,
+) -> IngressRedirectAction {
+    if !config.ingress_redirect_armed() {
+        return IngressRedirectAction::Pass;
+    }
+    if !packet.protocol_is_tcp {
+        return IngressRedirectAction::Pass;
+    }
+    if config.ingress_redirect_bypass(packet.skb_mark, packet.dst_port) {
+        return IngressRedirectAction::Pass;
+    }
+    if !packet.destination_pod_opted_in || !packet.destination_port_declared {
+        return IngressRedirectAction::Pass;
+    }
+    IngressRedirectAction::Steer
 }
 
 /// Node-source kubelet probe exemption for IPv4 direct-inbound traffic.
@@ -298,6 +439,19 @@ pub struct BpfCaptureConfig {
     /// NodeWaypoint relay backend dials. Packets to enrolled pod IPs without
     /// this mark are direct pod traffic and are dropped fail-closed.
     pub node_waypoint_inbound_auth_mark: u32,
+    /// `skb->mark` the tc ingress redirect program stamps on a packet it has
+    /// steered to the local NodeWaypoint inbound listener with
+    /// `bpf_sk_assign()`. The node-agent installs a matching policy-routing
+    /// rule (`ip rule fwmark <mark> lookup <table>` + `ip route add local
+    /// default dev lo table <table>`) so the assigned packet is delivered
+    /// locally instead of being forwarded on to the pod.
+    ///
+    /// **Zero disables the inbound redirect entirely** — the tc ingress
+    /// program returns `TC_ACT_OK` without touching a single packet, and the
+    /// pre-existing direct-pod guard remains the only inbound control. This is
+    /// the default, so a node that has not been explicitly opted in keeps its
+    /// previous behavior.
+    pub node_waypoint_ingress_redirect_mark: u32,
 }
 
 /// Maximum number of explicit `includeOutboundPorts` ports the per-cgroup
@@ -393,6 +547,33 @@ pub const INBOUND_HBONE_PORT: u16 = 15008;
 /// dialing the local backend pod. Chosen adjacent to Ferrum's TPROXY mark but
 /// distinct from it, and outside the common masked CNI mark classes.
 pub const NODE_WAYPOINT_INBOUND_AUTH_MARK: u32 = 0x734;
+
+/// `skb->mark` stamped by `ferrum_tc_ingress_redirect` on a packet it steered
+/// to the local NodeWaypoint inbound listener.
+///
+/// Chosen adjacent to — and distinct from — the UDP TPROXY mark (`0x733`) and
+/// the inbound relay auth mark (`0x734`), and outside the common masked CNI
+/// mark classes (`0x735 & 0xF00 == 0x700`, so it does not alias Cilium's
+/// `0xF00` class). It must never equal the auth mark: the tc programs treat
+/// the auth mark as "already relayed" for loop prevention, so collapsing the
+/// two would make a redirected packet indistinguishable from a relay dial.
+pub const NODE_WAYPOINT_INGRESS_REDIRECT_MARK: u32 = 0x735;
+
+/// Ferrum-owned policy-routing table for tc-ingress-redirected inbound TCP.
+/// Distinct from the UDP TPROXY table (`33133`) so teardown of one path can
+/// never reap the other, and distinct from Istio's conventional tables.
+pub const NODE_WAYPOINT_INGRESS_REDIRECT_TABLE: u32 = 33134;
+
+/// `ip rule` priority for the inbound-redirect local-delivery rule. Like the
+/// UDP TPROXY rule it must sort BELOW the kernel `main` rule (priority 32766)
+/// or `main` resolves the marked packet first and the redirect black-holes.
+/// One above the UDP rule (`100`) so the two are independently deletable.
+pub const NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY: u32 = 101;
+
+// The two NodeWaypoint marks must stay distinct from each other and from the
+// UDP TPROXY mark, and must not alias the common masked CNI mark classes.
+const _: () = assert!(NODE_WAYPOINT_INGRESS_REDIRECT_MARK != NODE_WAYPOINT_INBOUND_AUTH_MARK);
+const _: () = assert!(NODE_WAYPOINT_INGRESS_REDIRECT_MARK & 0xF00 != 0xF00);
 
 /// Singleton key for `FERRUM_CAPTURE_CONFIG`.
 pub const FERRUM_CAPTURE_CONFIG_KEY: u32 = 0;
@@ -528,6 +709,10 @@ impl BpfCaptureConfig {
             hbone_redirect_port: hbone_redirect_port as u32,
             ipv6_outbound_deny: 0,
             node_waypoint_inbound_auth_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            // Fail closed to "no redirect": the inbound tc redirect only
+            // engages once an operator opts the node in AND the node-agent has
+            // installed the matching local-delivery routing.
+            node_waypoint_ingress_redirect_mark: 0,
         }
     }
 
@@ -541,6 +726,74 @@ impl BpfCaptureConfig {
     pub const fn with_node_waypoint_inbound_auth_mark(mut self, mark: u32) -> Self {
         self.node_waypoint_inbound_auth_mark = mark;
         self
+    }
+
+    /// Set the tc ingress redirect mark — see
+    /// [`Self::node_waypoint_ingress_redirect_mark`]. Zero disables the
+    /// redirect.
+    pub const fn with_node_waypoint_ingress_redirect_mark(mut self, mark: u32) -> Self {
+        self.node_waypoint_ingress_redirect_mark = mark;
+        self
+    }
+
+    /// `true` when the inbound tc ingress redirect is armed. Requires a
+    /// non-zero redirect mark AND a non-zero relay port to steer to; either
+    /// missing leaves the datapath on the pre-existing direct-pod guard.
+    pub const fn ingress_redirect_armed(&self) -> bool {
+        self.node_waypoint_ingress_redirect_mark != 0 && self.hbone_redirect_port != 0
+    }
+
+    /// Loop / self-capture bypass for the tc ingress redirect: `true` means
+    /// "leave this packet completely alone".
+    ///
+    /// Lives here rather than in the kernel program so the host-side unit tests
+    /// exercise the exact truth table the classifier evaluates. Three
+    /// independent conditions:
+    ///
+    /// 1. `mark == node_waypoint_inbound_auth_mark` — the relay's own
+    ///    authorized dial down to the local backend pod. Redirecting it would
+    ///    feed the relay its own traffic in a loop.
+    /// 2. `mark == node_waypoint_ingress_redirect_mark` — already redirected by
+    ///    this program (or a peer hook); never redirect twice.
+    /// 3. `dst_port == hbone_redirect_port` — already addressed to the relay
+    ///    listener (peer-to-peer HBONE included), so it must reach it directly.
+    ///
+    /// A zero auth mark (local-pod mode) must NOT make an unmarked packet look
+    /// authorized, which is why condition 1 is guarded on a non-zero mark.
+    pub const fn ingress_redirect_bypass(&self, mark: u32, dst_port: u16) -> bool {
+        if self.node_waypoint_inbound_auth_mark != 0
+            && mark == self.node_waypoint_inbound_auth_mark
+        {
+            return true;
+        }
+        if self.node_waypoint_ingress_redirect_mark != 0
+            && mark == self.node_waypoint_ingress_redirect_mark
+        {
+            return true;
+        }
+        self.hbone_redirect_port != 0 && dst_port as u32 == self.hbone_redirect_port
+    }
+
+
+    /// The loop / self-capture guards. `true` means "leave this packet alone":
+    /// it is the relay's own authorized dial down to the local backend pod, a
+    /// packet this program (or a peer hook) already redirected, or traffic
+    /// already aimed at the relay listener itself (peer HBONE included).
+    ///
+    /// Without all three a redirected packet would be re-dispatched to the
+    /// relay forever, and the relay's own backend dial would be fed back into
+    /// itself.
+    /// A **zero** configured mark never matches: local-pod mode publishes a
+    /// zero inbound auth mark, and treating that as "already relayed" would
+    /// bypass every unmarked packet — i.e. everything.
+    pub const fn ingress_redirect_bypass(&self, skb_mark: u32, dst_port: u16) -> bool {
+        if skb_mark != 0
+            && (skb_mark == self.node_waypoint_inbound_auth_mark
+                || skb_mark == self.node_waypoint_ingress_redirect_mark)
+        {
+            return true;
+        }
+        dst_port as u32 == self.hbone_redirect_port
     }
 
     pub const fn default_ports() -> Self {
@@ -584,6 +837,8 @@ mod userspace_pod {
         PodInfo,
         NodeProbePortKey4,
         NodeProbePortKey6,
+        InboundRedirectKey4,
+        InboundRedirectKey6,
         WorkloadIdentity,
         BpfCaptureConfig,
         IncludePortsPolicy,
@@ -636,7 +891,14 @@ mod tests {
         // 8-byte aligned for the BPF verifier.
         assert_eq!(mem::size_of::<WorkloadIdentity>(), 32);
         assert_eq!(mem::align_of::<WorkloadIdentity>(), 8);
-        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 16);
+        // BpfCaptureConfig: five u32 = 20 bytes, 4-byte aligned. The fifth word
+        // is the tc-ingress-redirect mark.
+        assert_eq!(mem::size_of::<BpfCaptureConfig>(), 20);
+        assert_eq!(mem::align_of::<BpfCaptureConfig>(), 4);
+        // InboundRedirectKey4: u32 + two u16 = 8 bytes; the v6 key is
+        // [u32;4] + two u16 = 20 bytes. Both are fully defined (explicit pad).
+        assert_eq!(mem::size_of::<InboundRedirectKey4>(), 8);
+        assert_eq!(mem::size_of::<InboundRedirectKey6>(), 20);
         assert_eq!(mem::size_of::<CidrKey4>(), 4);
         assert_eq!(mem::size_of::<CidrKey6>(), 16);
         // IncludePortsPolicy: two u32 (8) + [u16; INCLUDE_PORTS_MAX] (32) = 40 bytes, 4-byte aligned.
@@ -875,6 +1137,389 @@ mod tests {
                 .ipv6_outbound_deny,
             0
         );
+    }
+
+    #[test]
+    fn inbound_redirect_flag_is_opt_in_and_orthogonal_to_udp_flags() {
+        let plain = PodInfo {
+            proxy_port: 15001,
+            capture_flags: 0,
+        };
+        assert!(
+            !plain.inbound_redirect_enabled(),
+            "a pod with no flags must never be redirected"
+        );
+
+        // The UDP lifecycle flags must not imply inbound redirect, and the
+        // inbound-redirect flag must not disturb the UDP readiness gate.
+        let udp_guarded = PodInfo {
+            proxy_port: 15001,
+            capture_flags: POD_CAPTURE_FLAG_UDP_ENABLED,
+        };
+        assert!(!udp_guarded.inbound_redirect_enabled());
+        let redirect_only = PodInfo {
+            proxy_port: 15001,
+            capture_flags: POD_CAPTURE_FLAG_INBOUND_REDIRECT,
+        };
+        assert!(redirect_only.inbound_redirect_enabled());
+        assert!(!redirect_only.udp_capture_not_ready());
+
+        let both = PodInfo {
+            proxy_port: 15001,
+            capture_flags: POD_CAPTURE_FLAG_INBOUND_REDIRECT | POD_CAPTURE_FLAG_UDP_ENABLED,
+        };
+        assert!(both.inbound_redirect_enabled());
+        assert!(both.udp_capture_not_ready());
+    }
+
+    #[test]
+    fn inbound_redirect_keys_are_exact_addr_port_pairs() {
+        let v4 = InboundRedirectKey4::new(0x0a00_0005, 8080);
+        assert_eq!(v4.addr, 0x0a00_0005);
+        assert_eq!(v4.port, 8080);
+        assert_eq!(v4._pad, 0, "padding must be defined so map-key bytes match");
+        assert_ne!(
+            v4,
+            InboundRedirectKey4::new(0x0a00_0005, 8081),
+            "a different port must be a different key (per-port scoping)"
+        );
+
+        let v6 = InboundRedirectKey6::new([1, 2, 3, 4], 8080);
+        assert_eq!(v6.addr, [1, 2, 3, 4]);
+        assert_eq!(v6.port, 8080);
+        assert_eq!(v6._pad, 0);
+        assert_ne!(v6, InboundRedirectKey6::new([1, 2, 3, 5], 8080));
+    }
+
+    #[test]
+    fn ingress_redirect_mark_is_disabled_by_default_and_round_trips() {
+        let default = BpfCaptureConfig::new(15001, 15008);
+        assert_eq!(
+            default.node_waypoint_ingress_redirect_mark, 0,
+            "the inbound tc redirect must be opt-in, never on by default"
+        );
+        assert!(
+            !default.ingress_redirect_armed(),
+            "a zero mark must leave the redirect disarmed"
+        );
+
+        let armed = default
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert_eq!(
+            armed.node_waypoint_ingress_redirect_mark,
+            NODE_WAYPOINT_INGRESS_REDIRECT_MARK
+        );
+        assert!(armed.ingress_redirect_armed());
+
+        // A relay port of zero must disarm even with a mark set: there would be
+        // no listener to steer to and the program must not drop traffic.
+        let no_port = BpfCaptureConfig::new(15001, 0)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert!(!no_port.ingress_redirect_armed());
+    }
+
+    /// The armed configuration the redirect decision tests are written against.
+    fn armed_redirect_config() -> BpfCaptureConfig {
+        BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
+            .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+    }
+
+    #[test]
+    fn ingress_redirect_steers_only_a_fully_in_scope_packet() {
+        let config = armed_redirect_config();
+        let in_scope = IngressRedirectPacket::fully_in_scope(8080);
+        assert_eq!(
+            ingress_redirect_action(&config, &in_scope),
+            IngressRedirectAction::Steer,
+            "an enrolled, opted-in pod on a declared TCP port is the one case that redirects"
+        );
+
+        // Every gate, flipped one at a time off the in-scope baseline. Each of
+        // these MUST leave the packet on the pre-existing direct-pod guard.
+        let not_tcp = IngressRedirectPacket {
+            protocol_is_tcp: false,
+            ..in_scope
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &not_tcp),
+            IngressRedirectAction::Pass,
+            "bpf_sk_assign is TCP-only here; non-TCP must never be steered"
+        );
+
+        let unenrolled = IngressRedirectPacket {
+            destination_pod_opted_in: false,
+            ..in_scope
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &unenrolled),
+            IngressRedirectAction::Pass,
+            "traffic to a pod that did not opt in must never be captured"
+        );
+
+        let undeclared_port = IngressRedirectPacket {
+            destination_port_declared: false,
+            ..in_scope
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &undeclared_port),
+            IngressRedirectAction::Pass,
+            "an enrolled pod's undeclared port stays on the direct-pod guard"
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_is_inert_until_armed() {
+        let in_scope = IngressRedirectPacket::fully_in_scope(8080);
+
+        // Default (opt-out) posture: no redirect mark published.
+        let disarmed = BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT);
+        assert_eq!(
+            ingress_redirect_action(&disarmed, &in_scope),
+            IngressRedirectAction::Pass,
+            "a node that was never opted in must behave exactly as before"
+        );
+
+        // A relay port of zero means there is no listener to steer into, so the
+        // program must pass rather than drop in-scope traffic.
+        let no_relay = BpfCaptureConfig::new(15001, 0)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert_eq!(
+            ingress_redirect_action(&no_relay, &in_scope),
+            IngressRedirectAction::Pass
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_loop_guards_pass_relay_owned_traffic() {
+        let config = armed_redirect_config();
+
+        // (1) the relay's own authorized dial down to the local backend pod.
+        let relay_dial = IngressRedirectPacket {
+            skb_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
+            ..IngressRedirectPacket::fully_in_scope(8080)
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &relay_dial),
+            IngressRedirectAction::Pass,
+            "redirecting the relay's own backend dial would feed it its own traffic forever"
+        );
+
+        // (2) a packet this program (or a peer hook) already redirected.
+        let already_redirected = IngressRedirectPacket {
+            skb_mark: NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+            ..IngressRedirectPacket::fully_in_scope(8080)
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &already_redirected),
+            IngressRedirectAction::Pass,
+            "a packet must never be redirected twice"
+        );
+
+        // (3) traffic already aimed at the relay listener, including peer HBONE.
+        let to_the_relay = IngressRedirectPacket::fully_in_scope(INBOUND_HBONE_PORT);
+        assert_eq!(
+            ingress_redirect_action(&config, &to_the_relay),
+            IngressRedirectAction::Pass,
+            "HBONE traffic addressed to the relay listener must reach it directly"
+        );
+
+        // An unrelated CNI mark is NOT a bypass — otherwise a co-resident CNI
+        // could switch the redirect off per packet.
+        let foreign_mark = IngressRedirectPacket {
+            skb_mark: 0x0F00,
+            ..IngressRedirectPacket::fully_in_scope(8080)
+        };
+        assert_eq!(
+            ingress_redirect_action(&config, &foreign_mark),
+            IngressRedirectAction::Steer
+        );
+    }
+
+    #[test]
+    fn a_zero_auth_mark_never_bypasses_every_unmarked_packet() {
+        // Local-pod mode publishes a zero inbound auth mark. If a zero
+        // configured mark matched, `skb_mark == 0` (the overwhelming majority of
+        // packets) would read as "already relayed" and disable the redirect.
+        let config = BpfCaptureConfig::new(15001, INBOUND_HBONE_PORT)
+            .with_node_waypoint_inbound_auth_mark(0)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert!(!config.ingress_redirect_bypass(0, 8080));
+        assert_eq!(
+            ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(8080)),
+            IngressRedirectAction::Steer
+        );
+    }
+
+    /// A capture config with the inbound redirect fully armed, as the
+    /// node-agent publishes it in NodeWaypoint mode.
+    fn armed_redirect_config() -> BpfCaptureConfig {
+        BpfCaptureConfig::new(15001, 15008)
+            .with_node_waypoint_inbound_auth_mark(NODE_WAYPOINT_INBOUND_AUTH_MARK)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK)
+    }
+
+    #[test]
+    fn ingress_redirect_bypasses_the_relays_own_authorized_dial() {
+        let config = armed_redirect_config();
+        // The relay dials the backend pod with the auth mark. Redirecting that
+        // packet would feed the relay its own traffic in a loop.
+        assert!(config.ingress_redirect_bypass(NODE_WAYPOINT_INBOUND_AUTH_MARK, 8080));
+        // A packet this program already redirected must never be redirected
+        // again.
+        assert!(config.ingress_redirect_bypass(NODE_WAYPOINT_INGRESS_REDIRECT_MARK, 8080));
+        // Traffic already aimed at the relay listener reaches it directly.
+        assert!(config.ingress_redirect_bypass(0, 15008));
+        // Ordinary inbound app traffic is NOT bypassed.
+        assert!(!config.ingress_redirect_bypass(0, 8080));
+        // An unrelated CNI mark is not mistaken for either Ferrum mark.
+        assert!(!config.ingress_redirect_bypass(0xF00, 8080));
+    }
+
+    #[test]
+    fn ingress_redirect_zero_auth_mark_does_not_authorize_unmarked_packets() {
+        // Local-pod mode carries a zero auth mark. An unmarked packet must not
+        // compare equal to it and be treated as an authorized relay dial.
+        let config = BpfCaptureConfig::new(15001, 15008)
+            .with_node_waypoint_inbound_auth_mark(0)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert!(
+            !config.ingress_redirect_bypass(0, 8080),
+            "a zero auth mark must not make every unmarked packet look relayed"
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_action_requires_enrollment_and_a_declared_port() {
+        let config = armed_redirect_config();
+        let baseline = IngressRedirectPacket::fully_in_scope(8080);
+
+        // Fully in scope.
+        assert_eq!(
+            ingress_redirect_action(&config, &baseline),
+            IngressRedirectAction::Steer
+        );
+
+        // Flip ONE axis at a time off the in-scope baseline, so a gate cannot
+        // be removed without a test noticing.
+
+        // Enrolled pod, undeclared port: left to the direct-pod guard, never
+        // steered — this is what keeps the redirect scoped to declared ports.
+        assert_eq!(
+            ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket {
+                    destination_port_declared: false,
+                    ..baseline
+                }
+            ),
+            IngressRedirectAction::Pass
+        );
+        // Declared port but the destination pod is not enrolled / not opted in:
+        // never capture unenrolled traffic.
+        assert_eq!(
+            ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket {
+                    destination_pod_opted_in: false,
+                    ..baseline
+                }
+            ),
+            IngressRedirectAction::Pass
+        );
+        // Non-TCP is out of scope: `bpf_sk_assign` here is TCP-only.
+        assert_eq!(
+            ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket {
+                    protocol_is_tcp: false,
+                    ..baseline
+                }
+            ),
+            IngressRedirectAction::Pass
+        );
+        // Loop prevention wins over scope: an in-scope packet already carrying
+        // the relay's auth mark (its own dial down to the backend pod) is
+        // passed through, or the relay would be fed its own traffic forever.
+        assert_eq!(
+            ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket {
+                    skb_mark: NODE_WAYPOINT_INBOUND_AUTH_MARK,
+                    ..baseline
+                }
+            ),
+            IngressRedirectAction::Pass
+        );
+        // Likewise for a packet this program already redirected.
+        assert_eq!(
+            ingress_redirect_action(
+                &config,
+                &IngressRedirectPacket {
+                    skb_mark: NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+                    ..baseline
+                }
+            ),
+            IngressRedirectAction::Pass
+        );
+        // And for traffic already addressed to the relay listener itself.
+        assert_eq!(
+            ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(15008)),
+            IngressRedirectAction::Pass
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_action_is_inert_when_disarmed() {
+        let in_scope = IngressRedirectPacket::fully_in_scope(8080);
+
+        // Not opted in: every packet passes through untouched regardless of
+        // enrollment, so an un-opted-in node behaves exactly as before.
+        let disarmed = BpfCaptureConfig::new(15001, 15008);
+        assert!(!disarmed.ingress_redirect_armed());
+        assert_eq!(
+            ingress_redirect_action(&disarmed, &in_scope),
+            IngressRedirectAction::Pass
+        );
+
+        // A mark with no relay port is equally inert: there is no listener to
+        // steer at, so the program must not start dropping in-scope traffic.
+        let no_relay_port = BpfCaptureConfig::new(15001, 0)
+            .with_node_waypoint_ingress_redirect_mark(NODE_WAYPOINT_INGRESS_REDIRECT_MARK);
+        assert!(!no_relay_port.ingress_redirect_armed());
+        assert_eq!(
+            ingress_redirect_action(&no_relay_port, &in_scope),
+            IngressRedirectAction::Pass
+        );
+    }
+
+    #[test]
+    fn ingress_redirect_steer_predicate_matches_the_action() {
+        let config = armed_redirect_config();
+        assert!(
+            ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(8080))
+                .is_steer()
+        );
+        assert!(
+            !ingress_redirect_action(&config, &IngressRedirectPacket::fully_in_scope(15008))
+                .is_steer()
+        );
+    }
+
+    #[test]
+    fn node_waypoint_marks_are_mutually_distinct() {
+        // Loop prevention keys off the auth mark; local delivery keys off the
+        // redirect mark. Collapsing them would make a redirected packet
+        // indistinguishable from an authorized relay dial.
+        assert_ne!(
+            NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
+            NODE_WAYPOINT_INBOUND_AUTH_MARK
+        );
+        // Must not alias the common masked CNI mark classes (Cilium: 0xF00).
+        assert_ne!(NODE_WAYPOINT_INGRESS_REDIRECT_MARK & 0xF00, 0xF00);
+        // The local-delivery rule must sort below the kernel `main` rule.
+        assert!(NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY < 32766);
+        assert_eq!(NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, 33134);
     }
 
     #[test]
