@@ -458,15 +458,14 @@ async fn write_h3_finalized_reject_body<S>(
     // sanitize so the gateway-derived body length is the only one that can
     // reach the failed Extended CONNECT response.
     finalize_h3_websocket_reject_headers(&mut headers);
-    let framing = if body.is_empty() {
-        crate::proxy::headers::ClientResponseFraming::Streaming {
-            status: status.as_u16(),
-        }
-    } else {
-        crate::proxy::headers::ClientResponseFraming::ExactBody {
-            status: status.as_u16(),
-            len: body.len() as u64,
-        }
+    // A failed handshake is an ordinary HTTP error, so the body length is
+    // authoritative — including an authoritative zero, which must replace any
+    // plugin-authored `Content-Length`. Extended CONNECT is never `HEAD`, so
+    // there is no representation length to preserve here; a no-body status is
+    // handled inside the sanitizer.
+    let framing = crate::proxy::headers::ClientResponseFraming::ExactBody {
+        status: status.as_u16(),
+        len: body.len() as u64,
     };
     crate::proxy::headers::sanitize_client_response_headers_for_wire(&mut headers, framing);
     let builder =

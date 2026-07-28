@@ -3186,6 +3186,200 @@ fn test_normalized_reject_builder_keeps_authoritative_length_and_drops_negotiati
     );
 }
 
+/// The typed body-omission signal is derived from the request method + status
+/// only, and the framing selector never lets a claimed omission override real
+/// body bytes.
+#[test]
+fn test_reject_body_disposition_is_method_and_status_derived() {
+    use ferrum_edge::proxy::headers::{ClientResponseFraming, RejectBodyDisposition};
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        assert_eq!(
+            RejectBodyDisposition::for_request(method, 403),
+            RejectBodyDisposition::WireBody,
+            "{method} 403 carries a wire body"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert_eq!(
+            RejectBodyDisposition::for_request(method, 200),
+            RejectBodyDisposition::OmittedByProtocol,
+            "{method} omits body bytes"
+        );
+    }
+    for status in [100u16, 199, 204, 205, 304] {
+        assert_eq!(
+            RejectBodyDisposition::for_request("GET", status),
+            RejectBodyDisposition::OmittedByProtocol,
+            "status {status} forbids a body"
+        );
+    }
+
+    // Empty ordinary reject -> authoritative zero.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(403, 0, RejectBodyDisposition::WireBody),
+        ClientResponseFraming::ExactBody { len: 0, .. }
+    ));
+    // Empty omitted-by-protocol reject -> preserve the representation length.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(200, 0, RejectBodyDisposition::OmittedByProtocol),
+        ClientResponseFraming::Streaming { .. }
+    ));
+    // Bytes about to be written always win over a claimed omission.
+    assert!(matches!(
+        ClientResponseFraming::for_final_reject(200, 21, RejectBodyDisposition::OmittedByProtocol),
+        ClientResponseFraming::ExactBody { len: 21, .. }
+    ));
+}
+
+/// An *empty* ordinary reject is the residual the emptiness heuristic missed:
+/// zero is an authoritative length, so a plugin-authored `Content-Length: 999`
+/// must be replaced by canonical `0` rather than preserved as a streaming
+/// representation length. Covers the plain HTTP reject and the failed WebSocket
+/// handshake, which is also an ordinary HTTP error.
+#[test]
+fn test_normalized_reject_builder_replaces_hostile_length_on_empty_body() {
+    use ferrum_edge::_test_support::build_normalized_reject_wire_parts_with_method_for_test;
+
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "999".to_string()),
+    ]);
+
+    for failed_websocket_handshake in [false, true] {
+        for method in ["GET", "POST", "DELETE"] {
+            let wire = build_normalized_reject_wire_parts_with_method_for_test(
+                method,
+                StatusCode::FORBIDDEN,
+                b"",
+                headers.clone(),
+                failed_websocket_handshake,
+            )
+            .headers;
+            assert_eq!(
+                wire.get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()),
+                Some("0"),
+                "empty {method} reject must publish canonical 0 \
+                 (failed_websocket_handshake={failed_websocket_handshake})"
+            );
+            assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+        }
+    }
+}
+
+/// `HEAD` is the case the empty-body heuristic was protecting: the trusted
+/// synthetic-response preparation contract empties the body but keeps the
+/// representation length a `GET` would have returned. That length — and only
+/// that length — must survive; a plugin-authored value is overwritten by the
+/// contract's own representation size beforehand.
+#[test]
+fn test_head_reject_preserves_representation_length_from_preparation_contract() {
+    use ferrum_edge::_test_support::prepare_and_build_normalized_reject_wire_parts_for_test;
+
+    let body = br#"{"error":"forbidden"}"#;
+    let representation_len = body.len().to_string();
+
+    let wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+        "HEAD",
+        StatusCode::FORBIDDEN,
+        body,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .headers;
+    assert_eq!(
+        wire.get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(representation_len.as_str()),
+        "HEAD must keep the representation length a GET would have returned"
+    );
+
+    // The same trusted request, but a GET, publishes the real wire length.
+    let get_wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+        "GET",
+        StatusCode::FORBIDDEN,
+        body,
+        HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+    )
+    .headers;
+    assert_eq!(
+        get_wire
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(representation_len.as_str())
+    );
+}
+
+/// Statuses that forbid a message body strip `Content-Length` outright, on both
+/// the preparation contract and the final builder, no matter what a response
+/// hook wrote.
+#[test]
+fn test_no_body_status_rejects_strip_plugin_authored_length() {
+    use ferrum_edge::_test_support::prepare_and_build_normalized_reject_wire_parts_for_test;
+
+    for status in [
+        StatusCode::CONTINUE,
+        StatusCode::NO_CONTENT,
+        StatusCode::RESET_CONTENT,
+        StatusCode::NOT_MODIFIED,
+    ] {
+        for method in ["GET", "HEAD"] {
+            let wire = prepare_and_build_normalized_reject_wire_parts_for_test(
+                method,
+                status,
+                b"",
+                HashMap::from([("content-length".to_string(), "999".to_string())]),
+            )
+            .headers;
+            assert!(
+                wire.get(http::header::CONTENT_LENGTH).is_none(),
+                "{method} {status} must not advertise a body length"
+            );
+        }
+    }
+}
+
+/// A native gRPC reject normalizes to a trailers-only response: HTTP 200 with
+/// terminal metadata in the header block and no body. It must keep streaming /
+/// trailer semantics — inventing `Content-Length: 0` there would break clients
+/// that expect a trailers-only frame sequence.
+#[test]
+fn test_native_grpc_trailers_only_reject_does_not_invent_zero_length() {
+    use ferrum_edge::_test_support::build_grpc_trailers_only_reject_wire_parts_for_test;
+
+    let headers = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("x-ratelimit-limit".to_string(), "5".to_string()),
+    ]);
+    let parts = build_grpc_trailers_only_reject_wire_parts_for_test(
+        StatusCode::FORBIDDEN,
+        br#"{"error":"forbidden"}"#,
+        &headers,
+    );
+
+    assert_eq!(parts.status, StatusCode::OK);
+    let wire = parts.headers;
+    assert!(
+        wire.get(http::header::CONTENT_LENGTH).is_none(),
+        "trailers-only gRPC must neither keep the hostile length nor invent 0"
+    );
+    assert!(wire.get(http::header::TRANSFER_ENCODING).is_none());
+    assert_eq!(
+        wire.get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/grpc")
+    );
+    assert_eq!(
+        wire.get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("7")
+    );
+    assert_eq!(
+        wire.get("x-ratelimit-limit").and_then(|v| v.to_str().ok()),
+        Some("5"),
+        "plugin metadata unrelated to framing must survive"
+    );
+}
+
 #[test]
 fn test_insert_grpc_error_metadata_sanitizes_message() {
     let mut metadata = HashMap::new();

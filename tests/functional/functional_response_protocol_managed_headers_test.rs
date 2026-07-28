@@ -72,6 +72,14 @@ plugin_configs:
             content-type: text/plain
             x-mock: "yes"
           body: "mock-body"
+        - path: /empty
+          status_code: 403
+          headers:
+            content-type: application/json
+        - path: /nocontent
+          status_code: 204
+          headers:
+            content-type: application/json
 "#
     )
 }
@@ -317,5 +325,128 @@ async fn functional_protocol_managed_response_headers_h1_h2_h3() {
     assert!(
         hits.load(Ordering::SeqCst) >= 2,
         "ordinary paths should have reached the scripted backend"
+    );
+}
+
+/// An *empty* synthetic reject is still an ordinary HTTP response: its
+/// authoritative length is exactly zero, so the final boundary must publish
+/// `Content-Length: 0` on H1/H2/H3 rather than fall back to streaming framing
+/// (where a stale or hostile length could survive). `HEAD` keeps the
+/// representation length a `GET` would have returned but emits no body bytes,
+/// and no-body statuses advertise no length at all.
+#[tokio::test]
+#[ignore]
+async fn functional_empty_and_head_reject_framing_h1_h2_h3() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let backend_port = start_scripted_backend(Arc::clone(&hits)).await;
+    let (gateway, https_port) = spawn_gateway(backend_port).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+
+    let empty_url = gateway.proxy_url("/api/empty");
+    let mocked_url = gateway.proxy_url("/api/mocked");
+    let nocontent_url = gateway.proxy_url("/api/nocontent");
+
+    let h1 = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("h1 client");
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .no_proxy()
+        .build()
+        .expect("h2 client");
+
+    for (label, client) in [("H1", &h1), ("H2", &h2)] {
+        // Empty reject: canonical zero, never a preserved streaming length.
+        let empty = client.get(&empty_url).send().await.expect("empty reject");
+        assert_eq!(empty.status(), StatusCode::FORBIDDEN, "{label} empty status");
+        assert_no_protocol_managed(empty.headers(), &format!("{label} empty reject"));
+        assert_eq!(
+            empty
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "{label}: empty reject must publish canonical Content-Length: 0"
+        );
+        assert!(empty.bytes().await.expect("empty body").is_empty());
+
+        // HEAD keeps the representation length and omits body bytes.
+        let head = client.head(&mocked_url).send().await.expect("HEAD mock");
+        assert_eq!(head.status(), StatusCode::OK, "{label} HEAD status");
+        assert_eq!(
+            head.headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("9"),
+            "{label}: HEAD must keep the representation length"
+        );
+        assert!(head.bytes().await.expect("HEAD body").is_empty());
+
+        // 204 forbids a body: no length at all.
+        let no_content = client
+            .get(&nocontent_url)
+            .send()
+            .await
+            .expect("204 reject");
+        assert_eq!(no_content.status(), StatusCode::NO_CONTENT);
+        assert!(
+            no_content.headers().get(header::CONTENT_LENGTH).is_none(),
+            "{label}: 204 must not advertise a body length"
+        );
+    }
+
+    let h3 = Http3Client::insecure().expect("h3 client");
+    let h3_empty = h3_request_until_ready(
+        &h3,
+        &format!("https://localhost:{https_port}/api/empty"),
+        Method::GET,
+    )
+    .await;
+    assert_eq!(h3_empty.status, StatusCode::FORBIDDEN);
+    assert_no_protocol_managed(&h3_empty.headers, "H3 empty reject");
+    assert_eq!(
+        h3_empty
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("0"),
+        "H3: empty reject must publish canonical Content-Length: 0"
+    );
+    assert!(h3_empty.body_bytes.is_empty());
+
+    let h3_head = h3_request_until_ready(
+        &h3,
+        &format!("https://localhost:{https_port}/api/mocked"),
+        Method::HEAD,
+    )
+    .await;
+    assert_eq!(h3_head.status, StatusCode::OK);
+    assert_eq!(
+        h3_head
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some("9"),
+        "H3: HEAD must keep the representation length"
+    );
+    assert!(h3_head.body_bytes.is_empty());
+
+    let h3_no_content = h3_request_until_ready(
+        &h3,
+        &format!("https://localhost:{https_port}/api/nocontent"),
+        Method::GET,
+    )
+    .await;
+    assert_eq!(h3_no_content.status, StatusCode::NO_CONTENT);
+    assert!(
+        h3_no_content
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .is_none(),
+        "H3: 204 must not advertise a body length"
     );
 }

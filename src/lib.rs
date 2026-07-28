@@ -3854,6 +3854,26 @@ pub mod _test_support {
         headers: HashMap<String, String>,
         failed_websocket_handshake: bool,
     ) -> http::response::Parts {
+        build_normalized_reject_wire_parts_with_method_for_test(
+            "GET",
+            status,
+            body,
+            headers,
+            failed_websocket_handshake,
+        )
+    }
+
+    /// Same builder, with the trusted request method that drives the
+    /// [`crate::proxy::headers::RejectBodyDisposition`] signal. `HEAD` keeps the
+    /// representation length established by the synthetic-response preparation
+    /// contract; every other method makes the final body slice authoritative.
+    pub fn build_normalized_reject_wire_parts_with_method_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        headers: HashMap<String, String>,
+        failed_websocket_handshake: bool,
+    ) -> http::response::Parts {
         let reject = crate::proxy::NormalizedRejectResponse {
             http_status: status,
             headers,
@@ -3861,10 +3881,52 @@ pub mod _test_support {
             grpc_status: None,
             grpc_message: None,
             failed_websocket_handshake,
+            body_disposition: crate::proxy::headers::RejectBodyDisposition::for_request(
+                method,
+                status.as_u16(),
+            ),
         };
         crate::proxy::build_response_from_normalized_reject(reject)
             .into_parts()
             .0
+    }
+
+    /// Normalize a reject for a native gRPC request and build the wire parts
+    /// through the production H1/H2 builder, so the trailers-only branch is the
+    /// one under test (not the plain-HTTP branch).
+    pub fn build_grpc_trailers_only_reject_wire_parts_for_test(
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> http::response::Parts {
+        let reject = crate::proxy::normalize_reject_response(status, body, headers, true);
+        crate::proxy::build_response_from_normalized_reject(reject)
+            .into_parts()
+            .0
+    }
+
+    /// Run the shared synthetic-response wire preparation contract exactly as
+    /// the reject finalizer does, then build the wire parts. Proves the two
+    /// halves agree: preparation establishes the `HEAD` representation length
+    /// and empties the body; the builder preserves only that length.
+    pub fn prepare_and_build_normalized_reject_wire_parts_for_test(
+        method: &str,
+        status: StatusCode,
+        body: &[u8],
+        mut headers: HashMap<String, String>,
+    ) -> http::response::Parts {
+        let mut body = body.to_vec();
+        if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
+            method,
+            status.as_u16(),
+            &mut headers,
+            body.len(),
+        ) {
+            body = Vec::new();
+        }
+        build_normalized_reject_wire_parts_with_method_for_test(
+            method, status, &body, headers, false,
+        )
     }
 
     pub fn set_websocket_response_boundary_for_test(

@@ -697,6 +697,87 @@ pub enum ClientResponseFraming {
     /// strips invalid values and strips entirely when the status forbids a
     /// body.
     Streaming { status: u16 },
+    /// Native gRPC trailers-only error: HTTP 200 with terminal metadata in the
+    /// header block and no DATA frames. gRPC never frames with
+    /// `Content-Length`, and the body is empty by construction, so the field is
+    /// removed outright — neither invented as `0` (which would break the
+    /// trailers-only frame sequence clients expect) nor preserved from a
+    /// plugin-authored value (which would be a framing lie on an empty body).
+    TrailersOnly,
+}
+
+/// Trusted body-omission signal for a final reject / synthetic response writer.
+///
+/// Derived only from the request method and the gateway-selected status through
+/// the shared synthetic-response wire contract
+/// ([`crate::plugins::utils::synthetic_response::synthetic_response_omits_body`]).
+/// It must never be inferred from response header names or values: plugins and
+/// backends control those, and that is exactly the input the protocol-framing
+/// advisory covers.
+///
+/// The default is deliberately [`Self::WireBody`] — the fail-closed choice. A
+/// caller that forgets to derive the signal publishes an authoritative exact
+/// length instead of preserving an attacker-authored one; the worst outcome is
+/// a `HEAD` reject losing its representation length, never a smuggling primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RejectBodyDisposition {
+    /// Ordinary HTTP reject (including failed WebSocket handshakes): the final
+    /// body slice *is* the wire representation, so its length is authoritative —
+    /// including zero. Any plugin-authored `Content-Length` is replaced.
+    #[default]
+    WireBody,
+    /// `HEAD`, or a status that forbids a message body. The shared contract
+    /// ([`crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire`])
+    /// already emptied the body and established (or stripped) the representation
+    /// `Content-Length`; only that length may survive. An empty wire body here
+    /// must not be turned into `Content-Length: 0`.
+    OmittedByProtocol,
+}
+
+impl RejectBodyDisposition {
+    /// Derive the disposition from the trusted request method and the final
+    /// gateway-selected status.
+    #[inline]
+    pub fn for_request(method: &str, status: u16) -> Self {
+        use crate::plugins::utils::synthetic_response::synthetic_response_omits_body;
+        if synthetic_response_omits_body(method, status) {
+            Self::OmittedByProtocol
+        } else {
+            Self::WireBody
+        }
+    }
+}
+
+impl ClientResponseFraming {
+    /// Framing for a final reject/synthetic writer whose body bytes are already
+    /// final.
+    ///
+    /// An ordinary empty reject resolves to `ExactBody { len: 0 }` so the
+    /// canonical `Content-Length: 0` replaces anything a mutable response hook
+    /// left behind. Only a trusted [`RejectBodyDisposition::OmittedByProtocol`]
+    /// selects `Streaming`, where a `HEAD` representation length (or a
+    /// trailers-only gRPC response) must survive untouched.
+    ///
+    /// A non-empty `body_len` always wins: the caller is about to write those
+    /// bytes, so claiming the protocol omitted the body would publish a length
+    /// that does not match the wire. That keeps a caller which derived the
+    /// disposition without running
+    /// [`crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire`]
+    /// framed correctly instead of length-less.
+    #[inline]
+    pub fn for_final_reject(
+        status: u16,
+        body_len: usize,
+        disposition: RejectBodyDisposition,
+    ) -> Self {
+        match disposition {
+            RejectBodyDisposition::OmittedByProtocol if body_len == 0 => Self::Streaming { status },
+            _ => Self::ExactBody {
+                status,
+                len: body_len as u64,
+            },
+        }
+    }
 }
 
 /// Whether a plugin-produced map needs the full wire sanitizer for `framing`.
@@ -734,6 +815,9 @@ pub fn needs_client_response_wire_sanitization(
                 streaming_content_length_needs_repair(headers)
             }
         }
+        ClientResponseFraming::TrailersOnly => headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
     }
 }
 
@@ -864,6 +948,7 @@ pub fn sanitize_client_response_headers_for_wire(
                 canonicalize_streaming_content_length(headers);
             }
         }
+        ClientResponseFraming::TrailersOnly => remove_content_length_header(headers),
     }
 }
 
@@ -1845,6 +1930,36 @@ mod tests {
                 .keys()
                 .any(|name| name.eq_ignore_ascii_case("content-length"))
         );
+    }
+
+    #[test]
+    fn sanitize_trailers_only_removes_every_content_length_variant() {
+        let mut headers = std::collections::HashMap::from([
+            ("Content-Length".to_string(), "999".to_string()),
+            ("content-length".to_string(), "0".to_string()),
+            ("grpc-status".to_string(), "7".to_string()),
+        ]);
+        assert!(needs_client_response_wire_sanitization(
+            &headers,
+            ClientResponseFraming::TrailersOnly
+        ));
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::TrailersOnly,
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length"))
+        );
+        assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+
+        let mut clean = std::collections::HashMap::new();
+        clean.insert("grpc-status".to_string(), "7".to_string());
+        assert!(!needs_client_response_wire_sanitization(
+            &clean,
+            ClientResponseFraming::TrailersOnly
+        ));
     }
 
     #[test]

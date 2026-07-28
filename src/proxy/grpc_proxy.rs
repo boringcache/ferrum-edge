@@ -2373,11 +2373,12 @@ pub fn build_grpc_error_response_with_policy(
         message,
         initial_response_header_policy_plugins,
     );
+    // Trailers-only gRPC error: no DATA frames, and gRPC never frames with
+    // Content-Length. Remove the field outright so a policy-authored value can
+    // neither survive nor be replaced by a misleading `0`.
     crate::proxy::headers::sanitize_client_response_headers_for_wire(
         &mut response_headers,
-        crate::proxy::headers::ClientResponseFraming::Streaming {
-            status: StatusCode::OK.as_u16(),
-        },
+        crate::proxy::headers::ClientResponseFraming::TrailersOnly,
     );
     crate::proxy::headers::apply_response_headers(
         hyper::Response::builder().status(StatusCode::OK),

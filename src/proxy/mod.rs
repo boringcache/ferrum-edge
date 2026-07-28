@@ -16495,6 +16495,12 @@ pub(crate) struct NormalizedRejectResponse {
     /// gateway-derived body length reaches the wire. The response stays a valid
     /// HTTP/1.1-or-newer non-upgrade response.
     pub(crate) failed_websocket_handshake: bool,
+    /// Trusted body-omission signal, derived from the request method and the
+    /// final status via the shared synthetic-response wire contract — never from
+    /// response headers. `WireBody` (the default) makes the final body slice
+    /// authoritative, so an ordinary empty reject publishes `Content-Length: 0`
+    /// instead of preserving a plugin-authored length.
+    pub(crate) body_disposition: headers_mod::RejectBodyDisposition,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16641,6 +16647,7 @@ pub(crate) fn normalize_reject_response(
             grpc_status: None,
             grpc_message: None,
             failed_websocket_handshake: false,
+            body_disposition: headers_mod::RejectBodyDisposition::default(),
         };
     }
 
@@ -16678,6 +16685,9 @@ pub(crate) fn normalize_reject_response(
         grpc_status: Some(grpc_status),
         grpc_message: Some(grpc_message),
         failed_websocket_handshake: false,
+        // Trailers-only gRPC keeps streaming/trailer semantics through
+        // `grpc_status`; the disposition is unused on that branch.
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
     }
 }
 
@@ -16763,16 +16773,21 @@ pub(crate) fn build_response_from_normalized_reject(
     }
     // Final protocol-aware boundary after reject after_proxy hooks: strip
     // hop-by-hop / Connection-listed fields and derive Content-Length from the
-    // synthetic body. Empty bodies (HEAD representation CL from
-    // prepare_synthetic, trailers-only gRPC, 204/205/304) must not gain an
-    // invented Content-Length: 0.
-    let framing = if is_grpc_error || reject.body.is_empty() {
-        headers_mod::ClientResponseFraming::Streaming { status }
+    // synthetic body. Emptiness alone is NOT the discriminator — an ordinary
+    // empty HTTP reject has an authoritative length of exactly zero and must
+    // replace any plugin-authored value. Only the trusted `body_disposition`
+    // signal (HEAD representation length from `prepare_synthetic_response_wire`,
+    // or a no-body status) selects streaming framing. A native gRPC error is
+    // trailers-only: gRPC never frames with Content-Length, so the field is
+    // removed rather than invented as `0` or preserved from a plugin.
+    let framing = if is_grpc_error {
+        headers_mod::ClientResponseFraming::TrailersOnly
     } else {
-        headers_mod::ClientResponseFraming::ExactBody {
+        headers_mod::ClientResponseFraming::for_final_reject(
             status,
-            len: reject.body.len() as u64,
-        }
+            reject.body.len(),
+            reject.body_disposition,
+        )
     };
     headers_mod::sanitize_client_response_headers_for_wire(&mut headers, framing);
     let reject_builder = Response::builder().status(reject.http_status);
@@ -17909,6 +17924,13 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     // so the response builder can strip transport-managed fields after
     // ExactBody length repair. Do not infer this from response header names.
     normalized.failed_websocket_handshake = ctx.has_websocket_response_boundary();
+    // Carry the same body-omission decision the shared synthetic-response wire
+    // contract just applied inside `apply_reject_after_proxy_and_synthetic_body_hooks`
+    // (same trusted method + final status inputs), so the builder can tell a
+    // HEAD / no-body response apart from an ordinary empty reject without
+    // reading plugin-controlled headers.
+    normalized.body_disposition =
+        headers_mod::RejectBodyDisposition::for_request(&ctx.method, status.as_u16());
     normalized
 }
 
@@ -24460,13 +24482,22 @@ async fn handle_proxy_request_inner(
 
                 // Build gRPC response with headers and trailers (splitting any
                 // newline-joined Set-Cookie into separate header lines).
-                // Streaming framing: do not invent Content-Length on trailers-only
-                // RPCs; preserve a valid backend length when present.
-                headers_mod::sanitize_client_response_headers_for_wire(
-                    &mut response_headers,
+                // A plugin-replaced response is a trailers-only gRPC error whose
+                // header map came from the plugin, so remove Content-Length
+                // outright — never invent `0`, never keep a plugin-authored
+                // length on a response that carries no DATA frames. A genuine
+                // backend response keeps streaming framing so a valid backend
+                // representation length survives.
+                let grpc_framing = if after_proxy_rejected {
+                    headers_mod::ClientResponseFraming::TrailersOnly
+                } else {
                     headers_mod::ClientResponseFraming::Streaming {
                         status: response_status,
-                    },
+                    }
+                };
+                headers_mod::sanitize_client_response_headers_for_wire(
+                    &mut response_headers,
+                    grpc_framing,
                 );
                 let resp_builder = headers_mod::apply_response_headers(
                     Response::builder()
