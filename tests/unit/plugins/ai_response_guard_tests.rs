@@ -3611,12 +3611,8 @@ async fn grpc_enrolled_method_never_releases_on_sse_content_type() {
         !plugin.may_release_response_body_under_retries(&ctx),
         "native gRPC enrollment must remain buffered while retries are active"
     );
-    assert!(!plugin.should_release_response_body_under_retries(
-        &ctx, 200, &headers
-    ));
-    assert!(
-        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers)
-    );
+    assert!(!plugin.should_release_response_body_under_retries(&ctx, 200, &headers));
+    assert!(!plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers));
     assert!(plugin.should_buffer_response_body_for_content_type(
         &ctx,
         Some("text/event-stream"),
