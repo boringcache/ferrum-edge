@@ -944,13 +944,25 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
 #[test]
 fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
     let src = include_str!("../../../src/proxy/mod.rs");
+    // The gate is shared by the direct-H2 relay and the H1/H2 frontend ->
+    // native-H3 BACKEND relay, so its binding is `streaming_trailer_policy`
+    // rather than an H2-only name. Anchored on the `let` + its `if matches!(`
+    // head so this cannot latch onto some other mention of the binding.
     let gate = src
-        .split("let h2_streaming_trailer_policy = ")
+        .split("let streaming_trailer_policy = if matches!(")
         .nth(1)
         .expect("streaming H2 trailer policy gate")
         .split("Some((pre_policy, section, unbounded))")
         .next()
         .expect("bounded gate region");
+    // Both streaming bodies whose backend TRAILERS frame crosses this boundary
+    // enter the gate; neither may be filtered out of it.
+    for arm in ["ResponseBody::StreamingH2(_)", "ResponseBody::StreamingH3(_)"] {
+        assert!(
+            gate.contains(arm),
+            "{arm} must enter the streaming trailer-policy gate"
+        );
+    }
     // GHSA-r78v-rc86-6r86: native gRPC on this arm (the mesh-mTLS relay) is
     // GOVERNED — its application metadata crosses the same boundary — and is
     // selected as a gRPC terminal section so the reserved status fields survive.
@@ -973,9 +985,32 @@ fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
         !gate.contains("!grpc_request_is_web_translated"),
         "translated gRPC-Web must not be excluded from the trailer boundary"
     );
+    // The section selector is read as a bounded region rather than as one
+    // formatting-sensitive literal: rustfmt breaks a three-term `if` across
+    // lines, and a substring match would then silently stop proving anything.
+    let selector = gate
+        .split("let section = if ")
+        .nth(1)
+        .expect("structural trailer-section selector")
+        .split("};")
+        .next()
+        .expect("bounded trailer-section selector");
+    for term in [
+        "streaming_h2_native_grpc",
+        "streaming_h3_native_grpc",
+        "grpc_request_is_web_translated",
+    ] {
+        assert!(
+            selector.contains(term),
+            "the trailer section must be chosen structurally from `{term}`, so a \
+             translated gRPC-Web or native-gRPC trailer block is governed as a \
+             native gRPC terminal section"
+        );
+    }
     assert!(
-        gate.contains("streaming_h2_native_grpc || grpc_request_is_web_translated"),
-        "a translated gRPC-Web trailer block must be governed as a native gRPC terminal section"
+        selector.contains("TrailerSectionKind::NativeGrpcTerminal")
+            && selector.contains("TrailerSectionKind::PlainResponse"),
+        "the selector must resolve to exactly the two structural section kinds"
     );
     assert!(
         gate.contains("PrePolicyResponseHeaders::capture_for_streaming("),
@@ -1044,10 +1079,10 @@ fn streaming_h2_capture_precedes_the_first_response_header_phase() {
     // response BUILDER has taken its gateway-authored writes.
     let src = include_str!("../../../src/proxy/mod.rs");
     let capture_at = src
-        .find("let h2_streaming_trailer_policy = ")
+        .find("let streaming_trailer_policy = if matches!(")
         .expect("streaming H2 trailer policy capture");
     let seal_at = src
-        .find("let mut h2_streaming_trailer_governor = None;")
+        .find("let mut streaming_trailer_governor = None;")
         .expect("streaming H2 trailer governor seal");
     assert!(
         capture_at < seal_at,
@@ -1075,7 +1110,7 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     // new branch added without `.take()` would silently drop the boundary.
     let src = include_str!("../../../src/proxy/mod.rs");
     let after_seal = src
-        .split("let mut h2_streaming_trailer_governor = None;")
+        .split("let mut streaming_trailer_governor = None;")
         .nth(1)
         .expect("streaming H2 trailer governor seal");
     let region = after_seal
@@ -1085,9 +1120,7 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     let constructors = region
         .matches("_h2_body_strip_hop_by_hop_trailers(")
         .count();
-    let governed = region
-        .matches("h2_streaming_trailer_governor.take()")
-        .count();
+    let governed = region.matches("streaming_trailer_governor.take()").count();
     assert_eq!(
         constructors, 4,
         "the plain streaming H2 arm should build exactly four body variants"
@@ -1124,6 +1157,36 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     assert!(
         seal.contains("response_trailer_policy_prefixes_shared()"),
         "the seal must carry the precomputed policy-prefix Arc into the governor"
+    );
+}
+
+#[test]
+fn every_streaming_h3_backend_dispatch_site_installs_the_sealed_governor() {
+    // The SAME sealed governor serves the H1/H2 frontend -> native-H3 BACKEND
+    // relay, whose backend TRAILERS frame reaches the client through
+    // `body::H3FrameSource` after this boundary closed. Its three
+    // mutually-exclusive constructors need the identical proof the H2 arm gets:
+    // a fourth branch added without `.take()` would relay the backend trailer
+    // section ungoverned.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let region = src
+        .split("ResponseBody::StreamingH3(h3_resp) => {")
+        .nth(1)
+        .expect("native-H3 backend streaming arm")
+        .split("let mut body = if let Some(inspector) = response_inspector {")
+        .next()
+        .expect("bounded native-H3 body-construction region");
+    let constructors = region.matches("_h3_body(").count();
+    let governed = region.matches("streaming_trailer_governor.take()").count();
+    assert_eq!(
+        constructors, 3,
+        "the native-H3 backend streaming arm should build exactly three body \
+         variants: {constructors}"
+    );
+    assert_eq!(
+        governed, constructors,
+        "every native-H3 backend streaming body constructor must receive the \
+         sealed trailer governor"
     );
 }
 
@@ -1598,7 +1661,7 @@ fn the_grpc_web_adapter_wraps_the_governed_body_from_the_outside() {
         "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
         // Generic relay (mesh-mTLS `StreamingH2`): the adapter is applied after
         // the whole `match` that built the governed body.
-        "let h2_streaming_trailer_policy = if matches!(",
+        "let streaming_trailer_policy = if matches!(",
     ] {
         let region = src.split(arm).nth(1).expect("relay region not found");
         let governed = region

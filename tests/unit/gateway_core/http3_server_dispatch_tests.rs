@@ -1625,6 +1625,17 @@ fn buffered_h3_trailers_reconcile_with_response_policy_not_chain_emptiness() {
     );
 }
 
+/// The binding produced by the three PLAIN native/refined H3 streaming relays'
+/// pre-policy capture. The native gRPC relay's capture binds
+/// `grpc_pre_policy_response_headers` instead, so anchoring on this exact
+/// `let` keeps the two families countable apart while the bare
+/// `capture_for_streaming(` count still pins the file-wide total.
+const PLAIN_STREAMING_CAPTURE: &str = "let pre_policy_response_headers = \
+                                       PrePolicyResponseHeaders::capture_for_streaming(";
+
+/// The native gRPC H3 relay's counterpart binding.
+const GRPC_STREAMING_CAPTURE: &str = "let grpc_pre_policy_response_headers =";
+
 #[test]
 fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
     let src = include_str!("../../../src/http3/server.rs");
@@ -1653,20 +1664,34 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "streaming H3 must keep the hop-by-hop trailer strip"
     );
 
-    // All three plain native/refined streaming relays — the inline stream, the
-    // refined stream, and the buffered-request streaming helper — pass the
-    // policy through, and each captures its pre-policy evidence before the
-    // first response-header phase runs.
+    // This file holds FOUR streaming relays that cross the response-header
+    // policy boundary, and every one of them must capture pre-policy evidence:
+    // the three plain native/refined relays (the inline stream, the refined
+    // stream, and the buffered-request streaming helper) plus the native gRPC
+    // relay, which inlines its own trailer finish and is pinned separately
+    // below. Counting the total — not just the plain subset — is what makes a
+    // silently added fifth relay fail here instead of shipping ungoverned.
+    assert_eq!(
+        src.matches("PrePolicyResponseHeaders::capture_for_streaming(")
+            .count(),
+        4,
+        "every H3 streaming relay must capture its pre-policy response headers: \
+         three plain native/refined relays plus the native gRPC relay"
+    );
+    // The two families are told apart by the binding they produce, never by
+    // position, so adding a relay of either kind moves exactly one count.
+    assert_eq!(
+        src.matches(GRPC_STREAMING_CAPTURE).count(),
+        1,
+        "the native gRPC H3 relay must own exactly one pre-policy capture"
+    );
     assert_eq!(
         src.matches("H3StreamingTrailerPolicy {").count(),
         3,
         "every plain native/refined H3 streaming relay must bind the response \
          trailer policy at its trailer frame"
     );
-    let captures: Vec<&str> = src
-        .split("PrePolicyResponseHeaders::capture_for_streaming(")
-        .skip(1)
-        .collect();
+    let captures: Vec<&str> = src.split(PLAIN_STREAMING_CAPTURE).skip(1).collect();
     assert_eq!(
         captures.len(),
         3,
@@ -1817,8 +1842,15 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
     // the header map, then the response is built from that same map, and only
     // then does the trailer frame bind the policy. Bounded to each relay's own
     // region rather than counted across the file.
+    //
+    // Scoped to the PLAIN relays by their binding. The fourth streaming capture
+    // in this file belongs to the native gRPC relay
+    // (`grpc_pre_policy_response_headers`), which never synthesizes a default
+    // `content-type` — a gRPC response carries `application/grpc` from the
+    // backend — so it has no map write for this contract to order. That
+    // exclusion is checked below rather than assumed.
     let relays: Vec<&str> = src
-        .split("PrePolicyResponseHeaders::capture_for_streaming(")
+        .split(PLAIN_STREAMING_CAPTURE)
         .skip(1)
         .map(|tail| {
             tail.split("H3StreamingTrailerPolicy {")
@@ -1853,10 +1885,7 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
     // as a response-header phase for the pre-policy capture decision. Without
     // that, an auth/logging-only chain would take the no-clone #2941
     // pass-through and forward a conflicting backend `content-type` trailer.
-    for tail in src
-        .split("PrePolicyResponseHeaders::capture_for_streaming(")
-        .skip(1)
-    {
+    for tail in src.split(PLAIN_STREAMING_CAPTURE).skip(1) {
         let args = tail.split(");").next().expect("capture argument list");
         assert!(
             args.contains("gateway_synthesizes_content_type"),
@@ -1864,6 +1893,21 @@ fn streaming_h3_relays_put_the_default_content_type_on_the_final_header_map() {
              content-type: {args}"
         );
     }
+    // The native gRPC relay is exempt only because it authors no default
+    // media type. If one is ever added there, this fails and the predicate
+    // above has to grow a fourth site rather than silently under-capturing.
+    let grpc_relay = src
+        .split("async fn dispatch_grpc_native_h3(")
+        .nth(1)
+        .expect("native gRPC H3 dispatch")
+        .split("async fn log_h3_grpc_transaction(")
+        .next()
+        .expect("bounded native gRPC H3 dispatch");
+    assert!(
+        !grpc_relay.contains(r#".entry("content-type".to_string())"#),
+        "the native gRPC H3 relay must not synthesize a default content-type; \
+         if it does, its pre-policy capture predicate must fold that in"
+    );
     let flags: Vec<&str> = src
         .split("let gateway_synthesizes_content_type = ")
         .skip(1)
