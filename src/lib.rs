@@ -961,6 +961,7 @@ pub mod _test_support {
         }
     }
 
+    #[derive(Debug)]
     pub enum TestNamespaceConfigAdmissionCompletion<T> {
         Held(T),
         Lost(T),
