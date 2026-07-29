@@ -465,6 +465,13 @@ This means every WebSocket plugin works on H3 sessions unchanged:
   (`ws_rate_limiting`), plus delivery-accurate frame observation
   (`ws_frame_logging` via post-send `prepare_ws_frame_delivery` /
   `emit_ws_frame_delivery`, including peer Close)
+- physical-fragment metering (`on_ws_reassembly_frames`) and the parser's
+  incomplete-message frame/duration bounds
+  (`FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES` /
+  `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), installed on both framers
+  by the shared relay. H3 client frames are unmasked per RFC 9220 §5; the
+  bridge validates that rule before bytes reach the framer, so fragment
+  accounting sees exactly the same frame sequence on H1, H2, and H3
 - `on_ws_disconnect` (end-of-session bookkeeping with success-only frame/byte
   counts, direction, and `io_side` attribution)
 - `prometheus_metrics` WebSocket session count/duration and directional

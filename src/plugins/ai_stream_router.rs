@@ -48,10 +48,43 @@
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
 //!
-//! Fallback across providers after the first downstream byte is intentionally
-//! out of scope: once response headers/bytes have streamed to the client the
-//! provider cannot be switched. `ai_stream_router.fallback_attempts` is always
-//! `0` in this MVP.
+//! ## Provider fallback is rejected, not stored
+//!
+//! This plugin does **not** implement provider fallback, and a `fallback`
+//! config block is rejected at admission rather than parsed into an inert
+//! policy (issue #3328). Post-first-byte provider switching remains prohibited
+//! for the obvious reason — once response headers/bytes have streamed to the
+//! client the provider cannot be changed — but *pre*-first-byte fallback is
+//! also unimplementable at this layer, because the routing decision this plugin
+//! makes is committed exactly once and then consumed by the ordinary dispatch
+//! path:
+//!
+//! - `before_proxy` writes the provider's scheme/host/port/path/authority and
+//!   `route_override_resolved_tls` into [`RequestContext`]; the proxy bakes
+//!   those into a single effective `Arc<Proxy>` (`apply_route_overrides*`)
+//!   before any backend attempt.
+//! - The provider credential, `Host`, `anthropic-version`, and
+//!   `Accept-Encoding` policy are written into one request header map that the
+//!   dispatch loop borrows immutably for every attempt.
+//! - The provider-specific request body (Anthropic Messages translation vs.
+//!   OpenAI passthrough) is produced once by
+//!   `transform_request_body_with_context` and verified once by
+//!   `on_final_request_body_with_context`; the proxy guards that pipeline with
+//!   `request_body_prepared` so it cannot re-run.
+//! - The dispatch retry loop replays those exact prepared bytes and headers
+//!   against the same effective proxy, rotating only the load-balancer target
+//!   within one upstream. It has no per-attempt re-preparation boundary.
+//!
+//! A second provider needs a different endpoint/authority, different
+//! credentials, a different backend TLS resolution, a different translated
+//! body, and a different response-normalization decision — none of which are
+//! per-attempt today. Nor can the plugin retry internally: [`PluginResult`] can
+//! only short-circuit with a fully materialized body, so a plugin-owned
+//! fallback loop would have to buffer the entire SSE response and destroy the
+//! streaming contract this plugin exists to provide. Accepting a `fallback`
+//! block would therefore be worse than rejecting it: an operator could submit
+//! valid-looking failover policy and silently receive none. Admission fails
+//! closed instead.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -83,7 +116,6 @@ pub const AI_STREAM_ROUTER_CONFIG_KEYS: &[&str] = &[
     "inject_usage_options",
     "normalize_response_stream",
     "providers",
-    "fallback",
 ];
 
 /// Accepted keys for each `providers[]` entry.
@@ -99,13 +131,12 @@ pub const AI_STREAM_ROUTER_PROVIDER_KEYS: &[&str] = &[
     "inherit_backend_tls",
 ];
 
-/// Accepted keys for the optional `fallback` object.
-pub const AI_STREAM_ROUTER_FALLBACK_KEYS: &[&str] = &[
-    "enabled",
-    "on_connect_error",
-    "on_5xx_before_first_byte",
-    "max_attempts",
-];
+/// Admission diagnostic for the rejected `fallback` block (issue #3328).
+///
+/// The plugin never switches providers, so storing a fallback policy could only
+/// ever be runtime-inert. See the module docs for why pre-first-byte fallback
+/// cannot be expressed at this layer.
+pub const AI_STREAM_ROUTER_FALLBACK_REJECTION: &str = "ai_stream_router: unsupported field 'fallback'; provider fallback is not implemented — this plugin commits one provider route, credential set, backend TLS resolution, and translated body before dispatch and never switches providers, so a stored fallback policy would be silently inert. Remove the 'fallback' block.";
 
 // ---------------------------------------------------------------------------
 // Metadata keys
@@ -121,7 +152,6 @@ const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
-const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
 const META_REQUEST_TRANSLATED: &str = "ai_stream_router.request_translated";
 /// Set when the translated Anthropic request carries `tool_choice: {"type":"none"}`.
 /// Request-local only: the response normalizer fails closed if the provider
@@ -242,27 +272,6 @@ impl StreamProvider {
     }
 }
 
-/// Parsed `fallback` block. Stored for admin/observability parity; MVP does not
-/// switch providers after the first downstream byte.
-#[derive(Debug, Clone)]
-struct FallbackConfig {
-    enabled: bool,
-    on_connect_error: bool,
-    on_5xx_before_first_byte: bool,
-    max_attempts: u32,
-}
-
-impl Default for FallbackConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            on_connect_error: true,
-            on_5xx_before_first_byte: true,
-            max_attempts: 2,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Plugin struct
 // ---------------------------------------------------------------------------
@@ -274,8 +283,6 @@ pub struct AiStreamRouter {
     inject_usage_options: bool,
     normalize_response_stream: bool,
     providers: Vec<StreamProvider>,
-    #[allow(dead_code)]
-    fallback: FallbackConfig,
     /// Precomputed config-time flag: does any provider need response-stream
     /// normalization (and is normalization enabled)?
     response_stream_hooks: bool,
@@ -292,8 +299,8 @@ impl AiStreamRouter {
             .ok_or_else(|| "ai_stream_router: config must be an object".to_string())?;
 
         // Reject ambiguous fields that belong to `ai_federation`'s flat config
-        // shape, so an operator does not silently mix a non-streaming fallback
-        // config into this plugin (which uses a nested `fallback` block).
+        // shape, plus the `fallback` block this plugin cannot honor, BEFORE the
+        // generic unknown-key sweep so both get a specific diagnostic.
         reject_ambiguous_fields(config)?;
         reject_unknown_keys(
             config_object,
@@ -417,8 +424,6 @@ impl AiStreamRouter {
         // Ascending priority — lowest value is tried first.
         providers.sort_by_key(|p| p.priority);
 
-        let fallback = parse_fallback(config)?;
-
         let response_stream_hooks = enabled
             && normalize_response_stream
             && providers
@@ -432,7 +437,6 @@ impl AiStreamRouter {
             inject_usage_options,
             normalize_response_stream,
             providers,
-            fallback,
             response_stream_hooks,
         })
     }
@@ -448,7 +452,13 @@ impl AiStreamRouter {
 }
 
 /// Fields that belong to `ai_federation`'s flat config surface and would be
-/// silently ignored (or misinterpreted) here.
+/// silently ignored (or misinterpreted) here, plus the `fallback` block this
+/// plugin refuses to store (issue #3328).
+///
+/// The `fallback` rejection is deliberately a *separate*, more specific
+/// diagnostic than the generic unknown-key path: an operator submitting a
+/// well-formed failover policy needs to be told the capability does not exist,
+/// not that they made a typo.
 fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     const AMBIGUOUS: &[&str] = &[
         "stream",
@@ -462,37 +472,16 @@ fn reject_ambiguous_fields(config: &Value) -> Result<(), String> {
     for field in AMBIGUOUS {
         if config.get(*field).is_some() {
             return Err(format!(
-                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and configures fallback under the nested 'fallback' block"
+                "ai_stream_router: unsupported field '{field}'; ai_stream_router always claims \"stream\": true requests and does not implement provider fallback"
             ));
         }
     }
+    // Any presence at all — object, empty object, `null`, or scalar — is
+    // refused. A policy that cannot be honored must never be admitted.
+    if config.get("fallback").is_some() {
+        return Err(AI_STREAM_ROUTER_FALLBACK_REJECTION.to_string());
+    }
     Ok(())
-}
-
-fn parse_fallback(config: &Value) -> Result<FallbackConfig, String> {
-    let Some(fb) = config.get("fallback") else {
-        return Ok(FallbackConfig::default());
-    };
-    let fallback_object = fb
-        .as_object()
-        .ok_or_else(|| "ai_stream_router: 'fallback' must be an object".to_string())?;
-    reject_unknown_keys(
-        fallback_object,
-        "config.fallback",
-        AI_STREAM_ROUTER_FALLBACK_KEYS,
-        "ai_stream_router: ",
-    )?;
-    let defaults = FallbackConfig::default();
-    Ok(FallbackConfig {
-        enabled: optional_bool(fb, "enabled")?.unwrap_or(defaults.enabled),
-        on_connect_error: optional_bool(fb, "on_connect_error")?
-            .unwrap_or(defaults.on_connect_error),
-        on_5xx_before_first_byte: optional_bool(fb, "on_5xx_before_first_byte")?
-            .unwrap_or(defaults.on_5xx_before_first_byte),
-        max_attempts: optional_u64(fb, "max_attempts")?
-            .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
-            .unwrap_or(defaults.max_attempts),
-    })
 }
 
 fn build_auth(provider_type: ProviderType, api_key: String) -> ProviderAuth {
@@ -1684,8 +1673,9 @@ impl Plugin for AiStreamRouter {
         ctx.metadata.insert(META_MODEL.to_string(), model);
         ctx.metadata
             .insert(META_NORMALIZED.to_string(), normalizes.to_string());
-        ctx.metadata
-            .insert(META_FALLBACK_ATTEMPTS.to_string(), "0".to_string());
+        // No `ai_stream_router.fallback_attempts` key: this plugin never
+        // attempts a second provider, so a permanently-zero counter would only
+        // advertise a capability that does not exist (issue #3328).
 
         debug!(
             provider = %provider.name,
@@ -2182,36 +2172,109 @@ fn is_valid_url_model_component(model: &str) -> bool {
 // Anthropic SSE → OpenAI chat.completion.chunk SSE normalizer
 // ---------------------------------------------------------------------------
 
-/// Upper bound on bytes buffered in `carry` while waiting for one SSE event's
-/// blank-line boundary. Real Anthropic events are a few KiB (text/tool-arg
-/// deltas are chunked small); a provider that streams an enormous or
-/// never-terminated event would otherwise accumulate unbounded memory while
-/// producing no downstream bytes (especially with the response-size limit
-/// disabled). Overflow fails safe: emit an SSE error event + `[DONE]` and
-/// terminate the stream.
-const MAX_SSE_EVENT_CARRY_BYTES: usize = 1024 * 1024;
+/// Hard per-event SSE frame limit (bytes from event start through its blank-line
+/// delimiter). Checked when a boundary is discovered and before any UTF-8
+/// conversion, JSON parse, or transcode — including when a complete oversized
+/// event arrives in a single chunk. Also caps the unread partial event while
+/// waiting for a delimiter. Public so external tests can target the exact bound
+/// without inventing a parallel constant.
+pub const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+
+/// Cumulative Anthropic SSE plaintext bytes accepted by one normalizer
+/// instance (streaming or buffered). Reuses the residual content-coding
+/// plaintext ceiling so decode and normalize share one authoritative bound.
+pub const MAX_SSE_NORMALIZED_BODY_BYTES: usize = NORMALIZE_DECODE_LIMITS.max_decoded_bytes;
+
+/// Cumulative OpenAI-normalized SSE bytes a single normalizer may emit. Allows
+/// modest envelope expansion above the plaintext input ceiling while still
+/// failing closed; aligned with the residual-decode cumulative byte budget.
+pub const MAX_SSE_NORMALIZED_OUTPUT_BYTES: usize = NORMALIZE_DECODE_LIMITS.max_cumulative_bytes;
+
+/// Space kept below the normalized-output ceiling for one stable fail-closed
+/// error frame plus the terminal `[DONE]` sentinel. All non-provider-controlled
+/// bound diagnostics are materially smaller than this reserve.
+const SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES: usize = 512;
+
+const SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE: &str =
+    "upstream provider SSE stream exceeded the cumulative normalized size limit; stream terminated";
+
+/// Fixed bytes wrapping a bound diagnostic in one terminal emission:
+/// `data: {"error":{"message":"…","type":"upstream_error"}}\n\n` (56) plus the
+/// `data: [DONE]\n\n` sentinel (14). Bound diagnostics are ASCII literals, so
+/// JSON escaping never expands them beyond their own length.
+const SSE_BOUND_DIAGNOSTIC_ENVELOPE_BYTES: usize = 70;
+
+// The reserve is what lets a terminal frame replace an over-budget emission
+// without itself crossing `MAX_SSE_NORMALIZED_OUTPUT_BYTES`. Pin that invariant
+// to the longest `fail_bound` diagnostic at compile time so lengthening a
+// message cannot silently break it.
+const _: () = assert!(
+    SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE.len() + SSE_BOUND_DIAGNOSTIC_ENVELOPE_BYTES
+        <= SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES,
+    "terminal reserve must cover the normalized-output bound diagnostic frame"
+);
+
+/// Maximum complete SSE events accepted by one normalizer instance. Defends
+/// against tiny-event floods that stay under the per-event and body-byte caps.
+pub const MAX_SSE_EVENTS: usize = 100_000;
+
+/// Maximum JSON nesting depth accepted in an SSE `data:` payload before
+/// `serde_json` parse/transcode. Anthropic protocol frames are shallow; this
+/// is well below serde_json's own recursion ceiling and fails with a stable
+/// diagnostic rather than a parser-internal error.
+pub const MAX_SSE_EVENT_JSON_DEPTH: usize = 32;
+
+/// Compact when the consumed prefix reaches this many bytes (and is at least
+/// half the buffer) so total copy work stays linear in input size.
+const SSE_BUFFER_COMPACT_THRESHOLD: usize = 8192;
 
 /// How a stream reached its terminal OpenAI sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamTerminal {
     /// Anthropic `message_stop` — successful protocol completion.
     MessageStop,
-    /// Explicit Anthropic `error` event (or oversized-event fail-safe).
+    /// Explicit Anthropic `error` event (or resource-bound fail-safe).
     ProviderError,
     /// Clean EOF / malformed framing before a successful terminal state.
     UpstreamFailure,
 }
 
+/// Outcome of interpreting one complete SSE frame before mutation/transcode.
+enum FrameOutcome {
+    Ignore,
+    Event(Value),
+    Fail(&'static str),
+}
+
 /// Stateful, per-response inspector that transcodes Anthropic Messages API SSE
 /// events into OpenAI `chat.completion.chunk` SSE. Robust to chunk splits: raw
-/// bytes accumulate in `carry` and only complete SSE events are transcoded.
+/// bytes accumulate in a cursor-addressed buffer and only complete, in-limit
+/// SSE events are transcoded.
 ///
 /// Successful termination requires Anthropic `message_stop` (or an explicit
 /// provider `error`). Clean EOF before that state, and malformed complete event
 /// data that prevents protocol tracking, surface an upstream error rather than
 /// synthesizing a success-only `[DONE]`.
+///
+/// Resource bounds (per-event bytes, cumulative plaintext, cumulative
+/// normalized output, event count, JSON depth) are enforced before expensive
+/// parse/transcode work and fail closed with stable diagnostics.
 struct AnthropicSseNormalizer {
-    carry: Vec<u8>,
+    /// Incoming SSE bytes. Unread range is `buf[cursor..]`.
+    buf: Vec<u8>,
+    /// Index of the first unread byte in `buf`.
+    cursor: usize,
+    /// Absolute index where the next delimiter scan may resume. When a chunk
+    /// ends without a boundary this retains only the three-byte overlap needed
+    /// for a split `\r\n\r\n`, so one-byte provider chunks cannot repeatedly
+    /// rescan the full partial event.
+    scan_cursor: usize,
+    /// Total plaintext SSE bytes offered to this normalizer.
+    bytes_ingested: usize,
+    /// Complete SSE frames accepted (including ignored comment/control frames).
+    events_seen: usize,
+    /// Cumulative OpenAI SSE bytes already forwarded to the client.
+    normalized_out_bytes: usize,
     model: String,
     stream_id: Option<String>,
     created: i64,
@@ -2232,7 +2295,12 @@ struct AnthropicSseNormalizer {
 impl AnthropicSseNormalizer {
     fn new(model: String, tools_forbidden: bool) -> Self {
         Self {
-            carry: Vec::new(),
+            buf: Vec::new(),
+            cursor: 0,
+            scan_cursor: 0,
+            bytes_ingested: 0,
+            events_seen: 0,
+            normalized_out_bytes: 0,
             model,
             stream_id: None,
             created: Utc::now().timestamp(),
@@ -2245,6 +2313,36 @@ impl AnthropicSseNormalizer {
             next_tool_index: 0,
             prompt_tokens: None,
             completion_tokens: None,
+        }
+    }
+
+    fn unread_len(&self) -> usize {
+        self.buf.len().saturating_sub(self.cursor)
+    }
+
+    fn clear_buffer(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+        self.scan_cursor = 0;
+        if self.buf.capacity() > 64 * 1024 {
+            self.buf.shrink_to(4096);
+        }
+    }
+
+    /// Reclaim consumed prefix so total shift work stays linear in input size.
+    fn maybe_compact(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        if self.cursor >= self.buf.len() {
+            self.clear_buffer();
+            return;
+        }
+        if self.cursor >= SSE_BUFFER_COMPACT_THRESHOLD && self.cursor * 2 >= self.buf.len() {
+            let consumed = self.cursor;
+            self.buf.drain(..consumed);
+            self.scan_cursor = self.scan_cursor.saturating_sub(consumed);
+            self.cursor = 0;
         }
     }
 
@@ -2302,6 +2400,12 @@ impl AnthropicSseNormalizer {
             }
         });
         out.push_str(&format!("data: {err}\n\n"));
+    }
+
+    fn fail_bound(&mut self, message: &'static str, out: &mut String) {
+        self.clear_buffer();
+        self.emit_upstream_error(message, out);
+        self.finish(StreamTerminal::ProviderError, out);
     }
 
     /// Transcode one Anthropic event JSON into zero or more OpenAI SSE lines.
@@ -2487,74 +2591,274 @@ impl AnthropicSseNormalizer {
         out.push_str("data: [DONE]\n\n");
     }
 
-    fn ingest_complete_event(&mut self, raw: &[u8], out: &mut String) -> bool {
+    /// Interpret one complete SSE frame without mutating normalizer state.
+    /// Performs UTF-8 / framing / JSON-depth checks and JSON parse; does not
+    /// transcode. Caller must enforce the per-event byte cap before invoking.
+    fn interpret_sse_frame(raw: &[u8]) -> FrameOutcome {
         match extract_sse_event_result(raw) {
             Ok((event_name, None)) => {
                 if event_name.is_some_and(is_known_anthropic_event) {
-                    self.emit_upstream_error(
+                    FrameOutcome::Fail(
                         "upstream provider sent a known Anthropic SSE event without valid data framing; stream terminated",
-                        out,
-                    );
-                    self.finish(StreamTerminal::UpstreamFailure, out);
-                    true
+                    )
                 } else {
-                    false
+                    FrameOutcome::Ignore
                 }
             }
-            Ok((event_name, Some(data))) => match serde_json::from_str::<Value>(&data) {
-                Ok(event) => {
-                    let Some(payload_type) = event.get("type").and_then(Value::as_str) else {
-                        self.emit_upstream_error(
-                            "upstream provider sent an Anthropic SSE JSON event without a string type; stream terminated",
-                            out,
-                        );
-                        self.finish(StreamTerminal::UpstreamFailure, out);
-                        return true;
-                    };
-                    if let Some(event_name) = event_name
-                        && is_known_anthropic_event(event_name)
-                        && event_name != payload_type
-                    {
-                        self.emit_upstream_error(
-                            "upstream provider sent mismatched Anthropic SSE event and payload types; stream terminated",
-                            out,
-                        );
-                        self.finish(StreamTerminal::UpstreamFailure, out);
-                        return true;
-                    }
-                    self.transcode_event(&event, out)
-                }
-                Err(_) => {
-                    self.emit_upstream_error(
-                        "upstream provider sent a malformed SSE JSON event; stream terminated",
-                        out,
+            Ok((event_name, Some(data))) => {
+                if json_nesting_depth(&data) > MAX_SSE_EVENT_JSON_DEPTH {
+                    return FrameOutcome::Fail(
+                        "upstream provider sent an SSE event with excessive JSON nesting; stream terminated",
                     );
-                    self.finish(StreamTerminal::UpstreamFailure, out);
-                    true
                 }
-            },
-            Err(_) => {
-                self.emit_upstream_error(
-                    "upstream provider sent a malformed SSE event; stream terminated",
-                    out,
-                );
+                match serde_json::from_str::<Value>(&data) {
+                    Ok(event) => {
+                        let Some(payload_type) = event.get("type").and_then(Value::as_str) else {
+                            return FrameOutcome::Fail(
+                                "upstream provider sent an Anthropic SSE JSON event without a string type; stream terminated",
+                            );
+                        };
+                        if let Some(event_name) = event_name
+                            && is_known_anthropic_event(event_name)
+                            && event_name != payload_type
+                        {
+                            return FrameOutcome::Fail(
+                                "upstream provider sent mismatched Anthropic SSE event and payload types; stream terminated",
+                            );
+                        }
+                        FrameOutcome::Event(event)
+                    }
+                    Err(_) => FrameOutcome::Fail(
+                        "upstream provider sent a malformed SSE JSON event; stream terminated",
+                    ),
+                }
+            }
+            Err(_) => FrameOutcome::Fail(
+                "upstream provider sent a malformed SSE event; stream terminated",
+            ),
+        }
+    }
+
+    fn apply_frame_outcome(&mut self, outcome: FrameOutcome, out: &mut String) -> bool {
+        match outcome {
+            FrameOutcome::Ignore => false,
+            FrameOutcome::Event(event) => self.transcode_event(&event, out),
+            FrameOutcome::Fail(message) => {
+                self.emit_upstream_error(message, out);
                 self.finish(StreamTerminal::UpstreamFailure, out);
                 true
             }
         }
     }
 
-    /// Drain every complete SSE event currently buffered, transcoding each.
-    /// Returns whether the stream should terminate immediately.
-    fn drain(&mut self, out: &mut String) -> bool {
-        while let Some(end) = next_event_boundary(&self.carry) {
-            let raw: Vec<u8> = self.carry.drain(..end).collect();
-            if self.ingest_complete_event(&raw, out) {
-                self.carry.clear();
+    /// Drain every complete in-limit SSE event currently buffered, transcoding
+    /// each from a cursor slice (no front-`drain(..).collect()`). Returns
+    /// whether the stream should terminate immediately.
+    fn drain_complete(&mut self, out: &mut String) -> bool {
+        loop {
+            let end = {
+                let scan_start = self.scan_cursor.max(self.cursor).min(self.buf.len());
+                match next_event_boundary(&self.buf[scan_start..]) {
+                    Some(end_rel) => scan_start + end_rel,
+                    None => {
+                        // `\r\n\r\n` is the longest delimiter. Retain its
+                        // three-byte prefix so a boundary split across the next
+                        // chunk is still found without rescanning older bytes.
+                        self.scan_cursor = self.buf.len().saturating_sub(3).max(self.cursor);
+                        break;
+                    }
+                }
+            };
+            let end_rel = end.saturating_sub(self.cursor);
+            // Enforce the advertised per-event hard limit before any copy,
+            // UTF-8 conversion, JSON parse, or transcode of this frame.
+            if end_rel > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return true;
+            }
+            if self.events_seen >= MAX_SSE_EVENTS {
+                self.fail_bound(
+                    "upstream provider SSE stream exceeded the event count limit; stream terminated",
+                    out,
+                );
+                return true;
+            }
+
+            let start = self.cursor;
+            let outcome = Self::interpret_sse_frame(&self.buf[start..end]);
+            self.cursor = end;
+            self.scan_cursor = end;
+            self.events_seen = self.events_seen.saturating_add(1);
+
+            let terminate = self.apply_frame_outcome(outcome, out);
+            self.maybe_compact();
+            if self.normalized_output_exceeded(out, terminate) {
+                return true;
+            }
+            if terminate {
+                self.clear_buffer();
                 return true;
             }
         }
         false
+    }
+
+    fn normalized_output_exceeded(&mut self, out: &mut String, terminal: bool) -> bool {
+        let total = self.normalized_out_bytes.saturating_add(out.len());
+        let allowed = if terminal {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+        } else {
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES
+                .saturating_sub(SSE_NORMALIZED_OUTPUT_TERMINAL_RESERVE_BYTES)
+        };
+        if total <= allowed {
+            return false;
+        }
+
+        // A terminal provider event may itself be the bytes that cross the
+        // ceiling. Replace the complete current inspector emission, including
+        // any provider-controlled error message and an already-appended
+        // sentinel, with the fixed bound diagnostic. Prior non-terminal calls
+        // always retained enough room for this payload.
+        out.clear();
+        self.done_emitted = false;
+        self.terminal = None;
+        self.fail_bound(SSE_NORMALIZED_OUTPUT_LIMIT_MESSAGE, out);
+        true
+    }
+
+    fn account_ingested(&mut self, chunk_len: usize) -> Result<(), &'static str> {
+        let Some(next) = self.bytes_ingested.checked_add(chunk_len) else {
+            return Err(
+                "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
+            );
+        };
+        if next > MAX_SSE_NORMALIZED_BODY_BYTES {
+            return Err(
+                "upstream provider SSE stream exceeded the cumulative size limit; stream terminated",
+            );
+        }
+        self.bytes_ingested = next;
+        Ok(())
+    }
+
+    /// Ingest `chunk`, enforcing all resource bounds before expensive work.
+    /// Returns whether the stream should terminate.
+    fn push_chunk(&mut self, mut chunk: &[u8], out: &mut String) -> bool {
+        if let Err(message) = self.account_ingested(chunk.len()) {
+            self.fail_bound(message, out);
+            return true;
+        }
+
+        while !chunk.is_empty() {
+            let unread = self.unread_len();
+            // Grow the current partial event by at most one byte past the
+            // hard cap so an oversized complete or never-terminated frame is
+            // detected without buffering an unbounded provider chunk.
+            // `unread` is always <= `MAX_SSE_EVENT_BYTES` here: each prior
+            // iteration either stayed within the cap or failed closed.
+            let room = (MAX_SSE_EVENT_BYTES.saturating_add(1)).saturating_sub(unread);
+            let take = room.min(chunk.len());
+            self.buf.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+
+            if self.drain_complete(out) {
+                return true;
+            }
+            if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Terminal EOF handling. Always ends the OpenAI stream: every path emits a
+    /// terminal frame (or reuses one already emitted), so there is no
+    /// "continue reading" outcome to report back.
+    fn finish_stream(&mut self, out: &mut String) {
+        if self.drain_complete(out) {
+            return;
+        }
+        // Transcode any trailing event that lacked a final blank-line boundary.
+        if self.unread_len() > 0 {
+            if self.unread_len() > MAX_SSE_EVENT_BYTES {
+                self.fail_bound(
+                    "upstream provider sent an oversized SSE event; stream terminated",
+                    out,
+                );
+                return;
+            }
+            if self.events_seen >= MAX_SSE_EVENTS {
+                self.fail_bound(
+                    "upstream provider SSE stream exceeded the event count limit; stream terminated",
+                    out,
+                );
+                return;
+            }
+            let start = self.cursor;
+            let end = self.buf.len();
+            let raw_is_ws = self.buf[start..end].iter().all(u8::is_ascii_whitespace);
+            let outcome = Self::interpret_sse_frame(&self.buf[start..end]);
+            self.cursor = end;
+            self.events_seen = self.events_seen.saturating_add(1);
+            self.clear_buffer();
+
+            // Delimiter-less EOF remainder is trailing framing, not a complete
+            // event. Interpret Fail outcomes (incomplete JSON, bad UTF-8, etc.)
+            // with the stable trailing diagnostic rather than the complete-event
+            // malformed-JSON / malformed-SSE labels used by `drain_complete`.
+            match outcome {
+                FrameOutcome::Fail(_) => {
+                    self.emit_upstream_error(
+                        "upstream provider ended the Anthropic SSE stream with malformed trailing data",
+                        out,
+                    );
+                    self.finish(StreamTerminal::UpstreamFailure, out);
+                    let _ = self.normalized_output_exceeded(out, true);
+                    return;
+                }
+                outcome => {
+                    let terminate = self.apply_frame_outcome(outcome, out);
+                    if self.normalized_output_exceeded(out, terminate) {
+                        return;
+                    }
+                    if terminate {
+                        return;
+                    }
+                    // Preserve prior EOF framing: a non-terminating trailing frame
+                    // that is not pure whitespace is treated as malformed trailing
+                    // data.
+                    if !raw_is_ws {
+                        self.emit_upstream_error(
+                            "upstream provider ended the Anthropic SSE stream with malformed trailing data",
+                            out,
+                        );
+                        self.finish(StreamTerminal::UpstreamFailure, out);
+                        let _ = self.normalized_output_exceeded(out, true);
+                        return;
+                    }
+                }
+            }
+        }
+        // Clean EOF without `message_stop` is premature truncation — never
+        // synthesize a success-only `[DONE]`.
+        self.emit_upstream_error(
+            "upstream provider closed the Anthropic SSE stream before message_stop",
+            out,
+        );
+        self.finish(StreamTerminal::UpstreamFailure, out);
+        let _ = self.normalized_output_exceeded(out, true);
+    }
+
+    fn commit_forwarded(&mut self, out: &str) {
+        self.normalized_out_bytes = self.normalized_out_bytes.saturating_add(out.len());
     }
 }
 
@@ -2568,26 +2872,11 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         if self.done_emitted {
             return ResponseStreamAction::Terminate(None);
         }
-        self.carry.extend_from_slice(chunk);
         let mut out = String::new();
-        if self.drain(&mut out) {
+        if self.push_chunk(chunk, &mut out) {
             return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
         }
-        // Per-event bound: after draining every complete event, whatever is
-        // left is one partial event. If it exceeds the cap the provider is
-        // streaming a pathological/never-terminated event — fail safe by
-        // ending the OpenAI stream with an error event instead of buffering
-        // without bound.
-        if self.carry.len() > MAX_SSE_EVENT_CARRY_BYTES {
-            self.carry.clear();
-            self.carry.shrink_to_fit();
-            self.emit_upstream_error(
-                "upstream provider sent an oversized SSE event; stream terminated",
-                &mut out,
-            );
-            self.finish(StreamTerminal::ProviderError, &mut out);
-            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
-        }
+        self.commit_forwarded(&out);
         ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
     }
 
@@ -2596,33 +2885,7 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
             return ResponseStreamAction::Terminate(None);
         }
         let mut out = String::new();
-        if self.drain(&mut out) {
-            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
-        }
-        // Transcode any trailing event that lacked a final blank-line boundary.
-        if !self.carry.is_empty() {
-            let raw = std::mem::take(&mut self.carry);
-            if self.ingest_complete_event(&raw, &mut out) {
-                return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
-            }
-            // Trailing bytes that are not a complete SSE event (no data: line /
-            // incomplete framing) are a protocol failure, not success.
-            if !raw.iter().all(u8::is_ascii_whitespace) {
-                self.emit_upstream_error(
-                    "upstream provider ended the Anthropic SSE stream with malformed trailing data",
-                    &mut out,
-                );
-                self.finish(StreamTerminal::UpstreamFailure, &mut out);
-                return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
-            }
-        }
-        // Clean EOF without `message_stop` is premature truncation — never
-        // synthesize a success-only `[DONE]`.
-        self.emit_upstream_error(
-            "upstream provider closed the Anthropic SSE stream before message_stop",
-            &mut out,
-        );
-        self.finish(StreamTerminal::UpstreamFailure, &mut out);
+        self.finish_stream(&mut out);
         ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())))
     }
 }
@@ -2862,4 +3125,81 @@ fn extract_sse_event_result(raw: &[u8]) -> Result<(Option<&str>, Option<String>)
         }
     }
     Ok((event_name, found.then_some(data)))
+}
+
+/// Maximum nesting depth of `{` / `[` outside JSON strings. Used as a cheap
+/// pre-parse gate so hostile deep payloads fail closed before `serde_json`.
+fn json_nesting_depth(s: &str) -> usize {
+    let mut depth = 0usize;
+    let mut max = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for b in s.bytes() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match b {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > max {
+                    max = depth;
+                }
+                if max > MAX_SSE_EVENT_JSON_DEPTH {
+                    return max;
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
+#[cfg(test)]
+mod sse_buffer_tests {
+    use super::*;
+
+    /// Structural proof that the cursor/compaction path does not repeatedly
+    /// shift the unread remainder on every event: after many small complete
+    /// frames the unread window stays tiny and capacity stays O(partial), not
+    /// O(total_input).
+    #[test]
+    fn cursor_compaction_stays_linear_for_many_small_events() {
+        let mut normalizer = AnthropicSseNormalizer::new("claude-test".to_string(), false);
+        let event = b"data: {\"type\":\"ping\"}\n\n";
+        let mut out = String::new();
+        let iterations = 4_096usize;
+        for _ in 0..iterations {
+            assert!(
+                !normalizer.push_chunk(event, &mut out),
+                "ping flood under event-count cap must not terminate"
+            );
+            out.clear();
+        }
+        assert_eq!(normalizer.events_seen, iterations);
+        assert_eq!(normalizer.unread_len(), 0);
+        assert_eq!(normalizer.cursor, 0);
+        assert_eq!(normalizer.scan_cursor, 0);
+        // Compaction reclaims the consumed prefix; capacity must stay far below
+        // the quadratic alternative of retaining every prior event.
+        let capacity = normalizer.buf.capacity();
+        let total_input = iterations * event.len();
+        assert!(
+            capacity < total_input / 2,
+            "capacity {capacity} should stay well below total input {total_input}"
+        );
+        assert_eq!(normalizer.bytes_ingested, iterations * event.len());
+    }
 }

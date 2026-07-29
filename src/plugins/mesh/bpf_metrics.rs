@@ -32,10 +32,11 @@
 //!   `_in_overrun_regime` companion gauge stays at 1 between the warn
 //!   and recovery transitions so dashboards can alert without scraping
 //!   logs.
-//! - **TCP-layer latency aggregates** (SRTT, syn→ack) as `_sum`/`_count`
-//!   so operators can derive averages. Histogram buckets are deferred.
-//!   Accept-to-first-byte is omitted until a verifier-safe producer
-//!   exists (SOCK_OPS has no first-inbound-data-byte callback).
+//! - **TCP-layer latency histograms** (SRTT, syn→ack) as canonical
+//!   Prometheus histograms: fixed microsecond `le` buckets plus the
+//!   historical `_sum`/`_count` series for mean derivation. Accept-to-
+//!   first-byte is omitted until a verifier-safe producer exists
+//!   (SOCK_OPS has no first-inbound-data-byte callback).
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -43,7 +44,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::ebpf::bpf_metrics::{BpfDropReason, BpfMetricsSnapshot, BpfMetricsState};
+use crate::ebpf::bpf_metrics::{
+    BPF_LATENCY_BUCKET_LE_LABELS, BpfDropReason, BpfMetricsSnapshot, BpfMetricsState,
+};
 use crate::plugins::{ALL_PROTOCOLS, Plugin, ProxyProtocol, priority};
 
 /// Plugin name as it appears in plugin chain configuration. The `__mesh_`
@@ -176,7 +179,7 @@ impl MeshBpfMetrics {
 }
 
 fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String {
-    let mut out = String::with_capacity(2048);
+    let mut out = String::with_capacity(4096);
     let p = prefix;
 
     // TCP-layer event counters.
@@ -239,30 +242,27 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
         let _ = writeln!(out, "{p}_drop_reasons{{reason=\"{}\"}} 1", reason.label());
     }
 
-    // Latency sum/count aggregates (TCP-layer only; app-layer stays
-    // in workload_metrics).
-    let _ = writeln!(
-        out,
-        "# HELP {p}_srtt_microseconds TCP smoothed RTT samples (sum + count for mean derivation)."
+    // Latency histograms (TCP-layer only; app-layer stays in workload_metrics).
+    // Fixed low-cardinality µs buckets; `_sum`/`_count` preserved for means.
+    render_latency_histogram(
+        &mut out,
+        p,
+        "srtt_microseconds",
+        "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count; \
+         zero samples are ignored and sum overflow drops the sample.",
+        &snap.srtt_cumulative_buckets(),
+        snap.srtt_sample_us_sum,
+        snap.srtt_count,
     );
-    let _ = writeln!(out, "# TYPE {p}_srtt_microseconds summary");
-    let _ = writeln!(out, "{p}_srtt_microseconds_sum {}", snap.srtt_sample_us_sum);
-    let _ = writeln!(out, "{p}_srtt_microseconds_count {}", snap.srtt_count);
-
-    let _ = writeln!(
-        out,
-        "# HELP {p}_syn_to_ack_microseconds Time between SYN send and ACK observation."
-    );
-    let _ = writeln!(out, "# TYPE {p}_syn_to_ack_microseconds summary");
-    let _ = writeln!(
-        out,
-        "{p}_syn_to_ack_microseconds_sum {}",
-        snap.syn_to_ack_us_sum
-    );
-    let _ = writeln!(
-        out,
-        "{p}_syn_to_ack_microseconds_count {}",
-        snap.syn_to_ack_count
+    render_latency_histogram(
+        &mut out,
+        p,
+        "syn_to_ack_microseconds",
+        "Time between SYN send and ACK observation in microseconds. Fixed le buckets \
+         plus sum/count; zero samples are ignored and sum overflow drops the sample.",
+        &snap.syn_to_ack_cumulative_buckets(),
+        snap.syn_to_ack_us_sum,
+        snap.syn_to_ack_count,
     );
 
     // Ringbuf health.
@@ -298,6 +298,28 @@ fn render_prometheus_snapshot(prefix: &str, snap: &BpfMetricsSnapshot) -> String
     );
 
     out
+}
+
+fn render_latency_histogram(
+    out: &mut String,
+    prefix: &str,
+    metric: &str,
+    help: &str,
+    cumulative: &[u64],
+    sum: u64,
+    count: u64,
+) {
+    let _ = writeln!(out, "# HELP {prefix}_{metric} {help}");
+    let _ = writeln!(out, "# TYPE {prefix}_{metric} histogram");
+    for (le, &bucket_count) in BPF_LATENCY_BUCKET_LE_LABELS.iter().zip(cumulative.iter()) {
+        let _ = writeln!(
+            out,
+            "{prefix}_{metric}_bucket{{le=\"{le}\"}} {bucket_count}"
+        );
+    }
+    let _ = writeln!(out, "{prefix}_{metric}_bucket{{le=\"+Inf\"}} {count}");
+    let _ = writeln!(out, "{prefix}_{metric}_sum {sum}");
+    let _ = writeln!(out, "{prefix}_{metric}_count {count}");
 }
 
 fn parse_config(config: &Value) -> Result<BpfMetricsConfig, String> {
@@ -416,7 +438,10 @@ mod tests {
         // Drop counters (concrete count + the self-documenting gauge)
         assert!(text.contains("ferrum_mesh_bpf_drops_total{reason=\"bypass_uid_hit\"} 1"));
         assert!(text.contains("ferrum_mesh_bpf_drop_reasons{reason=\"exclude_cidr_hit\"} 1"));
-        // Latency aggregates
+        // Latency histogram (TYPE + buckets + preserved sum/count)
+        assert!(text.contains("# TYPE ferrum_mesh_bpf_srtt_microseconds histogram"));
+        assert!(text.contains("ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"250\"} 1"));
+        assert!(text.contains("ferrum_mesh_bpf_srtt_microseconds_bucket{le=\"+Inf\"} 1"));
         assert!(text.contains("ferrum_mesh_bpf_srtt_microseconds_sum 250"));
         assert!(text.contains("ferrum_mesh_bpf_srtt_microseconds_count 1"));
         // Ringbuf health: in-regime gauge flipped to 1 after the overrun.
