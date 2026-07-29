@@ -528,6 +528,15 @@ LIGHTWEIGHT_PATTERNS = [
 # accidentally omitted.
 FULL_CI_PREFIXES = ("vendor/",)
 
+# These checked-in artifacts are executable contract inputs, not lightweight
+# prose. Changes must run the Rust parity tests and static contract validator.
+FULL_CI_CONTRACT_PATHS = frozenset(
+    {
+        "docs/prometheus_metric_contract.json",
+        "docs/prometheus_metrics.md",
+    }
+)
+
 # These files deliberately trigger one or more live datapath suites. The
 # required-CI verifier mechanically checks this set against both
 # live_suite_path_filter.py and node-waypoint-ebpf-live.yml.
@@ -553,7 +562,10 @@ HELM_PATTERNS = [
     for pattern in (
         r"^charts/",
         r"^\.github/workflows/ci\.yml$",
+        r"^\.github/scripts/validate_prometheus_metric_contract\.py$",
         r"^\.github/actions/",
+        r"^docs/prometheus_metric_contract\.json$",
+        r"^docs/prometheus_metrics\.md$",
         r"^\.cargo/",
         r"^vendor/",
         r"^Dockerfile(?:\..*)?$",
@@ -637,7 +649,11 @@ GATE_CONTROLLER_PATHS = frozenset(
 
 
 def is_lightweight_path(path: str) -> bool:
-    if path.startswith(FULL_CI_PREFIXES) or path in FULL_CI_DOCUMENTATION_PATHS:
+    if (
+        path.startswith(FULL_CI_PREFIXES)
+        or path in FULL_CI_CONTRACT_PATHS
+        or path in FULL_CI_DOCUMENTATION_PATHS
+    ):
         return False
     return any(pattern.search(path) for pattern in LIGHTWEIGHT_PATTERNS)
 
@@ -706,6 +722,8 @@ def self_test() -> int:
         ("pull_request", ["docs/mesh.md"], "full"),
         ("pull_request", ["docs/configuration.md"], "full"),
         ("pull_request", ["docs/plans/node_waypoint_transport_adr.md"], "full"),
+        ("pull_request", ["docs/prometheus_metric_contract.json"], "full"),
+        ("pull_request", ["docs/prometheus_metrics.md"], "full"),
         (
             "pull_request",
             ["vendor/tungstenite-0.29.0-ferrum-patched/README.md"],
@@ -732,6 +750,21 @@ def self_test() -> int:
         (
             "pull_request",
             ["charts/ferrum-gateway/values.yaml"],
+            {"run_helm": True},
+        ),
+        (
+            "pull_request",
+            ["docs/prometheus_metric_contract.json"],
+            {"run_helm": True},
+        ),
+        (
+            "pull_request",
+            ["docs/prometheus_metrics.md"],
+            {"run_helm": True},
+        ),
+        (
+            "pull_request",
+            [".github/scripts/validate_prometheus_metric_contract.py"],
             {"run_helm": True},
         ),
         (
