@@ -682,7 +682,7 @@ Given all built-in plugins enabled, the execution order is:
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
-| 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect, on_udp_datagram |
 | 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, after_proxy, on_final_response_body |
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_final_request_body, on_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
@@ -1036,7 +1036,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
 | `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
-| `fault_injection` | ✓ | ✓ | ✓ | ✓ | | Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS) |
+| `fault_injection` | ✓ | ✓ | ✓ | ✓ | ✓ | Probabilistic aborts and delays across HTTP-family, TCP stream connect, and UDP/DTLS session + datagram hooks |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
 | `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
