@@ -34,10 +34,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Compile and exercise the candidate policy
+      - name: Exercise the candidate policy
         run: |
           set -euo pipefail
           policy=.github/scripts/verify_cross_build_policy.py
-          python3 -I -X "pycache_prefix=$RUNNER_TEMP/policy-candidate-pycache" \
-            -m py_compile "$policy"
           python3 -I "$policy" --self-test
