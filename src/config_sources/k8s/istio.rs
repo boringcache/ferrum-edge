@@ -5207,6 +5207,7 @@ mod tests {
     use super::*;
     use crate::config_sources::k8s::{K8sMetadata, K8sTranslationOptions, translate_k8s_objects};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
+    use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
     use crate::modes::mesh::config::ParsedCidr;
     use crate::modes::mesh::policy::{
         MeshAuthzDecision, MeshAuthzRequest, evaluate_mesh_authorization,
@@ -7604,7 +7605,7 @@ mod tests {
                 serde_json::json!({
                     "accessLogging": [{
                         "filter": {
-                            "expression": "response.code >= 500 || response.duration >= 1000"
+                            "expression": "response.code >= 500 || duration > 1s"
                         }
                     }]
                 }),
@@ -7620,21 +7621,28 @@ mod tests {
             .as_ref()
             .expect("access logging");
         let filter = access_logging.filter.as_ref().expect("filter");
-        assert!(filter.expression.is_some());
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::Or {
+                left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+            })
+        );
         assert_eq!(filter.status_code_min, None);
     }
 
     #[test]
     fn telemetry_access_log_filter_or_errors_or_slow_example() {
         let filter = parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
-            .expect_err("unsupported duration identifier should fail closed");
-        assert!(filter.contains("unsupported identifier"));
-
-        let filter =
-            parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
-                .expect("parses")
-                .expect("filter");
-        assert!(filter.expression.is_some());
+            .expect("documented errors-or-slow expression parses")
+            .expect("filter");
+        assert_eq!(
+            filter.expression,
+            Some(AccessLogFilterExpr::Or {
+                left: Box::new(AccessLogFilterExpr::StatusCodeMin { value: 500 }),
+                right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
+            })
+        );
     }
 
     #[test]

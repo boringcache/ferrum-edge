@@ -257,8 +257,15 @@ impl<'a> ExpressionParser<'a> {
                 self.parse_numeric_comparison("Telemetry access log response.code filter")?;
             return Ok(ComparisonAtom::StatusCode(comparison));
         }
-        if self.starts_with_identifier("response.duration") {
-            self.pos += "response.duration".len();
+        let duration_identifier_len = if self.starts_with_identifier("response.duration") {
+            Some("response.duration".len())
+        } else if self.starts_with_identifier("duration") {
+            Some("duration".len())
+        } else {
+            None
+        };
+        if let Some(identifier_len) = duration_identifier_len {
+            self.pos += identifier_len;
             self.skip_whitespace();
             let comparison =
                 self.parse_duration_comparison("Telemetry access log response.duration filter")?;
@@ -305,6 +312,10 @@ impl<'a> ExpressionParser<'a> {
         }
         self.skip_whitespace();
         let value = self.parse_signed_integer(field)?;
+        let multiplier = self.parse_duration_unit_multiplier()?;
+        let value = value.checked_mul(multiplier).ok_or_else(|| {
+            "Telemetry access log duration filter value overflows milliseconds".to_string()
+        })?;
         Ok(match op {
             ">=" => DurationComparison::Gte(value),
             ">" => DurationComparison::Gt(value),
@@ -355,6 +366,27 @@ impl<'a> ExpressionParser<'a> {
         raw.parse::<i64>().map_err(|_| {
             format!("{field} comparison value '{raw}' is outside supported integer range")
         })
+    }
+
+    fn parse_duration_unit_multiplier(&mut self) -> Result<i64, String> {
+        for (unit, multiplier) in [("ms", 1), ("s", 1_000)] {
+            if !self.input[self.pos..].starts_with(unit) {
+                continue;
+            }
+            let after = self.pos + unit.len();
+            if self
+                .input
+                .get(after..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            self.pos = after;
+            self.bump_token_count()?;
+            return Ok(multiplier);
+        }
+        Ok(1)
     }
 
     fn consume_token(&mut self, token: &str) -> Result<bool, String> {
@@ -677,7 +709,7 @@ mod tests {
     #[test]
     fn errors_or_slow_canonicalizes_to_or_tree() {
         let filter =
-            parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
+            parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
                 .expect("parses")
                 .expect("filter");
         let expr = filter.expression.expect("uses expression tree");
@@ -688,6 +720,18 @@ mod tests {
                 right: Box::new(AccessLogFilterExpr::MinLatencyMs { value: 1001 }),
             }
         );
+    }
+
+    #[test]
+    fn duration_units_convert_to_milliseconds_and_overflow_fails_closed() {
+        let filter = parse_access_log_filter_expression("response.duration >= 1500ms")
+            .expect("millisecond suffix parses")
+            .expect("filter");
+        assert_eq!(filter.min_latency_ms, Some(1500));
+
+        let error = parse_access_log_filter_expression("duration >= 9223372036854776s")
+            .expect_err("seconds-to-milliseconds overflow must fail closed");
+        assert!(error.contains("overflows milliseconds"), "{error}");
     }
 
     #[test]
