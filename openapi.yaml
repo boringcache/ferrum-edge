@@ -21797,6 +21797,7 @@ components:
             descriptor_path:
               type: string
               minLength: 1
+              pattern: '\S'
               description: >-
                 Node-local path to a compiled protobuf FileDescriptorSet.
                 Validated shape-only at Admin/CP admission and against the real
@@ -21824,6 +21825,7 @@ components:
                   response_type:
                     type: string
                     minLength: 1
+                    pattern: '\S'
                     description: Fully-qualified protobuf response message type.
                   text_fields:
                     type: array
@@ -21831,6 +21833,7 @@ components:
                     items:
                       type: string
                       minLength: 1
+                      pattern: '\S'
                     description: >-
                       Dotted field paths restricting what is scanned and
                       rewritten. Each path must end at a string field and may

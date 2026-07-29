@@ -8135,6 +8135,35 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
                 "methods": {"not-a-path": {"response_type": "a.R"}}
             }
         }),
+        // Runtime trims these three string surfaces and rejects an empty
+        // result. The published schema must not advertise whitespace-only
+        // values as admissible.
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": " \t ",
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"response_type": "\n "}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {
+                    "/a.B/C": {
+                        "response_type": "a.R",
+                        "text_fields": [" \r\n "]
+                    }
+                }
+            }
+        }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);
     }
