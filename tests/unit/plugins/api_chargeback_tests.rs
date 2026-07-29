@@ -4274,6 +4274,67 @@ fn test_charges_row_default_render_is_unprojected() {
 }
 
 #[test]
+fn test_charges_row_identity_projection_matches_the_native_row() {
+    // `ChargebackProxyRow` has two independent hand-written emitters:
+    // `to_native_json` (no schema configured) and the
+    // `SchemaSerializable::serialize_native` arms driven by
+    // `CHARGEBACK_REPORT_FIELDS`. A member added to one and missed on the other
+    // would keep appearing in the default `/charges` document while silently
+    // vanishing for every operator running a projection. An identity schema
+    // must therefore reproduce the native row exactly.
+    fn render_row(schema: Option<serde_json::Value>) -> serde_json::Value {
+        let registry = ChargebackRegistry::new();
+        registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+        if let Some(schema) = schema {
+            let plugin = ApiChargeback::new(&priced_config(json!({ "schema": schema })), "ferrum")
+                .expect("schema compiles");
+            registry.configure_render_schema(plugin.render_schema().cloned());
+        }
+        registry.record_http(
+            &scope(),
+            "alice",
+            "proxy-a",
+            "My API",
+            200,
+            0.5,
+            10,
+            20,
+            0.001,
+            0.002,
+        );
+        // Stream activity on the same proxy/currency/namespace merges into one
+        // aggregate, so the conditional `stream` member and the "mixed"
+        // protocol family are exercised too.
+        registry.record_stream(
+            &scope(),
+            "alice",
+            "proxy-a",
+            "My API",
+            0.25,
+            30,
+            40,
+            0.001,
+            0.002,
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+        document["consumers"]["alice"]["proxies"]["proxy-a"].clone()
+    }
+
+    let native = render_row(None);
+    // Every conditional member must actually be present, or the parity check
+    // below would pass vacuously.
+    assert!(native.get("stream").is_some(), "native row: {native}");
+    assert_eq!(native["protocol_family"], json!("mixed"));
+
+    let projected = render_row(Some(json!({})));
+    assert_eq!(
+        projected, native,
+        "identity projection must reproduce the native billing row"
+    );
+}
+
+#[test]
 fn test_charges_row_projection_renames_omits_and_adds() {
     let row = projected_charges_row(json!({
         "rename": { "proxy_id": "route_id", "total_charges": "amount" },

@@ -12,6 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ferrum_edge::plugins::api_chargeback_sink::{
+    ChargeEvent, compile_charge_event_projection, serialize_json_each_row,
+    serialize_json_each_row_projected,
+};
 use ferrum_edge::plugins::utils::log_schema::{
     CHARGE_EVENT_FIELDS, CHARGEBACK_REPORT_FIELDS, DEBUG_HTTP_FIELDS, DEBUG_STREAM_FIELDS,
     DEBUG_WS_FIELDS, HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS,
@@ -310,6 +314,104 @@ fn charge_event_fields_registry_matches_struct() {
     );
     // `received_at` is an epoch-nanosecond integer, not an RFC3339 string.
     assert!(CHARGE_EVENT_FIELDS.iter().all(|f| !f.is_timestamp));
+
+    // Struct-derived drift guard, mirroring `http_fields_registry_matches_struct`.
+    // The declaration-order assertion above only re-states the constant; it
+    // cannot see a field ADDED to `ChargeEvent`. Without this comparison a new
+    // charge-event column would keep flowing on the native path while every
+    // deployment running a `schema:` / `schema_ref:` projection silently
+    // dropped it from the ClickHouse INSERT body and the durable spool
+    // artifact alike.
+    let value = serde_json::to_value(fully_populated_charge_event()).expect("serialize");
+    let emitted: HashSet<String> = value.as_object().expect("object").keys().cloned().collect();
+    let names: HashSet<String> = CHARGE_EVENT_FIELDS.iter().map(|f| f.name.to_string()).collect();
+    let missing_from_registry: Vec<&String> = emitted.difference(&names).collect();
+    let missing_from_struct: Vec<&String> = names.difference(&emitted).collect();
+    assert!(
+        missing_from_registry.is_empty() && missing_from_struct.is_empty(),
+        "ChargeEvent <-> CHARGE_EVENT_FIELDS drift detected.\n  In struct but missing from registry: {:?}\n  In registry but missing from struct: {:?}",
+        missing_from_registry,
+        missing_from_struct,
+    );
+}
+
+/// Populate every `ChargeEvent` member, including each `Option`, so no
+/// `skip_serializing_if` guard hides a key.
+///
+/// Deliberately written without a struct-update base: a new member on
+/// `ChargeEvent` must be added here too, which is the compile-time half of the
+/// drift guard above.
+fn fully_populated_charge_event() -> ChargeEvent {
+    ChargeEvent {
+        event_id: "01JQ0000000000000000000000".to_string(),
+        received_at: 1_778_500_800_000_000_000,
+        node_id: "node-a".to_string(),
+        namespace: "ferrum".to_string(),
+        consumer_id: "alice".to_string(),
+        consumer_name: Some("Alice".to_string()),
+        proxy_id: "proxy-a".to_string(),
+        proxy_name: "My API".to_string(),
+        route_id: Some("route-1".to_string()),
+        status_code: 200,
+        http_status_code: Some(200),
+        grpc_status: Some(0),
+        protocol: "http".to_string(),
+        call_count: 3,
+        charge_call: 0.5,
+        bytes_sent: 100,
+        bytes_received: 200,
+        charge_bytes_sent: 0.001,
+        charge_bytes_received: 0.002,
+        charge_total: 0.503,
+        currency: "USD".to_string(),
+        pricing_version: "test-v1".to_string(),
+        request_id: Some("req-1".to_string()),
+        trace_id: Some("trace-1".to_string()),
+        snapshot_id: Some("snap-1".to_string()),
+    }
+}
+
+/// The same event with every optional member absent, so the projected row's
+/// `skip_serializing_if` parity is exercised in both directions.
+fn charge_event_without_optionals() -> ChargeEvent {
+    ChargeEvent {
+        consumer_name: None,
+        route_id: None,
+        http_status_code: None,
+        grpc_status: None,
+        request_id: None,
+        trace_id: None,
+        snapshot_id: None,
+        ..fully_populated_charge_event()
+    }
+}
+
+#[test]
+fn charge_event_identity_projection_matches_the_native_row() {
+    // `ChargeEvent` has two independent emitters: the serde derive (no schema
+    // configured) and the hand-written `SchemaSerializable::serialize_native`
+    // arms driven by `CHARGE_EVENT_FIELDS`. An identity projection must
+    // reproduce the native row exactly — same members, same presence, same
+    // values — otherwise a member covered by only one of the two silently
+    // changes the exported billing record for projected deployments only.
+    let projection = compile_charge_event_projection(&serde_json::json!({ "schema": {} }))
+        .expect("identity schema compiles")
+        .expect("schema present");
+
+    for (label, event) in [
+        ("all optional members present", fully_populated_charge_event()),
+        ("all optional members absent", charge_event_without_optionals()),
+    ] {
+        let rows = std::slice::from_ref(&event);
+        let native = serialize_json_each_row(rows).expect("native");
+        let shaped = serialize_json_each_row_projected(rows, Some(&projection)).expect("shaped");
+        let native_value: serde_json::Value = serde_json::from_str(&native).expect("native JSON");
+        let shaped_value: serde_json::Value = serde_json::from_str(&shaped).expect("shaped JSON");
+        assert_eq!(
+            shaped_value, native_value,
+            "{label}: identity projection drifted"
+        );
+    }
 }
 
 #[test]
