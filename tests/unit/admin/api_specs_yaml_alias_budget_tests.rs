@@ -95,6 +95,10 @@ fn merge_key_expands_when_present() {
 #[test]
 fn merge_sequence_uses_earlier_mapping_precedence() {
     let yaml = concat!(
+        "openapi: '3.1.0'\n",
+        "info:\n",
+        "  title: Merge Sequence\n",
+        "  version: '1.0.0'\n",
         "first: &first\n",
         "  backend_host: first.internal\n",
         "  backend_port: 443\n",
@@ -113,7 +117,14 @@ fn merge_sequence_uses_earlier_mapping_precedence() {
 #[test]
 fn quoted_merge_spelling_remains_an_ordinary_mapping_key() {
     let yaml = format!(
-        concat!("\"<<\": literal-value\n", "{}"),
+        concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Quoted Merge\n",
+            "  version: '1.0.0'\n",
+            "\"<<\": literal-value\n",
+            "{}",
+        ),
         proxy_yaml("quoted-merge-proxy")
     );
     let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
@@ -327,10 +338,11 @@ fn control_character_string_escaping_cannot_bypass_byte_budget() {
 }
 
 #[test]
-fn control_character_mapping_key_escaping_cannot_bypass_byte_budget() {
-    // Same inflation applied to mapping keys: alias reuse of a control-heavy
-    // key must charge JSON escaping, not decoded UTF-8 length alone.
-    let chunk = "\\u0001".repeat(100_000);
+fn escaped_mapping_key_cannot_bypass_byte_budget() {
+    // Same inflation applied to mapping keys: alias reuse of an escape-heavy
+    // key must charge JSON escaping, not decoded UTF-8 length alone. Unlike
+    // control characters, escaped backslashes remain valid YAML mapping keys.
+    let chunk = "\\\\".repeat(300_000);
     let aliases = std::iter::repeat_n("  - *e\n", 64).collect::<String>();
     let yaml = format!("e: &e\n  \"{chunk}\": 1\nitems:\n{aliases}");
     let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
@@ -339,10 +351,10 @@ fn control_character_mapping_key_escaping_cannot_bypass_byte_budget() {
             &err,
             ExtractError::InvalidYaml(msg) if msg.contains("expanded byte limit")
         ),
-        "control-character key escaping must hit the expanded-byte budget, got {err:?}"
+        "escaped key must hit the expanded-byte budget, got {err:?}"
     );
     assert!(
-        !format!("{err:?}").contains('\u{0001}'),
+        format!("{err:?}").len() < 1_024,
         "byte-budget diagnostics must not echo hostile key material"
     );
 }
@@ -394,7 +406,16 @@ fn flow_style_autodetect_expands_aliases_under_same_budgets() {
 #[test]
 fn parser_storage_remains_stable_across_repeated_extracts() {
     for index in 0..64 {
-        let yaml = proxy_yaml(&format!("stable-parser-{index}"));
+        let yaml = format!(
+            concat!(
+                "openapi: '3.1.0'\n",
+                "info:\n",
+                "  title: Stable Parser\n",
+                "  version: '1.0.0'\n",
+                "{}",
+            ),
+            proxy_yaml(&format!("stable-parser-{index}"))
+        );
         let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
         assert_eq!(bundle.proxy.id, format!("stable-parser-{index}"));
     }
