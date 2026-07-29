@@ -10506,7 +10506,7 @@ async fn multiple_sse_ambiguous_frames_keep_fixed_observation_cardinality() {
         "data: {\"c\":1,\"c\":2}\n\n",
         "data: [DONE]\n\n"
     );
-    let mut config = streaming_config(json!({}), "allow");
+    let mut config = streaming_config(json!({}), "deny");
     config["mode"] = json!("dry_run");
     let plugin = Arc::new(make(config));
     let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
