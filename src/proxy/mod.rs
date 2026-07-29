@@ -17580,6 +17580,7 @@ pub(crate) fn build_response_from_normalized_reject(
     let is_grpc_error = reject.grpc_status.is_some();
     let failed_websocket_handshake = reject.failed_websocket_handshake;
     let status = reject.http_status.as_u16();
+    let is_framed_unary_reject = framed_unary_reject_parts(&reject).is_some();
     let mut headers = reject.headers;
     // A failed WebSocket handshake is still an ordinary HTTP response (RFC 6455
     // §4.2.2), so it keeps its negotiated HTTP version and an authoritative
@@ -17612,7 +17613,7 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if framed_unary_reject_parts(&reject).is_some() {
+    let body = if is_framed_unary_reject {
         let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
         ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
     } else if reject.body.is_empty() {
