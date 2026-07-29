@@ -38234,13 +38234,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -38256,9 +38263,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
@@ -38280,13 +38287,20 @@ mod tests {
             "model": "gpt-test",
             "messages": [{"role": "user", "content": "hello"}]
         });
-
-        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
-        let mut request_headers =
+        let request_body_bytes = serde_json::to_vec(&request_body).unwrap();
+        let request_headers =
             HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        // Lookup lives in on_final_request_body (priority 4057), after final
+        // request transforms and before provider I/O — not in before_proxy.
+        let mut miss_ctx = request_ctx_with_ai_body(request_body.clone());
         assert!(matches!(
             cache
-                .before_proxy(&mut miss_ctx, &mut request_headers)
+                .on_final_request_body_with_context(
+                    &mut miss_ctx,
+                    &request_headers,
+                    &request_body_bytes
+                )
                 .await,
             PluginResult::Continue
         ));
@@ -38302,9 +38316,9 @@ mod tests {
             .await;
 
         let mut hit_ctx = request_ctx_with_ai_body(request_body);
-        let mut hit_headers =
-            HashMap::from([("content-type".to_string(), "application/json".to_string())]);
-        let synthetic = cache.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        let synthetic = cache
+            .on_final_request_body_with_context(&mut hit_ctx, &request_headers, &request_body_bytes)
+            .await;
         assert!(matches!(synthetic, PluginResult::RejectBinary { .. }));
 
         let response = normalize_synthetic_reject_for_test(&plugins, &mut hit_ctx, synthetic).await;
