@@ -17,8 +17,9 @@ Upstream mode queries filed upstream PRs via the GitHub REST API and reports del
 that still need filing or dated owner reaffirmation before the first stable
 release checkpoint (docs/dependency-policy.md).
 
---self-test exercises shape/wrapper/policy-ID validators with synthetic fixtures
-only (no network, no repository mutation).
+Every normal invocation runs synthetic self-tests first, then repository parity.
+--self-test runs only the synthetic fixtures and exits (no network, no repository
+mutation). --upstream-status self-tests, then parity, then network reporting.
 """
 
 from __future__ import annotations
@@ -64,21 +65,18 @@ INVENTORY_ROW_RE = re.compile(
     r"^\|\s*`([^`]+)`\s*\|\s*`[^`]+`\s*\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*[^|\n]+\|\s*\["
 )
 GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
-WRAPPER_DIR_ASSIGN_RE = re.compile(
-    r'^SCRIPT_DIR="\$\(CDPATH= cd -- "\$\(dirname -- "\$0"\)" && pwd\)"$'
-)
-WRAPPER_EXEC_RE = re.compile(
-    r'^exec python3 "\$SCRIPT_DIR/check_vendored_patch_lifecycle\.py" --upstream-status$'
+WRAPPER_SET_LINES = frozenset({"set -uo pipefail", "set -euo pipefail"})
+WRAPPER_DIR_ASSIGN = 'SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
+WRAPPER_EXEC = (
+    'exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status'
 )
 USER_AGENT = "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
 
 
-def load_lifecycle() -> dict[str, Any]:
+def load_lifecycle() -> Any:
+    """Decode the lifecycle inventory. Structural checks live in validate_lifecycle_shape."""
     with LIFECYCLE_PATH.open(encoding="utf-8") as handle:
-        data = json.load(handle)
-    if data.get("schema_version") != 1:
-        raise ValueError(f"unsupported schema_version in {LIFECYCLE_PATH}")
-    return data
+        return json.load(handle)
 
 
 def parse_patch_crates_io(cargo_path: Path) -> dict[str, str]:
@@ -164,6 +162,9 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
     if not isinstance(data, dict):
         return ["lifecycle inventory must be a JSON object"]
 
+    if data.get("schema_version") != 1:
+        errors.append("schema_version must be 1")
+
     patches = data.get("patches")
     if not isinstance(patches, list) or not patches:
         errors.append("patches must be a non-empty list")
@@ -212,6 +213,24 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                     f"{prefix}.upstream.issue_number: must be a positive integer when present"
                 )
 
+            fork_ref = upstream.get("fork_ref")
+            if fork_ref is not None and not _is_nonempty_str(fork_ref):
+                errors.append(
+                    f"{prefix}.upstream.fork_ref: must be null or a non-empty string"
+                )
+
+        reaffirmation = patch.get("reaffirmation")
+        if reaffirmation is not None:
+            if not isinstance(reaffirmation, dict):
+                errors.append(f"{prefix}.reaffirmation: must be null or an object")
+            else:
+                for field in ("date", "owner", "reason"):
+                    _require_nonempty_str(
+                        reaffirmation.get(field),
+                        f"{prefix}.reaffirmation.{field}",
+                        errors,
+                    )
+
         _require_nonempty_str_list(
             patch.get("regression_tests"), f"{prefix}.regression_tests", errors
         )
@@ -223,6 +242,12 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
             _require_nonempty_str(
                 retirement.get("trigger"), f"{prefix}.retirement.trigger", errors
             )
+            co_group = retirement.get("co_retirement_group")
+            if co_group is not None and not _is_nonempty_str(co_group):
+                errors.append(
+                    f"{prefix}.retirement.co_retirement_group: must be null or a "
+                    "non-empty string"
+                )
             compatible = retirement.get("compatible_release_test")
             if not isinstance(compatible, dict):
                 errors.append(
@@ -234,9 +259,56 @@ def validate_lifecycle_shape(data: Any) -> list[str]:
                     errors.append(
                         f"{prefix}: invalid compatible_release_test.status {status!r}"
                     )
+                notes = compatible.get("notes")
+                if notes is not None and not isinstance(notes, str):
+                    errors.append(
+                        f"{prefix}.retirement.compatible_release_test.notes: "
+                        "must be null or a string"
+                    )
 
     checklist = data.get("retirement_checklist")
     _require_nonempty_str_list(checklist, "retirement_checklist", errors)
+
+    declared_groups = data.get("co_retirement_groups", [])
+    if not isinstance(declared_groups, list):
+        errors.append("co_retirement_groups must be a list when present")
+        declared_groups = []
+
+    seen_group_ids: set[str] = set()
+    for group_index, group in enumerate(declared_groups):
+        if not isinstance(group, dict):
+            errors.append(f"co_retirement_groups[{group_index}]: must be an object")
+            continue
+        gid = group.get("id")
+        if not _is_nonempty_str(gid):
+            errors.append(f"co_retirement_groups[{group_index}]: id must be a non-empty string")
+            continue
+        if gid in seen_group_ids:
+            errors.append(f"duplicate co_retirement_group id {gid!r}")
+        else:
+            seen_group_ids.add(gid)
+
+        members = group.get("patch_ids")
+        if not isinstance(members, list) or not members:
+            errors.append(
+                f"co_retirement_groups.{gid}: patch_ids must be a non-empty list"
+            )
+            continue
+        member_ok = True
+        for member_index, member in enumerate(members):
+            if not _is_nonempty_str(member):
+                errors.append(
+                    f"co_retirement_groups.{gid}.patch_ids[{member_index}]: "
+                    "must be a non-empty string"
+                )
+                member_ok = False
+        if not member_ok:
+            continue
+        if len(members) != len(set(members)):
+            errors.append(
+                f"co_retirement_groups.{gid}: duplicate patch id in patch_ids"
+            )
+
     return errors
 
 
@@ -251,47 +323,41 @@ def executable_wrapper_lines(script_text: str) -> list[str]:
 
 
 def wrapper_delegation_errors(script_text: str) -> list[str]:
-    """Validate safe, directory-local delegation to the Python upstream checker."""
+    """Require the executable body to be exactly set + SCRIPT_DIR + quoted exec."""
     errors: list[str] = []
     lines = executable_wrapper_lines(script_text)
     if not lines:
         return ["scripts/check_vendored_patch_status.sh has no executable lines"]
 
-    if not any(line == "set -uo pipefail" or line == "set -euo pipefail" for line in lines):
+    exact = (
+        len(lines) == 3
+        and lines[0] in WRAPPER_SET_LINES
+        and lines[1] == WRAPPER_DIR_ASSIGN
+        and lines[2] == WRAPPER_EXEC
+    )
+    if exact:
+        return errors
+
+    if lines[0] not in WRAPPER_SET_LINES:
         errors.append(
             "scripts/check_vendored_patch_status.sh must enable nounset/pipefail "
-            "(set -uo pipefail or set -euo pipefail)"
+            "(set -uo pipefail or set -euo pipefail) as the first executable line"
         )
-
-    dir_assigns = [line for line in lines if line.startswith("SCRIPT_DIR=")]
-    if len(dir_assigns) != 1 or not WRAPPER_DIR_ASSIGN_RE.fullmatch(dir_assigns[0]):
+    if len(lines) < 2 or lines[1] != WRAPPER_DIR_ASSIGN:
         errors.append(
             "scripts/check_vendored_patch_status.sh must assign SCRIPT_DIR from "
             'the wrapper path via: SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"'
         )
-
-    exec_lines = [line for line in lines if line.startswith("exec ")]
-    if len(exec_lines) != 1 or not WRAPPER_EXEC_RE.fullmatch(exec_lines[0]):
+    if len(lines) < 3 or lines[2] != WRAPPER_EXEC:
         errors.append(
             "scripts/check_vendored_patch_status.sh must delegate with: "
             'exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status'
         )
-
-    # Reject cwd-relative or unquoted invocation forms that bypass the safe pattern.
-    joined = "\n".join(lines)
-    if "scripts/check_vendored_patch_lifecycle.py" in joined:
+    if len(lines) != 3:
         errors.append(
-            "scripts/check_vendored_patch_status.sh must not invoke the checker via a "
-            "cwd-relative scripts/ path"
-        )
-    if re.search(r"exec\s+python3\s+\$SCRIPT_DIR/", joined):
-        errors.append(
-            "scripts/check_vendored_patch_status.sh must quote $SCRIPT_DIR when "
-            "invoking the lifecycle checker"
-        )
-    if "eval " in joined or "`" in joined:
-        errors.append(
-            "scripts/check_vendored_patch_status.sh must not use eval or backtick substitution"
+            "scripts/check_vendored_patch_status.sh executable body must be exactly "
+            "the accepted set line, SCRIPT_DIR assignment, and quoted exec "
+            "(no extra, reordered, duplicated, or conditional statements)"
         )
     return errors
 
@@ -336,7 +402,7 @@ def policy_id_parity_errors(
     return errors
 
 
-def parity_errors(data: dict[str, Any]) -> list[str]:
+def parity_errors(data: Any) -> list[str]:
     errors: list[str] = []
     shape_errors = validate_lifecycle_shape(data)
     errors.extend(shape_errors)
@@ -349,6 +415,10 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
         )
     else:
         errors.append("missing scripts/check_vendored_patch_status.sh wrapper")
+
+    # Hostile top-level JSON (list/scalar) must fail closed without AttributeError.
+    if not isinstance(data, dict):
+        return errors
 
     patches_raw = data.get("patches")
     usable_patches = isinstance(patches_raw, list) and all(
@@ -405,7 +475,7 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
                 errors.append(
                     f"{pid}: lifecycle.reaffirmation set but README lacks matching dated reaffirmation"
                 )
-            if reaffirmation is not None and readme_reaffirm is not None:
+            if isinstance(reaffirmation, dict) and readme_reaffirm is not None:
                 for key in ("date", "owner", "reason"):
                     if str(reaffirmation.get(key, "")).strip() != readme_reaffirm[key]:
                         errors.append(
@@ -413,40 +483,27 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
                         )
 
     declared_groups = data.get("co_retirement_groups", [])
+    if not isinstance(declared_groups, list):
+        declared_groups = []
     known_ids = set(patch_ids)
     patch_declared_group = {
         patch["id"]: patch["retirement"].get("co_retirement_group") for patch in patches
     }
     group_members: dict[str, list[str]] = {}
-    seen_group_ids: set[str] = set()
     patch_group_membership: dict[str, str] = {}
 
-    if not isinstance(declared_groups, list):
-        errors.append("co_retirement_groups must be a list when present")
-        declared_groups = []
-
     for group in declared_groups:
+        # Shape validation already rejected non-objects / bad ids / bad members.
         if not isinstance(group, dict):
-            errors.append("co_retirement_groups entry must be an object")
             continue
         gid = group.get("id")
-        if not isinstance(gid, str) or not gid.strip():
-            errors.append("co_retirement_groups entry missing id")
+        if not _is_nonempty_str(gid):
             continue
-        if gid in seen_group_ids:
-            errors.append(f"duplicate co_retirement_group id {gid!r}")
-        seen_group_ids.add(gid)
-
         members = group.get("patch_ids")
         if not isinstance(members, list) or not members:
-            errors.append(
-                f"co_retirement_groups.{gid}: patch_ids must be a non-empty list"
-            )
             continue
-        if len(members) != len(set(members)):
-            errors.append(
-                f"co_retirement_groups.{gid}: duplicate patch id in patch_ids"
-            )
+        if not all(_is_nonempty_str(member) for member in members):
+            continue
 
         group_members[gid] = members
         for member in members:
@@ -608,7 +665,7 @@ def run_upstream_status(data: dict[str, Any]) -> int:
             if fork_ref:
                 print(f"- deliberate fork staging ref: {fork_ref}")
             reaffirmation = patch.get("reaffirmation")
-            if reaffirmation:
+            if isinstance(reaffirmation, dict):
                 print(
                     "- deliberate fork reaffirmation: "
                     f"{reaffirmation['date']} by {reaffirmation['owner']}: "
@@ -668,7 +725,7 @@ def run_upstream_status(data: dict[str, Any]) -> int:
     return 0
 
 
-def run_parity(data: dict[str, Any]) -> int:
+def run_parity(data: Any) -> int:
     errors = parity_errors(data)
     if errors:
         for message in errors:
@@ -680,8 +737,9 @@ def run_parity(data: dict[str, Any]) -> int:
             "Cargo.toml [patch.crates-io], scripts/check_vendored_patch_lifecycle.py, vendor/)."
         )
         return 1
+    patch_count = len(data["patches"]) if isinstance(data, dict) else 0
     print(
-        f"ok: lifecycle inventory covers {len(data['patches'])} patches with parity across "
+        f"ok: lifecycle inventory covers {patch_count} patches with parity across "
         "Cargo.toml, vendor/, policy docs, and per-patch READMEs."
     )
     return 0
@@ -905,7 +963,7 @@ exec python3 scripts/check_vendored_patch_lifecycle.py --upstream-status
 """
     expect_contains(
         wrapper_delegation_errors(cwd_relative),
-        "cwd-relative",
+        "exactly",
         "cwd-relative wrapper",
     )
 
@@ -916,7 +974,7 @@ exec python3 $SCRIPT_DIR/check_vendored_patch_lifecycle.py --upstream-status
 """
     expect_contains(
         wrapper_delegation_errors(unquoted),
-        "quote $SCRIPT_DIR",
+        "must delegate with",
         "unquoted SCRIPT_DIR wrapper",
     )
 
@@ -928,6 +986,124 @@ true
         wrapper_delegation_errors(noop),
         "must delegate with",
         "no-op wrapper",
+    )
+
+    early_exit = """#!/usr/bin/env bash
+set -uo pipefail
+exit 0
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status
+"""
+    expect_contains(
+        wrapper_delegation_errors(early_exit),
+        "exactly",
+        "early-exit wrapper with otherwise-valid lines",
+    )
+
+    trailing = """#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status
+true
+"""
+    expect_contains(
+        wrapper_delegation_errors(trailing),
+        "exactly",
+        "wrapper with trailing command",
+    )
+
+    expect_contains(
+        validate_lifecycle_shape(["not", "an", "object"]),
+        "must be a JSON object",
+        "non-object top level",
+    )
+    expect_contains(
+        parity_errors(["not", "an", "object"]),
+        "must be a JSON object",
+        "parity non-object top level",
+    )
+
+    unsupported_schema = {**base, "schema_version": 99}
+    expect_contains(
+        validate_lifecycle_shape(unsupported_schema),
+        "schema_version must be 1",
+        "unsupported schema_version",
+    )
+    expect_contains(
+        parity_errors(unsupported_schema),
+        "schema_version must be 1",
+        "parity unsupported schema_version",
+    )
+
+    bad_reaffirmation = {
+        **base,
+        "patches": [_valid_patch(reaffirmation="not-an-object")],
+    }
+    expect_contains(
+        validate_lifecycle_shape(bad_reaffirmation),
+        "reaffirmation: must be null or an object",
+        "malformed reaffirmation",
+    )
+    expect_contains(
+        parity_errors(bad_reaffirmation),
+        "reaffirmation: must be null or an object",
+        "parity malformed reaffirmation",
+    )
+
+    incomplete_reaffirmation = {
+        **base,
+        "patches": [
+            _valid_patch(reaffirmation={"date": "2026-01-01", "owner": "", "reason": "x"})
+        ],
+    }
+    expect_contains(
+        validate_lifecycle_shape(incomplete_reaffirmation),
+        "reaffirmation.owner",
+        "reaffirmation missing owner",
+    )
+
+    unhashable_members = {
+        **base,
+        "co_retirement_groups": [
+            {"id": "g1", "patch_ids": [{"nested": True}, ["list"]]},
+        ],
+        "patches": [_valid_patch()],
+    }
+    expect_contains(
+        validate_lifecycle_shape(unhashable_members),
+        "must be a non-empty string",
+        "unhashable co_retirement group members",
+    )
+    # Must fail closed as parity errors, never TypeError from set()/dict keys.
+    expect_contains(
+        parity_errors(unhashable_members),
+        "must be a non-empty string",
+        "parity unhashable co_retirement group members",
+    )
+
+    invalid_co_group = {
+        **base,
+        "patches": [_valid_patch(retirement={"co_retirement_group": ""})],
+    }
+    expect_contains(
+        validate_lifecycle_shape(invalid_co_group),
+        "co_retirement_group: must be null or a non-empty string",
+        "empty co_retirement_group",
+    )
+
+    list_co_group = {
+        **base,
+        "patches": [_valid_patch(retirement={"co_retirement_group": ["g"]})],
+    }
+    expect_contains(
+        validate_lifecycle_shape(list_co_group),
+        "co_retirement_group: must be null or a non-empty string",
+        "list co_retirement_group",
+    )
+    expect_contains(
+        parity_errors(list_co_group),
+        "co_retirement_group: must be null or a non-empty string",
+        "parity list co_retirement_group",
     )
 
     matching_policy = "\n".join(
@@ -994,17 +1170,28 @@ def main() -> int:
     parser.add_argument(
         "--upstream-status",
         action="store_true",
-        help="Report upstream PR state and deliberate-fork reaffirmation gaps (weekly workflow).",
+        help=(
+            "After self-test and parity, report upstream PR state and deliberate-fork "
+            "reaffirmation gaps (weekly workflow)."
+        ),
     )
     parser.add_argument(
         "--self-test",
         action="store_true",
-        help="Run deterministic static validator self-tests (no network, no repo mutation).",
+        help=(
+            "Run only deterministic static validator self-tests and exit "
+            "(no network, no repo mutation). Normal invocations also self-test first."
+        ),
     )
     args = parser.parse_args()
 
     if args.self_test:
         return run_self_test()
+
+    # Every normal checker path self-tests first, then repository parity.
+    self_test_code = run_self_test()
+    if self_test_code != 0:
+        return self_test_code
 
     if not LIFECYCLE_PATH.is_file():
         print(f"::error::missing lifecycle inventory at {LIFECYCLE_PATH}")
@@ -1012,7 +1199,7 @@ def main() -> int:
 
     try:
         data = load_lifecycle()
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         print(f"::error::failed to load lifecycle inventory: {exc}")
         return 1
 
@@ -1020,6 +1207,9 @@ def main() -> int:
     if parity_code != 0:
         return parity_code
     if args.upstream_status:
+        if not isinstance(data, dict):
+            print("::error::lifecycle inventory must be a JSON object for upstream status")
+            return 1
         return run_upstream_status(data)
     return 0
 

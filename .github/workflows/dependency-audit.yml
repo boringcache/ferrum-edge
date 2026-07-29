@@ -76,16 +76,15 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Vendored-patch lifecycle self-test
-        run: python3 scripts/check_vendored_patch_lifecycle.py --self-test
-
       - name: Vendored-patch lifecycle parity
+        # Checker runs synthetic self-tests before repository parity.
         run: python3 scripts/check_vendored_patch_lifecycle.py
 
       - name: Check upstream status of vendored patches
         # Reports each vendored patch's upstream PR state + latest crates.io
         # release. Fails (red scheduled run) when an upstream PR has merged, so
         # a retireable vendor copy can't be missed. See docs/dependency-policy.md.
+        # Wrapper path also self-tests, then parity, then network reporting.
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/check_vendored_patch_status.sh
