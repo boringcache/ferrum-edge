@@ -974,6 +974,7 @@ jobs:
               functional_spec_expose_test
               functional_prometheus_test
               functional_serverless_mirror_test
+              functional_serverless_grpc_terminate_test
               functional_ws_plugins_test
               functional_circuit_breaker_retry_test
               functional_dns_cache_test
