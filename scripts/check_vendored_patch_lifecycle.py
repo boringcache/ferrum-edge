@@ -13,7 +13,7 @@ Parity mode fails closed when the lifecycle contract drifts from:
   - docs/dependency-policy.md inventory table rows
   - per-patch README.md paths
 
-Upstream mode queries filed upstream PRs via gh and reports deliberate forks
+Upstream mode queries filed upstream PRs via the GitHub REST API and reports deliberate forks
 that still need filing or dated owner reaffirmation before the first stable
 release checkpoint (docs/dependency-policy.md).
 """
@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import subprocess
 import sys
 import urllib.request
 from pathlib import Path
@@ -248,38 +248,47 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
     return errors
 
 
-def gh_pr_state(repo: str, pr_number: int) -> str | None:
+GITHUB_REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+USER_AGENT = "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
+
+
+def github_auth_headers() -> dict[str, str]:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/vnd.github+json",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def github_pr_state(repo: str, pr_number: int) -> str | None:
+    if not GITHUB_REPO_RE.fullmatch(repo) or pr_number <= 0:
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
+        headers=github_auth_headers(),
+    )
     try:
-        proc = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(pr_number),
-                "--repo",
-                repo,
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+    except Exception:
         return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip() or None
+    if payload.get("merged_at"):
+        return "MERGED"
+    state = payload.get("state")
+    if state == "open":
+        return "OPEN"
+    if state == "closed":
+        return "CLOSED"
+    return None
 
 
 def crates_io_latest(crate: str) -> str | None:
     request = urllib.request.Request(
         f"https://crates.io/api/v1/crates/{crate}",
-        headers={
-            "User-Agent": "ferrum-edge-dependency-audit (github.com/ferrum-edge/ferrum-edge)"
-        },
+        headers={"User-Agent": USER_AGENT},
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -342,7 +351,7 @@ def run_upstream_status(data: dict[str, Any]) -> int:
                     "dated reaffirmation in the lifecycle inventory."
                 )
         elif pr is not None:
-            state = gh_pr_state(upstream["github_repo"], pr)
+            state = github_pr_state(upstream["github_repo"], pr)
             if not state:
                 print(
                     f"  ::warning::could not query upstream PR "

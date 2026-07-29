@@ -7,8 +7,9 @@
 # tracked upstream PR has MERGED (a retirement signal), so the scheduled run
 # goes red and a maintainer follows the retirement checklist.
 #
-# Requires `gh` (GitHub CLI, auto-authenticated via GH_TOKEN in Actions) and
-# network access for crates.io. Safe to run locally if `gh auth status` is set up.
+# Requires network access for api.github.com and crates.io. In Actions, set
+# GH_TOKEN (or GITHUB_TOKEN) so upstream PR queries use authenticated REST API
+# rate limits. Safe to run locally without a token for public upstream repos.
 #
 # Canonical inventory: docs/vendored-patch-lifecycle.json (enforced by
 # scripts/check_vendored_patch_lifecycle.py on every PR and weekly).
