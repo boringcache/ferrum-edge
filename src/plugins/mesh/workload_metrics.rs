@@ -29,7 +29,9 @@ use crate::plugins::otel_tracing::{
     trace_exporters_from_providers, trace_is_sampled, validate_trace_provider_endpoints,
 };
 use crate::plugins::utils::PluginHttpClient;
-use crate::plugins::utils::metadata_redaction::is_sensitive_metadata_key;
+use crate::plugins::utils::metadata_redaction::{
+    is_operator_sensitive_metadata_key, is_sensitive_metadata_key,
+};
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
     StreamTransactionSummary, TransactionSummary, priority,
@@ -1556,11 +1558,22 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
 /// substring search (so `ISTIO_META_CLUSTER_ID` / `FERRUM_REGION` stay allowed
 /// and incidental fragments inside unrelated words are not rejected).
 fn is_sensitive_environment_variable_name(name: &str) -> bool {
-    if is_sensitive_metadata_key(name) {
+    if is_operator_sensitive_metadata_key(name) {
         return true;
     }
 
     let fingerprint = environment_name_fingerprint(name);
+    if matches!(
+        fingerprint.as_str(),
+        "cache_request_headers_snapshot"
+            | "grpc_web_shadowed_trailers"
+            | "claim_header"
+            | "last_event_id"
+            | "lasteventid"
+    ) || fingerprint.starts_with("claim_header_")
+    {
+        return true;
+    }
     let segments: Vec<&str> = fingerprint
         .split('_')
         .filter(|segment| !segment.is_empty())
@@ -1613,6 +1626,10 @@ fn is_credential_token(segment: &str) -> bool {
             | "key"
             | "dsn"
             | "connection"
+            | "authorization"
+            | "bearer"
+            | "cookie"
+            | "csrf"
     )
 }
 

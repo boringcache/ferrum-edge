@@ -165,6 +165,11 @@ fn custom_env_tags_reject_credential_bypass_spellings_without_echo() {
         "GOOGLE_APPLICATION_CREDENTIALS",
         "FERRUM_DB_URL",
         "DATABASE_CONNECTION_STRING",
+        "AUTHORIZATION",
+        "SESSION_COOKIE",
+        "CACHE_REQUEST_HEADERS_SNAPSHOT",
+        "CLAIM_HEADER_SUBJECT",
+        "LAST_EVENT_ID",
     ];
 
     for env_var in cases {
@@ -215,6 +220,8 @@ fn custom_env_tags_do_not_reject_incidental_benign_fragments() {
     for env_var in [
         "AUTHENTICATION_MODE",
         "KEYBOARD_LAYOUT",
+        "SECRETION_RATE",
+        "SECRETARIAT_REGION",
         "CLUSTER_ID",
         "CLIENT_NAME",
         "REDIS_HOST",
