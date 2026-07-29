@@ -49,9 +49,11 @@
 //! mirrors dial through `PluginHttpClient::get_http2` (h2c prior knowledge for
 //! cleartext `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep
 //! the default all-version client so HTTP/1.1 destinations continue to work.
-//! The request-target prefers the original raw query (after the same auth
-//! credential strips the primary backend uses) so duplicate keys, order, flags,
-//! `+`, percent escapes, and encoded bytes match the primary contract.
+//! The request-target prefers the canonical backend-visible query (transformer
+//! outbound query when present, otherwise the original raw query, after the
+//! same auth credential strips the primary backend uses) so duplicate keys,
+//! order, flags, `+`, percent escapes, and encoded bytes match the primary
+//! contract.
 //!
 //! Path selection precedence when building the mirror URL:
 //! 1. explicit plugin `mirror_path` (operator override; wins)
@@ -160,7 +162,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde_json::{Map, Value};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -1015,11 +1016,12 @@ impl RequestMirror {
 
     /// Build the full mirror URL from the configured or gateway-selected path.
     ///
-    /// Prefer the effective raw query string (original wire query after the same
-    /// auth credential strips primary dispatch applies) so duplicate keys,
-    /// ordering, flags, empty values, `+`, percent escapes, and non-ASCII
-    /// encoded bytes survive. Fall back to the materialised `query_params` map
-    /// only when no raw query is available (tests / already-decoded contexts).
+    /// Prefer the effective backend query string (transformer outbound query
+    /// composed with auth credential strips) so duplicate keys, ordering,
+    /// flags, empty values, `+`, percent escapes, and non-ASCII encoded bytes
+    /// match primary dispatch. Fall back to the materialised `query_params`
+    /// map only when no raw/outbound query is available (tests / already-decoded
+    /// contexts).
     fn build_mirror_url(
         &self,
         original_path: &str,
@@ -1391,23 +1393,17 @@ impl Plugin for RequestMirror {
         // that primary dispatch still needs. An explicit operator mirror_path
         // remains authoritative.
         let mirror_path = self.select_mirror_path(ctx);
-        // Match primary backend query construction: start from the retained raw
-        // query, then apply auth credential strips marked on the context.
-        // Decoded `request_transformer` query-map mutations are intentionally
-        // not re-serialized here — primary dispatch likewise keeps the raw
-        // (auth-stripped) wire query.
-        let query_map_was_transformed = ctx
-            .metadata
-            .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY);
-        let effective_query = match ctx.raw_query_string() {
-            Some(raw) => Some(crate::proxy::query_string_after_plugin_strips(ctx, raw)),
-            // Query-transformer map mutations are intentionally not serialized
-            // by primary dispatch. Preserve that contract even when the client
-            // supplied no original query, while retaining the legacy map
-            // fallback for synthetic/test contexts with no transform marker.
-            None if query_map_was_transformed => Some(Cow::Borrowed("")),
-            None => None,
-        };
+        // Match primary backend query construction: transformer-published
+        // outbound query (when present) composed with auth credential strips.
+        // Primary and mirror must observe the same canonical request-target
+        // query identity and ordering. Fall back to the materialised map only
+        // when neither a raw nor outbound query was retained (synthetic tests).
+        let effective_query =
+            if ctx.outbound_query_string().is_some() || ctx.raw_query_string().is_some() {
+                Some(crate::proxy::effective_backend_query_string(ctx))
+            } else {
+                None
+            };
         let mirror_url =
             self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
         let method = ctx.method.clone();

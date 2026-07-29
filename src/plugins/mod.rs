@@ -1841,8 +1841,16 @@ pub struct RequestContext {
     headers_materialized: bool,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
-    /// duplicate pairs.
+    /// duplicate pairs. Unmodified when no query mutation/strip applies.
     raw_query_string: Option<String>,
+    /// Backend-bound query after `request_transformer` ordered mutations.
+    /// `None` means "use [`Self::raw_query_string`] unchanged" (ordinary
+    /// no-transform hot path). `Some("")` is an explicit empty outbound query
+    /// after a transform removed every pair. Authentication-owned strips are
+    /// removed from the transformer input before query rules run, and the
+    /// proxy applies [`crate::proxy::query_string_after_plugin_strips`] again
+    /// as defense in depth when composing the canonical backend-visible query.
+    outbound_query_string: Option<String>,
     /// Whether either decoded or raw query-param materialization has already
     /// populated `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
@@ -1853,6 +1861,9 @@ pub struct RequestContext {
     /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
     /// historical compatibility. HTTP/3 materializes raw query params unless
     /// an active plugin explicitly requires the decoded representation.
+    /// After a query transform, this map is rebuilt from the ordered outbound
+    /// representation (last occurrence wins) so later plugins see coherent
+    /// state without re-parsing the wire query.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Arc<Consumer>>,
@@ -2513,6 +2524,7 @@ impl RequestContext {
             headers: HashMap::new(),
             headers_materialized: false,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
@@ -3313,6 +3325,7 @@ impl RequestContext {
             headers: self.headers.clone(),
             headers_materialized: true,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: self.matched_proxy.clone(),
@@ -4062,6 +4075,7 @@ impl RequestContext {
     pub fn set_raw_query_string(&mut self, qs: String) {
         self.query_params.clear();
         self.query_params_materialized = false;
+        self.outbound_query_string = None;
         self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
@@ -4072,6 +4086,34 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Publish the ordered outbound query after `request_transformer` mutations
+    /// and rebuild the plugin-visible single-value map from that same
+    /// representation.
+    ///
+    /// Pass an empty string when every pair was removed. Marks query params as
+    /// materialized so a later materialization pass cannot resurrect the
+    /// pre-transform raw query into `query_params`. Callers must not log the
+    /// outbound value — it may contain secrets the transform just relocated.
+    #[inline]
+    pub fn publish_transformed_query(
+        &mut self,
+        outbound: String,
+        params: std::collections::HashMap<String, String>,
+    ) {
+        self.outbound_query_string = Some(outbound);
+        self.query_params = params;
+        self.query_params_materialized = true;
+    }
+
+    /// Borrow the transformer-published outbound query, when present.
+    ///
+    /// `Some("")` is distinct from `None`: empty means the transform cleared
+    /// the query; `None` means no transform ran and the raw wire query applies.
+    #[inline]
+    pub fn outbound_query_string(&self) -> Option<&str> {
+        self.outbound_query_string.as_deref()
     }
 
     /// Record the client's original request target after canonicalization
@@ -7895,8 +7937,10 @@ pub fn create_plugin_with_http_client(
 /// `plugin_config_id` is the configured plugin-config resource id (global /
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
-/// identity, `waf` instances isolate anomaly-score accumulators / ownership
-/// metadata, and `api_chargeback_sink` instances publish accepted-generation
+/// identity, `soap_ws_security` scopes its PasswordDigest nonce replay state to
+/// it so reload generations inherit prior claims, `waf` instances isolate
+/// anomaly-score accumulators / ownership metadata, and `api_chargeback_sink`
+/// instances publish accepted-generation
 /// status/metrics under that stable identity, while `request_mirror` records
 /// attribute each shadow destination. Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
@@ -8107,9 +8151,17 @@ pub fn create_plugin_with_http_client_and_config_id(
         "openapi_validator" => Ok(Some(Arc::new(openapi_validator::OpenapiValidator::new(
             config,
         )?))),
-        "soap_ws_security" => Ok(Some(Arc::new(soap_ws_security::SoapWsSecurity::new(
-            config,
-        )?))),
+        // The stable plugin-config id is the PasswordDigest replay scope: it is
+        // what lets a reload generation inherit the previous generation's nonce
+        // claims instead of starting from an empty cache, and what keys a
+        // shared (Redis) replay keyspace to one policy.
+        "soap_ws_security" => Ok(Some(Arc::new(
+            soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
@@ -8566,10 +8618,10 @@ pub(crate) fn validate_plugin_config_policy_only(
         return Err(errs.join("; "));
     }
     // Redis-backed plugins (rate_limit / request_deduplication /
-    // ai_semantic_cache with sync_mode=redis) build their client from
-    // `redis_url` WITHOUT the egress policy, and the client skips literals
-    // / falls back to the hostname on a DNS denial — so a denied literal
-    // endpoint must be rejected here at config-load.
+    // ai_semantic_cache / soap_ws_security with sync_mode=redis) build their
+    // client from `redis_url` WITHOUT the egress policy, and the client skips
+    // literals / falls back to the hostname on a DNS denial — so a denied
+    // literal endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
     // screened *inside* `create_plugin_with_http_client` above (before a dial),
@@ -8584,10 +8636,11 @@ pub(crate) fn validate_plugin_config_policy_only(
 /// `169.254.169.254`) must be rejected at config-admission time — not only in
 /// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
 /// policy at config-load. Redis-backed plugins (`rate_limit`,
-/// `request_deduplication`, `ai_semantic_cache` with `sync_mode=redis`) build
-/// their client from `redis_url` WITHOUT the policy, and the client skips IP
-/// literals / falls back to the hostname on a DNS denial — so a denied literal
-/// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
+/// `request_deduplication`, `ai_semantic_cache`, `soap_ws_security` with
+/// `sync_mode=redis`) build their client from `redis_url` WITHOUT the policy,
+/// and the client skips IP literals / falls back to the hostname on a DNS
+/// denial — so a denied literal endpoint (`redis://169.254.169.254:6379`)
+/// would otherwise be dialed. No-op
 /// when there is no `redis_url`, it's a hostname (screened at resolve), or it
 /// doesn't parse (shape errors are surfaced by the constructor).
 pub(crate) fn screen_redis_endpoint_egress(

@@ -587,6 +587,9 @@ where
     S: SerializeMap,
 {
     for (key, value) in metadata {
+        if crate::plugins::utils::metadata_redaction::is_internal_only_metadata_key(key) {
+            continue;
+        }
         let out_key = flatten_key(key, prefix);
         if emitted.contains(&out_key) {
             match on_collision {

@@ -420,6 +420,41 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
     }
 }
 
+#[test]
+fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
+    // The soap constructor rejects a blank stable identity because collapsing
+    // policies onto one replay registry/keyspace is unsafe. Reaching that
+    // constructor error through PluginCache proves the production routing path
+    // passes `pc.id`; the identityless factory would incorrectly admit this
+    // generation with private replay state.
+    let mut plugin = make_plugin_config(
+        "   ",
+        "soap_ws_security",
+        PluginScope::Proxy,
+        Some("soap"),
+        true,
+    );
+    plugin.config = json!({
+        "timestamp": {"require": false},
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret"}]
+        },
+        "nonce": {"replay_scope": "process"}
+    });
+    let config = make_config(vec![make_proxy("soap", "/soap", vec!["   "])], vec![plugin]);
+
+    let error = match PluginCache::new(&config) {
+        Ok(_) => panic!("blank SOAP replay identity must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("plugin config id must not be blank"),
+        "{error}"
+    );
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
@@ -3933,7 +3968,7 @@ fn test_apply_delta_rejects_unknown_load_testing_key_and_keeps_last_known_good()
 }
 
 #[test]
-fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_good() {
+fn test_apply_delta_rejects_invalid_ai_stream_router_config_and_keeps_last_known_good() {
     let good_router = json!({
         "enabled": true,
         "providers": [{
@@ -3963,7 +3998,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
         "baseline cache must include ai_stream_router"
     );
 
-    for (label, bad_config, needle) in [
+    for (label, bad_config, expected) in [
         (
             "enabled-typo",
             json!({
@@ -3976,7 +4011,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "model_patterns": ["gpt-*"]
                 }]
             }),
-            "config.enabeld",
+            &["unknown configuration key", "config.enabeld"][..],
         ),
         (
             "provider-tls-typo",
@@ -3990,10 +4025,13 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "inherit_backend_tl": true
                 }]
             }),
-            "config.providers[0].inherit_backend_tl",
+            &[
+                "unknown configuration key",
+                "config.providers[0].inherit_backend_tl",
+            ][..],
         ),
         (
-            "fallback-typo",
+            "fallback-block",
             json!({
                 "providers": [{
                     "name": "openai",
@@ -4002,9 +4040,12 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
                     "api_key": "sk-bad",
                     "model_patterns": ["gpt-*"]
                 }],
-                "fallback": {"on_connect_erro": true}
+                "fallback": {"on_connect_error": true}
             }),
-            "config.fallback.on_connect_erro",
+            &[
+                "unsupported field 'fallback'",
+                "provider fallback is not implemented",
+            ][..],
         ),
     ] {
         let config2 = make_config(
@@ -4025,7 +4066,7 @@ fn test_apply_delta_rejects_unknown_ai_stream_router_keys_and_keeps_last_known_g
         };
         let message = error.to_string();
         assert!(
-            message.contains("unknown configuration key") && message.contains(needle),
+            expected.iter().all(|needle| message.contains(needle)),
             "{label}: unexpected reload error: {message}"
         );
         assert!(
@@ -9106,6 +9147,40 @@ fn test_decoded_query_params_capability_false_for_method_only_route_dispatch() {
         !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
         "method/header-only route dispatch must preserve HTTP/3 raw query materialization"
     );
+}
+
+#[test]
+fn test_request_transformer_query_rules_do_not_set_decoded_h3_query_capability() {
+    // Ordered query rules parse retained raw/outbound query themselves. Opting
+    // into the shared pre-auth decoded map would change key_auth/JWT/HMAC and
+    // cache/policy acceptance merely by attaching an unrelated transformer.
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["ps1"])],
+        vec![make_plugin_config_with_json(
+            "ps1",
+            "request_transformer",
+            json!({
+                "rules": [
+                    {"operation": "remove", "target": "query", "key": "token"}
+                ]
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+
+    let caps = cache.get_capabilities("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        !caps.has(PluginCapabilities::NEEDS_DECODED_QUERY_PARAMS),
+        "request_transformer query rules must preserve HTTP/3 raw pre-auth query materialization"
+    );
+    let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+    let transformer = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "request_transformer")
+        .expect("request_transformer is cached");
+    assert!(!transformer.requires_decoded_query_params());
 }
 
 #[test]

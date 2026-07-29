@@ -449,9 +449,47 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 Disabled plugin configs are stored without plugin-specific construction, so operators can stage configuration before runtime-only prerequisites are present. For example, `basic_auth` may be created or imported with `enabled: false` before `FERRUM_BASIC_AUTH_HMAC_SECRET` is provisioned. Enabling the config performs normal construction and fails closed unless the secret is present and at least 32 bytes.
 
-Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw. For `loki_logging`, the projection preserves only the endpoint scheme, host, and port, replaces the path/query, `authorization_header`, and every `custom_headers` value, and never returns URL-embedded or explicit credentials.
+Plugin-config reads by `viewer` and `operator` roles use the same redacted projection stored in admin audit diffs; `admin` reads remain raw.
 
-For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized name contains `integrity_key` (including delimiter-collapsed forms such as `integrityKey`); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-collapsed forms such as `redisUrl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and query/fragment data is removed, so `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
+That projection is driven by a **schema-aware sensitivity contract** (`src/admin/plugin_config_projection.rs`), not by field-name guessing. Every built-in plugin has an entry declaring which config paths carry credentials, and a CI parity test fails if a new built-in ships without one. Three layers run in order, and each can only add redaction:
+
+1. **Schema rules** — exact per-plugin paths, with `*` wildcards for arbitrary maps and arrays and case/delimiter-insensitive segment matching that also equates compact spellings (`customHeaders`, `custom-headers`, `custom.headers`, `custom_headers`, and `customheaders` are one path). Rules classify a value as a wholesale secret, a structural endpoint URL, a Redis URL, or a librdkafka producer-property map.
+2. **Name heuristics** — the historical substring matcher (`api_key`, `client_secret`, `private_key`, `*_integrity_key`, `*function_key*`, `webhook`, plus the shared log-redaction key list). It still covers custom plugins, which have no built-in schema.
+3. **Structural URL sweep** — any remaining string anywhere in the config that parses as a URL carrying userinfo has that userinfo replaced by `redacted`, so `https://user:pass@host/x` cannot survive a projection even on a path no rule names.
+
+A structurally projected endpoint URL keeps only `scheme://host[:port]` and emits `[REDACTED_PATH]`, `[REDACTED_QUERY]`, and `[REDACTED_FRAGMENT]` markers for the components that were present; userinfo is never emitted. A value that does not parse as a URL, or that has no host, fails closed to `[REDACTED]`. A plugin `config` that is not an object (and not `null`) is replaced wholesale — no built-in accepts a scalar or array config, so its interior cannot be classified. Explicit JSON `null` values on sensitive fields stay `null` (they disclose nothing) rather than becoming `[REDACTED]`.
+
+Fields covered by the schema include:
+
+| Plugin | Paths | Projection |
+|---|---|---|
+| `serverless_function` | `function_url`, `aws_endpoint_url` | structural URL |
+| `serverless_function` | `azure_function_key` | `[REDACTED]` (sent verbatim as `x-functions-key`) |
+| `http_logging`, `loki_logging`, `ws_logging` | `endpoint_url` | structural URL |
+| `http_logging`, `loki_logging` | `custom_headers.*` | `[REDACTED]` |
+| `loki_logging` | `authorization_header` | `[REDACTED]` |
+| `otel_tracing` | `endpoint` | structural URL |
+| `otel_tracing` | `authorization`, `headers.*` | `[REDACTED]` |
+| `opa`, `ai_transcript_audit` | `headers.*`, `custom_headers.*` | `[REDACTED]` |
+| `ai_transcript_audit` | `sink.endpoint_url` | structural URL |
+| `ai_transcript_audit` | `sink.custom_headers.*` | `[REDACTED]` |
+| `api_chargeback_sink` | `clickhouse.insert_query_params.*` | `[REDACTED]` (credential-*named* keys are already rejected at admission; the values stay arbitrary) |
+| `proxy_alerts` | `channels.*.url` | structural URL (`channels.*.webhook_url` is caught wholesale by the name heuristic and projects as `[REDACTED]`) |
+| `proxy_alerts` | `channels.*.headers.*`, `channels.*.body_template` | `[REDACTED]` |
+| `kafka_logging` | `producer_config.*` | `[REDACTED]` unless the property is on the safe-tuning allow-list |
+| `jwks_auth`, `oauth2_introspection`, `oidc_relying_party` | `providers.*.{discovery_url,jwks_uri,introspection_endpoint,userinfo_endpoint,end_session_endpoint}` | structural URL |
+| `oidc_relying_party` | `providers.*.{token_endpoint,authorization_endpoint}` | `[REDACTED]` after structural projection because the additive name heuristic treats `token` and `authorization` as sensitive |
+| `mcp_gateway` | `servers.*.upstream_url` | structural URL |
+| `ldap_auth`, `spec_expose`, `api_chargeback_sink`, `ai_*` provider endpoints | discovery/base/endpoint URLs | structural URL |
+| `workload_metrics` | `tracing_provider.config.{url,agent_url,collector_url,endpoint}` and the corresponding `tracing_providers.*` paths | structural URL |
+
+Header **values** are secret by default wherever a plugin accepts an arbitrary header map, because vendor authentication header names (`x-honeycomb-team`, `dd-api-key`, `lightstep-access-token`) match no substring pattern. Header **names** stay visible as routing diagnostics. Configuration keys that hold header *name lists* rather than values (`expose_headers`, `claim_headers`, `vary_by_headers`, `forward_headers`, `redact_headers`, …) are deliberately not redacted — distinguishing them from value maps is exactly what the schema exists to do.
+
+`kafka_logging.producer_config` is an open escape hatch forwarded verbatim to librdkafka, several of whose properties are marked sensitive upstream (`ssl.key.pem`, `ssl.key.password`, `ssl.keystore.password`, `sasl.password`, `sasl.oauthbearer.config`, …). The projection therefore allow-lists the known non-credential tuning properties and redacts everything else, so a newly added upstream sensitive property is redacted by default. Separately, `producer_config` values carrying inline PEM private-key material are **rejected at admission** — use the top-level `ssl_key_location` field or an external secret reference. The rejection message names only the property, never the rejected material.
+
+`GET /backup` remains `admin`-only and intentionally exports raw configuration: backups must stay restorable.
+
+For Redis-backed plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, `request_deduplication`, `graphql`, `grpc_method_router`, `ai_semantic_cache`) the same projection covers two more secrets. `redis_integrity_key` — the HMAC-SHA256 secret that authenticates `ai_semantic_cache` Redis envelopes — is replaced wholesale by `[REDACTED]`, as is any other key whose normalized (delimiter-stripped lowercase) name contains `integritykey` (so `redis_integrity_key`, `redisIntegrityKey`, and `redisintegritykey` match); disclosure would let a reader forge an envelope the gateway replays as a cache hit. `redis_url` (including delimiter-stripped forms such as `redisUrl`, `redis-url`, and `redisurl`) is *not* wholesale-redacted, because its scheme, host, port, and database number are the diagnostics an operator needs: userinfo is replaced and query/fragment data is removed, so `redis://user:pass@cache.internal:6379/3?token=secret#private` projects as `redis://redacted@cache.internal:6379/3`. A `redis_url` value that cannot be parsed as a URL, or that uses any scheme other than `redis`/`rediss`, fails closed to `[REDACTED]`. The separate `redis_password` field is already covered by the existing password matcher; `redis_username` is not secret material and stays visible. Because full `admin` reads stay raw, rotating either secret by read-modify-write still works.
 
 ## Upstreams
 
