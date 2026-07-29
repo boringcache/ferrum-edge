@@ -1673,6 +1673,12 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     timeout-minutes: 30
     permissions:
       contents: read
+    # The repository-root Cargo config selects sccache, but this isolated fuzz
+    # job does not install it. Disable both Cargo wrapper inputs explicitly so
+    # toolchain discovery cannot fail before the pinned jobs run.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1763,6 +1769,12 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    # The repository-root Cargo config selects sccache, but this isolated fuzz
+    # job does not install it. Disable both Cargo wrapper inputs explicitly so
+    # toolchain discovery cannot fail before the pinned jobs run.
+    env:
+      RUSTC_WRAPPER: ""
+      CARGO_BUILD_RUSTC_WRAPPER: ""
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -22174,6 +22186,16 @@ pre_build = []
         if "contents: write" in admitted_text:
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
+            )
+        wrapper_override_block = (
+            '    env:\n'
+            '      RUSTC_WRAPPER: ""\n'
+            '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+        )
+        if wrapper_override_block not in admitted_text:
+            failures.append(
+                f"the admitted {admitted_label} no longer disables both "
+                "repository sccache wrapper inputs"
             )
     if (
         "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
