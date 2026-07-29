@@ -4738,9 +4738,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
         set_grpc_deadline_budget_for_test,
     };
 
-    let caching = create_plugin("response_caching", &json!({"add_cache_status_header": true}))
-        .unwrap()
-        .unwrap();
+    let caching = create_plugin(
+        "response_caching",
+        &json!({"add_cache_status_header": true}),
+    )
+    .unwrap()
+    .unwrap();
     let after_proxy_plugins = vec![caching];
     let committed: Vec<Arc<dyn Plugin>> = vec![Arc::new(StalledCommittedHook)];
 

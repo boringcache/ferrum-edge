@@ -4191,6 +4191,58 @@ async fn test_byte_cap_admission_reclaims_expired_entries() {
     assert_size_accounting_exact(&plugin);
 }
 
+/// Expiration order is independent of insertion order: a short-lived entry can
+/// expire behind an older long-lived entry and must still be reclaimable
+/// without scanning or evicting the fresh representation.
+#[tokio::test]
+async fn test_byte_cap_reclaims_later_inserted_short_lived_entry() {
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "max_entries": 1000,
+        "max_total_size_bytes": 3000
+    }));
+    let body = vec![b'x'; 1000];
+    let long_lived = HashMap::from([(
+        "cache-control".to_string(),
+        "public, max-age=120".to_string(),
+    )]);
+    let short_lived = HashMap::from([(
+        "cache-control".to_string(),
+        "public, max-age=1".to_string(),
+    )]);
+
+    cache_response(&plugin, "GET", "/long-lived", 200, &long_lived, &body).await;
+    cache_response(&plugin, "GET", "/short-lived", 200, &short_lived, &body).await;
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(10));
+
+    // A third entry cannot fit until the later-inserted short-lived entry is
+    // reclaimed. The older long-lived entry at the FIFO front remains fresh.
+    cache_response(&plugin, "GET", "/replacement", 200, &long_lived, &body).await;
+
+    let mut long_ctx = make_ctx("GET", "/long-lived");
+    let mut long_headers = HashMap::new();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut long_ctx, &mut long_headers).await),
+        "fresh older entry must not be evicted"
+    );
+
+    let mut short_ctx = make_ctx("GET", "/short-lived");
+    let mut short_headers = HashMap::new();
+    assert!(matches!(
+        plugin.before_proxy(&mut short_ctx, &mut short_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut replacement_ctx = make_ctx("GET", "/replacement");
+    let mut replacement_headers = HashMap::new();
+    assert!(
+        is_reject(&plugin.before_proxy(&mut replacement_ctx, &mut replacement_headers).await),
+        "new entry must be admitted after expiration-ordered reclaim"
+    );
+    assert!(response_caching_current_total_size_for_test(&plugin) <= 3000);
+    assert_size_accounting_exact(&plugin);
+}
+
 /// Concurrent stores racing an expiring working set must keep the size
 /// accountant exact: byte-cap admission reclaim runs under the same
 /// accounting lock as insertion and replacement accounting.

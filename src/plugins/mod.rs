@@ -2072,6 +2072,22 @@ pub struct RequestContext {
     /// authentication strip may remove the parameter before a retained-result
     /// plugin builds its key.
     query_credential_partition_digests: Vec<(String, [u8; 32])>,
+    /// Deltas from the original request-header view to the complete
+    /// backend-visible view, staged by `response_caching` instances during
+    /// lookup and consumed when the origin supplies its final `Vary`
+    /// dimensions. `Some(value)` adds/replaces a field and `None` records a
+    /// removal.
+    ///
+    /// An origin may vary on any field, including one an earlier request
+    /// transformer added or rewrote. The final response-body hook otherwise has
+    /// only `self.headers`, the original client view, and could store a response
+    /// under a key that no longer describes what the backend received. Raw
+    /// header values deliberately stay in this private, per-request map rather
+    /// than public `metadata`, which can be serialized into transaction logs.
+    /// The outer key is the process-unique cache instance ID, bounding the map
+    /// by configured `response_caching` instances.
+    response_cache_request_header_deltas:
+        HashMap<u64, Arc<HashMap<String, Option<String>>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -2721,6 +2737,7 @@ impl RequestContext {
             sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: None,
             query_credential_partition_digests: Vec::new(),
+            response_cache_request_header_deltas: HashMap::new(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -3146,6 +3163,45 @@ impl RequestContext {
         self.response_cache_hit
     }
 
+    pub(crate) fn stage_response_cache_request_header_delta(
+        &mut self,
+        instance_id: u64,
+        headers: &HashMap<String, String>,
+    ) {
+        let mut delta = HashMap::new();
+        for (name, value) in headers {
+            if self.headers.get(name) != Some(value) {
+                delta.insert(name.clone(), Some(value.clone()));
+            }
+        }
+        for name in self.headers.keys() {
+            if !headers.contains_key(name) {
+                delta.insert(name.clone(), None);
+            }
+        }
+        if delta.is_empty() {
+            self.response_cache_request_header_deltas
+                .remove(&instance_id);
+        } else {
+            self.response_cache_request_header_deltas
+                .insert(instance_id, Arc::new(delta));
+        }
+    }
+
+    pub(crate) fn response_cache_request_header_delta(
+        &self,
+        instance_id: u64,
+    ) -> Option<&HashMap<String, Option<String>>> {
+        self.response_cache_request_header_deltas
+            .get(&instance_id)
+            .map(Arc::as_ref)
+    }
+
+    pub(crate) fn clear_response_cache_request_header_delta(&mut self, instance_id: u64) {
+        self.response_cache_request_header_deltas
+            .remove(&instance_id);
+    }
+
     /// Record the genuine origin/backend HTTP status exactly once.
     ///
     /// Proxy core calls this at the start of `run_after_proxy_hooks` before any
@@ -3558,6 +3614,11 @@ impl RequestContext {
             sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
             query_credential_partition_digests: self.query_credential_partition_digests.clone(),
+            // Response caching has no final request-body hook. Its private
+            // backend-header delta remains on the live donor context for the
+            // eventual response store rather than extending raw values into
+            // this short-lived compatibility clone.
+            response_cache_request_header_deltas: HashMap::new(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,

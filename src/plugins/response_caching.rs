@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -430,6 +430,14 @@ impl CacheEntry {
 
     fn is_fresh_at(&self, now: Duration) -> bool {
         self.current_age(now) < self.freshness_lifetime
+    }
+
+    fn expires_at(&self) -> Duration {
+        duration_saturating_add(
+            self.stored_at,
+            self.freshness_lifetime
+                .saturating_sub(self.corrected_initial_age),
+        )
     }
 
     /// Approximate memory footprint of this entry (for total size tracking).
@@ -1087,6 +1095,13 @@ struct CacheMaintenance {
     /// ordering coincide, so FIFO reproduces the previous oldest-first policy
     /// without materializing or sorting the key set.
     eviction_queue: VecDeque<(String, u64)>,
+    /// Expiration-ordered live-entry index. Freshness lifetime can vary per
+    /// response, so insertion order cannot identify every expired entry: a
+    /// short-lived response may expire behind an older long-lived one. Exact
+    /// tuples are removed on replacement and eviction, keeping reclamation
+    /// bounded to expired entries with O(log n) maintenance and no full-cache
+    /// scan under the publication mutex.
+    expiry_index: BTreeSet<(Duration, u64, String)>,
     /// `authority scope -> encoded path -> cache keys`. RFC 9111 §4.4
     /// invalidation is an exact `BTreeMap` lookup plus one ordered range over
     /// the `path/` descendants, so its cost is bounded by the number of entries
@@ -1270,6 +1285,7 @@ impl ResponseCaching {
         ctx.metadata.remove(&self.meta_predict_key);
         ctx.metadata.remove(&self.meta_request_started);
         ctx.metadata.remove(&self.meta_headers_snapshot);
+        ctx.clear_response_cache_request_header_delta(self.instance_id);
     }
 
     /// Drop a staged unsafe-method invalidation without applying it.
@@ -1743,7 +1759,8 @@ impl ResponseCaching {
     ///
     /// Replacement of an existing key is not a new variant: the index and the
     /// variant state already describe it, and only the byte delta and a fresh
-    /// eviction slot change. All work is O(1) plus one `BTreeMap` insert.
+    /// eviction slot change. All work is O(1) plus one `BTreeMap` insert and
+    /// one expiration-index `BTreeSet` update.
     fn insert_entry_locked(
         &self,
         maintenance: &mut CacheMaintenance,
@@ -1754,10 +1771,16 @@ impl ResponseCaching {
         let scope = Arc::clone(&entry.invalidation_scope);
         let path = Arc::clone(&entry.invalidation_path);
         let insert_seq = entry.insert_seq;
+        let expires_at = entry.expires_at();
         let entry_size = entry.approx_size();
 
         match self.cache.insert(cache_key.clone(), entry) {
-            Some(old) => self.sub_total_size_locked(old.approx_size()),
+            Some(old) => {
+                self.sub_total_size_locked(old.approx_size());
+                maintenance
+                    .expiry_index
+                    .remove(&(old.expires_at(), old.insert_seq, cache_key.clone()));
+            }
             None => {
                 maintenance
                     .variant_counts
@@ -1779,18 +1802,26 @@ impl ResponseCaching {
         }
         self.add_total_size_locked(entry_size);
         maintenance
+            .expiry_index
+            .insert((expires_at, insert_seq, cache_key.clone()));
+        maintenance
             .eviction_queue
             .push_back((cache_key, insert_seq));
     }
 
     /// Remove one entry and every piece of metadata that described it.
-    /// Returns whether an entry was actually removed. O(1) plus one ordered-map
-    /// removal.
+    /// Returns whether an entry was actually removed. O(1) plus ordered path-
+    /// and expiration-index removals.
     fn remove_entry_locked(&self, maintenance: &mut CacheMaintenance, cache_key: &str) -> bool {
         let Some((_, entry)) = self.cache.remove(cache_key) else {
             return false;
         };
         self.sub_total_size_locked(entry.approx_size());
+        maintenance.expiry_index.remove(&(
+            entry.expires_at(),
+            entry.insert_seq,
+            cache_key.to_string(),
+        ));
 
         // `base_key_len` is always a byte boundary of this key: the key is the
         // base-key hex, optionally followed by an ASCII separator and more hex.
@@ -1893,15 +1924,15 @@ impl ResponseCaching {
         self.compact_eviction_queue_locked(maintenance);
     }
 
-    /// Reclaim *expired* retained bytes oldest-first so a stale working set
+    /// Reclaim *expired* retained bytes in expiration order so a stale working set
     /// cannot trap the byte budget (#2400).
     ///
     /// `max_total_size_bytes` is a hard cap on retained bytes, not an LRU
     /// trigger: a store that still does not fit once every reclaimable expired
     /// entry is gone is refused, and a *fresh* representation is never dropped
-    /// to make room for a new one. Insertion order and `stored_at` order
-    /// coincide, so the FIFO front is the oldest candidate; the walk stops at
-    /// the first live entry that is still fresh and is bounded by the slots it
+    /// to make room for a new one. Freshness lifetimes differ per response, so
+    /// the expiry index—not insertion FIFO—selects candidates. The walk stops
+    /// at the earliest live future expiry and is bounded by expired entries it
     /// actually retires rather than by cache size.
     fn reclaim_expired_for_byte_budget_locked(
         &self,
@@ -1909,23 +1940,27 @@ impl ResponseCaching {
         now: Duration,
     ) {
         loop {
-            let Some((oldest_key, oldest_seq)) = maintenance.eviction_queue.front().cloned() else {
+            let Some((expires_at, insert_seq, cache_key)) =
+                maintenance.expiry_index.iter().next().cloned()
+            else {
                 break;
             };
-            // A slot is authoritative only while it still names the live entry;
-            // a replaced entry's superseded slot is retired here for free.
-            let expired = match self.cache.get(&oldest_key) {
-                Some(entry) if entry.insert_seq == oldest_seq => {
-                    if entry.is_fresh_at(now) {
-                        break;
-                    }
-                    true
-                }
-                _ => false,
-            };
-            maintenance.eviction_queue.pop_front();
-            if expired {
-                self.remove_entry_locked(maintenance, &oldest_key);
+            if expires_at > now {
+                break;
+            }
+            let is_current = self
+                .cache
+                .get(&cache_key)
+                .is_some_and(|entry| entry.insert_seq == insert_seq);
+            if is_current {
+                self.remove_entry_locked(maintenance, &cache_key);
+            } else {
+                // Defensive stale-index retirement: normal replacement and
+                // removal paths delete the exact tuple, but never let an
+                // inconsistent tuple spin this bounded reclaim loop.
+                maintenance
+                    .expiry_index
+                    .remove(&(expires_at, insert_seq, cache_key));
             }
         }
         self.compact_eviction_queue_locked(maintenance);
@@ -2155,17 +2190,20 @@ impl ResponseCaching {
     /// load-bearing cache-key dimensions even when the operator never lists them
     /// in `vary_by_headers`.
     ///
-    /// Snapshot is intentionally narrow: only headers we know we will
-    /// consume go into it. Headers that show up later via the response
-    /// `Vary` directive — which can be any header at all — fall through
-    /// to `ctx.headers` at storage time. That's the same value we'd have
-    /// had to read at lookup time anyway, so the lookup/storage symmetry
-    /// is still preserved for them.
+    /// The complete live view is represented separately by a delta from
+    /// `ctx.headers` in RequestContext's private response-cache provenance map.
+    /// That private delta covers arbitrary origin-supplied `Vary` fields without
+    /// duplicating an unchanged header map or exposing raw values to transaction
+    /// metadata. This serialized snapshot remains intentionally narrow and
+    /// reduced so direct compatibility contexts that do not carry private
+    /// staging can still rebuild configured and auto-sensitive dimensions
+    /// without logging secrets.
     fn stash_request_headers_snapshot(
         &self,
         ctx: &mut RequestContext,
         headers: &HashMap<String, String>,
     ) {
+        ctx.stage_response_cache_request_header_delta(self.instance_id, headers);
         let mut snapshot: Vec<RequestHeaderSnapshotEntry> = Vec::with_capacity(
             self.config.vary_by_headers.len() + 1 + SENSITIVE_VARY_HEADERS.len(),
         );
@@ -2206,12 +2244,29 @@ impl ResponseCaching {
         }
     }
 
-    /// Rebuild the request-headers view used to derive the storage cache
-    /// key. Layers `before_proxy`'s snapshot on top of `ctx.headers` so
-    /// snapshotted keys reflect the transformed values seen at lookup
-    /// time while any other key (typically a header added by the
-    /// response's own `Vary` directive) falls back to the original.
+    /// Rebuild the request-headers view used to derive the storage cache key.
+    /// Prefer the private backend-visible delta so an arbitrary origin-supplied
+    /// `Vary` field reflects the value that actually reached the backend. The
+    /// reduced public-metadata snapshot remains a fail-closed compatibility
+    /// fallback for direct hook contexts that do not carry private staging.
     fn restore_request_headers_view(&self, ctx: &RequestContext) -> RestoredRequestHeadersView {
+        if let Some(delta) = ctx.response_cache_request_header_delta(self.instance_id) {
+            let mut headers = ctx.headers.clone();
+            for (name, value) in delta {
+                match value {
+                    Some(value) => {
+                        headers.insert(name.clone(), value.clone());
+                    }
+                    None => {
+                        headers.remove(name);
+                    }
+                }
+            }
+            return RestoredRequestHeadersView {
+                headers,
+                cache_key_ready_headers: HashSet::new(),
+            };
+        }
         let mut headers = ctx.headers.clone();
         let mut cache_key_ready_headers = HashSet::new();
         if let Some(serialized) = ctx.metadata.get(&self.meta_headers_snapshot)
@@ -2468,15 +2523,12 @@ impl Plugin for ResponseCaching {
         ctx.metadata
             .insert(self.meta_base_key.clone(), base_key.clone());
         self.stash_request_started_at(ctx, self.now_monotonic());
-        // Snapshot every header value that could end up in the cache key
-        // so `on_final_response_body` can rebuild the same key from
-        // metadata. The transformed `headers` view is only available
-        // during `before_proxy`; by storage time `on_final_response_body`
-        // has only `ctx.headers` (the original, untransformed map). Without
-        // this snapshot a request-side transformer that touches a
-        // configured `vary_by_headers` value, or rewrites `Host`, would
-        // make the lookup and storage keys disagree and cache every hit
-        // would miss.
+        // Preserve the complete backend-visible header view privately so
+        // `on_final_response_body` can key arbitrary origin-supplied Vary
+        // fields from the same values that reached the backend. A reduced,
+        // redaction-safe metadata snapshot also supports direct compatibility
+        // hook contexts. By storage time `ctx.headers` alone is the original,
+        // untransformed map.
         self.stash_request_headers_snapshot(ctx, headers);
 
         let mut vary_headers = self.cache_lookup_vary_headers(&base_key);
@@ -2839,10 +2891,9 @@ impl Plugin for ResponseCaching {
         // `lookup_headers` was built above from
         // `restore_request_headers_view`: it layers `before_proxy`'s header
         // snapshot on top of `ctx.headers`, so configured `vary_by_headers`
-        // / `host` / the sensitive headers reflect the transformed values that
-        // were live during lookup. Response-added Vary headers fall back to
-        // `ctx.headers`, the same source any future lookup would use for them,
-        // so the lookup/storage symmetry holds for those too.
+        // / `host` / the sensitive headers and arbitrary response-added Vary
+        // fields all reflect the complete backend-visible view staged during
+        // lookup.
         self.merge_present_sensitive_vary_headers(&mut vary_headers, &lookup_headers.headers);
         // The base key is *read back* from this instance's staging, never
         // recomputed here. `stash_request_headers_snapshot` deliberately stores
@@ -3516,6 +3567,77 @@ mod tests {
             predict_key, cache_keys[0],
             "lookup and storage keys must be identical when no Vary \
              header is added by the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn origin_vary_uses_complete_backend_visible_header_view() {
+        // The origin can name a header the operator did not preconfigure in
+        // `vary_by_headers`. Storage must still use the transformed value sent
+        // upstream, never the original client value retained in `ctx.headers`.
+        let plugin = plugin_with_config(json!({"ttl_seconds": 60}));
+
+        let mut store_ctx = make_ctx("GET", "/api/origin-vary");
+        store_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "client-a".to_string());
+        let mut store_headers = store_ctx.headers.clone();
+        store_headers.insert("x-origin-vary".to_string(), "backend-tenant-a".to_string());
+        assert!(matches!(
+            plugin.before_proxy(&mut store_ctx, &mut store_headers).await,
+            PluginResult::Continue
+        ));
+
+        let response_headers = HashMap::from([
+            (
+                "cache-control".to_string(),
+                "public, max-age=60".to_string(),
+            ),
+            ("vary".to_string(), "X-Origin-Vary".to_string()),
+        ]);
+        plugin
+            .on_final_response_body(
+                &mut store_ctx,
+                200,
+                &response_headers,
+                b"tenant-a-response",
+            )
+            .await;
+
+        // If storage incorrectly used the original `client-a` value, this
+        // request would replay tenant A even though its backend-visible value
+        // belongs to a different partition.
+        let mut cross_ctx = make_ctx("GET", "/api/origin-vary");
+        cross_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "different-client".to_string());
+        let mut cross_headers = cross_ctx.headers.clone();
+        cross_headers.insert("x-origin-vary".to_string(), "client-a".to_string());
+        assert!(
+            matches!(
+                plugin.before_proxy(&mut cross_ctx, &mut cross_headers).await,
+                PluginResult::Continue
+            ),
+            "a transformed value matching another request's original value must not cross-hit"
+        );
+
+        let mut hit_ctx = make_ctx("GET", "/api/origin-vary");
+        hit_ctx
+            .headers
+            .insert("x-origin-vary".to_string(), "third-client".to_string());
+        let mut hit_headers = hit_ctx.headers.clone();
+        hit_headers.insert("x-origin-vary".to_string(), "backend-tenant-a".to_string());
+        let hit = plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await;
+        assert!(
+            matches!(
+                hit,
+                PluginResult::RejectBinary {
+                    status_code: 200,
+                    ref body,
+                    ..
+                } if body.as_slice() == b"tenant-a-response"
+            ),
+            "the same backend-visible value must select the stored representation"
         );
     }
 
