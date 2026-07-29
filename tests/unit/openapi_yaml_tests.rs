@@ -5701,13 +5701,13 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .pointer("/components/schemas/WorkloadMetricsConfig/properties")
         .expect("WorkloadMetricsConfig properties exist");
 
-    for field in ["custom_tags", "custom_header_tags"] {
+    for field in ["custom_tags", "custom_header_tags", "custom_env_tags"] {
         assert_eq!(properties[field]["maxProperties"], json!(32));
         let description = properties[field]["description"]
             .as_str()
             .expect("custom tag description");
         assert!(
-            description.contains("32 distinct tag names combined"),
+            description.contains("32 distinct tag names"),
             "{field} must document the combined runtime cap"
         );
     }
@@ -5778,7 +5778,7 @@ fn workload_metrics_schema_documents_runtime_tag_limits() {
         .as_object_mut()
         .expect("custom_header_tags object")
         .insert("header_16".to_string(), json!("x-tag"));
-    // The per-map OpenAPI bounds cannot express a sum across two objects; the
+    // The per-map OpenAPI bounds cannot express a sum across these objects; the
     // property descriptions carry that contract and runtime rejects the union.
     assert_component_validity(&spec, "WorkloadMetricsConfig", &combined_33, true);
     assert!(WorkloadMetrics::new(&combined_33).is_err());

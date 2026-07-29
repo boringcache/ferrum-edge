@@ -8865,6 +8865,9 @@ fn inject_mesh_global_plugins(
             workload_metrics_config["custom_header_tags"] =
                 serde_json::json!(tracing.custom_header_tags);
         }
+        if !tracing.custom_env_tags.is_empty() {
+            workload_metrics_config["custom_env_tags"] = serde_json::json!(tracing.custom_env_tags);
+        }
         if tracing.disable_span_reporting.unwrap_or(false) {
             workload_metrics_config["span_reporting_disabled"] = serde_json::json!(true);
         }
@@ -9065,6 +9068,7 @@ fn merge_tracing_config(
         disable_span_reporting: None,
         custom_tags: HashMap::new(),
         custom_header_tags: HashMap::new(),
+        custom_env_tags: HashMap::new(),
         providers: Vec::new(),
     });
 
@@ -9077,10 +9081,11 @@ fn merge_tracing_config(
     if next.disable_span_reporting.is_some() {
         current.disable_span_reporting = next.disable_span_reporting;
     }
-    current.custom_tags.extend(next.custom_tags.clone());
-    current
-        .custom_header_tags
-        .extend(next.custom_header_tags.clone());
+    current.merge_custom_tag_sources(
+        &next.custom_tags,
+        &next.custom_header_tags,
+        &next.custom_env_tags,
+    );
     if !next.providers.is_empty() {
         current.providers.clone_from(&next.providers);
     }
@@ -21494,6 +21499,7 @@ mod tests {
                             disable_span_reporting: Some(true),
                             custom_tags: HashMap::new(),
                             custom_header_tags: HashMap::new(),
+                            custom_env_tags: HashMap::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -21518,6 +21524,7 @@ mod tests {
                                 "tenant".to_string(),
                                 "x-tenant".to_string(),
                             )]),
+                            custom_env_tags: HashMap::new(),
                             providers: Vec::new(),
                         }),
                         ..MeshTelemetryConfig::default()
@@ -21570,10 +21577,17 @@ mod tests {
                             custom_tags: HashMap::from([
                                 ("env".to_string(), "staging".to_string()),
                                 ("mesh".to_string(), "ferrum".to_string()),
+                                ("cluster".to_string(), "fallback-cluster".to_string()),
+                                ("region".to_string(), "old-region".to_string()),
+                                ("zone".to_string(), "fallback-zone".to_string()),
                             ]),
                             custom_header_tags: HashMap::from([(
                                 "mesh-tenant".to_string(),
                                 "x-mesh-tenant".to_string(),
+                            )]),
+                            custom_env_tags: HashMap::from([(
+                                "cluster".to_string(),
+                                "ISTIO_META_CLUSTER_ID".to_string(),
                             )]),
                             providers: vec![TracingProvider::Zipkin {
                                 url: "http://zipkin:9411/api/v2/spans".to_string(),
@@ -21598,11 +21612,15 @@ mod tests {
                             disable_span_reporting: None,
                             custom_tags: HashMap::from([
                                 ("env".to_string(), "prod".to_string()),
-                                ("region".to_string(), "us-east".to_string()),
+                                ("cluster".to_string(), "literal-cluster".to_string()),
                             ]),
-                            custom_header_tags: HashMap::from([(
-                                "tenant".to_string(),
-                                "x-tenant".to_string(),
+                            custom_header_tags: HashMap::from([
+                                ("tenant".to_string(), "x-tenant".to_string()),
+                                ("zone".to_string(), "x-zone".to_string()),
+                            ]),
+                            custom_env_tags: HashMap::from([(
+                                "region".to_string(),
+                                "FERRUM_REGION".to_string(),
                             )]),
                             providers: vec![TracingProvider::OpenTelemetry {
                                 endpoint: "http://otel:4318/v1/traces".to_string(),
@@ -21628,9 +21646,17 @@ mod tests {
             Some("ferrum")
         );
         assert_eq!(
-            tracing.custom_tags.get("region").map(String::as_str),
-            Some("us-east")
+            tracing.custom_tags.get("cluster").map(String::as_str),
+            Some("literal-cluster")
         );
+        assert!(!tracing.custom_env_tags.contains_key("cluster"));
+        assert!(!tracing.custom_tags.contains_key("region"));
+        assert_eq!(
+            tracing.custom_env_tags.get("region").map(String::as_str),
+            Some("FERRUM_REGION"),
+            "more-specific environment source removes the inherited literal"
+        );
+        assert!(!tracing.custom_tags.contains_key("zone"));
         assert_eq!(
             tracing
                 .custom_header_tags
@@ -21641,6 +21667,11 @@ mod tests {
         assert_eq!(
             tracing.custom_header_tags.get("tenant").map(String::as_str),
             Some("x-tenant")
+        );
+        assert_eq!(
+            tracing.custom_header_tags.get("zone").map(String::as_str),
+            Some("x-zone"),
+            "more-specific header source removes the inherited literal source"
         );
         assert_eq!(tracing.providers.len(), 1);
         assert!(matches!(
@@ -22521,6 +22552,109 @@ mod tests {
     }
 
     #[test]
+    fn inject_mesh_global_plugins_copies_custom_env_tags_into_workload_metrics() {
+        let runtime = test_mesh_runtime_config();
+        let mut mesh_slice = MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "default".to_string(),
+            labels: BTreeMap::from([("app".to_string(), "api".to_string())]),
+            version: chrono::Utc::now().to_rfc3339(),
+            telemetry_resources: vec![MeshTelemetryResource {
+                name: "api-tracing".to_string(),
+                namespace: "default".to_string(),
+                scope: PolicyScope::WorkloadSelector {
+                    selector: WorkloadSelector {
+                        labels: HashMap::from([("app".to_string(), "api".to_string())]),
+                        namespace: Some("default".to_string()),
+                    },
+                },
+                config: MeshTelemetryConfig {
+                    tracing: Some(MeshTracingConfig {
+                        mode: None,
+                        sampling_percentage: Some(100.0),
+                        disable_span_reporting: None,
+                        custom_tags: HashMap::from([(
+                            "cluster".to_string(),
+                            "fallback".to_string(),
+                        )]),
+                        custom_header_tags: HashMap::new(),
+                        custom_env_tags: HashMap::from([(
+                            "cluster".to_string(),
+                            "ISTIO_META_CLUSTER_ID".to_string(),
+                        )]),
+                        providers: Vec::new(),
+                    }),
+                    ..MeshTelemetryConfig::default()
+                },
+            }],
+            ..MeshSlice::default()
+        };
+
+        let prepared = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("mesh slice config");
+        let workload_metrics = prepared
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("workload_metrics plugin injected");
+
+        assert_eq!(
+            workload_metrics.config["custom_tags"]["cluster"].as_str(),
+            Some("fallback")
+        );
+        assert_eq!(
+            workload_metrics.config["custom_env_tags"]["cluster"].as_str(),
+            Some("ISTIO_META_CLUSTER_ID"),
+            "typed env lookup must reach the DP plugin config for local resolution"
+        );
+
+        mesh_slice.telemetry_resources[0].config.tracing = Some(MeshTracingConfig {
+            mode: None,
+            sampling_percentage: Some(100.0),
+            disable_span_reporting: None,
+            custom_tags: HashMap::from([(
+                "cluster".to_string(),
+                "literal-after-update".to_string(),
+            )]),
+            custom_header_tags: HashMap::new(),
+            custom_env_tags: HashMap::new(),
+            providers: Vec::new(),
+        });
+        let updated = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("updated mesh slice config");
+        let updated_metrics = updated
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("updated workload_metrics plugin injected");
+        assert!(
+            updated_metrics.config.get("custom_env_tags").is_none(),
+            "an update from environment to literal must withdraw the stale lookup"
+        );
+        assert_eq!(
+            updated_metrics.config["custom_tags"]["cluster"].as_str(),
+            Some("literal-after-update")
+        );
+
+        mesh_slice.telemetry_resources.clear();
+        let deleted = gateway_config_from_mesh_slice(&mesh_slice, &runtime, None, None)
+            .expect("deleted Telemetry mesh slice config");
+        let deleted_metrics = deleted
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.id == MESH_WORKLOAD_METRICS_PLUGIN_ID)
+            .expect("base workload_metrics plugin remains injected");
+        assert!(
+            deleted_metrics.config.get("custom_env_tags").is_none(),
+            "deleting the Telemetry resource must withdraw environment lookups"
+        );
+        assert!(
+            deleted_metrics.config.get("custom_tags").is_none(),
+            "deleting the Telemetry resource must withdraw fallback values"
+        );
+    }
+
+    #[test]
     fn inject_mesh_global_plugins_merges_zipkin_provider_into_workload_metrics() {
         let runtime = test_mesh_runtime_config();
         let mesh_slice = MeshSlice {
@@ -22544,6 +22678,7 @@ mod tests {
                         disable_span_reporting: None,
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
+                        custom_env_tags: HashMap::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],
@@ -22609,6 +22744,7 @@ mod tests {
                         disable_span_reporting: Some(true),
                         custom_tags: HashMap::new(),
                         custom_header_tags: HashMap::new(),
+                        custom_env_tags: HashMap::new(),
                         providers: vec![TracingProvider::Zipkin {
                             url: "http://zipkin.istio-system:9411/api/v2/spans".to_string(),
                         }],
