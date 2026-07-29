@@ -5672,6 +5672,7 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
 /// After a successful (or already-absent) pod-IP map delete, clear the family
 /// scope and only then drop the durable `pod_ip_remove` failure. A clear
 /// failure keeps the same pending key so periodic retry re-runs both steps.
+#[allow(clippy::too_many_arguments)]
 fn finish_pod_ip_removal_scope_clear(
     backend: &mut dyn EbpfBackend,
     pod_states: &DashMap<String, PodAttachmentState>,
