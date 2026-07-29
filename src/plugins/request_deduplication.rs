@@ -10,8 +10,15 @@
 //!   for single-instance deployments.
 //! - **redis**: Centralized storage via Redis/Valkey/DragonflyDB/KeyDB/Garnet.
 //!   Enables deduplication across multiple gateway instances. Uses the shared
-//!   `RedisRateLimitClient` infrastructure with automatic local fallback when
-//!   Redis is unreachable.
+//!   `RedisRateLimitClient` infrastructure. There is no automatic local
+//!   fallback: `on_redis_unavailable` governs an unreachable Redis and defaults
+//!   to failing closed, because a local-only dedup domain would let the same
+//!   non-idempotent request execute once per gateway process. Falling back to
+//!   in-memory state is the explicit `on_redis_unavailable: "local_only"` opt-in.
+//!   (This plugin does not accept `redis_failure_policy`, the equivalent field
+//!   on the rate-limit plugins.) The shared client screens every newly
+//!   established connection with `INFO CLUSTER` and terminally refuses a Redis
+//!   Cluster endpoint, after which `on_redis_unavailable` governs.
 //!
 //! Only applies to non-safe HTTP methods (POST, PUT, PATCH by default).
 //!

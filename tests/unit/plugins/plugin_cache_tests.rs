@@ -10464,3 +10464,88 @@ fn priority_override_preserves_dynamic_replay_provenance() {
          to unprovable; otherwise the runtime backstop for the dedup composition is defeated"
     );
 }
+
+#[test]
+fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() {
+    // Issue #3316: bounded body capture is an opt-in that must take effect on
+    // reload — including when it is turned back off — and must never claim
+    // buffering while it is disabled.
+    let disabled = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "debug-1",
+            "transaction_debugger",
+            json!({}),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&disabled).expect("default transaction_debugger cache");
+    assert!(!cache.requires_request_body_buffering("ferrum", "p1"));
+    assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+
+    let enabled = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "debug-1",
+            "transaction_debugger",
+            json!({
+                "log_request_body": true,
+                "log_response_body": true,
+                "max_request_body_bytes": 256,
+                "max_response_body_bytes": 256,
+            }),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    cache
+        .rebuild(&enabled)
+        .expect("enabling bounded body capture must reload");
+    assert!(cache.requires_request_body_buffering("ferrum", "p1"));
+    assert!(cache.requires_response_body_buffering("ferrum", "p1"));
+
+    // An out-of-range budget is rejected outright by plugin-config validation,
+    // so admin admission and file-mode startup never accept it.
+    let invalid_config = json!({"log_request_body": true, "max_request_body_bytes": 1_000_000});
+    let validation =
+        ferrum_edge::plugins::validate_plugin_config("transaction_debugger", &invalid_config);
+    let error = validation.expect_err("an out-of-range capture budget must fail validation");
+    assert!(error.contains("max_request_body_bytes"), "got: {error}");
+
+    // `transaction_debugger` is an optional observability plugin
+    // (`PluginFailurePolicy::OptionalFailOpen`), so a generation that still
+    // carries the rejected config omits the instance rather than publishing a
+    // capture with an unvalidated budget: the reload succeeds and the proxy
+    // stops claiming body buffering.
+    let invalid = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "debug-1",
+            "transaction_debugger",
+            invalid_config.clone(),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    cache
+        .rebuild(&invalid)
+        .expect("an omitted optional plugin still publishes a generation");
+    assert!(
+        !cache.requires_request_body_buffering("ferrum", "p1"),
+        "a fail-open omission must never leave buffering claimed"
+    );
+    assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+
+    // Re-enable so the disable step below is a real transition.
+    cache
+        .rebuild(&enabled)
+        .expect("re-enabling bounded body capture must reload");
+    assert!(cache.requires_request_body_buffering("ferrum", "p1"));
+
+    cache
+        .rebuild(&disabled)
+        .expect("disabling bounded body capture must reload");
+    assert!(!cache.requires_request_body_buffering("ferrum", "p1"));
+    assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+}

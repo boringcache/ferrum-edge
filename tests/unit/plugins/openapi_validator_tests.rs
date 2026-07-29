@@ -7664,3 +7664,399 @@ async fn response_conversion_and_media_errors_do_not_echo_backend_values() {
     assert!(!body.contains(secret_content_type));
     assert!(!detail.contains(secret_content_type));
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-c78j-5w9p-cpq6 — duplicate JSON object member names
+//
+// `serde_json` collapses duplicate members to the LAST value while many other
+// parsers keep the FIRST. This plugin validates the collapsed instance and
+// forwards the ORIGINAL bytes, so a schema-passing document could still deliver
+// a schema-forbidden value to a first-key-wins backend. Ambiguity is rejected
+// before schema evaluation on both directions, in `block` mode; `log_only`
+// observes without claiming enforcement.
+// ---------------------------------------------------------------------------
+
+/// A contract whose `role` may only be `safe`, on both request and response.
+fn role_validator_config(mode: &str) -> serde_json::Value {
+    json!({
+        "enforcement_mode": mode,
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/roles",
+            "path_regex": "^/roles$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["role"],
+                        "properties": { "role": {"type": "string", "enum": ["safe"]} }
+                    }
+                }
+            },
+            "responses": {
+                "200": {
+                    "application/json": {
+                        "type": "object",
+                        "required": ["role"],
+                        "properties": { "role": {"type": "string", "enum": ["safe"]} }
+                    }
+                }
+            }
+        }]
+    })
+}
+
+fn role_ctx() -> RequestContext {
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/roles".into());
+    ctx.headers = json_headers();
+    ctx
+}
+
+/// The advisory reproduction: `serde_json` validates the later, permitted
+/// `role`, so schema validation alone would pass and forward bytes a
+/// first-key-wins backend reads as `admin`.
+#[tokio::test]
+async fn duplicate_request_member_is_rejected_before_schema_evaluation() {
+    let body = br#"{"role":"admin","role":"safe"}"#;
+
+    // The collapsed instance really does satisfy the schema.
+    let parsed: Value = serde_json::from_slice(body).expect("valid JSON");
+    assert_eq!(parsed["role"], "safe");
+
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut ctx = role_ctx();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body)
+            .await,
+        Some(400),
+    );
+    let detail = request_error(&ctx).expect("request error recorded");
+    assert!(
+        detail.contains("duplicate object member names"),
+        "detail should name the duplicate-member cause: {detail}"
+    );
+    assert!(
+        !detail.contains("admin"),
+        "detail must not echo body bytes: {detail}"
+    );
+}
+
+/// The reverse ordering is rejected identically.
+#[tokio::test]
+async fn duplicate_request_member_is_rejected_in_either_key_order() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut ctx = role_ctx();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &json_headers(),
+                br#"{"role":"safe","role":"admin"}"#,
+            )
+            .await,
+        Some(400),
+    );
+}
+
+/// A `u`-escaped member name that decodes to an existing name is the same
+/// member.
+#[tokio::test]
+async fn escaped_duplicate_request_member_is_rejected() {
+    let escaped_r = format!("{}u0072", '\\');
+    let body = format!(r#"{{"role":"admin","{escaped_r}ole":"safe"}}"#);
+    let parsed: Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(parsed.as_object().expect("object").len(), 1);
+
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut ctx = role_ctx();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+/// Arbitrary nesting and array elements are covered.
+#[tokio::test]
+async fn duplicate_member_nested_anywhere_in_the_request_is_rejected() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    for body in [
+        r#"{"role":"safe","meta":{"role":"admin","role":"safe"}}"#,
+        r#"{"role":"safe","items":[{"a":1},{"b":2,"b":3}]}"#,
+        r#"{"role":"safe","deep":[[{"x":{"y":1,"y":2}}]]}"#,
+    ] {
+        let mut ctx = role_ctx();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+                .await,
+            Some(400),
+        );
+    }
+}
+
+/// Unambiguous bodies still validate normally — no over-rejection.
+#[tokio::test]
+async fn unambiguous_request_bodies_still_validate() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut ctx = role_ctx();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &json_headers(),
+                br#"{"role":"safe","items":[{"role":"safe"},{"role":"safe"}]}"#,
+            )
+            .await,
+    );
+}
+
+/// `log_only` may pass, but only with the sanitized fixed reason and the
+/// observational action — it must never record an enforcement action.
+#[tokio::test]
+async fn log_only_mode_observes_duplicate_members_without_claiming_enforcement() {
+    let plugin = OpenapiValidator::new(&role_validator_config("log_only")).unwrap();
+    let mut ctx = role_ctx();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &json_headers(),
+                br#"{"role":"admin","role":"safe"}"#,
+            )
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("openapi_validator.action")
+            .map(String::as_str),
+        Some("logged_request_mismatch")
+    );
+    let detail = request_error(&ctx).expect("request error recorded");
+    assert!(detail.contains("duplicate object member names"), "{detail}");
+    assert!(
+        !detail.contains("admin"),
+        "detail echoed body bytes: {detail}"
+    );
+}
+
+/// The response direction is the mirror image: the CLIENT is the first-key-wins
+/// parser, so an ambiguous backend body fails closed with the response status
+/// and a detail that never reflects backend bytes.
+#[tokio::test]
+async fn duplicate_response_member_is_rejected() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut ctx = role_ctx();
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &json_headers(),
+                br#"{"role":"admin","role":"safe"}"#,
+            )
+            .await,
+        Some(502),
+    );
+    let detail = response_error(&ctx).expect("response error recorded");
+    assert_eq!(detail, SAFE_RESPONSE_DECODE_ERROR);
+
+    let mut clean_ctx = role_ctx();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut clean_ctx, 200, &json_headers(), br#"{"role":"safe"}"#)
+            .await,
+    );
+}
+
+/// Form-derived embedded JSON: a multipart part declared `application/json` is
+/// governed by the same schema and gets the same screen. Nothing else inspects
+/// those bytes, so without the part-level screen the differential survives.
+#[tokio::test]
+async fn duplicate_member_in_multipart_json_part_is_rejected() {
+    let plugin = OpenapiValidator::new(&json!({
+        "enforcement_mode": "block",
+        "schema_draft": "draft7",
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_required": true,
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["meta"],
+                            "properties": {
+                                "meta": {
+                                    "type": "object",
+                                    "required": ["role"],
+                                    "properties": {
+                                        "role": {"type": "string", "enum": ["safe"]}
+                                    }
+                                }
+                            }
+                        },
+                        "encoding": { "meta": { "contentType": "application/json" } }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let multipart_headers = content_type_headers("multipart/form-data; boundary=BOUND");
+    let build = |meta: &str| {
+        format!(
+            "--BOUND\r\nContent-Disposition: form-data; name=\"meta\"\r\n\
+             Content-Type: application/json\r\n\r\n{meta}\r\n--BOUND--\r\n"
+        )
+        .into_bytes()
+    };
+
+    let mut ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/upload".into());
+    ctx.headers = multipart_headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &multipart_headers,
+                &build(r#"{"role":"admin","role":"safe"}"#),
+            )
+            .await,
+        Some(400),
+    );
+
+    let mut clean_ctx = RequestContext::new("127.0.0.1".into(), "POST".into(), "/upload".into());
+    clean_ctx.headers = multipart_headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut clean_ctx,
+                &multipart_headers,
+                &build(r#"{"role":"safe"}"#),
+            )
+            .await,
+    );
+}
+
+/// An Encoding Object Header Object `content` value declared `application/json`
+/// is a second form of form-derived embedded JSON: it is governed by its own
+/// schema, the original header bytes are forwarded verbatim, and nothing else
+/// screens them.
+#[tokio::test]
+async fn duplicate_member_in_multipart_header_content_json_is_rejected() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["role"],
+                    "properties": {"role": {"type": "string", "enum": ["safe"]}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let build = |meta: &str| {
+        format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\n\
+             X-Part-Meta: {meta}\r\n\r\nhello\r\n--abc--\r\n"
+        )
+        .into_bytes()
+    };
+
+    // The collapsed instance satisfies the schema, so schema validation alone
+    // would forward bytes a first-key-wins backend reads as `admin`.
+    let ambiguous = r#"{"role":"admin","role":"safe"}"#;
+    let parsed: Value = serde_json::from_str(ambiguous).expect("valid JSON");
+    assert_eq!(parsed["role"], "safe");
+
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, &build(ambiguous))
+            .await,
+        Some(400),
+    );
+
+    let mut clean_ctx = post_ctx("/header-content");
+    clean_ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut clean_ctx,
+                &headers,
+                &build(r#"{"role":"safe"}"#),
+            )
+            .await,
+    );
+}
+
+/// A compressed request body is screened AFTER decoding: the differential lives
+/// in the decoded document the backend will parse.
+#[tokio::test]
+async fn duplicate_member_in_gzipped_request_body_is_rejected() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let mut ctx = role_ctx();
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(
+                &mut ctx,
+                &headers,
+                &gzip_bytes(br#"{"role":"admin","role":"safe"}"#),
+            )
+            .await,
+        Some(400),
+    );
+
+    let mut clean_ctx = role_ctx();
+    clean_ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(
+                &mut clean_ctx,
+                &headers,
+                &gzip_bytes(br#"{"role":"safe"}"#),
+            )
+            .await,
+    );
+}
+
+/// Malformed JSON keeps its existing "Invalid JSON body" handling; the screen
+/// must not reclassify parse errors, and must never panic.
+#[tokio::test]
+async fn malformed_request_bodies_keep_invalid_json_handling() {
+    let plugin = OpenapiValidator::new(&role_validator_config("block")).unwrap();
+    for body in [
+        &b"{"[..],
+        &b"{\"role\":}"[..],
+        &b"{\"role\":\"safe\"} trailing"[..],
+        &b"\xff\xfe"[..],
+    ] {
+        let mut ctx = role_ctx();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &json_headers(), body)
+                .await,
+            Some(400),
+        );
+        let detail = request_error(&ctx).expect("request error recorded");
+        assert!(
+            !detail.contains("duplicate object member names"),
+            "malformed body must not be reported as ambiguity: {detail}"
+        );
+    }
+}
