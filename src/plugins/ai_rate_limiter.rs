@@ -43,11 +43,12 @@ use super::utils::ai_providers::{
 };
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::rate_limit::{
-    AiRateLimitOp, AiTokenRateAlgorithm, RateLimitBackend, RateLimitOutcome, ReservationBackend,
-    STANDALONE_RATE_LIMIT_CONFIG_ID, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    AiRateLimitOp, AiTokenRateAlgorithm, ENFORCEMENT_UNAVAILABLE_BODY,
+    ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend,
+    RateLimitOutcome, ReservationBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    apply_rate_limit_cleanup, debug_assert_closed_root_keys, debug_assert_rate_limit_redis_keys,
     validate_window_seconds,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 /// Shared key for the original (pre-rejection) backend HTTP status. Recorded by
 /// the proxy's `run_after_proxy_hooks` *before* the after_proxy loop, and again
@@ -191,7 +192,7 @@ const AI_RATE_LIMITER_POLICY_CONFIG_KEYS: &[&str] = &[
 /// Closed top-level key set for `ai_rate_limiter` plugin config.
 ///
 /// Must stay aligned with OpenAPI `AiRateLimiterConfig` (which must declare
-/// `additionalProperties: false`), [`REDIS_PLUGIN_CONFIG_KEYS`], and
+/// `additionalProperties: false`), [`RATE_LIMIT_REDIS_CONFIG_KEYS`], and
 /// `docs/plugins.md`. Unknown root keys fail closed: a valid `token_limit` can
 /// mask a misspelled `sync_mdoe`, `on_unmetered_responce`, or `limit_byy`, so
 /// construction would succeed while distributed enforcement, identity scope,
@@ -204,7 +205,7 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "expose_headers",
     "provider",
     "on_unmetered_response",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
     "redis_tls",
@@ -214,6 +215,7 @@ pub const AI_RATE_LIMITER_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 pub struct AiRateLimiter {
@@ -255,10 +257,16 @@ impl AiRateLimiter {
         let object = config
             .as_object()
             .ok_or_else(|| "ai_rate_limiter: config must be an object".to_string())?;
+        // Keeps the documented key groups aligned with the closed root
+        // allowlist used for admission and OpenAPI parity. The Redis group is
+        // the rate-limit list (shared keys plus `redis_failure_policy`), not the
+        // bare shared list: an enforcement plugin that unioned the shared list
+        // would reject the advisory's fail-closed/local_fallback opt-in.
+        debug_assert_rate_limit_redis_keys();
         debug_assert_closed_root_keys(
             AI_RATE_LIMITER_CONFIG_KEYS,
             AI_RATE_LIMITER_POLICY_CONFIG_KEYS,
-            REDIS_PLUGIN_CONFIG_KEYS,
+            RATE_LIMIT_REDIS_CONFIG_KEYS,
         );
         reject_unknown_keys(
             object,
@@ -372,6 +380,15 @@ impl AiRateLimiter {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective `redis_failure_policy` for advisory coverage. Not a production
+    /// API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
@@ -499,6 +516,13 @@ impl AiRateLimiter {
         if !self.expose_headers {
             return;
         }
+        // A fail-closed reconciliation outcome carries no authoritative counter
+        // (centralized enforcement could not be consulted). Publishing its empty
+        // remaining/usage would advertise `0 used` for a budget this gateway
+        // cannot see; leave the previously stored values in place instead.
+        if outcome.enforcement_unavailable {
+            return;
+        }
 
         ctx.metadata.insert(
             "ai_ratelimit_limit".to_string(),
@@ -560,6 +584,22 @@ impl AiRateLimiter {
                 usage, self.token_limit, self.window_seconds
             ),
             headers,
+        }
+    }
+
+    /// Generic refusal for "centralized enforcement could not be consulted".
+    ///
+    /// Shared by admission (`before_proxy`) and by authoritative post-response
+    /// usage reconciliation so the two cannot drift apart. Carries **no**
+    /// rate-limit headers: this gateway has no authoritative counter to report,
+    /// and the body names no endpoint, key, credential, or consumer identity —
+    /// a caller must not learn that a centralized store exists, let alone its
+    /// state.
+    fn reject_enforcement_unavailable(&self) -> PluginResult {
+        PluginResult::Reject {
+            status_code: ENFORCEMENT_UNAVAILABLE_STATUS,
+            body: ENFORCEMENT_UNAVAILABLE_BODY.to_string(),
+            headers: HashMap::new(),
         }
     }
 
@@ -814,6 +854,28 @@ impl AiRateLimiter {
                 )
                 .await
             {
+                // The authoritative charge could not be recorded: centralized
+                // enforcement went away between admission/reservation and this
+                // post-response reconcile, and `redis_failure_policy` is
+                // `fail_closed`. Delivering the upstream 2xx would hand the
+                // client a completion whose tokens nothing charged — the exact
+                // budget bypass the fail-closed default exists to prevent — so
+                // refuse with the same generic 503 admission uses.
+                //
+                // Only for a successful response. When the response is already
+                // non-2xx the charge/release failure is a conservative
+                // over-count against this consumer's own budget, and replacing
+                // an error response with a different error buys nothing.
+                //
+                // No warning here: the failover backend already emits one
+                // bounded operational warning per outage, and this path runs
+                // once per request.
+                if outcome.enforcement_unavailable {
+                    if (200..300).contains(&response_status) {
+                        return self.reject_enforcement_unavailable();
+                    }
+                    return PluginResult::Continue;
+                }
                 // Refresh expose-header metadata to the post-reconcile bucket so
                 // later header copies (after_proxy federation/gateway, or
                 // on_response_body on the normal path) describe actual usage —
@@ -1687,10 +1749,18 @@ impl Plugin for AiRateLimiter {
         };
 
         if !outcome.allowed {
+            if outcome.enforcement_unavailable {
+                // The shared failover backend emits one bounded operational
+                // warning per outage. Do not turn an unavailable dependency
+                // into one warning and one "exceeded" metric per request.
+                return self.reject_enforcement_unavailable();
+            }
             super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
             let usage = outcome.usage.unwrap_or(0);
+            // The rate-limit key embeds the identity dimension (consumer,
+            // authenticated identity, SPIFFE ID, or client IP) and is never
+            // logged; the bounded counters below stay.
             warn!(
-                rate_limit_key = %key,
                 current_tokens = usage,
                 limit = self.token_limit,
                 plugin = "ai_rate_limiter",

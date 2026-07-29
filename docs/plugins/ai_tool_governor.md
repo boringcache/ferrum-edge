@@ -181,8 +181,40 @@ forwarded ungoverned:
   merely opens with an unknown field name) is held in full and cut at
   end-of-stream.
 
+- **Ambiguous JSON (duplicate object member names, `GHSA-c78j-5w9p-cpq6`)**:
+  `serde_json` collapses duplicate members to the *last* value while many
+  backends and clients keep the *first*, so a duplicated tool name or argument
+  member means the document this plugin governs is not the document the next
+  parser reads. The plugin forwards the original bytes and has no request-body
+  transform, so ambiguity is **refused, never canonicalized**. Every governed
+  JSON surface is screened: the initial request body, the final
+  backend-visible request body, buffered JSON responses (plain and decoded),
+  the post-transform final re-check, live and buffered SSE `data:` payloads,
+  a fully-held JSON-shaped stream, and the approval webhook's own response.
+  A tool call whose `function.arguments` / MCP `params` arrive as a JSON
+  *string* gets its content screened separately — the enclosing document scan
+  cannot see inside a string — and an ambiguous one joins the ungovernable
+  class, exactly like a missing `function.name`. On the streaming path an
+  ambiguous frame cuts the stream **before any held bytes are released**.
+  Member names are compared after JSON escapes are decoded, so a literal name
+  and a `\uXXXX`-escaped spelling of the same code point are one member. The
+  screen is non-recursive and bounded by explicit depth, token, member-count,
+  member-name, and body-size budgets; exhausting any budget fails closed without
+  an unbounded confirmation pass.
+  Bytes that are not valid JSON at all keep their existing uninspectable
+  handling. Rejection details use a fixed set of reasons and never echo any
+  byte of the governed body.
+
 In `mode: dry_run` these bodies are forwarded uninspected (and a stream past
-the hold cap is released uninspected) — dry-run never disrupts traffic.
+the hold cap is released uninspected) — dry-run never disrupts traffic. That
+includes ambiguous JSON: dry-run forwards the original bytes unchanged and
+records a sanitized fixed-cardinality observation —
+`ai_tool_governor.decision=dry_run` plus
+`ai_tool_governor.uninspectable_reason=ambiguous_json` — and never claims
+enforcement with `decision=deny`. The reason label is sticky and bounded, so
+repeated ambiguous frames do not grow metadata cardinality. Generic
+uninspectable causes (encoding, size, non-UTF-8) keep their prior forward-only
+dry-run posture and are not relabeled as ambiguity.
 
 ## Actions
 
@@ -338,7 +370,9 @@ When `observability.emit_metadata` is on (default), the plugin writes
 (`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
 `approval_denied`),
 `tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
-(SHA-256, when `hash_arguments` is on), and `redacted_tools`.
+(SHA-256, when `hash_arguments` is on), `redacted_tools`, and — when global
+`mode: dry_run` observes duplicate-key ambiguity without blocking —
+`uninspectable_reason` (`ambiguous_json` only; never raw body bytes).
 
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked

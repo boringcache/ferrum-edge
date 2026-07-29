@@ -13,6 +13,7 @@ pub mod federation;
 pub mod hbone;
 pub mod multicluster;
 pub mod node_waypoint;
+pub mod node_waypoint_observability;
 pub mod outbound_enforcement;
 pub mod policy;
 pub mod policy_deny_log;
@@ -5119,6 +5120,8 @@ fn build_outbound_mesh_targets(
                 "Skipping NodeWaypoint service target without destination node_waypoint metadata; \
                  secured NodeWaypoint transport is required in this identity posture"
             );
+            crate::modes::mesh::node_waypoint_observability::record_missing_destination_metadata();
+            crate::modes::mesh::node_waypoint_observability::record_plaintext_fallback_attempt();
             continue;
         }
         // App (container) port the request is for. A DECLARED `targetPort` is
@@ -9334,6 +9337,12 @@ pub async fn run(
              apply."
         );
     }
+
+    // ADR observability producers (issue #3334). Process-static counters stay
+    // monotonic across reload/SVID rotation; enabling only gates new increments.
+    crate::modes::mesh::node_waypoint_observability::set_enabled(
+        runtime.topology == MeshTopology::NodeWaypoint,
+    );
 
     // Configure the process-singleton policy-deny recorder before anything can
     // record into it. This is idempotent and a no-op on subsequent calls
