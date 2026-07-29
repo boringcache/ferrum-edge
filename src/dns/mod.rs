@@ -1626,7 +1626,12 @@ impl DnsCache {
                     let expires = if e.is_error {
                         e.error_expires_at()
                     } else {
-                        e.resolved_at + e.applied_ttl
+                        self.shared_stale_deadline(
+                            e.resolved_at,
+                            e.native_ttl,
+                            e.load_longest_per_proxy_ttl(),
+                            e.load_default_consumer_observed(),
+                        )
                     };
                     (e.key().clone(), e.is_error, expires)
                 })
@@ -3913,6 +3918,61 @@ mod tests {
         assert!(
             errors_remaining <= 1,
             "Phase 2 must prefer error entries for eviction; remaining errors={errors_remaining}"
+        );
+    }
+
+    /// Capacity trimming must rank live rows by the longest observed consumer
+    /// deadline, not the shortest proactive-refresh TTL. Otherwise a short-TTL
+    /// peer can make a shared row the first live answer evicted while a
+    /// long-TTL peer still considers it fresh.
+    #[test]
+    fn capacity_eviction_preserves_row_fresh_for_longest_consumer() {
+        let cache = DnsCache::new(DnsConfig {
+            max_cache_size: 2,
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            ..DnsConfig::default()
+        });
+        let now = Instant::now();
+        let address = Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 80))]);
+
+        let shared = success_entry(
+            address.clone(),
+            now - Duration::from_secs(10),
+            Duration::from_secs(600),
+            Some(5),
+            now + Duration::from_secs(590),
+        );
+        shared.note_per_proxy_ttl(Some(600));
+        cache.cache.insert("shared.example".to_string(), shared);
+        cache.cache.insert(
+            "short.example".to_string(),
+            success_entry(
+                address.clone(),
+                now,
+                Duration::from_secs(30),
+                Some(30),
+                now + Duration::from_secs(30),
+            ),
+        );
+        cache.cache.insert(
+            "medium.example".to_string(),
+            success_entry(
+                address,
+                now,
+                Duration::from_secs(60),
+                Some(60),
+                now + Duration::from_secs(60),
+            ),
+        );
+
+        cache.evict_expired();
+
+        assert_eq!(cache.cache_len(), 1, "capacity target is 75% of max");
+        assert!(
+            cache.cache.get("shared.example").is_some(),
+            "the 600s consumer's shared row must outlive 30s/60s rows even though \
+             its shortest refresh policy is already expired"
         );
     }
 
