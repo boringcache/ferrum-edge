@@ -432,7 +432,7 @@ impl<'a> ExpressionParser<'a> {
 
 fn canonicalize_access_log_filter(parsed: ParsedExpr) -> Result<Option<AccessLogFilter>, String> {
     let canonical = canonicalize_parsed_expr(parsed)?;
-    if let Some(flat) = flatten_and_only(&canonical) {
+    if let Some(flat) = flatten_and_only(&canonical)? {
         return Ok(Some(flat));
     }
     Ok(Some(AccessLogFilter {
@@ -509,9 +509,11 @@ fn flatten_expr(expr: AccessLogFilterExpr) -> AccessLogFilterExpr {
     }
 }
 
-fn flatten_and_only(expr: &AccessLogFilterExpr) -> Option<AccessLogFilter> {
+fn flatten_and_only(expr: &AccessLogFilterExpr) -> Result<Option<AccessLogFilter>, String> {
     let mut atoms = Vec::new();
-    collect_and_atoms(expr, &mut atoms)?;
+    if collect_and_atoms(expr, &mut atoms).is_none() {
+        return Ok(None);
+    }
     let mut filter = AccessLogFilter {
         status_code_min: None,
         status_code_max: None,
@@ -522,7 +524,7 @@ fn flatten_and_only(expr: &AccessLogFilterExpr) -> Option<AccessLogFilter> {
     for atom in atoms {
         apply_atom_to_filter(&mut filter, atom)?;
     }
-    Some(filter)
+    Ok(Some(filter))
 }
 
 fn collect_and_atoms<'a>(
