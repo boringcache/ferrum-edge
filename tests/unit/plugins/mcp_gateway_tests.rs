@@ -6642,8 +6642,10 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
         .insert("mcp.server_id".to_string(), "forged".to_string());
     ctx.metadata
         .insert("mcp.protocol_version".to_string(), "forged".to_string());
-    ctx.metadata
-        .insert("mcp.catalog_degraded".to_string(), "forged:tools".to_string());
+    ctx.metadata.insert(
+        "mcp.catalog_degraded".to_string(),
+        "forged:tools".to_string(),
+    );
     let _ = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
         ctx.route_override_backend_host.is_none(),
