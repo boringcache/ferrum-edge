@@ -974,6 +974,12 @@ pub mod _test_support {
         plugin.max_retained_request_body_bytes_for_test()
     }
 
+    pub fn request_mirror_max_mirrored_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_mirrored_request_body_bytes_for_test()
+    }
+
     pub fn request_mirror_mirror_timeout_ms_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> Option<u64> {

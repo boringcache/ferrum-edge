@@ -61,7 +61,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 3. authorize            │  AuthZ, OPA decisions, consumer rate limiting, WAF metadata
+│ 3. authorize            │  AuthZ, OPA decisions, consumer rate limiting, WAF metadata, request_mirror pre-buffer admission
 └────────────┬────────────┘
              │
              ▼
@@ -220,6 +220,28 @@ final authorization. An explicit operator-configured `mirror_path` still wins.
 Each configured mirror instance appends its own bounded result receiver; result
 logging is detached per instance, so later instances and mixed completion order
 cannot overwrite an earlier destination's outcome.
+
+A body-mirroring `request_mirror` instance additionally participates in the
+`authorize` phase, purely to decide mirror admission before the gateway
+collects a request body (advisory `GHSA-jv66-mq44-m9v3`). That hook never
+rejects — mirroring stays fail-open for the primary request. It advances the
+deterministic sampler once and, on selection, takes the instance's
+`max_in_flight` permit plus a `max_retained_request_body_bytes` reservation
+equal to the full positive `max_mirrored_request_body_bytes` ceiling (declared
+`Content-Length` is used only to skip already-oversized bodies before sampling;
+it never sizes the aggregate charge). `should_buffer_request_body` is then a
+pure read of that decision, so a
+`percentage: 0`, sampled-out, or saturated request keeps streaming and never
+allocates a mirror body. Its built-in priority follows the built-in rejecting
+authorization hooks. If an operator priority override or custom plugin places a
+rejecting hook later, the proxy still waits for the complete authorization
+phase before collecting the body; that rejection drops the staged permit and
+reservation without reading the upload, though it may consume a sampling slot.
+Instances with `mirror_request_body: false` or a zero-quantized `percentage`
+declare no body capability at all and stay out of the authorize list. The staged
+decision is left behind as a consumed marker after `before_proxy` takes the
+lease, so the buffering predicate answers consistently for the whole request.
+
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
 the external call. After each deferred pass, the gateway removes every case
@@ -677,7 +699,7 @@ Given all built-in plugins enabled, the execution order is:
 | 52 | `response_mock` | 3030 | before_proxy |
 | 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
 | 54 | `load_testing` | 3070 | before_proxy |
-| 55 | `request_mirror` | 3075 | before_proxy |
+| 55 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), before_proxy |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |

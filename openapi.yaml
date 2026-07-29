@@ -19481,7 +19481,12 @@ components:
         Mirror response bodies are always drained under max_response_body_bytes
         so Content-Length responses do not strand keep-alive pools. Retained
         request bodies share Bytes with the primary buffer and are admitted under
-        max_in_flight plus max_retained_request_body_bytes. The mirror request
+        max_in_flight plus max_retained_request_body_bytes. Sampling and that
+        admission run in the authorize phase, BEFORE the request body is
+        collected: a percentage-zero, sampled-out, or saturated request keeps
+        streaming and never allocates a mirror body, and
+        max_mirrored_request_body_bytes bounds a single mirrored body even when
+        the global request-body limit is unlimited. The mirror request
         always has a finite deadline (mirror_timeout_ms, else positive proxy
         backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
         process-wide ferrum_request_mirror_*_total lifecycle counters are exported
@@ -19533,7 +19538,14 @@ components:
         mirror_request_body:
           type: boolean
           default: true
-          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy. Shared Bytes are charged against max_retained_request_body_bytes for each in-flight task."
+          description: >-
+            When true, the request body is forwarded to the mirror target.
+            Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads).
+            Body collection is gated by authorize-phase sampling and admission:
+            only an admitted request is buffered, and Shared Bytes are charged
+            against max_retained_request_body_bytes for each in-flight task.
+            When false, or when percentage quantizes to 0, this instance
+            declares no request-body capability at all.
         max_in_flight:
           type: integer
           format: uint64
@@ -19552,9 +19564,29 @@ components:
           default: 67108864
           description: >-
             Aggregate retained request-body budget for in-flight mirrors on this
-            plugin instance. Shared Bytes bodies are charged once per task for
-            their length; exhaustion drops the new mirror attempt without
-            affecting the primary request. Default is 64 MiB.
+            plugin instance. Charged at pre-buffer admission as the full
+            max_mirrored_request_body_bytes ceiling for every admitted request
+            (declared Content-Length is never trusted for the charge; it is used
+            only to skip already-oversized bodies before sampling) and reconciled
+            to the observed body length, returning any surplus exactly once.
+            Size this against max_in_flight times max_mirrored_request_body_bytes
+            when mirroring at high concurrency. Exhaustion drops the new mirror
+            attempt without affecting the primary request. Default is 64 MiB.
+        max_mirrored_request_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 10485760
+          description: >-
+            Positive plugin-local ceiling on one mirrored request body, applied
+            even when the global FERRUM_MAX_REQUEST_BODY_SIZE_BYTES is set to 0
+            (unlimited). Combined with the global limit by the proxy; the
+            strictest positive value wins, and it applies only to requests this
+            instance admitted for mirroring. An explicit value above
+            max_retained_request_body_bytes is rejected at construction; when
+            the key is omitted the default clamps down to
+            max_retained_request_body_bytes instead of failing.
+            Default is 10 MiB, matching the global default.
         mirror_timeout_ms:
           type: integer
           format: uint64
