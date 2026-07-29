@@ -72,9 +72,7 @@ impl BoundedYamlError {
             Self::NonStringMappingKey => {
                 "YAML mapping keys must be strings for JSON conversion".to_string()
             }
-            Self::DuplicateMappingKey => {
-                "YAML mapping contains a duplicate key".to_string()
-            }
+            Self::DuplicateMappingKey => "YAML mapping contains a duplicate key".to_string(),
             // Tags are supplied by the caller. Keep diagnostics actionable
             // without reflecting arbitrary tag text into an admin response.
             Self::UnsupportedTag { .. } => "unsupported YAML tag in API specs".to_string(),
@@ -532,9 +530,7 @@ fn expand_node(
                     Value::String(s) => s,
                     _ => return Err(BoundedYamlError::NonStringMappingKey),
                 };
-                if (key == "<<" && saw_merge_spelling)
-                    || (key != "<<" && map.contains_key(&key))
-                {
+                if (key == "<<" && saw_merge_spelling) || (key != "<<" && map.contains_key(&key)) {
                     return Err(BoundedYamlError::DuplicateMappingKey);
                 }
                 saw_merge_spelling |= key == "<<";
@@ -881,15 +877,8 @@ impl Parser {
             sys::yaml_parser_set_encoding(parser_ptr, sys::YAML_UTF8_ENCODING);
             // After this call the parser is self-referential via
             // `read_handler_data`; only the Box handle may move from here on.
-            sys::yaml_parser_set_input_string(
-                parser_ptr,
-                input.as_ptr(),
-                input.len() as u64,
-            );
-            Ok(Self {
-                sys,
-                _input: input,
-            })
+            sys::yaml_parser_set_input_string(parser_ptr, input.as_ptr(), input.len() as u64);
+            Ok(Self { sys, _input: input })
         }
     }
 
