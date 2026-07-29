@@ -202,3 +202,28 @@ fn flow_style_autodetect_expands_aliases_under_same_budgets() {
     assert_eq!(bundle.proxy.id, "flow-proxy");
     assert_eq!(meta.title.as_deref(), Some("flow"));
 }
+
+#[test]
+fn parser_storage_remains_stable_across_repeated_extracts() {
+    for index in 0..64 {
+        let yaml = proxy_yaml(&format!("stable-parser-{index}"));
+        let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+        assert_eq!(bundle.proxy.id, format!("stable-parser-{index}"));
+    }
+}
+
+#[test]
+fn malformed_documents_fail_without_reusing_parser_storage() {
+    for malformed in [
+        b"key: [unterminated".as_slice(),
+        b"key:\n  child: value\n broken".as_slice(),
+        b"'unterminated".as_slice(),
+    ] {
+        for _ in 0..16 {
+            assert!(matches!(
+                extract(malformed, Some(SpecFormat::Yaml), "prod"),
+                Err(ExtractError::InvalidYaml(_))
+            ));
+        }
+    }
+}

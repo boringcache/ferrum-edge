@@ -10,7 +10,7 @@
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
-use std::ptr::{NonNull, addr_of_mut};
+use std::ptr::NonNull;
 use std::slice;
 use unsafe_libyaml as sys;
 
@@ -790,50 +790,64 @@ enum Event {
 }
 
 struct Parser {
-    sys: sys::yaml_parser_t,
-    /// Keep input alive for the parser's duration.
+    /// Heap-resident foreign parser.
+    ///
+    /// `yaml_parser_set_input_string` stores `read_handler_data = parser`, making
+    /// the C object self-referential. Moving `yaml_parser_t` after input setup
+    /// leaves a dangling self-pointer and aborts inside the string read handler
+    /// (`ptr::copy_nonoverlapping` alignment/null precondition). Keeping the
+    /// object inside a private `Box` gives it a stable address while the owning
+    /// `Parser` moves freely.
+    sys: Box<sys::yaml_parser_t>,
+    /// Owned input bytes. The heap buffer must stay alive and unmoved for the
+    /// parser lifetime (`set_input_string` retains raw pointers into it).
     _input: Vec<u8>,
 }
 
 impl Parser {
     fn new(input: &[u8]) -> Result<Self, BoundedYamlError> {
-        let mut owned = MaybeUninit::<sys::yaml_parser_t>::uninit();
-        let sys_ptr = owned.as_mut_ptr();
+        // Own input first so its heap buffer address is stable before the
+        // parser retains pointers into it.
+        let input = input.to_vec();
+        let mut sys = Box::<sys::yaml_parser_t>::new_uninit();
         unsafe {
-            if sys::yaml_parser_initialize(sys_ptr).fail {
+            if sys::yaml_parser_initialize(sys.as_mut_ptr()).fail {
+                // Initialize failed: do not assume_init and do not delete.
                 return Err(BoundedYamlError::Parse(
                     "failed to initialize YAML parser".to_string(),
                 ));
             }
-            let input = input.to_vec();
-            // Input pointer must remain valid for the parser lifetime.
-            let input_ptr = input.as_ptr();
-            let input_len = input.len() as u64;
-            // Leak prevention: store input in Self before setting; pointer stays
-            // valid because Vec is not moved after this once placed in Self.
-            let mut parser = Self {
-                sys: owned.assume_init(),
-                _input: input,
-            };
-            sys::yaml_parser_set_encoding(addr_of_mut!(parser.sys), sys::YAML_UTF8_ENCODING);
+            // Promote MaybeUninit -> T in place without relocating the
+            // allocation. The private Box is never converted back into an
+            // owned yaml_parser_t, so its address stays stable.
+            let mut sys = sys.assume_init();
+            let parser_ptr = &mut *sys as *mut sys::yaml_parser_t;
+
+            sys::yaml_parser_set_encoding(parser_ptr, sys::YAML_UTF8_ENCODING);
+            // After this call the parser is self-referential via
+            // `read_handler_data`; only the Box handle may move from here on.
             sys::yaml_parser_set_input_string(
-                addr_of_mut!(parser.sys),
-                parser._input.as_ptr(),
-                parser._input.len() as u64,
+                parser_ptr,
+                input.as_ptr(),
+                input.len() as u64,
             );
-            let _ = (input_ptr, input_len);
-            Ok(parser)
+            Ok(Self {
+                sys,
+                _input: input,
+            })
         }
     }
 
     fn next(&mut self) -> Result<Event, BoundedYamlError> {
         let mut event = MaybeUninit::<sys::yaml_event_t>::uninit();
         unsafe {
-            let parser = addr_of_mut!(self.sys);
+            let parser = &mut *self.sys as *mut sys::yaml_parser_t;
             let event_ptr = event.as_mut_ptr();
-            // `yaml_parser_t` error detail fields are crate-private in
-            // unsafe-libyaml; fail closed with a non-secret generic diagnostic.
+            // `yaml_parser_parse` initializes `event` to zero before advancing
+            // the state machine. Delete any partially populated event on
+            // failure. Error detail fields are crate-private — fail closed.
             if sys::yaml_parser_parse(parser, event_ptr).fail {
+                sys::yaml_event_delete(event_ptr);
                 return Err(BoundedYamlError::Parse(
                     "malformed YAML document".to_string(),
                 ));
@@ -847,8 +861,11 @@ impl Parser {
 
 impl Drop for Parser {
     fn drop(&mut self) {
+        // Delete the foreign parser before `_input` drops so retained input
+        // pointers are not used during teardown. Rust then frees the parser
+        // allocation and the owned input buffer.
         unsafe {
-            sys::yaml_parser_delete(addr_of_mut!(self.sys));
+            sys::yaml_parser_delete(&mut *self.sys);
         }
     }
 }
