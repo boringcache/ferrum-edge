@@ -13,9 +13,7 @@ use serde_json::json;
 
 const ENV_VAR: &str = "FERRUM_TEST_WORKLOAD_METRICS_EXTERNAL_ENV_TAG";
 
-async fn metadata_after_before_proxy(
-    plugin: &impl Plugin,
-) -> HashMap<String, String> {
+async fn metadata_after_before_proxy(plugin: &impl Plugin) -> HashMap<String, String> {
     let mut ctx = RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
     let mut headers = HashMap::new();
     assert!(matches!(

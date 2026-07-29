@@ -1694,7 +1694,9 @@ fn segment_embeds_credential_compound(segment: &str) -> bool {
         "credential",
         "credentials",
     ];
-    const TRAILERS: &[&str] = &["key", "id", "url", "uri", "dsn", "string", "token", "secret"];
+    const TRAILERS: &[&str] = &[
+        "key", "id", "url", "uri", "dsn", "string", "token", "secret",
+    ];
 
     for stem in STEMS {
         if segment.len() <= stem.len() {
