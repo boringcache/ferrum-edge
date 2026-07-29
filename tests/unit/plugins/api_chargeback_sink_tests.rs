@@ -6127,6 +6127,67 @@ async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
     drop(plugin);
 }
 
+/// A compaction that refuses *after* preparation drained the staged overflow
+/// must give that overflow back and must not disable the generation's periodic
+/// emitter. Preparation takes the staged overflow rather than cloning it, so a
+/// refusal that simply dropped its local vector would destroy the only
+/// authoritative copy of those billing deltas while the code claims the Full
+/// generation is retained for a later retry.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compaction_projection_shortfall_restages_overflow_and_keeps_retry_alive() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_projection_shortfall_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-projection-shortfall"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    assert!(accumulator.stage_overflow_event_for_tests(sample_event("shortfall-pending-a")));
+    assert!(accumulator.stage_overflow_event_for_tests(sample_event("shortfall-pending-b")));
+    let charged_before = accumulator.retained_bytes_for_tests();
+
+    let (compacted, overflow_pending, periodic_task_alive) =
+        api_chargeback_sink_compact_projection_shortfall_for_test(&plugin)
+            .expect("snapshot lifecycle");
+
+    assert!(
+        !compacted,
+        "a measured payload above the reserved projection must fail closed, not publish an undercharged compact recovery"
+    );
+    assert_eq!(
+        overflow_pending, 2,
+        "the refused compaction must return every staged overflow charge it borrowed"
+    );
+    assert!(
+        periodic_task_alive,
+        "a refused compaction must not abort the retained generation's periodic emitter; that task is its retry path"
+    );
+    assert_eq!(
+        accumulator.retained_bytes_for_tests(),
+        charged_before,
+        "restaged overflow must re-reserve exactly the bytes preparation released"
+    );
+
+    drop(plugin);
+}
+
 /// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
 /// staging never push the accumulator past its hard entry/byte ceilings, and no
 /// charge is double-counted or silently dropped.

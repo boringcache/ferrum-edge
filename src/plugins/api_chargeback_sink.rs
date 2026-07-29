@@ -621,7 +621,28 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
 /// reload or shutdown — can retry after drain. The budget gate is checked
 /// against the current retained estimate *before* any staged overflow is
 /// drained, so a refused compaction never loses events.
+///
+/// Every refusal after preparation restores the staged overflow it borrowed and
+/// leaves the generation's periodic emitter running, so the Full generation is
+/// genuinely retained: it still owns every pending delta exactly once and still
+/// has a live path to durability.
 fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
+    compact_snapshot_lifecycle_measured(lifecycle, None)
+}
+
+/// [`compact_snapshot_lifecycle`] with a test-only override of the *measured*
+/// compact payload size.
+///
+/// Production always passes `None` and measures the real events, so no
+/// production admission decision is relaxed by this parameter. It exists only
+/// so external unit tests can reach the measured-payload-exceeds-projection
+/// branch — which the deliberately conservative projection bound makes
+/// unreachable with honest inputs — and prove that branch keeps the staged
+/// overflow and the generation's retry mechanism.
+fn compact_snapshot_lifecycle_measured(
+    lifecycle: &SnapshotLifecycle,
+    measured_bytes_override: Option<usize>,
+) -> bool {
     // Stop new admissions and require the admitted set to drain before touching
     // full-generation state. `admit()`'s double-checked `accepting` flag means
     // that once we observe `accepting == false`, `in_flight == 0`, and no
@@ -676,12 +697,44 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
         );
         return false;
     }
-    let Some(events) = lifecycle.prepare_compaction_events() else {
+    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events() else {
         // Serialize failure: keep the Full generation intact and retry later.
+        // `prepare_compaction_events` already restaged its borrowed overflow.
         return false;
     };
 
-    // Stop the periodic emitter for this generation regardless of outcome.
+    let retained_bytes = measured_bytes_override.unwrap_or_else(|| {
+        events
+            .iter()
+            .map(charge_event_retained_bytes)
+            .fold(0usize, usize::saturating_add)
+    });
+    // Transfer the projection's reservation to the Compact owner and true it up
+    // to the measured retained size. A shortfall is not expected because the
+    // projection bound is conservative, but it must still fail closed: retain
+    // the Full generation and retry later instead of publishing an undercharged
+    // compact recovery.
+    //
+    // This is the last refusal point, so it runs *before* the generation's
+    // periodic emitter is stopped: a refusal must leave both the staged
+    // overflow and the retry mechanism exactly as compaction found them.
+    if retained_bytes <= projection.held() {
+        projection.shrink_by(projection.held().saturating_sub(retained_bytes));
+    } else if !projection.try_grow(retained_bytes.saturating_sub(projection.held())) {
+        warn!(
+            plugin = PLUGIN_NAME,
+            generation = lifecycle.generation,
+            retained_bytes,
+            "Chargeback sink cannot compact failed finalization because its measured recovery payload exceeds the reserved projection; Full generation retained"
+        );
+        // The staged overflow was taken out of the accumulator by preparation
+        // and exists nowhere else; hand it back before dropping `events`.
+        lifecycle.restage_compaction_overflow(events, overflow_count);
+        return false;
+    }
+
+    // Past the last refusal point: compaction now commits. Stop the periodic
+    // emitter for this generation.
     let _ = lifecycle.shutdown_tx.send(true);
     {
         let mut task = match lifecycle.task.lock() {
@@ -703,26 +756,6 @@ fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
         return true;
     }
 
-    let retained_bytes = events
-        .iter()
-        .map(charge_event_retained_bytes)
-        .fold(0usize, usize::saturating_add);
-    // Transfer the projection's reservation to the Compact owner and true it up
-    // to the measured retained size. A shortfall is not expected because the
-    // projection bound is conservative, but it must still fail closed: retain
-    // the Full generation and retry later instead of publishing an undercharged
-    // compact recovery.
-    if retained_bytes <= projection.held() {
-        projection.shrink_by(projection.held().saturating_sub(retained_bytes));
-    } else if !projection.try_grow(retained_bytes.saturating_sub(projection.held())) {
-        warn!(
-            plugin = PLUGIN_NAME,
-            generation = lifecycle.generation,
-            retained_bytes,
-            "Chargeback sink cannot compact failed finalization because its measured recovery payload exceeds the reserved projection; Full generation retained"
-        );
-        return false;
-    }
     let recovery = Arc::new(CompactSnapshotRecovery {
         generation: lifecycle.generation,
         plugin_config_id: Arc::clone(&lifecycle.runtime.plugin_config_id),
@@ -1777,7 +1810,14 @@ impl SnapshotLifecycle {
             .delta_projection_bound(snapshot_event_extra_bytes(&self.config, &self.node_id))
     }
 
-    fn prepare_compaction_events(&self) -> Option<Vec<ChargeEvent>> {
+    /// Build the compact payload, returning it with the number of leading
+    /// events that came from staged overflow.
+    ///
+    /// The staged overflow is *taken*, not cloned, so it has no other
+    /// authoritative copy while the returned vector is alive. Every caller path
+    /// that does not reach the compact publication point must hand it back
+    /// through [`Self::restage_compaction_overflow`].
+    fn prepare_compaction_events(&self) -> Option<(Vec<ChargeEvent>, usize)> {
         let _emission_guard = match self.emission_lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1797,7 +1837,7 @@ impl SnapshotLifecycle {
         ) {
             Ok(prepared) => {
                 events.extend(prepared.events);
-                Some(events)
+                Some((events, overflow_count))
             }
             Err(error) => {
                 self.runtime
@@ -1807,16 +1847,20 @@ impl SnapshotLifecycle {
                 // overflow would clear accumulator totals that failed to
                 // serialize. Return the borrowed overflow to bounded staging so
                 // no pending billing delta is lost on this path.
-                events.truncate(overflow_count);
-                stage_overflow_events_or_reject(
-                    &self.accumulator,
-                    &self.runtime.metrics,
-                    self.generation,
-                    events,
-                );
+                self.restage_compaction_overflow(events, overflow_count);
                 None
             }
         }
+    }
+
+    /// Give the borrowed staged overflow back to bounded staging.
+    ///
+    /// `SnapshotLifecycle::generation` is `runtime.generation`, so this is the
+    /// same restore the periodic and final emitters use. The returned events
+    /// re-reserve exactly the bytes `take_overflow_pending` released, so no
+    /// uncharged copy is created.
+    fn restage_compaction_overflow(&self, events: Vec<ChargeEvent>, overflow_count: usize) {
+        restage_borrowed_overflow(&self.accumulator, &self.runtime, events, overflow_count);
     }
 
     async fn finalize_attempt(&self, deadline: Instant) -> bool {
@@ -2898,6 +2942,32 @@ impl ApiChargebackSink {
         let compacted_after_drain = lifecycle.compacted.load(Ordering::Acquire)
             || compact_recovery_for_generation(lifecycle.generation).is_some();
         Some((refused_while_held, compacted_after_drain))
+    }
+
+    /// Drive Full→Compact with a forced measured-payload overshoot so the
+    /// fail-closed projection-shortfall branch is exercised.
+    ///
+    /// Returns `(compacted, overflow_pending_len, periodic_task_alive)` observed
+    /// after the attempt. A correct refusal reports
+    /// `(false, <what was staged>, true)`: the generation kept the staged
+    /// overflow it borrowed and kept its retry mechanism.
+    #[allow(dead_code)]
+    pub(crate) fn compact_projection_shortfall_for_tests(&self) -> Option<(bool, usize, bool)> {
+        let lifecycle = self.snapshot_lifecycle.get()?;
+        lifecycle.commit();
+        let compacted = compact_snapshot_lifecycle_measured(lifecycle, Some(usize::MAX));
+        let task_alive = {
+            let task = match lifecycle.task.lock() {
+                Ok(task) => task,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            task.is_some()
+        };
+        Some((
+            compacted || compact_recovery_for_generation(lifecycle.generation).is_some(),
+            lifecycle.accumulator.overflow_pending_len(),
+            task_alive,
+        ))
     }
 }
 

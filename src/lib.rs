@@ -1069,6 +1069,12 @@ pub mod _test_support {
         plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
+    pub fn api_chargeback_sink_compact_projection_shortfall_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, usize, bool)> {
+        plugin.compact_projection_shortfall_for_tests()
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
