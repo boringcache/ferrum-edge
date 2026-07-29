@@ -5713,6 +5713,20 @@ pub mod _test_support {
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
 
+    /// Test-only view of the crate-private shared status-object generation
+    /// helper.
+    pub fn shared_status_objects_snapshot(
+        objects: &[crate::config_sources::k8s::K8sObject],
+        gateway_writer_present: bool,
+        istio_writer_present: bool,
+    ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
+        crate::k8s_controller::reconciler::shared_status_objects_snapshot(
+            objects,
+            gateway_writer_present,
+            istio_writer_present,
+        )
+    }
+
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
     pub use crate::k8s_controller::{

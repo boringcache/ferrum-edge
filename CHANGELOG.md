@@ -159,6 +159,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Kubernetes controller Gateway API and Istio status writers now share one
+  immutable `Arc<[K8sObject]>` generation per reconcile instead of each
+  deep-cloning the full unstructured object snapshot. Status semantics,
+  bounded update plans, route-conflict handling, and per-writer failure
+  isolation are unchanged; deployments with neither writer still pay no
+  snapshot clone cost (#3281).
+
 - Gateway API `GRPCRoute` predicates are now translated instead of dropped.
   A pathless `matches[]` entry (method-only, header-only, or a rule with no
   `matches` at all) previously disappeared during translation, so valid gRPC
