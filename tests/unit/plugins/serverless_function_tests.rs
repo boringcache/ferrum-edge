@@ -2163,8 +2163,8 @@ fn aggregate_terminate_trailers(count: usize, charge: usize) -> HashMap<String, 
 /// charges it — names + values + 32 bytes per field.
 #[test]
 fn test_native_grpc_terminate_bounds_aggregate_terminal_block() {
-    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
     use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_error_code_test as build_code;
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
 
     const MAX_BODY: usize = 1024 * 1024;
     const COUNT: usize = 32;
@@ -2193,7 +2193,10 @@ fn test_native_grpc_terminate_bounds_aggregate_terminal_block() {
     over.insert(name, format!("{value}a"));
     let body = serde_json::to_vec(&json!({ "grpc_status": 0, "trailers": over })).unwrap();
     let err = build(200, &body, MAX_BODY).unwrap_err();
-    assert!(err.contains("aggregate"), "names the aggregate budget: {err}");
+    assert!(
+        err.contains("aggregate"),
+        "names the aggregate budget: {err}"
+    );
     assert!(
         !err.contains("aaaa") && !err.contains("x-t"),
         "the diagnostic never echoes trailer names or values: {err}"
@@ -2246,7 +2249,10 @@ fn test_native_grpc_terminate_aggregate_budget_counts_protocol_owned_metadata() 
     });
     let with_details = serde_json::to_vec(&contract).unwrap();
     let err = build(200, &with_details, MAX_BODY).unwrap_err();
-    assert!(err.contains("aggregate"), "names the aggregate budget: {err}");
+    assert!(
+        err.contains("aggregate"),
+        "names the aggregate budget: {err}"
+    );
 }
 
 /// An over-budget contract must fail closed all the way out: no framed provenance
