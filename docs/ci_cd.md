@@ -1112,6 +1112,29 @@ shapes and nothing else:
   count **before** publication — with the upload gated on that bounding step
   having succeeded, from one fixed path, at short retention.
 
+A lane nothing observes is not a gate, so adopting `CI_FUZZ_SMOKE_JOB` also has
+to make it a required input of the `test` (`Tests`) aggregate. That aggregate is
+Cross-sensitive to the pull-request scan, so its per-job digest surface moves the
+moment the wiring lands. The policy therefore admits **exactly three** further
+lines, each byte-exact and each anchored immediately after the trusted-base
+`lint` line it must follow (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`):
+
+- `      - fuzz-smoke` in the aggregate `needs` list, after `      - lint`;
+- `add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"`, after the `Lint` row;
+- `require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"`, after the
+  `Lint` assertion.
+
+Only those three lines are withheld, only when the `fuzz-smoke` job itself is
+present and byte-identical, and they are withheld from *both* sides of the
+comparison — so every other byte of the aggregate is still compared against the
+trusted base. A missing, duplicated, tampered, relocated, or advisory-only
+reference, and any unrelated aggregate edit, is still rejected. Withholding is
+symmetric, so a separate one-way check
+(`ci_fuzz_smoke_aggregate_removal_errors`) keeps a pull request from taking the
+wiring back out once the trusted base carries it. The aggregate `test` job is not
+otherwise exempt, and no other job, action, automation surface, publisher
+contract, top-level `env`/trigger, or Cross token is affected.
+
 Neither admitted shape names the protected ARM64 target or the Cross executable,
 requests write permission, or references a secret; the verifier self-tests
 assert each of those directly, plus rejection of budget widening, unpinned or
