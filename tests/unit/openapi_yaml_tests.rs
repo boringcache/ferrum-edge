@@ -7677,12 +7677,16 @@ fn transaction_debugger_schema_matches_closed_runtime_surface() {
     for field in ["log_request_body", "log_response_body"] {
         assert_eq!(schema["properties"][field]["default"], json!(false));
     }
+    let body_field_items = &schema["properties"]["redacted_body_fields"]["items"];
+    assert_eq!(body_field_items["minLength"], json!(1));
+    assert_eq!(body_field_items["maxLength"], json!(128));
+    assert_eq!(body_field_items["pattern"], json!("\\S"));
 
     let description = schema["description"]
         .as_str()
         .expect("TransactionDebuggerConfig description");
     for contract in [
-        "never forces buffering",
+        "never forces an ineligible message to buffer",
         "text/event-stream",
         "application/grpc",
         "redacted",

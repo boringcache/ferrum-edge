@@ -124,12 +124,12 @@ pub const MAX_BODY_CAPTURE_BYTES: u64 = 8192;
 
 /// Absolute ceiling for the rendered (redacted + escaped) body field.
 ///
-/// The widest escape this renderer emits is `\u{XXXX}` (8 bytes) for a
-/// single-byte C0/C1 control character, so a maximal capture escapes to at most
-/// `8 * MAX_BODY_CAPTURE_BYTES`. The ceiling is dimensioned to exactly that
-/// worst case: escaping can touch it but — with the exact per-segment bound in
-/// `escape_for_diagnostics` — can never exceed it. The compile-time assertion
-/// below keeps the two constants from drifting apart.
+/// The maximum expansion per source byte is 8 output bytes: a single-byte
+/// C0/C1 control character renders as `\u{XXXX}`. A maximal capture therefore
+/// escapes to at most `8 * MAX_BODY_CAPTURE_BYTES`. The ceiling is dimensioned
+/// to exactly that worst case: escaping can touch it but — with the exact
+/// per-segment bound in `escape_for_diagnostics` — can never exceed it. The
+/// compile-time assertion below keeps the two constants from drifting apart.
 pub const MAX_RENDERED_BODY_BYTES: usize = 64 * 1024;
 
 const _: () = assert!(MAX_RENDERED_BODY_BYTES == 8 * MAX_BODY_CAPTURE_BYTES as usize);
@@ -1303,7 +1303,12 @@ fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> (&str, bool) {
 const fn is_spoofing_control(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
     )
 }
 
@@ -1449,7 +1454,7 @@ fn optional_body_field_names(
                 "transaction_debugger: '{field}[{idx}]' must not be empty"
             ));
         }
-        if trimmed.len() > 128 {
+        if trimmed.chars().count() > 128 {
             return Err(format!(
                 "transaction_debugger: '{field}[{idx}]' must be at most 128 characters"
             ));

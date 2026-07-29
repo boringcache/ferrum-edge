@@ -13314,11 +13314,12 @@ components:
         Plugin: transaction_debugger — Emits verbose request/response and
         terminal diagnostics via tracing::debug on the transaction_debug
         target. Requires FERRUM_LOG_LEVEL=debug to see output. Unsupported keys
-        are rejected. Body capture is opt-in, default off, and never forces
-        buffering: a body is sampled only when the message declares an identity
-        Content-Encoding, a Content-Length that fits inside the configured cap,
-        and a capturable textual Content-Type (application/json, +json,
-        text/json, application/x-www-form-urlencoded, text/plain). gRPC
+        are rejected. Body capture is opt-in and default off. It never forces an
+        ineligible message to buffer: a body is sampled only when the message
+        declares an identity Content-Encoding, a Content-Length that fits inside
+        the configured cap, and a capturable textual Content-Type
+        (application/json, +json, text/json,
+        application/x-www-form-urlencoded, text/plain). gRPC
         (application/grpc*), SSE (text/event-stream), WebSocket upgrades
         (including H2/H3 Extended CONNECT, excluded by typed request
         provenance rather than headers), XML, GraphQL, multipart, text/html,
@@ -13380,6 +13381,7 @@ components:
             type: string
             minLength: 1
             maxLength: 128
+            pattern: '\S'
           description: >-
             Additional body field names (compared case-insensitively) to redact
             beyond the built-in credential markers. Requires log_request_body or

@@ -419,6 +419,10 @@ fn test_transaction_debugger_accepts_bounded_body_capture_options() {
             "max_request_body_bytes": 8192,
             "redacted_body_fields": ["x_internal_field"]
         }),
+        json!({
+            "log_request_body": true,
+            "redacted_body_fields": ["é".repeat(128)]
+        }),
     ] {
         TransactionDebugger::new(&config).expect("bounded body capture options are supported");
     }
@@ -490,6 +494,14 @@ fn test_transaction_debugger_rejects_invalid_body_capture_options() {
         (
             json!({"log_request_body": true, "redacted_body_fields": [""]}),
             "'redacted_body_fields[0]' must not be empty",
+        ),
+        (
+            json!({"log_request_body": true, "redacted_body_fields": [" \t "]}),
+            "'redacted_body_fields[0]' must not be empty",
+        ),
+        (
+            json!({"log_request_body": true, "redacted_body_fields": ["x".repeat(129)]}),
+            "'redacted_body_fields[0]' must be at most 128 characters",
         ),
         (
             json!({"log_request_body": true, "redacted_body_fields": [7]}),
@@ -1296,11 +1308,24 @@ fn test_render_binary_unicode_and_truncation_markers() {
     assert_eq!(unicode.rendered, "***REDACTED***\\n");
     assert_eq!(unicode.original_bytes, 16);
 
-    // Bidi-spoofing and control characters are escaped, never emitted raw.
-    let spoof = plugin.render_captured_body("a\u{202E}b\u{0007}".as_bytes(), BodyKind::Text, 512);
-    assert!(!spoof.rendered.contains('\u{202E}'), "{}", spoof.rendered);
-    assert!(spoof.rendered.contains("\\u{202e}"), "{}", spoof.rendered);
-    assert!(spoof.rendered.contains("\\u{0007}"), "{}", spoof.rendered);
+    // Bidi-spoofing, invisible formatting, line separators, and control
+    // characters are escaped, never emitted raw.
+    let spoof = plugin.render_captured_body(
+        "a\u{061C}b\u{2028}c\u{2029}d\u{202E}e\u{2060}f\u{0007}".as_bytes(),
+        BodyKind::Text,
+        512,
+    );
+    for (raw, escaped) in [
+        ('\u{061C}', "\\u{061c}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{2029}', "\\u{2029}"),
+        ('\u{202E}', "\\u{202e}"),
+        ('\u{2060}', "\\u{2060}"),
+        ('\u{0007}', "\\u{0007}"),
+    ] {
+        assert!(!spoof.rendered.contains(raw), "{}", spoof.rendered);
+        assert!(spoof.rendered.contains(escaped), "{}", spoof.rendered);
+    }
 }
 
 #[test]
@@ -1405,9 +1430,9 @@ fn test_render_ceiling_is_exact_under_control_and_bidi_expansion() {
     let plugin = capture_plugin();
     let cap = MAX_BODY_CAPTURE_BYTES as usize;
 
-    // Worst-case expansion: every byte is a C0 control that escapes to the
-    // widest form this renderer emits (`\u{0007}`, 8 bytes). A maximal capture
-    // therefore lands exactly on the render ceiling and never past it.
+    // Worst-case expansion per source byte: every byte is a C0 control that
+    // escapes to `\u{0007}` (8 output bytes). A maximal capture therefore
+    // lands exactly on the render ceiling and never past it.
     let controls = vec![0x07u8; cap];
     let sample = plugin.render_captured_body(&controls, BodyKind::Text, cap);
     assert_eq!(sample.original_bytes, cap);
