@@ -111,8 +111,7 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// owned directly by [`repair_normalized_representation_headers`].
 static AI_STREAM_ROUTER_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
     std::sync::LazyLock::new(|| {
-        let mut names =
-            Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 3);
+        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 3);
         names.extend(
             super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS
                 .iter()

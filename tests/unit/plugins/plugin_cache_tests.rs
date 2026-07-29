@@ -2797,10 +2797,7 @@ async fn test_request_view_classifies_response_trailer_policy_by_capability() {
     );
     assert_eq!(
         view.response_trailer_policy_prefixes(),
-        &[
-            "x-amz-checksum-".to_string(),
-            "x-checksum-".to_string(),
-        ]
+        &["x-amz-checksum-".to_string(), "x-checksum-".to_string(),]
     );
     assert!(
         !view
