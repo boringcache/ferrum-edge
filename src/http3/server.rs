@@ -47,9 +47,9 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
-    ResponseTrailerPolicyWitness, apply_response_headers, is_backend_request_strip_header,
-    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
-    TrailerSectionKind, reconcile_backend_trailers_with_response_policy,
+    ResponseTrailerPolicyWitness, TrailerSectionKind, apply_response_headers,
+    is_backend_request_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map, reconcile_backend_trailers_with_response_policy,
     reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };

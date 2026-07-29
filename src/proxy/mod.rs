@@ -23415,7 +23415,9 @@ async fn handle_proxy_request_inner(
                 let grpc_streaming_trailer_policy_can_act = grpc_streaming_header_phases_can_mutate
                     || grpc_streaming_unbounded_trailer_policy
                     || !plugin_cache_view.response_trailer_policy_names().is_empty()
-                    || !plugin_cache_view.response_trailer_policy_prefixes().is_empty();
+                    || !plugin_cache_view
+                        .response_trailer_policy_prefixes()
+                        .is_empty();
                 let grpc_streaming_pre_policy_headers =
                     headers_mod::PrePolicyResponseHeaders::capture_for_streaming(
                         &response_headers,
@@ -25979,7 +25981,9 @@ async fn handle_proxy_request_inner(
         let trailer_policy_can_act = header_phases_can_mutate
             || unbounded
             || !plugin_cache_view.response_trailer_policy_names().is_empty()
-            || !plugin_cache_view.response_trailer_policy_prefixes().is_empty();
+            || !plugin_cache_view
+                .response_trailer_policy_prefixes()
+                .is_empty();
         if !trailer_policy_can_act {
             None
         } else {

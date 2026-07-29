@@ -2298,7 +2298,10 @@ impl<S> H3FrameSource<S> {
         if let Some(governor) = self.trailer_governor.as_ref() {
             let removed = governor.reconcile(trailers);
             if removed > 0 {
-                debug!(removed, route, "H3 backend stream: dropped governed trailer fields");
+                debug!(
+                    removed,
+                    route, "H3 backend stream: dropped governed trailer fields"
+                );
             }
         }
     }

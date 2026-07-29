@@ -1127,7 +1127,6 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
     );
 }
 
-
 // ── Native gRPC terminal sections (GHSA-r78v-rc86-6r86) ─────────────────────
 //
 // A streaming gRPC response runs `after_proxy` on the initial header map only,
@@ -1234,7 +1233,10 @@ fn an_observed_header_removal_governs_the_matching_grpc_trailer() {
     ]);
     let after = headers(&[("content-type", "application/grpc")]);
     let surviving = reconcile_grpc(
-        &[("grpc-status", "0"), ("x-internal-debug", "backend-trace-9f2a")],
+        &[
+            ("grpc-status", "0"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+        ],
         &before,
         &after,
         &[],
