@@ -267,6 +267,8 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
                     f"tests/performance/mesh/Cargo.toml {crate} path {mesh_path!r} "
                     f"does not mirror root {path!r}"
                 )
+    else:
+        errors.append("missing tests/performance/mesh/Cargo.toml patch mirror")
 
     if not PATCH_STATUS_SCRIPT.is_file():
         errors.append("missing scripts/check_vendored_patch_status.sh wrapper")
