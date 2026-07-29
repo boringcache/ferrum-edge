@@ -25,11 +25,11 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::warn;
 
+use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
 use crate::modes::mesh::access_log_filter::{
     AccessLogFilterContext, StreamAccessLogFilterContext, evaluate_access_log_filter_expr,
     evaluate_access_log_filter_expr_for_stream, validate_access_log_filter_expr,
 };
-use crate::modes::mesh::access_log_filter::AccessLogFilterExpr;
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
