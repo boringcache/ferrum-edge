@@ -1777,9 +1777,11 @@ impl ResponseCaching {
         match self.cache.insert(cache_key.clone(), entry) {
             Some(old) => {
                 self.sub_total_size_locked(old.approx_size());
-                maintenance
-                    .expiry_index
-                    .remove(&(old.expires_at(), old.insert_seq, cache_key.clone()));
+                maintenance.expiry_index.remove(&(
+                    old.expires_at(),
+                    old.insert_seq,
+                    cache_key.clone(),
+                ));
             }
             None => {
                 maintenance
@@ -3584,7 +3586,9 @@ mod tests {
         let mut store_headers = store_ctx.headers.clone();
         store_headers.insert("x-origin-vary".to_string(), "backend-tenant-a".to_string());
         assert!(matches!(
-            plugin.before_proxy(&mut store_ctx, &mut store_headers).await,
+            plugin
+                .before_proxy(&mut store_ctx, &mut store_headers)
+                .await,
             PluginResult::Continue
         ));
 
@@ -3596,12 +3600,7 @@ mod tests {
             ("vary".to_string(), "X-Origin-Vary".to_string()),
         ]);
         plugin
-            .on_final_response_body(
-                &mut store_ctx,
-                200,
-                &response_headers,
-                b"tenant-a-response",
-            )
+            .on_final_response_body(&mut store_ctx, 200, &response_headers, b"tenant-a-response")
             .await;
 
         // If storage incorrectly used the original `client-a` value, this
@@ -3615,7 +3614,9 @@ mod tests {
         cross_headers.insert("x-origin-vary".to_string(), "client-a".to_string());
         assert!(
             matches!(
-                plugin.before_proxy(&mut cross_ctx, &mut cross_headers).await,
+                plugin
+                    .before_proxy(&mut cross_ctx, &mut cross_headers)
+                    .await,
                 PluginResult::Continue
             ),
             "a transformed value matching another request's original value must not cross-hit"

@@ -2086,8 +2086,7 @@ pub struct RequestContext {
     /// than public `metadata`, which can be serialized into transaction logs.
     /// The outer key is the process-unique cache instance ID, bounding the map
     /// by configured `response_caching` instances.
-    response_cache_request_header_deltas:
-        HashMap<u64, Arc<HashMap<String, Option<String>>>>,
+    response_cache_request_header_deltas: HashMap<u64, Arc<HashMap<String, Option<String>>>>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains

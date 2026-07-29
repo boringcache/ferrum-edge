@@ -4206,10 +4206,8 @@ async fn test_byte_cap_reclaims_later_inserted_short_lived_entry() {
         "cache-control".to_string(),
         "public, max-age=120".to_string(),
     )]);
-    let short_lived = HashMap::from([(
-        "cache-control".to_string(),
-        "public, max-age=1".to_string(),
-    )]);
+    let short_lived =
+        HashMap::from([("cache-control".to_string(), "public, max-age=1".to_string())]);
 
     cache_response(&plugin, "GET", "/long-lived", 200, &long_lived, &body).await;
     cache_response(&plugin, "GET", "/short-lived", 200, &short_lived, &body).await;
@@ -4229,14 +4227,20 @@ async fn test_byte_cap_reclaims_later_inserted_short_lived_entry() {
     let mut short_ctx = make_ctx("GET", "/short-lived");
     let mut short_headers = HashMap::new();
     assert!(matches!(
-        plugin.before_proxy(&mut short_ctx, &mut short_headers).await,
+        plugin
+            .before_proxy(&mut short_ctx, &mut short_headers)
+            .await,
         PluginResult::Continue
     ));
 
     let mut replacement_ctx = make_ctx("GET", "/replacement");
     let mut replacement_headers = HashMap::new();
     assert!(
-        is_reject(&plugin.before_proxy(&mut replacement_ctx, &mut replacement_headers).await),
+        is_reject(
+            &plugin
+                .before_proxy(&mut replacement_ctx, &mut replacement_headers)
+                .await
+        ),
         "new entry must be admitted after expiration-ordered reclaim"
     );
     assert!(response_caching_current_total_size_for_test(&plugin) <= 3000);
