@@ -543,8 +543,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 4075,
         active_phases: "after_proxy, on_response_body, transform_response_body",
-        matrix_protocols: HTTP_ONLY_PROTOCOLS,
-        protocol_rationale: "HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported",
+        matrix_protocols: HTTP_GRPC_PROTOCOLS,
+        protocol_rationale: "HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block",
     },
     BuiltinPluginParityMeta {
         name: "security_headers",
