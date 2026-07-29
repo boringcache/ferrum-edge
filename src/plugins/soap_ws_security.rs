@@ -3225,9 +3225,11 @@ impl SoapWsSecurity {
             signed_info_node,
             security,
             sig_node,
-            structure,
-            id_index,
-            envelope,
+            &ReferenceDigestDocument {
+                structure,
+                id_index,
+                envelope,
+            },
             budget,
         )?;
 
@@ -3255,9 +3257,7 @@ impl SoapWsSecurity {
         signed_info: Node<'a, 'i>,
         security: Node<'a, 'i>,
         signature_node: Node<'a, 'i>,
-        structure: &SoapEnvelopeStructure<'a, 'i>,
-        id_index: &DocumentIdIndex<'a, 'i>,
-        envelope: &str,
+        document: &ReferenceDigestDocument<'a, 'i>,
         budget: &mut WorkBudget,
     ) -> Result<ReferenceCoverage, String> {
         let references: Vec<Node<'a, 'i>> = signed_info
@@ -3299,7 +3299,8 @@ impl SoapWsSecurity {
             }
             reference_ids.push(ref_id);
         }
-        let raw_occurrences = count_raw_id_occurrences(envelope, &reference_ids)?;
+        let raw_occurrences =
+            count_raw_id_occurrences(document.envelope, &reference_ids)?;
 
         let mut coverage = ReferenceCoverage::default();
         for (index, reference) in references.iter().enumerate() {
@@ -3344,21 +3345,21 @@ impl SoapWsSecurity {
                     raw_occurrences[index]
                 ));
             }
-            let referenced_node = id_index.resolve_unique(ref_id)?;
+            let referenced_node = document.id_index.resolve_unique(ref_id)?;
 
             // The referenced element must live inside the Security header or
             // inside the backend-visible Body. Anything else is a subtree the
             // gateway does not govern and a backend does not consume.
             let referenced_id = referenced_node.id();
             let in_security = node_is_within(referenced_node, security);
-            let in_body = node_is_within(referenced_node, structure.body);
+            let in_body = node_is_within(referenced_node, document.structure.body);
             if !in_security && !in_body {
                 return Err(
                     "WS-Security: Reference resolves outside the Security header and the SOAP Body"
                         .to_string(),
                 );
             }
-            if referenced_id == structure.body.id() {
+            if referenced_id == document.structure.body.id() {
                 coverage.covers_body = true;
             }
             coverage.covered.push(referenced_id);
@@ -3368,7 +3369,7 @@ impl SoapWsSecurity {
                 .enveloped_signature
                 .then_some(signature_node.id());
             let referenced_content = exclusive_canonicalize(
-                envelope,
+                document.envelope,
                 referenced_node,
                 &transforms.inclusive_prefixes,
                 excluded_signature,
@@ -5330,6 +5331,13 @@ fn is_xml_id_attribute(name: &str, namespace: Option<&str>) -> bool {
         // Any other namespace-qualified `Id` a backend might resolve.
         Some(_) => name == "Id",
     }
+}
+
+/// Borrowed envelope state for [`SoapWsSecurity::verify_reference_digests`].
+struct ReferenceDigestDocument<'a, 'i> {
+    structure: &'a SoapEnvelopeStructure<'a, 'i>,
+    id_index: &'a DocumentIdIndex<'a, 'i>,
+    envelope: &'a str,
 }
 
 /// What a verified `SignedInfo` actually protects.
@@ -7345,9 +7353,11 @@ mod tests {
                 signed_info,
                 security,
                 signature,
-                &structure,
-                &id_index,
-                envelope,
+                &ReferenceDigestDocument {
+                    structure: &structure,
+                    id_index: &id_index,
+                    envelope,
+                },
                 &mut budget,
             )
             .err()
