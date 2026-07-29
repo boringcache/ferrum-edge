@@ -6581,18 +6581,41 @@ x-ferrum-proxy:
 
     #[test]
     fn yaml_alias_cycle_rejected() {
-        let yaml = b"openapi: '3.1.0'\n\
-                     info:\n\
-                       title: Cycle\n\
-                       version: '1.0'\n\
-                     loop: &a\n\
-                       self: *a\n\
-                     x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}";
-        let err = extract(yaml, Some(SpecFormat::Yaml), "default").unwrap_err();
+        // Use concat! (not `\` line continuations): Rust elides indentation after
+        // `\`-newline, which flattens the mapping and drops the self-ref cycle.
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Cycle\n",
+            "  version: '1.0'\n",
+            "loop: &a\n",
+            "  self: *a\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+        );
+        let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap_err();
         assert!(
             matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("cycle")),
             "expected alias cycle rejection, got {err:?}"
         );
+    }
+
+    #[test]
+    fn yaml_anchored_scalar_title_preserved() {
+        let yaml = concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: &title Alias Scalar\n",
+            "  version: '1.0'\n",
+            "components:\n",
+            "  schemas:\n",
+            "    Shared:\n",
+            "      type: string\n",
+            "      default: *title\n",
+            "x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}\n",
+        );
+        let (bundle, meta) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "default").unwrap();
+        assert_eq!(bundle.proxy.id, "test");
+        assert_eq!(meta.title.as_deref(), Some("Alias Scalar"));
     }
 
     #[test]

@@ -468,6 +468,28 @@ fn expand_node(
     expanding: &mut HashSet<usize>,
 ) -> Result<Value, BoundedYamlError> {
     budgets.charge_work()?;
+    // Track every node on the expansion stack — including Alias edges — so
+    // self-refs, collection cycles, and alias-only mutual cycles all fail
+    // closed with Cycle rather than relying solely on the work budget.
+    if !expanding.insert(id) {
+        let anchor = document
+            .anchor_names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| id.to_string());
+        return Err(BoundedYamlError::Cycle { anchor });
+    }
+    let result = expand_node_inner(document, id, budgets, expanding);
+    expanding.remove(&id);
+    result
+}
+
+fn expand_node_inner(
+    document: &Document,
+    id: usize,
+    budgets: &mut Budgets,
+    expanding: &mut HashSet<usize>,
+) -> Result<Value, BoundedYamlError> {
     let kind = document
         .nodes
         .get(id)
@@ -476,6 +498,7 @@ fn expand_node(
     match kind {
         NodeKind::Alias { target, name } => {
             budgets.charge_alias()?;
+            // Fast path: alias into a collection/alias already on the stack.
             if expanding.contains(target) {
                 let anchor = document
                     .anchor_names
@@ -493,14 +516,6 @@ fn expand_node(
             Ok(json)
         }
         NodeKind::Sequence(items) => {
-            if !expanding.insert(id) {
-                let anchor = document
-                    .anchor_names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| id.to_string());
-                return Err(BoundedYamlError::Cycle { anchor });
-            }
             budgets.enter_depth()?;
             budgets.charge_node()?;
             budgets.charge_bytes(2)?;
@@ -509,18 +524,9 @@ fn expand_node(
                 out.push(expand_node(document, *child, budgets, expanding)?);
             }
             budgets.leave_depth();
-            expanding.remove(&id);
             Ok(Value::Array(out))
         }
         NodeKind::Mapping(pairs) => {
-            if !expanding.insert(id) {
-                let anchor = document
-                    .anchor_names
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| id.to_string());
-                return Err(BoundedYamlError::Cycle { anchor });
-            }
             budgets.enter_depth()?;
             budgets.charge_node()?;
             budgets.charge_bytes(2)?;
@@ -560,7 +566,6 @@ fn expand_node(
                 }
             }
             budgets.leave_depth();
-            expanding.remove(&id);
             Ok(Value::Object(map))
         }
     }

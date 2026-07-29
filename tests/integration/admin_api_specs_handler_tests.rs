@@ -6446,8 +6446,18 @@ x-ferrum-proxy:
         reqwest::StatusCode::CREATED,
         "bounded YAML aliases must be accepted; body: {body}"
     );
-    let spec_id = body["id"].as_str().expect("created spec id");
-    assert_eq!(body["title"].as_str(), Some("Alias Live"));
+    let spec_id = body["id"].as_str().expect("created spec id").to_string();
+    // ApiSpecCreateResponse intentionally omits title; verify extracted
+    // `info.title` (including anchored scalars) via the list summary.
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let posted = list_body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"].as_str() == Some(spec_id.as_str()))
+        .expect("created spec must appear in list");
+    assert_eq!(posted["title"].as_str(), Some("Alias Live"));
 
     let updated = format!(
         r#"openapi: "3.1.0"
@@ -6470,7 +6480,15 @@ copied: *title
         reqwest::StatusCode::OK,
         "PUT with aliases must succeed; body: {put_body}"
     );
-    assert_eq!(put_body["title"].as_str(), Some("Alias Updated"));
+    let (list_status, list_body) = client.get_json("/api-specs").await;
+    assert_eq!(list_status, reqwest::StatusCode::OK);
+    let replaced = list_body["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["id"].as_str() == Some(spec_id.as_str()))
+        .expect("replaced spec must appear in list");
+    assert_eq!(replaced["title"].as_str(), Some("Alias Updated"));
 
     let del_status = client.delete(&format!("/api-specs/{spec_id}")).await;
     assert_eq!(del_status, reqwest::StatusCode::NO_CONTENT);
