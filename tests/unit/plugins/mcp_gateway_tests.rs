@@ -7915,6 +7915,41 @@ async fn validate_tool_results_preserves_json_rpc_protocol_errors() {
 }
 
 #[tokio::test]
+async fn validate_tool_results_rejects_result_and_error_bypass() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 155).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 156,
+        "result": {
+            "structuredContent": {
+                "temperature": "not-a-number",
+                "conditions": "sunny"
+            }
+        },
+        "error": { "code": -32603, "message": "mask the invalid result" }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let (status, body, _) = reject_json(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(body["error"]["code"], -32012);
+    assert_eq!(body["id"], 156);
+}
+
+#[tokio::test]
 async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));

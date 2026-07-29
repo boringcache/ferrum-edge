@@ -4902,9 +4902,25 @@ impl Plugin for McpGateway {
                 return self.reject_invalid_tool_result(ctx, None, "tool result is not valid JSON");
             }
         };
-        // Preserve upstream JSON-RPC protocol errors unchanged.
-        if value.get("error").is_some() {
+        // Preserve only well-formed, error-only JSON-RPC responses. Merely
+        // adding an `error` key must not let an upstream bypass validation of
+        // a simultaneously supplied tool result.
+        if value.get("result").is_none()
+            && value.get("error").is_some_and(|error| {
+                error.as_object().is_some_and(|object| {
+                    object.get("code").and_then(Value::as_i64).is_some()
+                        && object.get("message").and_then(Value::as_str).is_some()
+                })
+            })
+        {
             return PluginResult::Continue;
+        }
+        if value.get("result").is_some() && value.get("error").is_some() {
+            return self.reject_invalid_tool_result(
+                ctx,
+                value.get("id").cloned(),
+                "tools/call response contains both result and error",
+            );
         }
         let Some(result) = value.get("result") else {
             return self.reject_invalid_tool_result(
@@ -4988,7 +5004,10 @@ impl Plugin for McpGateway {
             );
         };
 
-        let payload = match extract_tool_result_validation_payload(result) {
+        let payload = match extract_tool_result_validation_payload(
+            result,
+            self.validation.max_upstream_response_bytes,
+        ) {
             Ok(payload) => payload,
             Err(reason) => {
                 return self.reject_invalid_tool_result(ctx, value.get("id").cloned(), reason);
@@ -5714,9 +5733,13 @@ fn local_output_schema_pointer_target<'a>(
 /// content block when structured content is absent. When both are present they
 /// must agree so validation never accepts a different representation than the
 /// caller receives.
-fn extract_tool_result_validation_payload(result: &Value) -> Result<Value, &'static str> {
+fn extract_tool_result_validation_payload(
+    result: &Value,
+    max_json_text_bytes: usize,
+) -> Result<Value, &'static str> {
     let structured = result.get("structuredContent").cloned();
-    let content_json = extract_tool_result_content_json(result.get("content"))?;
+    let content_json =
+        extract_tool_result_content_json(result.get("content"), max_json_text_bytes)?;
     match (structured, content_json) {
         (Some(structured), Some(content)) => {
             if structured == content {
@@ -5733,6 +5756,7 @@ fn extract_tool_result_validation_payload(result: &Value) -> Result<Value, &'sta
 
 fn extract_tool_result_content_json(
     content: Option<&Value>,
+    max_json_text_bytes: usize,
 ) -> Result<Option<Value>, &'static str> {
     let Some(content) = content else {
         return Ok(None);
@@ -5751,7 +5775,7 @@ fn extract_tool_result_content_json(
         let Some(text) = item.get("text").and_then(Value::as_str) else {
             return Err("tool result text content missing text");
         };
-        if text.len() > DEFAULT_MAX_UPSTREAM_JSON_RESPONSE_BYTES {
+        if text.len() > max_json_text_bytes {
             return Err("tool result text content exceeded decode budget");
         }
         let Ok(parsed) = serde_json::from_str::<Value>(text) else {
