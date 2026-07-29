@@ -6703,6 +6703,42 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
 }
 
 #[tokio::test]
+async fn aggregate_batch_preserves_degraded_catalog_summary_across_clean_sibling() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    // The first member degrades the tools catalog; the second is a clean,
+    // gateway-local response that writes no catalog metadata. The request-level
+    // summary must retain the first member's bounded degraded pair even though
+    // per-item state is cleared before the clean sibling runs.
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} },
+        { "jsonrpc": "2.0", "id": 2, "method": "ping", "params": {} }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("batch response array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["error"]["code"], -32006);
+    assert!(responses[1]["result"].is_object());
+    assert_eq!(
+        ctx.metadata.get("mcp.catalog_degraded").map(String::as_str),
+        Some("github:tools"),
+        "a later clean member must not erase the request's degraded-catalog union"
+    );
+}
+
+#[tokio::test]
 async fn aggregate_batch_oversized_body_is_rejected_before_json_parsing() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["validation"] = json!({
