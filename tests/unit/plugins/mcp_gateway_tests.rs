@@ -8446,3 +8446,442 @@ async fn validate_tool_results_batch_tools_call_still_singleton_only() {
     assert!(body.is_array());
     assert_eq!(body[0]["error"]["code"], -32009);
 }
+
+async fn start_mcp_tool_server_without_output_schema() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "initialize"})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("mcp-session-id", "upstream-session")
+                .set_body_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": "init",
+                    "result": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "github", "version": "1.0.0" }
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "result": {
+                "tools": [{
+                    "name": "create_pr",
+                    "description": "Create a pull request",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["repo"],
+                        "properties": { "repo": { "type": "string" } }
+                    }
+                }]
+            }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+fn deeply_nested_output_schema(depth: usize) -> Value {
+    let mut node = json!({"type": "string"});
+    for _ in 0..depth {
+        node = json!({ "properties": { "n": node } });
+    }
+    node
+}
+
+fn node_budget_output_schema(property_count: usize) -> Value {
+    let mut properties = serde_json::Map::new();
+    for index in 0..property_count {
+        properties.insert(format!("f{index}"), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "properties": Value::Object(properties)
+    })
+}
+
+fn recursive_local_ref_output_schema() -> Value {
+    json!({
+        "$defs": {
+            "node": {
+                "type": "object",
+                "properties": {
+                    "child": { "$ref": "#/$defs/node" }
+                }
+            }
+        },
+        "type": "object",
+        "required": ["temperature", "conditions"],
+        "properties": {
+            "temperature": { "type": "number" },
+            "conditions": { "type": "string" },
+            "tree": { "$ref": "#/$defs/node" },
+            "echo": { "$ref": "#" },
+            "tags": {
+                "type": "array",
+                "items": { "type": "string" },
+                "prefixItems": [{ "type": "string" }],
+                "contains": { "type": "string" }
+            },
+            "meta": {
+                "type": "object",
+                "additionalProperties": { "type": "string" },
+                "propertyNames": { "type": "string" },
+                "unevaluatedProperties": false
+            }
+        },
+        "allOf": [{ "type": "object" }],
+        "anyOf": [{ "type": "object" }],
+        "oneOf": [{ "type": "object" }],
+        "not": { "type": "array" }
+    })
+}
+
+#[tokio::test]
+async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries() {
+    let cases = [
+        ("non-object schema", json!("not-a-schema")),
+        ("null schema", Value::Null),
+        ("array schema", json!([])),
+        (
+            "non-string $ref",
+            json!({ "$ref": ["#/$defs/x"] }),
+        ),
+        (
+            "non-string $dynamicRef",
+            json!({ "$dynamicRef": 12 }),
+        ),
+        (
+            "non-local $id",
+            json!({
+                "type": "object",
+                "$id": "https://example.invalid/schemas/weather.json"
+            }),
+        ),
+        (
+            "non-string $id",
+            json!({ "type": "object", "$id": 7 }),
+        ),
+        (
+            "non-local id",
+            json!({
+                "type": "object",
+                "id": "https://example.invalid/legacy-id"
+            }),
+        ),
+        (
+            "non-string id",
+            json!({ "type": "object", "id": false }),
+        ),
+        (
+            "$vocabulary refused",
+            json!({
+                "type": "object",
+                "$vocabulary": { "https://json-schema.org/draft/2020-12/vocab/core": true }
+            }),
+        ),
+        (
+            "non-pointer local $ref",
+            json!({ "$ref": "#foo" }),
+        ),
+        (
+            "missing local $ref target",
+            json!({ "$ref": "#/$defs/missing" }),
+        ),
+        (
+            "properties keyword not an object",
+            json!({ "type": "object", "properties": true }),
+        ),
+        (
+            "allOf keyword not an array",
+            json!({ "type": "object", "allOf": true }),
+        ),
+        (
+            "tuple-form items keyword",
+            json!({
+                "type": "array",
+                "items": [{ "type": "string" }, { "type": "number" }]
+            }),
+        ),
+        ("schema deeper than budget", deeply_nested_output_schema(40)),
+        ("schema wider than node budget", node_budget_output_schema(10_100)),
+    ];
+
+    for (offset, (case, schema)) in cases.into_iter().enumerate() {
+        let server = start_mcp_output_schema_tool_server(schema).await;
+        let plugin = create_plugin(
+            "mcp_gateway",
+            &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+        )
+        .unwrap()
+        .unwrap();
+        let session_id = initialize(&plugin).await;
+        let tools = aggregate_tool_names(&plugin, &session_id, 900 + offset as i64).await;
+        assert!(
+            tools.is_empty(),
+            "{case}: hostile or unusable outputSchema must be refused at catalog admission, got {tools:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_local_ref_and_combinator_output_schema() {
+    let server = start_mcp_output_schema_tool_server(recursive_local_ref_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 930).await,
+        vec!["github.create_pr"],
+        "local $ref / combinator outputSchema must compile at catalog admission"
+    );
+
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 931).await;
+    assert!(
+        plugin.may_replace_rejection_response(),
+        "SSE/uninspectable tool-result rejects must be replaceable under enforcement"
+    );
+    assert!(
+        plugin.may_enforce_response_body_policy(&ctx),
+        "routed tools/call with a compiled outputSchema must stage private enforcement"
+    );
+    assert!(
+        plugin.enforces_response_body_policy(&ctx, Some("application/json"), &[]),
+        "enforces_response_body_policy must mirror may_enforce once private state is set"
+    );
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 932,
+        "result": {
+            "structuredContent": {
+                "temperature": 19.5,
+                "conditions": "Overcast",
+                "tree": { "child": { "child": {} } },
+                "tags": ["a"],
+                "meta": { "source": "unit" }
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+}
+
+#[tokio::test]
+async fn validate_tool_results_without_output_schema_does_not_stage_enforcement() {
+    let server = start_mcp_tool_server_without_output_schema().await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    assert_eq!(
+        aggregate_tool_names(&plugin, &session_id, 940).await,
+        vec!["github.create_pr"],
+        "tools that omit outputSchema must remain in the catalog when validation is enabled"
+    );
+
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "method": "tools/call",
+        "params": {
+            "name": "github.create_pr",
+            "arguments": { "repo": "payments-api" }
+        }
+    });
+    let (mut ctx, mut headers) = mcp_ctx(request_body.clone());
+    headers.insert("mcp-session-id".to_string(), session_id);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !plugin.may_enforce_response_body_policy(&ctx),
+        "omitted outputSchema must not set private mcp_validate_tool_result enforcement"
+    );
+    assert!(!plugin.enforces_response_body_policy(&ctx, None, &[]));
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 941,
+        "result": {
+            "content": [{ "type": "text", "text": "created" }]
+        }
+    }))
+    .unwrap();
+    let response_headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_unusable_caller_visible_representations() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let cases = [
+        (
+            "missing structuredContent and JSON text",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "content": [{ "type": "text", "text": "plain prose only" }]
+                }
+            }),
+        ),
+        (
+            "content is not an array",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {
+                    "content": { "type": "text", "text": "{\"temperature\":1,\"conditions\":\"x\"}" }
+                }
+            }),
+        ),
+        (
+            "text content missing text field",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "result": {
+                    "content": [{ "type": "text" }]
+                }
+            }),
+        ),
+        (
+            "multiple JSON text content blocks",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "result": {
+                    "content": [
+                        { "type": "text", "text": "{\"temperature\":1,\"conditions\":\"a\"}" },
+                        { "type": "image", "data": "ignored" },
+                        { "text": "no-type-ignored" },
+                        { "type": "text", "text": "{\"temperature\":2,\"conditions\":\"b\"}" }
+                    ]
+                }
+            }),
+        ),
+        (
+            "empty result object",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "result": {}
+            }),
+        ),
+    ];
+
+    for (offset, (case, upstream_value)) in cases.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 950 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(
+            ctx.metadata
+                .get("mcp.result_schema_validation")
+                .map(String::as_str),
+            Some("fail"),
+            "{case}"
+        );
+        assert!(
+            !ctx.metadata.keys().any(|key| key.contains("result_body")),
+            "{case}: rejection metadata must never carry result bodies"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_accepts_structured_with_non_json_companion_text() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let mut ctx = route_validated_tool_call(&plugin, &session_id, 970).await;
+
+    let upstream_response = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 971,
+        "result": {
+            "content": [
+                { "type": "text", "text": "human summary, not JSON" },
+                {
+                    "type": "text",
+                    "text": "{\"temperature\":11.0,\"conditions\":\"Fog\"}"
+                }
+            ],
+            "structuredContent": {
+                "temperature": 11.0,
+                "conditions": "Fog"
+            }
+        }
+    }))
+    .unwrap();
+    let headers = known_json_response_headers(&upstream_response);
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("mcp.result_schema_validation")
+            .map(String::as_str),
+        Some("pass")
+    );
+}
