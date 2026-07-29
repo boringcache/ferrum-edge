@@ -3492,6 +3492,8 @@ mod tests {
             workloads: vec![make_workload("ns", "web", HashMap::new())],
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
+            node_waypoint_capture_destinations: Vec::new(),
+            node_waypoint_capture_peer_authentications: Vec::new(),
             services: vec![make_service("ns", "web")],
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
