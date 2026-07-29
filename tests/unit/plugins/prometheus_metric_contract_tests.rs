@@ -105,12 +105,11 @@ fn normalize_family_name(name: &str, contract: &BTreeMap<String, FamilyContract>
         return name.to_string();
     }
     for suffix in SAMPLE_SUFFIXES {
-        if let Some(candidate) = name.strip_suffix(suffix) {
-            if let Some(fam) = contract.get(candidate) {
-                if fam.metric_type == "histogram" || fam.metric_type == "summary" {
-                    return candidate.to_string();
-                }
-            }
+        if let Some(candidate) = name.strip_suffix(suffix)
+            && let Some(fam) = contract.get(candidate)
+            && (fam.metric_type == "histogram" || fam.metric_type == "summary")
+        {
+            return candidate.to_string();
         }
     }
     name.to_string()
@@ -122,12 +121,11 @@ fn family_for_sample_name(name: &str, types: &BTreeMap<String, String>) -> Optio
         return Some(name.to_string());
     }
     for suffix in SAMPLE_SUFFIXES {
-        if let Some(candidate) = name.strip_suffix(suffix) {
-            if let Some(ty) = types.get(candidate) {
-                if ty == "histogram" || ty == "summary" {
-                    return Some(candidate.to_string());
-                }
-            }
+        if let Some(candidate) = name.strip_suffix(suffix)
+            && let Some(ty) = types.get(candidate)
+            && (ty == "histogram" || ty == "summary")
+        {
+            return Some(candidate.to_string());
         }
     }
     None
