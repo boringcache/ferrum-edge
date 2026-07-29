@@ -7252,7 +7252,7 @@ mod tests {
             .map(|key| (*key, std::env::var_os(key)))
             .collect();
         for (key, _) in vars {
-            if !isolated_keys.iter().any(|isolated| *isolated == *key) {
+            if !isolated_keys.contains(key) {
                 previous.push((*key, std::env::var_os(key)));
             }
         }
