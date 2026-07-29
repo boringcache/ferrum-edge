@@ -4469,6 +4469,159 @@ fn test_charges_projection_must_agree_across_enabled_instances() {
     );
 }
 
+/// Deleting the final enabled `api_chargeback` instance must clear the
+/// process-global `/charges` render projection on accepted-generation commit.
+/// Retained billing rows stay; only the projection is unpublished.
+#[tokio::test]
+async fn test_deleting_final_chargeback_clears_render_projection_on_commit() {
+    const CONSUMER: &str = "projection-delete-consumer";
+    const PROXY_ID: &str = "projection-delete-proxy";
+    const PLUGIN_ID: &str = "projection-delete-chargeback";
+
+    let proxy = chargeback_chain_proxy(PROXY_ID, "/projection-delete", PLUGIN_ID);
+    let plugin_config = chargeback_chain_plugin(
+        PLUGIN_ID,
+        PROXY_ID,
+        "USD",
+        priced_config(json!({
+            "schema": { "rename": { "proxy_id": "route_id" } }
+        })),
+    );
+    let with_chargeback = GatewayConfig {
+        proxies: vec![proxy],
+        plugin_configs: vec![plugin_config],
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&with_chargeback).expect("chargeback cache with projection");
+    let plugin = cache
+        .get_plugins("ferrum", PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("chargeback plugin");
+    plugin
+        .log(&make_summary(PROXY_ID, PROXY_ID, Some(CONSUMER), 200))
+        .await;
+
+    let projected = global_registry().render_json_uncached().unwrap();
+    assert!(
+        projected.contains("\"route_id\""),
+        "accepted generation must publish the projection\n{projected}"
+    );
+    assert!(
+        !projected.contains("\"proxy_id\""),
+        "projected document must rename proxy_id\n{projected}"
+    );
+
+    // Drop the only enabled instance (proxy association + plugin config).
+    // Retained rows survive; the projection must not — commit has no plugin
+    // callback when zero instances remain.
+    let mut bare_proxy = chargeback_chain_proxy(PROXY_ID, "/projection-delete", PLUGIN_ID);
+    bare_proxy.plugins.clear();
+    let without_chargeback = GatewayConfig {
+        proxies: vec![bare_proxy],
+        plugin_configs: vec![],
+        ..GatewayConfig::default()
+    };
+    cache
+        .rebuild(&without_chargeback)
+        .expect("generation without api_chargeback");
+
+    assert!(
+        cache
+            .get_plugins("ferrum", PROXY_ID)
+            .iter()
+            .all(|plugin| plugin.name() != "api_chargeback"),
+        "accepted generation must retain no enabled api_chargeback instance"
+    );
+
+    let restored = global_registry().render_json_uncached().unwrap();
+    assert!(
+        restored.contains("\"proxy_id\""),
+        "zero-instance commit must publish projection absence\n{restored}"
+    );
+    assert!(
+        !restored.contains("\"route_id\""),
+        "stale projection must not survive final-instance delete\n{restored}"
+    );
+    let document: serde_json::Value = serde_json::from_str(&restored).unwrap();
+    assert_eq!(
+        document["consumers"][CONSUMER]["proxies"][PROXY_ID]["total_calls"],
+        json!(1),
+        "retained accounting must survive projection clear"
+    );
+}
+
+/// A JSON render that snapped a prior schema must never repopulate `json_cache`
+/// after a projection transition. Coverage is generation-mismatch based, not
+/// timing-based.
+#[test]
+fn test_stale_projection_render_cannot_repopulate_json_cache() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(60, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-a",
+        "My API",
+        200,
+        0.5,
+        10,
+        20,
+        0.0,
+        0.0,
+    );
+
+    let projected = ApiChargeback::new(
+        &priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+        "ferrum",
+    )
+    .expect("schema compiles");
+    registry.configure_render_schema(projected.render_schema().cloned());
+
+    let stale_meta = registry.proxy_metadata_generation_for_tests();
+    let stale_schema = registry.render_schema_generation_for_tests();
+    let stale_body = registry
+        .render_json_uncached()
+        .expect("projected render under snapped schema");
+    assert!(
+        stale_body.contains("\"route_id\""),
+        "in-flight body must be under the prior projection\n{stale_body}"
+    );
+
+    // Schema transition: clears cache and advances projection generation.
+    registry.configure_render_schema(None);
+    let native = registry.render_json().expect("native render after clear");
+    assert!(
+        native.contains("\"proxy_id\""),
+        "post-transition cache must be native\n{native}"
+    );
+    assert!(
+        !native.contains("\"route_id\""),
+        "post-transition cache must not carry the prior projection\n{native}"
+    );
+
+    // Completing the in-flight prior-schema render must be refused.
+    assert!(
+        !registry.try_store_json_cache_for_tests(stale_meta, stale_schema, stale_body),
+        "generation mismatch must reject stale-cache repopulation"
+    );
+
+    let after = registry.render_json().expect("cache hit after rejected stale store");
+    assert_eq!(
+        after, native,
+        "rejected stale store must leave the post-transition document cached"
+    );
+    assert!(
+        after.contains("\"proxy_id\""),
+        "live cache must remain native\n{after}"
+    );
+    assert!(
+        !after.contains("\"route_id\""),
+        "prior-schema document must not reappear\n{after}"
+    );
+}
+
 fn chargeback_plugin_config(id: &str, config: serde_json::Value) -> PluginConfig {
     serde_json::from_value(json!({
         "id": id,

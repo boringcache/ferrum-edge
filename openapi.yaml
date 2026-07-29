@@ -23204,11 +23204,11 @@ components:
             `proxy_name`, `currency`, `protocol_family`, `total_calls`,
             `total_charges`, `by_status`, `bandwidth`, `stream`). Billing
             identity, charge accounting, registry keys, and the Prometheus
-            exposition are unaffected. `summary_type`, `metadata`, `order`, and
-            every derived kind except `summary_kind` are rejected for this
-            surface. Process-global: every enabled api_chargeback instance must
-            resolve to the same projection because one render cache serves them
-            all. See docs/log_schema.md.
+            exposition are unaffected. `summary_type`, `timestamp_format`,
+            `metadata`, `order`, and every derived kind except `summary_kind`
+            are rejected for this surface. Process-global: every enabled
+            api_chargeback instance must resolve to the same projection because
+            one render cache serves them all. See docs/log_schema.md.
 
     ApiChargebackSinkConfig:
       type: object

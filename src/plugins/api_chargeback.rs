@@ -191,6 +191,21 @@ pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayC
     registry.set_active_proxy_names(names);
 }
 
+/// After an accepted generation is installed, publish the absence of a
+/// `/charges` render projection when no enabled `api_chargeback` remains.
+///
+/// Instance `commit_background_tasks` publishes a schema while at least one
+/// instance exists; a generation with zero instances has no plugin callback,
+/// so without this the previous projection would keep projecting retained
+/// rows. Does not claim [`CHARGEBACK_REGISTRY`] when it was never created,
+/// and never runs during candidate construction/validation.
+pub(crate) fn publish_render_schema_absence() {
+    let Some(registry) = CHARGEBACK_REGISTRY.get() else {
+        return;
+    };
+    registry.configure_render_schema(None);
+}
+
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -841,9 +856,15 @@ pub struct ChargebackRegistry {
     /// Advances whenever `active_proxy_names` is replaced. Render caches carry
     /// this generation so an overlapping reload cannot publish stale labels.
     proxy_metadata_generation: AtomicU64,
+    /// Advances whenever the published `/charges` render projection changes.
+    /// JSON cache entries carry this so a render that snapped a prior schema
+    /// cannot repopulate the cache after a schema transition.
+    render_schema_generation: AtomicU64,
     /// Cached render output with timestamp and proxy-metadata generation.
     prometheus_cache: ArcSwap<Option<(Instant, u64, String)>>,
-    json_cache: ArcSwap<Option<(Instant, u64, String)>>,
+    /// Cached JSON document tagged with proxy-metadata and projection
+    /// generations. One document must use one schema snapshot.
+    json_cache: ArcSwap<Option<(Instant, u64, u64, String)>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
@@ -899,6 +920,7 @@ impl ChargebackRegistry {
             shard_amount,
             active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
             proxy_metadata_generation: AtomicU64::new(0),
+            render_schema_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
             json_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -984,12 +1006,17 @@ impl ChargebackRegistry {
     /// generation, never on the render path. An inline `schema:` compiles a
     /// fresh `Arc` per instance, so this invalidates whenever a projection is
     /// involved at all rather than trying to prove two compiled schemas
-    /// equivalent; the unprojected default path never invalidates.
+    /// equivalent; the unprojected default path never invalidates. Projection
+    /// generation advances with every invalidation so an in-flight
+    /// [`Self::render_json`] that snapped the prior schema cannot store its
+    /// document back into `json_cache`.
     pub fn configure_render_schema(&self, render_schema: Option<Arc<SummarySchema>>) {
         let had_projection = self.render_schema.load().is_some();
         let has_projection = render_schema.is_some();
         self.render_schema.store(Arc::new(render_schema));
         if had_projection || has_projection {
+            self.render_schema_generation
+                .fetch_add(1, Ordering::AcqRel);
             self.json_cache.store(Arc::new(None));
         }
     }
@@ -1579,6 +1606,55 @@ impl ChargebackRegistry {
         self.shard_amount
     }
 
+    /// Current proxy-metadata generation carried by render caches.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn proxy_metadata_generation_for_tests(&self) -> u64 {
+        self.proxy_metadata_generation.load(Ordering::Acquire)
+    }
+
+    /// Current `/charges` projection generation carried by the JSON cache.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn render_schema_generation_for_tests(&self) -> u64 {
+        self.render_schema_generation.load(Ordering::Acquire)
+    }
+
+    /// Attempt to publish a JSON document into the render cache under the given
+    /// generation tags. Returns whether the store was accepted.
+    ///
+    /// Mirrors the generation-guarded store path in [`Self::render_json`] so
+    /// tests can prove a render started under a prior schema cannot repopulate
+    /// the cache after a schema transition without relying on timing sleeps.
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn try_store_json_cache_for_tests(
+        &self,
+        metadata_generation: u64,
+        schema_generation: u64,
+        output: String,
+    ) -> bool {
+        if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation
+            || self.render_schema_generation.load(Ordering::Acquire) != schema_generation
+        {
+            return false;
+        }
+        self.json_cache.store(Arc::new(Some((
+            Instant::now(),
+            metadata_generation,
+            schema_generation,
+            output,
+        ))));
+        if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
+            && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
+        {
+            true
+        } else {
+            self.json_cache.store(Arc::new(None));
+            false
+        }
+    }
+
     fn maybe_invalidate_caches(&self) {
         let min_age_nanos = self
             .cache_invalidation_min_age_nanos
@@ -1983,12 +2059,18 @@ impl ChargebackRegistry {
     ///
     /// Returns `Err` when any monetary field would be non-finite; callers must
     /// return an explicit error response rather than serializing JSON `null`.
+    ///
+    /// Cached documents are tagged with both proxy-metadata and projection
+    /// generations. A render that snapped a prior schema (or prior proxy-name
+    /// snapshot) can never repopulate the cache after those generations advance.
     pub fn render_json(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+        let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
         let cached = self.json_cache.load();
-        if let Some((generated_at, cached_generation, ref output)) = **cached
-            && cached_generation == metadata_generation
+        if let Some((generated_at, cached_meta_gen, cached_schema_gen, ref output)) = **cached
+            && cached_meta_gen == metadata_generation
+            && cached_schema_gen == schema_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -1999,16 +2081,22 @@ impl ChargebackRegistry {
 
         loop {
             let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let schema_generation = self.render_schema_generation.load(Ordering::Acquire);
             let output = self.render_json_uncached()?;
-            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation
+                || self.render_schema_generation.load(Ordering::Acquire) != schema_generation
+            {
                 continue;
             }
             self.json_cache.store(Arc::new(Some((
                 Instant::now(),
                 metadata_generation,
+                schema_generation,
                 output.clone(),
             ))));
-            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation
+                && self.render_schema_generation.load(Ordering::Acquire) == schema_generation
+            {
                 return Ok(output);
             }
             self.json_cache.store(Arc::new(None));
