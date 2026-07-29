@@ -2053,6 +2053,7 @@ fn mesh_config_validate_rejects_tracing_percentage_bounds() {
                     disable_span_reporting: None,
                     custom_tags: HashMap::new(),
                     custom_header_tags: HashMap::new(),
+                    custom_env_tags: HashMap::new(),
                     providers: Vec::new(),
                 }),
                 ..MeshTelemetryConfig::default()
