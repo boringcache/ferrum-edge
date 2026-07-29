@@ -13,6 +13,10 @@
 #
 # Canonical inventory: docs/vendored-patch-lifecycle.json (enforced by
 # scripts/check_vendored_patch_lifecycle.py on every PR and weekly).
+#
+# Delegates from this script's directory so a cwd-relative no-op cannot disable
+# weekly upstream-status reporting.
 set -uo pipefail
 
-exec python3 scripts/check_vendored_patch_lifecycle.py --upstream-status
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+exec python3 "$SCRIPT_DIR/check_vendored_patch_lifecycle.py" --upstream-status

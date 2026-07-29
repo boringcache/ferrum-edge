@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "Machine-readable vendored-patch lifecycle inventory. Human prose remains in docs/dependency-policy.md and per-patch READMEs; this file is the contract CI enforces against Cargo.toml, vendor/, scripts/check_vendored_patch_lifecycle.py, and the policy inventory table.",
+  "description": "Machine-readable vendored-patch lifecycle inventory. Human prose remains in docs/dependency-policy.md and per-patch READMEs; this file is the contract CI enforces against Cargo.toml, vendor/, scripts/check_vendored_patch_lifecycle.py, and the policy inventory Lifecycle ID set.",
   "retirement_checklist": [
     "Bump registry dependency versions in Cargo.toml and Cargo.lock when a compatible upstream release is identified.",
     "Validate behavior on a branch that removes the relevant patch before merging retirement.",

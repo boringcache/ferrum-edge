@@ -868,6 +868,10 @@ jobs:
         # exception is rejected at PR time, not only by the weekly workflow.
         run: bash scripts/check_advisory_expiry.sh
 
+      - name: Vendored-patch lifecycle self-test
+        # Deterministic validator fixtures (no network / no repo mutation).
+        run: python3 scripts/check_vendored_patch_lifecycle.py --self-test
+
       - name: Vendored-patch lifecycle parity
         # Fails when docs/vendored-patch-lifecycle.json drifts from Cargo.toml,
         # vendor/, dependency-policy.md, or per-patch READMEs.
