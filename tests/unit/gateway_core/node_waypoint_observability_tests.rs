@@ -127,21 +127,21 @@ fn enabled_producers_increment_and_render_bounded_labels() {
     // and plaintext-fallback counters have no other producer in this binary and
     // stay exact.
     assert!(
-        after.asserted_identity.accepted >= before.asserted_identity.accepted + 1,
+        after.asserted_identity.accepted > before.asserted_identity.accepted,
         "asserted identity accept must move (was {}, now {})",
         before.asserted_identity.accepted,
         after.asserted_identity.accepted
     );
     assert!(
         after.asserted_identity.rejected_untrusted_assertor
-            >= before.asserted_identity.rejected_untrusted_assertor + 1,
+            > before.asserted_identity.rejected_untrusted_assertor,
         "untrusted-assertor reject must move (was {}, now {})",
         before.asserted_identity.rejected_untrusted_assertor,
         after.asserted_identity.rejected_untrusted_assertor
     );
     assert!(
         after.destination_policy_rejections.authz_deny
-            >= before.destination_policy_rejections.authz_deny + 1,
+            > before.destination_policy_rejections.authz_deny,
         "authz_deny must move (was {}, now {})",
         before.destination_policy_rejections.authz_deny,
         after.destination_policy_rejections.authz_deny
