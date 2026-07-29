@@ -42,9 +42,11 @@ use crate::scaffolding::clients::Http3Client;
 
 use bytes::Bytes;
 use http::{Method, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http_body::Frame;
+use http_body_util::{BodyExt, StreamBody};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -580,8 +582,8 @@ impl Harness {
     }
 
     /// POST `size` bytes with no declared length: chunked on H1, a DATA-only
-    /// stream on H2 (hyper's H2 client never synthesizes `content-length`), and
-    /// DATA frames on H3.
+    /// stream on H2 (no exact `size_hint`, so hyper cannot synthesize
+    /// `content-length`), and DATA frames on H3.
     async fn post_streamed(&self, proto: Proto, path: &str, size: usize) -> StatusCode {
         match proto {
             Proto::H1 => self.h1_chunked(path, size).await,
@@ -630,7 +632,14 @@ impl Harness {
             let _ = conn.await;
         });
         let uri = format!("http://127.0.0.1:{}{path}", self.gateway.proxy_port);
-        let body = Full::<Bytes>::new(Bytes::from(vec![b'x'; size]));
+        // `Full` exposes an exact size_hint; hyper's H2 client then inserts
+        // Content-Length, which makes request_mirror skip admission for an
+        // oversize declared body (intentional — stays streaming, no 413). Use
+        // StreamBody so the upload stays DATA-only and exercises the admitted
+        // plugin-local ceiling path that H1 chunked / H3 DATA already cover.
+        let body = StreamBody::new(futures_util::stream::iter([Ok::<Frame<Bytes>, Infallible>(
+            Frame::data(Bytes::from(vec![b'x'; size])),
+        )]));
         let request = Request::builder()
             .method(Method::POST)
             .uri(uri)
