@@ -957,7 +957,10 @@ fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
         .expect("bounded gate region");
     // Both streaming bodies whose backend TRAILERS frame crosses this boundary
     // enter the gate; neither may be filtered out of it.
-    for arm in ["ResponseBody::StreamingH2(_)", "ResponseBody::StreamingH3(_)"] {
+    for arm in [
+        "ResponseBody::StreamingH2(_)",
+        "ResponseBody::StreamingH3(_)",
+    ] {
         assert!(
             gate.contains(arm),
             "{arm} must enter the streaming trailer-policy gate"
