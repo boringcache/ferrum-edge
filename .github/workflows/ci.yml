@@ -3528,8 +3528,32 @@ jobs:
           workspaces: fuzz -> target
           shared-key: fuzz-smoke
 
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run fuzz property smoke tests
+        working-directory: fuzz
+        run: cargo test --quiet
+
       - name: Run deterministic fuzz smoke lane
-        run: bash scripts/fuzz_smoke.sh
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          for target in \
+            traceparent \
+            config_decode \
+            proxy_protocol \
+            mesh_udp_frame \
+            k8s_crd \
+            plugin_config
+          do
+            cargo fuzz run "$target" -- \
+              -runs=512 \
+              -max_total_time=8 \
+              -max_len=4096 \
+              -timeout=2 \
+              -rss_limit_mb=512
+          done
 
   build-ebpf:
     name: Build eBPF Programs

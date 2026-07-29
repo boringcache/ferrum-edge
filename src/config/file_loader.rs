@@ -658,9 +658,7 @@ pub fn decode_and_validate_config_document(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<GatewayConfig, anyhow::Error> {
     if content.len() as u64 > MAX_CONFIG_FILE_BYTES {
-        anyhow::bail!(
-            "config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes"
-        );
+        anyhow::bail!("config document exceeds maximum size of {MAX_CONFIG_FILE_BYTES} bytes");
     }
 
     let is_yaml = serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()

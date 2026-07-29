@@ -7,13 +7,13 @@
 use bytes::{Bytes, BytesMut};
 use serde_json::Value;
 
-use crate::config::file_loader::decode_and_validate_config_document;
 use crate::config::BackendEgressPolicy;
-use crate::config_sources::k8s::{translate_k8s_objects, K8sObject, K8sTranslationOptions};
+use crate::config::file_loader::decode_and_validate_config_document;
+use crate::config_sources::k8s::{K8sObject, K8sTranslationOptions, translate_k8s_objects};
 use crate::identity::spiffe::TrustDomain;
-use crate::plugins::otel_tracing::{build_traceparent, OtelTracing};
+use crate::plugins::otel_tracing::{OtelTracing, build_traceparent};
 use crate::plugins::validate_plugin_config;
-use crate::proxy::mesh_udp_frame::{encode_datagram, pop_framed_datagram, MAX_FRAME_PAYLOAD};
+use crate::proxy::mesh_udp_frame::{MAX_FRAME_PAYLOAD, encode_datagram, pop_framed_datagram};
 use crate::proxy::proxy_protocol::parse_proxy_protocol_header_bytes;
 
 /// Hard cap on arbitrary fuzz input bytes passed into a single target invocation.
@@ -51,12 +51,8 @@ pub fn enforce_input_budget(data: &[u8]) -> Result<&[u8], ()> {
 /// Measure structural depth of a parsed JSON value.
 pub fn json_value_depth(value: &Value) -> usize {
     match value {
-        Value::Array(items) => {
-            1 + items.iter().map(json_value_depth).max().unwrap_or(0)
-        }
-        Value::Object(map) => {
-            1 + map.values().map(json_value_depth).max().unwrap_or(0)
-        }
+        Value::Array(items) => 1 + items.iter().map(json_value_depth).max().unwrap_or(0),
+        Value::Object(map) => 1 + map.values().map(json_value_depth).max().unwrap_or(0),
         _ => 1,
     }
 }
@@ -120,8 +116,8 @@ pub fn mesh_udp_frame_round_trip(payload: &[u8]) -> Result<(), String> {
     let mut wire = BytesMut::new();
     encode_datagram(&mut wire, payload).map_err(|error| error.to_string())?;
     let mut buf = wire;
-    let decoded = pop_framed_datagram(&mut buf)
-        .ok_or_else(|| "round-trip frame missing".to_string())?;
+    let decoded =
+        pop_framed_datagram(&mut buf).ok_or_else(|| "round-trip frame missing".to_string())?;
     if decoded.as_ref() != payload {
         return Err("round-trip payload mismatch".to_string());
     }
@@ -176,7 +172,8 @@ pub fn smoke_invariants() -> Result<(), String> {
     mesh_udp_frame_round_trip(b"smoke")?;
     let proxy_v1 = b"PROXY TCP4 127.0.0.1 10.0.0.1 12345 443\r\n";
     fuzz_parse_proxy_protocol(proxy_v1)?;
-    let config = r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
+    let config =
+        r#"{"version":"1","proxies":[],"consumers":[],"plugin_configs":[],"upstreams":[]}"#;
     fuzz_decode_config_document(config)?;
     let plugin = serde_json::json!({"origins": ["*"]});
     validate_plugin_config("cors", &plugin).map_err(|error| error)?;

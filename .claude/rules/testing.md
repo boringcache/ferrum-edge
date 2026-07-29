@@ -92,7 +92,8 @@ paths:
 
 - Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
   `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
-- Ordinary PR CI runs the deterministic `Fuzz Smoke` job (`scripts/fuzz_smoke.sh`).
+- Ordinary PR CI runs the deterministic inline `Fuzz Smoke` job in
+  `.github/workflows/ci.yml`.
 - Longer sanitizer-backed runs are scheduled in `.github/workflows/fuzz.yml` only.
 
 ## CI Expectations
