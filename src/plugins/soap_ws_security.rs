@@ -5092,8 +5092,12 @@ fn parse_bounded_xml<'a>(xml: &'a str, context: &str) -> Result<Document<'a>, St
 // creating a gateway/backend parser differential.
 
 /// The one namespace-correct SOAP envelope this request is validated against.
-struct SoapEnvelopeStructure<'a, 'input> {
-    envelope_ns: &'input str,
+///
+/// Lifetimes mirror `roxmltree::Node<'a, 'input: 'a>`: `'a` is the borrow of
+/// the parsed `Document`, and `'input` is the original XML text that document
+/// borrows. Namespace URIs from `tag_name().namespace()` are `&'a str`.
+struct SoapEnvelopeStructure<'a, 'input: 'a> {
+    envelope_ns: &'a str,
     header: Option<Node<'a, 'input>>,
     /// The SOAP `Body` the backend will consume. X.509 signature coverage is
     /// proven against exactly this node.
@@ -5108,7 +5112,7 @@ fn is_soap_envelope_namespace(namespace: &str) -> bool {
 /// all in the same SOAP envelope namespace, and reject any additional
 /// namespace-correct `Envelope`/`Header`/`Body` element anywhere in the
 /// document.
-fn resolve_soap_envelope<'a, 'input>(
+fn resolve_soap_envelope<'a, 'input: 'a>(
     document: &'a Document<'input>,
 ) -> Result<SoapEnvelopeStructure<'a, 'input>, String> {
     let envelope = document.root_element();
@@ -5220,7 +5224,7 @@ fn security_header_targets_receiver(node: Node<'_, '_>, envelope_ns: &str) -> bo
 /// SOAP `Header`; one placed anywhere else (inside the Body, inside another
 /// header block) is a wrapping attempt. Exactly one of them may target this
 /// receiver.
-fn resolve_security_node<'a, 'input>(
+fn resolve_security_node<'a, 'input: 'a>(
     document: &'a Document<'input>,
     structure: &SoapEnvelopeStructure<'a, 'input>,
 ) -> Result<Option<Node<'a, 'input>>, String> {
@@ -5281,13 +5285,16 @@ fn element_text(node: Node<'_, '_>) -> Option<String> {
 /// the broad set of id spellings a tolerant backend might resolve (`wsu:Id`,
 /// bare `Id`, `ID`, `id`, `xml:id`) so a duplicate under any of them fails
 /// closed.
-struct DocumentIdIndex<'a, 'input> {
-    entries: HashMap<&'input str, (usize, Node<'a, 'input>)>,
+///
+/// Keys are `&'a str` because `roxmltree::Attribute::value()` returns a borrow
+/// of the document (`&'a str`), not a direct `&'input str`.
+struct DocumentIdIndex<'a, 'input: 'a> {
+    entries: HashMap<&'a str, (usize, Node<'a, 'input>)>,
 }
 
-impl<'a, 'input> DocumentIdIndex<'a, 'input> {
+impl<'a, 'input: 'a> DocumentIdIndex<'a, 'input> {
     fn build(document: &'a Document<'input>) -> Self {
-        let mut entries: HashMap<&'input str, (usize, Node<'a, 'input>)> = HashMap::new();
+        let mut entries: HashMap<&'a str, (usize, Node<'a, 'input>)> = HashMap::new();
         for node in document.descendants().filter(Node::is_element) {
             for attribute in node.attributes() {
                 if !is_xml_id_attribute(attribute.name(), attribute.namespace()) {
@@ -7416,7 +7423,11 @@ mod tests {
             decls = TEST_NS_DECLS
         );
         let document = parse_bounded_xml(&envelope, "test envelope").expect("fixture parses");
-        let error = resolve_soap_envelope(&document).expect_err("duplicate Body must reject");
+        // Avoid `expect_err`: SoapEnvelopeStructure is intentionally not Debug.
+        let error = match resolve_soap_envelope(&document) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate Body must reject"),
+        };
         assert!(
             error.contains("duplicate namespace-qualified"),
             "got: {error}"
