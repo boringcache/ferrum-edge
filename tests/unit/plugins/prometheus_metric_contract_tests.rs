@@ -764,15 +764,10 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
     let entries = &contract["ferrum_api_chargeback_registry_entries"];
     assert_eq!(entries.metric_type, "gauge");
     assert!(entries.labels.is_empty());
-    let asserted_identity =
-        &contract["ferrum_mesh_node_waypoint_asserted_identity_total"];
+    let asserted_identity = &contract["ferrum_mesh_node_waypoint_asserted_identity_total"];
     assert_eq!(
         asserted_identity.labels,
-        BTreeSet::from([
-            "gateway_namespace".into(),
-            "reason".into(),
-            "result".into(),
-        ])
+        BTreeSet::from(["gateway_namespace".into(), "reason".into(), "result".into(),])
     );
 }
 
