@@ -1690,7 +1690,7 @@ async fn semantic_noop_preserves_representation_validators() {
     let plugin = Arc::new(plugin) as Arc<dyn Plugin>;
     let mut ctx = make_ctx();
     let mut status = 200u16;
-    let mut body_buf = body.to_vec();
+    let mut body_buf = bytes::Bytes::from(body.to_vec());
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
@@ -1703,7 +1703,7 @@ async fn semantic_noop_preserves_representation_validators() {
     )
     .await;
     assert!(!rewritten);
-    assert_eq!(body_buf, body);
+    assert_eq!(&body_buf[..], &body[..]);
     assert_stale_representation_headers_present(&headers);
 }
 
@@ -1743,7 +1743,7 @@ async fn parse_failure_and_non_json_preserve_representation_validators() {
     let before = headers.clone();
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
-    let mut body_buf = html.to_vec();
+    let mut body_buf = bytes::Bytes::from(html.to_vec());
     let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -1756,7 +1756,7 @@ async fn parse_failure_and_non_json_preserve_representation_validators() {
     .await;
     assert!(!replaced);
     assert!(!rewritten);
-    assert_eq!(body_buf, html);
+    assert_eq!(&body_buf[..], &html[..]);
     assert_eq!(headers, before);
     assert_stale_representation_headers_present(&headers);
 }
@@ -1776,7 +1776,7 @@ async fn buffered_lifecycle_strips_stale_validators_on_rewrite() {
     insert_stale_representation_headers(&mut headers);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -1820,7 +1820,7 @@ async fn synthetic_lifecycle_strips_stale_validators_on_rewrite() {
     headers.insert("content-length".to_string(), original.len().to_string());
     insert_stale_representation_headers(&mut headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     apply_synthetic_response_body_hooks_for_test(
         &[plugin],
         &mut ctx,
@@ -1869,7 +1869,7 @@ async fn multiple_transformer_instances_strip_validators_in_order() {
     insert_stale_representation_headers(&mut headers);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[first, second],
         &mut ctx,
@@ -1902,7 +1902,7 @@ async fn trailer_integrity_fields_retired_after_body_rewrite() {
     insert_stale_representation_headers(&mut headers);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -1955,7 +1955,7 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     insert_stale_representation_headers(&mut headers);
     stamp_original_response_metadata_for_test(&mut transform_ctx, status, &headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[transformer],
         &mut transform_ctx,
@@ -2007,7 +2007,7 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
             headers: hit_headers,
         } => {
             assert_eq!(status_code, 200, "must serve the transformed body, not 304");
-            assert_eq!(hit_body.as_ref(), body.as_slice());
+            assert_eq!(hit_body.as_ref(), &body[..]);
             assert!(
                 hit_headers
                     .keys()

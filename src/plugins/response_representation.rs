@@ -148,6 +148,7 @@
 //!   `ai_semantic_firewall`. It is stricter than browsers about padding after the
 //!   final member, so such a body is rejected rather than decoded.
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::Arc;
@@ -797,10 +798,10 @@ pub(crate) fn evaluate_response_body_policy_posture(
 pub(crate) fn install_decoded_response_body(
     ctx: &mut RequestContext,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut Bytes,
     decoded: Vec<u8>,
 ) {
-    *response_body = decoded;
+    *response_body = Bytes::from(decoded);
     response_headers.retain(|name, _| !name.eq_ignore_ascii_case("content-encoding"));
     super::invalidate_content_bound_response_headers(response_headers);
     let length = response_body.len().to_string();

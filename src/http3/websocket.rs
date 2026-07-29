@@ -401,7 +401,8 @@ pub(crate) async fn send_h3_error_body<S>(
     send_h3_reject_body(
         stream,
         status,
-        body.as_bytes(),
+        // `&'static str` literal: `from_static` keeps this allocation-free.
+        Bytes::from_static(body.as_bytes()),
         HashMap::new(),
         initial_response_header_policy_plugins,
     )
@@ -411,7 +412,7 @@ pub(crate) async fn send_h3_error_body<S>(
 async fn send_h3_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     mut headers: HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) where
@@ -448,7 +449,7 @@ fn ensure_h3_reject_content_type(headers: &mut HashMap<String, String>) {
 async fn write_h3_finalized_reject_body<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     mut headers: HashMap<String, String>,
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
@@ -481,8 +482,12 @@ async fn write_h3_finalized_reject_body<S>(
         debug!("H3 WS: failed to send reject response: {}", e);
         return;
     }
+    // GHSA-5fp3-pp5p-c4gh: move the owned `Bytes` straight into QUIC. A cached
+    // synthetic / admission `RejectBinary` body keeps its shared allocation
+    // identity here; re-adding a slice copy at this boundary restores the
+    // advisory. Pinned by `h3_native_reject_bytes_share_tests`.
     if !body.is_empty()
-        && let Err(e) = stream.send_data(Bytes::copy_from_slice(body)).await
+        && let Err(e) = stream.send_data(body).await
     {
         debug!("H3 WS: failed to send reject body: {}", e);
     }
@@ -529,7 +534,7 @@ async fn send_h3_backend_admission_rejection<S>(
     )
     .await;
     crate::proxy::record_request(state, status.as_u16());
-    write_h3_finalized_reject_body(stream, status, &rejection.body, headers).await;
+    write_h3_finalized_reject_body(stream, status, rejection.body, headers).await;
 }
 
 pub(crate) fn release_h3_ws_circuit_breaker_probe_on_admission_reject(
@@ -816,7 +821,7 @@ pub(crate) async fn handle_h3_websocket(
             send_h3_reject_body(
                 &mut stream,
                 StatusCode::BAD_GATEWAY,
-                br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+                Bytes::from_static(crate::http3::server::MESH_DISPATCH_REQUIRED_REJECT_BODY),
                 reason_headers,
                 &initial_response_header_policy_plugins,
             )

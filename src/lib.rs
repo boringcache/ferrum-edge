@@ -212,7 +212,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
@@ -564,9 +564,9 @@ pub mod _test_support {
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
         status_code: u16,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
         headers: HashMap<String, String>,
-    ) -> (u16, Vec<u8>, HashMap<String, String>) {
+    ) -> (u16, bytes::Bytes, HashMap<String, String>) {
         let mut response_status = status_code;
         let mut response_headers = headers.clone();
         let response_body = crate::proxy::apply_plugin_rejection_response(
@@ -576,7 +576,7 @@ pub mod _test_support {
             &mut response_headers,
             crate::proxy::RejectedResponseParts {
                 status_code,
-                body,
+                body: body.into(),
                 headers,
             },
         )
@@ -888,6 +888,23 @@ pub mod _test_support {
         crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
     }
 
+    /// Returns `(replayed api_spec ids, skipped spec count, cleared ownership
+    /// tag count, replayed proxy id → surviving api_spec_id)`.
+    #[allow(clippy::type_complexity)]
+    pub fn plan_additive_rollback_api_specs_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        snapshot_specs: Vec<crate::config::types::ApiSpec>,
+        current: crate::config::types::GatewayConfig,
+        current_spec_ids: Vec<String>,
+    ) -> (Vec<String>, usize, usize, Vec<(String, Option<String>)>) {
+        crate::admin::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            snapshot_specs,
+            current,
+            current_spec_ids,
+        )
+    }
+
     pub fn collect_rejecting_runtime_config_errors_for_test(
         config: &crate::config::types::GatewayConfig,
     ) -> Vec<String> {
@@ -898,6 +915,54 @@ pub mod _test_support {
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {
         crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    /// Acquire the durable namespace config admission lease (same primitive as
+    /// admin mutations and api_specs-emitting backups) for external tests.
+    pub async fn lock_namespace_config_admission_db_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+    ) -> Result<TestNamespaceConfigAdmissionGuard, String> {
+        crate::admin::crud::lock_namespace_config_admission(db, namespace)
+            .await
+            .map(TestNamespaceConfigAdmissionGuard)
+            .map_err(|_error| "namespace config admission unavailable".to_string())
+    }
+
+    /// Opaque handle around the production admission guard for external tests.
+    pub struct TestNamespaceConfigAdmissionGuard(crate::admin::crud::NamespaceConfigAdmissionGuard);
+
+    impl TestNamespaceConfigAdmissionGuard {
+        /// Force the lease into the lost state without waiting for TTL/renewal.
+        pub fn force_lose(&self) {
+            self.0.force_lose_for_test();
+        }
+
+        /// Run work under the same held-lease observer backup/mutations use.
+        pub async fn run_to_completion_while_held<F, T>(
+            &self,
+            future: F,
+        ) -> Result<TestNamespaceConfigAdmissionCompletion<T>, String>
+        where
+            F: std::future::Future<Output = T>,
+        {
+            match self.0.run_to_completion_while_held(future).await {
+                Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
+                    Ok(TestNamespaceConfigAdmissionCompletion::Held(result))
+                }
+                Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result,
+                    error: _,
+                }) => Ok(TestNamespaceConfigAdmissionCompletion::Lost(result)),
+                Err(_error) => Err("namespace config admission unavailable".to_string()),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum TestNamespaceConfigAdmissionCompletion<T> {
+        Held(T),
+        Lost(T),
     }
 
     pub fn validate_plugin_configs_fatal_for_test(
@@ -1117,7 +1182,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -1144,7 +1209,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -3489,7 +3554,7 @@ pub mod _test_support {
         flavor: crate::config::types::HttpFlavor,
         grpc_web_response_content_type: Option<&str>,
         http_status: StatusCode,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
     ) -> bool {
         // No provenance seeding here: the production delegate seeds it, so this
@@ -3537,7 +3602,7 @@ pub mod _test_support {
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,
-        pub body: Vec<u8>,
+        pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
         pub failed_websocket_handshake: bool,
@@ -3611,7 +3676,7 @@ pub mod _test_support {
         ctx.begin_buffered_deadline_response_header_provenance(&headers);
         headers.insert("x-correlation-id".to_string(), "request-123".to_string());
         ctx.record_deadline_response_header_mutations(&headers);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
             grpc_web_response_content_type,
@@ -3636,8 +3701,9 @@ pub mod _test_support {
         grpc_web_response_content_type: Option<&str>,
         mut backend_headers: HashMap<String, String>,
         gateway_headers: HashMap<String, String>,
-        mut body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
     ) -> NormalizedRejectResponse {
+        let mut body = body.into();
         let mut ctx = crate::plugins::RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
@@ -3672,7 +3738,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
             plugins,
@@ -3699,7 +3765,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         response_body_rejected: bool,
     ) -> (bool, bool) {
@@ -3778,7 +3844,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_synthetic_response_body_hooks(
             plugins,
@@ -3797,7 +3863,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
             plugins,
@@ -3930,7 +3996,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
-    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> Option<(u16, bytes::Bytes, HashMap<String, String>)> {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .map(|reject| (reject.status_code, reject.body, reject.headers))
@@ -3969,7 +4035,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
         transform_buffered_response_body_with_deadline_and_policy_for_test(
@@ -3989,7 +4055,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ) -> bool {
@@ -4076,6 +4142,37 @@ pub mod _test_support {
         crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
     }
 
+    pub fn h3_normalize_reject_for_client_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: http::StatusCode,
+        body: bytes::Bytes,
+        headers: &std::collections::HashMap<String, String>,
+        native_grpc: bool,
+    ) -> (
+        NormalizedRejectResponse,
+        Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    ) {
+        let (normalized, grpc_web_error) =
+            crate::http3::cross_protocol::normalize_reject_for_client(
+                ctx,
+                status,
+                body,
+                headers,
+                native_grpc,
+            );
+        (
+            NormalizedRejectResponse {
+                http_status: normalized.http_status,
+                headers: normalized.headers,
+                body: normalized.body,
+                grpc_status: normalized.grpc_status,
+                grpc_message: normalized.grpc_message,
+                failed_websocket_handshake: normalized.failed_websocket_handshake,
+            },
+            grpc_web_error,
+        )
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }
@@ -4096,7 +4193,7 @@ pub mod _test_support {
             None,
         );
         let body = match response.body {
-            crate::retry::ResponseBody::Buffered(body) => body,
+            crate::retry::ResponseBody::Buffered(body) => body.to_vec(),
             crate::retry::ResponseBody::Streaming { .. }
             | crate::retry::ResponseBody::StreamingH2(_)
             | crate::retry::ResponseBody::StreamingH3(_) => Vec::new(),
@@ -4221,8 +4318,12 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         is_grpc_request: bool,
     ) -> NormalizedRejectResponse {
-        let normalized =
-            crate::proxy::normalize_reject_response(status, body, headers, is_grpc_request);
+        let normalized = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            is_grpc_request,
+        );
         NormalizedRejectResponse {
             http_status: normalized.http_status,
             headers: normalized.headers,
@@ -4267,7 +4368,7 @@ pub mod _test_support {
         let reject = crate::proxy::NormalizedRejectResponse {
             http_status: status,
             headers,
-            body: body.to_vec(),
+            body: bytes::Bytes::copy_from_slice(body),
             grpc_status: None,
             grpc_message: None,
             failed_websocket_handshake,
@@ -4289,10 +4390,39 @@ pub mod _test_support {
         body: &[u8],
         headers: &HashMap<String, String>,
     ) -> http::response::Parts {
-        let reject = crate::proxy::normalize_reject_response(status, body, headers, true);
+        let reject = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            true,
+        );
         crate::proxy::build_response_from_normalized_reject(reject)
             .into_parts()
             .0
+    }
+
+    /// Drive the production reject wire path with an already-shared `Bytes`
+    /// payload, returning the wire parts alongside the body pointer the
+    /// normalizer produced. Lets a test pin the two guarantees that meet on a
+    /// cached synthetic reject: the retained allocation is handed onward without
+    /// a per-hit copy, *and* the gateway still derives an authoritative
+    /// `Content-Length` instead of trusting a plugin-authored one.
+    pub fn build_reject_wire_parts_from_shared_bytes_for_test(
+        method: &str,
+        status: StatusCode,
+        body: bytes::Bytes,
+        headers: &HashMap<String, String>,
+    ) -> (http::response::Parts, usize) {
+        let mut normalized = crate::proxy::normalize_reject_response(status, body, headers, false);
+        normalized.body_disposition =
+            crate::proxy::headers::RejectBodyDisposition::for_request(method, status.as_u16());
+        let observed_body_ptr = normalized.body.as_ptr() as usize;
+        (
+            crate::proxy::build_response_from_normalized_reject(normalized)
+                .into_parts()
+                .0,
+            observed_body_ptr,
+        )
     }
 
     /// Run the shared synthetic-response wire preparation contract exactly as

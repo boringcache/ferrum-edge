@@ -1632,7 +1632,7 @@ async fn h3_injected_sticky_cookie_survives_committed_hook_grpc_deadline() {
     // A committed-response hook then exhausts the RPC deadline.
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
     let mut status = 200;
-    let mut body = b"discarded backend response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"discarded backend response");
     assert!(
         run_deadline_bounded_response_committed_hooks_for_test(
             &committed,

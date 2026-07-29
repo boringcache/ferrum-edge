@@ -1421,7 +1421,7 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             final_status, 200,
             "ae={accept_encoding:?}: acceptable identity must keep cache HIT"
         );
-        assert_eq!(final_body, br#"{"cached":"identity"}"#);
+        assert_eq!(&final_body[..], br#"{"cached":"identity"}"#);
         assert!(
             !final_headers.contains_key("content-encoding"),
             "ae={accept_encoding:?}: must not commit content-encoding on reject path"
@@ -1481,7 +1481,7 @@ async fn test_security_rejection_not_replaced_by_406() {
         final_status, 401,
         "auth rejection must not be masked by compression 406"
     );
-    assert_eq!(final_body, br#"{"error":"unauthorized"}"#);
+    assert_eq!(&final_body[..], br#"{"error":"unauthorized"}"#);
     assert_eq!(
         final_headers.get("www-authenticate").map(String::as_str),
         Some("Bearer")
@@ -4212,7 +4212,7 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
     );
     assert_integrity_digests_present(&headers);
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (replaced, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4255,7 +4255,7 @@ async fn test_compression_transform_strips_stale_integrity_digests() {
 
     use flate2::read::GzDecoder;
     use std::io::Read;
-    let mut decoder = GzDecoder::new(body.as_slice());
+    let mut decoder = GzDecoder::new(&body[..]);
     let mut decompressed = Vec::new();
     decoder
         .read_to_end(&mut decompressed)
@@ -4288,7 +4288,7 @@ async fn test_brotli_compression_transform_strips_stale_integrity_digests() {
         Some("br")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4336,7 +4336,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[Arc::clone(&plugin)],
             &mut ctx,
@@ -4376,7 +4376,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[Arc::clone(&plugin)],
             &mut ctx,
@@ -4414,7 +4414,7 @@ async fn test_skipped_compression_preserves_integrity_digests() {
         ));
         assert!(!headers.contains_key("content-encoding"));
 
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
             &[plugin],
             &mut ctx,
@@ -4447,7 +4447,7 @@ async fn test_compression_noop_transform_preserves_integrity_digests() {
     insert_stale_integrity_digests(&mut headers);
 
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4489,7 +4489,7 @@ async fn test_synthetic_compression_transform_strips_stale_integrity_digests() {
         Some("gzip")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     apply_synthetic_response_body_hooks_for_test(
         &[plugin],
         &mut ctx,
@@ -4530,7 +4530,7 @@ async fn test_trailer_integrity_digests_retired_after_compression_rewrite() {
         PluginResult::Continue
     ));
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &[plugin],
         &mut ctx,
@@ -4685,7 +4685,7 @@ async fn test_multi_instance_response_single_coding_layer() {
         Some("gzip")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     let (_, rewritten) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4741,7 +4741,7 @@ async fn test_multi_instance_response_order_selects_brotli_first() {
         Some("br")
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4795,7 +4795,7 @@ async fn test_multi_instance_identity_then_later_instance_may_compress() {
         "identity-only earlier instance must not block a later compress"
     );
 
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4982,7 +4982,7 @@ async fn test_multi_instance_plugin_cache_reload_preserves_ownership() {
         run_after_proxy_chain(&compression, &mut ctx, status, &mut resp_headers).await,
         PluginResult::Continue
     ));
-    let mut body = original.clone();
+    let mut body = bytes::Bytes::from(original.clone());
     transform_buffered_response_body_with_deadline_full_for_test(
         &compression,
         &mut ctx,
@@ -6032,7 +6032,7 @@ async fn test_response_encode_abort_restores_identity_representation() {
 
     // Simulate a missing permit / encoder abort after Content-Encoding commit.
     let _ = take_compression_response_buffer_permit_for_test(&mut ctx);
-    let mut identity = compressible_json_body();
+    let mut identity = bytes::Bytes::from(compressible_json_body());
     let transformed = plugin
         .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
         .await;
@@ -6096,7 +6096,7 @@ async fn test_codec_saturation_at_transform_restores_identity_and_frees_buffer_s
                 "buffer admission is what gates the commit; codec saturation is later"
             );
 
-            let mut identity = compressible_json_body();
+            let mut identity = bytes::Bytes::from(compressible_json_body());
             assert!(
                 plugin
                     .transform_response_body_with_context(
@@ -6168,7 +6168,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
                 PluginResult::Continue
             ));
 
-            let mut body = compressible_json_body();
+            let mut body = bytes::Bytes::from(compressible_json_body());
             assert!(
                 plugin
                     .transform_response_body_with_context(
@@ -6199,7 +6199,7 @@ async fn test_codec_saturation_with_identity_forbidden_returns_406() {
             assert!(!resp.contains_key("content-encoding"));
             assert_eq!(resp.get("content-length"), Some(&body.len().to_string()));
             assert!(
-                String::from_utf8(body)
+                String::from_utf8(body.to_vec())
                     .expect("406 body must be UTF-8")
                     .contains("not acceptable")
             );

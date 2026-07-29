@@ -3775,8 +3775,14 @@ paths:
           required: false
           description: |
             Comma-separated list of resource types to include.
-            Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`.
+            Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Including `api_specs` also requires `proxies`, `upstreams`, and
+            `plugin_configs` so the export stays directly restorable (owning
+            proxy plus generated upstream/plugin relationships). Otherwise the
+            request fails with `400` and does not emit a partial artifact.
+            `consumers` is optional because API-spec extraction does not create
+            consumers.
           schema:
             type: string
             example: "proxies,upstreams"
@@ -3799,6 +3805,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BackupResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3831,14 +3839,15 @@ paths:
         available. If the snapshot cannot be taken, restore aborts before any
         delete: connectivity failures return `503`, while corrupt/undecodable
         stored resources return `500` with `failure_class: data_integrity` and
-        a safe resource type/id when available. `api_specs` are admin-only metadata outside the config and
-        are NOT restored by rollback; a failed restore reports the authoritative
-        total number that must be re-submitted via `POST /api-specs` (list the
-        namespace's current specs with `GET /api-specs`).
+        a safe resource type/id when available. API specs are included in the
+        versioned backup section and are restored (and rolled back) with config
+        resources. Legacy backups that omit `api_specs` while the target
+        namespace holds specs require `?confirm_api_spec_deletion=true` in
+        addition to `?confirm=true`.
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
-        then plugin configs).
+        then plugin configs, then API specs).
 
         Restore normalizes the submitted payload once before validation — the
         same `normalize_fields()` admission used by CRUD, batch, file mode, and
@@ -3871,6 +3880,17 @@ paths:
           in: query
           required: true
           description: Must be `true` to confirm the destructive operation
+          schema:
+            type: boolean
+            enum: [true]
+        - name: confirm_api_spec_deletion
+          in: query
+          required: false
+          description: |
+            Required (as `true`) when restoring a legacy backup that omits the
+            versioned `api_specs` section while the target namespace currently
+            holds API specs. Without it, restore returns `409 Conflict` and
+            deletes nothing.
           schema:
             type: boolean
             enum: [true]
@@ -3943,15 +3963,15 @@ paths:
                     type: integer
                     description: >-
                       Authoritative count of API specs present before the restore
-                      that a config rollback cannot restore. Present only when the
-                      namespace carried specs.
+                      that may still be missing after an incomplete rollback.
+                      Present only when rollback is incomplete and the namespace
+                      carried specs.
                   api_specs_note:
                     type: string
                     description: >-
-                      Operator guidance to recover the affected API specs
-                      (re-submit original documents via POST /api-specs and list
-                      current specs with GET /api-specs). Present only when
-                      `api_specs_not_restored` is set.
+                      Operator guidance to verify API specs with GET /api-specs
+                      and re-submit originals via POST /api-specs if missing.
+                      Present only when `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3960,6 +3980,25 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: >-
+            Restore refused because the backup omits the versioned `api_specs`
+            section while the target namespace currently holds API specs.
+            Nothing was deleted. Retry with `confirm_api_spec_deletion=true` or
+            restore from a backup that includes `api_specs`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, api_specs_at_risk, confirmation_required]
+                properties:
+                  error:
+                    type: string
+                  api_specs_at_risk:
+                    type: integer
+                  confirmation_required:
+                    type: string
+                    example: confirm_api_spec_deletion=true
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
@@ -12269,7 +12308,7 @@ components:
           description: Where the config was read from
         counts:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams]
+          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
           properties:
             proxies:
               type: integer
@@ -12278,6 +12317,8 @@ components:
             plugin_configs:
               type: integer
             upstreams:
+              type: integer
+            api_specs:
               type: integer
         proxies:
           type: array
@@ -12295,12 +12336,115 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
+
+    ApiSpecsBackupSection:
+      type: object
+      description: |
+        Versioned backup/restore section for raw API specification documents
+        and ownership metadata. Omitted entirely on cached-fallback exports
+        (`X-Data-Source: cached`), which cannot prove spec ownership and so
+        restore as legacy backups; database-backed exports always include it
+        (possibly with an empty `items` array). The aggregate decompressed
+        API-spec content is bounded by the configured restore body limit.
+      required: [section_version, items]
+      properties:
+        section_version:
+          type: string
+          description: Section contract version
+          example: "1"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiSpecBackupItem"
+
+    ApiSpecBackupItem:
+      type: object
+      description: |
+        One API spec document in a backup/restore payload. `spec_content_base64`
+        is the gzip-compressed original document (standard Base64). Do not log
+        this field; it may contain proprietary API definitions.
+      required:
+        - id
+        - proxy_id
+        - spec_version
+        - spec_format
+        - spec_content_base64
+        - content_encoding
+        - uncompressed_size
+        - content_hash
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        namespace:
+          type: string
+          default: ferrum
+        proxy_id:
+          type: string
+        spec_version:
+          type: string
+          example: "3.1.0"
+        spec_format:
+          type: string
+          enum: [json, yaml]
+        spec_content_base64:
+          type: string
+          description: Standard Base64 of gzip-compressed original document bytes
+        content_encoding:
+          type: string
+          enum: [gzip]
+        uncompressed_size:
+          type: integer
+          format: int64
+        content_hash:
+          type: string
+          description: Lowercase hex SHA-256 of uncompressed document bytes
+        title:
+          type: string
+        info_version:
+          type: string
+        description:
+          type: string
+        contact_name:
+          type: string
+        contact_email:
+          type: string
+        license_name:
+          type: string
+        license_identifier:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        server_urls:
+          type: array
+          items:
+            type: string
+        operation_count:
+          type: integer
+        resource_hash:
+          type: string
+          pattern: "^$|^[0-9a-f]{64}$"
+          description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
 
     RestoreRequest:
       type: object
       description: |
         Same format as the backup output or the batch create request.
         All fields are optional — omitted resource types are treated as empty.
+        Omitting `api_specs` entirely means a legacy backup (preflight may
+        require `confirm_api_spec_deletion=true`). An empty `api_specs.items`
+        array is an intentional wipe of API specs.
       properties:
         proxies:
           type: array
@@ -12318,6 +12462,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
 
     RestoreResponse:
       type: object
@@ -12325,7 +12471,7 @@ components:
       properties:
         restored:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams]
+          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
           properties:
             proxies:
               type: integer
@@ -12339,6 +12485,9 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams restored
+            api_specs:
+              type: integer
+              description: Number of API specs restored
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the

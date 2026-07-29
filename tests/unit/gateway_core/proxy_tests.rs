@@ -1482,7 +1482,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 
     let (status_code, body, headers) = result.expect("missing credentials should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
         Some("ferrum-edge")
@@ -1623,7 +1623,7 @@ async fn test_single_auth_preserves_reject_from_plugin_that_sets_identity() {
 
     let (status, body, _headers) = result.expect("same-plugin rejection must remain terminal");
     assert_eq!(status, 403);
-    assert_eq!(body, br#"{"error":"account disabled"}"#);
+    assert_eq!(&body[..], br#"{"error":"account disabled"}"#);
 }
 
 #[tokio::test]
@@ -1648,7 +1648,7 @@ async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
 
     let (status_code, body, headers) = result.expect("all-missing multi-auth should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
         Some("ferrum-edge")
@@ -1683,7 +1683,7 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
     let (status_code, body, _headers) =
         result.expect("specific reject should win over generic missing fallback");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Specific auth failure"}"#);
+    assert_eq!(&body[..], br#"{"error":"Specific auth failure"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
@@ -1865,7 +1865,7 @@ async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership
     .await;
 
     assert_eq!(status, 503);
-    assert_eq!(body.as_slice(), b"must not replace terminal deadline");
+    assert_eq!(&body[..], b"must not replace terminal deadline");
     assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
 }
 
@@ -2271,7 +2271,7 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
                 .expect("both auth attempts must reject");
 
         assert_eq!(status_code, 403);
-        assert_eq!(body, br#"{"error":"mixed-case rejection"}"#);
+        assert_eq!(&body[..], br#"{"error":"mixed-case rejection"}"#);
         assert_eq!(
             headers.get("X-Rejection").map(String::as_str),
             Some("selected")
@@ -4077,5 +4077,66 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
         Some("999"),
         "guard the premise: streaming framing preserves the plugin length, which \
          is why the buffered gRPC writers must not select it for an empty body"
+    );
+}
+
+/// GHSA-xvr4 header sealing and GHSA-5fp3 shared-`Bytes` delivery meet on the
+/// same rejection: a retained cached payload must be handed onward as one
+/// allocation while the gateway still publishes its own authoritative
+/// `Content-Length`. Pinning them together stops a later change from buying
+/// sharing back with a plugin-authored length, or fail-closed framing back with
+/// a per-hit copy of the cached body.
+#[test]
+fn test_shared_reject_bytes_keep_allocation_and_gateway_derived_content_length() {
+    use ferrum_edge::_test_support::build_reject_wire_parts_from_shared_bytes_for_test;
+    use http::StatusCode;
+
+    // Far past any inline-capacity threshold, so a copy shows up as an
+    // unmistakable pointer change rather than an allocator coincidence.
+    let cached = bytes::Bytes::from(vec![0x5cu8; 256 * 1024]);
+    let cached_ptr = cached.as_ptr() as usize;
+    // A plugin-authored length that disagrees with the payload actually sent.
+    let headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "9".to_string()),
+    ]);
+
+    let (parts, observed_ptr) = build_reject_wire_parts_from_shared_bytes_for_test(
+        "GET",
+        StatusCode::FORBIDDEN,
+        cached.clone(),
+        &headers,
+    );
+
+    assert_eq!(
+        observed_ptr, cached_ptr,
+        "the final reject header boundary must not copy the shared cached body"
+    );
+    let expected = cached.len().to_string();
+    assert_eq!(
+        parts
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str()),
+        "the gateway must overwrite the plugin-authored length with the real one"
+    );
+
+    // HEAD: the synthetic-response contract has already emptied the wire body,
+    // so the declared representation length survives instead of collapsing to a
+    // misleading `0`.
+    let (head_parts, _) = build_reject_wire_parts_from_shared_bytes_for_test(
+        "HEAD",
+        StatusCode::OK,
+        bytes::Bytes::new(),
+        &HashMap::from([("content-length".to_string(), "4096".to_string())]),
+    );
+    assert_eq!(
+        head_parts
+            .headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("4096"),
+        "HEAD must keep the representation length the synthetic contract established"
     );
 }

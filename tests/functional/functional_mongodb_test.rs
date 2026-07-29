@@ -1342,6 +1342,32 @@ async fn enable_delete_failpoint(
     (client, count)
 }
 
+async fn enable_one_shot_insert_failpoint(
+    mongo_url: &str,
+    app_name: &str,
+    collection: &str,
+) -> (MongoClient, i64) {
+    let client = MongoClient::with_uri_str(mongo_url)
+        .await
+        .expect("connect MongoDB restore failpoint controller");
+    let result = client
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": {"times": 1},
+            "data": {
+                "errorCode": 1,
+                "failCommands": ["insert"],
+                "namespace": format!("{DEFAULT_MONGO_DATABASE}.{collection}"),
+                "appName": app_name,
+            }
+        })
+        .await
+        .expect("enable one-shot MongoDB restore insert failpoint");
+    let count = failpoint_count(&result);
+    (client, count)
+}
+
 async fn disable_delete_failpoint(client: &MongoClient, initial_count: i64) {
     let result = client
         .database("admin")
@@ -1354,6 +1380,21 @@ async fn disable_delete_failpoint(client: &MongoClient, initial_count: i64) {
     assert!(
         failpoint_count(&result) > initial_count,
         "the targeted MongoDB delete command must reach the configured failpoint"
+    );
+}
+
+async fn disable_insert_failpoint(client: &MongoClient, initial_count: i64) {
+    let result = client
+        .database("admin")
+        .run_command(doc! {
+            "configureFailPoint": "failCommand",
+            "mode": "off",
+        })
+        .await
+        .expect("disable MongoDB restore insert failpoint");
+    assert!(
+        failpoint_count(&result) > initial_count,
+        "the targeted MongoDB restore insert must reach the configured failpoint"
     );
 }
 
@@ -1675,6 +1716,153 @@ async fn test_mongodb_replica_set_owner_delete_failure_rolls_back() {
 #[ignore]
 async fn test_mongodb_replica_set_owned_upstream_delete_failure_rolls_back() {
     assert_replica_set_delete_failure_rolls_back("upstreams").await;
+}
+
+/// A restore failure after the namespace clear must replay the authoritative
+/// snapshot, including the API spec document and its complete ownership graph.
+#[tokio::test]
+#[ignore]
+async fn test_mongodb_replica_set_restore_failure_rolls_back_api_specs() {
+    let Ok(replica_set) = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET") else {
+        println!("SKIP: FERRUM_TEST_MONGO_REPLICA_SET not set");
+        return;
+    };
+    let mongo_url = std::env::var("FERRUM_TEST_MONGO_REPLICA_SET_URL")
+        .or_else(|_| std::env::var("FERRUM_TEST_MONGO_URL"))
+        .unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        return;
+    }
+
+    let mut harness = MongoTestHarness::new().await.expect("create harness");
+    harness
+        .start_gateway_replica_set(&mongo_url, &replica_set)
+        .await
+        .expect("start gateway with MongoDB replica set");
+    let client = reqwest::Client::new();
+    let auth_header = format!("Bearer {}", harness.generate_token().expect("token"));
+    let fixture = OwnedProxyDeleteFixture::new("restore-rollback");
+    let spec_id = submit_owned_proxy_fixture(&client, &harness, &auth_header, &fixture).await;
+
+    let backup_response = client
+        .get(format!("{}/backup", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("take MongoDB API-spec recovery snapshot");
+    let backup_status = backup_response.status();
+    let backup: serde_json::Value = backup_response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        backup_status.as_u16(),
+        200,
+        "MongoDB API-spec backup must succeed: {backup:?}"
+    );
+    let backup_spec_ids: Vec<String> = backup["api_specs"]["items"]
+        .as_array()
+        .expect("backup API-spec section must contain an items array")
+        .iter()
+        .map(|item| {
+            item["id"]
+                .as_str()
+                .expect("backup API spec must carry an id")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        backup["counts"]["api_specs"].as_u64(),
+        u64::try_from(backup_spec_ids.len()).ok(),
+        "backup API-spec count must describe the authoritative section: {backup:?}"
+    );
+    assert!(
+        backup_spec_ids.iter().any(|id| id == &spec_id),
+        "backup must contain the API spec created by this test: {backup:?}"
+    );
+
+    // The namespace clear completes before restore imports begin. Fail exactly
+    // the first proxy insert, then let the one-shot failpoint disarm so the
+    // rollback replay can restore the snapshot through the same insert path.
+    let (failpoint_client, initial_count) =
+        enable_one_shot_insert_failpoint(&mongo_url, &harness.mongo_app_name, "proxies").await;
+    let response_result = client
+        .post(format!("{}/restore?confirm=true", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .json(&backup)
+        .send()
+        .await;
+    disable_insert_failpoint(&failpoint_client, initial_count).await;
+    let response = response_result.expect("restore request with MongoDB insert failpoint");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        status.as_u16(),
+        500,
+        "the injected MongoDB restore failure must never report success: {body:?}"
+    );
+    assert_eq!(
+        body["rollback"], "completed",
+        "the authoritative MongoDB snapshot must replay completely: {body:?}"
+    );
+
+    let specs_response = client
+        .get(format!("{}/api-specs", harness.admin_base_url))
+        .header("Authorization", &auth_header)
+        .send()
+        .await
+        .expect("list API specs after MongoDB restore rollback");
+    let specs_status = specs_response.status();
+    let specs: serde_json::Value = specs_response.json().await.unwrap_or_else(|_| json!({}));
+    assert_eq!(
+        specs_status.as_u16(),
+        200,
+        "API-spec list failed: {specs:?}"
+    );
+    assert_eq!(
+        specs["total"].as_u64(),
+        u64::try_from(backup_spec_ids.len()).ok(),
+        "MongoDB rollback must restore exactly the authoritative API-spec count: {specs:?}"
+    );
+    for backup_spec_id in &backup_spec_ids {
+        let restored_spec_response = client
+            .get(format!(
+                "{}/api-specs/{backup_spec_id}",
+                harness.admin_base_url
+            ))
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read restored API spec {backup_spec_id}: {error}"));
+        assert_eq!(
+            restored_spec_response.status().as_u16(),
+            200,
+            "MongoDB rollback must restore API spec {backup_spec_id}"
+        );
+    }
+
+    for (resource, id) in [
+        ("proxies", fixture.proxy_id.as_str()),
+        ("upstreams", fixture.upstream_id.as_str()),
+        ("plugins/config", fixture.plugin_id.as_str()),
+    ] {
+        let restored_response = client
+            .get(format!("{}/{resource}/{id}", harness.admin_base_url))
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read restored {resource}/{id}: {error}"));
+        let restored_status = restored_response.status();
+        let restored: serde_json::Value =
+            restored_response.json().await.unwrap_or_else(|_| json!({}));
+        assert_eq!(
+            restored_status.as_u16(),
+            200,
+            "MongoDB rollback must restore {resource}/{id}: {restored:?}"
+        );
+        assert_eq!(
+            restored["api_spec_id"].as_str(),
+            Some(spec_id.as_str()),
+            "MongoDB rollback must restore ownership on {resource}/{id}: {restored:?}"
+        );
+    }
 }
 
 /// The transaction-capable path still removes the complete ownership graph and
