@@ -430,6 +430,7 @@ mod tests {
             let strict = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                 &mesh,
+                true,
             )
             .expect("the strict workload's destination still resolves");
             assert_eq!(
@@ -446,6 +447,7 @@ mod tests {
             let permissive = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.8:{APP_PORT}").parse().unwrap(),
                 &mesh,
+                true,
             )
             .expect("the permissive workload's destination resolves");
             assert_eq!(permissive.mtls_mode, MtlsMode::Permissive);
@@ -468,6 +470,7 @@ mod tests {
             let destination = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                 &mesh,
+                true,
             )
             .expect("destination resolves");
 
@@ -482,8 +485,38 @@ mod tests {
                 destination.entry.socket_mark,
                 Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK)
             );
+            assert!(
+                destination.entry.requires_destination_mesh_authz,
+                "NodeWaypoint capture entries must require destination mesh authz"
+            );
+            assert!(
+                destination.entry.has_destination_mesh_authz,
+                "test fixture stamps authz-ready so the connect path may proceed"
+            );
             // No PeerAuthentication at all is Istio's PERMISSIVE default.
             assert_eq!(destination.mtls_mode, MtlsMode::Permissive);
+        }
+
+        #[test]
+        fn capture_entry_without_mesh_managed_authz_is_marked_not_ready() {
+            let mesh = capture_mesh(
+                vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                Vec::new(),
+            );
+            let destination = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                &mesh,
+                false,
+            )
+            .expect("destination resolves");
+            assert!(destination.entry.requires_destination_mesh_authz);
+            assert!(!destination.entry.has_destination_mesh_authz);
+            assert!(
+                crate::proxy::mesh_tcp_inbound::capture_requires_destination_authz_refusal(
+                    &destination.entry
+                ),
+                "capture handler must refuse when mesh-managed authz was absent at synthesis"
+            );
         }
 
         /// Fail closed when the destination cannot be pinned to exactly one
@@ -498,6 +531,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.9.9:{APP_PORT}").parse().unwrap(),
                     &mesh,
+                    true,
                 )
                 .is_none(),
                 "an address no slice workload declares must be refused, not relayed"
@@ -510,6 +544,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                     &duplicate,
+                    true,
                 )
                 .is_some(),
                 "identical duplicate workload records collapse to one scope"
@@ -521,6 +556,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                     &ambiguous,
+                    true,
                 )
                 .is_none(),
                 "two divergent workload identities on one address are ambiguous and must fail \
@@ -565,6 +601,7 @@ mod tests {
             let destination = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                 &mesh,
+                true,
             )
             .expect("the cross-namespace destination resolves");
             assert_eq!(destination.mtls_mode, MtlsMode::Strict);
@@ -590,6 +627,7 @@ mod tests {
             let still_strict = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                 &mesh,
+                true,
             )
             .expect("the cross-namespace destination still resolves");
             assert_eq!(
@@ -620,6 +658,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                     &mesh,
+                    true,
                 )
                 .is_none(),
                 "a foreign-node destination must be refused"
@@ -637,6 +676,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                     &legacy,
+                    true,
                 )
                 .is_none(),
                 "an absent capture inventory must fail closed, never fall back to `workloads`"
@@ -654,6 +694,7 @@ mod tests {
                 resolve_node_waypoint_capture_destination(
                     "10.244.1.7:9999".parse().unwrap(),
                     &mesh,
+                    true,
                 )
                 .is_none(),
                 "a port the destination workload does not declare must be refused"

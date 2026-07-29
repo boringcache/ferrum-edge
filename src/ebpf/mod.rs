@@ -1047,6 +1047,10 @@ pub struct MockEbpfBackend {
     /// tests can prove a pod whose redirect scope could not be written is not
     /// left flagged for redirect.
     pub fail_update_pod_inbound_port: bool,
+    /// When `true`, `clear_pod_inbound_ports` / `clear_pod_inbound_ports6` fail
+    /// so removal tests can prove a successful pod-IP map delete that cannot
+    /// clear the bounded scope map stays pending and retryable.
+    pub fail_clear_pod_inbound_ports: bool,
     /// When `true`, `validate_startup_ready` fails even though every earlier
     /// step succeeded, so tests can drive the post-attach startup-validation
     /// unwind (classifier detached, then Ferrum-owned routing removed).
@@ -1222,6 +1226,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn clear_pod_inbound_ports(&mut self, ip: Ipv4Addr) -> Result<(), String> {
+        if self.fail_clear_pod_inbound_ports {
+            return Err(format!(
+                "injected pod inbound redirect scope clear failure for {ip}"
+            ));
+        }
         self.pod_inbound_ports
             .retain(|(entry_ip, _)| *entry_ip != ip);
         Ok(())
@@ -1243,6 +1252,11 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn clear_pod_inbound_ports6(&mut self, ip: Ipv6Addr) -> Result<(), String> {
+        if self.fail_clear_pod_inbound_ports {
+            return Err(format!(
+                "injected pod IPv6 inbound redirect scope clear failure for {ip}"
+            ));
+        }
         self.pod_inbound_ports6
             .retain(|(entry_ip, _)| *entry_ip != ip);
         Ok(())

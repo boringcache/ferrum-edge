@@ -3573,21 +3573,38 @@ fn retry_pending_pod_ip_removals(
             continue;
         }
 
-        let result = match ip {
+        // Re-run the full removal contract: delete (or tolerate already-absent)
+        // the pod-IP entry first, then clear the family scope. Completing the
+        // handoff after only the map delete would permanently leak bounded
+        // `(pod, port)` scope keys when clear failed earlier.
+        let remove_result = match ip {
             std::net::IpAddr::V4(ip) => backend.remove_pod_ip(ip),
             std::net::IpAddr::V6(ip) => backend.remove_pod_ip6(ip),
         };
-        match result {
+        if let Err(e) = remove_result {
+            warn!(
+                %ip,
+                error = %e,
+                "Retrying pending pod IP map removal failed; keeping capture state degraded"
+            );
+            continue;
+        }
+        let clear_result = match ip {
+            std::net::IpAddr::V4(ip) => backend.clear_pod_inbound_ports(ip),
+            std::net::IpAddr::V6(ip) => backend.clear_pod_inbound_ports6(ip),
+        };
+        match clear_result {
             Ok(()) => {
                 PENDING_CAPTURE_FAILURES.remove(&failure_key);
-                debug!(%ip, "Recovered pending pod IP map removal failure");
+                debug!(%ip, "Recovered pending pod IP map removal and inbound redirect scope clear");
                 complete_removed_udp_close_handoff(pod_states, config, &state_key, &pod_uid);
             }
             Err(e) => {
                 warn!(
                     %ip,
                     error = %e,
-                    "Retrying pending pod IP map removal failed; keeping capture state degraded"
+                    "Retrying pending inbound redirect scope clear after pod IP removal failed; \
+                     keeping capture state degraded"
                 );
             }
         }
@@ -5408,18 +5425,19 @@ fn remove_pod_ip_if_unowned(
     // keeps the bounded scope map from accumulating across pod churn. Ordered
     // after the pod-IP removal on purpose: scope-first would briefly leave a
     // flagged pod with no reachable port, which fails closed (drops) rather
-    // than passing through.
-    if let Err(e) = backend.clear_pod_inbound_ports(ip) {
-        warn!(
-            pod_uid,
-            %ip,
-            error = %e,
-            removal_reason,
-            "Failed to clear inbound redirect scope after pod IP removal"
-        );
-    }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-    clear_partial_capture_state_if_recovered(pod_states, metrics);
+    // than passing through. Scope clear is part of the durable removal key —
+    // a transient clear failure must stay pending/retryable, not complete the
+    // handoff while unreachable `(pod, port)` keys remain.
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V4(ip),
+        removal_reason,
+        false,
+    );
 }
 
 fn remove_pod_ip6_if_unowned(
@@ -5455,17 +5473,16 @@ fn remove_pod_ip6_if_unowned(
         );
         return;
     }
-    if let Err(e) = backend.clear_pod_inbound_ports6(ip) {
-        warn!(
-            pod_uid,
-            %ip,
-            error = %e,
-            removal_reason,
-            "Failed to clear IPv6 inbound redirect scope after pod IP removal"
-        );
-    }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
-    clear_partial_capture_state_if_recovered(pod_states, metrics);
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V6(ip),
+        removal_reason,
+        false,
+    );
 }
 
 fn other_pod_owning_ip(
@@ -5591,16 +5608,16 @@ fn remove_pre_enrollment_pod_ip_if_unowned(
     // written (scope lands before the pod-IP flag), so the same after-the-IP
     // clear the enrolled teardown does is needed here or those
     // `(pod address, port)` pairs accumulate in the bounded scope map.
-    if let Err(e) = backend.clear_pod_inbound_ports(ip) {
-        warn!(
-            pod_uid,
-            %ip,
-            error = %e,
-            removal_reason,
-            "Failed to clear pre-enrollment inbound redirect scope after pod IP removal"
-        );
-    }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V4(ip),
+        removal_reason,
+        true,
+    );
 }
 
 fn remove_pre_enrollment_pod_ip6_if_unowned(
@@ -5640,16 +5657,67 @@ fn remove_pre_enrollment_pod_ip6_if_unowned(
         );
         return;
     }
-    if let Err(e) = backend.clear_pod_inbound_ports6(ip) {
+    finish_pod_ip_removal_scope_clear(
+        backend,
+        pod_states,
+        metrics,
+        &state_key,
+        pod_uid,
+        std::net::IpAddr::V6(ip),
+        removal_reason,
+        true,
+    );
+}
+
+/// After a successful (or already-absent) pod-IP map delete, clear the family
+/// scope and only then drop the durable `pod_ip_remove` failure. A clear
+/// failure keeps the same pending key so periodic retry re-runs both steps.
+fn finish_pod_ip_removal_scope_clear(
+    backend: &mut dyn EbpfBackend,
+    pod_states: &DashMap<String, PodAttachmentState>,
+    metrics: &NodeAgentMetrics,
+    state_key: &str,
+    pod_uid: &str,
+    ip: std::net::IpAddr,
+    removal_reason: &'static str,
+    pre_enrollment: bool,
+) -> bool {
+    let clear_result = match ip {
+        std::net::IpAddr::V4(ip) => backend.clear_pod_inbound_ports(ip),
+        std::net::IpAddr::V6(ip) => backend.clear_pod_inbound_ports6(ip),
+    };
+    if let Err(e) = clear_result {
+        let scope_label = if pre_enrollment {
+            if ip.is_ipv6() {
+                "Failed to clear pre-enrollment IPv6 inbound redirect scope after pod IP removal"
+            } else {
+                "Failed to clear pre-enrollment inbound redirect scope after pod IP removal"
+            }
+        } else if ip.is_ipv6() {
+            "Failed to clear IPv6 inbound redirect scope after pod IP removal"
+        } else {
+            "Failed to clear inbound redirect scope after pod IP removal"
+        };
         warn!(
             pod_uid,
             %ip,
             error = %e,
             removal_reason,
-            "Failed to clear pre-enrollment IPv6 inbound redirect scope after pod IP removal"
+            "{scope_label}"
         );
+        metrics.record_attach_error();
+        remember_pending_capture_failure(
+            state_key,
+            CAPTURE_FAILURE_POD_IP_REMOVE,
+            &ip.to_string(),
+        );
+        return false;
     }
-    forget_pending_capture_failure(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    forget_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
+    if !pre_enrollment {
+        clear_partial_capture_state_if_recovered(pod_states, metrics);
+    }
+    true
 }
 
 /// Re-evaluate the `includeOutboundPorts` annotations of an already-enrolled
@@ -14301,6 +14369,236 @@ mod tests {
             metrics.snapshot().capture_state,
             NODE_AGENT_CAPTURE_STATE_READY
         );
+    }
+
+    #[test]
+    fn tracked_pod_ip_scope_clear_failure_stays_pending_until_retry() {
+        for (family, ip_v4, ip_v6) in [
+            (
+                "ipv4",
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 31)),
+                None::<std::net::Ipv6Addr>,
+            ),
+            (
+                "ipv6",
+                None::<std::net::Ipv4Addr>,
+                Some("fd00::31".parse::<std::net::Ipv6Addr>().unwrap()),
+            ),
+        ] {
+            let registry = tempfile::tempdir().unwrap();
+            let mut capture_config = CaptureConfig::explicit(15006, 15001);
+            capture_config.udp_capture_enabled = true;
+            let config = NodeAgentConfig {
+                node_name: "test-node".to_string(),
+                capture_config,
+                cgroup_root: "/nonexistent".to_string(),
+                bpf_fs_path: "/nonexistent".to_string(),
+                fallback_mode: FallbackMode::Fail,
+                excluded_namespaces: HashSet::new(),
+                capture_contract: CaptureContract::local_pod_defaults(),
+                trust_domain: "cluster.local".to_string(),
+                node_waypoint_pod_registry_dir: Some(registry.path().to_path_buf()),
+            };
+            let pod_uid = format!("pod-scope-clear-{family}");
+            let pod_states = DashMap::new();
+            pod_states.insert(
+                pod_uid.clone(),
+                PodAttachmentState {
+                    pod_uid: pod_uid.clone(),
+                    pod_name: pod_uid.clone(),
+                    namespace: "default".to_string(),
+                    pod_ip: ip_v4,
+                    pod_ip6: ip_v6,
+                    cgroup_path: Some(format!("/cg/{pod_uid}")),
+                    veth_iface: Some("veth-scope".to_string()),
+                    attached: true,
+                    include_ports_cgroup_ids: Vec::new(),
+                    include_ports_policy: None,
+                    workload_identity_cgroup_ids: Vec::new(),
+                    node_probe_ports: Vec::new(),
+                    inbound_redirect_ports: vec![8080],
+                },
+            );
+            let state_key = pod_state_key(&pod_states, &pod_uid);
+            let mut backend = MockEbpfBackend {
+                fail_clear_pod_inbound_ports: true,
+                ..MockEbpfBackend::default()
+            };
+            if let Some(ip) = ip_v4 {
+                backend
+                    .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports(ip, &[8080]).unwrap();
+            }
+            if let Some(ip) = ip_v6 {
+                backend
+                    .update_pod_ip6(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports6(ip, &[8080]).unwrap();
+            }
+            let metrics = NodeAgentMetrics::default();
+
+            handle_pod_removed(&mut backend, &pod_states, &config, &metrics, &pod_uid);
+
+            let detail = ip_v4
+                .map(|ip| ip.to_string())
+                .or_else(|| ip_v6.map(|ip| ip.to_string()))
+                .unwrap();
+            let failure_key =
+                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "scope clear failure must keep the durable pod_ip_remove key ({family})"
+            );
+            assert!(has_pending_removal_blocking_failure(&state_key));
+            assert!(
+                !registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .exists(),
+                "UDP cleaned-gate handoff must wait for scope clear ({family})"
+            );
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_ips.contains_key(&ip));
+                assert!(backend.pod_inbound_ports.contains(&(ip, 8080)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_ips6.contains_key(&ip));
+                assert!(backend.pod_inbound_ports6.contains(&(ip, 8080)));
+            }
+
+            // Retry while clear still fails: pod-IP is already absent (ENOENT
+            // path) but scope remains, so the pending key must stay.
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "retry must keep the pending key while scope clear fails ({family})"
+            );
+            assert!(
+                !registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .exists()
+            );
+
+            backend.fail_clear_pod_inbound_ports = false;
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+
+            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_inbound_ports.contains(&(ip, 8080)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_inbound_ports6.contains(&(ip, 8080)));
+            }
+            assert!(
+                registry
+                    .path()
+                    .join(".udp-gate-cleaned")
+                    .join(&pod_uid)
+                    .is_file(),
+                "successful scope-clear retry must complete the UDP handoff ({family})"
+            );
+            assert_eq!(
+                metrics.snapshot().capture_state,
+                NODE_AGENT_CAPTURE_STATE_READY
+            );
+        }
+    }
+
+    #[test]
+    fn pre_enrollment_pod_ip_scope_clear_failure_stays_pending_until_retry() {
+        for (family, ip_v4, ip_v6) in [
+            (
+                "ipv4",
+                Some(std::net::Ipv4Addr::new(10, 0, 0, 32)),
+                None::<std::net::Ipv6Addr>,
+            ),
+            (
+                "ipv6",
+                None::<std::net::Ipv4Addr>,
+                Some("fd00::32".parse::<std::net::Ipv6Addr>().unwrap()),
+            ),
+        ] {
+            let pod_states = DashMap::new();
+            let pod_uid = format!("pod-pre-enroll-scope-{family}");
+            let state_key = pod_state_key(&pod_states, &pod_uid);
+            let mut backend = MockEbpfBackend {
+                fail_clear_pod_inbound_ports: true,
+                ..MockEbpfBackend::default()
+            };
+            let metrics = NodeAgentMetrics::default();
+            if let Some(ip) = ip_v4 {
+                backend
+                    .update_pod_ip(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports(ip, &[9090]).unwrap();
+                remove_pre_enrollment_pod_ip_if_unowned(
+                    &mut backend,
+                    &pod_states,
+                    &metrics,
+                    &pod_uid,
+                    ip,
+                    "failed enrollment cleanup",
+                );
+            }
+            if let Some(ip) = ip_v6 {
+                backend
+                    .update_pod_ip6(ip, &PodInfo::for_capture(15001, true, true))
+                    .unwrap();
+                backend.update_pod_inbound_ports6(ip, &[9090]).unwrap();
+                remove_pre_enrollment_pod_ip6_if_unowned(
+                    &mut backend,
+                    &pod_states,
+                    &metrics,
+                    &pod_uid,
+                    ip,
+                    "failed enrollment cleanup",
+                );
+            }
+
+            let detail = ip_v4
+                .map(|ip| ip.to_string())
+                .or_else(|| ip_v6.map(|ip| ip.to_string()))
+                .unwrap();
+            let failure_key =
+                pending_capture_failure_key(&state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &detail);
+            assert!(
+                PENDING_CAPTURE_FAILURES.contains_key(&failure_key),
+                "pre-enrollment scope clear failure must stay pending ({family})"
+            );
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_ips.contains_key(&ip));
+                assert!(backend.pod_inbound_ports.contains(&(ip, 9090)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_ips6.contains_key(&ip));
+                assert!(backend.pod_inbound_ports6.contains(&(ip, 9090)));
+            }
+
+            let config = NodeAgentConfig {
+                node_name: "test-node".to_string(),
+                capture_config: CaptureConfig::explicit(15006, 15001),
+                cgroup_root: "/nonexistent".to_string(),
+                bpf_fs_path: "/nonexistent".to_string(),
+                fallback_mode: FallbackMode::Fail,
+                excluded_namespaces: HashSet::new(),
+                capture_contract: CaptureContract::local_pod_defaults(),
+                trust_domain: "cluster.local".to_string(),
+                node_waypoint_pod_registry_dir: None,
+            };
+            backend.fail_clear_pod_inbound_ports = false;
+            retry_pending_pod_ip_removals(&mut backend, &pod_states, &config, &metrics);
+            assert!(!PENDING_CAPTURE_FAILURES.contains_key(&failure_key));
+            if let Some(ip) = ip_v4 {
+                assert!(!backend.pod_inbound_ports.contains(&(ip, 9090)));
+            }
+            if let Some(ip) = ip_v6 {
+                assert!(!backend.pod_inbound_ports6.contains(&(ip, 9090)));
+            }
+        }
     }
 
     #[test]

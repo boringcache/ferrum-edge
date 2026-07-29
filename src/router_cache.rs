@@ -324,6 +324,16 @@ pub(crate) struct MeshTcpInboundEntry {
     /// to ride the entry.
     pub(crate) node_waypoint_policy_scope:
         Option<Arc<crate::modes::mesh::runtime::PolicyScopeCache>>,
+    /// When `true`, this entry is a NodeWaypoint transparent-capture relay and
+    /// must never take the Sidecar empty-plugin fast path: unauthenticated
+    /// direct plaintext must run destination L4 authz before the backend dial.
+    /// Precomputed at entry synthesis so the connect path is a bool check.
+    pub(crate) requires_destination_mesh_authz: bool,
+    /// Whether the synthesizing epoch carried an enabled mesh-managed
+    /// `__mesh_authz` instance. Captured with
+    /// [`Self::requires_destination_mesh_authz`] so a missing authz instance
+    /// fails closed without scanning the plugin chain on every connect.
+    pub(crate) has_destination_mesh_authz: bool,
 }
 
 /// Outcome of a raw-TCP egress lookup for a captured original destination
@@ -2281,6 +2291,10 @@ impl RouterCache {
                         // node-waypoint code path on a topology that does not
                         // enable it.
                         node_waypoint_policy_scope: None,
+                        // Sidecar preserves the historical empty-chain fast
+                        // path; destination-authz gating is NodeWaypoint-only.
+                        requires_destination_mesh_authz: false,
+                        has_destination_mesh_authz: false,
                     })
                 });
             }
@@ -5740,6 +5754,10 @@ mod tests {
         assert!(
             entry.node_waypoint_policy_scope.is_none(),
             "Sidecar relay entries must not stamp a node-waypoint destination policy scope"
+        );
+        assert!(
+            !entry.requires_destination_mesh_authz,
+            "Sidecar relay entries must not require NodeWaypoint capture destination authz"
         );
 
         let tcp_entry = table

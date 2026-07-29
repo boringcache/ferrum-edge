@@ -49,6 +49,15 @@ use crate::plugins::{
 use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpInboundEntry;
 
+/// Fail-closed gate for NodeWaypoint transparent capture: refuse before the
+/// backend dial when the entry requires destination mesh authz and the
+/// synthesizing epoch did not carry an enabled mesh-managed `__mesh_authz`.
+/// Sidecar entries leave `requires_destination_mesh_authz` false and keep the
+/// historical empty-chain fast path.
+pub(crate) fn capture_requires_destination_authz_refusal(entry: &MeshTcpInboundEntry) -> bool {
+    entry.requires_destination_mesh_authz && !entry.has_destination_mesh_authz
+}
+
 pub(crate) async fn handle_mesh_tcp_inbound(
     client_stream: TcpStream,
     remote_addr: std::net::SocketAddr,
@@ -79,10 +88,37 @@ pub(crate) async fn handle_mesh_tcp_inbound(
             .plugin_cache
             .plugins_for_protocol(&proxy.namespace, &proxy.id, ProxyProtocol::Tcp);
 
+    // NodeWaypoint transparent capture admits unauthenticated direct plaintext.
+    // Never take the Sidecar empty-chain fast path for those entries, and fail
+    // closed when the synthesizing epoch lacked mesh-managed destination authz
+    // (precomputed on the entry — no hot-path plugin scan).
+    if capture_requires_destination_authz_refusal(entry) {
+        warn!(
+            service = %entry.service_fqdn,
+            orig_dst = %orig_dst,
+            client_ip = %client_ip,
+            "Refusing NodeWaypoint transparent inbound capture: mesh-managed \
+             destination authz is absent; closing without dialing the backend"
+        );
+        return;
+    }
+
     // No global TCP chain resolved: relay immediately. There is no plugin state
     // to track and no policy to evaluate, so the connect/disconnect lifecycle is
     // a no-op and we skip building a summary that nothing consumes.
+    // Capture entries never reach here without authz (gated above); Sidecar
+    // preserves this historical empty-chain fast path.
     if plugins.is_empty() {
+        if entry.requires_destination_mesh_authz {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %orig_dst,
+                client_ip = %client_ip,
+                "Refusing NodeWaypoint transparent inbound capture: TCP plugin \
+                 chain is empty despite capture requiring destination authz"
+            );
+            return;
+        }
         relay_to_loopback(client_stream, state, entry, orig_dst, &client_ip).await;
         return;
     }
@@ -580,5 +616,62 @@ async fn emit_disconnect(
     }
     for plugin in plugins.iter() {
         plugin.on_stream_disconnect(&summary).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modes::mesh::config::MeshInboundTcpRoute;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    fn sample_entry(
+        requires_destination_mesh_authz: bool,
+        has_destination_mesh_authz: bool,
+    ) -> MeshTcpInboundEntry {
+        let backend_addr: SocketAddr = "127.0.0.1:6379".parse().unwrap();
+        let route = MeshInboundTcpRoute {
+            match_port: 6379,
+            backend_addr,
+            namespace: "default".to_string(),
+            service_name: "redis".to_string(),
+            service_fqdn: "redis.default.svc.cluster.local".to_string(),
+            tls_inspect: false,
+            first_bytes_inspect: false,
+        };
+        MeshTcpInboundEntry {
+            relay_proxy: Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route)),
+            backend_addr,
+            service_fqdn: route.service_fqdn,
+            tls_inspect: false,
+            first_bytes_inspect: false,
+            socket_mark: if requires_destination_mesh_authz {
+                Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK)
+            } else {
+                None
+            },
+            node_waypoint_policy_scope: None,
+            requires_destination_mesh_authz,
+            has_destination_mesh_authz,
+        }
+    }
+
+    #[test]
+    fn sidecar_entries_never_refuse_for_missing_destination_authz() {
+        let entry = sample_entry(false, false);
+        assert!(!capture_requires_destination_authz_refusal(&entry));
+    }
+
+    #[test]
+    fn capture_entries_refuse_when_mesh_managed_authz_is_absent() {
+        let entry = sample_entry(true, false);
+        assert!(capture_requires_destination_authz_refusal(&entry));
+    }
+
+    #[test]
+    fn capture_entries_proceed_when_mesh_managed_authz_is_present() {
+        let entry = sample_entry(true, true);
+        assert!(!capture_requires_destination_authz_refusal(&entry));
     }
 }

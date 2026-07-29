@@ -2187,7 +2187,19 @@ pub(crate) fn build_node_waypoint_capture_relay_entry(
     orig_dst: SocketAddr,
     epoch: &crate::request_epoch::RequestEpoch,
 ) -> Option<NodeWaypointCaptureDestination> {
-    resolve_node_waypoint_capture_destination(orig_dst, epoch.config.mesh.as_deref()?)
+    let mesh = epoch.config.mesh.as_deref()?;
+    // Capture destination authz readiness once per connection at synthesis so
+    // `handle_mesh_tcp_inbound` can fail closed without scanning the plugin
+    // chain on the connect hot path. Require the mesh-managed reserved id: an
+    // operator global mesh_authz alone is not destination/slice-fed capture
+    // enforcement.
+    let has_destination_mesh_authz = epoch.config.plugin_configs.iter().any(|plugin| {
+        plugin.id == crate::modes::mesh::MESH_AUTHZ_PLUGIN_ID
+            && plugin.plugin_name == "mesh_authz"
+            && plugin.enabled
+            && plugin.scope == crate::config::types::PluginScope::Global
+    });
+    resolve_node_waypoint_capture_destination(orig_dst, mesh, has_destination_mesh_authz)
 }
 
 /// Slice-only core of [`build_node_waypoint_capture_relay_entry`], split out so
@@ -2196,6 +2208,7 @@ pub(crate) fn build_node_waypoint_capture_relay_entry(
 pub(crate) fn resolve_node_waypoint_capture_destination(
     orig_dst: SocketAddr,
     mesh: &crate::modes::mesh::config::MeshConfig,
+    has_destination_mesh_authz: bool,
 ) -> Option<NodeWaypointCaptureDestination> {
     let host = orig_dst.ip().to_string();
     // Resolution runs ONLY against the dedicated NodeWaypoint capture
@@ -2298,6 +2311,8 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
             first_bytes_inspect: false,
             socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
             node_waypoint_policy_scope: Some(Arc::new(policy_scope)),
+            requires_destination_mesh_authz: true,
+            has_destination_mesh_authz,
         }),
         mtls_mode,
     })

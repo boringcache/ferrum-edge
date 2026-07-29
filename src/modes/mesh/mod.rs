@@ -8908,13 +8908,28 @@ fn inject_mesh_global_plugins(
                 .collect(),
         );
     }
-    ensure_global_plugin(
-        config,
-        MESH_AUTHZ_PLUGIN_ID,
-        "mesh_authz",
-        mesh_authz_config,
-        &runtime.namespace,
-    );
+    // Transparent inbound capture admits unauthenticated direct plaintext, so
+    // the mesh-managed, slice-fed `__mesh_authz` instance must be present even
+    // when an operator global mesh_authz (including a disabled / capture-
+    // unaware override) would otherwise suppress injection. Redirect-off and
+    // non-capture topologies keep the historical operator-override behavior.
+    if runtime.transparent_inbound_capture_requested() {
+        force_ensure_global_plugin(
+            config,
+            MESH_AUTHZ_PLUGIN_ID,
+            "mesh_authz",
+            mesh_authz_config,
+            &runtime.namespace,
+        );
+    } else {
+        ensure_global_plugin(
+            config,
+            MESH_AUTHZ_PLUGIN_ID,
+            "mesh_authz",
+            mesh_authz_config,
+            &runtime.namespace,
+        );
+    }
 
     // Outbound registry: inject the `mesh_outbound_registry` plugin when
     // either the slice (CRD path) OR the runtime env var declares
@@ -9391,6 +9406,29 @@ fn ensure_global_plugin(
     plugin_config: serde_json::Value,
     namespace: &str,
 ) {
+    ensure_global_plugin_inner(config, id, plugin_name, plugin_config, namespace, false);
+}
+
+/// Like [`ensure_global_plugin`], but always upserts the reserved mesh-managed
+/// id even when an operator-managed global of the same type is present.
+fn force_ensure_global_plugin(
+    config: &mut GatewayConfig,
+    id: &str,
+    plugin_name: &str,
+    plugin_config: serde_json::Value,
+    namespace: &str,
+) {
+    ensure_global_plugin_inner(config, id, plugin_name, plugin_config, namespace, true);
+}
+
+fn ensure_global_plugin_inner(
+    config: &mut GatewayConfig,
+    id: &str,
+    plugin_name: &str,
+    plugin_config: serde_json::Value,
+    namespace: &str,
+    force: bool,
+) {
     let now = chrono::Utc::now();
     let mesh_plugin = PluginConfig {
         id: id.to_string(),
@@ -9412,16 +9450,19 @@ fn ensure_global_plugin(
         .find(|plugin| plugin.namespace == namespace && plugin.id == id)
     {
         *existing = mesh_plugin;
-    } else if config
-        .plugin_configs
-        .iter()
-        .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
+    } else if !force
+        && config
+            .plugin_configs
+            .iter()
+            .any(|plugin| plugin.scope == PluginScope::Global && plugin.plugin_name == plugin_name)
     {
         // A user-managed global plugin of the same type is an explicit
         // operator override when plugin_configs are already present in the
         // GatewayConfig handed to mesh preparation. Native/xDS MeshSlice feeds
         // do not currently carry operator plugin_configs. Reserved
-        // mesh-managed IDs still update above.
+        // mesh-managed IDs still update above. Callers that require the
+        // mesh-managed instance (NodeWaypoint transparent capture) pass
+        // `force` so a disabled or capture-unaware override cannot suppress it.
     } else {
         config.plugin_configs.push(mesh_plugin);
     }
@@ -22792,6 +22833,112 @@ mod tests {
             workload_metrics.config.get("trusted_hbone_assertors"),
             Some(&serde_json::json!([])),
             "workload_metrics must honor the operator mesh_authz empty allow-list instead of the runtime/env list"
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_forces_mesh_authz_when_capture_redirect_is_on() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(runtime.transparent_inbound_capture_requested());
+
+                for (label, operator) in [
+                    (
+                        "enabled override",
+                        global_mesh_authz_plugin(
+                            "operator-mesh-authz",
+                            serde_json::json!({ "trusted_hbone_assertors": [] }),
+                        ),
+                    ),
+                    (
+                        "disabled override",
+                        {
+                            let mut plugin = global_mesh_authz_plugin(
+                                "operator-mesh-authz-disabled",
+                                serde_json::json!({}),
+                            );
+                            plugin.enabled = false;
+                            plugin
+                        },
+                    ),
+                ] {
+                    let mut config = GatewayConfig {
+                        plugin_configs: vec![operator.clone()],
+                        ..GatewayConfig::default()
+                    };
+                    inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+                    assert!(
+                        config
+                            .plugin_configs
+                            .iter()
+                            .any(|plugin| plugin.id == operator.id),
+                        "operator mesh_authz must remain present ({label})"
+                    );
+                    let managed = config
+                        .plugin_configs
+                        .iter()
+                        .find(|plugin| plugin.id == MESH_AUTHZ_PLUGIN_ID)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "capture-on NodeWaypoint must inject mesh-managed __mesh_authz \
+                                 even when an operator override exists ({label})"
+                            )
+                        });
+                    assert!(managed.enabled);
+                    assert_eq!(managed.plugin_name, "mesh_authz");
+                    assert!(
+                        managed
+                            .config
+                            .get("per_pod_policy_scoping")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                        "forced mesh-managed authz must be slice-fed for NodeWaypoint ({label})"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn inject_mesh_global_plugins_keeps_operator_authz_override_when_capture_redirect_is_off() {
+        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+        assert!(
+            !runtime.transparent_inbound_capture_requested(),
+            "default NodeWaypoint fixture must leave the ingress redirect off"
+        );
+        let mut config = GatewayConfig {
+            plugin_configs: vec![global_mesh_authz_plugin(
+                "operator-mesh-authz",
+                serde_json::json!({ "trusted_hbone_assertors": [] }),
+            )],
+            ..GatewayConfig::default()
+        };
+        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.id == "operator-mesh-authz")
+        );
+        assert!(
+            config
+                .plugin_configs
+                .iter()
+                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+            "redirect-off NodeWaypoint must preserve operator mesh_authz override suppression"
         );
     }
 
