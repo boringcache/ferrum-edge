@@ -5749,12 +5749,15 @@ fn local_output_schema_pointer_target<'a>(
     if pointer.is_empty() {
         return Ok(Some(document));
     }
+    let pointer = percent_decode_str(pointer).decode_utf8().map_err(|_| {
+        format!("outputSchema '{key}' has a local JSON Pointer fragment that is not valid UTF-8")
+    })?;
     if !pointer.starts_with('/') {
         return Err(format!(
             "outputSchema '{key}' must be a JSON Pointer fragment (starting with '#/')"
         ));
     }
-    match document.pointer(pointer) {
+    match document.pointer(pointer.as_ref()) {
         Some(target) => Ok(Some(target)),
         None => Err(format!(
             "outputSchema '{key}' target '{reference}' was not found"

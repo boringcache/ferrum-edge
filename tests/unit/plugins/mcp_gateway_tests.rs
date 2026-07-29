@@ -8525,15 +8525,20 @@ fn recursive_local_ref_output_schema() -> Value {
                 "properties": {
                     "child": { "$ref": "#/$defs/node" }
                 }
+            },
+            "encoded target": {
+                "type": "string",
+                "const": "decoded"
             }
         },
         "type": "object",
-        "required": ["temperature", "conditions"],
+        "required": ["temperature", "conditions", "encoded"],
         "properties": {
             "temperature": { "type": "number" },
             "conditions": { "type": "string" },
             "tree": { "$ref": "#/$defs/node" },
             "echo": { "$ref": "#" },
+            "encoded": { "$ref": "#/$defs/encoded%20target" },
             "tags": {
                 "type": "array",
                 "items": { "type": "string" },
@@ -8586,6 +8591,10 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
             }),
         ),
         ("non-pointer local $ref", json!({ "$ref": "#foo" })),
+        (
+            "non-UTF-8 local $ref fragment",
+            json!({ "$ref": "#/$defs/%FF" }),
+        ),
         (
             "missing local $ref target",
             json!({ "$ref": "#/$defs/missing" }),
@@ -8666,6 +8675,7 @@ async fn validate_tool_results_accepts_local_ref_and_combinator_output_schema() 
             "structuredContent": {
                 "temperature": 19.5,
                 "conditions": "Overcast",
+                "encoded": "decoded",
                 "tree": { "child": { "child": {} } },
                 "tags": ["a"],
                 "meta": { "source": "unit" }
