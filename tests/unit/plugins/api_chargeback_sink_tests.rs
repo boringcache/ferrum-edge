@@ -1671,16 +1671,30 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
     let _clear_hook = ClearSpoolWriteHookGuard;
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_for_hook = Arc::clone(&calls);
-    let planted_for_hook = planted.clone();
+    let day_for_hook = day.clone();
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
         if point != SpoolWriteHookPoint::QuotaInventoryTaken {
             return;
         }
-        // Every pass loses its oldest candidate to a peer, so no pass ever gets
-        // to act on a snapshot that still describes the tree.
-        let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
-        if let Some(path) = planted_for_hook.get(call) {
-            fs::remove_file(path).expect("peer removes each pass's oldest candidate");
+        // Replace the whole observed generation on every pass. Deleting a
+        // guessed planted filename was ordering-sensitive: if that path was
+        // not the next eviction candidate, the old fixture could shrink below
+        // the quota and legitimately admit instead of exercising the bounded
+        // stale-inventory refusal.
+        let generation = calls_for_hook.fetch_add(1, Ordering::SeqCst) as u64;
+        for entry in fs::read_dir(&day_for_hook).expect("peer inventories current generation") {
+            let path = entry.expect("peer reads generation entry").path();
+            if path.is_file() {
+                fs::remove_file(path).expect("peer replaces current generation");
+            }
+        }
+        let replacement_base = 1_000u64.saturating_add(generation.saturating_mul(file_count));
+        for offset in 0..file_count {
+            let path = day_for_hook.join(planted_spool_name(
+                replacement_base.saturating_add(offset),
+            ));
+            fs::write(path, vec![b'x'; file_len as usize])
+                .expect("peer writes replacement generation");
         }
     })));
 
@@ -1702,15 +1716,15 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
         8,
         "refresh must be bounded at 8 inventory passes, not unbounded"
     );
-    // Eviction itself unlinked nothing: it broke to refresh on every pass and
-    // then declined, so the remaining files are exactly the untouched newest.
-    for path in planted.iter().skip(8) {
-        assert!(
-            path.exists(),
-            "fail-closed refusal must not delete beyond the vanished candidates"
-        );
+    // Eviction itself unlinked nothing from any snapshot: it broke to refresh
+    // on every pass and then declined. The peer's final complete generation
+    // remains, so capacity never happened to fall below the quota mid-test.
+    for path in &planted {
+        assert!(!path.exists(), "the peer must replace the planted generation");
     }
-    assert_eq!(spool.scan_stats().unwrap().files, 2);
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, file_count);
+    assert_eq!(after.bytes, file_len.saturating_mul(file_count));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
