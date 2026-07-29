@@ -5724,11 +5724,7 @@ async fn aggregate_batch_item_cap_counts_raw_whitespace_bytes() {
     let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
     config["validation"] = batch_validation(item_cap);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let batch = raw_batch(&[
-        oversized.as_str(),
-        NOTIFICATION_MEMBER,
-        sibling.as_str(),
-    ]);
+    let batch = raw_batch(&[oversized.as_str(), NOTIFICATION_MEMBER, sibling.as_str()]);
     let (mut ctx, mut headers) = mcp_ctx_raw(batch);
 
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
@@ -5762,11 +5758,7 @@ async fn transparent_batch_item_cap_counts_raw_whitespace_bytes() {
     let mut config = transparent_config("http://github-mcp.example:8080/mcp");
     config["validation"] = batch_validation(item_cap);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
-    let batch = raw_batch(&[
-        oversized.as_str(),
-        NOTIFICATION_MEMBER,
-        sibling.as_str(),
-    ]);
+    let batch = raw_batch(&[oversized.as_str(), NOTIFICATION_MEMBER, sibling.as_str()]);
     let (mut ctx, mut headers) = mcp_ctx_raw(batch);
 
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
