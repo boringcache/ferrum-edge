@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
 /// Stable client/log message for response-side decode/conversion failures.
 /// Backend-controlled encoding details must not cross this boundary.
@@ -2691,6 +2691,466 @@ async fn multipart_file_part_with_structured_content_type_validates_actual_metad
 }
 
 #[tokio::test]
+async fn multipart_filename_star_decodes_utf8_extended_value() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "résumé.txt"},
+                                    "content_type": {"type": "string", "const": "text/plain"},
+                                    "size": {"type": "integer", "const": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    // UTF-8 percent-encoded non-ASCII filename via RFC 8187 ext-value.
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+
+    // Language tag is accepted and ignored for decoding.
+    let with_lang = body.replace(
+        "filename*=UTF-8''r%C3%A9sum%C3%A9.txt",
+        "filename*=utf-8'en'r%C3%A9sum%C3%A9.txt",
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, with_lang.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_filename_star_hostile_inputs_fail_closed() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename"],
+                                "properties": {
+                                    "filename": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    const UNSUPPORTED_CHARSET_CANARY: &str = "HOSTILE-FILENAME-STAR-UNSUPPORTED-CHARSET-CANARY-r1";
+    let cases: &[(&str, &str)] = &[
+        (
+            "ambiguous ordinary filename plus filename*",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"; filename*=UTF-8''a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "RFC 2231 continuation",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*0*=UTF-8''a; filename*1*=.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "unsupported charset",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=HOSTILE-FILENAME-STAR-UNSUPPORTED-CHARSET-CANARY-r1''a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "malformed percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%GGtxt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "truncated percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%C3\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "invalid UTF-8 after percent-decoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''%80.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "CR injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%0D.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "LF injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%0A.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "NUL injection via percent-encoding",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a%00.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "raw space outside attr-char",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a b.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "missing charset/language delimiters",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "invalid language tag",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8'en_US'a.txt\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "quoted filename* ext-value",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*=\"UTF-8''evil.txt\"\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare ordinary filename segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare filename* segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "bare filename* continuation segment",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; filename*0\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+        (
+            "non-token parameter name",
+            concat!(
+                "--abc\r\n",
+                "Content-Disposition: form-data; name=\"file\"; file name=\"a.txt\"\r\n",
+                "Content-Type: text/plain\r\n\r\n",
+                "hello\r\n",
+                "--abc--\r\n"
+            ),
+        ),
+    ];
+
+    for (label, body) in cases {
+        let mut ctx = post_ctx("/upload");
+        ctx.headers = headers.clone();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+                .await,
+            Some(400),
+        );
+        if *label == "unsupported charset" {
+            let error = request_error(&ctx)
+                .unwrap_or_else(|| panic!("{label}: expected request validation error"));
+            assert!(
+                !error.contains(UNSUPPORTED_CHARSET_CANARY),
+                "{label}: request error must not echo attacker-controlled charset: {error}"
+            );
+            assert!(
+                error.contains("unsupported filename* charset"),
+                "{label}: expected field-specific charset diagnostic: {error}"
+            );
+            assert!(
+                error.contains("only UTF-8 is supported"),
+                "{label}: expected UTF-8-only diagnostic: {error}"
+            );
+        } else {
+            assert!(
+                request_error(&ctx).is_some(),
+                "{label}: expected request validation error"
+            );
+        }
+    }
+
+    // Raw filename* param value exact bound (UTF-8'' + value-chars == 4 KiB).
+    let exact_raw_chars = 4 * 1024 - "UTF-8''".len();
+    let exact_filename = "a".repeat(exact_raw_chars);
+    let exact_raw = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
+        exact_filename
+    );
+    let plugin_exact = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": exact_filename},
+                                    "content_type": {"type": "string", "const": "text/plain"},
+                                    "size": {"type": "integer", "const": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin_exact
+            .on_final_request_body_with_context(&mut ctx, &headers, exact_raw.as_bytes())
+            .await,
+    );
+
+    // One-over raw filename* param value (UTF-8'' + value-chars == 4 KiB + 1).
+    let one_over_raw = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"file\"; filename*=UTF-8''{}\r\nContent-Type: text/plain\r\n\r\nhello\r\n--abc--\r\n",
+        "a".repeat(exact_raw_chars + 1)
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, one_over_raw.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Unknown key=value parameters remain accepted alongside filename*.
+    let with_unknown = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''a.txt; x-custom=keep\r\n",
+        "Content-Type: text/plain\r\n\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let plugin_unknown = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "a.txt"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_continue(
+        plugin_unknown
+            .on_final_request_body_with_context(&mut ctx, &headers, with_unknown.as_bytes())
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn multipart_filename_star_keeps_structured_body_spoofing_fail_closed() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/upload",
+            "path_regex": "^/upload$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {
+                                "type": "object",
+                                "required": ["filename", "content_type", "size", "content"],
+                                "properties": {
+                                    "filename": {"type": "string", "const": "safe.png"},
+                                    "content_type": {"type": "string", "const": "image/png"},
+                                    "size": {"type": "integer", "maximum": 2},
+                                    "content": {"type": "string", "const": "ok"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    // filename* must preserve file-part semantics: validate real metadata, not
+    // the attacker-controlled JSON body that claims safe.png / image/png.
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*=UTF-8''evil.svg\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"filename\":\"safe.png\",\"content_type\":\"image/png\",\"size\":2,\"content\":\"ok\"}\r\n",
+        "--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+
+    // Bare filename* must fail closed at the parser boundary, not demote the
+    // part to a non-file field that would accept attacker-controlled JSON.
+    let bare_star = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename*\r\n",
+        "Content-Type: application/json\r\n\r\n",
+        "{\"filename\":\"safe.png\",\"content_type\":\"image/png\",\"size\":2,\"content\":\"ok\"}\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/upload");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, bare_star.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
+#[tokio::test]
 async fn text_and_binary_response_validation_use_matching_schema_rules() {
     let plugin = OpenapiValidator::new(&json!({
         "operations": [{
@@ -4245,6 +4705,506 @@ async fn multipart_encoding_headers_use_full_json_schema_validation() {
             None => assert_continue(result),
         }
     }
+}
+
+fn multipart_header_content_plugin(header_object: Value) -> OpenapiValidator {
+    OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Meta": header_object
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .expect("multipart header content config must construct")
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_json_validates_on_live_path() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    for (meta, expected_status) in [
+        (r#"{"kind":"doc"}"#, None),
+        (r#"{"kind":"ab"}"#, Some(400)),
+        ("not-json", Some(400)),
+        (r#"{"extra":true}"#, Some(400)),
+    ] {
+        let body = format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {meta}\r\n\r\nhello\r\n--abc--\r\n"
+        );
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        match expected_status {
+            Some(status) => assert_reject(result, Some(status)),
+            None => assert_continue(result),
+        }
+    }
+
+    // Concrete media keys may carry valid token and quoted-string parameters;
+    // semicolons inside quotes remain data while the base type selects decoding.
+    let parameterized = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json; charset=\"utf-8\"; profile=\"v1;beta\"": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: {\"kind\":\"doc\"}\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_continue(
+        parameterized
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+}
+
+#[test]
+fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_shapes() {
+    for (header_object, expected_fragment) in [
+        (
+            json!({
+                "schema": {"type": "string"},
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema",
+        ),
+        (json!({"content": {}}), "exactly one media type"),
+        (
+            json!({
+                "content": {
+                    "application/json": {"schema": {"type": "object"}},
+                    "text/plain": {"schema": {"type": "string"}}
+                }
+            }),
+            "exactly one media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "encoding": {"nested": {"style": "form"}}
+                    }
+                }
+            }),
+            "encoding",
+        ),
+        (
+            json!({
+                "content": {
+                    "multipart/form-data": {"schema": {"type": "object"}}
+                }
+            }),
+            "multipart/form-data",
+        ),
+        (
+            json!({"content": {"not-a-media": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"application/*": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"*/*": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"application/{json}": {"schema": {"type": "object"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"text/pl{ain}": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;\u{0001}charset=utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "valid HTTP header value",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset =utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset= utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;; charset=utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=\"unterminated": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "example": {"kind": "one"},
+                        "examples": {"two": {"value": {"kind": "two"}}}
+                    }
+                }
+            }),
+            "mutually exclusive",
+        ),
+        (
+            json!({
+                "style": "simple",
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema-form Header Object field",
+        ),
+        (
+            json!({
+                "example": {"kind": "doc"},
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema-form Header Object field",
+        ),
+        (
+            json!({
+                "allowEmptyValue": true,
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "not valid for Header Objects",
+        ),
+        (
+            json!({
+                "allowReserved": true,
+                "schema": {"type": "string"}
+            }),
+            "not valid for Header Objects",
+        ),
+    ] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/header-content",
+                "path_regex": "^/header-content$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {"X-Part-Meta": header_object}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        assert!(
+            error.contains(expected_fragment),
+            "malformed header content must fail closed with a field-specific diagnostic containing '{expected_fragment}': {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_deletes_live_contract()
+{
+    use chrono::Utc;
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    fn header_content_config(header_object: Value) -> Value {
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/header-content",
+                "path_regex": "^/header-content$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["title"],
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {
+                                        "X-Part-Meta": header_object
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        })
+    }
+
+    fn gateway_with_validator(config: Value) -> GatewayConfig {
+        let mut proxy = create_test_proxy();
+        proxy.id = "p1".to_string();
+        proxy.listen_path = Some("/header-content".to_string());
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: "ov1".to_string(),
+        }];
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy],
+            consumers: vec![],
+            plugin_configs: vec![PluginConfig {
+                id: "ov1".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "openapi_validator".to_string(),
+                config,
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                priority_override: None,
+                api_spec_id: Some("spec-1".to_string()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            upstreams: vec![],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    let content_config = header_content_config(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let schema_config = header_content_config(json!({
+        "required": true,
+        "schema": {"type": "string", "pattern": "^[a-z]{4}$"}
+    }));
+    let deleted_config = json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {}
+                        }
+                    }
+                }
+            }
+        }]
+    });
+
+    let cache = PluginCache::new(&gateway_with_validator(content_config))
+        .expect("content-form openapi_validator must admit");
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let json_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: {\"kind\":\"doc\"}\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let scalar_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: abcd\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let missing_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+
+    async fn run(
+        cache: &PluginCache,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.name() == "openapi_validator")
+            .expect("openapi_validator must be present after rebuild");
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, headers, body)
+            .await
+    }
+
+    assert_continue(run(&cache, &headers, json_body.as_bytes()).await);
+    assert_reject(
+        run(&cache, &headers, scalar_body.as_bytes()).await,
+        Some(400),
+    );
+
+    cache
+        .rebuild(&gateway_with_validator(schema_config))
+        .expect("schema-form replacement must rebuild");
+    assert_continue(run(&cache, &headers, scalar_body.as_bytes()).await);
+    assert_reject(run(&cache, &headers, json_body.as_bytes()).await, Some(400));
+
+    cache
+        .rebuild(&gateway_with_validator(deleted_config))
+        .expect("header-contract delete must rebuild");
+    assert_continue(run(&cache, &headers, missing_body.as_bytes()).await);
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_rejects_oversized_header_block() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {"type": "object"}
+            }
+        }
+    }));
+    // Entire part header block must stay under the existing 8 KiB ceiling.
+    let oversized = "x".repeat(9 * 1024);
+    let body = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {{\"pad\":\"{oversized}\"}}\r\n\r\nhello\r\n--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
 }
 
 #[tokio::test]

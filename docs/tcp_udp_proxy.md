@@ -603,6 +603,14 @@ When `FERRUM_ACCEPT_THREADS > 1`, a TCP stream listener binds multiple sockets o
 - Failure policy is atomic: sibling loops are cancelled (and aborted if they ignore cancel), `started` is cleared, and the listener task returns a failure to `StreamListenerManager` so reconcile/readiness owners see the outage via the existing async bind-failure path rather than silently reduced accept capacity.
 - Operator or per-listener shutdown completion remains a clean success and is not reported as an operational failure.
 
+## DTLS Recv-Loop Supervision
+
+A DTLS frontend listener runs `DtlsServer::run` (UDP demux / handshake) in a background task while the owning future selects on `accept()`, per-listener shutdown, and global SIGTERM:
+
+- Unexpected recv-loop exit (ordinary `recv_from` failure, panic/`JoinError`, or unexpected cancellation) is observed immediately beside `accept()` — it must not leave the listener blocked in `accept()` with `started` still true while no task reads UDP.
+- Failure policy clears `started`, closes the DTLS server, and returns a contextual error to `StreamListenerManager` so reconcile/async bind-failure/readiness see the outage and can restart the listener.
+- Operator or per-listener shutdown still closes the server, awaits the recv task, and returns `Ok` — it is not reported as an operational failure.
+
 ## Limitations
 
 - **No protocol inspection**: Stream proxies forward raw bytes — no HTTP header manipulation, path routing, or content transformation

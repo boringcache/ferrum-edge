@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, PEER_REPUBLISH_MARKER,
@@ -1523,6 +1523,188 @@ fn quota_eviction_large_file_count_still_uses_one_planning_pass() {
         after.bytes.saturating_add(file_len) <= max_bytes,
         "post-eviction usage must admit the planned incoming batch"
     );
+}
+
+/// Lexicographically ordered owned data-file name for quota-eviction fixtures.
+fn planted_spool_name(index: u64) -> String {
+    owned_data_name(&format!("000000000000000000000000{index:02}"))
+}
+
+/// Clears the process-global spool write hook even if the test panics.
+struct ClearSpoolWriteHookGuard;
+
+impl Drop for ClearSpoolWriteHookGuard {
+    fn drop(&mut self) {
+        set_spool_write_hook_for_tests(None);
+    }
+}
+
+/// A peer sharing the volume removes a selected candidate and replaces it with
+/// files the stale snapshot never saw.
+///
+/// Crediting the vanished candidate's snapshot size would let admission stop
+/// early with the peer's replacement bytes unaccounted, leaving on-disk usage
+/// above `spool.max_bytes`. The eviction must instead refresh the inventory and
+/// keep reclaiming until the *observed* tree leaves room.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn quota_eviction_refreshes_inventory_when_a_candidate_disappears() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(planted_spool_name(index));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+    // Sort after every planted name, so the peer replacements are the newest
+    // entries and are only reclaimed after the originals.
+    let peers: Vec<_> = [50u64, 51u64]
+        .into_iter()
+        .map(|index| day.join(planted_spool_name(index)))
+        .collect();
+
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let vanishing = planted[0].clone();
+    let peers_for_hook = peers.clone();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        if calls_for_hook.fetch_add(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        // The first snapshot is already taken: unlink the oldest candidate and
+        // add two files that snapshot can never account for.
+        fs::remove_file(&vanishing).expect("peer removes the selected candidate");
+        for peer in &peers_for_hook {
+            fs::write(peer, vec![b'p'; file_len as usize]).expect("peer writes a replacement");
+        }
+    })));
+
+    let report = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect("eviction must refresh and succeed rather than fail closed");
+    set_spool_write_hook_for_tests(None);
+
+    assert_eq!(
+        report,
+        QuotaEvictionReport {
+            // One stale pass plus the refreshed pass that actually decides.
+            inventory_passes: 2,
+            // 10 in the stale snapshot, then 9 survivors + 2 peer replacements.
+            files_inventoried: 21,
+            bytes_before: file_len.saturating_mul(file_count),
+            // Only files this call actually unlinked; the vanished candidate is
+            // never counted as reclaimed work.
+            files_deleted: 9,
+            bytes_freed: file_len.saturating_mul(9),
+        },
+        "a disappearing candidate must force a refreshed inventory, not a stale byte credit"
+    );
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "exactly the stale pass and the refreshed pass may plan deletions"
+    );
+    for path in &planted {
+        assert!(!path.exists(), "every original must be reclaimed or gone");
+    }
+    for peer in &peers {
+        assert!(
+            peer.exists(),
+            "newest peer replacements must be retained, not over-evicted"
+        );
+    }
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 2);
+    assert_eq!(after.bytes, file_len.saturating_mul(2));
+    assert_eq!(
+        after.bytes,
+        disk_owned_bytes(&default_test_namespace_root(temp.path()))
+    );
+    // The load-bearing invariant: crediting the vanished candidate would have
+    // stopped eviction with 4 files (256 bytes) resident and admitted anyway.
+    assert!(
+        after.bytes.saturating_add(file_len) <= max_bytes,
+        "admission must never leave on-disk owned usage above spool.max_bytes"
+    );
+}
+
+/// A namespace that keeps mutating under eviction must fail closed rather than
+/// admit on numbers no pass ever observed as consistent.
+#[test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_len = 64u64;
+    let file_count = 10u64;
+    let max_bytes = file_len.saturating_mul(3);
+    let settings = spool_settings(temp.path(), max_bytes);
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let day = spool.namespace_root_for_tests().join("20260524");
+    fs::create_dir_all(&day).unwrap();
+
+    let mut planted = Vec::new();
+    for index in 0..file_count {
+        let path = day.join(planted_spool_name(index));
+        fs::write(&path, vec![b'x'; file_len as usize]).unwrap();
+        planted.push(path);
+    }
+
+    let _clear_hook = ClearSpoolWriteHookGuard;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let planted_for_hook = planted.clone();
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| {
+        if point != SpoolWriteHookPoint::QuotaInventoryTaken {
+            return;
+        }
+        // Every pass loses its oldest candidate to a peer, so no pass ever gets
+        // to act on a snapshot that still describes the tree.
+        let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        if let Some(path) = planted_for_hook.get(call) {
+            fs::remove_file(path).expect("peer removes each pass's oldest candidate");
+        }
+    })));
+
+    let error = spool
+        .evict_until_can_admit_for_tests(file_len)
+        .expect_err("a perpetually mutating namespace must refuse admission");
+    set_spool_write_hook_for_tests(None);
+
+    assert!(
+        error.contains("spool changed concurrently during 8 quota inventory passes"),
+        "refusal must name the bounded pass budget: {error}"
+    );
+    assert!(
+        error.contains("refusing to admit encoded batch (64 bytes)"),
+        "refusal must name the batch it declined: {error}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        8,
+        "refresh must be bounded at 8 inventory passes, not unbounded"
+    );
+    // Eviction itself unlinked nothing: it broke to refresh on every pass and
+    // then declined, so the remaining files are exactly the untouched newest.
+    for path in planted.iter().skip(8) {
+        assert!(
+            path.exists(),
+            "fail-closed refusal must not delete beyond the vanished candidates"
+        );
+    }
+    assert_eq!(spool.scan_stats().unwrap().files, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3071,23 +3253,199 @@ impl Drop for HeldClickHouseExport {
     }
 }
 
+/// Deterministic BeforeWrite parking gate bound to the spool-write hook.
+///
+/// Readiness is published only after the writer has incremented `parked` and is
+/// committed to blocking on `release` while still holding the release mutex.
+/// Waiting on a looser "entered hook" flag published before that increment lets
+/// observers race ahead and see `parked == 0` under scheduler pressure (the
+/// hosted flake at issue #3433).
+struct SpoolBeforeWriteGate {
+    release: Mutex<bool>,
+    release_cv: Condvar,
+    parked: Mutex<usize>,
+    parked_cv: Condvar,
+    finished: Mutex<bool>,
+    finished_cv: Condvar,
+}
+
+impl SpoolBeforeWriteGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            release: Mutex::new(false),
+            release_cv: Condvar::new(),
+            parked: Mutex::new(0),
+            parked_cv: Condvar::new(),
+            finished: Mutex::new(false),
+            finished_cv: Condvar::new(),
+        })
+    }
+
+    fn on_before_write(&self) {
+        // Acquire release first so publishing parked commits us to waiting
+        // before any observer can proceed from wait_until_parked.
+        let mut release = self.release.lock().expect("release gate lock");
+        {
+            let mut parked = self.parked.lock().expect("parked gate lock");
+            *parked = parked.saturating_add(1);
+            self.parked_cv.notify_all();
+        }
+        while !*release {
+            release = self.release_cv.wait(release).expect("release gate wait");
+        }
+        let mut parked = self.parked.lock().expect("parked gate lock");
+        *parked = parked.saturating_sub(1);
+    }
+
+    fn on_after_write(&self) {
+        let mut finished = self.finished.lock().expect("finished gate lock");
+        *finished = true;
+        self.finished_cv.notify_all();
+    }
+
+    fn parked_count(&self) -> usize {
+        *self.parked.lock().expect("parked gate lock")
+    }
+
+    fn is_finished(&self) -> bool {
+        *self.finished.lock().expect("finished gate lock")
+    }
+
+    fn is_released(&self) -> bool {
+        *self.release.lock().expect("release gate lock")
+    }
+
+    fn diagnostic_snapshot(&self) -> String {
+        format!(
+            "parked={} finished={} released={}",
+            self.parked_count(),
+            self.is_finished(),
+            self.is_released()
+        )
+    }
+
+    /// Block until at least `min_parked` writers are inside BeforeWrite.
+    ///
+    /// Returns a bounded diagnostic when the gate is never reached instead of
+    /// racing on a later parked-count assertion.
+    fn wait_until_parked(&self, min_parked: usize, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut parked = self.parked.lock().expect("parked gate lock");
+        while *parked < min_parked {
+            let now = Instant::now();
+            if now >= deadline {
+                let parked_now = *parked;
+                // Drop parked before reading sibling gate locks so we never
+                // invert the release->parked order used by on_before_write.
+                drop(parked);
+                return Err(format!(
+                    "spool BeforeWrite gate did not reach parked>={min_parked} within {timeout:?}; parked={parked_now} finished={} released={}",
+                    self.is_finished(),
+                    self.is_released()
+                ));
+            }
+            let (next, wait_result) = self
+                .parked_cv
+                .wait_timeout(parked, deadline.saturating_duration_since(now))
+                .expect("parked gate wait");
+            parked = next;
+            if wait_result.timed_out() && *parked < min_parked {
+                let parked_now = *parked;
+                drop(parked);
+                return Err(format!(
+                    "spool BeforeWrite gate did not reach parked>={min_parked} within {timeout:?}; parked={parked_now} finished={} released={}",
+                    self.is_finished(),
+                    self.is_released()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_until_finished(&self) {
+        let mut finished = self.finished.lock().expect("finished gate lock");
+        while !*finished {
+            finished = self.finished_cv.wait(finished).expect("finished gate wait");
+        }
+    }
+
+    fn release_all(&self) {
+        let mut release = self.release.lock().expect("release gate lock");
+        *release = true;
+        self.release_cv.notify_all();
+    }
+}
+
 /// Clears the process-global spool write hook and opens any held release gate
 /// even if the test panics mid-block.
 struct ClearSpoolWriteHookOnDrop {
-    release: Arc<(Mutex<bool>, Condvar)>,
+    gate: Arc<SpoolBeforeWriteGate>,
 }
 
 impl Drop for ClearSpoolWriteHookOnDrop {
     fn drop(&mut self) {
-        {
-            let (lock, cv) = &*self.release;
-            if let Ok(mut guard) = lock.lock() {
-                *guard = true;
-                cv.notify_all();
-            }
-        }
+        self.gate.release_all();
         set_spool_write_hook_for_tests(None);
     }
+}
+
+#[test]
+fn spool_before_write_gate_publishes_parked_before_waiters_return() {
+    // Regression for #3433: readiness must not be observable while parked==0.
+    let gate = SpoolBeforeWriteGate::new();
+    let writer_gate = Arc::clone(&gate);
+    let started = Arc::new(Barrier::new(2));
+    let writer_started = Arc::clone(&started);
+
+    let writer = thread::spawn(move || {
+        writer_started.wait();
+        writer_gate.on_before_write();
+        writer_gate.on_after_write();
+    });
+
+    started.wait();
+    gate.wait_until_parked(1, Duration::from_secs(5))
+        .expect("writer must publish parked before waiters observe readiness");
+    assert_eq!(
+        gate.parked_count(),
+        1,
+        "wait_until_parked must not return while parked==0; {}",
+        gate.diagnostic_snapshot()
+    );
+    assert!(
+        !gate.is_finished(),
+        "writer must remain inside BeforeWrite until release; {}",
+        gate.diagnostic_snapshot()
+    );
+
+    gate.release_all();
+    writer.join().expect("gated writer thread");
+    assert_eq!(gate.parked_count(), 0);
+    assert!(gate.is_finished());
+}
+
+#[test]
+fn spool_before_write_gate_timeout_names_unreachable_gate_state() {
+    let gate = SpoolBeforeWriteGate::new();
+    let error = gate
+        .wait_until_parked(1, Duration::from_millis(20))
+        .expect_err("an unreachable BeforeWrite gate must fail closed");
+    assert!(
+        error.contains("did not reach parked>=1"),
+        "timeout must name the missed parked threshold: {error}"
+    );
+    assert!(
+        error.contains("parked=0"),
+        "timeout must report parked count: {error}"
+    );
+    assert!(
+        error.contains("finished=false"),
+        "timeout must report finished state: {error}"
+    );
+    assert!(
+        error.contains("released=false"),
+        "timeout must report release state: {error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3114,49 +3472,18 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     config["spool"]["delivery_queue_capacity"] = json!(8);
     config["spool"]["replay_interval_secs"] = json!(3600);
 
-    let entered = Arc::new((Mutex::new(false), Condvar::new()));
-    let release = Arc::new((Mutex::new(false), Condvar::new()));
-    let finished = Arc::new((Mutex::new(false), Condvar::new()));
-    // Count writers currently parked inside BeforeWrite so the assertion below
-    // proves the gated write is still blocked, not merely that AfterWrite has
-    // not yet been observed on some other unpaired completion.
-    let parked_before_write = Arc::new(AtomicUsize::new(0));
+    let gate = SpoolBeforeWriteGate::new();
     let _clear_hook = ClearSpoolWriteHookOnDrop {
-        release: Arc::clone(&release),
+        gate: Arc::clone(&gate),
     };
 
-    let entered_for_hook = Arc::clone(&entered);
-    let release_for_hook = Arc::clone(&release);
-    let finished_for_hook = Arc::clone(&finished);
-    let parked_for_hook = Arc::clone(&parked_before_write);
+    let hook_gate = Arc::clone(&gate);
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
-        SpoolWriteHookPoint::BeforeWrite => {
-            // Hold the release lock before publishing `entered` so the test
-            // cannot race past this point until we are on the condvar wait.
-            // Every write that arrives while the gate is closed parks here, so
-            // a peer SpoolManager cannot publish AfterWrite early.
-            let (lock, cv) = &*release_for_hook;
-            let mut guard = lock.lock().expect("release gate lock");
-            {
-                let (entered_lock, entered_cv) = &*entered_for_hook;
-                let mut entered_guard = entered_lock.lock().expect("entered gate lock");
-                if !*entered_guard {
-                    *entered_guard = true;
-                    entered_cv.notify_all();
-                }
-            }
-            parked_for_hook.fetch_add(1, Ordering::SeqCst);
-            while !*guard {
-                guard = cv.wait(guard).expect("release gate wait");
-            }
-            parked_for_hook.fetch_sub(1, Ordering::SeqCst);
-        }
-        SpoolWriteHookPoint::AfterWrite => {
-            let (lock, cv) = &*finished_for_hook;
-            let mut guard = lock.lock().expect("finished gate lock");
-            *guard = true;
-            cv.notify_all();
-        }
+        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        // This test gates only the write boundary; quota-eviction snapshots are
+        // not part of the stall it asserts.
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
@@ -3177,7 +3504,16 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     // to the bounded spool delivery worker, which blocks in write_events.
     plugin.log(&billable_summary("overflow-blocked")).await;
 
-    wait_condvar_flag(Arc::clone(&entered)).await;
+    // Wait on the parked count itself (not a looser "entered" flag) so readiness
+    // is bound to the actual BeforeWrite gate under the release mutex.
+    let wait_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || {
+        wait_gate
+            .wait_until_parked(1, Duration::from_secs(5))
+            .expect("overflow spool write must park in BeforeWrite")
+    })
+    .await
+    .expect("parked gate wait task");
 
     let (enqueued_while_blocked, written_while_blocked, lost_while_blocked) =
         spool_delivery_totals();
@@ -3221,24 +3557,24 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
         "bounded overflow enqueue must not drop while the delivery queue has capacity"
     );
     assert!(
-        parked_before_write.load(Ordering::SeqCst) > 0,
-        "gated spool write must still be parked in BeforeWrite before release"
+        gate.parked_count() > 0,
+        "gated spool write must still be parked in BeforeWrite before release; {}",
+        gate.diagnostic_snapshot()
     );
     assert!(
-        !*finished.0.lock().expect("finished gate lock"),
-        "blocked spool write must not finish before release"
+        !gate.is_finished(),
+        "blocked spool write must not finish before release; {}",
+        gate.diagnostic_snapshot()
     );
 
     let enqueued_during_gate = enqueued_after_hook - enqueued_baseline;
 
-    {
-        let (lock, cv) = &*release;
-        let mut guard = lock.lock().expect("release gate lock");
-        *guard = true;
-        cv.notify_all();
-    }
+    gate.release_all();
 
-    wait_condvar_flag(Arc::clone(&finished)).await;
+    let finished_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || finished_gate.wait_until_finished())
+        .await
+        .expect("finished gate wait task");
 
     // AfterWrite runs inside write_events; the delivery worker publishes
     // jobs_written only after spawn_blocking joins. Yield until our gated
@@ -3275,6 +3611,304 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     // sit on the client timeout.
     held_export.release_held_connections();
     set_spool_write_hook_for_tests(None);
+    drop(plugin);
+}
+
+fn queue_status_counters() -> (u64, u64, u64, u64, u64) {
+    let status: Value = serde_json::from_str(&render_status_json()).expect("status json");
+    let queue = &status["instances"][0]["queue"];
+    (
+        queue["depth"].as_u64().unwrap_or(0),
+        queue["capacity"].as_u64().unwrap_or(0),
+        queue["high_water_hits_total"].as_u64().unwrap_or(0),
+        queue["high_water_diversions_total"].as_u64().unwrap_or(0),
+        queue["full_drops_total"].as_u64().unwrap_or(0),
+    )
+}
+
+/// Issue #3038: with spool disabled, high water is telemetry only and every
+/// configured channel slot remains usable until the buffer is actually full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn no_spool_uses_full_buffer_capacity_past_high_water() {
+    let mut held_export = HeldClickHouseExport::start().await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(held_export.url);
+    config["clickhouse"]["timeout_ms"] = json!(60_000);
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(600_000);
+    config["batch"]["buffer_capacity"] = json!(10);
+    config["retry"]["max_attempts"] = json!(1);
+    config["spool"]["enabled"] = json!(false);
+
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    // Park the flush worker inside HTTP so the capacity-10 channel stays full.
+    plugin.log(&billable_summary("block-flush")).await;
+    wait_condvar_flag(Arc::clone(&held_export.first_accept)).await;
+
+    for idx in 0..10 {
+        plugin
+            .log(&billable_summary(&format!("fill-{idx:02}")))
+            .await;
+    }
+
+    let (depth, capacity, high_water_hits, diversions, drops) = queue_status_counters();
+    assert_eq!(capacity, 10, "status must report configured capacity");
+    assert_eq!(
+        depth, 10,
+        "all configured no-spool channel slots must remain usable past 80% high water; depth={depth}"
+    );
+    assert!(
+        high_water_hits > 0,
+        "crossing high water must still emit telemetry; hits={high_water_hits}"
+    );
+    assert_eq!(
+        diversions, 0,
+        "no-spool high water must not divert; diversions={diversions}"
+    );
+    assert_eq!(
+        drops, 0,
+        "filling exactly to capacity must not count a full-buffer drop; drops={drops}"
+    );
+
+    let prom = render_prometheus();
+    assert_eq!(
+        prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total"),
+        0
+    );
+    assert_eq!(
+        prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
+        0
+    );
+
+    // The next item follows the configured full-buffer policy (drop).
+    plugin.log(&billable_summary("overflow-full")).await;
+    let (depth_after, _, _, diversions_after, drops_after) = queue_status_counters();
+    assert_eq!(depth_after, 10, "full buffer depth must stay at capacity");
+    assert_eq!(
+        diversions_after, 0,
+        "no-spool full buffer must not record a durable diversion"
+    );
+    assert_eq!(
+        drops_after, 1,
+        "the item past capacity must count as a true full-buffer drop"
+    );
+    let prom_after = render_prometheus();
+    assert_eq!(
+        prometheus_counter(&prom_after, "chargeback_sink_queue_full_drops_total"),
+        1
+    );
+    assert_eq!(
+        prometheus_counter(
+            &prom_after,
+            "chargeback_sink_queue_high_water_diversions_total"
+        ),
+        0
+    );
+
+    held_export.release_held_connections();
+    drop(plugin);
+}
+
+/// Issue #3038: with spool enabled, high-water diversion remains durable and is
+/// counted separately from true full-buffer drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn spool_enabled_high_water_diversion_is_durable_and_distinct_from_drops() {
+    let mut held_export = HeldClickHouseExport::start().await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(held_export.url);
+    config["clickhouse"]["timeout_ms"] = json!(60_000);
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(600_000);
+    config["batch"]["buffer_capacity"] = json!(1);
+    config["retry"]["max_attempts"] = json!(1);
+    config["spool"]["delivery_queue_capacity"] = json!(8);
+    config["spool"]["replay_interval_secs"] = json!(3600);
+
+    let (enqueued_baseline, _, lost_baseline) = spool_delivery_totals();
+
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    plugin.log(&billable_summary("block-flush")).await;
+    wait_condvar_flag(Arc::clone(&held_export.first_accept)).await;
+
+    // Fill the only channel slot so the next enqueue observes high water.
+    plugin.log(&billable_summary("fill-queue")).await;
+    plugin.log(&billable_summary("divert-high-water")).await;
+
+    let (_, _, high_water_hits, diversions, drops) = queue_status_counters();
+    assert!(
+        high_water_hits > 0,
+        "high-water telemetry must fire; hits={high_water_hits}"
+    );
+    assert!(
+        diversions >= 1,
+        "spool-enabled high water must durable-divert; diversions={diversions}"
+    );
+    assert_eq!(
+        drops, 0,
+        "durable high-water diversion must not count as a full-buffer drop"
+    );
+
+    let (enqueued_after, _, lost_after) = spool_delivery_totals();
+    assert!(
+        enqueued_after > enqueued_baseline,
+        "high-water diversion must enqueue a spool delivery job"
+    );
+    assert_eq!(
+        lost_after, lost_baseline,
+        "successful high-water diversion must not count spool loss"
+    );
+
+    let prom = render_prometheus();
+    assert!(prometheus_counter(&prom, "chargeback_sink_queue_high_water_diversions_total") >= 1);
+    assert_eq!(
+        prometheus_counter(&prom, "chargeback_sink_queue_full_drops_total"),
+        0
+    );
+
+    // Wait briefly for the async spool write to land on disk.
+    for _ in 0..100_000 {
+        if disk_owned_bytes(temp.path()) > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        disk_owned_bytes(temp.path()) > 0,
+        "high-water diversion must leave durable owned spool bytes"
+    );
+
+    held_export.release_held_connections();
+    drop(plugin);
+}
+
+/// Saturated spool delivery must not report a successful high-water diversion or
+/// enqueue, and must not masquerade as a full in-memory channel drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
+    let mut held_export = HeldClickHouseExport::start().await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(held_export.url);
+    config["clickhouse"]["timeout_ms"] = json!(60_000);
+    config["batch"]["size"] = json!(1);
+    config["batch"]["flush_interval_ms"] = json!(600_000);
+    config["batch"]["buffer_capacity"] = json!(1);
+    config["retry"]["max_attempts"] = json!(1);
+    // Capacity 1: one job can sit in the delivery channel while the worker is
+    // parked inside a blocked write, so the next high-water handoff is refused.
+    config["spool"]["delivery_queue_capacity"] = json!(1);
+    config["spool"]["replay_interval_secs"] = json!(3600);
+
+    let gate = SpoolBeforeWriteGate::new();
+    let _clear_hook = ClearSpoolWriteHookOnDrop {
+        gate: Arc::clone(&gate),
+    };
+    let hook_gate = Arc::clone(&gate);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
+        SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
+        SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        // Quota inventory snapshots are unrelated to the delivery-channel
+        // saturation boundary this test intentionally stalls.
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
+    })));
+
+    let (_, _, spool_lost_baseline) = spool_delivery_totals();
+    let enqueued_baseline = prometheus_counter(
+        &render_prometheus(),
+        "chargeback_sink_events_enqueued_total",
+    );
+
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    plugin.log(&billable_summary("block-flush")).await;
+    wait_condvar_flag(Arc::clone(&held_export.first_accept)).await;
+    plugin.log(&billable_summary("fill-queue")).await;
+
+    // First high-water diversion is accepted and parks the delivery worker.
+    plugin.log(&billable_summary("divert-accepted")).await;
+    let wait_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || {
+        wait_gate
+            .wait_until_parked(1, Duration::from_secs(5))
+            .expect("accepted diversion must park in BeforeWrite")
+    })
+    .await
+    .expect("parked gate wait task");
+
+    let (_, _, _, diversions_after_accept, drops_after_accept) = queue_status_counters();
+    assert_eq!(
+        diversions_after_accept, 1,
+        "accepted high-water handoff must count exactly one diversion"
+    );
+    assert_eq!(drops_after_accept, 0);
+
+    // Fill the only delivery-queue slot while the worker remains blocked.
+    plugin.log(&billable_summary("divert-fills-delivery")).await;
+    let (_, _, _, diversions_after_fill, _) = queue_status_counters();
+    assert_eq!(
+        diversions_after_fill, 2,
+        "second accepted handoff must count a diversion while still durable"
+    );
+    let enqueued_before_reject = prometheus_counter(
+        &render_prometheus(),
+        "chargeback_sink_events_enqueued_total",
+    );
+
+    // Next high-water handoff must be refused by the saturated delivery queue.
+    plugin.log(&billable_summary("divert-rejected")).await;
+
+    let (_, _, _, diversions_after_reject, drops_after_reject) = queue_status_counters();
+    assert_eq!(
+        diversions_after_reject, diversions_after_fill,
+        "refused spool-delivery handoff must not increment high-water diversions"
+    );
+    assert_eq!(
+        drops_after_reject, 0,
+        "spool-delivery saturation must not masquerade as a full-buffer drop"
+    );
+
+    let prom = render_prometheus();
+    let enqueued_after = prometheus_counter(&prom, "chargeback_sink_events_enqueued_total");
+    let (_, _, spool_lost_after) = spool_delivery_totals();
+    assert!(
+        spool_lost_after > spool_lost_baseline,
+        "refused handoff must remain visible on spool loss counters"
+    );
+    assert_eq!(
+        enqueued_after, enqueued_before_reject,
+        "rejected diversion must not increment events_enqueued_total"
+    );
+    assert!(
+        enqueued_before_reject > enqueued_baseline,
+        "accepted channel/diversion admissions must still increment events_enqueued_total"
+    );
+
+    gate.release_all();
+    let finished_gate = Arc::clone(&gate);
+    tokio::task::spawn_blocking(move || finished_gate.wait_until_finished())
+        .await
+        .expect("finished gate wait task");
+
+    held_export.release_held_connections();
     drop(plugin);
 }
 

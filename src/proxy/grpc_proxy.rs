@@ -93,6 +93,18 @@ pub trait GrpcUploadTerminationObserver: Send + Sync {
 pub enum GrpcBody {
     /// Complete body in memory (retries, plugin transforms).
     Buffered(Full<Bytes>),
+    /// Complete body in memory that terminates with an HTTP/2 TRAILERS frame.
+    ///
+    /// `Full<Bytes>` cannot emit a terminal trailers frame, so a request whose
+    /// end-of-stream metadata arrived out-of-band — today, a gRPC-Web client
+    /// that encoded its trailers as a `0x80` body frame the `grpc_web` plugin
+    /// split off — uses this variant instead. The DATA is emitted first and the
+    /// trailers exactly once, so the backend observes the native gRPC request
+    /// representation rather than a body with framing bytes appended to it.
+    BufferedWithTrailers {
+        data: Option<Bytes>,
+        trailers: Option<hyper::HeaderMap>,
+    },
     /// Streaming body from the client with inline size enforcement.
     /// When `max_bytes > 0`, tracks accumulated bytes and sets the shared
     /// `exceeded` flag if the limit is breached. The caller checks the flag
@@ -157,7 +169,7 @@ impl Drop for GrpcBody {
             | GrpcBody::Channel {
                 upload_observer, ..
             } => upload_observer.as_ref(),
-            GrpcBody::Buffered(_) => None,
+            GrpcBody::Buffered(_) | GrpcBody::BufferedWithTrailers { .. } => None,
         };
         if let Some(observer) = upload_observer {
             observer.on_upload_terminated();
@@ -177,6 +189,19 @@ impl http_body::Body for GrpcBody {
             GrpcBody::Buffered(full) => Pin::new(full)
                 .poll_frame(cx)
                 .map_err(|never| match never {}),
+            GrpcBody::BufferedWithTrailers { data, trailers } => {
+                // Skip an empty DATA frame so hyper does not emit a zero-length
+                // frame before the trailers block.
+                if let Some(bytes) = data.take()
+                    && !bytes.is_empty()
+                {
+                    return Poll::Ready(Some(Ok(Frame::data(bytes))));
+                }
+                match trailers.take() {
+                    Some(trailers) => Poll::Ready(Some(Ok(Frame::trailers(trailers)))),
+                    None => Poll::Ready(None),
+                }
+            }
             GrpcBody::Streaming {
                 incoming,
                 bytes_seen,
@@ -246,6 +271,9 @@ impl http_body::Body for GrpcBody {
     fn is_end_stream(&self) -> bool {
         match self {
             GrpcBody::Buffered(full) => full.is_end_stream(),
+            GrpcBody::BufferedWithTrailers { data, trailers } => {
+                data.is_none() && trailers.is_none()
+            }
             GrpcBody::Streaming {
                 incoming, exceeded, ..
             } => incoming.is_end_stream() || exceeded.load(Ordering::Relaxed),
@@ -259,6 +287,14 @@ impl http_body::Body for GrpcBody {
     fn size_hint(&self) -> http_body::SizeHint {
         match self {
             GrpcBody::Buffered(full) => full.size_hint(),
+            GrpcBody::BufferedWithTrailers { data, .. } => {
+                // Exact DATA length only. The trailers block is header bytes,
+                // not content, so it must not appear in the size hint hyper
+                // uses to frame (and length-declare) the request body.
+                let mut hint = http_body::SizeHint::new();
+                hint.set_exact(data.as_ref().map_or(0, Bytes::len) as u64);
+                hint
+            }
             GrpcBody::Streaming { incoming, .. } => incoming.size_hint(),
             GrpcBody::Channel { .. } => http_body::SizeHint::default(),
         }
@@ -814,9 +850,9 @@ impl GrpcPoolManager {
 
         // The candidate attempt includes TCP socket setup, negotiated ALPN h2
         // when TLS is configured, and the Hyper H2 handshake. Cleartext h2c
-        // additionally observes the spawned driver for an immediate protocol
-        // rejection. A peer that accepts TCP but cannot establish the requested
-        // protocol must not pin this pool to that DNS address.
+        // additionally waits for the peer's initial SETTINGS, since it has no
+        // ALPN proof. A peer that accepts TCP but cannot establish the
+        // requested protocol must not pin this pool to that DNS address.
         let result = if use_tls {
             let tls_config = self.get_tls_config(proxy, svid_generation)?;
             let connector = tokio_rustls::TlsConnector::from(tls_config);
@@ -921,7 +957,16 @@ impl GrpcPoolManager {
     }
 
     /// Build an HTTP/2 client builder with keepalive and flow-control settings.
-    fn build_h2_builder(pool_config: &PoolConfig) -> http2::Builder<TokioExecutor> {
+    ///
+    /// `settings_readiness_sentinel` is set only for h2c, where there is no
+    /// ALPN proof and `create_h2c_connection` needs a value that cannot be
+    /// confused with a peer-supplied one. ALPN-proven TLS keeps the previous
+    /// pre-SETTINGS outbound bound so its first request is never gated on the
+    /// peer's SETTINGS arriving.
+    fn build_h2_builder(
+        pool_config: &PoolConfig,
+        settings_readiness_sentinel: bool,
+    ) -> http2::Builder<TokioExecutor> {
         let mut builder = http2::Builder::new(TokioExecutor::new());
 
         // Timer is required for keep_alive_interval and keep_alive_timeout to work
@@ -947,9 +992,19 @@ impl GrpcPoolManager {
             .max_frame_size(pool_config.http2_max_frame_size);
 
         if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
+            // Advertised to the peer as our own inbound stream cap.
+            builder.max_concurrent_streams(max_streams);
+        }
+
+        if settings_readiness_sentinel {
+            // Zero is a pre-SETTINGS sentinel only. h2 replaces it when the
+            // peer's *initial* SETTINGS is applied, using the advertised value
+            // or `usize::MAX` when the parameter is absent, so any non-zero
+            // reading proves the peer completed its half of the preface.
+            builder.initial_max_send_streams(0);
+        } else if let Some(max_streams) = pool_config.http2_max_concurrent_streams {
             // Preserve the configured initial outbound bound until the peer's
             // SETTINGS frame replaces it.
-            builder.max_concurrent_streams(max_streams);
             builder.initial_max_send_streams(max_streams as usize);
         }
 
@@ -963,9 +1018,9 @@ impl GrpcPoolManager {
         pool_config: &PoolConfig,
     ) -> Result<http2::SendRequest<GrpcBody>, GrpcProxyError> {
         let io = TokioIo::new(tcp);
-        let builder = Self::build_h2_builder(pool_config);
+        let builder = Self::build_h2_builder(pool_config, true);
 
-        let (sender, conn) = builder.handshake(io).await.map_err(|e| {
+        let (sender, mut conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 format!("h2c handshake failed: {}", e),
@@ -973,26 +1028,7 @@ impl GrpcPoolManager {
             )
         })?;
 
-        // Unlike TLS-backed H2, h2c has no ALPN proof. Give the spawned driver
-        // one short observation window to surface an immediate protocol error
-        // (for example an HTTP/1.1 response to the prior-knowledge preface)
-        // before this DNS candidate is accepted.
-        let (driver_closed_tx, mut driver_closed_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = conn.await.map_err(|error| error.to_string());
-            if let Err(ref e) = result {
-                debug!("gRPC h2c connection closed: {}", e);
-            }
-            let _ = driver_closed_tx.send(result);
-        });
-        if let Ok(result) =
-            tokio::time::timeout(Duration::from_millis(25), &mut driver_closed_rx).await
-        {
-            let message = match result {
-                Ok(Err(message)) => format!("h2c handshake failed: {message}"),
-                Ok(Ok(())) => "h2c connection closed during handshake".to_string(),
-                Err(_) => "h2c connection driver ended during handshake".to_string(),
-            };
+        if let Err(message) = Self::await_h2c_peer_settings(&mut conn).await {
             return Err(GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2cHandshake,
                 message.clone(),
@@ -1000,7 +1036,59 @@ impl GrpcPoolManager {
             ));
         }
 
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                debug!("gRPC h2c connection closed: {}", e);
+            }
+        });
+
         Ok(sender)
+    }
+
+    /// Wait for positive proof that an h2c peer completed the HTTP/2 preface.
+    ///
+    /// Unlike TLS-backed H2, h2c has no ALPN proof, so a peer that merely
+    /// accepts TCP must not pin this pool to its DNS address. `handshake()`
+    /// resolves once the *client* preface is written; readiness is the peer's
+    /// initial SETTINGS having been applied, which lifts the zero-stream
+    /// sentinel installed by `build_h2_builder`.
+    ///
+    /// `conn` is hyper's connection-driver future. Polling it drives the peer's
+    /// preface and SETTINGS processing and surfaces a protocol error or close,
+    /// but the future does not resolve merely because SETTINGS arrived. The
+    /// short timeout therefore supplies a bounded recheck cadence for the
+    /// sentinel while also continuing to drive the connection.
+    ///
+    /// There is no timeout here by design: the caller runs inside
+    /// `dns::connect_candidates`, whose per-candidate share of
+    /// `backend_connect_timeout_ms` bounds this wait and moves on to the next
+    /// address. A peer whose initial SETTINGS explicitly advertises
+    /// `MAX_CONCURRENT_STREAMS: 0` is indistinguishable from one that has sent
+    /// nothing and is rejected the same way — it could not carry a stream
+    /// either.
+    async fn await_h2c_peer_settings(
+        conn: &mut http2::Connection<TokioIo<TcpStream>, GrpcBody, TokioExecutor>,
+    ) -> Result<(), String> {
+        // First re-read delay; the common case resolves on the first or second
+        // pass over a loopback or same-datacenter RTT.
+        const FIRST_RECHECK: Duration = Duration::from_millis(1);
+        // Ceiling for the doubling backoff, so a peer that accepts TCP and
+        // then stalls costs a bounded number of timer wakeups per candidate.
+        const MAX_RECHECK: Duration = Duration::from_millis(20);
+
+        let mut recheck = FIRST_RECHECK;
+        loop {
+            if conn.current_max_send_streams() > 0 {
+                return Ok(());
+            }
+            match tokio::time::timeout(recheck, &mut *conn).await {
+                Ok(Ok(())) => {
+                    return Err("h2c connection closed before peer SETTINGS".to_string());
+                }
+                Ok(Err(error)) => return Err(format!("h2c handshake failed: {error}")),
+                Err(_elapsed) => recheck = (recheck * 2).min(MAX_RECHECK),
+            }
+        }
     }
 
     /// Create an h2 (TLS) connection with ALPN negotiation, mTLS, and custom CA bundles.
@@ -1028,7 +1116,7 @@ impl GrpcPoolManager {
         }
 
         let io = TokioIo::new(tls_stream);
-        let builder = Self::build_h2_builder(pool_config);
+        let builder = Self::build_h2_builder(pool_config, false);
         let (sender, conn) = builder.handshake(io).await.map_err(|e| {
             GrpcProxyError::backend_unavailable_with_source(
                 GrpcBackendUnavailableKind::H2Handshake,
@@ -2390,6 +2478,13 @@ pub fn build_grpc_error_response_with_policy(
 /// defense-in-depth on the pinned h2 0.4.x transport: h2 already writes the
 /// response HEADERS before its permitted NO_ERROR request cancellation, and a
 /// raw client can still observe that reset after the complete response.
+///
+/// #3422 re-confirmed the emitted shape is terminal: the synthesized error body
+/// is `ProxyBody::empty()`, whose `is_end_stream()` makes hyper's h2 server take
+/// the `send_response(res, end_of_stream = true)` branch, so `grpc-status` ships
+/// in a single Trailers-Only HEADERS frame that precedes any reset. A client
+/// must therefore treat the observed HEADERS END_STREAM bit — not h2 stream
+/// state it can no longer trust after the reset — as the terminal-shape signal.
 pub fn attach_held_frontend_grpc_upload(
     mut response: hyper::Response<super::ProxyBody>,
     held_frontend_upload: Option<GrpcBody>,
@@ -2486,6 +2581,7 @@ pub async fn proxy_grpc_request_from_bytes(
     method: hyper::Method,
     headers: hyper::HeaderMap,
     body_bytes: Bytes,
+    request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
@@ -2499,6 +2595,7 @@ pub async fn proxy_grpc_request_from_bytes(
         method,
         headers,
         body_bytes,
+        request_trailers,
         proxy,
         backend_url,
         grpc_pool,
@@ -2939,11 +3036,17 @@ pub(crate) async fn collect_grpc_request_body(
 /// When `stream_response` is true, returns `GrpcResponseKind::Streaming` with
 /// the live `Incoming` body instead of buffering the full response. The caller
 /// is responsible for ensuring this is only used when retries are not needed.
+///
+/// `request_trailers` carries validated end-of-stream request metadata that did
+/// not arrive as HTTP/2 trailers — today, a gRPC-Web body trailer frame. It is
+/// sent as a real TRAILERS frame after the buffered DATA, and it is passed to
+/// every attempt because a retry replays the same complete request.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn proxy_grpc_request_core(
     method: hyper::Method,
     mut headers: hyper::HeaderMap,
     body_bytes: Bytes,
+    request_trailers: Option<hyper::HeaderMap>,
     proxy: &Proxy,
     backend_url: &str,
     grpc_pool: &GrpcConnectionPool,
@@ -3026,7 +3129,17 @@ pub(crate) async fn proxy_grpc_request_core(
         streaming_effective_timeout_ms(&headers, proxy).unwrap_or(0)
     };
 
-    let mut backend_req = Request::new(GrpcBody::Buffered(Full::new(body_bytes)));
+    // A validated end-of-stream metadata block (today: a gRPC-Web request
+    // trailer frame the `grpc_web` plugin split off the body) is re-emitted as
+    // a native HTTP/2 TRAILERS frame after the DATA. An empty map is treated as
+    // "no trailers" so a stray empty block cannot cost the backend a frame.
+    let mut backend_req = Request::new(match request_trailers {
+        Some(trailers) if !trailers.is_empty() => GrpcBody::BufferedWithTrailers {
+            data: Some(body_bytes),
+            trailers: Some(trailers),
+        },
+        _ => GrpcBody::Buffered(Full::new(body_bytes)),
+    });
     *backend_req.method_mut() = method;
     *backend_req.uri_mut() = uri;
     *backend_req.headers_mut() = headers;

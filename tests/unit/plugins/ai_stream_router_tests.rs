@@ -3,7 +3,10 @@
 use super::plugin_utils::{create_test_proxy, normalize_compressed_request_for_plugin_test};
 use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
-use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
+use ferrum_edge::plugins::ai_stream_router::{
+    AiStreamRouter, MAX_SSE_EVENT_BYTES, MAX_SSE_EVENT_JSON_DEPTH, MAX_SSE_EVENTS,
+    MAX_SSE_NORMALIZED_BODY_BYTES, MAX_SSE_NORMALIZED_OUTPUT_BYTES,
+};
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
     ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
@@ -385,8 +388,73 @@ fn test_config_rejects_unknown_root_keys_with_path_and_suggestion() {
     );
 }
 
+/// Issue #3328: a `fallback` block must fail admission outright instead of
+/// being parsed into a policy the runtime never honors. Every JSON shape is
+/// refused — an object, a well-formed policy, an empty object, `null`, and a
+/// scalar — so no operator can persist inert failover configuration.
 #[test]
-fn test_config_rejects_unknown_provider_and_fallback_keys() {
+fn test_config_rejects_fallback_block_in_every_shape() {
+    for fallback in [
+        json!({"enabled": true, "on_connect_error": true, "on_5xx_before_first_byte": true, "max_attempts": 3}),
+        json!({"enabled": false}),
+        json!({}),
+        Value::Null,
+        json!(true),
+        json!(2),
+        json!("enabled"),
+    ] {
+        let cfg = json!({
+            "providers": [valid_provider()],
+            "fallback": fallback.clone(),
+        });
+        let err = AiStreamRouter::new(&cfg, http_client())
+            .err()
+            .unwrap_or_else(|| panic!("fallback {fallback} must be rejected"));
+        assert!(
+            err.contains("unsupported field 'fallback'"),
+            "fallback {fallback}: {err}"
+        );
+        assert!(
+            err.contains("provider fallback is not implemented"),
+            "rejection must explain the missing capability, not read as a typo: {err}"
+        );
+        // The same fail-closed verdict must reach Admin API / file validate /
+        // CP-DP publication through the shared admission entrypoint.
+        assert!(
+            validate_plugin_config("ai_stream_router", &cfg).is_err(),
+            "shared admission must reject fallback {fallback}"
+        );
+    }
+}
+
+/// A `fallback` block is refused with its own diagnostic rather than being
+/// reported as an unknown-key typo, so the operator learns the capability does
+/// not exist.
+#[test]
+fn test_fallback_rejection_is_specific_not_a_typo_suggestion() {
+    let cfg = json!({
+        "providers": [valid_provider()],
+        "fallback": {"on_connect_error": true},
+    });
+    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
+    assert!(!err.contains("did you mean"), "{err}");
+    assert!(!err.contains("unknown configuration key"), "{err}");
+    assert!(err.contains("Remove the 'fallback' block"), "{err}");
+}
+
+/// Omitting `fallback` preserves the plugin's existing behavior exactly: the
+/// router still constructs and still routes a claimed streaming request.
+#[test]
+fn test_omitted_fallback_preserves_construction() {
+    let cfg = json!({
+        "providers": [valid_provider()]
+    });
+    assert!(AiStreamRouter::new(&cfg, http_client()).is_ok());
+    assert!(validate_plugin_config("ai_stream_router", &cfg).is_ok());
+}
+
+#[test]
+fn test_config_rejects_unknown_provider_keys() {
     let cfg = json!({
         "providers": [{
             "name": "p",
@@ -410,23 +478,6 @@ fn test_config_rejects_unknown_provider_and_fallback_keys() {
     assert!(
         err.contains("did you mean 'allow_plaintext'")
             || err.contains("did you mean 'inherit_backend_tls'"),
-        "{err}"
-    );
-
-    let cfg = json!({
-        "providers": [valid_provider()],
-        "fallback": {
-            "enabled": true,
-            "on_connect_erro": false,
-            "max_attemps": 3
-        }
-    });
-    let err = AiStreamRouter::new(&cfg, http_client()).err().unwrap();
-    assert!(err.contains("'config.fallback.on_connect_erro'"), "{err}");
-    assert!(err.contains("'config.fallback.max_attemps'"), "{err}");
-    assert!(
-        err.contains("did you mean 'on_connect_error'")
-            || err.contains("did you mean 'max_attempts'"),
         "{err}"
     );
 }
@@ -665,11 +716,13 @@ async fn test_route_override_and_metadata_set_for_openai() {
             .map(String::as_str),
         Some("false")
     );
-    assert_eq!(
-        ctx.metadata
-            .get("ai_stream_router.fallback_attempts")
-            .map(String::as_str),
-        Some("0")
+    // Issue #3328: no permanently-zero fallback counter is published — the
+    // plugin never attempts a second provider, so the key would only advertise
+    // a capability that does not exist.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_stream_router.fallback_attempts"),
+        "claimed requests must not stamp an inert fallback_attempts counter"
     );
 }
 
@@ -1942,19 +1995,48 @@ async fn test_backend_tls_default_and_inherit() {
 }
 
 // ---------------------------------------------------------------------------
-// Normalizer carry bound
+// Normalizer resource bounds (GHSA-7c68-39j4-mjg9)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn test_normalizer_terminates_on_oversized_sse_event() {
+async fn claimed_anthropic_inspector() -> (
+    AiStreamRouter,
+    RequestContext,
+    Box<dyn ResponseStreamInspector>,
+) {
     let plugin = build(openai_and_anthropic_config());
     let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
     let mut ctx = post_ctx(&claude);
     let mut headers = json_headers();
     plugin.before_proxy(&mut ctx, &mut headers).await;
-    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+    let inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .unwrap();
+        .expect("anthropic normalizer");
+    (plugin, ctx, inspector)
+}
+
+fn assert_bound_termination(text: &str, needle: &str) {
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(text.contains(needle), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    // Stable diagnostics must not echo raw provider payload bytes.
+    assert!(!text.contains("aaaaaaaa"), "{text}");
+}
+
+fn oversized_complete_event(event_bytes: usize) -> Vec<u8> {
+    // `data: ` (6) + filler + `\n\n` (2) == event_bytes.
+    assert!(event_bytes >= 8, "event frame too small");
+    let filler_len = event_bytes - 8;
+    let mut event = Vec::with_capacity(event_bytes);
+    event.extend_from_slice(b"data: ");
+    event.resize(event.len() + filler_len, b'a');
+    event.extend_from_slice(b"\n\n");
+    assert_eq!(event.len(), event_bytes);
+    event
+}
+
+#[tokio::test]
+async fn test_normalizer_terminates_on_oversized_sse_event() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
 
     // One giant never-terminated event: no blank-line boundary ever arrives.
     let filler = vec![b'a'; 64 * 1024];
@@ -1978,9 +2060,7 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
         .expect("oversized unterminated SSE event must terminate the stream")
         .expect("termination must carry a client-facing SSE error payload");
     let text = String::from_utf8(final_bytes.to_vec()).unwrap();
-    assert!(text.contains("upstream_error"), "{text}");
-    assert!(text.contains("oversized"), "{text}");
-    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert_bound_termination(&text, "oversized");
 
     // After termination the inspector keeps the stream closed without
     // emitting the terminal payload a second time.
@@ -1990,6 +2070,494 @@ async fn test_normalizer_terminates_on_oversized_sse_event() {
         ResponseStreamAction::Terminate(Some(_)) => panic!("must not emit terminal bytes twice"),
         ResponseStreamAction::Forward(_) => panic!("terminated inspector must remain closed"),
     }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_complete_event_at_exact_boundary_plus_one() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    let action = inspector.on_chunk(&event).await;
+    match action {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("boundary+1 complete event must terminate before parse: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_accepts_complete_event_at_exact_per_event_boundary() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Exact-cap frame that is not valid Anthropic JSON: the size gate must
+    // admit it so malformed-JSON rejection (not oversized) is what fires.
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES);
+    let action = inspector.on_chunk(&event).await;
+    match action {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("upstream_error"), "{text}");
+            assert!(
+                text.contains("malformed") || text.contains("JSON"),
+                "exact-cap event must reach parse/framing checks, not the oversized gate: {text}"
+            );
+            assert!(!text.contains("oversized"), "{text}");
+        }
+        ResponseStreamAction::Forward(bytes) => {
+            // Ignored non-JSON data frames may forward empty/partial output.
+            assert!(
+                bytes.is_empty()
+                    || String::from_utf8_lossy(&bytes).contains("chat.completion.chunk"),
+                "unexpected forward payload"
+            );
+        }
+        other => panic!("exact-cap event must not be treated as oversized: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_split_oversized_event_before_boundary() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let half = MAX_SSE_EVENT_BYTES / 2 + 1;
+    let first = vec![b'x'; half];
+    match inspector.on_chunk(&first).await {
+        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+        other => panic!("first half under the cap must not terminate: {other:?}"),
+    }
+    let second = vec![b'y'; half];
+    match inspector.on_chunk(&second).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("split oversized partial must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_when_boundary_arrives_with_final_oversized_bytes() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Fill exactly to the cap with no delimiter, then deliver the blank line
+    // that would complete an oversized frame.
+    let prefix = vec![b'z'; MAX_SSE_EVENT_BYTES];
+    match inspector.on_chunk(&prefix).await {
+        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+        other => panic!("exact-cap partial must wait for more bytes: {other:?}"),
+    }
+    match inspector.on_chunk(b"\n\n").await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("delimiter completing an oversized event must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_many_small_events_stream_without_quadratic_growth() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Many tiny complete frames in one chunk: cursor design must finish
+    // without terminating and without requiring giant allocations.
+    let event = b"data: {\"type\":\"ping\"}\n\n";
+    let count = 2_048usize;
+    let mut body = Vec::with_capacity(count * event.len());
+    for _ in 0..count {
+        body.extend_from_slice(event);
+    }
+    match inspector.on_chunk(&body).await {
+        ResponseStreamAction::Forward(bytes) => {
+            assert!(
+                bytes.is_empty(),
+                "ping frames produce no OpenAI output: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        other => panic!("many small in-limit events must not terminate: {other:?}"),
+    }
+    // Structural companion: library-inline `sse_buffer_tests` asserts cursor
+    // compaction keeps capacity O(partial). Here we only prove the public
+    // streaming path stays healthy under a many-event burst.
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_excessive_normalized_output() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Text-dominated frames expand ~1:1 and trip the 8 MiB plaintext ceiling
+    // before the 16 MiB normalized-output ceiling. A long stream id is repeated
+    // in every OpenAI envelope, so tiny Anthropic text deltas expand enough to
+    // exercise the output bound while staying under the plaintext and
+    // event-count caps.
+    let stream_id = "m".repeat(32 * 1024);
+    let start = format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+    );
+    match inspector.on_chunk(start.as_bytes()).await {
+        ResponseStreamAction::Forward(_) => {}
+        other => panic!("message_start must forward: {other:?}"),
+    }
+
+    let delta = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    assert!(
+        delta.len() < 128,
+        "fixture delta must stay tiny so OpenAI envelope expansion dominates"
+    );
+    const {
+        assert!(
+            MAX_SSE_NORMALIZED_OUTPUT_BYTES > MAX_SSE_NORMALIZED_BODY_BYTES,
+            "output ceiling must sit above the plaintext ceiling"
+        );
+    }
+
+    let batch_events = 64usize;
+    let mut batch = Vec::with_capacity(batch_events * delta.len());
+    for _ in 0..batch_events {
+        batch.extend_from_slice(delta);
+    }
+    // Long enough to exceed the 16 MiB output ceiling under envelope expansion
+    // (id repeated per OpenAI chunk), but still under the event-count hard cap.
+    let max_batches = MAX_SSE_EVENTS / batch_events;
+
+    for index in 0..max_batches {
+        match inspector.on_chunk(&batch).await {
+            ResponseStreamAction::Forward(_) => {}
+            ResponseStreamAction::Terminate(Some(bytes)) => {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                assert_bound_termination(&text, "cumulative normalized size limit");
+                // Distinguish from the plaintext body ceiling diagnostic.
+                assert!(
+                    !text.contains("exceeded the cumulative size limit"),
+                    "{text}"
+                );
+                assert!(!text.contains("event count limit"), "{text}");
+                assert!(!text.contains("oversized"), "{text}");
+                return;
+            }
+            other => panic!("text delta batch {index} unexpected: {other:?}"),
+        }
+    }
+    panic!("stream must terminate before {max_batches} batches exhaust the output cap");
+}
+
+#[tokio::test]
+async fn test_normalizer_terminal_provider_error_cannot_bypass_output_cap() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let stream_id = "m".repeat(32 * 1024);
+    let start = format!(
+        "event: message_start\n\
+         data: {{\"type\":\"message_start\",\"message\":{{\"id\":\"{stream_id}\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+    );
+    let mut forwarded = match inspector.on_chunk(start.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) => bytes.len(),
+        other => panic!("message_start must forward: {other:?}"),
+    };
+
+    let delta = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"}}\n\n";
+    let batch_events = 8usize;
+    let mut batch = Vec::with_capacity(batch_events * delta.len());
+    for _ in 0..batch_events {
+        batch.extend_from_slice(delta);
+    }
+
+    // Stop with less than 900 KiB remaining. One batch expands by far less
+    // than the 388 KiB gap between that target and the terminal reserve.
+    const PROVIDER_MESSAGE_BYTES: usize = 900 * 1024;
+    let target = MAX_SSE_NORMALIZED_OUTPUT_BYTES - PROVIDER_MESSAGE_BYTES;
+    while forwarded < target {
+        match inspector.on_chunk(&batch).await {
+            ResponseStreamAction::Forward(bytes) => forwarded += bytes.len(),
+            other => panic!("in-budget text deltas must forward: {other:?}"),
+        }
+    }
+
+    let provider_marker = "PROVIDER-CONTROLLED-TERMINAL-SECRET:";
+    let provider_message = format!(
+        "{provider_marker}{}",
+        "p".repeat(PROVIDER_MESSAGE_BYTES - provider_marker.len())
+    );
+    let provider_error = format!(
+        "event: error\n\
+         data: {{\"type\":\"error\",\"error\":{{\"message\":\"{provider_message}\"}}}}\n\n"
+    );
+    assert!(
+        provider_error.len() < MAX_SSE_EVENT_BYTES,
+        "terminal fixture must remain within the per-event cap"
+    );
+
+    let terminal = match inspector.on_chunk(provider_error.as_bytes()).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => bytes,
+        other => panic!("oversized normalized terminal output must terminate: {other:?}"),
+    };
+    let text = String::from_utf8(terminal.to_vec()).unwrap();
+    assert_bound_termination(&text, "cumulative normalized size limit");
+    assert!(
+        !text.contains(provider_marker),
+        "provider-controlled terminal text must be replaced, not echoed"
+    );
+    assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+    assert!(
+        forwarded + text.len() <= MAX_SSE_NORMALIZED_OUTPUT_BYTES,
+        "terminal output must remain within the cumulative normalized cap"
+    );
+}
+
+#[tokio::test]
+async fn test_normalizer_cumulative_body_exhaustion() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    const EVENT_BYTES: usize = 512 * 1024;
+    let prefix = b"data: {\"type\":\"ping\",\"padding\":\"";
+    let suffix = b"\"}\n\n";
+    let mut event = Vec::with_capacity(EVENT_BYTES);
+    event.extend_from_slice(prefix);
+    event.resize(EVENT_BYTES - suffix.len(), b'a');
+    event.extend_from_slice(suffix);
+    assert_eq!(event.len(), EVENT_BYTES);
+    assert!(event.len() < MAX_SSE_EVENT_BYTES);
+    assert_eq!(MAX_SSE_NORMALIZED_BODY_BYTES, 8 * 1024 * 1024);
+
+    // Sixteen valid ~512 KiB frames exactly fill the 8 MiB plaintext budget.
+    // The seventeenth must trip that budget specifically, well before either
+    // the per-event or event-count limits.
+    for index in 0..16 {
+        match inspector.on_chunk(&event).await {
+            ResponseStreamAction::Forward(bytes) => assert!(
+                bytes.is_empty(),
+                "valid ping frame {index} should produce no normalized output"
+            ),
+            other => panic!("in-budget valid frame {index} must continue: {other:?}"),
+        }
+    }
+    match inspector.on_chunk(&event).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "cumulative size limit");
+            assert!(!text.contains("event count limit"), "{text}");
+            assert!(!text.contains("oversized"), "{text}");
+        }
+        other => panic!("seventeenth valid frame must cross the cumulative cap: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_event_count_exhaustion() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let event = b"data: {\"type\":\"ping\"}\n\n";
+    // Stay under the cumulative byte cap while exhausting the event counter.
+    assert!(
+        (MAX_SSE_EVENTS + 1) * event.len() <= MAX_SSE_NORMALIZED_BODY_BYTES,
+        "event-count fixture must fit under the body byte cap"
+    );
+    let batch = 1_024usize;
+    let mut seen = 0usize;
+    let mut terminated = None;
+    while seen < MAX_SSE_EVENTS + 1 {
+        let n = batch.min(MAX_SSE_EVENTS + 1 - seen);
+        let mut chunk = Vec::with_capacity(n * event.len());
+        for _ in 0..n {
+            chunk.extend_from_slice(event);
+        }
+        match inspector.on_chunk(&chunk).await {
+            ResponseStreamAction::Forward(_) => seen += n,
+            ResponseStreamAction::Terminate(bytes) => {
+                terminated = Some(bytes);
+                break;
+            }
+        }
+    }
+    let final_bytes = terminated
+        .expect("event-count exhaustion must terminate")
+        .expect("termination payload required");
+    let text = String::from_utf8(final_bytes.to_vec()).unwrap();
+    assert_bound_termination(&text, "event count limit");
+}
+
+#[tokio::test]
+async fn test_normalizer_rejects_excessive_json_depth() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let depth = MAX_SSE_EVENT_JSON_DEPTH + 1;
+    let mut payload = String::new();
+    for _ in 0..depth {
+        payload.push('{');
+        payload.push_str("\"k\":");
+    }
+    payload.push('1');
+    for _ in 0..depth {
+        payload.push('}');
+    }
+    let frame = format!("data: {payload}\n\n");
+    match inspector.on_chunk(frame.as_bytes()).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "excessive JSON nesting");
+        }
+        other => panic!("over-deep JSON must fail closed before parse: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_trailing_incomplete_event_is_malformed() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let body = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tr\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"x\"",
+    );
+    match inspector.on_chunk(body.as_bytes()).await {
+        ResponseStreamAction::Forward(_) => {}
+        other => panic!("incomplete trailing frame must wait for EOF: {other:?}"),
+    }
+    match inspector.on_end().await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("malformed trailing data"), "{text}");
+            // Delimiter-less EOF remainder must not use the complete-event
+            // malformed-JSON diagnostic.
+            assert!(!text.contains("malformed SSE JSON"), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+            assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+        }
+        other => panic!("EOF must fail closed on incomplete trailing data: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_sse_comment_frames_are_ignored() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let body = concat!(
+        ": keepalive\n\n",
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    match inspector.on_chunk(body.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("\"content\":\"ok\""), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+            assert!(!text.contains("upstream_error"), "{text}");
+        }
+        ResponseStreamAction::Terminate(None) => {
+            panic!("comment frames must not terminate the stream early")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_buffered_path_enforces_complete_event_size() {
+    let (plugin, mut ctx, _inspector) = claimed_anthropic_inspector().await;
+    let event = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    let out = plugin
+        .normalize_response_body_with_context(
+            &mut ctx,
+            200,
+            &event,
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered normalize must return a body");
+    let text = String::from_utf8(out).unwrap();
+    assert_bound_termination(&text, "oversized");
+}
+
+#[tokio::test]
+async fn test_normalizer_streamed_path_enforces_complete_event_size_single_chunk() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    // Single chunk containing the entire oversized event and blank-line
+    // boundary — the original advisory reproduction.
+    let mut chunk = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+    chunk.extend_from_slice(b"data: {\"type\":\"ping\"}\n\n");
+    match inspector.on_chunk(&chunk).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_bound_termination(&text, "oversized");
+        }
+        other => panic!("single-chunk oversized complete event must terminate: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_normalizer_malformed_utf8_fails_closed() {
+    let (_plugin, _ctx, mut inspector) = claimed_anthropic_inspector().await;
+    let frame = b"data: \xff\xfe not utf8\n\n";
+    match inspector.on_chunk(frame).await {
+        ResponseStreamAction::Terminate(Some(bytes)) => {
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            assert!(text.contains("upstream_error"), "{text}");
+            assert!(text.contains("malformed"), "{text}");
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+        }
+        other => panic!("malformed UTF-8 must fail closed: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_independent_normalizers() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let plugin = build(openai_and_anthropic_config());
+        let mut ctx = post_ctx(&claude);
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        handles.push(tokio::spawn(async move {
+            let mut inspector = plugin
+                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                .expect("inspector");
+            if i % 2 == 0 {
+                let bad = oversized_complete_event(MAX_SSE_EVENT_BYTES + 1);
+                match inspector.on_chunk(&bad).await {
+                    ResponseStreamAction::Terminate(Some(bytes)) => {
+                        let text = String::from_utf8(bytes.to_vec()).unwrap();
+                        assert!(text.contains("oversized"), "{text}");
+                    }
+                    other => panic!("concurrent oversized path failed: {other:?}"),
+                }
+            } else {
+                let ok = concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_c\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                );
+                let mut out = Vec::new();
+                match inspector.on_chunk(ok.as_bytes()).await {
+                    ResponseStreamAction::Forward(b) | ResponseStreamAction::Terminate(Some(b)) => {
+                        out.extend_from_slice(&b);
+                    }
+                    ResponseStreamAction::Terminate(None) => {}
+                }
+                if !String::from_utf8_lossy(&out).contains("[DONE]") {
+                    match inspector.on_end().await {
+                        ResponseStreamAction::Forward(b)
+                        | ResponseStreamAction::Terminate(Some(b)) => {
+                            out.extend_from_slice(&b);
+                        }
+                        ResponseStreamAction::Terminate(None) => {}
+                    }
+                }
+                let text = String::from_utf8(out).unwrap();
+                assert!(text.contains("\"content\":\"ok\""), "{text}");
+                assert!(text.contains("data: [DONE]"), "{text}");
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("normalizer task");
+    }
+    // Keep the outer plugin alive so the test clearly owns independent instances.
+    let _ = plugin.name();
 }
 
 // ---------------------------------------------------------------------------

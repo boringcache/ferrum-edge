@@ -51,6 +51,19 @@
 //! client: dropping the client aborts it so retired plugin generations do not
 //! retain connections or keep pinging obsolete endpoints.
 //!
+//! Every transition to unavailable arms that task, because
+//! [`RedisRateLimitClient::mark_unavailable`] owns both halves. Not every
+//! consumer of `is_available()` fails *open*: `soap_ws_security`'s
+//! `replay_scope: shared` PasswordDigest claims and `request_deduplication`'s
+//! exactly-once admission deliberately reject traffic while the shared backend
+//! is unavailable, so an unarmed checker would convert one transient command
+//! error into an outage lasting until the next config reload. The single
+//! exception is a **literal-IP** egress-policy denial, which is static
+//! configuration rather than a transient outage and uses
+//! `mark_unavailable_without_recovery`. A **hostname** that currently resolves
+//! to a denied address is different: DNS answers can change, so that denial
+//! arms recovery and the checker re-screens every interval.
+//!
 //! # Connection pool
 //!
 //! `redis_pool_size` sizes a bounded set of multiplexed
@@ -543,10 +556,16 @@ fn parse_optional_u64(
 enum RedisEndpoint {
     /// A policy-screened URL to dial.
     Url(String),
-    /// Host blocked by the backend egress policy. Fail closed and do NOT start
-    /// the recovery checker — this is configuration, not a transient outage, so a
-    /// config change (which rebuilds the client) is the only recovery.
-    EgressDenied,
+    /// A configured hostname currently resolves to an address the backend egress
+    /// policy denies. Fail closed for this attempt, but arm the recovery checker:
+    /// DNS answers are not static, so a later re-screen may land on an allowed
+    /// address without a config reload.
+    HostnameEgressDenied,
+    /// A literal-IP `redis_url` is blocked by the backend egress policy. Fail
+    /// closed and do NOT start the recovery checker — the denied address is
+    /// configuration, not a transient outage, so a config change (which rebuilds
+    /// the client) is the only recovery.
+    LiteralIpEgressDenied,
     /// The DNS cache could not resolve the host (resolver outage / misconfigured
     /// gateway DNS). Fail closed rather than dialing an unscreened address, but
     /// the background recovery checker may re-screen successfully later.
@@ -577,9 +596,9 @@ async fn screen_redis_endpoint(
                     warn!(
                         hostname = %hostname,
                         error = %e,
-                        "Redis host blocked by backend egress policy — failing closed (in-memory fallback)"
+                        "Redis hostname currently resolves to an address blocked by backend egress policy — failing closed (in-memory fallback, will re-screen)"
                     );
-                    return RedisEndpoint::EgressDenied;
+                    return RedisEndpoint::HostnameEgressDenied;
                 }
                 // Fail CLOSED on ANY screen failure (resolver outage / misconfigured
                 // gateway DNS), not just policy denials: handing the unscreened
@@ -604,9 +623,9 @@ async fn screen_redis_endpoint(
         warn!(
             redis_ip = %ip,
             reason,
-            "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback)"
+            "Redis literal host blocked by backend egress policy — failing closed (in-memory fallback, no recovery checker)"
         );
-        return RedisEndpoint::EgressDenied;
+        return RedisEndpoint::LiteralIpEgressDenied;
     }
     RedisEndpoint::Url(config.effective_url())
 }
@@ -783,11 +802,12 @@ impl RedisRateLimitClient {
         Arc::clone(&self.available)
     }
 
-    /// Mark Redis unavailable and start the recovery checker (test support).
+    /// Mark Redis unavailable (test support). Arming the recovery checker is
+    /// part of [`Self::mark_unavailable`] itself, so this exercises the same
+    /// transition production error paths take.
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn mark_unavailable_for_test(&self) {
         self.mark_unavailable();
-        self.start_health_checker_if_needed();
     }
 
     /// Whether the background recovery checker has been started (test support).
@@ -877,7 +897,9 @@ impl RedisRateLimitClient {
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
-            RedisEndpoint::EgressDenied | RedisEndpoint::ResolveFailed => return false,
+            RedisEndpoint::HostnameEgressDenied
+            | RedisEndpoint::LiteralIpEgressDenied
+            | RedisEndpoint::ResolveFailed => return false,
         };
         let client = match self.build_client(&url) {
             Ok(client) => client,
@@ -1093,18 +1115,24 @@ impl RedisRateLimitClient {
 
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
-            RedisEndpoint::EgressDenied => {
-                // Policy denial: fail closed to the in-memory limiter with NO
-                // recovery checker — it would re-screen and stay denied every
-                // interval. A config change rebuilds the client.
+            RedisEndpoint::HostnameEgressDenied => {
+                // Hostname currently maps to a denied address: fail closed, but
+                // arm recovery so a later DNS answer can restore connectivity
+                // without a config reload.
                 self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::LiteralIpEgressDenied => {
+                // Static literal-IP denial: fail closed with NO recovery
+                // checker — re-screening the same IP stays denied forever. A
+                // config change rebuilds the client.
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
                 // Transient DNS failure: fail closed (never dial an unscreened
                 // host), but let the recovery checker re-screen later.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1118,7 +1146,6 @@ impl RedisRateLimitClient {
                     "Failed to create Redis client for rate limiting"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1145,7 +1172,6 @@ impl RedisRateLimitClient {
                     "Failed to connect to Redis for rate limiting — falling back to local"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1156,7 +1182,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting to Redis for rate limiting — falling back to local"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1185,18 +1210,24 @@ impl RedisRateLimitClient {
     async fn get_dedicated_connection(&self) -> Option<redis::aio::MultiplexedConnection> {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
-            RedisEndpoint::EgressDenied => {
-                // Policy denial: fail closed to the in-memory limiter with NO
-                // recovery checker — it would re-screen and stay denied every
-                // interval. A config change rebuilds the client.
+            RedisEndpoint::HostnameEgressDenied => {
+                // Hostname currently maps to a denied address: fail closed, but
+                // arm recovery so a later DNS answer can restore connectivity
+                // without a config reload.
                 self.mark_unavailable();
+                return None;
+            }
+            RedisEndpoint::LiteralIpEgressDenied => {
+                // Static literal-IP denial: fail closed with NO recovery
+                // checker — re-screening the same IP stays denied forever. A
+                // config change rebuilds the client.
+                self.mark_unavailable_without_recovery();
                 return None;
             }
             RedisEndpoint::ResolveFailed => {
                 // Transient DNS failure: fail closed (never dial an unscreened
                 // host), but let the recovery checker re-screen later.
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1209,7 +1240,6 @@ impl RedisRateLimitClient {
                     "Failed to create dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 return None;
             }
         };
@@ -1226,7 +1256,6 @@ impl RedisRateLimitClient {
                     "Failed to connect dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
             Err(ConnectAttemptError::Timeout) => {
@@ -1236,7 +1265,6 @@ impl RedisRateLimitClient {
                     "Timed out connecting dedicated Redis client"
                 );
                 self.mark_unavailable();
-                self.start_health_checker_if_needed();
                 None
             }
         }
@@ -1250,8 +1278,44 @@ impl RedisRateLimitClient {
         }
     }
 
-    /// Mark Redis as unavailable and clear the connection for re-resolution.
+    /// Mark Redis as unavailable, clear the connection for re-resolution, and
+    /// guarantee the background recovery checker is running.
+    ///
+    /// Starting the checker here rather than at each call site is a security
+    /// invariant, not a convenience. Callers fall into two classes:
+    ///
+    /// - **Fail-open consumers** (the rate limiters) degrade to an in-memory
+    ///   limiter while `is_available()` is false, so a checker that never runs
+    ///   costs accuracy.
+    /// - **Fail-closed consumers** (`soap_ws_security`'s `replay_scope: shared`
+    ///   PasswordDigest replay claims, `request_deduplication`'s exactly-once
+    ///   admission) *reject* traffic while `is_available()` is false. For those,
+    ///   a missing checker turns one transient error into an outage that only a
+    ///   config reload can clear.
+    ///
+    /// Only the connect paths used to start it, so a client whose commands ran
+    /// on [`Self::get_dedicated_connection`] (which does not start it on
+    /// success) could be pinned unavailable forever by a single `WATCH`/`EXEC`
+    /// I/O error. Owning the transition here makes "unavailable implies a live
+    /// recovery task" hold for every present and future error path.
+    ///
+    /// The one transition that must *not* arm recovery is a **literal-IP**
+    /// egress-policy denial — see [`Self::mark_unavailable_without_recovery`].
+    /// A hostname egress denial is retryable (DNS may change) and uses this
+    /// path so fail-closed consumers are not pinned unavailable forever.
     fn mark_unavailable(&self) {
+        self.mark_unavailable_without_recovery();
+        self.start_health_checker_if_needed();
+    }
+
+    /// Mark Redis unavailable **without** arming the recovery checker.
+    ///
+    /// Reserved for literal-IP egress-policy denials: re-screening the same
+    /// denied address every interval would stay denied forever, so this is
+    /// configuration rather than a transient outage and a config change (which
+    /// rebuilds the client) is the recovery path. Hostname denials must not use
+    /// this — they arm recovery via [`Self::mark_unavailable`].
+    fn mark_unavailable_without_recovery(&self) {
         self.available.store(false, Ordering::Relaxed);
         self.clear_connection();
     }
@@ -1283,9 +1347,13 @@ impl RedisRateLimitClient {
                 // would otherwise let the background ping dial a denied address).
                 let url = match screen_redis_endpoint(&config, dns_cache.as_ref()).await {
                     RedisEndpoint::Url(url) => url,
-                    // Blocked by the egress policy or unresolvable — skip this ping
-                    // and re-check next interval (stay on the in-memory limiter).
-                    RedisEndpoint::EgressDenied | RedisEndpoint::ResolveFailed => continue,
+                    // Still denied or unresolvable this interval — skip the ping
+                    // and re-screen next interval (including hostname egress
+                    // denials, whose DNS answer may change). Literal-IP denials
+                    // never start this task.
+                    RedisEndpoint::HostnameEgressDenied
+                    | RedisEndpoint::LiteralIpEgressDenied
+                    | RedisEndpoint::ResolveFailed => continue,
                 };
 
                 // Build the client with TLS settings matching the main connection.
@@ -1423,14 +1491,34 @@ impl RedisRateLimitClient {
         current_key: &str,
         ttl_seconds: u64,
     ) -> Result<(i64, i64), ()> {
+        self.sliding_window_increment_by(previous_key, current_key, 1, ttl_seconds)
+            .await
+    }
+
+    /// [`Self::sliding_window_increment`] with an explicit charge.
+    ///
+    /// Used where one admission decision covers several units of work — the
+    /// WebSocket frame limiter charges every physical fragment of a reassembled
+    /// message in a single round trip rather than one round trip per fragment.
+    /// `amount` must be positive; the caller owns the bound on how large it can
+    /// grow.
+    pub async fn sliding_window_increment_by(
+        &self,
+        previous_key: &str,
+        current_key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+    ) -> Result<(i64, i64), ()> {
+        let amount = amount.max(1);
         let mut conn = self.get_connection().await.ok_or(())?;
 
         let result: Result<(Option<i64>, i64), redis::RedisError> = redis::pipe()
             .atomic()
             .cmd("GET")
             .arg(previous_key)
-            .cmd("INCR")
+            .cmd("INCRBY")
             .arg(current_key)
+            .arg(amount)
             .cmd("EXPIRE")
             .arg(current_key)
             .arg(expire_seconds(ttl_seconds))
@@ -1448,7 +1536,7 @@ impl RedisRateLimitClient {
                     previous_key = %previous_key,
                     current_key = %current_key,
                     error = %e,
-                    "Redis sliding-window GET+INCR+EXPIRE transaction failed — falling back to local rate limiting"
+                    "Redis sliding-window GET+INCRBY+EXPIRE transaction failed — falling back to local rate limiting"
                 );
                 self.mark_unavailable();
                 Err(())

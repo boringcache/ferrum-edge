@@ -9,8 +9,8 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::plugins::geo_restriction::GeoRestriction;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, priority,
-    validate_plugin_config,
+    ALL_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, StreamConnectionContext,
+    priority, validate_plugin_config,
 };
 use http::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -1200,5 +1200,206 @@ fn test_validate_all_fields_does_not_check_mmdb() {
         result.is_ok(),
         "validate_all_fields should not check .mmdb files: {:?}",
         result.err()
+    );
+}
+
+// ── Mapped/native GeoIP equivalence (advisory GHSA-vjwj-657f-5w9g) ──────────
+
+fn geo_stream_context(client_ip: &str) -> StreamConnectionContext {
+    StreamConnectionContext::new(
+        client_ip.to_string(),
+        client_ip.to_string(),
+        "geo-stream-proxy".to_string(),
+        Some("Geo Stream Proxy".to_string()),
+        5432,
+        ferrum_edge::config::types::BackendScheme::Tcp,
+        Arc::new(ferrum_edge::ConsumerIndex::new(&[])),
+    )
+}
+
+/// The advisory's core GeoIP case. Under a **deny** lookup-failure policy an
+/// allow-list is only satisfied by a lookup that actually reached the IPv4
+/// country record. If the mapped form were handed to MaxMind as IPv6 the query
+/// would miss (or be rejected outright by an IPv4-only database) and this
+/// request would be denied — so a passing mapped case proves the IPv4 tree was
+/// searched, not merely that both forms landed on the same failure branch.
+#[tokio::test]
+async fn mapped_client_reaches_the_ipv4_country_record_under_fail_closed_policy() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+
+    for client_ip in ["89.160.20.112", "::ffff:89.160.20.112"] {
+        let mut ctx = request_context(client_ip);
+        assert!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Continue
+            ),
+            "allow-listed country must resolve for both representations: {client_ip}"
+        );
+    }
+}
+
+/// An IPv4 address the fixture database genuinely cannot resolve.
+///
+/// Derived from the fixture rather than assumed, so the lookup-failure
+/// assertions below cannot silently degrade into country assertions if the
+/// upstream test database ever gains a record for a documentation range.
+fn unresolvable_ipv4_in_fixture() -> String {
+    let bytes = country_mmdb_bytes();
+    let reader = maxminddb::Reader::from_source(bytes.as_slice()).expect("fixture opens");
+    for candidate in ["192.0.2.10", "198.51.100.7", "203.0.113.9", "192.0.2.200"] {
+        let ip: std::net::IpAddr = candidate.parse().expect("candidate address parses");
+        let Ok(lookup) = reader.lookup(ip) else {
+            return candidate.to_string();
+        };
+        // Same two record paths `GeoRestriction::lookup_country` consults.
+        let direct: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["country", "iso_code"])
+            .unwrap_or(None);
+        let registered: Option<&str> = lookup
+            .decode_path(&maxminddb::path!["registered_country", "iso_code"])
+            .unwrap_or(None);
+        if direct.or(registered).is_none() {
+            return candidate.to_string();
+        }
+    }
+    panic!("fixture unexpectedly resolves every candidate documentation address");
+}
+
+/// The configured lookup-failure policy itself must be representation-blind: an
+/// address genuinely absent from the database takes the same branch either way,
+/// under both `deny` and `allow`.
+#[tokio::test]
+async fn configured_lookup_failure_policy_is_representation_blind() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+
+    let deny = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+    let allow = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "allow_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    let native = unresolvable_ipv4_in_fixture();
+    let mapped = format!("::ffff:{native}");
+    for client_ip in [native.as_str(), mapped.as_str()] {
+        let mut denied = request_context(client_ip);
+        assert!(
+            matches!(
+                deny.on_request_received(&mut denied).await,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "unresolved address must fail closed for both representations: {client_ip}"
+        );
+
+        let mut allowed = request_context(client_ip);
+        assert!(
+            matches!(
+                allow.on_request_received(&mut allowed).await,
+                PluginResult::Continue
+            ),
+            "unresolved address must fail open for both representations: {client_ip}"
+        );
+    }
+
+    // Non-vacuity: the same fail-closed policy admits an address the database
+    // DOES resolve to the allow-listed country, in either representation.
+    for client_ip in ["89.160.20.112", "::ffff:89.160.20.112"] {
+        let mut ctx = request_context(client_ip);
+        assert!(matches!(
+            deny.on_request_received(&mut ctx).await,
+            PluginResult::Continue
+        ));
+    }
+}
+
+/// Deny-list policy on the stream hook (`tcp`/`tcp_tls`/`udp`/`dtls`), which
+/// reads the same shared canonical identity as the HTTP hook.
+#[tokio::test]
+async fn stream_geo_policy_matches_across_representations() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "allow"
+    }))
+    .unwrap();
+
+    for client_ip in ["89.160.20.112", "::ffff:89.160.20.112"] {
+        let mut ctx = geo_stream_context(client_ip);
+        assert!(
+            matches!(
+                plugin.on_stream_connect(&mut ctx).await,
+                PluginResult::Reject {
+                    status_code: 403,
+                    ..
+                }
+            ),
+            "stream connections must get the same country decision: {client_ip}"
+        );
+    }
+}
+
+/// A true IPv6 client keeps its own identity: it must not inherit the decision
+/// of the IPv4 address embedded in an IPv4-compatible or NAT64 encoding.
+#[tokio::test]
+async fn true_ipv6_client_is_not_folded_onto_an_ipv4_country_decision() {
+    let directory = TempDir::new().unwrap();
+    let path = write_fixture(&directory, "country.mmdb", &country_mmdb_bytes());
+    let plugin = GeoRestriction::new(&json!({
+        "db_path": path_text(&path),
+        "deny_countries": ["SE"],
+        "on_lookup_failure": "deny"
+    }))
+    .unwrap();
+
+    // `89.160.20.112` is the denied SE address; `::59a0:1470` is its
+    // IPv4-compatible encoding and `64:ff9b::59a0:1470` its NAT64 encoding.
+    // Neither is that host, so neither may be *folded onto* it: the shared
+    // canonical identity must stay IPv6. (Both are rejected here — by the
+    // fail-closed lookup branch, or by country if the database aliases the
+    // prefix — so the identity assertion carries the contract.)
+    for client_ip in ["::59a0:1470", "64:ff9b::59a0:1470"] {
+        let mut ctx = request_context(client_ip);
+        assert!(
+            matches!(
+                plugin.on_request_received(&mut ctx).await,
+                PluginResult::Reject { .. }
+            ),
+            "true IPv6 identity must not resolve through the embedded IPv4: {client_ip}"
+        );
+        assert!(
+            matches!(ctx.canonical_client_ip(), Some(std::net::IpAddr::V6(_))),
+            "shared canonical identity must stay IPv6: {client_ip}"
+        );
+    }
+
+    // Non-vacuity: the native IPv4 form of the same host IS denied by country.
+    let mut native = request_context("89.160.20.112");
+    assert!(matches!(
+        plugin.on_request_received(&mut native).await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        native.canonical_client_ip(),
+        Some("89.160.20.112".parse().unwrap())
     );
 }

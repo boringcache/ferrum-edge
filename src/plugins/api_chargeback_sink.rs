@@ -48,8 +48,8 @@ use super::utils::{
     BatchConfig, BatchingLogger, ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES,
     HARD_MAX_BUFFER_MAX_BYTES, HTTP_BATCH_RESPONSE_DRAIN_TIMEOUT, LoggerHooks,
     MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    RetryPolicy, redacted_endpoint_url, redacted_endpoint_url_str, wait_until_committed,
-    wait_until_committed_or_closed,
+    RetryPolicy, TrySendOutcome, redacted_endpoint_url, redacted_endpoint_url_str,
+    wait_until_committed, wait_until_committed_or_closed,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
@@ -70,6 +70,8 @@ const MAX_METADATA_FIELD_LEN: usize = 256;
 const MAX_CHARGE_EVENT_BYTES: usize = 96 + (MAX_FIELD_LEN * 16) + (MAX_METADATA_FIELD_LEN * 4);
 const SPOOL_WARN_INTERVAL_SECS: i64 = 60;
 const SPOOL_JOB_WARN_EVERY: u64 = 100;
+/// Bound refreshes when another process mutates the shared spool during quota eviction.
+const SPOOL_QUOTA_MAX_INVENTORY_PASSES: u64 = 8;
 const GRPC_STATUS_OTHER_SENTINEL: u32 = u32::MAX;
 /// Versioned on-disk ownership format for managed chargeback spool trees.
 const SPOOL_FORMAT_VERSION: u32 = 1;
@@ -1831,7 +1833,16 @@ struct SinkMetrics {
     events_exported_total: AtomicU64,
     failures_total: AtomicU64,
     failure_reasons: FailureReasonCounters,
+    /// Observed queue depth at/above the high-water mark (telemetry only).
     queue_high_water_hits_total: AtomicU64,
+    /// High-water events whose durable spool-delivery handoff actually accepted
+    /// the job. Saturation/closure of the delivery queue is counted by spool
+    /// loss metrics instead.
+    queue_high_water_diversions_total: AtomicU64,
+    /// Events lost because the bounded in-memory channel was actually full and
+    /// no durable overflow path accepted ownership. Never incremented for
+    /// shutdown/unavailable admission.
+    queue_full_drops_total: AtomicU64,
     queue_byte_budget_exhausted_total: AtomicU64,
     spool_drops_total: AtomicU64,
     spool_available: AtomicBool,
@@ -1865,6 +1876,8 @@ impl Default for SinkMetrics {
             failures_total: AtomicU64::new(0),
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
+            queue_high_water_diversions_total: AtomicU64::new(0),
+            queue_full_drops_total: AtomicU64::new(0),
             queue_byte_budget_exhausted_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
             spool_available: AtomicBool::new(false),
@@ -2214,7 +2227,7 @@ impl ApiChargebackSink {
         };
 
         let snapshot_events_are_pre_spooled = self.config.mode == SinkMode::Snapshot;
-        let overflow_metrics = Arc::clone(&metrics);
+        let high_water_metrics = Arc::clone(&metrics);
         let (commit_tx, commit_rx) = watch::channel(false);
         let spool_enqueue = spool.as_ref().map(|spool_manager| {
             start_spool_delivery(
@@ -2225,7 +2238,31 @@ impl ApiChargebackSink {
             )
         });
         let failed_enqueue = spool_enqueue.clone();
-        let overflow_enqueue = spool_enqueue.clone();
+        // Install diversion only when a durable owner exists. Without spool,
+        // high water is telemetry-only and the bounded channel remains usable
+        // until it is actually full (issue #3038).
+        let on_overflow: Option<
+            Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>,
+        > = spool_enqueue.as_ref().map(|overflow_enqueue| {
+            let overflow_metrics = Arc::clone(&metrics);
+            let overflow_enqueue = Arc::clone(overflow_enqueue);
+            Arc::new(move |queued: QueuedChargeEvent, reason: &'static str| {
+                if snapshot_events_are_pre_spooled {
+                    // Snapshot charges are already durably owned; acknowledge
+                    // ownership without counting a fresh high-water diversion.
+                    invalidate_status_cache();
+                    return true;
+                }
+                let accepted = overflow_enqueue.try_enqueue(vec![queued], reason);
+                if accepted && reason == "queue high water" {
+                    overflow_metrics
+                        .queue_high_water_diversions_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                invalidate_status_cache();
+                accepted
+            }) as Arc<dyn Fn(QueuedChargeEvent, &'static str) -> bool + Send + Sync>
+        });
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |batch: Vec<QueuedChargeEvent>, error| {
                 if snapshot_events_are_pre_spooled {
@@ -2241,26 +2278,11 @@ impl ApiChargebackSink {
                     );
                 }
             })),
-            on_overflow: Some(Arc::new(move |queued: QueuedChargeEvent, reason| {
-                overflow_metrics
+            on_overflow,
+            on_high_water: Some(Arc::new(move |_, _| {
+                high_water_metrics
                     .queue_high_water_hits_total
                     .fetch_add(1, Ordering::Relaxed);
-                if snapshot_events_are_pre_spooled {
-                    invalidate_status_cache();
-                    return;
-                }
-                if let Some(enqueue) = overflow_enqueue.as_ref() {
-                    let _ = enqueue.try_enqueue(vec![queued], reason);
-                } else {
-                    warn!(
-                        plugin = PLUGIN_NAME,
-                        overflow_reason = reason,
-                        "Chargeback sink queue overflowed and spool is disabled; event was lost"
-                    );
-                }
-                invalidate_status_cache();
-            })),
-            on_high_water: Some(Arc::new(|_, _| {
                 invalidate_status_cache();
             })),
             high_watermark_percent: 80,
@@ -2957,7 +2979,7 @@ fn disabled_status_snapshot() -> Value {
         "snapshot_finalizations_oldest_age_secs": oldest_age,
         "snapshot_finalization_recovery_policy": SNAPSHOT_FINALIZATION_RECOVERY_POLICY,
         "totals": {
-            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
+            "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0, "high_water_diversions_total": 0, "full_drops_total": 0},
             "spool": {
                 "files": 0,
                 "bytes": 0,
@@ -2988,6 +3010,8 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
     let mut queue_depth = 0u64;
     let mut queue_capacity = 0u64;
     let mut high_water = 0u64;
+    let mut high_water_diversions = 0u64;
+    let mut full_drops = 0u64;
     let mut spool_files = 0u64;
     let mut spool_bytes = 0u64;
     let mut spool_drops = 0u64;
@@ -3007,6 +3031,18 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             runtime
                 .metrics
                 .queue_high_water_hits_total
+                .load(Ordering::Relaxed),
+        );
+        high_water_diversions = high_water_diversions.saturating_add(
+            runtime
+                .metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        full_drops = full_drops.saturating_add(
+            runtime
+                .metrics
+                .queue_full_drops_total
                 .load(Ordering::Relaxed),
         );
         events_enqueued = events_enqueued.saturating_add(
@@ -3061,7 +3097,9 @@ fn aggregate_status_snapshot(sinks: &BTreeMap<String, Arc<SinkRuntime>>) -> Valu
             "queue": {
                 "depth": queue_depth,
                 "capacity": queue_capacity,
-                "high_water_hits_total": high_water
+                "high_water_hits_total": high_water,
+                "high_water_diversions_total": high_water_diversions,
+                "full_drops_total": full_drops
             },
             "spool": {
                 "files": spool_files,
@@ -3122,6 +3160,11 @@ impl SinkRuntime {
                 "depth": self.logger.queue_depth(),
                 "capacity": self.logger.buffer_capacity(),
                 "high_water_hits_total": self.metrics.queue_high_water_hits_total.load(Ordering::Relaxed),
+                "high_water_diversions_total": self
+                    .metrics
+                    .queue_high_water_diversions_total
+                    .load(Ordering::Relaxed),
+                "full_drops_total": self.metrics.queue_full_drops_total.load(Ordering::Relaxed),
                 "retained_bytes": self.byte_budget.used(),
                 "buffer_max_bytes": self.byte_budget.max_bytes(),
                 "byte_budget_exhausted_total": self
@@ -3252,6 +3295,9 @@ fn render_prometheus_for_sinks(
     let mut spool_all_available = true;
     let mut queue_retained_bytes = 0u64;
     let mut queue_byte_budget_exhausted = 0u64;
+    let mut queue_high_water_hits = 0u64;
+    let mut queue_high_water_diversions = 0u64;
+    let mut queue_full_drops = 0u64;
     let mut snapshot_emits = 0u64;
     let mut snapshot_entries = 0u64;
     let mut snapshot_retained_bytes = 0u64;
@@ -3305,6 +3351,15 @@ fn render_prometheus_for_sinks(
                 .queue_byte_budget_exhausted_total
                 .load(Ordering::Relaxed),
         );
+        queue_high_water_hits = queue_high_water_hits
+            .saturating_add(metrics.queue_high_water_hits_total.load(Ordering::Relaxed));
+        queue_high_water_diversions = queue_high_water_diversions.saturating_add(
+            metrics
+                .queue_high_water_diversions_total
+                .load(Ordering::Relaxed),
+        );
+        queue_full_drops =
+            queue_full_drops.saturating_add(metrics.queue_full_drops_total.load(Ordering::Relaxed));
         let spool_stats = runtime
             .spool
             .as_ref()
@@ -3353,7 +3408,7 @@ fn render_prometheus_for_sinks(
         latency_total = latency_total.saturating_add(metrics.latency.count.load(Ordering::Relaxed));
     }
 
-    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events accepted by the exporter.\n");
+    output.push_str("# HELP chargeback_sink_events_enqueued_total Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.\n");
     output.push_str("# TYPE chargeback_sink_events_enqueued_total counter\n");
     output.push_str(&format!(
         "chargeback_sink_events_enqueued_total {}\n",
@@ -3383,6 +3438,30 @@ fn render_prometheus_for_sinks(
     output.push_str("# HELP chargeback_sink_queue_depth Chargeback sink in-memory queue depth.\n");
     output.push_str("# TYPE chargeback_sink_queue_depth gauge\n");
     output.push_str(&format!("chargeback_sink_queue_depth {}\n", queue_depth));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_hits_total Chargeback sink enqueue attempts observed at or above the queue high-water mark (telemetry only).\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_hits_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_hits_total {}\n",
+        queue_high_water_hits
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_high_water_diversions_total Chargeback sink events whose high-water durable spool-delivery handoff was accepted. Spool delivery saturation/closure is counted by spool loss metrics, not this counter.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_high_water_diversions_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_high_water_diversions_total {}\n",
+        queue_high_water_diversions
+    ));
+    output.push_str(
+        "# HELP chargeback_sink_queue_full_drops_total Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path accepted ownership. Shutdown/unavailable admission is not counted here.\n",
+    );
+    output.push_str("# TYPE chargeback_sink_queue_full_drops_total counter\n");
+    output.push_str(&format!(
+        "chargeback_sink_queue_full_drops_total {}\n",
+        queue_full_drops
+    ));
     output.push_str("# HELP chargeback_sink_snapshot_finalizations_pending Snapshot generations retaining unspooled terminal deltas after admission closed.\n");
     output.push_str("# TYPE chargeback_sink_snapshot_finalizations_pending gauge\n");
     output.push_str(&format!(
@@ -4398,11 +4477,13 @@ struct OwnedSpoolInventory {
 /// inventory/sort rather than rescanning after every deletion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QuotaEvictionReport {
-    /// How many times owned spool metadata was inventoried/sorted.
+    /// How many times owned spool metadata was inventoried/sorted. Greater than
+    /// one only when a selected candidate disappeared and the snapshot had to be
+    /// refreshed before an admission decision could be made.
     pub inventory_passes: u64,
-    /// Owned files present in that inventory snapshot.
+    /// Owned files observed, summed across every inventory pass.
     pub files_inventoried: u64,
-    /// Owned bytes observed before deletions.
+    /// Owned bytes observed by the first inventory pass, before any deletion.
     pub bytes_before: u64,
     /// Files successfully unlinked during the pass.
     pub files_deleted: u64,
@@ -5660,6 +5741,15 @@ impl SpoolManager {
                     inventory.stats.bytes = inventory.stats.bytes.saturating_add(len);
                     inventory.entries.push(OwnedSpoolEntry { path: file, len });
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // A peer sharing the volume can unlink a listed file between
+                    // the walk and this stat. A path with no directory entry
+                    // occupies no quota bytes, so drop it from the snapshot
+                    // instead of failing the caller. The quota refresh loop
+                    // exists to survive exactly this race and cannot do so if
+                    // re-inventorying hard-errors on it.
+                    continue;
+                }
                 Err(error) => {
                     return Err(format!(
                         "{PLUGIN_NAME}: failed to stat spool file '{}': {error}",
@@ -5684,7 +5774,9 @@ impl SpoolManager {
     /// stealing them.
     ///
     /// Planning inventories and sorts the owned set once, then deletes enough
-    /// eligible files from that snapshot in a single bounded pass.
+    /// eligible files from that snapshot in a single bounded pass. If a peer
+    /// removes a selected file, refresh the inventory before admitting so a
+    /// peer replacement absent from the stale snapshot is quota-accounted.
     fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
         self.evict_until_can_admit_with_report(incoming_len)
             .map(|_| ())
@@ -5700,80 +5792,113 @@ impl SpoolManager {
                 self.cfg.max_bytes
             ));
         }
-        let inventory = self.inventory_owned_spool_files()?;
         let mut report = QuotaEvictionReport {
-            inventory_passes: 1,
-            files_inventoried: inventory.stats.files,
-            bytes_before: inventory.stats.bytes,
+            inventory_passes: 0,
+            files_inventoried: 0,
+            bytes_before: 0,
             files_deleted: 0,
             bytes_freed: 0,
         };
-        let mut remaining_bytes = inventory.stats.bytes;
-        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
-            return Ok(report);
-        }
-
-        let wall_clock = SystemTime::now();
-        let mut protected = 0u64;
         let mut warned = false;
-        for entry in &inventory.entries {
+        loop {
+            let inventory = self.inventory_owned_spool_files()?;
+            report.inventory_passes = report.inventory_passes.saturating_add(1);
+            report.files_inventoried = report
+                .files_inventoried
+                .saturating_add(inventory.stats.files);
+            if report.inventory_passes == 1 {
+                report.bytes_before = inventory.stats.bytes;
+            }
+            let mut remaining_bytes = inventory.stats.bytes;
             if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 return Ok(report);
             }
-            if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
-                protected = protected.saturating_add(1);
-                continue;
+
+            // Test seam only: one uncontended slot read, taken after the early
+            // "already fits" return so the common admission path is untouched,
+            // and on a pass that has already paid for a full directory walk.
+            if let Some(hook) = snapshot_spool_write_hook_for_tests() {
+                hook(SpoolWriteHookPoint::QuotaInventoryTaken);
             }
-            self.assert_managed_path(&entry.path)?;
-            match fs::remove_file(&entry.path) {
-                Ok(()) => {
-                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
-                    report.files_deleted = report.files_deleted.saturating_add(1);
-                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
-                    self.metrics
-                        .spool_drops_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    if !warned {
-                        let now = unix_timestamp_seconds();
-                        let last = self.last_drop_warn_at.load(Ordering::Relaxed);
-                        if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
-                            && self
-                                .last_drop_warn_at
-                                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                                .is_ok()
-                        {
-                            warn!(
-                                plugin = PLUGIN_NAME,
-                                max_bytes = self.cfg.max_bytes,
-                                incoming_bytes = incoming_len,
-                                "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
-                            );
-                            warned = true;
+
+            let wall_clock = SystemTime::now();
+            let mut protected = 0u64;
+            let mut inventory_stale = false;
+            for entry in &inventory.entries {
+                if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                    return Ok(report);
+                }
+                if !self.is_evictable_owned_file(entry.path.as_path(), wall_clock) {
+                    protected = protected.saturating_add(1);
+                    continue;
+                }
+                self.assert_managed_path(&entry.path)?;
+                match fs::remove_file(&entry.path) {
+                    Ok(()) => {
+                        remaining_bytes = remaining_bytes.saturating_sub(entry.len);
+                        report.files_deleted = report.files_deleted.saturating_add(1);
+                        report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
+                        self.metrics
+                            .spool_drops_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        if !warned {
+                            let now = unix_timestamp_seconds();
+                            let last = self.last_drop_warn_at.load(Ordering::Relaxed);
+                            if now.saturating_sub(last) >= SPOOL_WARN_INTERVAL_SECS
+                                && self
+                                    .last_drop_warn_at
+                                    .compare_exchange(
+                                        last,
+                                        now,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                            {
+                                warn!(
+                                    plugin = PLUGIN_NAME,
+                                    max_bytes = self.cfg.max_bytes,
+                                    incoming_bytes = incoming_len,
+                                    "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
+                                );
+                                warned = true;
+                            }
                         }
                     }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    // Already gone: credit the snapshot size so admission can
-                    // continue from this one inventory without rescanning.
-                    remaining_bytes = remaining_bytes.saturating_sub(entry.len);
-                    report.bytes_freed = report.bytes_freed.saturating_add(entry.len);
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
-                        entry.path.display()
-                    ));
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A peer may have replaced the missing file with a new
+                        // path after this snapshot. Never credit stale bytes;
+                        // refresh before making an admission decision.
+                        inventory_stale = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "{PLUGIN_NAME}: failed to remove oldest spool file '{}': {error}",
+                            entry.path.display()
+                        ));
+                    }
                 }
             }
-        }
 
-        if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
-            return Ok(report);
+            if inventory_stale {
+                if report.inventory_passes < SPOOL_QUOTA_MAX_INVENTORY_PASSES {
+                    continue;
+                }
+                return Err(format!(
+                    "{PLUGIN_NAME}: spool changed concurrently during {} quota inventory passes; refusing to admit encoded batch ({incoming_len} bytes)",
+                    report.inventory_passes
+                ));
+            }
+
+            if remaining_bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
+                return Ok(report);
+            }
+            return Err(format!(
+                "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
+                self.cfg.max_bytes
+            ));
         }
-        Err(format!(
-            "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}); {protected} retained spool file(s) are in-flight, under an active write, or owned by another identity and are never evicted",
-            self.cfg.max_bytes
-        ))
     }
 
     /// Whether one owned file may be dropped to make room for a new batch.
@@ -6891,11 +7016,16 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
 /// Observation points for the optional spool-write test seam.
 ///
 /// Used by external unit tests to inject deliberate stalls around
-/// [`SpoolManager::write_events`] without relying on wall-clock sleeps.
+/// [`SpoolManager::write_events`] without relying on wall-clock sleeps, and to
+/// mutate the spool tree at the exact instant a quota-eviction snapshot has been
+/// taken so the disappearing-candidate race is deterministic rather than timed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpoolWriteHookPoint {
     BeforeWrite,
     AfterWrite,
+    /// One quota-eviction inventory snapshot has been taken and the tree is over
+    /// the ceiling; deletions from that snapshot have not started yet.
+    QuotaInventoryTaken,
 }
 
 type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;
@@ -9172,11 +9302,29 @@ fn enqueue_charge_event(runtime: &SinkRuntime, event: ChargeEvent) {
         invalidate_status_cache();
         return;
     };
-    runtime
-        .metrics
-        .events_enqueued_total
-        .fetch_add(1, Ordering::Relaxed);
-    runtime.logger.try_send(QueuedChargeEvent { event, lease });
+    match runtime
+        .logger
+        .try_send_outcome(QueuedChargeEvent { event, lease })
+    {
+        TrySendOutcome::ChannelAccepted | TrySendOutcome::DiversionAccepted => {
+            runtime
+                .metrics
+                .events_enqueued_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::BufferFull => {
+            // Genuine full in-memory channel with no accepted durable ownership.
+            runtime
+                .metrics
+                .queue_full_drops_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendOutcome::DiversionRejected | TrySendOutcome::WorkerUnavailable => {
+            // DiversionRejected: spool delivery saturation/closure already
+            // recorded spool job/event loss. WorkerUnavailable: shutdown must
+            // not masquerade as a full-buffer drop.
+        }
+    }
     invalidate_status_cache();
 }
 

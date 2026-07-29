@@ -856,11 +856,16 @@ fn http_header_attribute(
         .map(str::to_string)
 }
 
-/// Parse an IP string into an `IpAddr` for
-/// Istio `source.ip` / `remote.ip` matching. Returns `None` for an
-/// unparseable value so IP-block matchers fail closed.
+/// Parse a context client-IP string into the canonical typed address used for
+/// Istio `source.ip` / `remote.ip` matching. Returns `None` for an unparseable
+/// value so IP-block matchers fail closed.
+///
+/// Ingress already folds IPv4-mapped IPv6 (GHSA-vjwj-657f-5w9g); folding again
+/// here keeps the rendered attribute value and the CIDR comparison — which
+/// canonicalizes independently — from ever describing different principals for
+/// one host.
 fn parse_client_ip(client_ip: &str) -> Option<std::net::IpAddr> {
-    client_ip.trim().parse().ok()
+    crate::util::client_identity::parse_canonical_client_ip(client_ip.trim())
 }
 
 /// Destination port for mesh authorization (`to.operation.ports` /

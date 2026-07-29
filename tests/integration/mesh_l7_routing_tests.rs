@@ -2465,6 +2465,168 @@ async fn mesh_tier3_redirect_vs_returns_redirect_response() {
     }
 }
 
+/// Explicit `redirect.port` and both `derivePort` modes project through the
+/// translator onto the live `mesh_route_dispatch` data path. Request-port
+/// provenance uses `frontend_listen_port` only — never spoofable forwarding
+/// headers.
+#[tokio::test]
+async fn mesh_tier3_redirect_port_and_derive_port_live_data_path() {
+    // Explicit port.
+    let with_port = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/old"}}],
+                    "redirect": {
+                        "uri": "/new",
+                        "authority": "api.example.com",
+                        "scheme": "https",
+                        "port": 8443,
+                        "redirectCode": 302
+                    }
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("explicit port translates");
+    let proxy = with_port
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/old"))
+        .expect("redirect proxy");
+    let dispatch =
+        MeshRouteDispatch::new(&dispatch_plugin_for_proxy(&with_port.config, proxy).config)
+            .expect("plugin config");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/old".to_string(),
+    );
+    let mut headers = HashMap::new();
+    match dispatch.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 302);
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com:8443/new")
+            );
+        }
+        other => panic!("expected explicit-port redirect, got {other:?}"),
+    }
+
+    // FROM_REQUEST_PORT — trusted listener port, ignore X-Forwarded-Port.
+    let with_request_port = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/old"}}],
+                    "redirect": {
+                        "uri": "/new",
+                        "scheme": "https",
+                        "derivePort": "FROM_REQUEST_PORT"
+                    }
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("FROM_REQUEST_PORT translates");
+    let proxy = with_request_port
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/old"))
+        .expect("redirect proxy");
+    let dispatch =
+        MeshRouteDispatch::new(&dispatch_plugin_for_proxy(&with_request_port.config, proxy).config)
+            .expect("plugin config");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/old".to_string(),
+    );
+    ctx.frontend_listen_port = Some(8080);
+    let mut headers = HashMap::from([
+        ("host".to_string(), "api.example.com".to_string()),
+        ("x-forwarded-port".to_string(), "65535".to_string()),
+    ]);
+    match dispatch.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com:8080/new")
+            );
+        }
+        other => panic!("expected FROM_REQUEST_PORT redirect, got {other:?}"),
+    }
+
+    // FROM_PROTOCOL_DEFAULT — strip non-default Host port to scheme default.
+    let with_protocol_default = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"prefix": "/old"}}],
+                    "redirect": {
+                        "uri": "/secure",
+                        "scheme": "https",
+                        "derivePort": "FROM_PROTOCOL_DEFAULT"
+                    }
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("FROM_PROTOCOL_DEFAULT translates");
+    let proxy = with_protocol_default
+        .config
+        .proxies
+        .iter()
+        .find(|p| p.listen_path.as_deref() == Some("/old"))
+        .expect("redirect proxy");
+    let dispatch = MeshRouteDispatch::new(
+        &dispatch_plugin_for_proxy(&with_protocol_default.config, proxy).config,
+    )
+    .expect("plugin config");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/old".to_string(),
+    );
+    let mut headers = HashMap::from([("host".to_string(), "api.example.com:8080".to_string())]);
+    match dispatch.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com/secure")
+            );
+        }
+        other => panic!("expected FROM_PROTOCOL_DEFAULT redirect, got {other:?}"),
+    }
+
+    // Delete: empty translation batch drops the redirect proxy.
+    let deleted = translate_k8s_objects(&[], options()).expect("delete");
+    assert!(
+        !deleted
+            .config
+            .proxies
+            .iter()
+            .any(|p| p.listen_path.as_deref() == Some("/old")),
+        "delete must remove the redirect proxy"
+    );
+}
+
 /// VirtualService L4 `tcp[]` routing materializes a Ferrum TCP stream proxy
 /// (listen-by-port → destination), reusing the stream machinery.
 #[test]

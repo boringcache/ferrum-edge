@@ -71,11 +71,16 @@ pub(crate) async fn handle_mesh_tcp_egress(
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let lb = &epoch.load_balancer;
+    // Canonicalize the captured source once, at the boundary, so the LB hash
+    // key, the observability/stream-summary identity, and every log line below
+    // describe the same principal. A dual-stack capture listener reports an
+    // IPv4 pod as `::ffff:a.b.c.d` (GHSA-vjwj-657f-5w9g).
+    let client_ip = crate::util::client_identity::canonical_ip(remote_addr.ip());
     let mut observability = super::mesh_egress_observability::CapturedMeshEgressLifecycle::start(
         epoch,
         proxy,
         crate::plugins::ProxyProtocol::Tcp,
-        remote_addr.ip(),
+        client_ip,
         &entry.service_fqdn,
         orig_dst.port(),
         asserted_source_identity,
@@ -125,7 +130,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
             return;
         }
     }
-    let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(remote_addr.ip());
+    let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(client_ip);
     let health_ctx = backend_dispatch::health_context_for_selection(
         proxy,
         &state.health_checker,
@@ -154,7 +159,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
         warn!(
             service = %entry.service_fqdn,
             orig_dst = %orig_dst,
-            client_ip = %remote_addr.ip(),
+            client_ip = %client_ip,
             "Raw-TCP mesh egress has no selectable workload target; closing captured connection"
         );
         return;
@@ -378,7 +383,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
         orig_dst = %orig_dst,
         target_host = %target.host,
         target_port = target.port,
-        client_ip = %remote_addr.ip(),
+        client_ip = %client_ip,
         "Relaying captured raw-TCP connection over mesh CONNECT tunnel"
     );
     let buffer_size = state
@@ -467,7 +472,7 @@ fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, p
 }
 
 fn mesh_stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
-    ip.to_canonical().to_string()
+    crate::util::client_identity::canonical_ip_string(ip)
 }
 
 fn mesh_stream_port_lane_supported(

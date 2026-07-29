@@ -964,3 +964,100 @@ async fn vs_query_params_exact_match() {
         PluginResult::Continue
     ));
 }
+
+/// VS feature: `http[].redirect.port` / `derivePort`. Projects onto
+/// `mesh_route_dispatch` `redirect.port` / `redirect.derive_port` and renders
+/// `Location` with scheme-default canonicalization. Request-port provenance is
+/// the trusted frontend listener port only.
+#[tokio::test]
+async fn vs_redirect_port_and_derive_port() {
+    register_feature!(
+        category = CATEGORY,
+        feature = "http[].redirect.port",
+        status = Status::Supported,
+        notes = "Explicit redirect.port and derivePort (FROM_PROTOCOL_DEFAULT / FROM_REQUEST_PORT) project onto mesh_route_dispatch; Location uses trusted orig_dst/frontend_listen_port for FROM_REQUEST_PORT and never X-Forwarded-Port; scheme-default ports are omitted from authority.",
+    );
+
+    // Explicit port.
+    let plugin_config = dispatch_plugin_for_host_only(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/old"}}],
+            "redirect": {
+                "uri": "/new",
+                "authority": "api.example.com",
+                "scheme": "https",
+                "port": 8443
+            }
+        }]
+    }))])
+    .expect("redirect.port must emit mesh_route_dispatch");
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+    let mut req = ctx("GET", "/old");
+    let mut headers = HashMap::new();
+    match dispatch.before_proxy(&mut req, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com:8443/new")
+            );
+        }
+        other => panic!("expected explicit-port redirect, got {other:?}"),
+    }
+
+    // FROM_REQUEST_PORT.
+    let plugin_config = dispatch_plugin_for_host_only(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/old"}}],
+            "redirect": {
+                "uri": "/new",
+                "scheme": "https",
+                "derivePort": "FROM_REQUEST_PORT"
+            }
+        }]
+    }))])
+    .expect("derivePort FROM_REQUEST_PORT must emit mesh_route_dispatch");
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+    let mut req = ctx("GET", "/old");
+    req.frontend_listen_port = Some(8080);
+    let mut headers = HashMap::from([
+        ("host".to_string(), "api.example.com".to_string()),
+        ("x-forwarded-port".to_string(), "65535".to_string()),
+    ]);
+    match dispatch.before_proxy(&mut req, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com:8080/new")
+            );
+        }
+        other => panic!("expected FROM_REQUEST_PORT redirect, got {other:?}"),
+    }
+
+    // FROM_PROTOCOL_DEFAULT.
+    let plugin_config = dispatch_plugin_for_host_only(&[virtual_service(json!({
+        "hosts": ["api.example.com"],
+        "http": [{
+            "match": [{"uri": {"prefix": "/old"}}],
+            "redirect": {
+                "uri": "/secure",
+                "scheme": "https",
+                "derivePort": "FROM_PROTOCOL_DEFAULT"
+            }
+        }]
+    }))])
+    .expect("derivePort FROM_PROTOCOL_DEFAULT must emit mesh_route_dispatch");
+    let dispatch = MeshRouteDispatch::new(&plugin_config.config).expect("plugin config");
+    let mut req = ctx("GET", "/old");
+    let mut headers = HashMap::from([("host".to_string(), "api.example.com:8080".to_string())]);
+    match dispatch.before_proxy(&mut req, &mut headers).await {
+        PluginResult::Reject { headers, .. } => {
+            assert_eq!(
+                headers.get("location").map(String::as_str),
+                Some("https://api.example.com/secure")
+            );
+        }
+        other => panic!("expected FROM_PROTOCOL_DEFAULT redirect, got {other:?}"),
+    }
+}

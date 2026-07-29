@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
@@ -82,25 +83,28 @@ const REQUEST_BODY_CONTENT_KEYS: &[&str] = &["content"];
 const MEDIA_TYPE_OBJECT_KEYS: &[&str] = &["schema", "encoding"];
 /// Fixed fields retained on a generated response object that carries `content`.
 const RESPONSE_OBJECT_KEYS: &[&str] = &["description", "content"];
-/// OpenAPI Header Object fields accepted inside request-body Encoding Objects.
-///
-/// A Header Object is distinguished from the supported bare-schema form by its
-/// `schema` or `content` field. Once that wrapper shape is selected, it is a
-/// fixed-field object: accepting a misspelled `required` would silently make a
-/// required multipart header optional.
-const ENCODING_HEADER_OBJECT_KEYS: &[&str] = &[
+/// Schema-form Header Object fields. `style`/`explode`/`example`/`examples`
+/// apply only when `schema` is selected. Common fields (`description`,
+/// `required`, `deprecated`) are included here and in the content-form set.
+const ENCODING_HEADER_OBJECT_SCHEMA_KEYS: &[&str] = &[
     "description",
     "required",
     "deprecated",
-    "allowEmptyValue",
     "style",
     "explode",
-    "allowReserved",
     "schema",
     "example",
     "examples",
-    "content",
 ];
+
+/// Content-form Header Object fields. Examples belong on the Media Type Object
+/// inside `content`, not on the Header Object itself.
+const ENCODING_HEADER_OBJECT_CONTENT_KEYS: &[&str] =
+    &["description", "required", "deprecated", "content"];
+
+/// Parameter-location fields that OpenAPI forbids on Header Objects
+/// (`allowEmptyValue` is query-only; `allowReserved` is query-only).
+const ENCODING_HEADER_OBJECT_INVALID_KEYS: &[&str] = &["allowEmptyValue", "allowReserved"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -343,6 +347,11 @@ struct EncodingHeaderValidator {
     /// Precomputed at admission so header scalar conversion never re-walks.
     schema_types: SchemaTypeSet,
     validator: jsonschema::Validator,
+    /// When set, the header value is decoded as this single Media Type Object
+    /// media type before schema validation (OpenAPI Header Object `content`).
+    content_media_type: Option<String>,
+    /// Conversion plan for structured `content` decoding (JSON/XML/text/…).
+    conversion: ConversionPlan,
 }
 
 /// Hostile-input caps for multipart parsing (RFC 2046 / RFC 7578).
@@ -1929,84 +1938,135 @@ fn parse_property_encoding(
             let is_header_object = header_object.is_some_and(|object| {
                 object.contains_key("schema") || object.contains_key("content")
             });
-            if is_header_object && let Some(header_object) = header_object {
+            let (schema_value, content_media_type, required) = if is_header_object {
+                let header_object = header_object.ok_or_else(|| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] must be a Header Object"
+                    )
+                })?;
+                let header_path = format!("encoding['{property}'].headers['{header_name}']");
+                let has_schema = header_object.contains_key("schema");
+                let has_content = header_object.contains_key("content");
+                if has_schema && has_content {
+                    return Err(format!(
+                        "{header_path} must not declare both schema and content"
+                    ));
+                }
+                if !has_schema && !has_content {
+                    return Err(format!("{header_path} must contain schema or content"));
+                }
+                for key in ENCODING_HEADER_OBJECT_INVALID_KEYS {
+                    if header_object.contains_key(*key) {
+                        return Err(format!(
+                            "{header_path}.{key} is not valid for Header Objects"
+                        ));
+                    }
+                }
+                if has_content {
+                    for key in ["style", "explode", "example", "examples", "schema"] {
+                        if header_object.contains_key(key) {
+                            return Err(format!(
+                                "{header_path}.{key} is a schema-form Header Object field and is not valid with content"
+                            ));
+                        }
+                    }
+                }
+                // Keep spelling suggestions for near-miss keys on the selected form.
                 reject_unknown_keys(
                     header_object,
-                    &format!("encoding['{property}'].headers['{header_name}']"),
-                    ENCODING_HEADER_OBJECT_KEYS,
+                    &header_path,
+                    if has_content {
+                        ENCODING_HEADER_OBJECT_CONTENT_KEYS
+                    } else {
+                        ENCODING_HEADER_OBJECT_SCHEMA_KEYS
+                    },
                     ERROR_PREFIX,
                 )?;
                 if let Some(description) = header_object.get("description")
                     && !description.is_null()
                     && !description.is_string()
                 {
-                    return Err(format!(
-                        "encoding['{property}'].headers['{header_name}'].description must be a string"
-                    ));
+                    return Err(format!("{header_path}.description must be a string"));
                 }
-                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
-                    if let Some(value) = header_object.get(key)
-                        && !value.is_boolean()
-                    {
-                        return Err(format!(
-                            "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
-                        ));
-                    }
-                }
-                if let Some(examples) = header_object.get("examples")
-                    && !examples.is_object()
+                if let Some(deprecated) = header_object.get("deprecated")
+                    && !deprecated.is_boolean()
                 {
-                    return Err(format!(
-                        "encoding['{property}'].headers['{header_name}'].examples must be an object"
-                    ));
+                    return Err(format!("{header_path}.deprecated must be a boolean"));
                 }
-            }
-            let required = if is_header_object {
-                match header_object.and_then(|object| object.get("required")) {
+                let required = match header_object.get("required") {
                     None => false,
                     Some(Value::Bool(value)) => *value,
                     Some(_) => {
+                        return Err(format!("{header_path}.required must be a boolean"));
+                    }
+                };
+                if has_content {
+                    let content_object = header_object
+                        .get("content")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| format!("{header_path}.content must be an object"))?;
+                    if content_object.len() != 1 {
                         return Err(format!(
-                            "encoding['{property}'].headers['{header_name}'].required must be a boolean"
+                            "{header_path}.content must contain exactly one media type"
                         ));
                     }
+                    let (media_type, media_value) =
+                        content_object.iter().next().ok_or_else(|| {
+                            format!("{header_path}.content must contain exactly one media type")
+                        })?;
+                    let media_path = format!("{header_path}.content['{media_type}']");
+                    validate_concrete_media_type(media_type, &media_path)?;
+                    let media_base = normalize_media_type(media_type);
+                    if media_base == "multipart/form-data" {
+                        return Err(format!("{media_path} does not support multipart/form-data"));
+                    }
+                    let media_object = media_value
+                        .as_object()
+                        .ok_or_else(|| format!("{media_path} must be a Media Type Object"))?;
+                    reject_unknown_keys(
+                        media_object,
+                        &media_path,
+                        &["schema", "example", "examples"],
+                        ERROR_PREFIX,
+                    )?;
+                    if let Some(examples) = media_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(format!("{media_path}.examples must be an object"));
+                    }
+                    if media_object.contains_key("example") && media_object.contains_key("examples")
+                    {
+                        return Err(format!(
+                            "{media_path}.example and .examples are mutually exclusive"
+                        ));
+                    }
+                    let schema = media_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{media_path} must contain schema"))?;
+                    (schema, Some(media_base), required)
+                } else {
+                    if let Some(style) = header_object.get("style")
+                        && style.as_str() != Some("simple")
+                    {
+                        return Err(format!("{header_path}.style must be 'simple'"));
+                    }
+                    if let Some(explode) = header_object.get("explode")
+                        && !explode.is_boolean()
+                    {
+                        return Err(format!("{header_path}.explode must be a boolean"));
+                    }
+                    if let Some(examples) = header_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(format!("{header_path}.examples must be an object"));
+                    }
+                    let schema = header_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{header_path} must contain schema or content"))?;
+                    (schema, None, required)
                 }
             } else {
-                true
-            };
-            if is_header_object
-                && header_object.is_some_and(|object| object.contains_key("content"))
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].content is not supported; use a schema Header Object"
-                ));
-            }
-            if is_header_object
-                && let Some(style) = header_object.and_then(|object| object.get("style"))
-                && style.as_str() != Some("simple")
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
-                ));
-            }
-            if is_header_object
-                && let Some(explode) = header_object.and_then(|object| object.get("explode"))
-                && !explode.is_boolean()
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
-                ));
-            }
-            let schema_value = if is_header_object {
-                header_object
-                    .and_then(|object| object.get("schema"))
-                    .ok_or_else(|| {
-                        format!(
-                            "encoding['{property}'].headers['{header_name}'] must contain schema"
-                        )
-                    })?
-            } else {
-                header_schema
+                (header_schema, None, true)
             };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
@@ -2014,6 +2074,12 @@ fn parse_property_encoding(
                 )
             })?;
             let schema_types = collect_schema_types(schema_value);
+            let conversion =
+                ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                    )
+                })?;
             headers.insert(
                 name,
                 EncodingHeaderValidator {
@@ -2021,6 +2087,8 @@ fn parse_property_encoding(
                     schema: schema_value.clone(),
                     schema_types,
                     validator,
+                    content_media_type,
+                    conversion,
                 },
             );
         }
@@ -2735,27 +2803,16 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
-        // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
-        // extended filename parameters as an ordinary non-file field would
-        // re-enable structured JSON/XML body spoofing. Reject unsupported
-        // extended/continued forms instead of dropping their file semantics.
-        if params.keys().any(|key| key.starts_with("filename*")) {
-            return Err(
-                "Malformed multipart part: extended filename parameters are unsupported"
-                    .to_string(),
-            );
-        }
         if name.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
-        if let Some(filename) = params.get("filename")
-            && filename.value.len() > MAX_MULTIPART_PARAM_BYTES
-        {
-            return Err("Multipart filename exceeds size limit".to_string());
-        }
+        // Resolve ordinary `filename` and RFC 5987/8187 `filename*` with
+        // fail-closed conflict/continuation rules. Presence of either form
+        // marks a file part so structured JSON/XML body spoofing stays closed.
+        let filename = resolve_multipart_filename(&params)?;
         parts.push(MultipartPart {
             name: name.to_string(),
-            filename: params.get("filename").map(|value| value.value.clone()),
+            filename,
             content_type: headers.get("content-type").cloned(),
             headers,
             body: part_body.to_vec(),
@@ -3584,6 +3641,39 @@ fn multipart_values_to_schema_value(
     multipart_part_to_schema_value(first, schema, encoding, conversion)
 }
 
+/// Decode an Encoding Object Header Object `content` value under the existing
+/// multipart header-size ceiling, then materialize a JSON Schema instance.
+fn header_content_to_schema_value(
+    value: &str,
+    media_type: &str,
+    schema: &Value,
+    conversion: &ConversionPlan,
+) -> Result<Value, String> {
+    if value.len() > MAX_MULTIPART_HEADER_BYTES {
+        return Err(format!(
+            "header content exceeds {MAX_MULTIPART_HEADER_BYTES} bytes"
+        ));
+    }
+    let media_type = media_type.to_ascii_lowercase();
+    if is_json_media_type(&media_type) {
+        return serde_json::from_str(value)
+            .map_err(|error| format!("Invalid JSON header content: {error}"));
+    }
+    if is_xml_media_type(&media_type) {
+        return xml_body_to_value(value, schema, conversion);
+    }
+    if media_type == "application/x-www-form-urlencoded" {
+        return form_urlencoded_to_value(value, schema, &AHashMap::new(), conversion);
+    }
+    if is_text_media_type(&media_type) {
+        return scalar_to_schema_value(value, schema, conversion);
+    }
+    match binary_body_to_schema_instance(value.as_bytes(), schema)? {
+        SchemaInstance::Value(instance) => Ok(instance),
+        SchemaInstance::BinaryLengthOnly => Ok(Value::String(value.to_string())),
+    }
+}
+
 fn multipart_part_to_schema_value(
     part: &MultipartPart,
     schema: &Value,
@@ -3615,12 +3705,34 @@ fn multipart_part_to_schema_value(
                 }
                 continue;
             };
-            let converted = scalar_to_schema_value_with_types(
-                header_value,
-                &header_validator.schema,
-                header_validator.schema_types,
-                schema_is_composed(&header_validator.schema).then_some(&header_validator.validator),
-            )?;
+            if header_value.len() > MAX_MULTIPART_HEADER_BYTES {
+                return Err(format!(
+                    "Multipart field '{}' header '{header_name}' exceeds {MAX_MULTIPART_HEADER_BYTES} bytes",
+                    part.name
+                ));
+            }
+            let converted = if let Some(media_type) = &header_validator.content_media_type {
+                header_content_to_schema_value(
+                    header_value,
+                    media_type,
+                    &header_validator.schema,
+                    &header_validator.conversion,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Multipart field '{}' header '{header_name}' failed content decoding: {error}",
+                        part.name
+                    )
+                })?
+            } else {
+                scalar_to_schema_value_with_types(
+                    header_value,
+                    &header_validator.schema,
+                    header_validator.schema_types,
+                    schema_is_composed(&header_validator.schema)
+                        .then_some(&header_validator.validator),
+                )?
+            };
             header_validator
                 .validator
                 .validate(&converted)
@@ -4358,11 +4470,7 @@ fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
             "{ERROR_PREFIX}'{path}' must be a valid HTTP header value"
         ));
     }
-    let base = value.split(';').next().unwrap_or("").trim();
-    let Some((type_, subtype)) = base.split_once('/') else {
-        return Err(format!("{ERROR_PREFIX}'{path}' must be a media type"));
-    };
-    if type_ == "*" || subtype == "*" || !is_mime_token(type_) || !is_mime_token(subtype) {
+    if !is_concrete_http_media_type(value) {
         return Err(format!(
             "{ERROR_PREFIX}'{path}' must be a concrete media type"
         ));
@@ -4524,11 +4632,14 @@ fn parse_header_type_and_params(
         if piece.is_empty() {
             continue;
         }
+        // MIME parameters are always `attribute=value`. Bare segments such as
+        // `filename*` / `filename*0` must fail closed so extended filename
+        // family markers cannot disappear before file-part resolution.
         let Some((key, raw_value)) = piece.split_once('=') else {
-            continue;
+            return Err("Malformed header parameter: expected name=value".to_string());
         };
         let key = key.trim().to_ascii_lowercase();
-        if key.is_empty() || key.len() > 256 {
+        if key.is_empty() || key.len() > 256 || !is_mime_token(&key) {
             return Err("Invalid header parameter name".to_string());
         }
         let decoded = decode_header_param_value(raw_value.trim())?;
@@ -4611,7 +4722,211 @@ fn decode_header_param_value(value: &str) -> Result<HeaderParamValue, String> {
     })
 }
 
+/// Resolve the effective multipart filename from Content-Disposition params.
+///
+/// Supports ordinary RFC 7578 `filename` and a single RFC 5987/8187
+/// `filename*` extended value (`charset'language'value-chars`). Continuations
+/// (`filename*0*`, …), duplicates, ambiguous `filename`+`filename*`, quoted
+/// `filename*` (RFC 8187 `ext-value` is not a quoted-string), unsupported
+/// charsets, malformed percent-encoding, invalid UTF-8, CR/LF/NUL, and encoded
+/// length overflow fail closed. A decoded-length cap is kept as defense in
+/// depth even though percent-decoding cannot expand past the raw value-chars
+/// budget. Either form marks a file part so structured body spoofing cannot
+/// demote the part to a non-file field.
+fn resolve_multipart_filename(
+    params: &HashMap<String, HeaderParamValue>,
+) -> Result<Option<String>, String> {
+    let mut filename_star: Option<&HeaderParamValue> = None;
+    for (key, value) in params {
+        if key == "filename*" {
+            filename_star = Some(value);
+        } else if key.starts_with("filename*") {
+            // RFC 2231 continuations / sectioned forms are unsupported.
+            return Err(
+                "Malformed multipart part: filename* continuations are unsupported".to_string(),
+            );
+        }
+    }
+
+    let ordinary = params.get("filename");
+    match (ordinary, filename_star) {
+        (Some(_), Some(_)) => {
+            Err("Malformed multipart part: ambiguous filename and filename* parameters".to_string())
+        }
+        (Some(ordinary), None) => {
+            if ordinary.value.len() > MAX_MULTIPART_PARAM_BYTES {
+                return Err("Multipart filename exceeds size limit".to_string());
+            }
+            reject_filename_injection(&ordinary.value)?;
+            Ok(Some(ordinary.value.clone()))
+        }
+        (None, Some(extended)) => {
+            // RFC 8187 `ext-value` is not a quoted-string. Stripping quotes and
+            // decoding would accept a non-conforming wire form.
+            if extended.was_quoted {
+                return Err(
+                    "Malformed multipart part: filename* must not be a quoted-string".to_string(),
+                );
+            }
+            let decoded = decode_rfc8187_filename_star(&extended.value)?;
+            Ok(Some(decoded))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Decode RFC 8187 `ext-value` for `filename*`: `charset'language'value-chars`.
+///
+/// Supported charset is UTF-8 only (case-insensitive). Language tags, when
+/// present, must be a conservative ASCII subset and are otherwise ignored for
+/// decoding. `value-chars` may contain only `attr-char` and well-formed
+/// percent-encoded octets; the decoded byte sequence must be valid UTF-8.
+fn decode_rfc8187_filename_star(raw: &str) -> Result<String, String> {
+    if raw.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* exceeds size limit".to_string());
+    }
+    let Some((charset, rest)) = raw.split_once('\'') else {
+        return Err(
+            "Malformed multipart part: filename* must use charset'language'value form".to_string(),
+        );
+    };
+    let Some((language, value_chars)) = rest.split_once('\'') else {
+        return Err(
+            "Malformed multipart part: filename* must use charset'language'value form".to_string(),
+        );
+    };
+    if !charset.eq_ignore_ascii_case("utf-8") {
+        return Err(
+            "Malformed multipart part: unsupported filename* charset (only UTF-8 is supported)"
+                .to_string(),
+        );
+    }
+    if !is_supported_rfc8187_language(language) {
+        return Err("Malformed multipart part: invalid filename* language tag".to_string());
+    }
+    if value_chars.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* exceeds size limit".to_string());
+    }
+    // Percent-decoding maps 3 wire bytes to 1 output byte (or copies attr-char
+    // 1:1), so decoded length cannot exceed the raw value-chars cap above. The
+    // decoded-length checks below are defense in depth only.
+    let decoded_bytes = decode_rfc8187_value_chars(value_chars)?;
+    if decoded_bytes.len() > MAX_MULTIPART_PARAM_BYTES {
+        return Err("Multipart filename* decoded value exceeds size limit".to_string());
+    }
+    let decoded = String::from_utf8(decoded_bytes).map_err(|_| {
+        "Malformed multipart part: filename* decoded value is not valid UTF-8".to_string()
+    })?;
+    reject_filename_injection(&decoded)?;
+    Ok(decoded)
+}
+
+fn is_supported_rfc8187_language(language: &str) -> bool {
+    // Empty language is common (`UTF-8''file.txt`). Non-empty tags are limited
+    // to a conservative Language-Tag subset: 1*8ALPHA *("-" 1*8alphanum).
+    if language.is_empty() {
+        return true;
+    }
+    let mut parts = language.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(1..=8).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    for subtag in parts {
+        if !(1..=8).contains(&subtag.len()) || !subtag.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn decode_rfc8187_value_chars(value_chars: &str) -> Result<Vec<u8>, String> {
+    let bytes = value_chars.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let Some(hi) = bytes
+                    .get(index + 1)
+                    .copied()
+                    .and_then(|byte| char::from(byte).to_digit(16))
+                else {
+                    return Err(
+                        "Malformed multipart part: filename* contains malformed percent-encoding"
+                            .to_string(),
+                    );
+                };
+                let Some(lo) = bytes
+                    .get(index + 2)
+                    .copied()
+                    .and_then(|byte| char::from(byte).to_digit(16))
+                else {
+                    return Err(
+                        "Malformed multipart part: filename* contains malformed percent-encoding"
+                            .to_string(),
+                    );
+                };
+                out.push(((hi << 4) | lo) as u8);
+                index += 3;
+            }
+            byte if is_rfc8187_attr_char(byte) => {
+                out.push(byte);
+                index += 1;
+            }
+            _ => {
+                return Err(
+                    "Malformed multipart part: filename* value contains characters outside attr-char"
+                        .to_string(),
+                );
+            }
+        }
+        // Defense in depth: unreachable while callers cap value_chars length
+        // first, because decoding never expands past the wire length.
+        if out.len() > MAX_MULTIPART_PARAM_BYTES {
+            return Err("Multipart filename* decoded value exceeds size limit".to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// RFC 8187 `attr-char`.
+fn is_rfc8187_attr_char(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
+fn reject_filename_injection(filename: &str) -> Result<(), String> {
+    if filename
+        .bytes()
+        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+    {
+        return Err("Malformed multipart part: filename contains CR, LF, or NUL".to_string());
+    }
+    Ok(())
+}
+
 /// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.
+/// Retained for multipart Content-Type parameter names/values (including
+/// boundary) where the historical MIME token grammar still applies.
 fn is_mime_token(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_mime_token_char)
 }

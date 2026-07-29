@@ -94,7 +94,8 @@ const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 /// Request-metadata namespace prefix. Each plugin instance appends its
 /// process-unique [`ResponseCaching::instance_id`] so multiple
 /// `response_caching` configs on one proxy cannot overwrite one another's
-/// staged base key, status, predictor key, timing, or header snapshot.
+/// staged base key, status, predictor key, timing, header snapshot, or
+/// pending unsafe-method invalidation host partition.
 const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
 const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
 const CACHE_STATUS_SUFFIX: &str = "cache_status";
@@ -108,6 +109,14 @@ const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str = "cache_request_starte
 /// and the bug it fixes. The full metadata key is
 /// `response_caching.<instance_id>.cache_request_headers_snapshot`.
 const CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX: &str = "cache_request_headers_snapshot";
+/// Normalized Host/authority partition (`h-<sha256>` or empty) stashed when an
+/// unsafe method may require RFC 9111 §4.4 invalidation after a non-error
+/// response. Must match [`cache_key_host_part`] used by lookup/storage.
+const CACHE_PENDING_INVALIDATE_HOST_SUFFIX: &str = "cache_pending_invalidate_host";
+/// Client-facing path stashed alongside the authority partition above. The
+/// proxy may replace `RequestContext::path` with a backend route rewrite before
+/// `after_proxy`, so deferred invalidation must not read the then-current path.
+const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_path";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -989,6 +998,10 @@ pub struct ResponseCaching {
     meta_request_started: String,
     /// Precomputed `response_caching.<id>.cache_request_headers_snapshot`.
     meta_headers_snapshot: String,
+    /// Precomputed `response_caching.<id>.cache_pending_invalidate_host`.
+    meta_pending_invalidate_host: String,
+    /// Precomputed `response_caching.<id>.cache_pending_invalidate_path`.
+    meta_pending_invalidate_path: String,
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
@@ -1050,6 +1063,14 @@ impl ResponseCaching {
                 instance_id,
                 CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX,
             ),
+            meta_pending_invalidate_host: staging_metadata_key(
+                instance_id,
+                CACHE_PENDING_INVALIDATE_HOST_SUFFIX,
+            ),
+            meta_pending_invalidate_path: staging_metadata_key(
+                instance_id,
+                CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
+            ),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1099,11 +1120,22 @@ impl ResponseCaching {
     /// sibling instances' namespaced keys. Used on method/SSE bypass and
     /// HIT/REVALIDATED so leftover base/snapshot/predict/timing from an
     /// earlier phase of this instance cannot leak into a later final hook.
+    /// Pending unsafe-method invalidation host is intentionally retained
+    /// unless [`Self::clear_pending_invalidation`] is also called.
     fn clear_lookup_staging(&self, ctx: &mut RequestContext) {
         ctx.metadata.remove(&self.meta_base_key);
         ctx.metadata.remove(&self.meta_predict_key);
         ctx.metadata.remove(&self.meta_request_started);
         ctx.metadata.remove(&self.meta_headers_snapshot);
+    }
+
+    /// Drop a staged unsafe-method invalidation without applying it.
+    ///
+    /// Used when a cache HIT/REVALIDATED short-circuits before origin contact:
+    /// serving a stored representation must not flush peer path variants.
+    fn clear_pending_invalidation(&self, ctx: &mut RequestContext) {
+        ctx.metadata.remove(&self.meta_pending_invalidate_host);
+        ctx.metadata.remove(&self.meta_pending_invalidate_path);
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -1326,11 +1358,20 @@ impl ResponseCaching {
     /// RFC 9110 §9.2.1 safe methods (GET/HEAD/OPTIONS/TRACE) never invalidate
     /// cached entries, even when absent from `cacheable_methods` — being
     /// ineligible for storage is not the same as changing server state. Every
-    /// other method (POST/PUT/PATCH/DELETE, and any extension method, which is
-    /// conservatively treated as unsafe because its semantics are unknown to
-    /// the gateway) triggers `invalidate_on_unsafe_methods`.
+    /// other method (POST/PUT/PATCH/DELETE, and any extension/custom method)
+    /// is treated as unsafe. Unknown methods fail closed: their semantics are
+    /// unknown to the gateway, so `invalidate_on_unsafe_methods` applies after
+    /// a non-error response (RFC 9111 §4.4).
     fn is_unsafe_method(method: &str) -> bool {
         !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+
+    /// RFC 9110 / RFC 9111: final status codes below 400 are non-error.
+    ///
+    /// Mandatory cache invalidation for unsafe methods is tied to receiving a
+    /// non-error response, not merely forwarding the request.
+    fn is_non_error_status(status: u16) -> bool {
+        status < 400
     }
 
     fn cache_lookup_vary_headers(&self, base_key: &str) -> Vec<String> {
@@ -1640,21 +1681,27 @@ impl ResponseCaching {
         }
     }
 
-    /// Invalidate cache entries matching a path pattern.
-    /// Called when an unsafe method (POST/PUT/PATCH/DELETE, or an extension
-    /// method conservatively treated as unsafe — see
-    /// [`Self::is_unsafe_method`]) hits a path.
-    fn invalidate_path(&self, ctx: &RequestContext) {
+    /// Invalidate cache entries matching a path under one authority partition.
+    ///
+    /// Called only after a non-error response to an unsafe method (see
+    /// [`Self::is_unsafe_method`] and RFC 9111 §4.4). `host_part` must be the
+    /// same normalized Host partition that [`Self::build_base_cache_key`]
+    /// embeds (including the empty partition when Host is absent), so a
+    /// mutation on authority A cannot evict authority B on a shared proxy.
+    fn invalidate_path(&self, ctx: &RequestContext, host_part: &str, path: &str) {
         let _guard = self.accounting_guard();
         let proxy_id = ctx
             .matched_proxy
             .as_ref()
             .map(|p| p.id.as_str())
             .unwrap_or("_");
-        let mut prefix = String::with_capacity(proxy_id.len() + 1);
+        // Prefix is `proxy_id:host_part:` — identical authority isolation to
+        // lookup/storage. Avoids scanning other Host partitions on the proxy.
+        let mut prefix = String::with_capacity(proxy_id.len() + 1 + host_part.len() + 1);
         prefix.push_str(proxy_id);
         prefix.push(':');
-        let path = &ctx.path;
+        prefix.push_str(host_part);
+        prefix.push(':');
         let mut removed_size = 0usize;
 
         self.cache.retain(|key, entry| {
@@ -1678,6 +1725,47 @@ impl ResponseCaching {
         // (every principal/variant of the invalidated path); reclaim them now
         // rather than waiting for the next store.
         self.prune_vary_index_locked();
+    }
+
+    /// Stage RFC 9111 §4.4 invalidation for an unsafe method using the same
+    /// transformed Host view that cache lookup would use. Actual eviction runs
+    /// in [`Self::after_proxy`] only after a non-error response.
+    fn stage_pending_invalidation(
+        &self,
+        ctx: &mut RequestContext,
+        request_headers: &HashMap<String, String>,
+    ) {
+        let host_part = request_headers
+            .get("host")
+            .map(|h| cache_key_host_part(h))
+            .unwrap_or_default();
+        ctx.metadata
+            .insert(self.meta_pending_invalidate_host.clone(), host_part);
+        ctx.metadata
+            .insert(self.meta_pending_invalidate_path.clone(), ctx.path.clone());
+    }
+
+    /// Apply a previously staged unsafe-method invalidation when the origin
+    /// produced a non-error status.
+    ///
+    /// Prefers private typed origin provenance
+    /// ([`RequestContext::origin_http_response_status`]) when present so an
+    /// earlier `after_proxy` rejection that replaces the client-visible status
+    /// cannot suppress eviction after a successful mutation. Falls back to
+    /// `response_status` for direct `after_proxy` calls (unit tests) that never
+    /// went through `run_after_proxy_hooks`. Consumes the staged host exactly
+    /// once so observe + after_proxy cannot double-invalidate.
+    fn maybe_apply_pending_invalidation(&self, ctx: &mut RequestContext, response_status: u16) {
+        let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
+            return;
+        };
+        let Some(path) = ctx.metadata.remove(&self.meta_pending_invalidate_path) else {
+            return;
+        };
+        let status = ctx.origin_http_response_status().unwrap_or(response_status);
+        if Self::is_non_error_status(status) {
+            self.invalidate_path(ctx, &host_part, &path);
+        }
     }
 
     fn add_cache_status_header(&self, headers: &mut HashMap<String, String>, value: &str) {
@@ -2067,16 +2155,25 @@ impl Plugin for ResponseCaching {
         // refuses to store a representation produced across a publication.
         // One ArcSwap load, memoized on the context for sibling instances.
         let policy_stamp = ctx.pin_response_policy_stamp().clone();
+
+        // Method safety is independent of storage eligibility (RFC 9111 §4.4 /
+        // RFC 9110 §9.2.1). An unsafe method listed in `cacheable_methods`
+        // (e.g. POST) must still stage authority-scoped invalidation; a safe
+        // method merely absent from that set must not. Staging uses the live
+        // `headers` view so a rewritten Host partitions identically to lookup.
+        // HIT/REVALIDATED paths clear this staging below — a served cache HIT
+        // never contacted the origin and must not flush peer variants.
+        let stage_unsafe_invalidation =
+            self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method);
+        if stage_unsafe_invalidation {
+            self.stage_pending_invalidation(ctx, headers);
+        }
+
         if !self.is_cacheable_method(&ctx.method) {
-            // Only genuinely unsafe methods evict: a safe method that is
-            // merely ineligible for storage (OPTIONS with the default
-            // cacheable set, HEAD with a GET-only set) must bypass without
-            // flushing hot entries.
-            if self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method) {
-                self.invalidate_path(ctx);
-            }
-            // Clear only this instance's staging so a sibling cache keeps
-            // its independently staged base/snapshot/status.
+            // Clear only this instance's lookup staging so a sibling cache keeps
+            // its independently staged base/snapshot/status. Pending
+            // invalidation host is intentionally retained until origin success
+            // is observed (or cleared on a later HIT of a cacheable sibling).
             self.clear_lookup_staging(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
@@ -2127,7 +2224,9 @@ impl Plugin for ResponseCaching {
             if directives.request_bypasses_cache() {
                 // Keep this instance's staged base/snapshot/predict so a
                 // no-cache refresh can still store the replacement response
-                // under the same instance-owned key inputs.
+                // under the same instance-owned key inputs. Pending unsafe
+                // invalidation (if any) is retained — the request contacts
+                // the origin.
                 self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
@@ -2178,8 +2277,11 @@ impl Plugin for ResponseCaching {
                     self.set_cache_status(ctx, "REVALIDATED");
                     // HIT/REVALIDATED will not store; drop this instance's
                     // lookup staging so a later final hook cannot mix it with
-                    // another instance's store path.
+                    // another instance's store path. Also drop pending
+                    // invalidation — this representation was served without
+                    // contacting the origin.
                     self.clear_lookup_staging(ctx);
+                    self.clear_pending_invalidation(ctx);
                     // Stored validators/headers are already the final
                     // post-transform representation. Mark the private finalized
                     // replay capability so synthetic presentation transforms
@@ -2198,6 +2300,7 @@ impl Plugin for ResponseCaching {
                 self.add_cache_status_header(&mut headers, "HIT");
                 self.set_cache_status(ctx, "HIT");
                 self.clear_lookup_staging(ctx);
+                self.clear_pending_invalidation(ctx);
                 // Same finalized-replay contract as REVALIDATED / idempotent
                 // replay: the entry was stored after transform_response_body
                 // and after_proxy header rules on the miss path.
@@ -2215,12 +2318,27 @@ impl Plugin for ResponseCaching {
         PluginResult::Continue
     }
 
+    fn observe_origin_http_response_status(&self, ctx: &mut RequestContext, status: u16) {
+        // RFC 9111 §4.4: mandatory invalidation runs on a non-error origin
+        // response, not on successful client presentation. This hook is
+        // invoked by proxy core before any `after_proxy` plugin can reject,
+        // so an earlier response-size / OpenAPI rejection cannot suppress
+        // eviction after a successful mutation.
+        self.maybe_apply_pending_invalidation(ctx, status);
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Safety net for direct `after_proxy` calls (unit tests) and any path
+        // that reached this hook with staging still pending. When
+        // `observe_origin_http_response_status` already consumed the staging
+        // key, this is a no-op.
+        self.maybe_apply_pending_invalidation(ctx, response_status);
+
         let Some(status) = self.cache_status(ctx) else {
             // A preceding sibling may already have short-circuited with a HIT
             // before this instance reached `before_proxy`. Do not invent MISS
@@ -3000,6 +3118,15 @@ mod tests {
             .insert("host".to_string(), "example.com".to_string());
         let mut post_headers = post_ctx.headers.clone();
         plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+        assert_eq!(
+            plugin.cache.len(),
+            1,
+            "unsafe method must not invalidate before a non-error response"
+        );
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+            .await;
 
         assert!(
             plugin.cache.is_empty(),
@@ -3030,6 +3157,10 @@ mod tests {
             .insert("host".to_string(), "example.com".to_string());
         let mut post_headers = post_ctx.headers.clone();
         plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+        let mut resp_headers = HashMap::new();
+        plugin
+            .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+            .await;
 
         assert_eq!(
             plugin.cache.len(),
@@ -3163,6 +3294,10 @@ mod tests {
                 .insert("host".to_string(), host.to_string());
             let mut post_headers = post_ctx.headers.clone();
             plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+            let mut resp_headers = HashMap::new();
+            plugin
+                .after_proxy(&mut post_ctx, 200, &mut resp_headers)
+                .await;
 
             assert!(
                 plugin.cache.is_empty(),

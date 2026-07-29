@@ -137,6 +137,32 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::supervise_tcp_accept_loop_peers(peers, cancel_siblings).await
     }
 
+    /// Classify an unexpected DTLS recv-loop JoinHandle result the same way
+    /// production does when the accept loop observes recv-task exit.
+    pub fn classify_dtls_recv_loop_exit_for_test(
+        join_result: Result<Result<(), anyhow::Error>, tokio::task::JoinError>,
+    ) -> anyhow::Error {
+        crate::proxy::udp_proxy::classify_dtls_recv_loop_exit(join_result)
+    }
+
+    /// Drive DTLS recv-loop vs shutdown supervision with synthetic tasks.
+    pub async fn supervise_dtls_recv_loop_task_for_test(
+        server_task: tokio::task::JoinHandle<Result<(), anyhow::Error>>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        global_shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        on_shutdown: impl FnOnce(),
+    ) -> Result<(), anyhow::Error> {
+        crate::proxy::udp_proxy::supervise_dtls_recv_loop_task(
+            server_task,
+            shutdown_rx,
+            global_shutdown_rx,
+            started,
+            on_shutdown,
+        )
+        .await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -1263,6 +1289,11 @@ pub mod _test_support {
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
         pub max_maintenance_entries: usize,
+        /// The fixed claim-retention horizon in seconds that entries are
+        /// expired against. Not configurable and not per-generation: it is the
+        /// widest acceptance window the schema admits, so no later reload can
+        /// outlive a claim.
+        pub retention_seconds: u64,
     }
 
     /// Controllable-time harness for the PasswordDigest nonce replay state.
@@ -1280,6 +1311,23 @@ pub mod _test_support {
                 plugin: crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?,
                 epoch: std::time::Instant::now(),
             })
+        }
+
+        /// A harness bound to a registered process replay scope, sharing an
+        /// explicit epoch so two generations of the same scope can be driven
+        /// against one deterministic timeline.
+        pub fn with_scope(
+            config: &serde_json::Value,
+            plugin_config_id: &str,
+            epoch: std::time::Instant,
+        ) -> Result<Self, String> {
+            use crate::plugins::soap_ws_security::SoapWsSecurity;
+            let plugin = SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+            Ok(Self { plugin, epoch })
         }
 
         pub fn claim(&self, nonce: &str) -> Result<(), String> {
@@ -1304,8 +1352,30 @@ pub mod _test_support {
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
+                retention_seconds: snapshot.retention_seconds,
             })
         }
+    }
+
+    /// The UsernameToken `Created` admission decision at an explicit instant.
+    /// The outer `Result` is construction, the inner one is the decision.
+    pub fn soap_username_token_created_outcome_for_test(
+        config: &serde_json::Value,
+        security_block: &str,
+        created: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Result<(), String>, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        Ok(plugin.username_token_created_outcome_for_tests(security_block, created, now))
+    }
+
+    /// The TTL a `replay_scope: shared` claim writes with its atomic
+    /// `SET NX EX`, observed without a live Redis server.
+    pub fn soap_shared_claim_retention_seconds_for_test(
+        config: &serde_json::Value,
+    ) -> Result<u64, String> {
+        crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+            .shared_claim_retention_seconds_for_tests()
     }
 
     /// One-shot proof that map/index drift cannot be recovered as a fresh
@@ -1320,6 +1390,82 @@ pub mod _test_support {
             Ok(()) => Err("soap nonce inconsistent state admitted a probe".to_string()),
             Err(error) => Ok(error),
         }
+    }
+
+    pub const MAX_NONCE_REPLAY_SCOPES_FOR_TESTS: usize =
+        crate::plugins::soap_ws_security::MAX_NONCE_REPLAY_SCOPES_FOR_TESTS;
+    pub const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 =
+        crate::plugins::soap_ws_security::NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS;
+
+    pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
+    }
+
+    pub fn soap_nonce_replay_registry_contains_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_contains_for_tests(scope_key)
+    }
+
+    /// Process-global registry key for `plugin_config_id` under the default
+    /// namespace used by `PluginHttpClient::default()`.
+    pub fn soap_nonce_replay_scope_key_for_test(plugin_config_id: &str) -> String {
+        format!(
+            "{}|{plugin_config_id}",
+            crate::config::types::DEFAULT_NAMESPACE
+        )
+    }
+
+    /// Build a scoped process-replay plugin and poison its registry mutex.
+    pub fn soap_poison_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.poison_nonce_replay_state_for_tests()?;
+        // Drop the plugin so the registry is the sole strong owner; prune must
+        // still refuse to replace poisoned state.
+        drop(plugin);
+        Ok(())
+    }
+
+    /// Build a scoped process-replay plugin, seed one claim, then corrupt the
+    /// age index and drop the holder so the registry is the sole owner.
+    pub fn soap_retire_inconsistent_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.check_nonce_replay("inconsistent-retired-seed")?;
+        plugin.corrupt_nonce_age_index_for_tests()?;
+        drop(plugin);
+        Ok(())
+    }
+
+    /// Retire a replay scope whose cache and age index retain equal cardinality
+    /// but no longer describe the same claim.
+    pub fn soap_retire_same_cardinality_drift_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.check_nonce_replay("same-cardinality-retired-seed")?;
+        plugin.corrupt_nonce_age_index_value_for_tests()?;
+        drop(plugin);
+        Ok(())
     }
 
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
@@ -1519,6 +1665,44 @@ pub mod _test_support {
         error: &WsError,
     ) -> Option<(CloseFrame, &'static str, usize, usize)> {
         crate::proxy::EffectiveWsSizeLimits::global_capacity_close_for_error(error)
+    }
+
+    /// Resolve the parser incomplete-message bounds from env config.
+    /// Returns `(max_frames, max_duration)`; `None` means that bound is off.
+    pub fn ws_fragment_policy_from_env_for_test(
+        env_config: &crate::config::EnvConfig,
+    ) -> (Option<usize>, Option<std::time::Duration>) {
+        crate::proxy::WsFragmentPolicy::from_env(env_config).bounds()
+    }
+
+    /// Bounded incomplete-message policy Close (RFC 6455 1008).
+    pub fn ws_fragment_policy_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_fragment_policy_close_frame()
+    }
+
+    /// Policy-Close selection for the parser's incomplete-message bounds.
+    pub fn ws_fragment_policy_close_for_error_for_test(
+        error: &WsError,
+    ) -> Option<(CloseFrame, &'static str)> {
+        crate::proxy::ws_fragment_policy_close_for_error(error)
+    }
+
+    /// Exercise the shared H1/H2/H3 reassembly-fragment charging path.
+    pub async fn apply_ws_fragment_plugins_for_test(
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        proxy_id: &str,
+        connection_id: u64,
+        direction: crate::plugins::WebSocketFrameDirection,
+        fragment_frames: u64,
+    ) -> Option<Option<CloseFrame>> {
+        crate::proxy::apply_ws_fragment_plugins(
+            plugins,
+            proxy_id,
+            connection_id,
+            direction,
+            fragment_frames,
+        )
+        .await
     }
 
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
@@ -3155,6 +3339,49 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
+    pub const GRPC_FRAME_TRAILER_COMPRESSED: u8 =
+        crate::plugins::grpc_web::GRPC_FRAME_TRAILER_COMPRESSED;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_BLOCK_BYTES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_BLOCK_BYTES;
+    pub const MAX_GRPC_WEB_REQUEST_TRAILER_ENTRIES: usize =
+        crate::plugins::grpc_web::MAX_REQUEST_TRAILER_ENTRIES;
+
+    /// Wire-level view of the request-side gRPC-Web trailer-frame split.
+    ///
+    /// Returns `Ok(None)` when the body carries no trailer frame, the
+    /// `(data_end, trailers)` split when it carries a valid one, and the
+    /// field-specific diagnostic when the frame is invalid.
+    #[allow(clippy::type_complexity)]
+    pub fn split_grpc_web_request_trailer_frame(
+        data: &[u8],
+    ) -> Result<Option<(usize, Vec<(String, String)>)>, &'static str> {
+        crate::plugins::grpc_web::split_request_trailer_frame(data)
+            .map(|split| split.map(|frame| (frame.data_end, frame.trailers)))
+    }
+
+    /// The request trailers a gRPC dispatch would send, read back from
+    /// owner-scoped request staging exactly as the dispatch paths read them.
+    ///
+    /// Sorted by name so assertions do not depend on `HeaderMap`'s hash order;
+    /// the sort is stable, so repeated values of one name keep wire order.
+    pub fn staged_grpc_web_request_trailers(
+        metadata: &HashMap<String, String>,
+    ) -> Option<Vec<(String, String)>> {
+        crate::plugins::grpc_web::staged_request_trailers(metadata).map(|map| {
+            let mut entries: Vec<(String, String)> = map
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries
+        })
+    }
+
     pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
     }
@@ -3215,6 +3442,11 @@ pub mod _test_support {
             request_is_secure,
             add_forwarded_header,
         );
+    }
+
+    /// Canonical backend-visible query (transformer outbound + auth strips).
+    pub fn effective_backend_query_string_for_test(ctx: &crate::plugins::RequestContext) -> String {
+        crate::proxy::effective_backend_query_string(ctx).into_owned()
     }
 
     pub fn collect_forwardable_websocket_headers_for_test(
@@ -4873,5 +5105,30 @@ pub mod _test_support {
             drain_timeout,
         )
         .await
+    }
+
+    /// The exact client identity the HTTP-family accept loop installs for one
+    /// accepted connection, including node-agent source-IP restoration.
+    ///
+    /// This is the production function `run_accept_loop` calls, not a mirror of
+    /// it, so external coverage of the ingress canonicalization boundary
+    /// (GHSA-vjwj-657f-5w9g) cannot drift away from the served path.
+    pub fn accept_peer_identity_for_test(
+        accepted: std::net::SocketAddr,
+        source_ip_override: Option<std::net::IpAddr>,
+    ) -> std::net::SocketAddr {
+        crate::proxy::resolve_accept_peer_identity(accepted, source_ip_override)
+    }
+
+    /// The canonical `(typed peer, pre-formatted IP string)` pair the HTTP/3
+    /// connection loop derives for a QUIC peer, at connection start and again on
+    /// every observed connection migration.
+    ///
+    /// Production function, not a mirror — see
+    /// [`accept_peer_identity_for_test`].
+    pub fn h3_client_identity_for_test(
+        addr: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, Arc<str>) {
+        crate::http3::server::h3_client_identity(addr)
     }
 }

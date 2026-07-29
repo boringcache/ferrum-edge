@@ -124,7 +124,7 @@ use serde_json::Value;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -1467,10 +1467,14 @@ impl CorrelationIdState {
 }
 
 impl CanonicalClientIpCache {
+    /// Ingress already folded IPv4-mapped IPv6 identities to native IPv4
+    /// (GHSA-vjwj-657f-5w9g). The shared helper is applied once more here so a
+    /// context built outside the gateway accept paths — a custom plugin, an
+    /// external test — still resolves one principal per host.
     fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
         *self
             .value
-            .get_or_init(|| parse_canonical_client_ip(client_ip))
+            .get_or_init(|| crate::util::client_identity::parse_canonical_client_ip(client_ip))
     }
 
     /// Whether a policy has already resolved the typed address.
@@ -1499,30 +1503,6 @@ impl CanonicalClientIpCache {
     fn project_correlation_ids(&self, metadata: &mut HashMap<String, String>) {
         self.correlation_ids.project_correlation_ids(metadata);
     }
-}
-
-fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
-    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
-}
-
-/// Parse the legacy client/rule literal forms without allocation.
-///
-/// IPv4 uses the standard library's strict literal grammar. Brackets and zone
-/// identifiers remain IPv6-only; accepting them on IPv4 would broaden the
-/// established policy grammar.
-fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
-    if let Ok(ipv4) = client_ip.parse() {
-        return Some(IpAddr::V4(ipv4));
-    }
-
-    let unbracketed = client_ip
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(client_ip);
-    let without_zone = unbracketed
-        .find('%')
-        .map_or(unbracketed, |index| &unbracketed[..index]);
-    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
 }
 
 /// AI usage that was produced by a built-in accounting path.
@@ -1861,8 +1841,16 @@ pub struct RequestContext {
     headers_materialized: bool,
     /// Raw query string stored for lazy parsing. `None` when empty. Preserved
     /// after query-param materialization so security plugins can inspect raw
-    /// duplicate pairs.
+    /// duplicate pairs. Unmodified when no query mutation/strip applies.
     raw_query_string: Option<String>,
+    /// Backend-bound query after `request_transformer` ordered mutations.
+    /// `None` means "use [`Self::raw_query_string`] unchanged" (ordinary
+    /// no-transform hot path). `Some("")` is an explicit empty outbound query
+    /// after a transform removed every pair. Authentication-owned strips are
+    /// removed from the transformer input before query rules run, and the
+    /// proxy applies [`crate::proxy::query_string_after_plugin_strips`] again
+    /// as defense in depth when composing the canonical backend-visible query.
+    outbound_query_string: Option<String>,
     /// Whether either decoded or raw query-param materialization has already
     /// populated `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
@@ -1873,6 +1861,9 @@ pub struct RequestContext {
     /// HTTP/1.1 and HTTP/2 materialize percent-decoded query params for
     /// historical compatibility. HTTP/3 materializes raw query params unless
     /// an active plugin explicitly requires the decoded representation.
+    /// After a query transform, this map is rebuilt from the ordered outbound
+    /// representation (last occurrence wins) so later plugins see coherent
+    /// state without re-parsing the wire query.
     pub query_params: HashMap<String, String>,
     pub matched_proxy: Option<Arc<Proxy>>,
     pub identified_consumer: Option<Arc<Consumer>>,
@@ -1928,6 +1919,14 @@ pub struct RequestContext {
     /// metadata so sibling/custom plugins cannot clear or forge the signal
     /// consumed by fail-closed response negotiation.
     response_cache_hit: bool,
+    /// Genuine HTTP status from the origin/backend response, recorded once by
+    /// proxy core at the start of `run_after_proxy_hooks` before any
+    /// `after_proxy` hook can reject and replace the client-visible response.
+    /// `None` when no origin response was received (pre-dispatch rejects,
+    /// transport failures that never yield headers, gateway-only synthetics).
+    /// Kept private so request metadata cannot forge origin success for
+    /// invalidation or similar origin-success boundaries.
+    origin_http_response_status: Option<u16>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -2525,6 +2524,7 @@ impl RequestContext {
             headers: HashMap::new(),
             headers_materialized: false,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
@@ -2543,6 +2543,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
             response_cache_hit: false,
+            origin_http_response_status: None,
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -2972,6 +2973,23 @@ impl RequestContext {
         self.response_cache_hit
     }
 
+    /// Record the genuine origin/backend HTTP status exactly once.
+    ///
+    /// Proxy core calls this at the start of `run_after_proxy_hooks` before any
+    /// response hook can replace the downstream status. Subsequent calls are
+    /// ignored so an earlier rejection or plugin cannot overwrite provenance.
+    pub(crate) fn record_origin_http_response_status(&mut self, status: u16) {
+        if self.origin_http_response_status.is_none() {
+            self.origin_http_response_status = Some(status);
+        }
+    }
+
+    /// Genuine origin/backend HTTP status when one was received for this
+    /// request, otherwise `None`.
+    pub(crate) fn origin_http_response_status(&self) -> Option<u16> {
+        self.origin_http_response_status
+    }
+
     pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
         self.authorized_backend_path = Some(path);
     }
@@ -3307,6 +3325,7 @@ impl RequestContext {
             headers: self.headers.clone(),
             headers_materialized: true,
             raw_query_string: None,
+            outbound_query_string: None,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: self.matched_proxy.clone(),
@@ -3325,6 +3344,7 @@ impl RequestContext {
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
             response_cache_hit: self.response_cache_hit,
+            origin_http_response_status: self.origin_http_response_status,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -4055,6 +4075,7 @@ impl RequestContext {
     pub fn set_raw_query_string(&mut self, qs: String) {
         self.query_params.clear();
         self.query_params_materialized = false;
+        self.outbound_query_string = None;
         self.raw_query_string = (!qs.is_empty()).then_some(qs);
     }
 
@@ -4065,6 +4086,34 @@ impl RequestContext {
     #[inline]
     pub fn raw_query_string(&self) -> Option<&str> {
         self.raw_query_string.as_deref()
+    }
+
+    /// Publish the ordered outbound query after `request_transformer` mutations
+    /// and rebuild the plugin-visible single-value map from that same
+    /// representation.
+    ///
+    /// Pass an empty string when every pair was removed. Marks query params as
+    /// materialized so a later materialization pass cannot resurrect the
+    /// pre-transform raw query into `query_params`. Callers must not log the
+    /// outbound value — it may contain secrets the transform just relocated.
+    #[inline]
+    pub fn publish_transformed_query(
+        &mut self,
+        outbound: String,
+        params: std::collections::HashMap<String, String>,
+    ) {
+        self.outbound_query_string = Some(outbound);
+        self.query_params = params;
+        self.query_params_materialized = true;
+    }
+
+    /// Borrow the transformer-published outbound query, when present.
+    ///
+    /// `Some("")` is distinct from `None`: empty means the transform cleared
+    /// the query; `None` means no transform ran and the raw wire query applies.
+    #[inline]
+    pub fn outbound_query_string(&self) -> Option<&str> {
+        self.outbound_query_string.as_deref()
     }
 
     /// Record the client's original request target after canonicalization
@@ -6134,11 +6183,11 @@ pub mod priority {
     pub const API_CHARGEBACK_SINK: u16 = 9351;
     pub const WORKLOAD_METRICS: u16 = 9360;
     /// `__mesh_bpf_metrics`: exposes TCP-layer counters (Connect, Accept,
-    /// Rst, Fin, SRTT, BPF drop reasons, ringbuf overrun) from the
-    /// SOCK_OPS event consumer. Auto-injected only when topology is
-    /// `NodeWaypoint`. Lives in the observability band alongside other
-    /// metric-emitter plugins so its `log` hook runs after all
-    /// transaction-summary serialization.
+    /// Rst, Fin, SRTT/SYN→ACK latency histograms, BPF drop reasons,
+    /// ringbuf overrun) from the SOCK_OPS event consumer. Auto-injected
+    /// only when topology is `NodeWaypoint`. Lives in the observability
+    /// band alongside other metric-emitter plugins so its `log` hook
+    /// runs after all transaction-summary serialization.
     pub const MESH_BPF_METRICS: u16 = 9365;
     /// `transaction_log_schema` is a config-only plugin with no lifecycle
     /// hooks; its priority is irrelevant in practice but is kept at the
@@ -6895,6 +6944,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Observe the genuine origin/backend HTTP status exactly once, before any
+    /// `after_proxy` hook can reject and replace the downstream response.
+    ///
+    /// Proxy core records the status on [`RequestContext`] as private typed
+    /// provenance and then invokes this hook for every plugin in configured
+    /// order. Default is a no-op. Plugins whose success-boundary side effects
+    /// must not depend on later hooks presenting the origin status to the
+    /// client (for example cache invalidation) override this.
+    fn observe_origin_http_response_status(&self, _ctx: &mut RequestContext, _status: u16) {}
+
     /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
     /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted
     /// response.
@@ -7597,6 +7656,42 @@ pub trait Plugin: Send + Sync {
         None
     }
 
+    /// Called for the physical WebSocket frames a peer spent on message
+    /// reassembly that [`Plugin::on_ws_frame`] can never see.
+    ///
+    /// Tungstenite yields only reassembled messages, so the initial non-final
+    /// Text/Binary frame and every intermediate Continuation frame — including
+    /// zero-length ones — are invisible to `on_ws_frame`. Without this hook a
+    /// peer could drive unbounded framing work while paying for a single
+    /// logical message (GHSA-qq94-2gv2-phh6).
+    ///
+    /// `fragment_frames` is always `>= 1` and counts only frames that produced
+    /// no message. The completing frame is charged exactly once through the
+    /// ordinary [`Plugin::on_ws_frame`] call for the reassembled message, so a
+    /// plugin implementing both hooks charges each wire frame exactly once.
+    ///
+    /// The relay invokes this before the message chain for the read that
+    /// surfaced them, and also for an interleaved Ping/Pong that arrives
+    /// mid-reassembly. A peer `Close` is the exception: it bypasses mutating
+    /// admission entirely so no plugin can replace the peer's code/reason, and
+    /// the session is ending anyway. There is no message to mutate: only
+    /// `Some(Message::Close(..))` is honored, which closes the connection in
+    /// both directions; every other return value is ignored. Observational
+    /// plugins ([`Plugin::observes_ws_frame_decisions`]) are skipped entirely.
+    ///
+    /// The count/duration ceilings that stop a message which never completes
+    /// live in the parser (see `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_FRAMES`
+    /// / `FERRUM_WEBSOCKET_MAX_INCOMPLETE_MESSAGE_SECONDS`), not here.
+    async fn on_ws_reassembly_frames(
+        &self,
+        _proxy_id: &str,
+        _connection_id: u64,
+        _direction: WebSocketFrameDirection,
+        _fragment_frames: u64,
+    ) -> Option<tokio_tungstenite::tungstenite::Message> {
+        None
+    }
+
     /// Prepare a deferred delivery observation from the final post-plugin,
     /// post-control-guard message **before** the destination `send()` moves it.
     ///
@@ -7842,8 +7937,10 @@ pub fn create_plugin_with_http_client(
 /// `plugin_config_id` is the configured plugin-config resource id (global /
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
-/// identity, `waf` instances isolate anomaly-score accumulators / ownership
-/// metadata, and `api_chargeback_sink` instances publish accepted-generation
+/// identity, `soap_ws_security` scopes its PasswordDigest nonce replay state to
+/// it so reload generations inherit prior claims, `waf` instances isolate
+/// anomaly-score accumulators / ownership metadata, and `api_chargeback_sink`
+/// instances publish accepted-generation
 /// status/metrics under that stable identity, while `request_mirror` records
 /// attribute each shadow destination. Pass `None` for config-validation and
 /// direct/test construction that does not need sibling isolation or attribution
@@ -8054,9 +8151,17 @@ pub fn create_plugin_with_http_client_and_config_id(
         "openapi_validator" => Ok(Some(Arc::new(openapi_validator::OpenapiValidator::new(
             config,
         )?))),
-        "soap_ws_security" => Ok(Some(Arc::new(soap_ws_security::SoapWsSecurity::new(
-            config,
-        )?))),
+        // The stable plugin-config id is the PasswordDigest replay scope: it is
+        // what lets a reload generation inherit the previous generation's nonce
+        // claims instead of starting from an empty cache, and what keys a
+        // shared (Redis) replay keyspace to one policy.
+        "soap_ws_security" => Ok(Some(Arc::new(
+            soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "request_termination" => Ok(Some(Arc::new(
             request_termination::RequestTermination::new(config)?,
         ))),
@@ -8513,10 +8618,10 @@ pub(crate) fn validate_plugin_config_policy_only(
         return Err(errs.join("; "));
     }
     // Redis-backed plugins (rate_limit / request_deduplication /
-    // ai_semantic_cache with sync_mode=redis) build their client from
-    // `redis_url` WITHOUT the egress policy, and the client skips literals
-    // / falls back to the hostname on a DNS denial — so a denied literal
-    // endpoint must be rejected here at config-load.
+    // ai_semantic_cache / soap_ws_security with sync_mode=redis) build their
+    // client from `redis_url` WITHOUT the egress policy, and the client skips
+    // literals / falls back to the hostname on a DNS denial — so a denied
+    // literal endpoint must be rejected here at config-load.
     screen_redis_endpoint_egress(config, backend_allow_ips)?;
     // NOTE: ldap_auth / kafka_logging / ws_logging literal endpoints are
     // screened *inside* `create_plugin_with_http_client` above (before a dial),
@@ -8531,10 +8636,11 @@ pub(crate) fn validate_plugin_config_policy_only(
 /// `169.254.169.254`) must be rejected at config-admission time — not only in
 /// Screen a Redis-backed plugin's `redis_url` literal-IP host against the egress
 /// policy at config-load. Redis-backed plugins (`rate_limit`,
-/// `request_deduplication`, `ai_semantic_cache` with `sync_mode=redis`) build
-/// their client from `redis_url` WITHOUT the policy, and the client skips IP
-/// literals / falls back to the hostname on a DNS denial — so a denied literal
-/// endpoint (`redis://169.254.169.254:6379`) would otherwise be dialed. No-op
+/// `request_deduplication`, `ai_semantic_cache`, `soap_ws_security` with
+/// `sync_mode=redis`) build their client from `redis_url` WITHOUT the policy,
+/// and the client skips IP literals / falls back to the hostname on a DNS
+/// denial — so a denied literal endpoint (`redis://169.254.169.254:6379`)
+/// would otherwise be dialed. No-op
 /// when there is no `redis_url`, it's a hostname (screened at resolve), or it
 /// doesn't parse (shape errors are surfaced by the constructor).
 pub(crate) fn screen_redis_endpoint_egress(
