@@ -4778,6 +4778,41 @@ async fn test_unsafe_invalidation_uses_transformed_host_partition() {
     assert_cache_hit_for_host(&plugin, "/api/items", "other.example.com", b"other-host").await;
 }
 
+/// Deferred invalidation must retain the client-facing path used by cache
+/// lookup even when proxy routing rewrites `ctx.path` for the backend.
+#[tokio::test]
+async fn test_unsafe_invalidation_uses_original_path_after_route_rewrite() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/v1/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"cached-v1",
+    )
+    .await;
+
+    let mut post_ctx = make_ctx("POST", "/v1/items");
+    post_ctx
+        .headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut post_headers = post_ctx.headers.clone();
+    plugin.before_proxy(&mut post_ctx, &mut post_headers).await;
+
+    // Proxy core applies a route override after before_proxy hooks.
+    post_ctx.path = "/v2/items".to_string();
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut post_ctx, 204, &mut response_headers)
+        .await;
+
+    assert_cache_miss_for_host(&plugin, "/v1/items", "a.example.com").await;
+}
+
 /// A failed mutation must not evict cache entries (RFC 9111 §4.4).
 #[tokio::test]
 async fn test_failed_unsafe_mutation_does_not_invalidate() {
