@@ -8200,10 +8200,7 @@ async fn validate_tool_results_rejects_uninspectable_response_headers() {
         ),
         (
             "missing content-length",
-            HashMap::from([(
-                "content-type".to_string(),
-                "application/json".to_string(),
-            )]),
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
         ),
         (
             "malformed content-length",
@@ -8226,8 +8223,7 @@ async fn validate_tool_results_rejects_uninspectable_response_headers() {
     for (offset, (case, mut headers)) in cases.into_iter().enumerate() {
         let mut ctx =
             route_validated_tool_call(&plugin, &session_id, 172 + offset as i64 * 2).await;
-        let (status, body, _) =
-            reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+        let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
         assert_eq!(status, 200, "{case}");
         assert_eq!(body["error"]["code"], -32012, "{case}");
     }
