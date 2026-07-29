@@ -11,9 +11,8 @@ use ferrum_edge::plugins::api_chargeback_sink::{
     QuotaEvictionReport, SnapshotAccumulator, SpoolCompression, SpoolFinalOwnership, SpoolFsFault,
     SpoolManager, SpoolOwnerSpec, SpoolSettings, SpoolWriteHookPoint,
     classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
-    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests,
-    decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    encode_spool_bytes_without_content_size_for_tests, new_ulid,
+    clickhouse_insert_url_for_tests, compact_recovery_probe_for_tests, decode_spool_file_for_tests,
+    encode_spool_bytes_for_tests, encode_spool_bytes_without_content_size_for_tests, new_ulid,
     probe_charge_body_materialization_for_tests, probe_compact_recovery_retry_for_tests,
     render_prometheus, render_status_json, replay_spool_once_for_tests,
     replay_spool_once_with_batch_size_for_tests, replay_spool_once_with_ceiling_for_tests,
@@ -6997,9 +6996,7 @@ fn a_highly_compressible_zstd_artifact_this_build_writes_uses_its_declared_size(
         plain.len()
     );
 
-    let path = temp
-        .path()
-        .join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
+    let path = temp.path().join("01ARZ3NDEKTSV4RRFFQ69G5FC3.ndjson.zst");
     fs::write(&path, encoded).unwrap();
     let decoded = decode_spool_file_for_tests(&path)
         .expect("a writer-owned frame with a safe declared size must decode");
