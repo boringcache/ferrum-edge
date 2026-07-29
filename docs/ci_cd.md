@@ -41,7 +41,7 @@ adding, removing, or materially changing a workflow.
 | `mesh-e2e-sidecar-live.yml` | Mesh E2E Sidecar Live Datapath | PRs, push to `main`, manual | Release-blocking sidecar datapath validation; `Mesh E2E Sidecar Live` is directly required on PRs. |
 | `cross-build-policy.yml` | Cross Build Policy | `pull_request_target` for PRs to `main` | Read-only trusted-base validation of every PR-controlled ARM64 Cross configuration and invocation surface; `Trusted Cross Build Policy` must be directly required after the bootstrap workflow merges. |
 | `node-waypoint-ebpf-live.yml` | NodeWaypoint eBPF Live Datapath | Path-filtered PRs, manual | Live eBPF datapath validation in kind. |
-| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | Path-filtered PRs, manual | Live multicluster federation datapath validation. |
+| `multicluster-federation-live.yml` | Multicluster Federation Live Datapath | PRs, push to `main`, manual | Release-blocking multicluster federation datapath validation; `Multicluster Federation Live` is directly required on PRs. |
 | `dependency-audit.yml` | Dependency Audit | Weekly schedule, manual | Scheduled supply-chain governance beyond the per-PR audit gate. |
 | `scaling-regression.yml` | Scheduled Scaling Regression | Weekly schedule, manual | Runs the 30k proxy scale and 10k proxy load-stress tests excluded from PR CI. |
 | `protocol-perf-regression.yml` | Protocol Performance Regression | Weekly schedule, manual | Scheduled multi-protocol throughput/latency regression with churn, soak, resource plateaus, reload-under-load, versioned alert-only budgets, and machine-readable trends. Not a required PR check; see [protocol_perf_regression.md](protocol_perf_regression.md). |
@@ -74,7 +74,8 @@ Pull Request
     └─► Dedicated required checks (internally skip unrelated changes)
             ├─► Merge Coverage
             ├─► Gateway API Conformance
-            └─► Mesh E2E Sidecar Live
+            ├─► Mesh E2E Sidecar Live
+            └─► Multicluster Federation Live
 
 Push to main
     ├─► Full required validation gate
@@ -124,16 +125,59 @@ edit cannot classify itself as light; edits to the planner therefore receive
 the full matrix. The required-CI verifier also checks that documentation paths
 used by live-suite filters remain in the planner's full-CI set.
 
-The same trusted planner emits fail-closed job outputs for Helm, mesh federation,
-the sidecar deployment smoke, eBPF program builds, and eBPF/netns live suites.
-PRs outside those curated path sets skip the downstream job before GitHub
-allocates a runner. Pushes to `main` and manual runs force all of these gates on.
-Rust formatting and the integration-shard coverage contract also run as named
-steps in `CI Plan`, avoiding two additional runner allocations. The required
-`Tests` aggregate runs the first-party Markdown link checker through its CI
-contract verifier (`.github/scripts/check_markdown_links.py`), including in
-light mode, so docs-only PRs still validate relative file targets and GitHub
-heading slugs.
+The same trusted planner emits fail-closed job outputs for Helm, the legacy
+multicluster deployment smoke, the sidecar deployment smoke, eBPF program
+builds, and eBPF/netns live suites. The deploy-only multicluster job remains a
+distinct packaging-and-rollout check; authoritative datapath coverage rides the
+dedicated `multicluster-federation-live.yml` workflow (path-filtered on PRs,
+force-run on every `main` push). PRs outside those curated path sets skip the
+downstream job before GitHub allocates a runner. Pushes to `main` and manual
+runs force all of these gates on. Rust formatting and the integration-shard
+coverage contract also run as named steps in `CI Plan`, avoiding two additional
+runner allocations. The required `Tests` aggregate runs the first-party
+Markdown link checker through its CI contract verifier
+(`.github/scripts/check_markdown_links.py`), including in light mode, so
+docs-only PRs still validate relative file targets and GitHub heading slugs.
+
+Both live-datapath suites validate their emitted `live-assertions.json`, but by
+different mechanisms, because the trusted ARM64 Cross build policy freezes each
+workflow's existing Cross-sensitive executable/configuration surfaces.
+
+`mesh-e2e-sidecar-live.yml` validates in-workflow inside its live job via
+`conformance::live_contract::live_contract_artifact_gate` (a cargo test).
+
+`multicluster-federation-live.yml` cannot do that: adding a cargo step to its
+live job, or editing that job at all, changes the per-job digest the trusted
+policy compares and is rejected by `Trusted Cross Build Policy`. Its live job is
+therefore byte-identical to `main`, and validation happens in the separate
+`gate` job — the same job that publishes the required
+`Multicluster Federation Live` check. That job carries no toolchain and no
+build: it downloads the pinned `multicluster-federation-results` artifact with a
+full-SHA-pinned `actions/download-artifact` and runs
+`.github/scripts/validate_live_assertions.py` (standard library only), which
+fails closed on a missing or non-regular artifact, malformed JSON, a wrong
+schema version, suite, `github.sha` commit, or
+`kind-spire-multicluster-federation` platform profile, an invalid, future, or
+more-than-six-hour-old timestamp, duplicate assertion ids, a missing or extra
+required `multicluster.*` id, or any required assertion whose status is not
+`pass`. An irrelevant pull request skips the download entirely — the artifact
+steps run only after the aggregate step positively establishes that a relevant
+live run succeeded.
+
+Three layers therefore have to agree, and hosted CI fails if they drift:
+
+1. The fixture's own fail-closed
+   `ferrum_live_assertions_require_all_passed` call over the run.sh-local
+   `REQUIRED_LIVE_ASSERTIONS` array.
+2. The `gate` job's explicit `--require` id list.
+3. The enforced, non-`live_deferred` `multicluster-federation` rows of
+   `tests/conformance/ga_contract.yaml`.
+
+`tests/conformance/live_contract.rs` asserts set equality between (1) and (3)
+and between (2) and (3); `.github/scripts/verify_required_ci.py` independently
+pins the gate's download action, its exactness flags, its `validate`-gated
+steps, and the same id set, and runs the validator's own self-tests (which
+prove each rejection dimension) in the `Tests` aggregate.
 
 In full mode, the `Tests` aggregate waits for the planner/format checks, test
 shards, lint, dependency audit, vendored patch regressions,
@@ -143,10 +187,11 @@ and accepts the planned heavy jobs as skipped. Pushes to `main` publish the
 `latest` prerelease and Docker images only after the full aggregate and build
 matrix pass.
 
-Branch protection must require five independent PR checks: the unchanged `Tests`
+Branch protection must require six independent PR checks: the unchanged `Tests`
 aggregate from `ci.yml`, `Merge Coverage` from `coverage.yml`, `Gateway API
 Conformance` from `gateway-api-conformance.yml`, `Mesh E2E Sidecar Live` from
-`mesh-e2e-sidecar-live.yml`, and `Trusted Cross Build Policy` from
+`mesh-e2e-sidecar-live.yml`, `Multicluster Federation Live` from
+`multicluster-federation-live.yml`, and `Trusted Cross Build Policy` from
 `cross-build-policy.yml`. Each dedicated workflow triggers on every pull
 request and fails closed on planning or validation failures. They are required
 directly rather than mirrored by runner-holding polling jobs in `ci.yml`.
@@ -1162,9 +1207,11 @@ On pushes to `main`, the `main-publish-gate` job runs after the native build mat
 The Release pipeline creates official releases when a version tag is pushed. It
 first verifies that the tag is exactly `v` followed by the `[package]` version
 from `Cargo.toml`. It then resolves the tag to its target commit and waits for
-successful `CI` and `Coverage` workflow runs for that exact SHA before any
-release binary or image job starts. A version mismatch fails immediately, and
-every build and publishing job depends transitively on this guard.
+successful `CI`, `Coverage`, `Mesh E2E Sidecar Live Datapath`, and
+`Multicluster Federation Live Datapath` workflow push runs for that exact SHA
+before any release binary or image job starts. A version mismatch fails
+immediately, and every build and publishing job depends transitively on this
+guard.
 
 Release runs use `concurrency.group: release-${{ github.ref }}` with `cancel-in-progress: false`, so a versioned release is never canceled by a later tag push.
 
