@@ -12,7 +12,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ferrum_edge::plugins::utils::log_schema::{HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS};
+use ferrum_edge::plugins::utils::log_schema::{
+    CHARGE_EVENT_FIELDS, CHARGEBACK_REPORT_FIELDS, DEBUG_HTTP_FIELDS, DEBUG_STREAM_FIELDS,
+    DEBUG_WS_FIELDS, HTTP_FIELDS, STREAM_FIELDS, WS_DISCONNECT_FIELDS,
+};
 use ferrum_edge::plugins::{
     Direction, DisconnectCause, StreamTransactionSummary, TransactionSummary,
 };
@@ -225,4 +228,204 @@ fn ws_disconnect_fields_registry_matches_expected() {
         registered.len(),
         "WS_DISCONNECT_FIELDS contains duplicate field names"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Non-summary record families (issues #3312, #3313, #3314)
+// ---------------------------------------------------------------------------
+
+/// Assert a family registry against its expected declaration order and check
+/// that its output keys are unique — the uniqueness the compiler relies on.
+fn assert_family(
+    registered: Vec<&str>,
+    expected: &[&str],
+    label: &str,
+    owner: &str,
+) {
+    assert_eq!(
+        registered, expected,
+        "{label} drift detected.\n  Registry: {registered:?}\n  Expected: {expected:?}\n  \
+         Update {label} and {owner} together."
+    );
+    let unique: HashSet<&str> = registered.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        registered.len(),
+        "{label} contains duplicate field names"
+    );
+}
+
+#[test]
+fn chargeback_report_fields_registry_matches_rendered_row() {
+    assert_family(
+        CHARGEBACK_REPORT_FIELDS.iter().map(|f| f.name).collect(),
+        &[
+            "proxy_id",
+            "namespace",
+            "proxy_name",
+            "currency",
+            "protocol_family",
+            "total_calls",
+            "total_charges",
+            "by_status",
+            "bandwidth",
+            "stream",
+        ],
+        "CHARGEBACK_REPORT_FIELDS",
+        "ChargebackProxyRow::to_native_json / serialize_native (src/plugins/api_chargeback.rs)",
+    );
+    // A billing row carries no timestamp: `timestamp_format` is rejected for
+    // this family, so a timestamp field here would be unreachable.
+    assert!(CHARGEBACK_REPORT_FIELDS.iter().all(|f| !f.is_timestamp));
+}
+
+#[test]
+fn charge_event_fields_registry_matches_struct() {
+    assert_family(
+        CHARGE_EVENT_FIELDS.iter().map(|f| f.name).collect(),
+        &[
+            "event_id",
+            "received_at",
+            "node_id",
+            "namespace",
+            "consumer_id",
+            "consumer_name",
+            "proxy_id",
+            "proxy_name",
+            "route_id",
+            "status_code",
+            "http_status_code",
+            "grpc_status",
+            "protocol",
+            "call_count",
+            "charge_call",
+            "bytes_sent",
+            "bytes_received",
+            "charge_bytes_sent",
+            "charge_bytes_received",
+            "charge_total",
+            "currency",
+            "pricing_version",
+            "request_id",
+            "trace_id",
+            "snapshot_id",
+        ],
+        "CHARGE_EVENT_FIELDS",
+        "ChargeEvent + its serialize_native (src/plugins/api_chargeback_sink.rs)",
+    );
+    // `received_at` is an epoch-nanosecond integer, not an RFC3339 string.
+    assert!(CHARGE_EVENT_FIELDS.iter().all(|f| !f.is_timestamp));
+}
+
+#[test]
+fn debug_diagnostic_fields_registries_match_default_records() {
+    assert_family(
+        DEBUG_HTTP_FIELDS.iter().map(|f| f.name).collect(),
+        &[
+            "outcome",
+            "namespace",
+            "timestamp_received",
+            "client_ip",
+            "method",
+            "path",
+            "status",
+            "proxy_id",
+            "proxy_name",
+            "backend_target",
+            "backend_resolved_ip",
+            "consumer_username",
+            "auth_method",
+            "error_class",
+            "body_error_class",
+            "response_streamed",
+            "body_completed",
+            "client_disconnected",
+            "bytes_sent",
+            "bytes_received",
+            "rejection_phase",
+            "grpc_status",
+            "request_id",
+            "trace_id",
+            "latency_total_ms",
+            "latency_backend_ttfb_ms",
+            "latency_backend_total_ms",
+            "latency_plugin_ms",
+            "latency_gw_overhead_ms",
+            "metadata",
+        ],
+        "DEBUG_HTTP_FIELDS",
+        "TransactionDebugger::log (src/plugins/transaction_debugger.rs)",
+    );
+    assert_family(
+        DEBUG_STREAM_FIELDS.iter().map(|f| f.name).collect(),
+        &[
+            "outcome",
+            "namespace",
+            "protocol",
+            "proxy_id",
+            "proxy_name",
+            "client_ip",
+            "listen_port",
+            "backend_target",
+            "backend_resolved_ip",
+            "consumer_username",
+            "auth_method",
+            "connection_error",
+            "error_class",
+            "disconnect_direction",
+            "disconnect_cause",
+            "duration_ms",
+            "bytes_sent",
+            "bytes_received",
+            "timestamp_connected",
+            "timestamp_disconnected",
+            "sni_hostname",
+            "request_id",
+            "trace_id",
+            "metadata",
+        ],
+        "DEBUG_STREAM_FIELDS",
+        "TransactionDebugger::on_stream_disconnect (src/plugins/transaction_debugger.rs)",
+    );
+    assert_family(
+        DEBUG_WS_FIELDS.iter().map(|f| f.name).collect(),
+        &[
+            "outcome",
+            "namespace",
+            "proxy_id",
+            "proxy_name",
+            "client_ip",
+            "listen_port",
+            "backend_target",
+            "consumer_username",
+            "auth_method",
+            "duration_ms",
+            "frames_client_to_backend",
+            "frames_backend_to_client",
+            "bytes_client_to_backend",
+            "bytes_backend_to_client",
+            "disconnect_direction",
+            "io_side",
+            "error_class",
+            "request_id",
+            "trace_id",
+            "metadata",
+        ],
+        "DEBUG_WS_FIELDS",
+        "TransactionDebugger::on_ws_disconnect (src/plugins/transaction_debugger.rs)",
+    );
+
+    // The RFC3339 timestamp fields are the ones `timestamp_format` converts.
+    let http_ts: Vec<&str> = DEBUG_HTTP_FIELDS
+        .iter()
+        .filter(|f| f.is_timestamp)
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(http_ts, vec!["timestamp_received"]);
+    let stream_ts: Vec<&str> = DEBUG_STREAM_FIELDS
+        .iter()
+        .filter(|f| f.is_timestamp)
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(stream_ts, vec!["timestamp_connected", "timestamp_disconnected"]);
 }

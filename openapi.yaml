@@ -12507,6 +12507,11 @@ components:
         HTTP summaries include the normalized terminal `grpc_status` field
         (separate from `response_status_code`) when the request is gRPC. It
         can be renamed, omitted, or ordered like every other native field.
+        `api_chargeback`, `api_chargeback_sink`, and `transaction_debugger`
+        reuse this same shape against their own record families; whatever a
+        family cannot express (`summary_type`, `timestamp_format`, `metadata`,
+        `order`, or a derived kind with no source field) is rejected at
+        construction with a plugin- and field-specific diagnostic.
         See docs/log_schema.md.
       additionalProperties: false
       properties:
@@ -13677,6 +13682,20 @@ components:
             Additional body field names (compared case-insensitively) to redact
             beyond the built-in credential markers. Requires log_request_body or
             log_response_body true.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the terminal diagnostic
+            records (HTTP, stream, WebSocket disconnect) emitted on the
+            `transaction_debug` target; the diagnostic field inventory is the
+            plugin's own (`outcome`, `method`, `path`, `status`,
+            `rejection_phase`, `latency_plugin_ms`, …), not the transaction
+            summary's. A portable named schema can only reference names shared
+            with the summary registry, so use an inline `schema:` for
+            diagnostic-only fields. See docs/log_schema.md.
 
     CorrelationIdConfig:
       type: object
@@ -23073,6 +23092,22 @@ components:
             billing rows and aggregate overflow rows together. 0 is rejected.
             Process-global: every enabled api_chargeback instance must use the
             same value.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the per-proxy billing row
+            inside the `GET /charges` document (`proxy_id`, `namespace`,
+            `proxy_name`, `currency`, `protocol_family`, `total_calls`,
+            `total_charges`, `by_status`, `bandwidth`, `stream`). Billing
+            identity, charge accounting, registry keys, and the Prometheus
+            exposition are unaffected. `summary_type`, `metadata`, `order`, and
+            every derived kind except `summary_kind` are rejected for this
+            surface. Process-global: every enabled api_chargeback instance must
+            resolve to the same projection because one render cache serves them
+            all. See docs/log_schema.md.
 
     ApiChargebackSinkConfig:
       type: object
@@ -23578,6 +23613,21 @@ components:
                 async delivery-worker spool strategy as max_entries. Runtime
                 additionally requires the value to be at least one bounded
                 charge-event size.
+        schema:
+          $ref: "#/components/schemas/SummaryLogSchema"
+        schema_ref:
+          type: string
+          description: >-
+            Name of a schema registered by a `transaction_log_schema` plugin.
+            Mutually exclusive with `schema`. Projects the exported charge-event
+            record (the JSONEachRow row delivered to ClickHouse and the durable
+            spool artifact that replays it), not the pricing, the accumulator
+            identities, or the snapshot keys. Renaming a field renames the
+            ClickHouse column the row inserts into, so the target table must
+            agree. `summary_type`, `timestamp_format`, the `metadata` policy,
+            and the `backend_host` derived kind are rejected for this surface:
+            a charge event has no RFC3339 timestamp field, no metadata map, and
+            no backend target. See docs/log_schema.md.
 
     ChargebackResponse:
       type: object

@@ -4199,3 +4199,234 @@ fn test_admin_charges_path_is_non_owning_when_unconfigured() {
         "GET /charges must not call owning global_registry()"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `/charges` billing-row schema projection (issue #3312)
+// ---------------------------------------------------------------------------
+
+/// Minimal config that satisfies the "at least one pricing dimension" rule.
+fn priced_config(extra: serde_json::Value) -> serde_json::Value {
+    let mut config = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.5 }]
+    });
+    if let Some(object) = extra.as_object() {
+        for (key, value) in object {
+            config[key.as_str()] = value.clone();
+        }
+    }
+    config
+}
+
+/// Render one HTTP billing row under `schema`, returning the proxy row.
+fn projected_charges_row(schema: serde_json::Value) -> serde_json::Value {
+    let plugin = ApiChargeback::new(&priced_config(json!({ "schema": schema })), "ferrum")
+        .expect("schema compiles");
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    registry.configure_render_schema(plugin.render_schema().cloned());
+    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    let document: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    document["consumers"]["alice"]["proxies"]["proxy-a"].clone()
+}
+
+#[test]
+fn test_charges_row_default_render_is_unprojected() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    let document: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let row = &document["consumers"]["alice"]["proxies"]["proxy-a"];
+    assert_eq!(row["proxy_id"], json!("proxy-a"));
+    assert_eq!(row["proxy_name"], json!("My API"));
+    assert_eq!(row["currency"], json!("USD"));
+    assert_eq!(row["protocol_family"], json!("http"));
+    assert_eq!(row["total_calls"], json!(1));
+    assert!(row["by_status"].is_object());
+    assert!(row["bandwidth"].is_object());
+    // No stream activity — the sub-object stays absent, as before.
+    assert!(row.get("stream").is_none());
+}
+
+#[test]
+fn test_charges_row_projection_renames_omits_and_adds() {
+    let row = projected_charges_row(json!({
+        "rename": { "proxy_id": "route_id", "total_charges": "amount" },
+        "omit": ["by_status"],
+        "static_fields": { "ledger": "prod" },
+        "derived_fields": [{ "name": "record_kind", "kind": "summary_kind" }]
+    }));
+    assert_eq!(row["route_id"], json!("proxy-a"));
+    assert!(row.get("proxy_id").is_none());
+    assert_eq!(row["amount"], json!(0.5));
+    assert!(row.get("total_charges").is_none());
+    assert!(row.get("by_status").is_none());
+    assert_eq!(row["ledger"], json!("prod"));
+    assert_eq!(row["record_kind"], json!("chargeback_proxy"));
+    // Untouched natives keep their names and values.
+    assert_eq!(row["proxy_name"], json!("My API"));
+    assert_eq!(row["namespace"], json!("ferrum"));
+}
+
+#[test]
+fn test_charges_projection_does_not_alter_registry_keys_or_accounting() {
+    let plugin = ApiChargeback::new(
+        &priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+        "ferrum",
+    )
+    .expect("schema compiles");
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    registry.configure_render_schema(plugin.render_schema().cloned());
+    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+
+    // The registry entry key and the accounted charge are untouched — only the
+    // rendered representation moved.
+    let key = make_key_with_prices("alice", "proxy-a", 200, ProtocolFamily::Http, 0.5, 0.0, 0.0);
+    let entry = registry.entries.get(&key).expect("billing row keyed natively");
+    assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
+    assert_eq!(&*entry.proxy_id, "proxy-a");
+    // Prometheus label sets are likewise unaffected by the JSON projection.
+    let exposition = registry.render_prometheus_uncached().unwrap();
+    assert!(exposition.contains("proxy_id=\"proxy-a\""), "{exposition}");
+    assert!(!exposition.contains("route_id="), "{exposition}");
+}
+
+#[test]
+fn test_charges_projection_change_invalidates_render_cache() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
+    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    let before = registry.render_json().unwrap();
+    assert!(before.contains("\"proxy_id\""));
+
+    let plugin = ApiChargeback::new(
+        &priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+        "ferrum",
+    )
+    .expect("schema compiles");
+    registry.configure_render_schema(plugin.render_schema().cloned());
+    let after = registry.render_json().unwrap();
+    assert!(after.contains("\"route_id\""), "{after}");
+    assert!(!after.contains("\"proxy_id\""), "{after}");
+
+    // Removing the projection restores the native document.
+    registry.configure_render_schema(None);
+    let restored = registry.render_json().unwrap();
+    assert!(restored.contains("\"proxy_id\""), "{restored}");
+}
+
+#[test]
+fn test_charges_schema_rejects_unrepresentable_shapes() {
+    for (schema, needle) in [
+        (
+            json!({ "summary_type": "http" }),
+            "'summary_type' is not supported",
+        ),
+        (
+            json!({ "metadata": { "mode": "flatten" } }),
+            "'metadata' policy is not supported",
+        ),
+        (json!({ "order": ["proxy_id", "*"] }), "'order' is not supported"),
+        (
+            json!({ "timestamp_format": "epoch_ms" }),
+            "'timestamp_format' is not supported",
+        ),
+        (
+            json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
+            "not representable from a chargeback billing row",
+        ),
+        (
+            json!({ "omit": ["latency_total_ms"] }),
+            "schema omit references unknown field 'latency_total_ms'",
+        ),
+        (
+            json!({ "static_fields": { "api_secret": "x" } }),
+            "matches a sensitive-data substring",
+        ),
+        (
+            json!({ "rename": { "proxy_id": "namespace" } }),
+            "duplicate output key 'namespace'",
+        ),
+    ] {
+        let err = ApiChargeback::new(&priced_config(json!({ "schema": schema })), "ferrum")
+            .err()
+            .unwrap_or_else(|| panic!("expected rejection for {schema}"));
+        assert!(err.contains(needle), "needle={needle}, got: {err}");
+    }
+}
+
+#[test]
+fn test_charges_schema_and_schema_ref_are_mutually_exclusive() {
+    let err = ApiChargeback::new(
+        &priced_config(json!({ "schema": {}, "schema_ref": "shared" })),
+        "ferrum",
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("mutually exclusive"), "got: {err}");
+}
+
+#[test]
+fn test_charges_projection_must_agree_across_enabled_instances() {
+    // Two *global* instances also trip the exactly-once rule, so assert on the
+    // projection error specifically rather than on overall failure.
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            chargeback_plugin_config(
+                "cb-a",
+                priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+            ),
+            chargeback_plugin_config(
+                "cb-b",
+                priced_config(json!({ "schema": { "rename": { "proxy_id": "route" } } })),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    let errors = ferrum_edge::plugins::api_chargeback::validate_composition(&config)
+        .expect_err("disagreeing projections must be rejected");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("render projection must match")),
+        "{errors:?}"
+    );
+
+    // Identical projections raise no projection error.
+    let config = GatewayConfig {
+        plugin_configs: vec![
+            chargeback_plugin_config(
+                "cb-a",
+                priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+            ),
+            chargeback_plugin_config(
+                "cb-b",
+                priced_config(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+            ),
+        ],
+        ..GatewayConfig::default()
+    };
+    let matching = ferrum_edge::plugins::api_chargeback::validate_composition(&config)
+        .err()
+        .unwrap_or_default();
+    assert!(
+        !matching
+            .iter()
+            .any(|error| error.contains("render projection must match")),
+        "{matching:?}"
+    );
+}
+
+fn chargeback_plugin_config(id: &str, config: serde_json::Value) -> PluginConfig {
+    serde_json::from_value(json!({
+        "id": id,
+        "plugin_name": "api_chargeback",
+        "namespace": "ferrum",
+        "config": config,
+        "scope": "global",
+        "enabled": true
+    }))
+    .expect("test plugin config")
+}

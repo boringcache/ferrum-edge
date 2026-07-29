@@ -192,7 +192,9 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 > path. See **[docs/log_schema.md](log_schema.md)** for the full
 > reference, including the per-plugin caveats (statsd's tag-name
 > mapping, Kafka partition keys, Loki labels, WebSocket-disconnect
-> entries).
+> entries). `api_chargeback`, `api_chargeback_sink`, and
+> `transaction_debugger` accept the same contract against their own
+> record families.
 
 ### `stdout_logging`
 
@@ -1486,10 +1488,14 @@ WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic an
 | `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
 | `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
 | `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
+| `schema` | Object | *(none)* | Inline projection for the terminal diagnostic records (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key outside the table above is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+The configuration object is closed: any key outside the table above is rejected. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
+
+`schema` / `schema_ref` project the terminal diagnostic records emitted on the `transaction_debug` target. The field inventory is this plugin's own — `outcome`, `method`, `path`, `status`, `rejection_phase`, `latency_plugin_ms`, `latency_gw_overhead_ms`, `metadata`, and the rest of the names in the default records — not the transaction-summary names, so a summary-only name such as `request_user_agent` is rejected with a field-specific diagnostic. With a schema configured the plugin emits one `record` field carrying the projected JSON document instead of the individual `tracing` fields; with none configured the default records are byte-for-byte unchanged. Body capture samples are never part of the projection. See [docs/log_schema.md](log_schema.md).
 
 ### `correlation_id`
 
@@ -1735,6 +1741,8 @@ are HTTP/gRPC only).
 | `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
 | `max_entries` | Integer | `100000` | Hard ceiling on retained billing rows (complete registry entry keys) in the shared registry. One principal can occupy many slots because keys also include proxy, status, protocol family, currency, namespace, and prices. A new row beyond the ceiling is folded into the internal `__cardinality_overflow__~sha256:ferrum-edge/api-chargeback/overflow/v1` aggregate row instead of being dropped (per-identity attribution lost; invoice totals preserved). Must be `> 0` — there is no unlimited mode. Process-global: every enabled instance must use the same value |
 | `max_retained_bytes` | Integer | `67108864` | Hard ceiling on estimated retained registry bytes, covering ordinary billing rows and aggregate overflow rows together. Must be `> 0`. Process-global: every enabled instance must use the same value |
+| `schema` | Object | *(none)* | Inline projection for the `/charges` per-proxy billing row (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref`. Process-global: every enabled instance must resolve to the same projection |
+| `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
@@ -1822,7 +1830,16 @@ status with aggregate totals), and process-wide aggregate Prometheus metrics
 under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, the
-ownership/claim protocol, and reconciliation guidance. Each spool is partitioned
+ownership/claim protocol, and reconciliation guidance.
+
+`schema` / `schema_ref` project the exported charge-event record — the
+JSONEachRow row delivered to ClickHouse and the durable spool artifact that
+replays it. Renaming a field renames the column the row inserts into, so the
+target table must agree. `summary_type`, `timestamp_format`, the `metadata`
+policy, and the `backend_host` derived kind are rejected for this surface.
+Pricing, accumulator identities, and snapshot keys are unaffected. See [docs/log_schema.md](log_schema.md).
+
+Each spool is partitioned
 by a non-secret owner identity (plugin config id, Ferrum namespace/ledger,
 ClickHouse endpoint/database/table, node id), so sibling instances can never
 replay, delete, or dead-letter each other's billing records. Set
