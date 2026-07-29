@@ -95,10 +95,9 @@ impl StdoutLogging {
                 let expression = match filter_config.get("expression") {
                     None | Some(Value::Null) => None,
                     Some(value) => {
-                        let expression =
-                            serde_json::from_value(value.clone()).map_err(|err| {
-                                format!("stdout_logging: filter.expression is invalid: {err}")
-                            })?;
+                        let expression = serde_json::from_value(value.clone()).map_err(|err| {
+                            format!("stdout_logging: filter.expression is invalid: {err}")
+                        })?;
                         validate_access_log_filter_expr(&expression).map_err(|err| {
                             format!("stdout_logging: filter.expression is invalid: {err}")
                         })?;

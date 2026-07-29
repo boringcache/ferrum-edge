@@ -137,8 +137,7 @@ pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(),
             ));
         }
         match node {
-            AccessLogFilterExpr::And { left, right }
-            | AccessLogFilterExpr::Or { left, right } => {
+            AccessLogFilterExpr::And { left, right } | AccessLogFilterExpr::Or { left, right } => {
                 pending.push(right);
                 pending.push(left);
             }
