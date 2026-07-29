@@ -1087,15 +1087,18 @@ Cross-readable executable surface in `ci.yml` outside the protected ARM64 job,
 so rather than relaxing that rule the policy admits **exactly two** byte-frozen
 shapes and nothing else:
 
-- `CI_FUZZ_SMOKE_JOB` — the entire `fuzz-smoke` job in `ci.yml`. A pull request
-  may add it exactly as written or omit it. Its surfaces, and only its surfaces,
+- `CI_FUZZ_SMOKE_JOB` — the entire `fuzz-smoke` job in `ci.yml`. A repository
+  that has not adopted it may omit it; once the trusted base carries it, a pull
+  request may neither remove nor alter it. Its surfaces, and only its surfaces,
   are then withheld from the `ci.yml` surface comparison; a top-level surface
   and every other job's surfaces are unaffected. Every command, action pin,
   toolchain pin (`nightly-2025-07-01`), tool version (`cargo-fuzz 0.13.1`),
   target name, and libFuzzer bound (`-runs`, `-max_total_time`, `-max_len`,
   `-timeout`, `-rss_limit_mb`) is part of the contract. All commands are inline,
   so no repository-supplied script executes in this lane.
-- `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. Whole-file
+- `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
+  that has not adopted it may omit it; once the trusted base carries it, a pull
+  request may neither remove nor alter it. Whole-file
   equality is the contract because a scheduled lane's triggers, permissions, and
   concurrency are as security-relevant as its steps. It is `schedule` +
   input-less `workflow_dispatch` only (no untrusted head can schedule it),

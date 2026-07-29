@@ -1654,8 +1654,8 @@ LIVE_SUITE_JOB_BINDING = {
 #     libFuzzer bound is part of the contract;
 #   * the job cannot be redirected at a repository-supplied script, so no
 #     pull-request-authored executable code runs in this lane;
-#   * a pull request may add the job exactly as written or omit it, and can do
-#     nothing else with it.
+#   * a repository that has not adopted the job may omit it, but once the
+#     trusted base carries it a pull request cannot remove it.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
 CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     # Byte-frozen by the trusted Cross build policy
@@ -1722,8 +1722,8 @@ FUZZ_WORKFLOW = r"""name: Fuzz
 # (.github/scripts/verify_cross_build_policy.py, FUZZ_WORKFLOW): the filename,
 # triggers, permissions, action pins, toolchain and cargo-fuzz versions, target
 # matrix, libFuzzer budgets, and artifact bounds below are the whole contract.
-# A pull request may add this file exactly as written, or delete it; it may not
-# change one byte of it.
+# A repository that has not adopted this file may omit it. Once the trusted
+# base carries it, a pull request may neither remove it nor change one byte.
 #
 # Deliberate constraints:
 #   * read-only `contents: read` permissions at both workflow and job level,
@@ -9041,6 +9041,23 @@ def admitted_ci_job_names(contents: str, source: str) -> frozenset[str]:
     return frozenset({CI_FUZZ_SMOKE_JOB_NAME})
 
 
+def admitted_fuzz_smoke_removal_errors(
+    merge_base_contents: str,
+    proposed_contents: str,
+    source: str,
+) -> list[str]:
+    """Keep the admitted smoke gate once the trusted base has adopted it."""
+
+    baseline = admitted_ci_job_names(merge_base_contents, f"merge-base {source}")
+    proposed = admitted_ci_job_names(proposed_contents, f"proposed {source}")
+    if CI_FUZZ_SMOKE_JOB_NAME in baseline and CI_FUZZ_SMOKE_JOB_NAME not in proposed:
+        return [
+            f"{source} cannot remove or alter the admitted "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} job after the trusted base adopts it"
+        ]
+    return []
+
+
 def without_admitted_job_surfaces(
     surfaces: tuple[str, ...],
     admitted: frozenset[str],
@@ -9195,10 +9212,11 @@ def compare_pr_workflow_collection(
         baseline_contents = merge_base_workflows.get(name, "")
         proposed_contents = proposed_workflows.get(name, "")
         if name == FUZZ_WORKFLOW_FILENAME:
-            # Adding the frozen file and deleting it are both allowed; anything
-            # else is refused. A non-conforming file already present on the
-            # trusted base is reported too, so the contract cannot be inherited
-            # around.
+            # Adding the frozen file is allowed before adoption. Once the
+            # trusted base carries it, deletion is refused; anything other than
+            # the frozen content is always refused. A non-conforming file
+            # already present on the trusted base is reported too, so the
+            # contract cannot be inherited around.
             if name in proposed_workflows:
                 errors.extend(
                     frozen_fuzz_workflow_errors(
@@ -9213,6 +9231,11 @@ def compare_pr_workflow_collection(
                         f"merge-base {source}/{name}",
                     )
                 )
+                if name not in proposed_workflows:
+                    errors.append(
+                        f"proposed {source}/{name} cannot remove the scheduled "
+                        "fuzz lane after the trusted base adopts it"
+                    )
             continue
         baseline_surfaces, baseline_failures = generic_workflow_cross_surfaces(
             baseline_contents,
@@ -13480,6 +13503,13 @@ def compare_pr_workflow_job(
         # withheld from both sides of the comparison; every other job's are not.
         errors.extend(
             admitted_fuzz_smoke_errors(proposed_contents, f"proposed {source}")
+        )
+        errors.extend(
+            admitted_fuzz_smoke_removal_errors(
+                merge_base_contents,
+                proposed_contents,
+                source,
+            )
         )
         baseline_surfaces = without_admitted_job_surfaces(
             baseline_surfaces,
@@ -21968,6 +21998,18 @@ pre_build = []
         failures.append("an absent fuzz-smoke job was rejected")
     if admitted_ci_job_names(fuzz_absent_workflow, "CI workflow"):
         failures.append("an absent fuzz-smoke job was reported as admitted")
+    if not admitted_fuzz_smoke_removal_errors(
+        fuzz_ci_workflow,
+        fuzz_absent_workflow,
+        "CI workflow",
+    ):
+        failures.append("removal of an adopted fuzz-smoke job was not rejected")
+    if admitted_fuzz_smoke_removal_errors(
+        fuzz_absent_workflow,
+        fuzz_ci_workflow,
+        "CI workflow",
+    ):
+        failures.append("initial adoption of the fuzz-smoke job was rejected")
 
     fuzz_smoke_tampering: dict[str, tuple[str, str]] = {
         "widened libFuzzer budget": ("-max_total_time=8", "-max_total_time=800"),
@@ -22031,6 +22073,20 @@ pre_build = []
 
     if frozen_fuzz_workflow_errors(FUZZ_WORKFLOW, "self-test/fuzz.yml"):
         failures.append("the admitted scheduled fuzz-lane contract was rejected")
+    scheduled_removal = compare_pr_workflow_collection(
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        relevance_workflows,
+        "self-test workflows",
+    )
+    if not any("cannot remove the scheduled fuzz lane" in error for error in scheduled_removal):
+        failures.append("removal of an adopted scheduled fuzz lane was not rejected")
+    scheduled_adoption = compare_pr_workflow_collection(
+        relevance_workflows,
+        {"fuzz.yml": FUZZ_WORKFLOW, **relevance_workflows},
+        "self-test workflows",
+    )
+    if any("scheduled fuzz lane" in error for error in scheduled_adoption):
+        failures.append("initial adoption of the scheduled fuzz lane was rejected")
     fuzz_workflow_tampering: dict[str, tuple[str, str]] = {
         "untrusted trigger": (
             "  workflow_dispatch:\n",

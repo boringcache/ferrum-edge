@@ -38,8 +38,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   required live gates".
 - The fuzz/property lane is admitted only as two byte-frozen shapes:
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
-  `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Both may be
-  added verbatim or omitted; nothing else is accepted. A committed
+  `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
+  absent before initial adoption; once present on the trusted base, pull
+  requests may neither remove nor alter it. A committed
   `.cargo/config[.toml]` below the repository root is rejected outright.
 
 ## Drift Guard
