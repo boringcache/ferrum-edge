@@ -11636,11 +11636,15 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             )
         }
     } else {
-        let normalized = crate::proxy::normalize_reject_response(
+        // Committed observers must see what the sender writes, so the
+        // framed unary terminate representation is authorized here on
+        // exactly the same provenance the writer uses.
+        let normalized = crate::proxy::normalize_reject_response_with_provenance(
             http_status,
             body.clone(),
             headers,
             matches!(flavor, HttpFlavor::Grpc),
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
         );
         (normalized.http_status, normalized.headers, normalized.body)
     };
@@ -11857,6 +11861,8 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                 )
                 .await
             } else {
+                // The gateway deadline response replaced the plugin rejection
+                // wholesale; no terminate provenance survives it.
                 send_h3_reject_flavor_aware_with_recv_halt(
                     stream,
                     flavor,
@@ -11864,6 +11870,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                     deadline_body,
                     &deadline_headers,
                     false,
+                    crate::proxy::FramedGrpcUnaryProvenance::NONE,
                 )
                 .await
             }
@@ -11880,6 +11887,10 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
         };
     }
 
+    // Snapshot the `serverless_function` terminate provenance before the write
+    // future borrows `ctx` mutably. A gRPC-Web client never receives a native
+    // framed unary body, so that branch is deliberately not authorized.
+    let authored_grpc_terminate_frame = ctx.serverless_grpc_terminate_frame.clone();
     let write = async {
         if let Some(content_type) = grpc_web_response_content_type {
             return send_h3_grpc_web_reject_with_recv_halt(
@@ -11902,6 +11913,9 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             body,
             headers,
             halt_recv,
+            crate::proxy::FramedGrpcUnaryProvenance::from_authored_frame(
+                authored_grpc_terminate_frame.as_deref(),
+            ),
         )
         .await
     };
@@ -12256,6 +12270,7 @@ async fn send_h3_reject_flavor_aware(
         http_body,
         headers,
         true,
+        crate::proxy::FramedGrpcUnaryProvenance::NONE,
     )
     .await
 }
@@ -12267,6 +12282,7 @@ async fn send_h3_reject_flavor_aware_with_recv_halt(
     http_body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
+    framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
 ) -> Result<(), anyhow::Error> {
     send_h3_reject_flavor_aware_with_header_state(
         stream,
@@ -12276,6 +12292,7 @@ async fn send_h3_reject_flavor_aware_with_recv_halt(
         headers,
         false,
         halt_recv,
+        framed_unary_provenance,
     )
     .await
 }
@@ -12298,10 +12315,12 @@ async fn send_h3_finalized_reject_flavor_aware(
         headers,
         true,
         true,
+        crate::proxy::FramedGrpcUnaryProvenance::NONE,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_h3_reject_flavor_aware_with_header_state(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
@@ -12310,6 +12329,7 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     headers: &HashMap<String, String>,
     headers_finalized: bool,
     halt_recv: bool,
+    framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
 ) -> Result<(), anyhow::Error> {
     if !matches!(flavor, HttpFlavor::Grpc) {
         if matches!(flavor, HttpFlavor::WebSocket) {
@@ -12366,10 +12386,64 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
     let headers = &sanitized_headers;
 
-    // Derive signalling from the sanitized response metadata. Inspection only —
-    // the trailers-only gRPC reject drops the body, so this borrow never forces
-    // the owned `Bytes` payload to be copied.
-    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, &http_body, headers);
+    // A rejection that carries byte-exact `serverless_function` terminate
+    // provenance is emitted as HEADERS + one uncompressed unary DATA frame +
+    // terminal trailers. Everything else — including a body that merely looks
+    // like a gRPC frame — normalizes to trailers-only below. Only authorizing
+    // provenance can produce framed parts, so skip the full normalizer on the
+    // ordinary H3 gRPC reject flood. The `Bytes` clone is a refcount bump; the
+    // authorized frame that reaches `send_data` is the caller's own buffer,
+    // never a copy of it.
+    if framed_unary_provenance.is_authorizing() {
+        let normalized = crate::proxy::normalize_reject_response_with_provenance(
+            http_status,
+            http_body.clone(),
+            headers,
+            true,
+            framed_unary_provenance,
+        );
+        if let Some((framed_body, framed_trailers)) =
+            crate::proxy::framed_unary_reject_parts(&normalized)
+        {
+            let framed_body = framed_body.clone();
+            let resp = h3_framed_unary_initial_response(&normalized.headers)
+                .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
+            stream.send_response(resp).await?;
+            stream.send_data(framed_body).await?;
+            let trailers =
+                crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(framed_trailers);
+            stream.send_trailers(trailers).await?;
+            stream.finish().await?;
+            if halt_recv {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            return Ok(());
+        }
+    }
+
+    // This writer uses H3's status-mapping table rather than the H1/H2
+    // normalizer's table, but shares the complete provenance correction with H3
+    // transaction logging so observability cannot disagree with the wire.
+    // Everything below is inspection only — the trailers-only gRPC reject drops
+    // the body, so these borrows never force the owned `Bytes` to be copied.
+    //
+    // 1. An UNCHANGED status-only terminate contract is legitimately
+    //    trailers-only, and its terminal metadata is the contract's own — not
+    //    whatever the decorated reject header map now says.
+    // 2. Otherwise, reaching here while still HOLDING terminate authorization
+    //    means the authored representation was invalidated, and the contract's
+    //    `grpc-status: 0` must not be emitted as an empty Trailers-Only success.
+    // 3. The status-only contract's `grpc-message` is OPTIONAL, so an omitted
+    //    one is emitted as no field at all — never as a synthesized reason and
+    //    never as an empty value.
+    let status_only =
+        crate::proxy::status_only_grpc_signal(framed_unary_provenance, http_status, &http_body);
+    let (grpc_status, grpc_message) = h3_non_framed_grpc_reject_signal_with_provenance(
+        http_status,
+        &http_body,
+        headers,
+        framed_unary_provenance,
+    );
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the
@@ -12380,10 +12454,28 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     for (k, v) in headers {
         // `eq_ignore_ascii_case` avoids the `to_ascii_lowercase` String
         // allocation that was previously executed per header.
+        // `content-length` is dropped for the same reason the H1/H2 normalizer
+        // drops it: this branch emits no DATA, so any surviving value describes
+        // bytes that are not being sent. The framed serverless-terminate
+        // representation runs the shared response-body lifecycle, whose
+        // transforms set `content-length` on the reject header map, so a stale
+        // nonzero value can reach here once that authorization is invalidated.
         if k.eq_ignore_ascii_case("content-type")
             || k.eq_ignore_ascii_case("grpc-status")
             || k.eq_ignore_ascii_case("grpc-message")
+            || k.eq_ignore_ascii_case("content-length")
         {
+            continue;
+        }
+        // Same eviction the H1/H2 normalizer performs: while a terminate
+        // contract is authorizing, no terminal metadata survives out of the
+        // mutable reject header map — neither what the contract authored nor a
+        // `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance below; an
+        // invalidated contract emits none of them, so the replacement status
+        // can never ride out beside the original contract's details or
+        // custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(k) {
             continue;
         }
         if k.eq_ignore_ascii_case("set-cookie") {
@@ -12402,9 +12494,24 @@ async fn send_h3_reject_flavor_aware_with_header_state(
             builder = builder.header(name, val);
         }
     }
+    // Restore the intact status-only contract's remaining terminal metadata from
+    // the validated provenance, so decorators can add initial response headers
+    // but cannot alter, drop, or inject what the contract terminated with.
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            if let (Ok(name), Ok(val)) = (
+                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                hyper::header::HeaderValue::from_str(value),
+            ) {
+                builder = builder.header(name, val);
+            }
+        }
+    }
+    builder = builder.header("grpc-status", grpc_status.to_string());
+    if let Some(message) = grpc_message.as_deref().filter(|value| !value.is_empty()) {
+        builder = builder.header("grpc-message", message);
+    }
     let resp = builder
-        .header("grpc-status", grpc_status.to_string())
-        .header("grpc-message", grpc_message.as_ref())
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
@@ -12415,7 +12522,17 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     Ok(())
 }
 
-fn h3_reject_log_status_and_metadata(
+/// Build the initial HEADERS block for an authorized framed unary gRPC reject.
+///
+/// Route through the shared response-header emitter so HTTP/3 preserves the
+/// proxy's newline-joined repeated-cookie representation exactly like H1/H2.
+pub(crate) fn h3_framed_unary_initial_response(
+    headers: &HashMap<String, String>,
+) -> Result<Response<()>, http::Error> {
+    apply_response_headers(Response::builder().status(StatusCode::OK), headers).body(())
+}
+
+pub(crate) fn h3_reject_log_status_and_metadata(
     ctx: &mut RequestContext,
     flavor: HttpFlavor,
     http_status: StatusCode,
@@ -12441,8 +12558,36 @@ fn h3_reject_log_status_and_metadata(
         return http_status.as_u16();
     }
 
-    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
-    crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message.as_ref());
+    let provenance = crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx);
+    let (grpc_status, grpc_message) = if provenance.is_authorizing() {
+        // Borrowed inspection only: share the exact intact-framed predicates
+        // with the owned normalizer so log and wire cannot drift, without a
+        // full-body copy of an authorized (up to multi-MiB) frame merely to
+        // read grpc-status/message for transaction metadata.
+        if let Some((status, message, _)) = crate::proxy::intact_framed_unary_terminate_signal(
+            provenance,
+            http_status,
+            http_body,
+            headers,
+        ) {
+            (status, message.map(std::borrow::Cow::Owned))
+        } else {
+            h3_non_framed_grpc_reject_signal_with_provenance(
+                http_status,
+                http_body,
+                headers,
+                provenance,
+            )
+        }
+    } else {
+        let (status, message) = h3_grpc_reject_signal(http_status, http_body, headers);
+        (status, Some(message))
+    };
+    crate::proxy::insert_grpc_error_metadata(
+        &mut ctx.metadata,
+        grpc_status,
+        grpc_message.as_deref().unwrap_or(""),
+    );
     StatusCode::OK.as_u16()
 }
 
@@ -12485,6 +12630,42 @@ fn h3_grpc_reject_signal(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| reject_body_as_grpc_message(http_body, http_status));
     (grpc_status, grpc_message)
+}
+
+/// H3 trailers-only signal after applying the request-scoped serverless
+/// terminate provenance contract.
+///
+/// Kept separate from [`h3_grpc_reject_signal`] because H3 intentionally uses
+/// a distinct HTTP-status mapping table. Both the direct writer and transaction
+/// logging call this helper after ruling out an intact framed response, so the
+/// logged status/message exactly match the wire: an intact status-only contract
+/// restores its optional authored message, while an invalidated authorization
+/// fails closed and cannot be logged as success.
+fn h3_non_framed_grpc_reject_signal_with_provenance(
+    http_status: StatusCode,
+    http_body: &[u8],
+    headers: &HashMap<String, String>,
+    framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
+) -> (u32, Option<std::borrow::Cow<'static, str>>) {
+    let (derived_status, derived_message) = h3_grpc_reject_signal(http_status, http_body, headers);
+    if let Some(authored) =
+        crate::proxy::status_only_grpc_signal(framed_unary_provenance, http_status, http_body)
+    {
+        return (
+            authored.grpc_status,
+            authored.grpc_message.map(std::borrow::Cow::Owned),
+        );
+    }
+
+    let mapped_status = crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
+    match crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
+        framed_unary_provenance,
+        derived_status,
+        mapped_status,
+    ) {
+        Some((status, message)) => (status, Some(std::borrow::Cow::Borrowed(message))),
+        None => (derived_status, Some(derived_message)),
+    }
 }
 
 /// Extract a grpc-message string from a plugin/auth reject body, which is
