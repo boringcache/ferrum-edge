@@ -579,20 +579,21 @@ pub(crate) fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<
     ]
 }
 
-/// Install the inbound-redirect local-delivery routing for both families.
+/// Install the inbound-redirect local-delivery routing for every family the
+/// capture listener can actually accept.
 ///
 /// The load-bearing `rule add` / `route replace` are **fatal** on failure —
 /// TPROXY-style steering without local delivery is a black hole, so the two go
 /// in together or not at all. Only the idempotence `rule del` is best-effort.
 ///
-/// Failure is **partial by nature**: the IPv4 rule can be in place when the
-/// IPv6 route fails. Every caller therefore removes the Ferrum-owned routing on
-/// the error path — see `initialize_backend_after_load`.
-fn install_ingress_redirect_routing() -> Result<(), String> {
+/// Failure is **partial by nature**: an earlier command can be in place when a
+/// later route fails. Every caller therefore removes the Ferrum-owned routing
+/// on the error path — see `initialize_backend_after_load`.
+fn install_ingress_redirect_routing(supports_ipv6: bool) -> Result<(), String> {
     #[cfg(test)]
-    let result = ingress_redirect_routing_seam::install();
+    let result = ingress_redirect_routing_seam::install(supports_ipv6);
     #[cfg(not(test))]
-    let result = install_ingress_redirect_routing_impl();
+    let result = install_ingress_redirect_routing_impl(supports_ipv6);
     result
 }
 
@@ -619,6 +620,7 @@ pub(crate) mod ingress_redirect_routing_seam {
     pub(crate) struct RoutingCalls {
         pub installs: usize,
         pub removals: usize,
+        pub install_supports_ipv6: Option<bool>,
     }
 
     struct SeamState {
@@ -671,10 +673,11 @@ pub(crate) mod ingress_redirect_routing_seam {
         })
     }
 
-    pub(super) fn install() -> Result<(), String> {
+    pub(super) fn install(supports_ipv6: bool) -> Result<(), String> {
         SEAM.with(|seam| match seam.borrow_mut().as_mut() {
             Some(state) => {
                 state.calls.installs += 1;
+                state.calls.install_supports_ipv6 = Some(supports_ipv6);
                 record(state, "install_ingress_redirect_routing");
                 if state.fail_install {
                     Err("injected ingress redirect routing install failure".to_string())
@@ -698,8 +701,11 @@ pub(crate) mod ingress_redirect_routing_seam {
 }
 
 #[cfg(all(target_os = "linux", not(test)))]
-fn install_ingress_redirect_routing_impl() -> Result<(), String> {
+fn install_ingress_redirect_routing_impl(supports_ipv6: bool) -> Result<(), String> {
     for ipv6 in [false, true] {
+        if ipv6 && !supports_ipv6 {
+            continue;
+        }
         for args in ingress_redirect_routing_commands(ipv6) {
             let best_effort = args.iter().any(|arg| arg == "del");
             match std::process::Command::new("ip").args(&args).output() {
@@ -728,7 +734,7 @@ fn install_ingress_redirect_routing_impl() -> Result<(), String> {
 }
 
 #[cfg(all(not(target_os = "linux"), not(test)))]
-fn install_ingress_redirect_routing_impl() -> Result<(), String> {
+fn install_ingress_redirect_routing_impl(_supports_ipv6: bool) -> Result<(), String> {
     Err("the NodeWaypoint inbound tc ingress redirect is Linux-only".to_string())
 }
 
@@ -6665,7 +6671,9 @@ fn initialize_backend_after_load(
     // first means an aborted startup leaves only inert routing behind.
     let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
     if ingress_redirect_enabled {
-        if let Err(e) = install_ingress_redirect_routing() {
+        if let Err(e) = install_ingress_redirect_routing(
+            config.capture_contract.ingress_capture_supports_ipv6,
+        ) {
             // The `ip` batch is not atomic: the v4 rule can be installed when
             // the v6 route fails. Remove exactly the Ferrum-owned rule/route on
             // this path too — an inert leftover priority/table entry still
@@ -8143,6 +8151,11 @@ mod tests {
         assert!(err.to_string().contains("policy routing"), "{err}");
         assert_eq!(calls.installs, 1);
         assert_eq!(
+            calls.install_supports_ipv6,
+            Some(false),
+            "an IPv4-only capture listener must not install fatal IPv6 routing commands"
+        );
+        assert_eq!(
             calls.removals,
             1,
             "the partially installed Ferrum-owned rule/route must be removed"
@@ -8181,6 +8194,11 @@ mod tests {
 
         assert!(err.to_string().contains("startup validation failed"), "{err}");
         assert_eq!(calls.installs, 1);
+        assert_eq!(
+            calls.install_supports_ipv6,
+            Some(false),
+            "an IPv4-only capture listener must not install fatal IPv6 routing commands"
+        );
         assert_eq!(
             calls.removals,
             1,

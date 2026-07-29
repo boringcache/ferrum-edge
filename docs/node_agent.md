@@ -430,7 +430,9 @@ The per-family flag and the per-family scope are derived together, so an
 IPv4-only bind also *clears* any IPv6 scope for the pod's address (a pinned map
 can outlive a previous dual-stack configuration) and never sets the IPv6
 redirect flag — a true flag paired with unreachable scope is the fail-closed
-drop case.
+drop case. Policy routing follows the same family gate: an IPv4-only listener
+installs only the IPv4 rule and route, so a host with IPv6 disabled cannot
+abort otherwise-valid IPv4 capture during an `ip -6 route` operation.
 Bind `FERRUM_MESH_INBOUND_LISTEN_ADDR` to `[::]:15006` — dual-stack under the
 default `bindv6only=0` — to redirect both families.
 
