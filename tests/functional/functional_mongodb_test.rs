@@ -2089,13 +2089,14 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     async fn mongo_op_timeout<T, E, F>(
         phase: &str,
         op: &str,
-        fut: F,
+        action: F,
     ) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
     where
-        F: std::future::Future<Output = Result<T, E>>,
+        F: std::future::IntoFuture<Output = Result<T, E>>,
         E: std::fmt::Display,
     {
-        match tokio::time::timeout(CHANGE_STREAM_TEST_MONGO_OP_TIMEOUT, fut).await {
+        match tokio::time::timeout(CHANGE_STREAM_TEST_MONGO_OP_TIMEOUT, action.into_future()).await
+        {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(err)) => Err(format!("{phase}: {op} failed: {err}").into()),
             Err(_) => Err(format!(
