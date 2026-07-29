@@ -4583,22 +4583,24 @@ fn parse_root_document(
             Ok(v) => (v, false, SpecFormat::Json),
             Err(e) if declared_format.is_none() => {
                 // Autodetected as JSON but failed — try YAML (covers flow-style).
-                // Preserve fail-closed alias/budget diagnostics as InvalidYaml
-                // (matching the former preflight). Generic YAML syntax failures
-                // keep the original JSON error so autodetection messaging stays
-                // stable for non-YAML garbage that merely started with `{`.
-                let val = parse_yaml_document(body).map_err(|yaml_err| match yaml_err {
-                    ExtractError::InvalidYaml(msg)
-                        if msg.contains("undefined YAML alias")
-                            || msg.contains("duplicate YAML anchor")
-                            || msg.contains("alias cycle")
-                            || msg.contains("exceeds")
-                            || msg.contains("limit") =>
-                    {
-                        ExtractError::InvalidYaml(msg)
+                // Preserve every semantic fail-closed YAML diagnostic. Only a
+                // YAML syntax failure keeps the original JSON error, so adding
+                // a new bounded-composer error cannot silently weaken this
+                // classification through a brittle message allowlist.
+                let val = crate::admin::api_specs::bounded_yaml::parse_yaml_to_json(
+                    body,
+                    MAX_SOURCE_DOCUMENT_NODES,
+                )
+                .map_err(|yaml_err| {
+                    if matches!(
+                        &yaml_err,
+                        crate::admin::api_specs::bounded_yaml::BoundedYamlError::Parse(_)
+                            | crate::admin::api_specs::bounded_yaml::BoundedYamlError::EmptyDocument
+                    ) {
+                        ExtractError::InvalidJson(e.to_string())
+                    } else {
+                        ExtractError::InvalidYaml(yaml_err.message())
                     }
-                    ExtractError::InvalidYaml(_) => ExtractError::InvalidJson(e.to_string()),
-                    other => other,
                 })?;
                 (val, true, SpecFormat::Yaml)
             }
@@ -6590,6 +6592,16 @@ x-ferrum-proxy:
         assert!(
             matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("cycle")),
             "expected alias cycle rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn autodetected_flow_yaml_duplicate_key_is_invalid_yaml() {
+        let yaml = br#"{openapi: '3.1.0', info: {title: Duplicate, version: '1.0'}, x-ferrum-proxy: {id: test, backend_host: x.com, backend_port: 443}, marker: one, marker: two}"#;
+        let err = extract(yaml, None, "default").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("duplicate key")),
+            "semantic YAML failures must survive JSON-first autodetection, got {err:?}"
         );
     }
 

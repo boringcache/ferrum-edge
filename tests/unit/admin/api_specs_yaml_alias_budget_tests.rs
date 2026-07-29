@@ -130,6 +130,24 @@ fn duplicate_mapping_keys_fail_closed_without_echoing_the_key() {
 }
 
 #[test]
+fn unsupported_collection_tags_fail_closed_without_echoing_the_tag() {
+    for yaml in [
+        "!must-not-escape\nx-ferrum-proxy:\n  id: tagged-map\n  backend_host: backend.internal\n  backend_port: 443\n",
+        "tagged: !must-not-escape [one, two]\nx-ferrum-proxy:\n  id: tagged-sequence\n  backend_host: backend.internal\n  backend_port: 443\n",
+    ] {
+        let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+        assert!(
+            matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("unsupported YAML tag")),
+            "got {err:?}"
+        );
+        assert!(
+            !format!("{err:?}").contains("must-not-escape"),
+            "unsupported-tag diagnostics must not echo hostile tag text"
+        );
+    }
+}
+
+#[test]
 fn undefined_alias_fails_closed() {
     let yaml = format!(
         "openapi: '3.1.0'\n\

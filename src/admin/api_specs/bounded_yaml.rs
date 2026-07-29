@@ -50,11 +50,9 @@ impl BoundedYamlError {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::Parse(msg) => format!("YAML parse error: {msg}"),
-            Self::UndefinedAlias { name } => format!("undefined YAML alias '*{name}'"),
-            Self::DuplicateAnchor { name } => format!("duplicate YAML anchor '&{name}'"),
-            Self::Cycle { anchor } => {
-                format!("YAML alias cycle detected while expanding '&{anchor}'")
-            }
+            Self::UndefinedAlias { .. } => "undefined YAML alias".to_string(),
+            Self::DuplicateAnchor { .. } => "duplicate YAML anchor".to_string(),
+            Self::Cycle { .. } => "YAML alias cycle detected during expansion".to_string(),
             Self::DepthExceeded => "YAML document exceeds nesting depth limit".to_string(),
             Self::NodeLimitExceeded => {
                 "YAML document exceeds expanded node limit; reduce nesting or alias reuse"
@@ -77,9 +75,9 @@ impl BoundedYamlError {
             Self::DuplicateMappingKey => {
                 "YAML mapping contains a duplicate key".to_string()
             }
-            Self::UnsupportedTag { tag } => {
-                format!("unsupported YAML tag '{tag}' in API specs")
-            }
+            // Tags are supplied by the caller. Keep diagnostics actionable
+            // without reflecting arbitrary tag text into an admin response.
+            Self::UnsupportedTag { .. } => "unsupported YAML tag in API specs".to_string(),
             Self::EmptyDocument => "YAML document is empty".to_string(),
             Self::NonFiniteNumber => {
                 "YAML non-finite numbers are not representable in JSON".to_string()
@@ -249,7 +247,14 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
                 }
                 seen_document = true;
             }
-            Event::StreamEnd => break,
+            Event::StreamEnd => {
+                if !stack.is_empty() || (seen_document && !finished_document) {
+                    return Err(BoundedYamlError::Parse(
+                        "unexpected stream end inside YAML document".to_string(),
+                    ));
+                }
+                break;
+            }
             Event::DocumentEnd => {
                 if !stack.is_empty() {
                     return Err(BoundedYamlError::Parse(
@@ -298,12 +303,13 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
                 register_anchor(&mut document, anchor, id)?;
                 attach_child(&mut document, &mut stack, id)?;
             }
-            Event::SequenceStart { anchor } => {
+            Event::SequenceStart { anchor, tag } => {
                 if finished_document {
                     return Err(BoundedYamlError::Parse(
                         "content after document end".to_string(),
                     ));
                 }
+                validate_collection_tag(tag.as_deref(), "tag:yaml.org,2002:seq")?;
                 let id = alloc_node(&mut document, max_nodes, NodeKind::Sequence(Vec::new()))?;
                 // Register before children so self-referential aliases resolve.
                 register_anchor(&mut document, anchor, id)?;
@@ -318,12 +324,13 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
                     ));
                 }
             },
-            Event::MappingStart { anchor } => {
+            Event::MappingStart { anchor, tag } => {
                 if finished_document {
                     return Err(BoundedYamlError::Parse(
                         "content after document end".to_string(),
                     ));
                 }
+                validate_collection_tag(tag.as_deref(), "tag:yaml.org,2002:map")?;
                 let id = alloc_node(&mut document, max_nodes, NodeKind::Mapping(Vec::new()))?;
                 register_anchor(&mut document, anchor, id)?;
                 attach_child(&mut document, &mut stack, id)?;
@@ -357,6 +364,19 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
         return Err(BoundedYamlError::EmptyDocument);
     }
     Ok(document)
+}
+
+fn validate_collection_tag(
+    tag: Option<&str>,
+    expected_core_tag: &str,
+) -> Result<(), BoundedYamlError> {
+    match tag {
+        None | Some("!") => Ok(()),
+        Some(tag) if tag == expected_core_tag => Ok(()),
+        Some(tag) => Err(BoundedYamlError::UnsupportedTag {
+            tag: tag.to_owned(),
+        }),
+    }
 }
 
 fn alloc_node(
@@ -814,10 +834,12 @@ enum Event {
     },
     SequenceStart {
         anchor: Option<String>,
+        tag: Option<String>,
     },
     SequenceEnd,
     MappingStart {
         anchor: Option<String>,
+        tag: Option<String>,
     },
     MappingEnd,
 }
@@ -935,7 +957,11 @@ unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, BoundedYamlE
                 sys::YAML_DOUBLE_QUOTED_SCALAR_STYLE => ScalarStyle::DoubleQuoted,
                 sys::YAML_LITERAL_SCALAR_STYLE => ScalarStyle::Literal,
                 sys::YAML_FOLDED_SCALAR_STYLE => ScalarStyle::Folded,
-                _ => ScalarStyle::Plain,
+                _ => {
+                    return Err(BoundedYamlError::Parse(
+                        "unsupported YAML scalar style".to_string(),
+                    ));
+                }
             };
             Ok(Event::Scalar {
                 anchor,
@@ -946,12 +972,14 @@ unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, BoundedYamlE
         }
         sys::YAML_SEQUENCE_START_EVENT => {
             let anchor = unsafe { optional_cstr(event.data.sequence_start.anchor) }?;
-            Ok(Event::SequenceStart { anchor })
+            let tag = unsafe { optional_cstr(event.data.sequence_start.tag) }?;
+            Ok(Event::SequenceStart { anchor, tag })
         }
         sys::YAML_SEQUENCE_END_EVENT => Ok(Event::SequenceEnd),
         sys::YAML_MAPPING_START_EVENT => {
             let anchor = unsafe { optional_cstr(event.data.mapping_start.anchor) }?;
-            Ok(Event::MappingStart { anchor })
+            let tag = unsafe { optional_cstr(event.data.mapping_start.tag) }?;
+            Ok(Event::MappingStart { anchor, tag })
         }
         sys::YAML_MAPPING_END_EVENT => Ok(Event::MappingEnd),
         _ => Err(BoundedYamlError::Parse(

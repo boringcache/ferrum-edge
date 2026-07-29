@@ -11,10 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - API-spec YAML ingestion now expands anchors and aliases through a bounded
   libyaml event graph (node, depth, alias-reference, expanded-byte, and work
-  budgets) with cycle / undefined-alias / duplicate-anchor detection before
-  JSON conversion (#3307). Merge keys are applied when present. JSON and YAML
-  share the same expanded-node admission cap so autodetection cannot weaken
-  checks.
+  budgets) with cycle / undefined-alias / duplicate-anchor /
+  duplicate-mapping-key detection before JSON conversion (#3307). Merge keys
+  are applied when present. JSON and YAML share the same expanded-node
+  admission cap so autodetection cannot weaken checks.
 
 ### Security
 
