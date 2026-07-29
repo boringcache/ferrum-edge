@@ -1015,8 +1015,7 @@ impl ChargebackRegistry {
         let has_projection = render_schema.is_some();
         self.render_schema.store(Arc::new(render_schema));
         if had_projection || has_projection {
-            self.render_schema_generation
-                .fetch_add(1, Ordering::AcqRel);
+            self.render_schema_generation.fetch_add(1, Ordering::AcqRel);
             self.json_cache.store(Arc::new(None));
         }
     }

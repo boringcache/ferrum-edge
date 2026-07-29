@@ -4607,7 +4607,9 @@ fn test_stale_projection_render_cannot_repopulate_json_cache() {
         "generation mismatch must reject stale-cache repopulation"
     );
 
-    let after = registry.render_json().expect("cache hit after rejected stale store");
+    let after = registry
+        .render_json()
+        .expect("cache hit after rejected stale store");
     assert_eq!(
         after, native,
         "rejected stale store must leave the post-transition document cached"
