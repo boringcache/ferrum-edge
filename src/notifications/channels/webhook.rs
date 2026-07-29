@@ -232,7 +232,10 @@ fn header_value_is_json(value: &HeaderValue) -> bool {
     media_type.to_ascii_lowercase().ends_with("+json")
 }
 
-fn base_vars(n: &Notification) -> HashMap<String, String> {
+/// Project the generic [`Notification`] variables into a template map. Shared
+/// with the email channel so both operator-templated transports expose exactly
+/// the same variable names.
+pub(super) fn base_vars(n: &Notification) -> HashMap<String, String> {
     let mut vars = HashMap::with_capacity(NOTIFICATION_TEMPLATE_VARS.len());
     vars.insert("title".to_string(), n.title.clone());
     vars.insert("body".to_string(), n.body.clone());
