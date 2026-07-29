@@ -509,7 +509,9 @@ fn transaction_debugger_schema_rejects_unknown_field_with_diagnostic() {
         json!({ "schema": { "summary_type": "http", "omit": ["request_user_agent"] } }),
     );
     assert!(
-        err.contains("transaction_debugger: schema omit references unknown field 'request_user_agent'"),
+        err.contains(
+            "transaction_debugger: schema omit references unknown field 'request_user_agent'"
+        ),
         "got: {err}"
     );
 }
@@ -563,8 +565,14 @@ fn api_chargeback_schema_rejects_summary_type_metadata_and_order() {
             json!({ "summary_type": "http" }),
             "'summary_type' is not supported",
         ),
-        (json!({ "metadata": { "mode": "omit" } }), "'metadata' policy is not supported"),
-        (json!({ "order": ["proxy_id", "*"] }), "'order' is not supported"),
+        (
+            json!({ "metadata": { "mode": "omit" } }),
+            "'metadata' policy is not supported",
+        ),
+        (
+            json!({ "order": ["proxy_id", "*"] }),
+            "'order' is not supported",
+        ),
         (
             json!({ "derived_fields": [{ "name": "host", "kind": "backend_host" }] }),
             "not representable from a chargeback billing row",
@@ -837,10 +845,7 @@ fn non_summary_families_resolve_schema_ref_and_survive_reload() {
 
     // Both non-summary families recompile the named definition under their own
     // record family — the shared `proxy_id` name resolves in each.
-    create_ok(
-        "transaction_debugger",
-        json!({ "schema_ref": "portable" }),
-    );
+    create_ok("transaction_debugger", json!({ "schema_ref": "portable" }));
     create_ok(
         "api_chargeback",
         json!({

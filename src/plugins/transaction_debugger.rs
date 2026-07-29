@@ -1180,7 +1180,11 @@ impl Plugin for TransactionDebugger {
         if !tracing::enabled!(target: "transaction_debug", tracing::Level::DEBUG) {
             return;
         }
-        if let Some(schema) = self.schema.as_ref().filter(|schema| schema.applies_to_http()) {
+        if let Some(schema) = self
+            .schema
+            .as_ref()
+            .filter(|schema| schema.applies_to_http())
+        {
             let record = DebugHttpRecord {
                 summary,
                 outcome: Self::classify_http_outcome(summary),
@@ -1365,7 +1369,9 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
             "backend_resolved_ip" => {
                 emit_optional(out_key, summary.backend_resolved_ip.as_deref(), map)
             }
-            "consumer_username" => emit_optional(out_key, summary.consumer_username.as_deref(), map),
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
             "auth_method" => emit_optional(out_key, summary.auth_method, map),
             "error_class" => emit_optional(out_key, summary.error_class.map(|c| c.as_str()), map),
             "body_error_class" => {
@@ -1446,8 +1452,8 @@ impl<'a> SchemaSerializable for DebugHttpRecord<'a> {
                 Ok(true)
             }
             DerivedKind::Outcome => {
-                let is_error = self.summary.response_status_code >= 500
-                    || self.summary.is_terminal_failure();
+                let is_error =
+                    self.summary.response_status_code >= 500 || self.summary.is_terminal_failure();
                 map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
                 Ok(true)
             }
@@ -1503,7 +1509,9 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
             "backend_resolved_ip" => {
                 emit_optional(out_key, summary.backend_resolved_ip.as_deref(), map)
             }
-            "consumer_username" => emit_optional(out_key, summary.consumer_username.as_deref(), map),
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
             "auth_method" => emit_optional(out_key, summary.auth_method, map),
             "connection_error" => emit_optional(out_key, summary.connection_error.as_deref(), map),
             "error_class" => emit_optional(out_key, summary.error_class.map(|c| c.as_str()), map),
@@ -1570,7 +1578,10 @@ impl<'a> SchemaSerializable for DebugStreamRecord<'a> {
             DerivedKind::Outcome => {
                 let is_error = self.summary.connection_error.is_some()
                     || self.summary.error_class.is_some()
-                    || matches!(self.summary.disconnect_cause, Some(DisconnectCause::BackendError));
+                    || matches!(
+                        self.summary.disconnect_cause,
+                        Some(DisconnectCause::BackendError)
+                    );
                 map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
                 Ok(true)
             }
@@ -1622,7 +1633,9 @@ impl<'a> SchemaSerializable for DebugWsRecord<'a> {
             "client_ip" => map.serialize_entry(out_key, &summary.client_ip),
             "listen_port" => map.serialize_entry(out_key, &summary.listen_port),
             "backend_target" => map.serialize_entry(out_key, &summary.backend_target),
-            "consumer_username" => emit_optional(out_key, summary.consumer_username.as_deref(), map),
+            "consumer_username" => {
+                emit_optional(out_key, summary.consumer_username.as_deref(), map)
+            }
             "auth_method" => emit_optional(out_key, summary.auth_method, map),
             "duration_ms" => map.serialize_entry(out_key, &summary.duration_ms),
             "frames_client_to_backend" => {

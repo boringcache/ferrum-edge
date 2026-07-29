@@ -7400,11 +7400,13 @@ fn sink_config_with(extra: Value) -> Value {
 }
 
 fn projected_row(schema: Value, event: &ChargeEvent) -> Value {
-    let projection = compile_charge_event_projection(&sink_config_with(json!({ "schema": schema })))
-        .expect("schema compiles")
-        .expect("schema present");
-    let rendered = serialize_json_each_row_projected(std::slice::from_ref(event), Some(&projection))
-        .expect("row serializes");
+    let projection =
+        compile_charge_event_projection(&sink_config_with(json!({ "schema": schema })))
+            .expect("schema compiles")
+            .expect("schema present");
+    let rendered =
+        serialize_json_each_row_projected(std::slice::from_ref(event), Some(&projection))
+            .expect("row serializes");
     serde_json::from_str(&rendered).expect("row is valid JSON")
 }
 
@@ -7493,16 +7495,18 @@ fn charge_event_projection_outcome_marks_grpc_and_server_errors() {
     let mut event = sample_event("evt-5xx");
     event.status_code = 503;
     event.grpc_status = None;
-    assert_eq!(projected_row(schema, &event)["call_outcome"], json!("error"));
+    assert_eq!(
+        projected_row(schema, &event)["call_outcome"],
+        json!("error")
+    );
 }
 
 #[test]
 fn charge_event_projection_reservation_bound_still_covers_the_body() {
     // The retained-byte reservation is taken before serialization, so it must
     // account for the renamed keys and injected members up front.
-    let ceiling: &'static RetainedByteCeiling = Box::leak(Box::new(RetainedByteCeiling::new(
-        16 * 1024 * 1024,
-    )));
+    let ceiling: &'static RetainedByteCeiling =
+        Box::leak(Box::new(RetainedByteCeiling::new(16 * 1024 * 1024)));
     let events: Vec<ChargeEvent> = (0..8).map(|i| sample_event(&format!("evt-{i}"))).collect();
     let projection = Arc::new(
         compile_charge_event_projection(&sink_config_with(json!({
@@ -7610,5 +7614,8 @@ fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
     )
     .err()
     .expect("unrepresentable schema is rejected at construction");
-    assert!(err.contains("'summary_type' is not supported"), "got: {err}");
+    assert!(
+        err.contains("'summary_type' is not supported"),
+        "got: {err}"
+    );
 }

@@ -58,12 +58,12 @@ use super::utils::{
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
+use crate::observability_delivery::DeliveryWorkerControl;
 use crate::plugins::utils::log_schema::view::status_class;
 use crate::plugins::utils::log_schema::{
     DerivedKind, FieldSpec, MetadataPolicy, SchemaCapabilities, SchemaSerializable, SchemaView,
     SummarySchema, TimestampFormat, resolve_schema,
 };
-use crate::observability_delivery::DeliveryWorkerControl;
 use tokio::sync::mpsc;
 
 const PLUGIN_NAME: &str = "api_chargeback_sink";
@@ -1492,8 +1492,8 @@ impl SchemaSerializable for ChargeEvent {
                 Ok(true)
             }
             DerivedKind::Outcome => {
-                let is_error = self.status_code >= 500
-                    || self.grpc_status.is_some_and(|status| status != 0);
+                let is_error =
+                    self.status_code >= 500 || self.grpc_status.is_some_and(|status| status != 0);
                 map.serialize_entry(out_key, if is_error { "error" } else { "ok" })?;
                 Ok(true)
             }

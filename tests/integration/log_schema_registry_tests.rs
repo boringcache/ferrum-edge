@@ -236,12 +236,7 @@ fn ws_disconnect_fields_registry_matches_expected() {
 
 /// Assert a family registry against its expected declaration order and check
 /// that its output keys are unique — the uniqueness the compiler relies on.
-fn assert_family(
-    registered: Vec<&str>,
-    expected: &[&str],
-    label: &str,
-    owner: &str,
-) {
+fn assert_family(registered: Vec<&str>, expected: &[&str], label: &str, owner: &str) {
     assert_eq!(
         registered, expected,
         "{label} drift detected.\n  Registry: {registered:?}\n  Expected: {expected:?}\n  \
@@ -427,5 +422,8 @@ fn debug_diagnostic_fields_registries_match_default_records() {
         .filter(|f| f.is_timestamp)
         .map(|f| f.name)
         .collect();
-    assert_eq!(stream_ts, vec!["timestamp_connected", "timestamp_disconnected"]);
+    assert_eq!(
+        stream_ts,
+        vec!["timestamp_connected", "timestamp_disconnected"]
+    );
 }

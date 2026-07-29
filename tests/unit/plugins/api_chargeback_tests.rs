@@ -4224,7 +4224,18 @@ fn projected_charges_row(schema: serde_json::Value) -> serde_json::Value {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.configure_render_schema(plugin.render_schema().cloned());
-    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-a",
+        "My API",
+        200,
+        0.5,
+        10,
+        20,
+        0.0,
+        0.0,
+    );
     let document: serde_json::Value =
         serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     document["consumers"]["alice"]["proxies"]["proxy-a"].clone()
@@ -4234,7 +4245,18 @@ fn projected_charges_row(schema: serde_json::Value) -> serde_json::Value {
 fn test_charges_row_default_render_is_unprojected() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
-    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-a",
+        "My API",
+        200,
+        0.5,
+        10,
+        20,
+        0.0,
+        0.0,
+    );
     let document: serde_json::Value =
         serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
     let row = &document["consumers"]["alice"]["proxies"]["proxy-a"];
@@ -4279,12 +4301,26 @@ fn test_charges_projection_does_not_alter_registry_keys_or_accounting() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
     registry.configure_render_schema(plugin.render_schema().cloned());
-    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-a",
+        "My API",
+        200,
+        0.5,
+        10,
+        20,
+        0.0,
+        0.0,
+    );
 
     // The registry entry key and the accounted charge are untouched — only the
     // rendered representation moved.
     let key = make_key_with_prices("alice", "proxy-a", 200, ProtocolFamily::Http, 0.5, 0.0, 0.0);
-    let entry = registry.entries.get(&key).expect("billing row keyed natively");
+    let entry = registry
+        .entries
+        .get(&key)
+        .expect("billing row keyed natively");
     assert_eq!(entry.call_count.load(Ordering::Relaxed), 1);
     assert_eq!(&*entry.proxy_id, "proxy-a");
     // Prometheus label sets are likewise unaffected by the JSON projection.
@@ -4297,7 +4333,18 @@ fn test_charges_projection_does_not_alter_registry_keys_or_accounting() {
 fn test_charges_projection_change_invalidates_render_cache() {
     let registry = ChargebackRegistry::new();
     registry.configure(5, 3600, 500, TEST_MAX_ENTRIES, TEST_MAX_BYTES);
-    registry.record_http(&scope(), "alice", "proxy-a", "My API", 200, 0.5, 10, 20, 0.0, 0.0);
+    registry.record_http(
+        &scope(),
+        "alice",
+        "proxy-a",
+        "My API",
+        200,
+        0.5,
+        10,
+        20,
+        0.0,
+        0.0,
+    );
     let before = registry.render_json().unwrap();
     assert!(before.contains("\"proxy_id\""));
 
@@ -4328,7 +4375,10 @@ fn test_charges_schema_rejects_unrepresentable_shapes() {
             json!({ "metadata": { "mode": "flatten" } }),
             "'metadata' policy is not supported",
         ),
-        (json!({ "order": ["proxy_id", "*"] }), "'order' is not supported"),
+        (
+            json!({ "order": ["proxy_id", "*"] }),
+            "'order' is not supported",
+        ),
         (
             json!({ "timestamp_format": "epoch_ms" }),
             "'timestamp_format' is not supported",

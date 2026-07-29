@@ -1838,7 +1838,10 @@ fn test_debugger_projection_renames_omits_and_adds_fields() {
     );
     assert_eq!(value["http.url"], json!(summary.request_path));
     assert!(value.get("path").is_none());
-    assert_eq!(value["http.status_code"], json!(summary.response_status_code));
+    assert_eq!(
+        value["http.status_code"],
+        json!(summary.response_status_code)
+    );
     assert!(value.get("latency_gw_overhead_ms").is_none());
     assert!(value.get("latency_plugin_ms").is_none());
     assert_eq!(value["service"], json!("ferrum-edge"));
@@ -1862,7 +1865,10 @@ fn test_debugger_projection_orders_output_keys() {
     let status_at = rendered.find("\"status\"").expect("status present");
     let method_at = rendered.find("\"method\"").expect("method present");
     let namespace_at = rendered.find("\"namespace\"").expect("namespace present");
-    assert!(status_at < method_at && method_at < namespace_at, "{rendered}");
+    assert!(
+        status_at < method_at && method_at < namespace_at,
+        "{rendered}"
+    );
 }
 
 #[test]
