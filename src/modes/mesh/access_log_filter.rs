@@ -115,10 +115,6 @@ pub fn evaluate_access_log_filter_expr_for_stream(
     }
 }
 
-pub fn access_log_filter_has_expression(filter: &AccessLogFilter) -> bool {
-    filter.expression.is_some()
-}
-
 /// Validate a serialized expression tree at the plugin/config boundary.
 ///
 /// Istio expressions already cross the bounded parser above, but operators can
@@ -300,8 +296,10 @@ impl<'a> ExpressionParser<'a> {
             ">=" => {}
             ">" => {}
             other => {
+                // Field labels end with "filter"; do not append another "filter"
+                // before "filters" or the diagnostic becomes "...filter filters...".
                 return Err(format!(
-                    "{field} filters only support '>' and '>=' (got '{other}')"
+                    "Telemetry access log response.duration filters only support '>' and '>=' (got '{other}')"
                 ));
             }
         }
@@ -317,7 +315,21 @@ impl<'a> ExpressionParser<'a> {
     fn parse_comparison_operator(&mut self, field: &str) -> Result<&'static str, String> {
         self.skip_whitespace();
         for op in [">=", "<=", "==", ">", "<"] {
-            if self.consume_token(op)? {
+            if self.input[self.pos..].starts_with(op) {
+                // Reject malformed runs like `>>`, `<<`, `===` at the operator
+                // boundary instead of greedily accepting the first valid prefix
+                // and then failing later as an empty/non-number value.
+                let after = self.pos + op.len();
+                if self
+                    .input
+                    .get(after..)
+                    .and_then(|rest| rest.chars().next())
+                    .is_some_and(|ch| matches!(ch, '>' | '<' | '='))
+                {
+                    return Err(format!("{field} must use a numeric comparison"));
+                }
+                self.pos = after;
+                self.bump_token_count()?;
                 return Ok(op);
             }
         }
@@ -678,13 +690,24 @@ mod tests {
 
     #[test]
     fn parentheses_override_precedence() {
+        // Without parens, `&&` binds tighter than `||` so the root would be `Or`.
+        // Parentheses force `(A || B) && C`, whose canonical root is `And`.
         let filter = parse_access_log_filter_expression(
-            "response.code >= 500 || (response.duration >= 1000 && response.duration <= 2000)",
+            "(response.code >= 500 || response.duration >= 1000) && response.code <= 599",
         )
         .expect("parses")
         .expect("filter");
         let expr = filter.expression.expect("uses expression tree");
-        assert!(matches!(expr, AccessLogFilterExpr::Or { .. }));
+        assert!(
+            matches!(
+                expr,
+                AccessLogFilterExpr::And {
+                    left,
+                    right: _
+                } if matches!(left.as_ref(), AccessLogFilterExpr::Or { .. })
+            ),
+            "parentheses must force And(Or(...), ...) rather than default Or precedence"
+        );
     }
 
     #[test]
