@@ -6721,7 +6721,9 @@ fn extract_mtom_root_part<'a>(
             }
             selected
         }
-        None => parts.first().ok_or(SoapBodyDecodeError::MalformedEncoding)?,
+        None => parts
+            .first()
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?,
     };
 
     // The root part must itself declare a SOAP/XOP infoset. A root part

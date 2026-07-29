@@ -2987,7 +2987,10 @@ async fn test_non_envelope_soap_body_rejects() {
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     let body = reject_body(&result);
-    assert!(body.contains("not a namespace-qualified SOAP Envelope"), "{body}");
+    assert!(
+        body.contains("not a namespace-qualified SOAP Envelope"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -7448,7 +7451,10 @@ mod governed_parse_failures_reject {
         let result = run("<notasoap>hello</notasoap>").await;
         assert_eq!(reject_status(&result), 400);
         let body = reject_body(&result);
-        assert!(body.contains("not a namespace-qualified SOAP Envelope"), "{body}");
+        assert!(
+            body.contains("not a namespace-qualified SOAP Envelope"),
+            "{body}"
+        );
     }
 
     /// Two namespace-correct `soap:Body` elements are exactly the ambiguity
@@ -7476,7 +7482,10 @@ mod governed_parse_failures_reject {
     #[tokio::test]
     async fn a_genuinely_absent_security_header_still_passes_through() {
         let inner = "<soap:Header/><soap:Body><GetPrice/></soap:Body>";
-        assert!(matches!(run(&envelope(inner)).await, PluginResult::Continue));
+        assert!(matches!(
+            run(&envelope(inner)).await,
+            PluginResult::Continue
+        ));
     }
 }
 
