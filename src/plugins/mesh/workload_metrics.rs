@@ -1731,7 +1731,7 @@ fn segment_embeds_credential_compound(segment: &str) -> bool {
             let abs = start + rel;
             let after = abs + stem.len();
             let suffix = &segment[after..];
-            if !suffix.is_empty() && TRAILERS.iter().any(|trailer| *trailer == suffix) {
+            if !suffix.is_empty() && TRAILERS.contains(&suffix) {
                 return true;
             }
             start = abs + 1;
@@ -1746,7 +1746,7 @@ fn segment_embeds_credential_compound(segment: &str) -> bool {
     ];
     if let Some(prefix) = segment.strip_suffix("key")
         && !prefix.is_empty()
-        && KEY_PREFIXES.iter().any(|allowed| *allowed == prefix)
+        && KEY_PREFIXES.contains(&prefix)
     {
         return true;
     }
