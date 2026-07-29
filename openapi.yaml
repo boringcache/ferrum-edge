@@ -22933,8 +22933,17 @@ components:
             validate_tool_results:
               type: boolean
               default: false
-              enum: [false]
-              description: Reserved; tool result validation is not implemented yet, so true is rejected at config validation.
+              description: >
+                When true, compile each discovered tool outputSchema at catalog
+                construction and validate bounded tools/call results against that
+                schema before releasing the caller-visible response or publishing
+                audit metadata. structuredContent is preferred; a single JSON text
+                content block is accepted when structuredContent is absent; mixed
+                disagreeing variants fail closed. Tool execution errors (result.isError)
+                and upstream JSON-RPC errors are preserved. Event-stream and
+                non-JSON tool results fail closed. Invalid or unrepresentable
+                outputSchema values are refused at catalog admission with
+                field-specific diagnostics. Default false.
             max_upstream_response_bytes:
               type: integer
               format: int64
