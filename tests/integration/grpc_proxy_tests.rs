@@ -3944,18 +3944,10 @@ async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
-    let mut gateway_error_security = security_headers_plugin("grpc-web-backend-error-security");
-    gateway_error_security.config["set"] = serde_json::json!({
-        "X-Security-Policy": "gateway-enforced",
-        "Connection": "close",
-        "Keep-Alive": "timeout=5",
-        "Proxy-Authenticate": "Basic realm=hostile",
-        "Proxy-Connection": "close",
-        "TE": "trailers",
-        "Trailer": "x-hostile",
-        "Transfer-Encoding": "chunked",
-        "Upgrade": "h2c"
-    });
+    // Protocol-managed `security_headers.set` destinations now fail closed at
+    // construction and have dedicated exhaustive coverage. Keep this fixture
+    // admissible so it reaches the gRPC-Web gateway-error behavior under test.
+    let gateway_error_security = security_headers_plugin("grpc-web-backend-error-security");
     let state =
         create_test_proxy_state_with_plugins(vec![proxy], vec![plugin, gateway_error_security]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
