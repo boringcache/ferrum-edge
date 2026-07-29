@@ -2426,6 +2426,13 @@ pub fn build_grpc_error_response_with_policy(
 /// defense-in-depth on the pinned h2 0.4.x transport: h2 already writes the
 /// response HEADERS before its permitted NO_ERROR request cancellation, and a
 /// raw client can still observe that reset after the complete response.
+///
+/// #3422 re-confirmed the emitted shape is terminal: the synthesized error body
+/// is `ProxyBody::empty()`, whose `is_end_stream()` makes hyper's h2 server take
+/// the `send_response(res, end_of_stream = true)` branch, so `grpc-status` ships
+/// in a single Trailers-Only HEADERS frame that precedes any reset. A client
+/// must therefore treat the observed HEADERS END_STREAM bit — not h2 stream
+/// state it can no longer trust after the reset — as the terminal-shape signal.
 pub fn attach_held_frontend_grpc_upload(
     mut response: hyper::Response<super::ProxyBody>,
     held_frontend_upload: Option<GrpcBody>,

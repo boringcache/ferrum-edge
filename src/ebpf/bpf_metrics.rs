@@ -18,6 +18,15 @@
 //! `crossbeam_utils::CachePadded` so per-CPU consumer threads don't
 //! coherence-traffic each other through a shared cache line.
 //!
+//! ## Latency histograms
+//!
+//! SRTT and SYN→ACK samples keep the historical `_sum`/`_count` series and
+//! additionally maintain fixed exclusive bucket counters
+//! ([`BPF_LATENCY_BUCKET_BOUNDS_US`] plus an implicit `+Inf` slot). Observe
+//! cost is three atomics (checked sum CAS, count, one exclusive bucket) with
+//! no locks, allocations, or per-flow labels. Zero samples are ignored;
+//! samples that would overflow `u64` sum are dropped entirely.
+//!
 //! ## Ringbuf overrun handling
 //!
 //! [`BpfMetricsState::record_ringbuf_overrun`] increments `ringbuf_overruns`
@@ -33,6 +42,54 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crossbeam_utils::CachePadded;
+
+/// Inclusive upper bounds (`le`) for TCP-layer latency histograms, in
+/// microseconds. Stable, low-cardinality contract shared by SRTT and
+/// SYN→ACK. Samples strictly greater than the last bound land in `+Inf`.
+pub const BPF_LATENCY_BUCKET_BOUNDS_US: [u64; 15] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000,
+];
+
+/// Number of finite latency buckets (excludes the `+Inf` slot).
+pub const BPF_LATENCY_FINITE_BUCKET_COUNT: usize = BPF_LATENCY_BUCKET_BOUNDS_US.len();
+
+/// Exclusive bucket slots: one per finite bound, plus one for `+Inf`.
+pub const BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT: usize = BPF_LATENCY_FINITE_BUCKET_COUNT + 1;
+
+/// Prometheus `le` label strings for [`BPF_LATENCY_BUCKET_BOUNDS_US`].
+pub const BPF_LATENCY_BUCKET_LE_LABELS: [&str; BPF_LATENCY_FINITE_BUCKET_COUNT] = [
+    "100", "250", "500", "1000", "2500", "5000", "10000", "25000", "50000", "100000", "250000",
+    "500000", "1000000", "2500000", "5000000",
+];
+
+/// Index into the exclusive-bucket array for a latency sample in microseconds.
+///
+/// Returns `0..BPF_LATENCY_FINITE_BUCKET_COUNT` for finite buckets and
+/// [`BPF_LATENCY_FINITE_BUCKET_COUNT`] for the `+Inf` overflow slot.
+#[inline]
+pub fn bpf_latency_exclusive_bucket_index(us: u64) -> usize {
+    for (i, &bound) in BPF_LATENCY_BUCKET_BOUNDS_US.iter().enumerate() {
+        if us <= bound {
+            return i;
+        }
+    }
+    BPF_LATENCY_FINITE_BUCKET_COUNT
+}
+
+/// Fold exclusive bucket counts into Prometheus cumulative `le` counts.
+#[inline]
+pub fn bpf_latency_cumulative_from_exclusive(
+    exclusive: &[u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
+) -> [u64; BPF_LATENCY_FINITE_BUCKET_COUNT] {
+    let mut out = [0u64; BPF_LATENCY_FINITE_BUCKET_COUNT];
+    let mut cum = 0u64;
+    for i in 0..BPF_LATENCY_FINITE_BUCKET_COUNT {
+        cum = cum.saturating_add(exclusive[i]);
+        out[i] = cum;
+    }
+    out
+}
 
 /// One BPF drop reason from the data path. Each variant maps to a
 /// kernel-side decision the connect hooks logged before redirecting (or
@@ -83,18 +140,16 @@ pub struct BpfMetricsState {
 
     // Latency samples (TCP-layer only).
     //
-    // We track sum + count so the plugin can emit a derived mean without
-    // doing per-sample work. Histogram-style buckets are a future
-    // follow-up; for now operators correlate `mean = srtt_sum_us /
-    // srtt_count` against an alerting threshold.
-    //
-    // Accept-to-first-byte is intentionally absent: SOCK_OPS has no
-    // first-inbound-data-byte callback, so exporting a zero summary would
-    // advertise an unsupported contract.
+    // Sum + count preserve the historical mean-derivation contract.
+    // Exclusive bucket counters feed Prometheus histogram exposition
+    // (cumulative at scrape time). Accept-to-first-byte remains absent:
+    // SOCK_OPS has no first-inbound-data-byte callback.
     pub srtt_sample_us_sum: AtomicU64,
     pub srtt_count: CachePadded<AtomicU64>,
+    pub srtt_bucket_exclusive: [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     pub syn_to_ack_us_sum: AtomicU64,
     pub syn_to_ack_count: AtomicU64,
+    pub syn_to_ack_bucket_exclusive: [CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
 
     // BPF drop-reason counters — one bin per reason. Produced by the
     // connect4/connect6 bypass paths via the shared ringbuf.
@@ -137,14 +192,25 @@ impl BpfMetricsState {
     }
 
     pub fn record_srtt_sample(&self, srtt_us: u64) {
-        self.srtt_sample_us_sum
-            .fetch_add(srtt_us, Ordering::Relaxed);
-        self.srtt_count.fetch_add(1, Ordering::Relaxed);
+        observe_latency(
+            &self.srtt_sample_us_sum,
+            &self.srtt_bucket_exclusive,
+            srtt_us,
+            || {
+                self.srtt_count.fetch_add(1, Ordering::Relaxed);
+            },
+        );
     }
 
     pub fn record_syn_to_ack(&self, us: u64) {
-        self.syn_to_ack_us_sum.fetch_add(us, Ordering::Relaxed);
-        self.syn_to_ack_count.fetch_add(1, Ordering::Relaxed);
+        observe_latency(
+            &self.syn_to_ack_us_sum,
+            &self.syn_to_ack_bucket_exclusive,
+            us,
+            || {
+                self.syn_to_ack_count.fetch_add(1, Ordering::Relaxed);
+            },
+        );
     }
 
     pub fn record_drop(&self, reason: BpfDropReason) {
@@ -200,8 +266,10 @@ impl BpfMetricsState {
             fin_received: self.fin_received.load(Ordering::Relaxed),
             srtt_sample_us_sum: self.srtt_sample_us_sum.load(Ordering::Relaxed),
             srtt_count: self.srtt_count.load(Ordering::Relaxed),
+            srtt_bucket_exclusive: load_exclusive_buckets(&self.srtt_bucket_exclusive),
             syn_to_ack_us_sum: self.syn_to_ack_us_sum.load(Ordering::Relaxed),
             syn_to_ack_count: self.syn_to_ack_count.load(Ordering::Relaxed),
+            syn_to_ack_bucket_exclusive: load_exclusive_buckets(&self.syn_to_ack_bucket_exclusive),
             drop_bypass_uid_hit: self.drop_bypass_uid_hit.load(Ordering::Relaxed),
             drop_exclude_cidr_hit: self.drop_exclude_cidr_hit.load(Ordering::Relaxed),
             drop_not_in_include_cidr: self.drop_not_in_include_cidr.load(Ordering::Relaxed),
@@ -211,6 +279,46 @@ impl BpfMetricsState {
             in_overrun_regime: self.in_overrun_regime.load(Ordering::Acquire),
         }
     }
+}
+
+/// Record one latency sample into sum/count/exclusive buckets.
+///
+/// - `us == 0` is treated as invalid and ignored (no sum/count/bucket update).
+/// - Samples that would overflow the `u64` sum are dropped entirely.
+/// - Otherwise: checked sum CAS, then `bump_count`, then one exclusive bucket++.
+fn observe_latency(
+    sum: &AtomicU64,
+    exclusive: &[CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
+    us: u64,
+    bump_count: impl FnOnce(),
+) {
+    if us == 0 {
+        return;
+    }
+    loop {
+        let old = sum.load(Ordering::Relaxed);
+        let Some(new) = old.checked_add(us) else {
+            // Deterministic overflow handling: drop the sample rather than
+            // wrap the sum (which would corrupt mean derivation).
+            return;
+        };
+        match sum.compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+    bump_count();
+    exclusive[bpf_latency_exclusive_bucket_index(us)].fetch_add(1, Ordering::Relaxed);
+}
+
+fn load_exclusive_buckets(
+    exclusive: &[CachePadded<AtomicU64>; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
+) -> [u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT] {
+    let mut out = [0u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT];
+    for (i, slot) in exclusive.iter().enumerate() {
+        out[i] = slot.load(Ordering::Relaxed);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,8 +339,10 @@ pub struct BpfMetricsSnapshot {
     pub fin_received: u64,
     pub srtt_sample_us_sum: u64,
     pub srtt_count: u64,
+    pub srtt_bucket_exclusive: [u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     pub syn_to_ack_us_sum: u64,
     pub syn_to_ack_count: u64,
+    pub syn_to_ack_bucket_exclusive: [u64; BPF_LATENCY_EXCLUSIVE_BUCKET_COUNT],
     pub drop_bypass_uid_hit: u64,
     pub drop_exclude_cidr_hit: u64,
     pub drop_not_in_include_cidr: u64,
@@ -262,5 +372,15 @@ impl BpfMetricsSnapshot {
             ),
             (BpfDropReason::ExcludePortHit, self.drop_exclude_port_hit),
         ]
+    }
+
+    /// Cumulative `le` bucket counts for SRTT (finite bounds only).
+    pub fn srtt_cumulative_buckets(&self) -> [u64; BPF_LATENCY_FINITE_BUCKET_COUNT] {
+        bpf_latency_cumulative_from_exclusive(&self.srtt_bucket_exclusive)
+    }
+
+    /// Cumulative `le` bucket counts for SYN→ACK (finite bounds only).
+    pub fn syn_to_ack_cumulative_buckets(&self) -> [u64; BPF_LATENCY_FINITE_BUCKET_COUNT] {
+        bpf_latency_cumulative_from_exclusive(&self.syn_to_ack_bucket_exclusive)
     }
 }
