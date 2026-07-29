@@ -18928,7 +18928,7 @@ components:
     FaultInjectionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; raw TCP faults run on stream connect. UDP and DTLS are not supported."
+      description: "Plugin: fault_injection — Probabilistic aborts and latency injection for chaos testing. HTTP-family faults run in before_proxy; TCP/UDP/DTLS session admission faults run on stream connect; UDP/DTLS also apply per-datagram faults on on_udp_datagram (client→backend) in isolated session workers without blocking the shared recv loop."
       properties:
         abort:
           type: [object, "null"]
@@ -20188,9 +20188,50 @@ components:
         Google Cloud Functions as middleware in the proxy pipeline. In
         `pre_proxy` mode the function response can inject request headers and
         metadata before the backend call. In `terminate` mode the function
-        response is returned directly to the client (HTTP only — gRPC
-        rejection normalization would drop the body, so terminate mode on
-        gRPC requests is rejected with 500). Cloud credential fields fall
+        response is returned directly to the client. Native gRPC terminate
+        requires a JSON contract with `grpc_status` plus optional
+        `message_base64` (raw protobuf bytes), `grpc_message`,
+        `status_details_base64`, and custom `trailers`; the gateway frames an
+        uncompressed unary DATA message and owns reserved terminal metadata.
+        The request is classified as native gRPC by the HTTP flavor the
+        frontend stamps at intake, not by a mutable effective content-type.
+        Every terminal trailer value is bounded by an 8 KiB wire-value
+        ceiling, measured after sanitization and after base64 or
+        percent-encoding, and the complete terminal metadata block —
+        `grpc-status`, `grpc-message`, `grpc-status-details-bin`, every
+        custom trailer, and `content-type` — is bounded by a separate 16 KiB
+        aggregate budget charged as name + value + 32 bytes per field, the
+        way HTTP/2 charges `SETTINGS_MAX_HEADER_LIST_SIZE` and HTTP/3 charges
+        `SETTINGS_MAX_FIELD_SECTION_SIZE`. Custom trailers are additionally
+        capped at 32 entries. `grpc_message` is authored as human-readable text
+        and emitted in the canonical percent-encoded `grpc-message` wire form
+        (uppercase hex for `%` and every byte outside the grammar's
+        unescaped range). Custom trailers use the gRPC Custom-Metadata name
+        alphabet and printable-ASCII value grammar; `-bin` values must be
+        standard base64 with or without padding. Names are case-insensitive,
+        so two `trailers` members differing only in case are rejected rather
+        than one silently overwriting the other. The raw function output is
+        also screened for duplicate JSON object member names before parsing —
+        byte-identical, escaped-equivalent, or nested inside `trailers` — so a
+        document whose terminal outcome depends on which parser reads it is
+        refused instead of resolved.
+        gRPC-Web terminate is rejected with 500. Streaming and compression
+        contract shapes fail closed. Malformed or oversized function output
+        fails closed without reflecting untrusted bodies. The validated
+        framed response enters the shared response-body policy lifecycle, so
+        configured gRPC response validators and limits still apply; if a body
+        policy or transform invalidates that authorized representation, the
+        response fails closed to a nonzero gRPC error rather than degrading to
+        an empty successful trailers-only reply. The status-only shape carries
+        the same provenance: unchanged, it stays trailers-only and restores its
+        complete terminal metadata (grpc-status, optional grpc-message,
+        grpc-status-details-bin, and validated custom trailers) from the
+        validated contract rather than the reject header map, with an omitted
+        grpc-message emitted as omission rather than a synthesized reason; a
+        changed status or an unauthored body fails closed the same way and
+        discards every authored terminal key with it, and it can never
+        authorize DATA. Cloud credential
+        fields fall
         back to well-known environment variables. Terminate mode forwards
         applicable end-to-end response headers, preserving repeated Set-Cookie
         and list-valued Link while requiring Location, Content-Location, and
@@ -20240,7 +20281,8 @@ components:
         and enforcing
         redaction-dependent plugins reject governed content when those bytes
         cannot be safely rewritten.
-        Proven pre-invocation payload-validation, unsupported-gRPC, DNS-policy,
+        Proven pre-invocation payload-validation, unsupported-gRPC-Web,
+        DNS-policy,
         and literal-IP-policy rejections release every acquired deduplication
         owner after commit. Real remote 502 responses remain application
         responses; uncertain post-invocation failures retain their protection.
@@ -20276,7 +20318,8 @@ components:
           default: pre_proxy
           description: |
             pre_proxy: invoke and inject headers/metadata, then continue.
-            terminate: invoke and return response to client (HTTP only).
+            terminate: invoke and return response to client (HTTP body
+            passthrough, or native-gRPC JSON unary contract).
         function_url:
           type: string
           format: uri

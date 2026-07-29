@@ -484,6 +484,35 @@ pub mod _test_support {
             .plugins_for_protocol(namespace, proxy_id, protocol)
     }
 
+    /// Read the generation-level NodeWaypoint transparent-capture
+    /// destination-authz readiness bit the plugin cache precomputed.
+    ///
+    /// This is the exact value `build_node_waypoint_capture_relay_entry` stamps
+    /// onto a synthesized capture relay entry and the value the captured-
+    /// connection handler re-checks before dialing the backend. Exposed so
+    /// external coverage can pin managed-vs-operator / disabled / wrong-scope /
+    /// wrong-name semantics without a config or plugin-chain scan.
+    pub fn node_waypoint_destination_authz_ready_for_test(cache: &crate::PluginCache) -> bool {
+        cache.load_inner().node_waypoint_destination_authz_ready()
+    }
+
+    /// Decide the same readiness bit straight from its three generation counts.
+    ///
+    /// Lets coverage pin the "managed reserved row is configured but its
+    /// runtime policy never reached the prebuilt global TCP chain" arm, which
+    /// cannot be produced by config alone.
+    pub fn node_waypoint_destination_authz_ready_from_counts_for_test(
+        managed_config_present: bool,
+        enabled_global_mesh_authz_configs: usize,
+        built_global_tcp_mesh_authz_plugins: usize,
+    ) -> bool {
+        crate::plugin_cache::node_waypoint_destination_authz_ready_from_counts(
+            managed_config_present,
+            enabled_global_mesh_authz_configs,
+            built_global_tcp_mesh_authz_plugins,
+        )
+    }
+
     /// Resolve the same protocol plugin list with a BARE proxy ID — the
     /// spelling that misses every namespace-keyed protocol entry and silently
     /// falls back to the global chain (issue #3094). Exposed only so
@@ -4184,6 +4213,7 @@ pub mod _test_support {
         pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
+        pub grpc_trailers: HashMap<String, String>,
     }
 
     pub struct DeadlineBackendResponse {
@@ -4271,6 +4301,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            grpc_trailers: HashMap::new(),
         }
     }
 
@@ -4306,6 +4337,7 @@ pub mod _test_support {
                 .get("grpc_status")
                 .and_then(|value| value.parse().ok()),
             grpc_message: ctx.metadata.get("grpc_message").cloned(),
+            grpc_trailers: HashMap::new(),
         }
     }
 
@@ -4399,6 +4431,10 @@ pub mod _test_support {
         crate::proxy::stamp_original_request_metadata(ctx);
     }
 
+    /// Stamp the retained gRPC-Web client representation the way
+    /// `on_request_received` does, so tests can build a request whose live
+    /// `content-type` has already been rewritten to `application/grpc` while
+    /// the client is still a gRPC-Web browser.
     pub fn retain_grpc_web_client_content_type_for_test(
         ctx: &mut crate::plugins::RequestContext,
         content_type: &str,
@@ -4743,6 +4779,7 @@ pub mod _test_support {
                 body: normalized.body,
                 grpc_status: normalized.grpc_status,
                 grpc_message: normalized.grpc_message,
+                grpc_trailers: normalized.grpc_trailers,
             },
             grpc_web_error,
         )
@@ -4905,7 +4942,199 @@ pub mod _test_support {
             body: normalized.body,
             grpc_status: normalized.grpc_status,
             grpc_message: normalized.grpc_message,
+            grpc_trailers: normalized.grpc_trailers,
         }
+    }
+
+    /// Stamp the request-scoped provenance that `serverless_function` sets when
+    /// a validated native-gRPC terminate contract produced `frame` plus
+    /// `trailers`.
+    ///
+    /// The authored HTTP status is 200, exactly as the production plugin stamps
+    /// it — authorization is checked against that status as well as the bytes.
+    ///
+    /// An empty `frame` is the status-only contract shape, which production
+    /// stamps too: it can never authorize DATA, but it records the authored
+    /// status and terminal metadata so an invalidated status-only reply fails
+    /// closed instead of falling back to the mutable reject header map.
+    pub fn set_serverless_grpc_terminate_frame_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        frame: &[u8],
+        trailers: HashMap<String, String>,
+    ) {
+        let authored = crate::plugins::ServerlessGrpcTerminateFrame {
+            http_status: 200,
+            frame: bytes::Bytes::copy_from_slice(frame),
+            trailers,
+        };
+        ctx.serverless_grpc_terminate_frame = Some(Arc::new(authored));
+    }
+
+    /// Mark the request as carrying a `serverless_function` terminate response,
+    /// the same flag the plugin sets before returning its `RejectBinary`.
+    pub fn set_serverless_terminate_response_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        value: bool,
+    ) {
+        ctx.serverless_terminate_response = value;
+    }
+
+    /// The production gate that decides whether a plugin short-circuit runs the
+    /// shared response-body policy lifecycle (`on_response_body`,
+    /// representation admission, transforms, `on_final_response_body`).
+    ///
+    /// Exposed so the native-gRPC terminate carve-out is asserted against the
+    /// real predicate rather than a test-local restatement of it.
+    pub fn synthetic_response_body_hooks_apply_for_test(
+        status_code: u16,
+        is_grpc_request: bool,
+        response_body: &[u8],
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        crate::proxy::should_apply_synthetic_response_body_hooks(
+            status_code,
+            is_grpc_request,
+            response_body,
+            plugins,
+            ctx,
+        )
+    }
+
+    /// Read back the request-scoped framed native-gRPC terminate provenance:
+    /// `(frame, terminal trailers)`, or `None` when nothing authorized this
+    /// request to keep a body on a gRPC stream.
+    pub fn serverless_grpc_terminate_frame_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<(bytes::Bytes, HashMap<String, String>)> {
+        ctx.serverless_grpc_terminate_frame
+            .as_deref()
+            .map(|authored| (authored.frame.clone(), authored.trailers.clone()))
+    }
+
+    /// Normalize a rejection under the request's real framed-unary provenance —
+    /// the same authorization the H1/H2 finalizer, the direct-H3 writer, and the
+    /// H3 cross-protocol writer read.
+    pub fn normalize_reject_response_with_context(
+        ctx: &crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+        is_grpc_request: bool,
+    ) -> NormalizedRejectResponse {
+        normalize_reject_response_bytes_with_context(
+            ctx,
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            is_grpc_request,
+        )
+    }
+
+    /// Owned-`Bytes` form of [`normalize_reject_response_with_context`], so a
+    /// test can assert that an authorized framed terminate reject carries the
+    /// caller's buffer through to the wire representation rather than a copy.
+    pub fn normalize_reject_response_bytes_with_context(
+        ctx: &crate::plugins::RequestContext,
+        status: StatusCode,
+        body: bytes::Bytes,
+        headers: &HashMap<String, String>,
+        is_grpc_request: bool,
+    ) -> NormalizedRejectResponse {
+        let normalized = crate::proxy::normalize_reject_response_with_provenance(
+            status,
+            body,
+            headers,
+            is_grpc_request,
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
+        );
+        NormalizedRejectResponse {
+            http_status: normalized.http_status,
+            headers: normalized.headers,
+            body: normalized.body,
+            grpc_status: normalized.grpc_status,
+            grpc_message: normalized.grpc_message,
+            grpc_trailers: normalized.grpc_trailers,
+        }
+    }
+
+    /// Owned `(grpc-status, optional grpc-message, additional terminal metadata)`
+    /// tuple returned by [`status_only_grpc_terminate_signal_for_test`].
+    pub type StatusOnlyGrpcTerminateSignal = (u32, Option<String>, Vec<(String, String)>);
+
+    /// The shared emitter-facing terminate result for a trailers-only reply:
+    /// `(grpc-status, optional grpc-message, remaining authored terminal
+    /// metadata sorted by name)`, or `None` when this response is not an intact
+    /// status-only terminate contract.
+    ///
+    /// This is the exact value the H1/H2 normalizer and the direct-H3 writer
+    /// both consume, so asserting against it pins their parity at the one place
+    /// they share rather than at two restatements of it.
+    pub fn status_only_grpc_terminate_signal_for_test(
+        ctx: &crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<StatusOnlyGrpcTerminateSignal> {
+        let authored = crate::proxy::status_only_grpc_signal(
+            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
+            status,
+            body,
+        )?;
+        let additional = authored
+            .additional
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        Some((authored.grpc_status, authored.grpc_message, additional))
+    }
+
+    /// Run the production H3 reject logging normalization and return the
+    /// resulting HTTP log status plus gRPC status/message metadata.
+    pub fn h3_reject_log_signal_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: StatusCode,
+        body: &[u8],
+        headers: &HashMap<String, String>,
+    ) -> (u16, Option<String>, Option<String>) {
+        let log_status = crate::http3::server::h3_reject_log_status_and_metadata(
+            ctx,
+            crate::config::types::HttpFlavor::Grpc,
+            status,
+            body,
+            headers,
+        );
+        (
+            log_status,
+            ctx.metadata.get("grpc_status").cloned(),
+            ctx.metadata.get("grpc_message").cloned(),
+        )
+    }
+
+    /// Build the production HTTP/3 framed-unary initial response and expose its
+    /// headers for protocol-boundary regression coverage.
+    pub fn h3_framed_unary_response_headers_for_test(
+        headers: &HashMap<String, String>,
+    ) -> Result<http::HeaderMap, http::Error> {
+        crate::http3::server::h3_framed_unary_initial_response(headers)
+            .map(|response| response.headers().clone())
+    }
+
+    /// The emitter-side decision every gRPC reject writer shares: `Some` means
+    /// "write DATA and then these terminal trailers", `None` means
+    /// "trailers-only". Exercises the production predicate, so a writer that
+    /// diverges from it cannot pass this boundary.
+    pub fn framed_unary_reject_trailers(
+        normalized: &NormalizedRejectResponse,
+    ) -> Option<HashMap<String, String>> {
+        let production = crate::proxy::NormalizedRejectResponse {
+            http_status: normalized.http_status,
+            headers: normalized.headers.clone(),
+            body: normalized.body.clone(),
+            grpc_status: normalized.grpc_status,
+            grpc_message: normalized.grpc_message.clone(),
+            grpc_trailers: normalized.grpc_trailers.clone(),
+        };
+        crate::proxy::framed_unary_reject_parts(&production).map(|(_, t)| t.clone())
     }
 
     pub fn set_websocket_response_boundary_for_test(
@@ -5534,6 +5763,20 @@ pub mod _test_support {
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
+
+    /// Test-only view of the crate-private shared status-object generation
+    /// helper.
+    pub fn shared_status_objects_snapshot(
+        objects: &[crate::config_sources::k8s::K8sObject],
+        gateway_writer_present: bool,
+        istio_writer_present: bool,
+    ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
+        crate::k8s_controller::reconciler::shared_status_objects_snapshot(
+            objects,
+            gateway_writer_present,
+            istio_writer_present,
+        )
+    }
 
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 

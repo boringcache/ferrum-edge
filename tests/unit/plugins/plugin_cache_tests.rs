@@ -10476,6 +10476,171 @@ fn priority_override_preserves_dynamic_replay_provenance() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// serverless_function terminate config lifecycle (issue #3292 acceptance)
+//
+// Whether a native gRPC request gets the framed unary terminate contract is
+// decided entirely by this plugin config, so the acceptance evidence is that
+// create / read / update / reload / delete all reach the resolved gRPC request
+// view — not only first-start construction.
+// ---------------------------------------------------------------------------
+
+const SERVERLESS_GRPC_PROXY: &str = "grpc-terminate-proxy";
+
+fn serverless_terminate_plugin_config(id: &str, mode: &str) -> PluginConfig {
+    serverless_terminate_plugin_config_at(id, mode, "https://example.com/func")
+}
+
+fn serverless_terminate_plugin_config_at(id: &str, mode: &str, function_url: &str) -> PluginConfig {
+    make_plugin_config_with_json(
+        id,
+        "serverless_function",
+        json!({
+            "provider": "azure_functions",
+            "function_url": function_url,
+            "mode": mode,
+            "timeout_ms": 5000
+        }),
+        PluginScope::Proxy,
+        Some(SERVERLESS_GRPC_PROXY),
+    )
+}
+
+fn resolved_plugins(cache: &PluginCache, protocol: ProxyProtocol) -> Arc<Vec<Arc<dyn Plugin>>> {
+    plugins_for_protocol_for_test(
+        cache,
+        &ferrum_edge::config::types::default_namespace(),
+        SERVERLESS_GRPC_PROXY,
+        protocol,
+    )
+}
+
+fn resolved_plugin_names(cache: &PluginCache, protocol: ProxyProtocol) -> Vec<String> {
+    resolved_plugins(cache, protocol)
+        .iter()
+        .map(|plugin| plugin.name().to_string())
+        .collect()
+}
+
+/// The resolved `serverless_function` instance for the gRPC request view, or
+/// `None` when the config no longer publishes one.
+fn resolved_serverless_instance(cache: &PluginCache) -> Option<Arc<dyn Plugin>> {
+    resolved_plugins(cache, ProxyProtocol::Grpc)
+        .iter()
+        .find(|plugin| plugin.name() == "serverless_function")
+        .cloned()
+}
+
+#[test]
+fn test_serverless_terminate_grpc_config_lifecycle_create_update_reload_delete() {
+    let proxy = || make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec!["sls-terminate"]);
+
+    // Create.
+    let created = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "terminate",
+        )],
+    );
+    let cache = PluginCache::new(&created).expect("terminate config builds");
+
+    // Read: resolved for native gRPC and for HTTP, matching the documented
+    // HTTP_GRPC_PROTOCOLS matrix row.
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "terminate-mode serverless_function must resolve for native gRPC requests"
+    );
+    assert!(
+        resolved_plugin_names(&cache, ProxyProtocol::Http)
+            .contains(&"serverless_function".to_string())
+    );
+
+    // Read the published INSTANCE, not just the name. These are production
+    // `Plugin` predicates the runtime reads, and they are mode/config-derived —
+    // so they witness which instance the cache actually resolves without adding
+    // any introspection surface that exists only for this test.
+    let created_instance = resolved_serverless_instance(&cache).expect("terminate instance");
+    assert!(
+        created_instance.requires_prior_request_deduplication(),
+        "terminate mode must be the published behavior"
+    );
+    assert!(!created_instance.modifies_request_headers());
+    assert_eq!(
+        created_instance.warmup_hostnames(),
+        vec!["example.com".to_string()]
+    );
+    drop(created_instance);
+
+    // Update + reload: flipping the mode AND the function URL republishes in
+    // place. Asserting only that *a* plugin named `serverless_function` is still
+    // resolved would pass even if the rebuild retained the old instance, so the
+    // assertions below are on the updated behavior and config.
+    let updated = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config_at(
+            "sls-terminate",
+            "pre_proxy",
+            "https://updated.example.net/func",
+        )],
+    );
+    cache.rebuild(&updated).expect("pre_proxy config reloads");
+    let updated_instance =
+        resolved_serverless_instance(&cache).expect("updated instance stays resolved for gRPC");
+    assert!(
+        !updated_instance.requires_prior_request_deduplication(),
+        "the updated pre_proxy instance must be the one published, not the retained terminate one"
+    );
+    assert!(
+        updated_instance.modifies_request_headers(),
+        "pre_proxy mode modifies request headers; terminate mode does not"
+    );
+    assert!(updated_instance.deferred_before_proxy_may_change_routing_headers());
+    assert_eq!(
+        updated_instance.warmup_hostnames(),
+        vec!["updated.example.net".to_string()],
+        "the rebuilt instance must carry the updated function_url, not the created one"
+    );
+    drop(updated_instance);
+
+    // An invalid mode is fail-closed at reload rather than silently accepted or
+    // partially published.
+    let invalid = make_config(
+        vec![proxy()],
+        vec![serverless_terminate_plugin_config(
+            "sls-terminate",
+            "shortcircuit",
+        )],
+    );
+    let error = cache
+        .rebuild(&invalid)
+        .expect_err("an unknown serverless_function mode must reject reload");
+    assert!(error.contains("mode"), "unexpected reload error: {error}");
+    let after_failed_reload =
+        resolved_serverless_instance(&cache).expect("live instance survives a refused reload");
+    assert!(
+        !after_failed_reload.requires_prior_request_deduplication()
+            && after_failed_reload.warmup_hostnames() == vec!["updated.example.net".to_string()],
+        "a refused reload must leave the last accepted instance published, not partially apply"
+    );
+    drop(after_failed_reload);
+
+    // Delete.
+    let deleted = make_config(
+        vec![make_proxy(SERVERLESS_GRPC_PROXY, "/rpc", vec![])],
+        vec![],
+    );
+    cache
+        .rebuild(&deleted)
+        .expect("cache reloads without the plugin");
+    assert!(
+        !resolved_plugin_names(&cache, ProxyProtocol::Grpc)
+            .contains(&"serverless_function".to_string()),
+        "deleting the plugin config must remove it from the resolved gRPC view"
+    );
+}
+
 #[test]
 fn ai_response_guard_descriptor_preload_scopes_and_lifecycle() {
     use ferrum_edge::_test_support::ai_response_guard_descriptor_preload_required_for_test;
@@ -10706,4 +10871,136 @@ fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() 
         .expect("disabling bounded body capture must reload");
     assert!(!cache.requires_request_body_buffering("ferrum", "p1"));
     assert!(!cache.requires_response_body_buffering("ferrum", "p1"));
+}
+
+// ---------------------------------------------------------------------------
+// NodeWaypoint transparent-capture destination-authz readiness (issue #3287).
+//
+// The captured-connection path must never scan `config.plugin_configs` or the
+// built plugin chain to decide whether mesh-managed destination L4 authz can be
+// enforced. The plugin cache precomputes one generation-level bit at
+// construction/reload; these tests pin exactly what that bit means.
+// ---------------------------------------------------------------------------
+
+/// The reserved config id the mesh runtime injects for its managed, slice-fed
+/// authz instance. Operator-authored rows can never carry it.
+const MANAGED_MESH_AUTHZ_ID: &str = ferrum_edge::modes::mesh::MESH_AUTHZ_PLUGIN_ID;
+
+fn mesh_authz_plugin_config(id: &str, scope: PluginScope, enabled: bool) -> PluginConfig {
+    let proxy_id = if scope == PluginScope::Global {
+        None
+    } else {
+        Some("p1")
+    };
+    let mut plugin = make_plugin_config_with_json(id, "mesh_authz", json!({}), scope, proxy_id);
+    plugin.enabled = enabled;
+    plugin
+}
+
+fn node_waypoint_authz_ready(plugin_configs: Vec<PluginConfig>) -> bool {
+    let config = make_config(Vec::new(), plugin_configs);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache)
+}
+
+fn ready_from_counts(managed: bool, configured: usize, built: usize) -> bool {
+    ferrum_edge::_test_support::node_waypoint_destination_authz_ready_from_counts_for_test(
+        managed, configured, built,
+    )
+}
+
+#[test]
+fn managed_mesh_authz_plus_prebuilt_tcp_chain_is_destination_authz_ready() {
+    let plugin = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let config = make_config(Vec::new(), vec![plugin]);
+    let cache = PluginCache::new(&config).expect("mesh_authz plugin cache builds");
+
+    // The bit is only meaningful because the managed instance really is in the
+    // prebuilt GLOBAL TCP chain — the chain the dynamically synthesized capture
+    // relay resolves, since that proxy is never in `config.proxies`.
+    let tcp_chain = plugins_for_protocol_for_test(
+        &cache,
+        "ferrum",
+        "__mesh_inbound_tcp_relay_synthesized__",
+        ProxyProtocol::Tcp,
+    );
+    assert!(
+        tcp_chain.iter().any(|p| p.name() == "mesh_authz"),
+        "the managed mesh_authz runtime policy must be in the global TCP fallback chain"
+    );
+    assert!(
+        ferrum_edge::_test_support::node_waypoint_destination_authz_ready_for_test(&cache),
+        "an enabled managed __mesh_authz whose policy is in the global TCP chain is ready"
+    );
+}
+
+#[test]
+fn operator_only_mesh_authz_is_not_destination_authz_ready() {
+    // An operator global mesh_authz is not the mesh-managed, slice-fed capture
+    // enforcement instance, so it must never satisfy the managed requirement.
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(!node_waypoint_authz_ready(vec![operator]));
+}
+
+#[test]
+fn disabled_managed_mesh_authz_is_not_destination_authz_ready() {
+    let disabled = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, false);
+    assert!(!node_waypoint_authz_ready(vec![disabled]));
+}
+
+#[test]
+fn proxy_scoped_managed_mesh_authz_id_is_not_destination_authz_ready() {
+    // Only a GLOBAL row lands in the global TCP fallback chain the synthesized
+    // relay resolves; a proxy-scoped row carrying the reserved id does not.
+    let scoped = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Proxy, true);
+    assert!(!node_waypoint_authz_ready(vec![scoped]));
+}
+
+#[test]
+fn reserved_id_on_a_different_plugin_is_not_destination_authz_ready() {
+    // The reserved id alone proves nothing: readiness requires the exact
+    // (id, plugin_name) pair the mesh runtime injects.
+    let impostor = make_plugin_config_with_json(
+        MANAGED_MESH_AUTHZ_ID,
+        "ip_restriction",
+        json!({ "allow": ["10.0.0.0/8"] }),
+        PluginScope::Global,
+        None,
+    );
+    assert!(!node_waypoint_authz_ready(vec![impostor]));
+}
+
+#[test]
+fn no_mesh_authz_at_all_is_not_destination_authz_ready() {
+    assert!(!node_waypoint_authz_ready(Vec::new()));
+}
+
+#[test]
+fn managed_and_operator_mesh_authz_together_stay_destination_authz_ready() {
+    // Both rows build and both survive the TCP protocol filter, so the managed
+    // instance is still provably present.
+    let managed = mesh_authz_plugin_config(MANAGED_MESH_AUTHZ_ID, PluginScope::Global, true);
+    let operator = mesh_authz_plugin_config("operator-mesh-authz", PluginScope::Global, true);
+    assert!(node_waypoint_authz_ready(vec![managed, operator]));
+}
+
+#[test]
+fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
+    // Managed row configured, but nothing named `mesh_authz` reached the
+    // prebuilt global TCP chain: fail closed.
+    assert!(!ready_from_counts(true, 1, 0));
+    // Managed plus operator rows configured but only one instance reached the
+    // chain: which one survived is unknowable from trait objects, so this fails
+    // closed rather than assuming the managed one did.
+    assert!(!ready_from_counts(true, 2, 1));
+    // Every configured row is accounted for in the chain, so the managed
+    // instance is necessarily among them.
+    assert!(ready_from_counts(true, 1, 1));
+    assert!(ready_from_counts(true, 2, 2));
+    // An unexpected extra runtime instance also invalidates the exact
+    // config-to-chain proof and must fail closed.
+    assert!(!ready_from_counts(true, 1, 2));
+    // No managed row: an operator instance in the chain never satisfies it.
+    assert!(!ready_from_counts(false, 1, 1));
+    assert!(!ready_from_counts(true, 0, 0));
 }
