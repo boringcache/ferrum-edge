@@ -5626,6 +5626,10 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
         json!(["forward", "ignore"])
     );
 
+    let oversized_matcher = "a".repeat(513);
+    let too_many_matchers: Vec<serde_json::Value> = (0..65)
+        .map(|i| json!({"exact": format!("https://app{i}.example.com")}))
+        .collect();
     let cases = [
         (json!({"allowed_origins": ["*"]}), true),
         (json!({"allowed_origins": ["*.example.com"]}), true),
@@ -5656,10 +5660,34 @@ fn cors_schema_matches_strict_runtime_and_istio_projection_surface() {
             json!({"allowed_origins": ["https://app.example/path"]}),
             false,
         ),
+        // Issue #3254: the Istio object `exact` matcher is LITERAL, so a
+        // wildcard-shaped or noncanonical value is representable (and matches
+        // only itself) rather than rejected. The NATIVE plain-string form above
+        // keeps its own stricter origin/wildcard grammar.
         (
             json!({"allowed_origins": [{"exact": "*.example.com"}]}),
+            true,
+        ),
+        (
+            json!({"allowed_origins": [{"exact": "https://app.example.com:443"}]}),
+            true,
+        ),
+        (json!({"allowed_origins": [{"exact": "   "}]}), false),
+        // Issue #3253: explicit byte / count bounds, enforced by BOTH the
+        // schema and the runtime.
+        (
+            json!({"allowed_origins": [{"exact": &oversized_matcher}]}),
             false,
         ),
+        (
+            json!({"allowed_origins": [{"prefix": &oversized_matcher}]}),
+            false,
+        ),
+        (
+            json!({"allowed_origins": [{"regex": &oversized_matcher}]}),
+            false,
+        ),
+        (json!({"allowed_origins": too_many_matchers}), false),
         (
             json!({"allowed_origins": ["*"], "allowed_methods": []}),
             false,
