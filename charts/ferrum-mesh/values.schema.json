@@ -551,6 +551,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "ingressRedirectIfaces": {
+          "type": "string",
+          "description": "Comma-separated host interfaces where the node agent attaches the optional NodeWaypoint tc ingress redirect; empty keeps redirect disabled."
+        },
         "trustedKubeletProbeSourceIps": {
           "type": "string"
         },
