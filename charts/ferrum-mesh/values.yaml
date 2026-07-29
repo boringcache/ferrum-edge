@@ -15,6 +15,9 @@ controlPlane:
   grpcPort: 50051
   rbac:
     create: true
+    # Grants get/list/watch (+ status patch) for GatewayClass/Gateway/HTTPRoute/
+    # GRPCRoute/TCPRoute/TLSRoute/ReferenceGrant. TCPRoute live data-plane
+    # conformance is gated by scripts/gateway_api_tcproute_conformance.sh.
     gatewayApi: true
     istio: true
     meshConfig: true
