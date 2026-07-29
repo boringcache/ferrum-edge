@@ -35,8 +35,7 @@ use crate::admin::backup::{
     ApiSpecsBackupSection, BackupCounts, BackupPayload, RestorePayload,
     clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
     parse_confirm_api_spec_deletion, parse_restore_confirm,
-    validate_backup_api_specs_resource_filter,
-    validate_restore_api_specs_section_with_total_limit,
+    validate_backup_api_specs_resource_filter, validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -7133,25 +7132,33 @@ async fn handle_restore(
     // delete/write.
     match payload.api_specs.take() {
         Some(section) => {
-            let proxies = payload.proxies.clone();
-            let upstreams = payload.upstreams.clone();
-            let plugin_configs = payload.plugin_configs.clone();
+            // Move the canonical resource vectors through the blocking task and
+            // take them back out of its result, so the ownership graph the API
+            // specs are validated against is the same instance that is later
+            // persisted. Do not clone the wire payload for validation here.
+            let proxies = std::mem::take(&mut payload.proxies);
+            let upstreams = std::mem::take(&mut payload.upstreams);
+            let plugin_configs = std::mem::take(&mut payload.plugin_configs);
             let max_spec_body_mib = state.admin_spec_max_body_size_mib;
             let max_total_spec_bytes = state
                 .admin_restore_max_body_size_mib
                 .saturating_mul(1024 * 1024);
             let validation = tokio::task::spawn_blocking(move || {
-                validate_restore_api_specs_section_with_total_limit(
+                let result = validate_restore_api_specs_section_with_total_limit(
                     &section,
                     &proxies,
                     &upstreams,
                     &plugin_configs,
                     max_spec_body_mib,
                     max_total_spec_bytes,
-                )
+                );
+                (result, proxies, upstreams, plugin_configs)
             })
             .await;
-            let validated = match validation {
+            // Reassemble on every successful join, for both validation
+            // outcomes; a join failure is a fail-closed abort before any
+            // durable mutation, so the moved vectors are not needed again.
+            let (validated, proxies, upstreams, plugin_configs) = match validation {
                 Ok(result) => result,
                 Err(_error) => {
                     warn_persistence_failure_redacted("restore_api_specs_validation_join");
@@ -7163,6 +7170,9 @@ async fn handle_restore(
                     ));
                 }
             };
+            payload.proxies = proxies;
+            payload.upstreams = upstreams;
+            payload.plugin_configs = plugin_configs;
             match validated {
                 Ok(mut specs) => {
                     for spec in &mut specs {
@@ -7282,7 +7292,6 @@ async fn handle_restore(
             if let Some(integrity_error) = data_integrity {
                 error!(
                     namespace = %namespace,
-                    failure_class = "data_integrity",
                     "Restore: aborting — prior config could not be snapshotted for rollback; existing config NOT deleted"
                 );
                 return Ok(json_response(

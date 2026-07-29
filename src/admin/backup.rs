@@ -353,9 +353,8 @@ pub(crate) fn validate_restore_api_specs_section_with_total_limit(
         .map(|item| u128::from(item.uncompressed_size))
         .sum();
     if declared_total > max_total_spec_bytes as u128 {
-        errors.push(
-            "api_specs: aggregate uncompressed_size exceeds restore body limit".to_string(),
-        );
+        errors
+            .push("api_specs: aggregate uncompressed_size exceeds restore body limit".to_string());
         return Err(errors);
     }
     // Compressed payload bound: reject absurd base64 that would decode past the
@@ -1092,8 +1091,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_aggregate_expansion_before_decompression() {
-        let raw =
-            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![
@@ -1118,8 +1116,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_actual_expansion_over_aggregate_limit() {
-        let raw =
-            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.uncompressed_size = 0;
         let section = ApiSpecsBackupSection {
@@ -1143,8 +1140,7 @@ mod tests {
 
     #[test]
     fn validate_api_specs_section_rejects_unbounded_resource_hash() {
-        let raw =
-            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
         item.resource_hash = "not-a-sha256".to_string();
         let section = ApiSpecsBackupSection {
