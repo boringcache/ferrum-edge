@@ -1097,9 +1097,7 @@ fn streaming_h2_capture_precedes_the_first_response_header_phase() {
         "the pre-policy capture must precede the first response-header phase"
     );
     let builder_at = src
-        .find(
-            "apply_sanitized_response_headers(resp_builder, &mut response_headers, framing)",
-        )
+        .find("apply_sanitized_response_headers(resp_builder, &mut response_headers, framing)")
         .expect("sanitized response builder header application");
     assert!(
         builder_at < seal_at,
