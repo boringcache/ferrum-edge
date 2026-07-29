@@ -885,9 +885,21 @@ fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
         && value.parse::<u64>() == Ok(expected)
 }
 
+/// Statuses that must not carry a message body (RFC 9110 §6.4.1 / §15.2).
+///
+/// Delegates to the shared synthetic-response wire contract rather than
+/// re-listing the statuses. The two halves of the reject boundary must agree:
+/// [`RejectBodyDisposition::for_request`] derives its omission signal from
+/// [`crate::plugins::utils::synthetic_response::synthetic_response_omits_body`]
+/// (which is built on the same predicate), and
+/// [`ClientResponseFraming::for_final_reject`] hands the result here for the
+/// actual `Content-Length` decision. A second copy of the status list would let
+/// those two disagree the moment either side gains a status — and a disposition
+/// that says "omitted" paired with a framing repair that says "body allowed"
+/// preserves exactly the plugin-authored length this boundary exists to remove.
 #[inline]
 fn status_forbids_response_body(status: u16) -> bool {
-    matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
+    crate::plugins::utils::synthetic_response::status_forbids_response_body(status)
 }
 
 /// Whether a value is a legal `Content-Length` field value for the wire.
