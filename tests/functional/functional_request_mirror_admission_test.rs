@@ -637,9 +637,9 @@ impl Harness {
         // oversize declared body (intentional — stays streaming, no 413). Use
         // StreamBody so the upload stays DATA-only and exercises the admitted
         // plugin-local ceiling path that H1 chunked / H3 DATA already cover.
-        let body = StreamBody::new(futures_util::stream::iter([Ok::<Frame<Bytes>, Infallible>(
-            Frame::data(Bytes::from(vec![b'x'; size])),
-        )]));
+        let body = StreamBody::new(futures_util::stream::iter([
+            Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(vec![b'x'; size]))),
+        ]));
         let request = Request::builder()
             .method(Method::POST)
             .uri(uri)
