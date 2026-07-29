@@ -2042,10 +2042,12 @@ const CHANGE_STREAM_TEST_DROP_JOIN_BUDGET: Duration = Duration::from_secs(12);
 /// change-stream invalidation and exercises the production
 /// `Invalidated → mark_degraded → wake authoritative poll → reconnect` path
 /// without touching the shared `ferrum_test` database or other CI services.
-/// Sustained unavailability uses the same appName-scoped `failCommand` pattern
-/// already used by the replica-set delete-rollback cells, failing only
-/// `aggregate` (what `watch()` sends) so Admin CRUD and cursor polls keep
-/// working.
+/// Sustained unavailability uses the same appName+namespace-scoped
+/// `failCommand` pattern already used by the replica-set delete-rollback
+/// cells, failing only `aggregate` against this run's `config_changes`
+/// collection (what `watch()` sends). Admin uniqueness checks also use
+/// `count_documents` → aggregate, so the failpoint must not be
+/// collection-unscoped or phase-3 Admin creates fail closed with 503.
 ///
 /// Every HTTP/Mongo/cleanup step in this test is observably bounded below the
 /// data-plane shard timeout. Loop deadlines alone are not enough: each await
@@ -2329,24 +2331,28 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         );
     }
 
-    /// Fail only `aggregate` for this gateway's appName. Change-stream
-    /// `watch()` opens via aggregate; Admin CRUD and authoritative
-    /// `config_changes` finds stay available, so this holds the watcher down
-    /// without blocking the poll loop under test.
+    /// Fail only `aggregate` against this run's `config_changes` collection
+    /// for the gateway's appName. Change-stream `watch()` opens via aggregate
+    /// on that collection; Admin uniqueness (`count_documents` → aggregate on
+    /// resource collections) and authoritative `config_changes` finds stay
+    /// available, so this holds the watcher down without blocking the poll
+    /// loop or the Admin mutation under test.
     async fn enable_change_stream_open_failpoint(
         client: &MongoClient,
+        database: &str,
         app_name: &str,
         phase: &str,
     ) -> i64 {
         let result = mongo_op_timeout(
             phase,
-            "enable appName-scoped aggregate failpoint",
+            "enable appName+namespace-scoped aggregate failpoint",
             client.database("admin").run_command(doc! {
                 "configureFailPoint": "failCommand",
                 "mode": "alwaysOn",
                 "data": {
                     "errorCode": 6, // HostUnreachable — classified as stream/connect fault
                     "failCommands": ["aggregate"],
+                    "namespace": format!("{database}.config_changes"),
                     "appName": app_name,
                 }
             }),
@@ -2593,10 +2599,12 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     drop(harness);
 
     // ── Phase 3: periodic poll remains correctness fallback while unavailable ─
-    // Short poll interval + appName-scoped aggregate failpoint keeps the
-    // watcher from delivering events. A committed mutation must still appear
-    // through the durable sequence-cursor poll. We assert events_total does
-    // not advance for that commit so the stream is proven non-authoritative.
+    // Short poll interval + appName+`config_changes`-scoped aggregate failpoint
+    // keeps the watcher from delivering events without blocking Admin
+    // uniqueness aggregates on other collections. A committed mutation must
+    // still appear through the durable sequence-cursor poll. We assert
+    // events_total does not advance for that commit so the stream is proven
+    // non-authoritative.
     const FALLBACK_POLL_INTERVAL_SECS: u32 = 2;
     const FALLBACK_MAX_BACKOFF_SECS: u32 = 30;
 
@@ -2629,6 +2637,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
 
     let _failpoint_count_before = enable_change_stream_open_failpoint(
         &mongo_client,
+        &mongo_database,
         &harness.mongo_app_name,
         "phase3 arm failpoint",
     )
@@ -2662,7 +2671,7 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     }
     assert!(
         watcher_held_down,
-        "aggregate failpoint + collection drop must keep the watcher unavailable: {last_held:?}"
+        "config_changes-scoped aggregate failpoint + collection drop must keep the watcher unavailable: {last_held:?}"
     );
     println!("  OK: phase3 watcher held unavailable (connected=false)");
 
