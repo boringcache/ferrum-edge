@@ -5813,6 +5813,9 @@ fn extract_tool_result_content_json(
         if text.len() > max_json_text_bytes {
             return Err("tool result text content exceeded decode budget");
         }
+        if crate::util::json_dup_keys::str_ambiguity(text).is_some() {
+            return Err("tool result JSON text content is ambiguous");
+        }
         let Ok(parsed) = serde_json::from_str::<Value>(text) else {
             // Non-JSON text is ordinary unstructured companion content.
             continue;

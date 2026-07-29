@@ -8900,6 +8900,10 @@ async fn validate_tool_results_rejects_duplicate_json_keys() {
             "escaped-equivalent structuredContent key",
             br#"{"jsonrpc":"2.0","id":3,"result":{"structuredContent":{"temperature":22.5,"conditions":"ok"},"\u0073tructuredContent":{"temperature":"bad","conditions":"x"}}}"#,
         ),
+        (
+            "duplicate member inside JSON text content",
+            br#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"temperature\":\"bad\",\"temperature\":22.5,\"conditions\":\"ok\"}"},{"type":"text","text":"human summary"}]}}"#,
+        ),
     ];
 
     for (offset, (case, body)) in cases.iter().enumerate() {
