@@ -5,9 +5,13 @@
 //! Operator reference: `docs/prometheus_metrics.md`
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ferrum_edge::modes::database::DatabaseDeltaPollMetrics;
+use ferrum_edge::plugins::api_chargeback::{
+    ChargebackRegistry, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_RETAINED_BYTES, InstanceScope,
+};
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::prometheus_metric_contract::{
@@ -17,6 +21,24 @@ use ferrum_edge::plugins::prometheus_metric_contract::{
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
 use serde_json::Value;
+
+const SAMPLE_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count"];
+
+const API_CHARGEBACK_FAMILIES: &[&str] = &[
+    "ferrum_api_bandwidth_charges_total",
+    "ferrum_api_bytes_received_total",
+    "ferrum_api_bytes_sent_total",
+    "ferrum_api_chargeable_calls_total",
+    "ferrum_api_chargeback_dropped_charges_total",
+    "ferrum_api_chargeback_identity_overflow_total",
+    "ferrum_api_chargeback_registry_entries",
+    "ferrum_api_chargeback_registry_max_entries",
+    "ferrum_api_chargeback_registry_max_retained_bytes",
+    "ferrum_api_chargeback_registry_retained_bytes",
+    "ferrum_api_charges_total",
+    "ferrum_api_stream_connection_charges_total",
+    "ferrum_api_stream_connections_total",
+];
 
 #[derive(Debug, Clone)]
 struct FamilyContract {
@@ -60,6 +82,44 @@ fn load_contract() -> BTreeMap<String, FamilyContract> {
     out
 }
 
+/// Normalize a metric token to its inventoried family.
+///
+/// Inventoried families that legitimately end in `_bucket` / `_sum` / `_count`
+/// stay themselves. A suffix is stripped only when the exact name is not
+/// inventoried and the stripped candidate is an inventoried histogram/summary.
+fn normalize_family_name(name: &str, contract: &BTreeMap<String, FamilyContract>) -> String {
+    if contract.contains_key(name) {
+        return name.to_string();
+    }
+    for suffix in SAMPLE_SUFFIXES {
+        if let Some(candidate) = name.strip_suffix(suffix) {
+            if let Some(fam) = contract.get(candidate) {
+                if fam.metric_type == "histogram" || fam.metric_type == "summary" {
+                    return candidate.to_string();
+                }
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Exposition-local sample → family mapping using `# TYPE` lines as inventory.
+fn family_for_sample_name(name: &str, types: &BTreeMap<String, String>) -> Option<String> {
+    if types.contains_key(name) {
+        return Some(name.to_string());
+    }
+    for suffix in SAMPLE_SUFFIXES {
+        if let Some(candidate) = name.strip_suffix(suffix) {
+            if let Some(ty) = types.get(candidate) {
+                if ty == "histogram" || ty == "summary" {
+                    return Some(candidate.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<String>)> {
     let mut types: BTreeMap<String, String> = BTreeMap::new();
     let mut labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -90,15 +150,10 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<S
         } else {
             (name_and_maybe_labels, None)
         };
-        let family = name
-            .strip_suffix("_bucket")
-            .or_else(|| name.strip_suffix("_sum"))
-            .or_else(|| name.strip_suffix("_count"))
-            .unwrap_or(name);
-        if !types.contains_key(family) {
+        let Some(family) = family_for_sample_name(name, &types) else {
             continue;
-        }
-        let entry = labels.entry(family.to_string()).or_default();
+        };
+        let entry = labels.entry(family).or_default();
         if let Some(body) = label_body {
             for piece in body.split(',') {
                 if let Some((key, _)) = piece.split_once('=') {
@@ -115,7 +170,10 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<S
     out
 }
 
-fn ferrum_metric_names_in_text(text: &str) -> BTreeSet<String> {
+fn ferrum_metric_names_in_text(
+    text: &str,
+    contract: &BTreeMap<String, FamilyContract>,
+) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -128,18 +186,159 @@ fn ferrum_metric_names_in_text(text: &str) -> BTreeSet<String> {
             }
             let token = &text[start..i];
             if token.starts_with("ferrum_") || token.starts_with("chargeback_sink_") {
-                let family = token
-                    .strip_suffix("_bucket")
-                    .or_else(|| token.strip_suffix("_sum"))
-                    .or_else(|| token.strip_suffix("_count"))
-                    .unwrap_or(token);
-                names.insert(family.to_string());
+                names.insert(normalize_family_name(token, contract));
             }
             continue;
         }
         i += 1;
     }
     names
+}
+
+/// Extract `# TYPE` families from Rust string-literal contents only.
+fn type_literals_in_rust_source(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for literal in extract_rust_string_literal_contents(text) {
+        let mut search_from = 0;
+        while let Some(rel) = literal[search_from..].find("# TYPE ") {
+            let start = search_from + rel;
+            let rest = &literal[start + "# TYPE ".len()..];
+            let mut parts = rest.split_whitespace();
+            let Some(name) = parts.next() else {
+                search_from = start + 1;
+                continue;
+            };
+            let Some(ty) = parts.next() else {
+                search_from = start + 1;
+                continue;
+            };
+            if (name.starts_with("ferrum_") || name.starts_with("chargeback_sink_"))
+                && matches!(ty, "counter" | "gauge" | "histogram" | "summary")
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                found.entry(name.to_string()).or_default().insert(ty.to_string());
+            }
+            search_from = start + 1;
+        }
+    }
+    found
+}
+
+fn extract_rust_string_literal_contents(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+        }
+        if bytes[i] == b'r' && i + 1 < bytes.len() && (bytes[i + 1] == b'#' || bytes[i + 1] == b'"')
+        {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while j < bytes.len() && bytes[j] == b'#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'"' {
+                j += 1;
+                let end_pat = format!("\"{}", "#".repeat(hashes));
+                if let Some(rel) = text[j..].find(&end_pat) {
+                    out.push(text[j..j + rel].to_string());
+                    i = j + rel + end_pat.len();
+                    continue;
+                }
+                break;
+            }
+        }
+        if bytes[i] == b'"' {
+            let mut j = i + 1;
+            let mut buf = String::new();
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c == b'\\' {
+                    if j + 1 >= bytes.len() {
+                        break;
+                    }
+                    let esc = bytes[j + 1];
+                    if esc == b'\n' {
+                        j += 2;
+                        continue;
+                    }
+                    match esc {
+                        b'n' => buf.push('\n'),
+                        b't' => buf.push('\t'),
+                        b'r' => buf.push('\r'),
+                        b'"' | b'\\' => buf.push(esc as char),
+                        _ => buf.push(esc as char),
+                    }
+                    j += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    out.push(buf);
+                    j += 1;
+                    break;
+                }
+                buf.push(c as char);
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn walk_production_rust_sources() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn scan_production_type_literals() -> BTreeMap<String, BTreeSet<String>> {
+    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for path in walk_production_rust_sources() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for (name, types) in type_literals_in_rust_source(&text) {
+            found.entry(name).or_default().extend(types);
+        }
+    }
+    found
 }
 
 fn make_summary(proxy_id: &str) -> TransactionSummary {
@@ -209,9 +408,10 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
 ///
 /// Seeds registry-backed families (including the DOC-10 cited database-delta,
 /// remote-discovery, and raw-TCP egress signals), appends process observability
-/// families, and appends default-prefix mesh BPF families. Kafka / log-sink /
-/// chargeback sink series require live plugin/process state and are covered by
-/// the inventory + chart validators rather than this scrape fixture.
+/// families, appends default-prefix mesh BPF families, and appends api_chargeback
+/// registry families. Kafka / log-sink / chargeback sink series require live
+/// plugin/process state and are covered by the inventory + chart validators
+/// rather than this scrape fixture.
 fn representative_exposition() -> String {
     let registry = MetricsRegistry::new();
     registry.configure(60, 3600, 0, "contract-ns");
@@ -251,6 +451,44 @@ fn representative_exposition() -> String {
     let bpf =
         MeshBpfMetrics::new(&serde_json::json!({})).expect("default bpf metrics plugin config");
     output.push_str(&bpf.exporter().render_prometheus());
+
+    let chargeback = ChargebackRegistry::new();
+    chargeback.configure(
+        60,
+        3600,
+        0,
+        DEFAULT_MAX_ENTRIES,
+        DEFAULT_MAX_RETAINED_BYTES,
+    );
+    let scope = InstanceScope::new("USD", "contract-ns");
+    chargeback.record_http(
+        &scope,
+        "contract-consumer",
+        "contract-proxy",
+        "Contract API",
+        200,
+        0.00001,
+        64,
+        32,
+        0.0001,
+        0.0002,
+    );
+    chargeback.record_stream(
+        &scope,
+        "contract-consumer",
+        "stream-proxy",
+        "Contract Stream",
+        0.0005,
+        128,
+        256,
+        0.0003,
+        0.0004,
+    );
+    output.push_str(
+        &chargeback
+            .render_prometheus_uncached()
+            .expect("chargeback prometheus render"),
+    );
     output
 }
 
@@ -310,6 +548,34 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
             "DOC-10 required family missing from contract: {required}"
         );
     }
+    for required in API_CHARGEBACK_FAMILIES {
+        let fam = contract
+            .get(*required)
+            .unwrap_or_else(|| panic!("api_chargeback family missing from contract: {required}"));
+        assert_eq!(fam.emission, "when_plugin_enabled");
+        assert_eq!(fam.subsystem, "api_chargeback");
+        assert_eq!(fam.bundled, "documented_only");
+    }
+    let calls = &contract["ferrum_api_chargeable_calls_total"];
+    assert_eq!(calls.metric_type, "counter");
+    assert_eq!(
+        calls.labels,
+        BTreeSet::from([
+            "consumer".into(),
+            "proxy_id".into(),
+            "proxy_name".into(),
+            "status_code".into(),
+            "currency".into(),
+            "namespace".into(),
+        ])
+    );
+    let bandwidth = &contract["ferrum_api_bandwidth_charges_total"];
+    assert_eq!(bandwidth.metric_type, "counter");
+    assert!(bandwidth.labels.contains("direction"));
+    assert!(bandwidth.labels.contains("protocol_family"));
+    let entries = &contract["ferrum_api_chargeback_registry_entries"];
+    assert_eq!(entries.metric_type, "gauge");
+    assert!(entries.labels.is_empty());
 }
 
 #[test]
@@ -395,19 +661,31 @@ fn representative_metrics_exposition_matches_contract() {
         "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
         "ferrum_mesh_remote_discovery_endpoint_age_seconds",
         "ferrum_mesh_bpf_tcp_events_total",
+        "ferrum_api_chargeable_calls_total",
+        "ferrum_api_charges_total",
+        "ferrum_api_bandwidth_charges_total",
+        "ferrum_api_chargeback_registry_entries",
+        "ferrum_database_delta_backoff_bucket",
     ] {
         assert!(
             emitted.contains_key(required),
             "representative exposition missing required family {required}"
         );
     }
+    let backoff = &emitted["ferrum_database_delta_backoff_bucket"];
+    assert_eq!(backoff.0, "gauge");
+    assert!(
+        backoff.1.contains("bucket"),
+        "backoff bucket gauge labels must include the bucket key: {:?}",
+        backoff.1
+    );
 }
 
 #[test]
 fn bundled_prometheus_rule_metric_refs_are_inventoried_or_allowlisted() {
     let contract = load_contract();
     let allow: BTreeSet<&str> = BUNDLED_EXTERNAL_METRIC_ALLOWLIST.iter().copied().collect();
-    let names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE);
+    let names = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
     let mut unknown = Vec::new();
     for name in names {
         if allow.contains(name.as_str()) {
@@ -435,7 +713,7 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
     ];
     let mut unknown = Vec::new();
     for dash in DASHBOARDS {
-        for name in ferrum_metric_names_in_text(dash) {
+        for name in ferrum_metric_names_in_text(dash, &contract) {
             if !contract.contains_key(&name) {
                 unknown.push(name);
             }
@@ -452,7 +730,7 @@ fn bundled_grafana_dashboard_metric_refs_are_inventoried() {
 #[test]
 fn bundled_classification_matches_chart_references() {
     let contract = load_contract();
-    let mut referenced = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE);
+    let mut referenced = ferrum_metric_names_in_text(BUNDLED_PROMETHEUS_RULE_TEMPLATE, &contract);
     for dash in [
         include_str!("../../../charts/ferrum-mesh/dashboards/certificate-posture.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/egress-scope.json"),
@@ -460,7 +738,7 @@ fn bundled_classification_matches_chart_references() {
         include_str!("../../../charts/ferrum-mesh/dashboards/mesh-overview.json"),
         include_str!("../../../charts/ferrum-mesh/dashboards/policy-deny.json"),
     ] {
-        referenced.extend(ferrum_metric_names_in_text(dash));
+        referenced.extend(ferrum_metric_names_in_text(dash, &contract));
     }
     for fam in contract.values() {
         let is_ref = referenced.contains(&fam.name);
@@ -478,4 +756,109 @@ fn bundled_classification_matches_chart_references() {
             other => panic!("unexpected bundled value {other}"),
         }
     }
+}
+
+#[test]
+fn sample_suffix_normalization_preserves_semantic_bucket_gauges() {
+    let contract = load_contract();
+    assert_eq!(
+        normalize_family_name("ferrum_database_delta_backoff_bucket", &contract),
+        "ferrum_database_delta_backoff_bucket"
+    );
+    assert_eq!(
+        normalize_family_name("ferrum_request_duration_ms_bucket", &contract),
+        "ferrum_request_duration_ms"
+    );
+    assert_eq!(
+        normalize_family_name("ferrum_request_duration_ms_sum", &contract),
+        "ferrum_request_duration_ms"
+    );
+    assert_eq!(
+        normalize_family_name("ferrum_request_duration_ms_count", &contract),
+        "ferrum_request_duration_ms"
+    );
+
+    let exposition = "\
+# HELP ferrum_database_delta_backoff_bucket Current rejected-delta retry backoff bucket. Exactly one bucket is 1.\n\
+# TYPE ferrum_database_delta_backoff_bucket gauge\n\
+ferrum_database_delta_backoff_bucket{bucket=\"none\",namespace=\"ns\"} 1\n\
+# HELP ferrum_request_duration_ms Backend response time in milliseconds.\n\
+# TYPE ferrum_request_duration_ms histogram\n\
+ferrum_request_duration_ms_bucket{le=\"10\",proxy_id=\"p\"} 1\n\
+ferrum_request_duration_ms_sum{proxy_id=\"p\"} 1\n\
+ferrum_request_duration_ms_count{proxy_id=\"p\"} 1\n\
+";
+    let parsed = parse_exposition_families(exposition);
+    assert_eq!(parsed["ferrum_database_delta_backoff_bucket"].0, "gauge");
+    assert!(parsed["ferrum_database_delta_backoff_bucket"]
+        .1
+        .contains("bucket"));
+    assert_eq!(parsed["ferrum_request_duration_ms"].0, "histogram");
+    assert!(parsed["ferrum_request_duration_ms"].1.contains("le"));
+    assert!(!parsed.contains_key("ferrum_database_delta_backoff"));
+}
+
+#[test]
+fn production_type_literals_are_inventoried_with_matching_types() {
+    let contract = load_contract();
+    let found = scan_production_type_literals();
+    assert!(
+        !found.is_empty(),
+        "expected production Rust # TYPE string literals under src/"
+    );
+
+    let mut missing = Vec::new();
+    let mut mismatched = Vec::new();
+    for (name, types) in &found {
+        let Some(fam) = contract.get(name) else {
+            missing.push(name.clone());
+            continue;
+        };
+        if !types.contains(&fam.metric_type) {
+            mismatched.push(format!(
+                "{name}: contract={} source={types:?}",
+                fam.metric_type
+            ));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "production # TYPE families missing from inventory: {missing:?}"
+    );
+    assert!(
+        mismatched.is_empty(),
+        "production # TYPE type mismatches: {mismatched:?}"
+    );
+
+    for name in API_CHARGEBACK_FAMILIES {
+        assert!(
+            found.contains_key(*name),
+            "api_chargeback family missing production # TYPE literal: {name}"
+        );
+    }
+}
+
+#[test]
+fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
+    let contract = load_contract();
+    let synthetic = r#"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"#;
+    let detected = type_literals_in_rust_source(synthetic);
+    assert!(
+        detected.contains_key("ferrum_contract_mutation_missing_total"),
+        "synthetic undocumented # TYPE literal was not detected"
+    );
+    assert!(
+        !contract.contains_key("ferrum_contract_mutation_missing_total"),
+        "mutation sentinel must not be present in the inventory"
+    );
+
+    let noise = r#"
+        // # TYPE ferrum_comment_noise_total counter
+        let ferrum_identifier_noise_total = 1;
+        /* # TYPE ferrum_block_comment_noise_total gauge */
+    "#;
+    assert!(
+        type_literals_in_rust_source(noise).is_empty(),
+        "comment/identifier noise must not be treated as exported # TYPE literals"
+    );
 }

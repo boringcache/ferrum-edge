@@ -8,6 +8,8 @@
 //! - the checked-in operator reference diverges from the inventory
 //! - representative `/metrics` exposition introduces undocumented
 //!   name/type/label drift
+//! - production Rust string-literal `# TYPE` declarations export a family
+//!   absent from the inventory (or with a mismatched type)
 //! - bundled PrometheusRule / Grafana queries reference unknown Ferrum
 //!   families (while allowing an explicit `documented_only` classification)
 //!

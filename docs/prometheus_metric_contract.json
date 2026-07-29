@@ -469,6 +469,184 @@
     "emission": "when_series_present"
   },
   {
+    "name": "ferrum_api_bandwidth_charges_total",
+    "type": "counter",
+    "help": "Total bandwidth charges per consumer, split by direction.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "direction",
+      "currency",
+      "protocol_family",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_bytes_received_total",
+    "type": "counter",
+    "help": "Total bytes the gateway received backend->client and forwarded to this consumer.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "currency",
+      "protocol_family",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_bytes_sent_total",
+    "type": "counter",
+    "help": "Total bytes the gateway sent client->backend on this consumer's behalf.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "currency",
+      "protocol_family",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeable_calls_total",
+    "type": "counter",
+    "help": "Total chargeable HTTP-family API calls per consumer by billable status.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "status_code",
+      "currency",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_dropped_charges_total",
+    "type": "counter",
+    "help": "Charges lost because neither an ordinary billing row nor the aggregate row could be admitted.",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_identity_overflow_total",
+    "type": "counter",
+    "help": "Charges folded into the aggregate overflow row because a new billing row could not be admitted under max_entries (per-identity attribution lost).",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_registry_entries",
+    "type": "gauge",
+    "help": "Billing rows (complete registry entry keys) currently retained against max_entries.",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_registry_max_entries",
+    "type": "gauge",
+    "help": "Configured ceiling on retained billing rows (complete registry entry keys).",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_registry_max_retained_bytes",
+    "type": "gauge",
+    "help": "Configured ceiling on retained registry bytes.",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_chargeback_registry_retained_bytes",
+    "type": "gauge",
+    "help": "Estimated bytes retained by the shared registry.",
+    "labels": [],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_charges_total",
+    "type": "counter",
+    "help": "Total per-call charges accumulated per consumer.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "status_code",
+      "currency",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_stream_connection_charges_total",
+    "type": "counter",
+    "help": "Total per-connection charges for stream sessions.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "currency",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_api_stream_connections_total",
+    "type": "counter",
+    "help": "Total stream sessions (TCP/UDP/DTLS) per consumer.",
+    "labels": [
+      "consumer",
+      "proxy_id",
+      "proxy_name",
+      "currency",
+      "namespace"
+    ],
+    "subsystem": "api_chargeback",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
     "name": "ferrum_backend_duration_ms",
     "type": "histogram",
     "help": "Backend response time in milliseconds.",

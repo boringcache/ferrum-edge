@@ -8,7 +8,7 @@ Hosted CI and unit tests fail closed when exposition name/type/label drift is un
 
 | Field | Meaning |
 |-------|---------|
-| `name` | Exact Prometheus metric family name (histograms use the base name; `_bucket`/`_sum`/`_count` are implied) |
+| `name` | Exact Prometheus metric family name. Histogram/summary samples use `_bucket`/`_sum`/`_count`; those suffixes are normalized to the base family only when the exact name is not itself an inventoried family and the stripped candidate is an inventoried histogram/summary. |
 | `type` | Prometheus type: `counter`, `gauge`, or `histogram` |
 | `help` | HELP text emitted on scrape |
 | `labels` | Stable label keys the family may emit (optional `namespace` / `gateway_namespace` appear when the gateway namespace is configured) |
@@ -16,7 +16,7 @@ Hosted CI and unit tests fail closed when exposition name/type/label drift is un
 | `bundled` | `alert`, `dashboard`, `alert_and_dashboard`, or `documented_only` (explicitly no bundled alert/dashboard yet) |
 | `emission` | `always`, `conditional`, `when_series_present`, `when_plugin_enabled`, or `when_process_initialized` |
 
-Dynamic families (AI token counters, mesh BPF prefix overrides, request_mirror lifecycle counters, chargeback sink series) are inventoried explicitly — CI does not rediscover them with brittle source regex alone. The mesh BPF plugin defaults to prefix `ferrum_mesh_bpf`; inventory names use that default, and `name_template` records `{prefix}_…` for overrides.
+Dynamic families (AI token counters, mesh BPF prefix overrides, request_mirror lifecycle counters, chargeback sink series) are inventoried explicitly — CI does not rediscover them with brittle source regex alone. Hosted CI also scans production Rust string-literal `# TYPE` declarations and rejects any literal exported family absent from this inventory (or any type mismatch). The mesh BPF plugin defaults to prefix `ferrum_mesh_bpf`; inventory names use that default, and `name_template` records `{prefix}_…` for overrides.
 
 Scrape rendering stays allocation-light: the inventory is a documentation/CI contract only and is **not** scanned on the `/metrics` hot path.
 
@@ -105,6 +105,19 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_ai_federation_circuits_opened_total` | counter | `namespace` | `ai` | `documented_only` | `always` | ai_federation provider circuit closed-to-open transitions. |
 | `ferrum_ai_prompt_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Prompt tokens reported by AI providers. |
 | `ferrum_ai_tokens_total` | counter | `proxy_id`, `provider`, `namespace` | `ai` | `documented_only` | `when_series_present` | Total tokens reported by AI providers. |
+| `ferrum_api_bandwidth_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `direction`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bandwidth charges per consumer, split by direction. |
+| `ferrum_api_bytes_received_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bytes the gateway received backend->client and forwarded to this consumer. |
+| `ferrum_api_bytes_sent_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `protocol_family`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total bytes the gateway sent client->backend on this consumer's behalf. |
+| `ferrum_api_chargeable_calls_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `status_code`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total chargeable HTTP-family API calls per consumer by billable status. |
+| `ferrum_api_chargeback_dropped_charges_total` | counter | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Charges lost because neither an ordinary billing row nor the aggregate row could be admitted. |
+| `ferrum_api_chargeback_identity_overflow_total` | counter | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Charges folded into the aggregate overflow row because a new billing row could not be admitted under max_entries (per-identity attribution lost). |
+| `ferrum_api_chargeback_registry_entries` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Billing rows (complete registry entry keys) currently retained against max_entries. |
+| `ferrum_api_chargeback_registry_max_entries` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Configured ceiling on retained billing rows (complete registry entry keys). |
+| `ferrum_api_chargeback_registry_max_retained_bytes` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Configured ceiling on retained registry bytes. |
+| `ferrum_api_chargeback_registry_retained_bytes` | gauge | — | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Estimated bytes retained by the shared registry. |
+| `ferrum_api_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `status_code`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total per-call charges accumulated per consumer. |
+| `ferrum_api_stream_connection_charges_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total per-connection charges for stream sessions. |
+| `ferrum_api_stream_connections_total` | counter | `consumer`, `proxy_id`, `proxy_name`, `currency`, `namespace` | `api_chargeback` | `documented_only` | `when_plugin_enabled` | Total stream sessions (TCP/UDP/DTLS) per consumer. |
 | `ferrum_backend_duration_ms` | histogram | `proxy_id`, `le`, `namespace` | `prometheus_metrics` | `dashboard` | `always` | Backend response time in milliseconds. |
 | `ferrum_client_disconnects_total` | counter | `proxy_id`, `namespace` | `prometheus_metrics` | `dashboard` | `conditional` | Requests where the client disconnected before receiving the full response. |
 | `ferrum_compression_codec_admitted_total` | counter | `namespace` | `compression` | `documented_only` | `always` | Compression codec jobs admitted to the bounded spawn_blocking pool. |
