@@ -5003,8 +5003,10 @@ async fn test_concurrent_authority_scoped_invalidation() {
 #[tokio::test]
 async fn test_body_bearing_cacheable_method_is_refused_at_admission() {
     for method in ["POST", "PUT", "PATCH", "DELETE", "QUERY"] {
-        let error = ResponseCaching::new(&json!({ "cacheable_methods": ["GET", method] }))
-            .expect_err("body-bearing cacheable method must be refused");
+        let error = match ResponseCaching::new(&json!({ "cacheable_methods": ["GET", method] })) {
+            Ok(_) => panic!("body-bearing cacheable method must be refused"),
+            Err(error) => error,
+        };
         assert!(
             error.contains("bodyless retrieval method"),
             "unexpected admission error for {method}: {error}"

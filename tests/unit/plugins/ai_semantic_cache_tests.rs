@@ -381,7 +381,7 @@ async fn normalize_semantic_cache_request(
     ctx.headers
         .insert("content-encoding".to_string(), encoding.to_string());
     ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&body));
-    let headers = ctx.headers.clone();
+    let mut headers = ctx.headers.clone();
     headers.insert("content-length".to_string(), body.len().to_string());
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(compression) as Arc<dyn Plugin>];
 
