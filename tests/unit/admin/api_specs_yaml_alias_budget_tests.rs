@@ -366,9 +366,11 @@ fn escaped_mapping_key_cannot_bypass_byte_budget() {
     // Same inflation applied to mapping keys: alias reuse of an escape-heavy
     // key must charge JSON escaping, not decoded UTF-8 length alone. Unlike
     // control characters, escaped backslashes remain valid YAML mapping keys.
+    // Use the explicit-key form because YAML limits implicit simple keys to
+    // 1,024 characters before expansion.
     let chunk = "\\\\".repeat(300_000);
     let aliases = std::iter::repeat_n("  - *e\n", 64).collect::<String>();
-    let yaml = format!("e: &e\n  \"{chunk}\": 1\nitems:\n{aliases}");
+    let yaml = format!("e: &e\n  ? \"{chunk}\"\n  : 1\nitems:\n{aliases}");
     let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
     assert!(
         matches!(
