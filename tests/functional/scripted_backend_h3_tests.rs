@@ -2238,6 +2238,51 @@ fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
     file_mode_yaml_for_h3_with_compression_and_read_timeout(port, 5000)
 }
 
+/// A `security_headers` chain whose `remove` names a field the backend sends
+/// ONLY as a response TRAILER. The removal is a no-op on the initial header
+/// map, so nothing but the plugin's `response_trailer_policy()` declaration can
+/// bind the trailer section (advisory GHSA-r78v-rc86-6r86).
+fn file_mode_yaml_for_h3_streaming_trailer_policy(port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "h3-trailer-policy-security",
+                "plugin_name": "security_headers",
+                "scope": "global",
+                "enabled": true,
+                "config": {
+                    "set": {"X-Security-Policy": "gateway-enforced"},
+                    "remove": ["X-Powered-By"],
+                },
+            },
+            {
+                "id": "h3-access-log",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
 fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
     port: u16,
     backend_read_timeout_ms: u64,
@@ -2391,6 +2436,22 @@ async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
     extra_env: &[(&str, &str)],
     backend_read_timeout_ms: u64,
 ) -> (GatewayHarness, ScriptedH3Backend) {
+    spawn_h3_streaming_harness_with_config(ca_name, h3_steps, extra_env, &|port| {
+        file_mode_yaml_for_h3_with_compression_and_read_timeout(port, backend_read_timeout_ms)
+    })
+    .await
+}
+
+/// Same H3 streaming harness, with the file config chosen by the caller from
+/// the allocated backend port. Lets a test swap the plugin chain (for example
+/// `security_headers` instead of `compression`) without duplicating the
+/// capability-probe sidecar and `h3=supported` barrier.
+async fn spawn_h3_streaming_harness_with_config(
+    ca_name: &str,
+    h3_steps: Vec<H3Step>,
+    extra_env: &[(&str, &str)],
+    file_config: &dyn Fn(u16) -> String,
+) -> (GatewayHarness, ScriptedH3Backend) {
     let ca = TestCa::new(ca_name).expect("ca");
     let (cert, key) = ca.valid().expect("leaf");
 
@@ -2422,10 +2483,7 @@ async fn spawn_h3_streaming_downgrade_harness_with_read_timeout(
         .expect("spawn h3 backend");
 
     let mut builder = GatewayHarness::builder()
-        .file_config(file_mode_yaml_for_h3_with_compression_and_read_timeout(
-            backend_port,
-            backend_read_timeout_ms,
-        ))
+        .file_config(file_config(backend_port))
         .log_level("info")
         .capture_output()
         // Avoid pool warmup issuing an extra H3 request before the test's GET.
@@ -2843,6 +2901,106 @@ async fn h2c_frontend_h3_backend_206_buffered_decision_streams_and_forwards_trai
         !resp.trailers.contains_key("transfer-encoding"),
         "hop-by-hop trailer name must be stripped before forwarding; trailers={:?}",
         resp.trailers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.method == "GET"),
+        "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14b — the H1/H2 frontend → native-H3 backend STREAMING relay
+// (`ResponseBody::StreamingH3`) enforces the response-header policy on the
+// backend's TRAILERS frame (advisory GHSA-r78v-rc86-6r86).
+//
+// `security_headers` is configured with `{"remove": ["X-Powered-By"]}` and the
+// backend sends `x-powered-by` ONLY as a trailer. The removal is a no-op on the
+// initial header map, so no observed-mutation diff can catch it — only the
+// plugin's declared `response_trailer_policy()` name binds the trailer section.
+// Pre-fix `H3FrameSource` stripped hop-by-hop names and forwarded everything
+// else verbatim, landing the suppressed field on the wire after the policy had
+// already run. An UNDECLARED backend trailer must still be forwarded (issue
+// #2941 pass-through).
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy() {
+    let body_len = 512usize;
+    let body = bytes::Bytes::from(vec![b's'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_harness_with_config(
+        "phase-h3-trailer-policy",
+        vec![
+            H3Step::AcceptStream,
+            // Content-Length is load-bearing for the same reason as test 14:
+            // `H3FrameSource`'s graceful-close recovery only treats the
+            // end-of-script QUIC close as a clean EOS on a provably complete
+            // body. `x-powered-by` is deliberately ABSENT from the initial
+            // header block so the policy removal is a no-op there.
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::StallFor(Duration::from_millis(50)),
+            H3Step::RespondTrailers(vec![
+                // Governed: `security_headers` declared this name.
+                ("x-powered-by", "backend-trailer-bypass".to_string()),
+                // Ungoverned: nothing in the chain owns this field.
+                ("x-backend-checksum", "sha256-cafebabe".to_string()),
+            ]),
+            H3Step::StallFor(Duration::from_millis(100)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        &file_mode_yaml_for_h3_streaming_trailer_policy,
+    )
+    .await;
+
+    let resp = raw_h2c_request(&harness.proxy_url("/api/stream"), "GET", &[])
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 200,
+        "expected the response to STREAM; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected a clean stream end; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(
+        resp.body.len(),
+        body_len,
+        "expected the full {body_len}-byte body; got {}",
+        resp.body.len()
+    );
+    assert!(
+        !resp.trailers.contains_key("x-powered-by"),
+        "a backend TRAILER carrying a name `security_headers` removes must not reach the client \
+         — the removal was a no-op on the initial header map, so the trailer section is the only \
+         place it could land (GHSA-r78v-rc86-6r86); trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-cafebabe"),
+        "an UNGOVERNED backend trailer must still be forwarded (issue #2941); trailers={:?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.headers.get("x-security-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "the security_headers chain must actually have run on this response; headers={:?}",
+        resp.headers
     );
 
     let received = h3_backend.received_requests().await;

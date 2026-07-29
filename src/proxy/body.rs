@@ -2218,6 +2218,17 @@ pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
     /// optional trailers remain. `None` when no read timeout is configured (the
     /// outer wrapper is absent).
     progress: Option<Arc<H3ReadProgress>>,
+    /// Response-trailer policy boundary for the H1/H2 frontend → native-H3
+    /// backend STREAMING relay (`ResponseBody::StreamingH3`).
+    ///
+    /// This source sends nothing itself, but the response it feeds committed
+    /// its initial header block long before the backend's TRAILERS frame is
+    /// read, so the trailer section crosses the response-header policy boundary
+    /// exactly as the direct-H2 relay's does (GHSA-r78v-rc86-6r86). Owned
+    /// rather than borrowed because the body outlives
+    /// `handle_proxy_request_inner`. `None` on every path with nothing to
+    /// enforce (and in tests), which keeps this a pure hop-by-hop filter.
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 }
 
 impl<S> H3FrameSource<S> {
@@ -2236,7 +2247,19 @@ impl<S> H3FrameSource<S> {
             content_length,
             received: 0,
             progress,
+            trailer_governor: None,
         }
+    }
+
+    /// Attach the streaming response-trailer policy boundary. Chained from the
+    /// public constructors so every existing `new` call site (and the source
+    /// tests) keeps the ungoverned pass-through shape.
+    fn with_trailer_governor(
+        mut self,
+        governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    ) -> Self {
+        self.trailer_governor = governor;
+        self
     }
 
     fn is_done(&self) -> bool {
@@ -2372,6 +2395,24 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             crate::proxy::headers::strip_response_hop_by_hop_trailers(
                                 &mut trailers,
                             );
+                            // Last point on this relay where the response-header
+                            // policy boundary can still bind the trailer section:
+                            // the initial header block went to the client before
+                            // the first DATA frame, so `after_proxy`,
+                            // sticky-cookie injection, and the gateway's own
+                            // builder writes are all already committed. Runs once
+                            // per response, on the trailer frame only, and is
+                            // skipped entirely (`None`) whenever no signal could
+                            // drop a field.
+                            if let Some(governor) = this.trailer_governor.as_ref() {
+                                let removed = governor.reconcile(&mut trailers);
+                                if removed > 0 {
+                                    debug!(
+                                        removed,
+                                        "H3 backend stream: dropped governed trailer fields"
+                                    );
+                                }
+                            }
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
                         Poll::Ready(Ok(None)) => {
@@ -3727,6 +3768,7 @@ pub(crate) fn coalescing_h3_body(
     coalesce_max_bytes: usize,
     flush_interval: Duration,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
@@ -3735,7 +3777,8 @@ pub(crate) fn coalescing_h3_body(
         status,
         content_length,
         progress.clone(),
-    );
+    )
+    .with_trailer_governor(trailer_governor);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
         crate::http3::config::H3_COALESCE_MAX_CAP,
@@ -3770,6 +3813,7 @@ pub(crate) fn size_limited_streaming_h3_body(
     coalesce_max_bytes: usize,
     flush_interval: Duration,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
     let source = H3FrameSource::new(
@@ -3778,7 +3822,8 @@ pub(crate) fn size_limited_streaming_h3_body(
         status,
         content_length,
         progress.clone(),
-    );
+    )
+    .with_trailer_governor(trailer_governor);
     let limited = SizeLimitedFrameSource::new(source, max_bytes);
     let buffer_capacity = coalesce_max_bytes.clamp(
         crate::http3::config::H3_COALESCE_MIN_FLOOR,
@@ -3809,16 +3854,19 @@ pub(crate) fn direct_streaming_h3_body(
     status: u16,
     content_length: Option<u64>,
     read_timeout_ms: u64,
+    trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 ) -> ProxyBody {
     let progress = h3_read_progress(read_timeout_ms);
+    let source = H3FrameSource::new(
+        recv_stream,
+        method,
+        status,
+        content_length,
+        progress.clone(),
+    )
+    .with_trailer_governor(trailer_governor);
     let body = DirectH3Body {
-        source: H3FrameSource::new(
-            recv_stream,
-            method,
-            status,
-            content_length,
-            progress.clone(),
-        ),
+        source,
         content_length,
     };
     match progress {

@@ -408,6 +408,21 @@ gRPC (the mesh-mTLS relay) on that arm is governed as a gRPC terminal section,
 and so is translated gRPC-Web — see
 [Translated gRPC-Web terminal frames](#translated-grpc-web-terminal-frames).
 
+### Native HTTP/3 backend streaming (H1/H2 frontend)
+
+`ResponseBody::StreamingH3` — an HTTP/1.1 or HTTP/2 client in front of an
+H3-capable backend — commits its initial header block before the backend's
+TRAILERS frame is read, exactly like the direct-H2 relay, and forwards that
+trailer section to the client as HTTP/1.1 chunked trailers or an H2 TRAILERS
+frame. It carries the same owned `StreamingResponseTrailerGovernor`, built from
+the same capture, and `body::H3FrameSource` applies it on the single TRAILERS
+frame immediately after the hop-by-hop trailer strip. All three body
+constructors (`direct_streaming_h3_body`, `size_limited_streaming_h3_body`,
+`coalescing_h3_body`) install it. gRPC-flavored native-H3 dispatch is owned by
+`dispatch_grpc_native_h3`, so this relay is a plain-response section in
+practice; the section is still chosen structurally from the dispatch, never from
+a trailer's own name.
+
 ### Native gRPC terminal metadata
 
 Advisory GHSA-r78v-rc86-6r86: a streaming gRPC response runs `after_proxy` on
