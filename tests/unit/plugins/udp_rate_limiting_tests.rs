@@ -956,9 +956,11 @@ async fn mapped_ipv4_shares_native_client_byte_budget() {
 }
 
 /// Redis-configured enforcement derives its key from the same canonical session
-/// identity (`ip:{client_ip}`). With Redis unreachable the limiter falls back to
-/// its local map, which is exactly where a divergent key would show up as two
-/// tracked entries and a second free budget.
+/// identity (`ip:{client_ip}`). With Redis unreachable the default
+/// `fail_closed` policy would drop every datagram, which cannot distinguish a
+/// shared principal from a blanket outage refusal. Opt into `local_fallback`
+/// so the local map is the enforcement surface — exactly where a divergent
+/// key would show up as two tracked entries and a second free budget.
 #[tokio::test]
 async fn redis_mode_shares_one_budget_across_representations() {
     let plugin = make_plugin(json!({
@@ -966,7 +968,8 @@ async fn redis_mode_shares_one_budget_across_representations() {
         "bytes_per_second": 150,
         "sync_mode": "redis",
         "redis_url": "redis://127.0.0.1:9/0",
-        "redis_health_check_interval_seconds": 1
+        "redis_health_check_interval_seconds": 1,
+        "redis_failure_policy": "local_fallback"
     }));
 
     let native = make_ctx("192.0.2.10", 100);

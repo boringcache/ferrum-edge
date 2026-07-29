@@ -1387,3 +1387,109 @@ async fn test_dns_resolve_all_respects_refresh_semaphore() {
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(cache.cache_len(), 1);
 }
+
+// ============================================================================
+// Per-proxy TTL isolation on shared hostnames (issue #2415)
+// ============================================================================
+
+#[tokio::test]
+async fn test_shared_hostname_ttl_isolation_both_insertion_orders() {
+    // Public-API coverage: two consumers sharing 127.0.0.1 at 1s/600s must
+    // each honor their own freshness window regardless of who resolved first.
+    for (first, second) in [(1u64, 600u64), (600u64, 1u64)] {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+
+        cache
+            .resolve("127.0.0.1", None, Some(first))
+            .await
+            .expect("first consumer");
+        cache
+            .resolve("127.0.0.1", None, Some(second))
+            .await
+            .expect("second consumer");
+        assert_eq!(cache.cache_len(), 1, "shared hostname stays one cache row");
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let long = cache
+            .resolve("127.0.0.1", None, Some(600))
+            .await
+            .expect("long-TTL consumer");
+        assert!(long.is_ipv4() || long.is_ipv6());
+
+        let short = cache
+            .resolve("127.0.0.1", None, Some(1))
+            .await
+            .expect("short-TTL consumer");
+        assert_eq!(long, short);
+        assert_eq!(cache.cache_len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_warmup_reordering_shared_hostname_ttl_isolation() {
+    for order in [
+        vec![
+            ("127.0.0.1".to_string(), None, Some(1u64)),
+            ("127.0.0.1".to_string(), None, Some(600u64)),
+        ],
+        vec![
+            ("127.0.0.1".to_string(), None, Some(600u64)),
+            ("127.0.0.1".to_string(), None, Some(1u64)),
+        ],
+    ] {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            ..DnsConfig::default()
+        });
+        cache.warmup(order).await;
+        assert_eq!(cache.cache_len(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        assert!(
+            cache.resolve("127.0.0.1", None, Some(600)).await.is_ok(),
+            "600s consumer stays fresh after either warmup order"
+        );
+        assert!(
+            cache.resolve("127.0.0.1", None, Some(1)).await.is_ok(),
+            "1s consumer re-resolves after either warmup order"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_per_proxy_vs_global_ttl_precedence_on_shared_hostname() {
+    let cache = DnsCache::new(DnsConfig {
+        ttl_override_seconds: Some(3600),
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ..DnsConfig::default()
+    });
+
+    cache
+        .resolve("127.0.0.1", None, Some(1))
+        .await
+        .expect("per-proxy consumer");
+    cache
+        .resolve("127.0.0.1", None, None)
+        .await
+        .expect("global-policy consumer");
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert!(
+        cache.resolve("127.0.0.1", None, None).await.is_ok(),
+        "global 3600s policy must still be fresh"
+    );
+    assert!(
+        cache.resolve("127.0.0.1", None, Some(1)).await.is_ok(),
+        "per-proxy 1s policy must re-resolve after expiry"
+    );
+}
