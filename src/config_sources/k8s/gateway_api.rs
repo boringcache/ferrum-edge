@@ -2333,15 +2333,19 @@ fn route_allowed_parent_listeners_for_hostname(
 ) -> BTreeMap<String, BTreeSet<GatewayApiListenerKey>> {
     let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
     let unresolved = |keys: Vec<String>| -> BTreeMap<String, BTreeSet<GatewayApiListenerKey>> {
-        keys.into_iter()
-            .map(|key| (key, BTreeSet::new()))
-            .collect()
+        keys.into_iter().map(|key| (key, BTreeSet::new())).collect()
     };
     let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
-        return unresolved(route_parent_ref_keys_for_namespace(object, namespace_filter));
+        return unresolved(route_parent_ref_keys_for_namespace(
+            object,
+            namespace_filter,
+        ));
     };
     if parent_refs.is_empty() {
-        return unresolved(route_parent_ref_keys_for_namespace(object, namespace_filter));
+        return unresolved(route_parent_ref_keys_for_namespace(
+            object,
+            namespace_filter,
+        ));
     }
 
     let mut refs: BTreeMap<String, BTreeSet<GatewayApiListenerKey>> = BTreeMap::new();
@@ -8943,16 +8947,8 @@ mod tests {
             );
 
             for objects in [
-                vec![
-                    gateway.clone(),
-                    http_route.clone(),
-                    grpc_route.clone(),
-                ],
-                vec![
-                    grpc_route.clone(),
-                    http_route.clone(),
-                    gateway.clone(),
-                ],
+                vec![gateway.clone(), http_route.clone(), grpc_route.clone()],
+                vec![grpc_route.clone(), http_route.clone(), gateway.clone()],
             ] {
                 let result =
                     translate_k8s_objects(&objects, options()).expect("translation succeeds");
