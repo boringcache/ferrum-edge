@@ -8180,10 +8180,12 @@ pub fn probe_compact_recovery_retry_for_tests(
 
 /// Opaque compact-recovery handle for deterministic external concurrency tests.
 #[doc(hidden)]
+#[allow(dead_code)]
 pub struct CompactRecoveryProbe {
     recovery: CompactSnapshotRecovery,
 }
 
+#[allow(dead_code)]
 impl CompactRecoveryProbe {
     /// Run one synchronous retry through the production take/write/restore path.
     #[doc(hidden)]

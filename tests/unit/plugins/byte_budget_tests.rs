@@ -706,14 +706,14 @@ fn batch_materialization_loss_accounting_counts_records_separately_from_events()
         "the record-scale counter must advance by the records lost"
     );
     assert!(
-        batch_materialization_loss_events() >= events_before + 1,
+        batch_materialization_loss_events() > events_before,
         "the event counter must advance by one, not by seven"
     );
 
     // A degraded-but-complete delivery is a fallback, never a loss.
     let records_after_loss = batch_materialization_lost_records();
     record_batch_materialization_fallback("probe_sink", "probe reason");
-    assert!(batch_materialization_fallbacks() >= fallbacks_before + 1);
+    assert!(batch_materialization_fallbacks() > fallbacks_before);
     assert!(
         batch_materialization_lost_records() >= records_after_loss,
         "a fallback must never decrement the loss counter"
