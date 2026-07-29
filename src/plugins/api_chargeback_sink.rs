@@ -32,7 +32,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, watch};
 use tracing::warn;
@@ -626,6 +626,13 @@ async fn finalize_pending_snapshot(pending: &PendingSnapshotFinalization) -> boo
 /// leaves the generation's periodic emitter running, so the Full generation is
 /// genuinely retained: it still owns every pending delta exactly once and still
 /// has a live path to durability.
+///
+/// Preparation through publication runs under the generation's `emission_lock`,
+/// the same lock the periodic and final emitters hold across their own
+/// prepare→durable-commit sequence. That makes emission and compaction mutually
+/// exclusive owners of the pending deltas: no emitter can advance the
+/// accumulator baseline in the interval between the deltas compaction prepared
+/// and the moment it publishes them, so the same charge cannot be emitted twice.
 fn compact_snapshot_lifecycle(lifecycle: &SnapshotLifecycle) -> bool {
     compact_snapshot_lifecycle_measured(lifecycle, None)
 }
@@ -674,10 +681,28 @@ fn compact_snapshot_lifecycle_measured(
     // Admission is closed and drained; preparing the pending deltas is now
     // race-free against the request path.
     //
+    // The remaining race is the generation's own periodic/final emitter, which
+    // is still running: it holds `emission_lock` across its whole
+    // prepare-deltas → durable-spool → advance-baseline sequence. Compaction
+    // therefore takes the same lock *before* it prepares anything and keeps it
+    // until Compact ownership is published and the Full accumulator is cleared.
+    // Aborting the periodic task is not synchronous, so the abort alone cannot
+    // close this window: without the lock an emitter could durably advance the
+    // baseline after compaction snapshotted its deltas, and compaction would
+    // then publish the same deltas a second time.
+    //
+    // Only in-memory work runs under this guard: Full→Compact preparation and
+    // publication perform no filesystem or network I/O.
+    let emission_guard = match lifecycle.emission_lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
     // The projection is a second attacker-shaped representation that coexists
     // with the still-charged accumulator, so it owns its own process-wide
     // reservation *before* it is built. On refusal the Full generation is
-    // retained untouched and compaction retries later; nothing is lost.
+    // retained untouched, the emission lock is released, and compaction retries
+    // later; nothing is lost.
     let projection = GrowableProcessReservation::new(process_ceiling());
     let Some(projection_bound) = lifecycle.delta_projection_bound() else {
         warn!(
@@ -697,7 +722,7 @@ fn compact_snapshot_lifecycle_measured(
         );
         return false;
     }
-    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events() else {
+    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events(&emission_guard) else {
         // Serialize failure: keep the Full generation intact and retry later.
         // `prepare_compaction_events` already restaged its borrowed overflow.
         return false;
@@ -734,7 +759,11 @@ fn compact_snapshot_lifecycle_measured(
     }
 
     // Past the last refusal point: compaction now commits. Stop the periodic
-    // emitter for this generation.
+    // emitter for this generation. This still runs under `emission_guard`, so
+    // an emitter that was already blocked on the lock (or a blocking worker the
+    // abort cannot cancel) cannot slip between the prepared deltas above and
+    // the publication below; it can only observe the cleared accumulator
+    // afterwards, which yields no events.
     let _ = lifecycle.shutdown_tx.send(true);
     {
         let mut task = match lifecycle.task.lock() {
@@ -751,6 +780,9 @@ fn compact_snapshot_lifecycle_measured(
         // it as a successful finalization rather than leaking a Full entry.
         lifecycle.finalized.store(true, Ordering::Release);
         unregister_full_snapshot_generation(lifecycle.generation);
+        // Release this generation's emission lock before compacting *other*
+        // generations, so no two emission locks are ever held at once.
+        drop(emission_guard);
         enforce_full_pending_finalization_bound(lifecycle.generation);
         invalidate_status_cache();
         return true;
@@ -782,6 +814,11 @@ fn compact_snapshot_lifecycle_measured(
     }
     lifecycle.compacted.store(true, Ordering::Release);
     lifecycle.accumulator.clear_for_compaction();
+    // Compact ownership is published and Full state is cleared; from here an
+    // emission can safely run again — it observes an empty accumulator and
+    // emits nothing. Release before compacting other generations so no two
+    // emission locks are ever held at once.
+    drop(emission_guard);
     enforce_full_pending_finalization_bound(lifecycle.generation);
     invalidate_status_cache();
     true
@@ -1817,11 +1854,16 @@ impl SnapshotLifecycle {
     /// authoritative copy while the returned vector is alive. Every caller path
     /// that does not reach the compact publication point must hand it back
     /// through [`Self::restage_compaction_overflow`].
-    fn prepare_compaction_events(&self) -> Option<(Vec<ChargeEvent>, usize)> {
-        let _emission_guard = match self.emission_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    ///
+    /// The caller must already hold this generation's `emission_lock` and must
+    /// keep holding it until compaction either publishes these deltas or
+    /// restages them: the prepared set is only race-free against the periodic
+    /// and final emitters for as long as that guard is alive. The guard is
+    /// taken by reference purely as a compile-time witness of that requirement.
+    fn prepare_compaction_events(
+        &self,
+        _emission_guard: &MutexGuard<'_, ()>,
+    ) -> Option<(Vec<ChargeEvent>, usize)> {
         let snapshot_id = new_ulid();
         let received_at = unix_timestamp_nanos();
         // Compaction owns the staged overflow going forward, so take it rather
@@ -2967,6 +3009,60 @@ impl ApiChargebackSink {
             compacted || compact_recovery_for_generation(lifecycle.generation).is_some(),
             lifecycle.accumulator.overflow_pending_len(),
             task_alive,
+        ))
+    }
+
+    /// Prove emission and Full→Compact compaction are mutually exclusive owners
+    /// of a generation's pending deltas.
+    ///
+    /// This holds the generation's emission lock — exactly what
+    /// `emit_periodic_snapshot` / `emit_final_snapshot_to_spool` hold across
+    /// their whole prepare→durable-commit sequence — while a worker thread runs
+    /// the entire compaction sequence. Compaction must not be able to reach its
+    /// commit while that lock is held, and must complete once it is released.
+    ///
+    /// Returns `(blocked_while_emission_held, compacted_after_release)`; the
+    /// correct observation is `(true, true)`. One mutex guards both directions,
+    /// so this equally proves an emission cannot enter compaction's
+    /// prepare→publish interval.
+    #[allow(dead_code)]
+    pub(crate) fn compact_excluded_by_emission_lock_for_tests(
+        &self,
+        hold: Duration,
+    ) -> Option<(bool, bool)> {
+        let lifecycle = Arc::clone(self.snapshot_lifecycle.get()?);
+        lifecycle.commit();
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let emission_guard = match lifecycle.emission_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let worker = std::thread::spawn({
+            let lifecycle = Arc::clone(&lifecycle);
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            move || {
+                started.store(true, Ordering::Release);
+                let compacted = compact_snapshot_lifecycle(&lifecycle);
+                finished.store(true, Ordering::Release);
+                compacted
+            }
+        });
+        // Only assert on blocking once the worker is actually running, so the
+        // observation is about the lock rather than thread start-up latency.
+        let spin_deadline = Instant::now() + hold;
+        while !started.load(Ordering::Acquire) && Instant::now() < spin_deadline {
+            std::thread::yield_now();
+        }
+        let running = started.load(Ordering::Acquire);
+        std::thread::sleep(hold);
+        let blocked_while_held = running && !finished.load(Ordering::Acquire);
+        drop(emission_guard);
+        let compacted = worker.join().unwrap_or(false);
+        Some((
+            blocked_while_held,
+            compacted || compact_recovery_for_generation(lifecycle.generation).is_some(),
         ))
     }
 }

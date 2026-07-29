@@ -207,7 +207,16 @@ unregisters a full generation until admission is closed and every already
 admitted terminal hook has released its guard (`in_flight == 0`); until that
 drain is observed the Full generation is retained untouched and a later
 compaction pass retries, so an in-flight record can never race the accumulator
-clear. Once mapped, Compact owns that
+clear. Compaction also takes the generation's emission lock — the same lock the
+periodic and final snapshot emitters hold across their prepare → durable spool →
+advance-baseline sequence — and holds it from preparing the compact payload
+through publishing Compact ownership and clearing Full state. Emission and
+compaction are therefore mutually exclusive owners of the pending deltas, so a
+still-running emitter cannot durably advance the baseline inside the window
+where compaction has already snapshotted those deltas and the same charge cannot
+be emitted twice. Every compaction refusal releases that lock, restores the
+staged overflow it borrowed, and leaves the periodic emitter running. Once
+mapped, Compact owns that
 generation's recovery: later Full finalize/Drop paths must follow the registry
 mapping and must not treat a cleared accumulator as an empty successful
 finalization that unregisters Compact. Every later multi-threaded reload retries

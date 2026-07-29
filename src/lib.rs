@@ -1075,6 +1075,16 @@ pub mod _test_support {
         plugin.compact_projection_shortfall_for_tests()
     }
 
+    /// Hold a snapshot generation's emission lock while a worker thread runs the
+    /// whole Full→Compact sequence. Returns
+    /// `(blocked_while_emission_held, compacted_after_release)`.
+    pub fn api_chargeback_sink_compact_excluded_by_emission_lock_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        hold: std::time::Duration,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_excluded_by_emission_lock_for_tests(hold)
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,

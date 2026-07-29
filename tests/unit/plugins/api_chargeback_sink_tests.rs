@@ -6188,6 +6188,63 @@ async fn compaction_projection_shortfall_restages_overflow_and_keeps_retry_alive
     drop(plugin);
 }
 
+/// Full→Compact compaction must own the generation's pending deltas for the
+/// whole prepare→publish interval, not just at preparation.
+///
+/// The periodic and final emitters hold the generation's emission lock across
+/// their own prepare-deltas → durable-spool → advance-baseline sequence. If
+/// compaction only took that lock while preparing, an emitter could durably
+/// emit and advance the same baseline after compaction snapshotted its deltas
+/// and before it published them, so the same charge would be billed twice.
+/// Holding the emission lock during this test must therefore block compaction
+/// outright, and releasing it must let compaction complete.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compaction_cannot_interleave_with_snapshot_emission() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_excluded_by_emission_lock_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-emission-exclusion"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    let accumulator =
+        api_chargeback_sink_snapshot_accumulator_for_test(&plugin).expect("snapshot accumulator");
+    assert!(accumulator.stage_overflow_event_for_tests(sample_event("exclusion-pending")));
+
+    let (blocked_while_emission_held, compacted_after_release) =
+        api_chargeback_sink_compact_excluded_by_emission_lock_for_test(
+            &plugin,
+            Duration::from_millis(250),
+        )
+        .expect("snapshot lifecycle");
+
+    assert!(
+        blocked_while_emission_held,
+        "compaction must not reach its commit while an emission owns the generation's pending deltas"
+    );
+    assert!(
+        compacted_after_release,
+        "compaction must complete once the emission releases ownership"
+    );
+
+    drop(plugin);
+}
+
 /// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
 /// staging never push the accumulator past its hard entry/byte ceilings, and no
 /// charge is double-counted or silently dropped.
