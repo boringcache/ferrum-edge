@@ -58,9 +58,11 @@ jobs:
             # receives no syntax validation on its own pull request and a
             # broken file would land on main and break every later pull
             # request's trusted-base execution of it. `py_compile` parses and
-            # byte-compiles without running any module-level code.
-            PYTHONPYCACHEPREFIX="$RUNNER_TEMP/cross-policy-pyc" \
-              python3 -I -m py_compile .github/scripts/verify_cross_build_policy.py
+            # byte-compiles without running any module-level code. Use
+            # `-X pycache_prefix` (not PYTHONPYCACHEPREFIX) because isolated
+            # mode (`-I`) ignores all PYTHON* environment variables.
+            python3 -I -X "pycache_prefix=$RUNNER_TEMP/cross-policy-pyc" \
+              -m py_compile .github/scripts/verify_cross_build_policy.py
             if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
               trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
               git show "${base_ref}:${policy}" > "$trusted_policy"
