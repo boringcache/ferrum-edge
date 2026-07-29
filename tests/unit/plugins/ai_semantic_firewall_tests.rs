@@ -5406,8 +5406,7 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
     );
 
     // A later complete event resumes normal windowed inspection (timely clean).
-    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
-    else {
+    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await else {
         panic!("subsequent events resume normal inspection");
     };
     assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
@@ -5502,7 +5501,10 @@ async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
         "wire order is the concatenation of the original prefix and later drips"
     );
     assert_eq!(
-        forwarded.windows(PARTIAL_EVENT_PREFIX.len()).filter(|w| *w == PARTIAL_EVENT_PREFIX).count(),
+        forwarded
+            .windows(PARTIAL_EVENT_PREFIX.len())
+            .filter(|w| *w == PARTIAL_EVENT_PREFIX)
+            .count(),
         1,
         "original bytes must appear exactly once on the wire"
     );
@@ -5542,8 +5544,7 @@ async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
         "fail-closed must leak no partial SSE payload: {terminal:?}"
     );
 
-    let ResponseStreamAction::Forward(post) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await
-    else {
+    let ResponseStreamAction::Forward(post) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await else {
         panic!("post-cut chunks forward nothing");
     };
     assert!(post.is_empty());
