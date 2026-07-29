@@ -8145,7 +8145,7 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
 }
 
 #[tokio::test]
-async fn validate_tool_results_rejects_sse_tool_results() {
+async fn validate_tool_results_rejects_uninspectable_response_headers() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let plugin = create_plugin(
         "mcp_gateway",
@@ -8154,12 +8154,83 @@ async fn validate_tool_results_rejects_sse_tool_results() {
     .unwrap()
     .unwrap();
     let session_id = initialize(&plugin).await;
-    let mut ctx = route_validated_tool_call(&plugin, &session_id, 170).await;
-    let mut headers =
-        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
-    let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
-    assert_eq!(status, 200);
-    assert_eq!(body["error"]["code"], -32012);
+
+    let valid_body = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 171,
+        "result": {
+            "structuredContent": {
+                "temperature": 22.5,
+                "conditions": "Clear"
+            }
+        }
+    }))
+    .unwrap();
+    let mut valid_ctx = route_validated_tool_call(&plugin, &session_id, 170).await;
+    let mut valid_headers = known_json_response_headers(&valid_body);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut valid_ctx, 200, &mut valid_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let cases = [
+        (
+            "event stream",
+            HashMap::from([
+                ("content-type".to_string(), "text/event-stream".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+            ]),
+        ),
+        (
+            "non-JSON",
+            HashMap::from([
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+            ]),
+        ),
+        (
+            "encoded",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-length".to_string(), "128".to_string()),
+                ("content-encoding".to_string(), "gzip".to_string()),
+            ]),
+        ),
+        (
+            "missing content-length",
+            HashMap::from([(
+                "content-type".to_string(),
+                "application/json".to_string(),
+            )]),
+        ),
+        (
+            "malformed content-length",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                ("content-length".to_string(), "not-a-size".to_string()),
+            ]),
+        ),
+        (
+            "oversized content-length",
+            HashMap::from([
+                ("content-type".to_string(), "application/json".to_string()),
+                (
+                    "content-length".to_string(),
+                    (4 * 1024 * 1024 + 1).to_string(),
+                ),
+            ]),
+        ),
+    ];
+    for (offset, (case, mut headers)) in cases.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 172 + offset as i64 * 2).await;
+        let (status, body, _) =
+            reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+    }
 }
 
 #[tokio::test]

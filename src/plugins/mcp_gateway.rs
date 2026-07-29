@@ -4872,6 +4872,35 @@ impl Plugin for McpGateway {
                 "event-stream tool results require a bounded JSON representation",
             );
         }
+        if header_value(response_headers, "content-type")
+            .is_some_and(|value| !mcp_content_type_is_json(value))
+        {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result content-type is not inspectable JSON",
+            );
+        }
+        if !Self::response_encoding_allows_rewrite(response_headers) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "encoded tool results require an identity representation",
+            );
+        }
+        // Header-time buffer refinement deliberately releases responses whose
+        // declared size is missing, malformed, or above the plugin's cap. Once
+        // released, `on_final_response_body` cannot validate them, so reject
+        // here instead of allowing that optimization to become an enforcement
+        // bypass. The actual collected length is checked again in the final
+        // hook to cover a lying upstream.
+        if !self.response_length_allows_rewrite(response_headers) {
+            return self.reject_invalid_tool_result(
+                ctx,
+                None,
+                "tool result lacks a bounded acceptable content-length",
+            );
+        }
         PluginResult::Continue
     }
 
