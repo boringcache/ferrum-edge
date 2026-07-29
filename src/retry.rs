@@ -6,6 +6,7 @@
 //! failures so operators can control retry behavior for each independently.
 
 use crate::config::types::{BackoffStrategy, RetryConfig};
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::time::Duration;
@@ -961,7 +962,13 @@ pub fn classify_body_error(e: &(dyn std::error::Error + 'static)) -> (ErrorClass
 /// The response body, either fully buffered or still streaming from the backend.
 pub enum ResponseBody {
     /// Body has been fully collected into memory.
-    Buffered(Vec<u8>),
+    ///
+    /// Stored as cheaply cloneable [`Bytes`] so cached synthetic short-circuits
+    /// (spec exposure, response cache, dedup replay, AI semantic cache) can share
+    /// one immutable allocation across concurrent deliveries. Mutating later
+    /// response-body phases must take ownership and copy only when the buffer is
+    /// still shared — see [`ResponseBody::take_buffered_vec`].
+    Buffered(Bytes),
     /// Body is still attached to the backend response and will be streamed
     /// to the client. The status code and headers have already been extracted.
     Streaming {
@@ -976,6 +983,31 @@ pub enum ResponseBody {
     /// `recv_data()`. This avoids buffering the entire H3 response when
     /// streaming to HTTP/1.1 or HTTP/2 frontends.
     StreamingH3(Box<crate::http3::client::H3StreamingResponse>),
+}
+
+impl ResponseBody {
+    /// Build a buffered body from any type convertible to [`Bytes`].
+    #[inline]
+    pub fn buffered(data: impl Into<Bytes>) -> Self {
+        Self::Buffered(data.into())
+    }
+
+    /// Take a uniquely owned `Vec` for in-place mutation.
+    ///
+    /// Shared `Bytes` (multiple clones of one cached entry) copy once; uniquely
+    /// owned buffers reclaim without copying when the bytes crate can take the
+    /// underlying allocation. Callers must restore via
+    /// [`ResponseBody::store_buffered_vec`] (or assign `Buffered` directly).
+    #[inline]
+    pub fn take_buffered_vec(body: &mut Bytes) -> Vec<u8> {
+        std::mem::take(body).into()
+    }
+
+    /// Restore a previously taken owned buffer as shared [`Bytes`].
+    #[inline]
+    pub fn store_buffered_vec(body: &mut Bytes, owned: Vec<u8>) {
+        *body = Bytes::from(owned);
+    }
 }
 
 /// Result of a backend request, carrying enough context for the retry
@@ -1015,7 +1047,7 @@ impl BackendResponse {
     #[allow(dead_code)]
     pub fn into_buffered_body(self) -> Vec<u8> {
         match self.body {
-            ResponseBody::Buffered(b) => b,
+            ResponseBody::Buffered(b) => b.into(),
             ResponseBody::Streaming { .. }
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_) => {

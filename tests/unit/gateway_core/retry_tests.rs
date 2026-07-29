@@ -16,7 +16,7 @@ fn default_config() -> RetryConfig {
 fn http_response(status_code: u16) -> BackendResponse {
     BackendResponse {
         status_code,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
@@ -27,7 +27,7 @@ fn http_response(status_code: u16) -> BackendResponse {
 fn connection_failure() -> BackendResponse {
     BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
@@ -38,7 +38,7 @@ fn connection_failure() -> BackendResponse {
 fn post_header_body_read_failure() -> BackendResponse {
     BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
@@ -49,7 +49,7 @@ fn post_header_body_read_failure() -> BackendResponse {
 fn dispatch_policy_rejection() -> BackendResponse {
     BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
@@ -60,7 +60,7 @@ fn dispatch_policy_rejection() -> BackendResponse {
 fn terminal_gateway_error(status_code: u16, error_class: ErrorClass) -> BackendResponse {
     BackendResponse {
         status_code,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: None,
