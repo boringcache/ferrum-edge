@@ -44,6 +44,7 @@ use tokio::time::Duration;
 use tracing::warn;
 use url::{Host, Url};
 
+use super::utils::byte_budget::ProcessByteReservation;
 use super::utils::log_schema::view::{
     MetadataNested, emit_timestamp, extract_host_from_url, serialize_schema_metadata,
 };
@@ -308,6 +309,9 @@ struct WsByteLease {
     /// Current retained charge. Atomic so a provisional reservation can shrink
     /// race-safely against `Drop` without temporarily releasing the whole lease.
     bytes: AtomicUsize,
+    /// Matching reservation against the process-wide observability ceiling, so
+    /// multiple `ws_logging` instances cannot multiply past the process total.
+    process: ProcessByteReservation,
 }
 
 impl WsByteLease {
@@ -326,6 +330,7 @@ impl WsByteLease {
                 Ok(_) => {
                     self.used_bytes
                         .fetch_sub(current - new_bytes, Ordering::AcqRel);
+                    self.process.shrink_to(new_bytes);
                     return;
                 }
                 Err(observed) => current = observed,
@@ -373,8 +378,15 @@ impl WsByteBudget {
             return Some(Arc::new(WsByteLease {
                 used_bytes: Arc::clone(&self.used_bytes),
                 bytes: AtomicUsize::new(0),
+                process: ProcessByteReservation::try_acquire(0)?,
             }));
         }
+        // Process ceiling first: a failed aggregate reservation must never
+        // leave per-instance bytes held.
+        let Some(process) = ProcessByteReservation::try_acquire(bytes) else {
+            self.record_drop("process-wide retained-byte ceiling exhausted");
+            return None;
+        };
         let reserved = self
             .used_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -382,6 +394,7 @@ impl WsByteBudget {
                     .filter(|next| *next <= self.max_bytes)
             });
         if reserved.is_err() {
+            drop(process);
             self.record_drop("retained-content byte budget exhausted");
             return None;
         }
@@ -389,6 +402,7 @@ impl WsByteBudget {
         Some(Arc::new(WsByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
             bytes: AtomicUsize::new(bytes),
+            process,
         }))
     }
 

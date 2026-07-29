@@ -4910,7 +4910,7 @@ pub async fn normalize_response_body_for_inspection(
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
     // Seed provenance before the rewrite gate: a status that forbids body
@@ -4956,7 +4956,7 @@ pub async fn normalize_response_body_for_inspection(
         };
         if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
-            *response_body = body;
+            *response_body = bytes::Bytes::from(body);
             normalized = true;
         }
         ctx.record_deadline_response_header_mutations(response_headers);

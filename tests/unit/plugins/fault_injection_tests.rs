@@ -661,7 +661,7 @@ async fn test_fault_rejection_shaping_matches_request_protocols() {
             );
         } else {
             assert_eq!(normalized.http_status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(normalized.body, b"fault", "{protocol}");
+            assert_eq!(&normalized.body[..], b"fault", "{protocol}");
             assert_eq!(normalized.grpc_status, None, "{protocol}");
             assert!(
                 !normalized.headers.contains_key("grpc-status"),

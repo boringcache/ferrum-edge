@@ -6,6 +6,7 @@
 //! HTTP-flavor detection. Extracting them prevents logic drift between the
 //! two frontend paths.
 
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -599,7 +600,7 @@ fn circuit_breaker_target_key(
 pub(crate) struct BackendAdmissionRejection {
     pub(crate) plugin_name: String,
     pub(crate) status_code: u16,
-    pub(crate) body: Vec<u8>,
+    pub(crate) body: Bytes,
     pub(crate) headers: HashMap<String, String>,
 }
 
@@ -632,7 +633,7 @@ pub(crate) fn run_backend_admission_plugins(
                 return Err(BackendAdmissionRejection {
                     plugin_name: plugin.name().to_string(),
                     status_code,
-                    body,
+                    body: Bytes::from(body),
                     headers,
                 });
             }

@@ -3775,8 +3775,14 @@ paths:
           required: false
           description: |
             Comma-separated list of resource types to include.
-            Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`.
+            Valid values: `proxies`, `consumers`, `plugin_configs`, `upstreams`, `api_specs`.
             When omitted, all resource types are included.
+            Including `api_specs` also requires `proxies`, `upstreams`, and
+            `plugin_configs` so the export stays directly restorable (owning
+            proxy plus generated upstream/plugin relationships). Otherwise the
+            request fails with `400` and does not emit a partial artifact.
+            `consumers` is optional because API-spec extraction does not create
+            consumers.
           schema:
             type: string
             example: "proxies,upstreams"
@@ -3799,6 +3805,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BackupResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -3831,14 +3839,15 @@ paths:
         available. If the snapshot cannot be taken, restore aborts before any
         delete: connectivity failures return `503`, while corrupt/undecodable
         stored resources return `500` with `failure_class: data_integrity` and
-        a safe resource type/id when available. `api_specs` are admin-only metadata outside the config and
-        are NOT restored by rollback; a failed restore reports the authoritative
-        total number that must be re-submitted via `POST /api-specs` (list the
-        namespace's current specs with `GET /api-specs`).
+        a safe resource type/id when available. API specs are included in the
+        versioned backup section and are restored (and rolled back) with config
+        resources. Legacy backups that omit `api_specs` while the target
+        namespace holds specs require `?confirm_api_spec_deletion=true` in
+        addition to `?confirm=true`.
 
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
-        then plugin configs).
+        then plugin configs, then API specs).
 
         Restore normalizes the submitted payload once before validation — the
         same `normalize_fields()` admission used by CRUD, batch, file mode, and
@@ -3871,6 +3880,17 @@ paths:
           in: query
           required: true
           description: Must be `true` to confirm the destructive operation
+          schema:
+            type: boolean
+            enum: [true]
+        - name: confirm_api_spec_deletion
+          in: query
+          required: false
+          description: |
+            Required (as `true`) when restoring a legacy backup that omits the
+            versioned `api_specs` section while the target namespace currently
+            holds API specs. Without it, restore returns `409 Conflict` and
+            deletes nothing.
           schema:
             type: boolean
             enum: [true]
@@ -3943,15 +3963,15 @@ paths:
                     type: integer
                     description: >-
                       Authoritative count of API specs present before the restore
-                      that a config rollback cannot restore. Present only when the
-                      namespace carried specs.
+                      that may still be missing after an incomplete rollback.
+                      Present only when rollback is incomplete and the namespace
+                      carried specs.
                   api_specs_note:
                     type: string
                     description: >-
-                      Operator guidance to recover the affected API specs
-                      (re-submit original documents via POST /api-specs and list
-                      current specs with GET /api-specs). Present only when
-                      `api_specs_not_restored` is set.
+                      Operator guidance to verify API specs with GET /api-specs
+                      and re-submit originals via POST /api-specs if missing.
+                      Present only when `api_specs_not_restored` is set.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -3960,6 +3980,25 @@ paths:
           $ref: "#/components/responses/ReadOnly"
         "408":
           $ref: "#/components/responses/RequestTimeout"
+        "409":
+          description: >-
+            Restore refused because the backup omits the versioned `api_specs`
+            section while the target namespace currently holds API specs.
+            Nothing was deleted. Retry with `confirm_api_spec_deletion=true` or
+            restore from a backup that includes `api_specs`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error, api_specs_at_risk, confirmation_required]
+                properties:
+                  error:
+                    type: string
+                  api_specs_at_risk:
+                    type: integer
+                  confirmation_required:
+                    type: string
+                    example: confirm_api_spec_deletion=true
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
@@ -11625,6 +11664,70 @@ components:
             attempt, including empty-success, rejection, and handled-error
             outcomes. Panic/abort/cancellation do not advance it. Absent until the
             first poll tick finishes.
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
+
+    ConfigChangeWatcherStatus:
+      type: object
+      description: |
+        Backend-native config-change watcher state (database mode, MongoDB
+        replica sets, `FERRUM_MONGO_CHANGE_STREAM_ENABLED=true`). Absent unless
+        a watcher was started for this process.
+
+        The watcher is a **coalesced wake-up signal only**: it carries no
+        config, never advances the accepted durable sequence cursor, and never
+        publishes a runtime config generation. Every notification runs the same
+        authoritative cursor-based incremental/full reload a periodic poll tick
+        would have run, so duplicate, out-of-order, and missed notifications are
+        harmless. `connected: false` is therefore a reload-latency signal, not a
+        config-outage signal, and never forces `status: degraded` — periodic
+        polling continues to apply committed changes.
+
+        Every field is a counter, flag, or fixed enum label. Resource IDs,
+        namespaces, connection strings, resume tokens, and backend error bodies
+        are never exposed here.
+      required:
+        - enabled
+        - connected
+        - degraded_reason
+        - events_total
+        - reconnects_total
+        - invalidations_total
+        - history_losses_total
+        - resume_token_retained
+      properties:
+        enabled:
+          type: boolean
+          description: A watcher task was started for this process.
+        connected:
+          type: boolean
+          description: A watch is currently open and delivering wake-ups.
+        degraded_reason:
+          type: string
+          enum: [none, connect_failed, stream_error, history_lost, invalidated, unauthorized, unsupported_topology, stopped]
+        events_total:
+          type: integer
+          format: int64
+        reconnects_total:
+          type: integer
+          format: int64
+        invalidations_total:
+          type: integer
+          format: int64
+        history_losses_total:
+          type: integer
+          format: int64
+        resume_token_retained:
+          type: boolean
+          description: |
+            Whether a resume point is currently retained in memory. Resume
+            tokens are never persisted and never logged.
+        last_event_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recent observed change notification.
+            Absent until the first one arrives.
 
     DatabaseDeltaPollingMetrics:
       type: object
@@ -11683,6 +11786,8 @@ components:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
             - type: "null"
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
@@ -12269,7 +12374,7 @@ components:
           description: Where the config was read from
         counts:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams]
+          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
           properties:
             proxies:
               type: integer
@@ -12278,6 +12383,8 @@ components:
             plugin_configs:
               type: integer
             upstreams:
+              type: integer
+            api_specs:
               type: integer
         proxies:
           type: array
@@ -12295,12 +12402,115 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
+
+    ApiSpecsBackupSection:
+      type: object
+      description: |
+        Versioned backup/restore section for raw API specification documents
+        and ownership metadata. Omitted entirely on cached-fallback exports
+        (`X-Data-Source: cached`), which cannot prove spec ownership and so
+        restore as legacy backups; database-backed exports always include it
+        (possibly with an empty `items` array). The aggregate decompressed
+        API-spec content is bounded by the configured restore body limit.
+      required: [section_version, items]
+      properties:
+        section_version:
+          type: string
+          description: Section contract version
+          example: "1"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiSpecBackupItem"
+
+    ApiSpecBackupItem:
+      type: object
+      description: |
+        One API spec document in a backup/restore payload. `spec_content_base64`
+        is the gzip-compressed original document (standard Base64). Do not log
+        this field; it may contain proprietary API definitions.
+      required:
+        - id
+        - proxy_id
+        - spec_version
+        - spec_format
+        - spec_content_base64
+        - content_encoding
+        - uncompressed_size
+        - content_hash
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+        namespace:
+          type: string
+          default: ferrum
+        proxy_id:
+          type: string
+        spec_version:
+          type: string
+          example: "3.1.0"
+        spec_format:
+          type: string
+          enum: [json, yaml]
+        spec_content_base64:
+          type: string
+          description: Standard Base64 of gzip-compressed original document bytes
+        content_encoding:
+          type: string
+          enum: [gzip]
+        uncompressed_size:
+          type: integer
+          format: int64
+        content_hash:
+          type: string
+          description: Lowercase hex SHA-256 of uncompressed document bytes
+        title:
+          type: string
+        info_version:
+          type: string
+        description:
+          type: string
+        contact_name:
+          type: string
+        contact_email:
+          type: string
+        license_name:
+          type: string
+        license_identifier:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        server_urls:
+          type: array
+          items:
+            type: string
+        operation_count:
+          type: integer
+        resource_hash:
+          type: string
+          pattern: "^$|^[0-9a-f]{64}$"
+          description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
 
     RestoreRequest:
       type: object
       description: |
         Same format as the backup output or the batch create request.
         All fields are optional — omitted resource types are treated as empty.
+        Omitting `api_specs` entirely means a legacy backup (preflight may
+        require `confirm_api_spec_deletion=true`). An empty `api_specs.items`
+        array is an intentional wipe of API specs.
       properties:
         proxies:
           type: array
@@ -12318,6 +12528,8 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Upstream"
+        api_specs:
+          $ref: "#/components/schemas/ApiSpecsBackupSection"
 
     RestoreResponse:
       type: object
@@ -12325,7 +12537,7 @@ components:
       properties:
         restored:
           type: object
-          required: [proxies, consumers, plugin_configs, upstreams]
+          required: [proxies, consumers, plugin_configs, upstreams, api_specs]
           properties:
             proxies:
               type: integer
@@ -12339,6 +12551,9 @@ components:
             upstreams:
               type: integer
               description: Number of upstreams restored
+            api_specs:
+              type: integer
+              description: Number of API specs restored
     # ── Shared: Transaction-Log Schema Customization ──────────────────
     # Shape of the `schema:` block (and the entries inside
     # `transaction_log_schema.schemas`). See docs/log_schema.md for the
@@ -15985,9 +16200,9 @@ components:
         non-mesh gateways that want Istio-style workload labels in logs.
 
         Runtime admission permits at most 32 distinct custom tag names across
-        `custom_tags` and `custom_header_tags` combined. The individual
-        `maxProperties: 32` bounds remain for generated clients, but the
-        cross-property combined total cannot be expressed mechanically.
+        `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
+        individual `maxProperties: 32` bounds remain for generated clients, but
+        the cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -16048,8 +16263,10 @@ components:
             Custom tags injected into transaction metadata and exported spans.
             Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
             and cannot collide with reserved, sensitive, `mesh.*`, trace, or
-            authorization keys. This map and `custom_header_tags` may contain
-            at most 32 distinct tag names combined.
+            authorization keys. This map, `custom_header_tags`, and
+            `custom_env_tags` may contain at most 32 distinct tag names combined.
+            For Istio environment tags, values here are `defaultValue`
+            fallbacks only — live data-plane resolution uses `custom_env_tags`.
         custom_header_tags:
           type: object
           maxProperties: 32
@@ -16059,8 +16276,32 @@ components:
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
             sensitive destination names are rejected; runtime values over 1024
-            bytes are omitted. This map and `custom_tags` may contain at most
-            32 distinct tag names combined.
+            bytes are omitted. This map, `custom_tags`, and `custom_env_tags`
+            may contain at most 32 distinct tag names combined.
+        custom_env_tags:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            type: string
+            maxLength: 256
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+          description: |
+            Istio `customTags.<tag>.environment` lookups (`tag_name ->
+            env_var_name`) resolved from the local data-plane process
+            environment at plugin construction and reload. Controllers must
+            not resolve these against the controller-host environment. A
+            present UTF-8 value overrides any matching `custom_tags` default;
+            a missing variable keeps that default when present and otherwise
+            omits the tag. Credential-bearing environment variable names
+            (including secret/password/token/key/credential names, database
+            connection locations, client credential identifiers, and
+            operator-configured sensitive metadata names) are rejected.
+            Non-UTF-8 or >1024-byte values fail construction closed. Selected
+            values are deliberately emitted as custom transaction and trace
+            metadata; diagnostics never include resolved values or rejected
+            credential-bearing variable names. This map, `custom_tags`, and
+            `custom_header_tags` may contain at most 32 distinct tag names
+            combined.
         metrics:
           type: object
           description: |
@@ -20852,6 +21093,17 @@ components:
               enum: [cut_with_error_event, cut_silent]
               default: cut_with_error_event
               description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
+            max_hold_ms:
+              type: integer
+              format: uint
+              minimum: 1
+              maximum: 300000
+              description: "Absolute deadline, in milliseconds, on how long response content may be held awaiting a semantic verdict. Independent of max_window_bytes, provider.request_timeout_ms, and any transport timeout: the budget covers the time the bytes have already been held plus the semantic round-trip (including queueing for a detect-mode admission permit). The clock is anchored when un-released content first enters the hold and is never refreshed by further chunks or by a partial release that leaves older bytes held, so a drip-feeding backend cannot extend it. It clears only when the current hold is fully released, so the next hold receives a fresh budget. On expiry the in-flight evaluation is cancelled and streaming.on_hold_timeout decides. Omit the field to leave the hold unbounded (the historic behavior); 0 and values above 300000 are rejected."
+            on_hold_timeout:
+              type: string
+              enum: [on_error, cut, forward]
+              default: on_error
+              description: "Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes); forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]

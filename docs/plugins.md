@@ -766,7 +766,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 
 > **Requires a fully-open backend egress policy.** librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so Ferrum cannot screen those addresses. `kafka_logging` therefore **fails closed** and is refused whenever the backend egress policy can deny any address — which includes the default posture. `broker_list` is parsed with librdkafka's exact `[proto://]host[:port]` grammar, so protocol-prefixed denied literals (e.g. `PLAINTEXT://169.254.169.254:9092`) are rejected too. See [Backend Egress / SSRF Protection](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
 
-Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
+Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue, which keeps its own copy of the payload until delivery resolves. Ferrum therefore does **not** release the retained-byte lease at that handoff: it transfers the lease into the record's librdkafka delivery opaque, so a stalled broker's pinned downstream queue stays charged to both the per-instance `buffer_max_bytes` budget and the process-wide retained-byte ceiling. The lease is released exactly once, by the delivery callback (terminal delivery, terminal failure, or purge-on-destroy) or by the immediate-`send`-rejection path that hands the opaque back. Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1195,6 +1195,106 @@ current reservation depth. Alert on
 aggregate reject counter when diagnosing budget exhaustion: the aggregate also
 counts closed-admission and no-runtime rejects that occur normally at shutdown.
 
+### Process-wide retained-byte ceiling
+
+The task budget above bounds *pending delivery tasks*. A second, independent
+budget bounds *retained bytes*. Every observability sink instance —
+`http_logging`, `tcp_logging`, `udp_logging`, `statsd_logging`, `loki_logging`,
+`ws_logging`, `kafka_logging`, the OpenTelemetry/Zipkin/Datadog trace
+exporters, and `api_chargeback_sink` — already reserves against its own
+per-instance `buffer_max_bytes` budget before it clones, serializes, or
+compresses an attacker-shaped record. Each of those reservations now also takes
+a matching reservation against one process-wide ceiling,
+`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` (default 256 MiB).
+
+The process reservation is taken *first*, so a refused aggregate reservation
+never leaves per-instance bytes held, and the record is refused before any
+clone, serialization, or compression work happens. Reservations shrink to the
+exact retained size once the record is measured and release on drop, so
+delivery, drops, rejected channel handoffs, and cancellation all recover
+capacity without waiting for shutdown.
+
+This is what stops configuration from multiplying the bound: ten sink instances
+each configured at the 256 MiB per-instance hard maximum retain at most the one
+configured process total between them, not 2.5 GiB.
+
+#### What the ceiling covers, layer by layer
+
+The ceiling is an **end-to-end** retained-byte bound, not a queue bound. Every
+representation of an attacker-shaped record that can exist at the same time as
+the queued entry is charged to it:
+
+| Layer | Owner | Charged as | Released when |
+| --- | --- | --- | --- |
+| Serialized queued entry | the sink's admission path | `max_entry_bytes` lease, shrunk to the measured size | the entry is delivered, dropped, or cancelled |
+| Contiguous batch payload for `http_logging` / `tcp_logging` / `udp_logging` / `statsd_logging` / `ws_logging` | the delivery worker | the second of the two retained copies each entry's lease already charges | the payload and its retries finish |
+| librdkafka's own copy of a `kafka_logging` record | librdkafka, until delivery resolves | the record's lease is **transferred into the librdkafka delivery opaque** rather than released at handoff | the delivery callback fires — terminal delivery, terminal failure, or purge-on-destroy — or an immediate `send` rejection hands the opaque back |
+| `loki_logging` batch JSON body, and the gzip output when compression is enabled | the delivery worker | separate ceiling reservations taken *before* the body is written or compressed, sized from a conservative escaping/compression bound | the body and its retries finish |
+| `loki_logging` label-grouping order index | the payload writer | a ceiling reservation taken before the index is allocated; the index is one `usize` per entry and does **not** scale with the number of distinct dynamic label sets | the payload finishes being written |
+| Trace exporter batch `Value` tree and serialized request body | the exporter flush loop | separate ceiling reservations taken before the tree is built and before the body is serialized | the tree is dropped right after serialization; the body when its retries finish |
+| `api_chargeback_sink` JSONEachRow insert body (live batches) | the delivery worker | a ceiling reservation taken before serialization | the request finishes |
+| `api_chargeback_sink` decoded spool artifact and its line index | the replay worker | reservations taken *before* the file is read and before the index is allocated, sized from the artifact's declared decoded length — the on-disk length when it is uncompressed, and the decompressed size recorded in the zstd frame header for one this build wrote; only a frame carrying no content size (a foreign or hand-planted archive) falls back to the ratio-clamped decompression bound | the artifact is fully replayed, deferred, or dead-lettered |
+| `api_chargeback_sink` replay worklist and per-chunk body | the replay worker | a reservation for the whole worklist before it exists, plus one per chunk body | the chunk request finishes; the worklist when the file leaves replay |
+
+Two consequences are worth calling out:
+
+- **Batch materialization is charged to the process ceiling only**, never a
+  second time to the per-instance `buffer_max_bytes` budget. That budget is
+  already committed to the queued entries, so charging it again would refuse
+  every batch a full queue produces.
+- **A refused batch representation is not materialized.** `loki_logging` drops
+  the batch; the trace exporters halve the slice and retry, so a large
+  `batch_size` loses spans only when even a single span's representation cannot
+  be reserved. `api_chargeback_sink` never loses data to a refusal: a refused
+  live batch fails the flush and goes to the durable spool through the
+  pre-existing failed-batch path, and a refused spool artifact, worklist, or
+  chunk body is reported as *retryable* — the durable claim is released so a
+  later tick replays the same file in order, rather than quarantining a healthy
+  record.
+
+Retries never deep-copy a payload: each materialized body is an immutable
+refcounted buffer, and an attempt takes a handle rather than re-serializing.
+Spool replay never copies a row at all — chunking and 413 splitting address
+`(start, end)` byte ranges into the one decoded artifact, so splitting a batch
+cannot multiply retained row bytes.
+
+Telemetry uses fixed labels only — no attacker-controlled label values:
+
+- `ferrum_observability_retained_bytes` — current process-wide retention
+- `ferrum_observability_retained_bytes_high_water` — peak since startup
+- `ferrum_observability_max_retained_bytes` — the configured ceiling
+- `ferrum_observability_process_ceiling_rejections_total` — admissions refused
+  by the ceiling specifically, rather than by a per-instance budget. This counts
+  **reservations**, not records: one refusal can discard a whole batch, and some
+  refusals (chargeback replay) discard nothing at all.
+- `ferrum_observability_batch_materialization_lost_records_total` — the
+  record-scale companion: log entries, spans, and rows actually discarded
+  because their batch representation could not be materialized
+- `ferrum_observability_batch_materialization_losses_total` — discard events,
+  each of which lost one or more records
+- `ferrum_observability_batch_materialization_fallbacks_total` — batches
+  delivered complete but degraded, such as `loki_logging` sending uncompressed
+  because the gzip buffer could not be reserved. No record loss.
+
+Per-instance refusals stay on each sink's own drop accounting, so the counters
+together tell an operator whether to raise one sink's `buffer_max_bytes` or the
+process ceiling. If you see sustained
+`ferrum_observability_process_ceiling_rejections_total` growth alongside
+`ferrum_observability_batch_materialization_lost_records_total`, raise
+`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` or lower the affected sink's
+`batch_size`.
+
+Diagnostics on these paths are **sampled**, not per batch: the loss and fallback
+helpers warn on the first event and then every hundredth, with a fixed reason
+label and no payload content. Sustained ceiling saturation therefore produces a
+bounded warning stream, and the counters above — not the log — are the signal to
+alert on.
+
+The process-global stdout access-log sink is deliberately excluded: it is a
+single sink bounded by `FERRUM_LOG_BUFFER_CAPACITY` /
+`FERRUM_LOG_BUFFER_BYTES` / `FERRUM_LOG_MAX_RECORD_BYTES`, and it does not
+multiply with plugin instance count.
+
 A completed drain is terminal for that delivery lifecycle *generation*: its
 task and worker admission stay closed and its drain report stays cached, so
 late producers on a shutting-down process cannot reopen delivery work behind
@@ -1326,7 +1426,7 @@ The outer Loki timestamp is assigned in the plugin's single flush order and is s
 
 Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
 
-The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
+The channel slot is reserved before serialization. Hot-path admission then takes a provisional `max_entry_bytes` lease against both the per-instance `buffer_max_bytes` budget and the process-wide retained-byte ceiling **before** serializing the JSON line or constructing labels; a refused reservation skips both and fails closed. After admission the lease shrinks to the exact retained size (JSON line plus labels). Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 
@@ -4949,6 +5049,7 @@ Semantically inspects LLM request and response bodies for prompt injection, jail
 - `streaming_response: buffer` **inspects the stream** by forcing the SSE response onto the buffered path: the whole completion is collected, its deltas reassembled, and the full response engine runs before anything reaches the client. This is the most accurate option (full context) but loses streaming UX and raises time-to-first-byte; a stream exceeding `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` fails closed with HTTP 502 (the oversized body is never delivered uninspected), and a buffered stream that yields no inspectable content (non-UTF-8 / non-JSON `data:` events, or no extractable content) is treated as an inspection failure under `on_error` rather than delivered uninspected. Buffer mode records `ai_semantic_firewall.response_inspection=streaming_buffered` instead of the skip marker.
 - `streaming_response: inspect` **inspects the stream progressively in windows**, preserving streaming UX: SSE deltas (including legacy Completions `choices[].text`) are reassembled into running text; when the text crosses a sentence/paragraph boundary (or the `streaming.max_window_bytes` cap), that window is inspected and, if clean, its bytes are released to the client. The window covers assistant prose **and** streamed tool-call names/arguments, so `tool_abuse`/`response_leakage` rules that apply to tool-call segments are enforced on a tool-only stream too (not just assistant text). A confirmed violation **cuts the stream mid-flight** — the held window is dropped and a terminal SSE error event (`event: error` + `[DONE]`) is emitted, then the body ends. A rolling overlap re-inspects the boundary so a phrase split across windows is still caught; after a clean release, retained prose and tails across all tool-call names/arguments split one aggregate overlap budget with a reserved tool-state share, so prose cannot erase all tool context and attacker-selected parallel tool indexes cannot multiply retained state. An SSE event whose `data:` payload is not valid UTF-8/JSON (or a single event larger than `streaming.max_window_bytes`) is **uninspectable** and fails closed under `on_error: reject` (forwarded best-effort under `warn`/`allow`), and the total stream is still bounded by `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`. The default `block` enforcement holds each window until it passes (no un-inspected bytes reach the client) at the cost of ~one embedding round-trip of added latency per window; `streaming.max_inspections` caps provider calls and dry-run never cuts. Only a stream the firewall flagged on the request path (a detected `stream: true` JSON request, gated by `inspect.response`) is windowed — unrelated SSE such as a `GET` EventSource route keeps streaming untouched. Because headers are committed before the body streams, a cut can only **truncate** (the response stays `200`) — it cannot change the status or retract already-sent windows. Streamed rule details remain in the structured detection log (matched rule IDs + severity, no raw text): although core now provides terminal metadata write-back, `streaming.enforcement: detect` intentionally launches provider evaluations that can finish after transaction finalization, so the firewall keeps one audit contract across block and detect modes. Inspectors run on reqwest, direct HTTP/2, and native HTTP/3 response arms; the request-scoped reqwest preference remains an optimization. Tuned by the `streaming` block (see below).
   - `streaming.enforcement: detect` makes `inspect` **release-then-detect**: bytes stream through immediately (no holding, no added latency) and a violation is only **logged** — to the structured log, never the client or `/metrics` — never cut. Provider failures are also logged as a sanitized `provider_error` event, bounded to once per response, so a broken inspection provider cannot look like a clean stream. Use detect to observe what `block` *would* have cut without affecting traffic. If more than one stream-inspecting plugin is configured on a proxy (e.g. a global and a proxy-scoped `ai_semantic_firewall`), all of them run, chained — not just the first. Windowed inspection covers both the reassembled delta fields **and** per-frame non-delta `response_json_paths` (e.g. `message.content`, `output_text`), matching the buffered path. Known limitations: (1) embedding-provider I/O performed while inspecting streamed windows is **not** reflected in the `latency_plugin_external_io_ms` transaction field, which is captured at response-header time (before the body streams); (2) on the HTTP/3 frontend, a client that disconnects while the backend SSE stream is idle is noticed on the next send or when `backend_read_timeout_ms` expires (the H3 send side exposes no proactive peer-close signal) — the same behavior as all H3 streaming, so set a backend read timeout to bound idle backend connections. The H1/H2 inspected path cancels immediately on disconnect.
+  - `streaming.max_hold_ms` bounds **how long content may be retained awaiting a semantic verdict**, which no other timeout expresses: `max_window_bytes` bounds *size*, `provider.request_timeout_ms` bounds *one embedding call*, and transport timeouts bound *idle sockets*. The deadline is absolute and per-hold: it starts when un-released content first enters the hold, covers both accumulation and the semantic round-trip (including queueing for a `detect` admission permit), and is never refreshed by further chunks or by a partial clean release that leaves older bytes behind — a backend that drips one delta per interval cannot hold the window open indefinitely. It clears only when the current hold is fully released to the client (or after an expiry has applied its policy), so the next hold receives a fresh budget without extending bytes that were already waiting. On expiry the losing work is cancelled: the in-flight evaluation future is dropped, which cancels its embedding request and releases its admission permit. Completion wins a tie, so a verdict that lands together with the deadline is honored rather than discarded. `streaming.on_hold_timeout` picks the policy: fail closed (**cut** — the held window is discarded, never delivered, and the client sees the same terminal error event as a policy cut, so a timeout is not distinguishable from a violation) or fail open (**forward** — every byte that caused the hold is released uninspected, including any un-terminated partial SSE event; the remainder of that same event then passes through uninspected until the next event boundary so the already-forwarded prefix is never re-held or reclassified as a fresh protected window, after which later events resume normal windowed inspection; the one-time degraded-pass-through warning is logged with `reason = "hold_timeout"`). Each expiry emits one sanitized `warn` (fixed fields: `enforcement`, `phase`, `action`, `max_hold_ms` — no rule id, matched text, or window content) and folds into the fixed-cardinality `ai_semantic_firewall.stream_hold_timeouts` count (saturating-summed across active instances on the same response) plus the closed-vocabulary `ai_semantic_firewall.stream_hold_timeout_action` (`cut` / `forward` / `detect_abandoned`; most restrictive wins: `cut` > `forward` > `detect_abandoned`) transaction metadata. An instance with zero expiries neither synthesizes nor erases those keys. Limitation: the deadline is evaluated when the inspector is driven (a chunk, the end of the stream, or an in-flight evaluation), so a backend that holds content and then sends *nothing at all* is bounded by `backend_read_timeout_ms`, not by this field.
 
 > **Choosing a streaming mode.** Production enforcement should use `streaming_response: reject`, `buffer`, or `inspect` and `on_error: reject`. Use `buffer` when full-context accuracy matters more than UX (short responses, agent/batch backends) and you can spend the time-to-first-byte; `inspect` (block) when streaming UX must be preserved and windowed granularity + per-window latency are acceptable; `inspect` + `enforcement: detect` when you want to observe/log violations without affecting the stream; `reject` when no streaming is acceptable; `skip` only when response inspection is advisory. `buffer`'s memory cost is the dimension to weigh: because `stream: true` is the common case for production LLM clients, enabling `buffer` means *most* responses on that proxy are held fully in memory — up to `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` each — before the client receives a byte, so peak memory scales roughly as **concurrent streams × buffered completion size**; size that cap and the overload-manager thresholds for the aggregate, and do **not** set `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0` (unlimited) on a `buffer`-mode proxy or the oversize-502 bound is lost. `inspect` avoids the full-hold cost (only one window is held at a time, capped by `streaming.max_window_bytes`).
 
@@ -4969,6 +5070,8 @@ Under `reject`, `buffer`, `inspect`, or explicit `skip`, a response-only policy 
 | `streaming.overlap_bytes` | uint | `256` | `inspect` only. Already-cleared text re-inspected with the next window so a violation split across a boundary is still caught. Must be less than `streaming.max_window_bytes` and is included within that aggregate retained-state cap |
 | `streaming.max_inspections` | uint | `64` | `inspect` only. Safety cap on provider inspections per response. **Once reached, the no-un-inspected-bytes guarantee degrades**: further inspectable windows honor `on_error` — `reject` cuts (fail closed), but `warn`/`allow` **forward them uninspected** (a one-time structured `warn` log records this). A completion longer than `max_inspections` windows under `on_error: warn`/`allow` is effectively pass-through past the cap; raise the cap (or use `reject`) if that is unacceptable. The same uninspected-forward + log happens on a provider error under `warn`/`allow` |
 | `streaming.on_violation` | string | `cut_with_error_event` | `inspect` + `enforcement: block` only. `cut_with_error_event` (emit a terminal SSE error event on a cut) or `cut_silent` (end the stream silently) |
+| `streaming.max_hold_ms` | uint | unset (unbounded) | `inspect` only. Absolute deadline on how long response content may be held awaiting a semantic verdict, **independent of** `max_window_bytes`, `provider.request_timeout_ms`, and transport timeouts. The budget covers the time bytes have already been held **plus** the semantic round-trip (including queueing for a `detect` admission permit). The clock is anchored when un-released content first enters the hold and is **never refreshed by further chunks or a partial release that leaves older bytes held** — a drip-feeding backend cannot extend it. It clears only when the current hold is fully released, so the next hold receives a fresh budget. On expiry the in-flight evaluation is cancelled and `streaming.on_hold_timeout` decides. Must be `1..=300000`; `0` and larger values are rejected with a field-specific error |
+| `streaming.on_hold_timeout` | string | `on_error` | `inspect` only; requires `streaming.max_hold_ms`. `on_error` inherits the plugin's `on_error` policy (`reject` → **cut** / fail closed, `warn`/`allow` → **forward** every byte that caused the hold uninspected — including any partial SSE event — then pass through that event's remainder until the next boundary / fail open), matching provider-error and inspection-cap handling. `cut` and `forward` pin the behavior explicitly. `cut` is **rejected** with `enforcement: detect` (whose bytes were already forwarded, so it can only abandon the evaluation and release its permit) |
 | `streaming.enforcement` | string | `block` | `inspect` only. `block` (hold each window until it passes, then release; cut on violation) or `detect` (release-then-detect — stream through immediately, log violations to the structured log, never cut) |
 | `provider.type` | string | required | `openai_compatible_embeddings` |
 | `provider.endpoint` | string | required | OpenAI-compatible embeddings endpoint. Literal IP hosts are checked against `FERRUM_BACKEND_ALLOW_IPS`; DNS hostnames participate in startup warmup and are checked by the shared plugin HTTP client at request time |

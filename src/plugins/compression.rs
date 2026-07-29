@@ -324,7 +324,7 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
     ctx: &mut RequestContext,
     response_status: &mut u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
 ) -> bool {
     if !ctx.take_compression_response_encode_aborted() {
         return false;
@@ -340,7 +340,7 @@ pub(crate) fn reconcile_aborted_gateway_response_encoding(
         response_headers.clear();
         response_headers.insert("content-type".to_string(), "application/json".to_string());
         ensure_vary_accept_encoding(response_headers);
-        *response_body = NOT_ACCEPTABLE_RESPONSE_BODY.as_bytes().to_vec();
+        *response_body = bytes::Bytes::from_static(NOT_ACCEPTABLE_RESPONSE_BODY.as_bytes());
         response_headers.insert(
             "content-length".to_string(),
             response_body.len().to_string(),

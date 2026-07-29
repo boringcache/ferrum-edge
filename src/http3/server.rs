@@ -60,6 +60,13 @@ use crate::proxy::{
 };
 use crate::tls::{CrlList, TlsPolicy};
 
+/// Canonical mesh dispatch-required gateway reject body. Shared by the header
+/// finalizer, the committed-hook boundary, rejection logging, and the wire
+/// sender so all four observe one static payload and the `Bytes` handed to QUIC
+/// is `from_static` rather than a per-reject copy.
+pub(crate) const MESH_DISPATCH_REQUIRED_REJECT_BODY: &[u8] =
+    br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum H3RequestBodyReadError<E> {
     Read(E),
@@ -171,7 +178,7 @@ fn h3_request_body_timeout_contract<E>(
 struct FinalizedH3TerminalBodyRejection {
     http_status: StatusCode,
     headers: HashMap<String, String>,
-    body: Vec<u8>,
+    body: Bytes,
 }
 
 /// Commit an H3 terminal request-body failure before provider/backend I/O.
@@ -186,7 +193,7 @@ async fn finalize_h3_terminal_body_read_rejection(
     http_flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     start_time: std::time::Instant,
     plugin_execution_ns: &mut u64,
     request_path: &str,
@@ -197,7 +204,9 @@ async fn finalize_h3_terminal_body_read_rejection(
     );
     let mut response_status = status.as_u16();
     let mut headers = HashMap::new();
-    let mut body = body.to_vec();
+    // Owned already: a cached synthetic `RejectBinary` payload reaches this
+    // finalizer as shared `Bytes` and must keep that allocation identity.
+    let mut body = body;
     let rejection_hook_start = std::time::Instant::now();
     apply_reject_after_proxy_and_synthetic_body_hooks(
         plugins,
@@ -216,7 +225,7 @@ async fn finalize_h3_terminal_body_read_rejection(
         http_flavor,
         grpc_web_response_content_type,
         http_status,
-        &body,
+        body.clone(),
         &headers,
     )
     .await;
@@ -1903,7 +1912,7 @@ async fn handle_h3_request(
                 &mut ctx,
                 content_type,
                 StatusCode::METHOD_NOT_ALLOWED,
-                r#"{"error":"Method Not Allowed"}"#.as_bytes(),
+                Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
                 &headers,
             )
             .await?;
@@ -1912,7 +1921,7 @@ async fn handle_h3_request(
                 &mut stream,
                 http_flavor,
                 StatusCode::METHOD_NOT_ALLOWED,
-                r#"{"error":"Method Not Allowed"}"#.as_bytes(),
+                Bytes::from_static(br#"{"error":"Method Not Allowed"}"#),
                 &headers,
             )
             .await?;
@@ -2005,7 +2014,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Internal Server Error",
+                    Bytes::from_static(b"Internal Server Error"),
                     &HashMap::new(),
                 )
                 .await;
@@ -2024,7 +2033,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    b"Internal Server Error",
+                    Bytes::from_static(b"Internal Server Error"),
                     &HashMap::new(),
                 )
                 .await?;
@@ -2051,7 +2060,7 @@ async fn handle_h3_request(
                 http_flavor,
                 grpc_web_response_content_type,
                 http_status,
-                &reject_body,
+                reject_body.clone(),
                 &headers,
                 initial_response_header_policy_plugins.as_ref(),
             )
@@ -2090,7 +2099,7 @@ async fn handle_h3_request(
                 send_h3_finalized_reject_response(
                     &mut stream,
                     StatusCode::OK,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -2102,7 +2111,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -2152,7 +2161,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await;
@@ -2171,7 +2180,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await?;
@@ -2206,7 +2215,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await;
@@ -2238,7 +2247,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -2418,7 +2427,7 @@ async fn handle_h3_request(
             http_flavor,
             grpc_web_response_content_type,
             http_status,
-            &reject_body,
+            reject_body.clone(),
             &headers,
         )
         .await;
@@ -2451,7 +2460,7 @@ async fn handle_h3_request(
             http_flavor,
             grpc_web_response_content_type,
             http_status,
-            &reject_body,
+            reject_body.clone(),
             &headers,
         )
         .await?;
@@ -2601,7 +2610,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await;
@@ -2620,7 +2629,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await?;
@@ -2653,7 +2662,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await;
@@ -2684,7 +2693,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await?;
@@ -2863,7 +2872,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await;
@@ -2882,7 +2891,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await?;
@@ -2910,7 +2919,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await;
@@ -2938,7 +2947,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -2981,7 +2990,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await;
@@ -3000,7 +3009,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await?;
@@ -3033,7 +3042,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await;
@@ -3064,7 +3073,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await?;
@@ -3105,7 +3114,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await;
@@ -3124,7 +3133,7 @@ async fn handle_h3_request(
                             http_flavor,
                             grpc_web_response_content_type,
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            b"Internal Server Error",
+                            Bytes::from_static(b"Internal Server Error"),
                             &HashMap::new(),
                         )
                         .await?;
@@ -3158,7 +3167,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await;
@@ -3189,7 +3198,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         http_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &headers,
                     )
                     .await?;
@@ -3334,7 +3343,7 @@ async fn handle_h3_request(
                 http_flavor,
                 grpc_web_response_content_type,
                 StatusCode::PAYLOAD_TOO_LARGE,
-                br#"{"error":"Request body exceeds maximum size"}"#,
+                Bytes::from_static(br#"{"error":"Request body exceeds maximum size"}"#),
                 start_time,
                 &mut plugin_execution_ns,
                 &original_request_path,
@@ -3347,7 +3356,7 @@ async fn handle_h3_request(
                 http_flavor,
                 grpc_web_response_content_type,
                 rejection.http_status,
-                &rejection.body,
+                rejection.body.clone(),
                 &rejection.headers,
             )
             .await?;
@@ -3534,7 +3543,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await;
@@ -3553,7 +3562,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await?;
@@ -3580,7 +3589,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await;
@@ -3609,7 +3618,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -3642,7 +3651,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        br#"{"error":"Request body exceeds maximum size"}"#,
+                        Bytes::from_static(br#"{"error":"Request body exceeds maximum size"}"#),
                         start_time,
                         &mut plugin_execution_ns,
                         &original_request_path,
@@ -3655,7 +3664,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         rejection.http_status,
-                        &rejection.body,
+                        rejection.body.clone(),
                         &rejection.headers,
                     )
                     .await?;
@@ -3671,7 +3680,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         status,
-                        br#"{"error":"Client disconnected"}"#,
+                        Bytes::from_static(br#"{"error":"Client disconnected"}"#),
                         start_time,
                         &mut plugin_execution_ns,
                         &original_request_path,
@@ -3687,7 +3696,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::REQUEST_TIMEOUT,
-                        br#"{"error":"Request body read timed out"}"#,
+                        Bytes::from_static(br#"{"error":"Request body read timed out"}"#),
                         start_time,
                         &mut plugin_execution_ns,
                         &original_request_path,
@@ -3700,7 +3709,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         rejection.http_status,
-                        &rejection.body,
+                        rejection.body.clone(),
                         &rejection.headers,
                         false,
                     )
@@ -3765,7 +3774,7 @@ async fn handle_h3_request(
             reject @ PluginResult::Reject { .. } | reject @ PluginResult::RejectBinary { .. } => {
                 let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                     record_request(&state, 500);
-                    let mut body = b"Internal Server Error".to_vec();
+                    let mut body = Bytes::from_static(b"Internal Server Error");
                     let mut headers = HashMap::new();
                     if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
                         &ctx.method,
@@ -3773,13 +3782,14 @@ async fn handle_h3_request(
                         &mut headers,
                         body.len(),
                     ) {
-                        body = Vec::new();
+                        // HEAD/204/205/304: drop capacity, no DATA frame.
+                        body = Bytes::new();
                     }
                     send_h3_reject_flavor_aware(
                         &mut stream,
                         http_flavor,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        &body,
+                        body,
                         &headers,
                     )
                     .await?;
@@ -3805,7 +3815,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject.body,
+                    reject.body.clone(),
                     &headers,
                 )
                 .await;
@@ -3832,7 +3842,7 @@ async fn handle_h3_request(
                     &mut stream,
                     http_flavor,
                     http_status,
-                    &reject.body,
+                    reject.body.clone(),
                     &headers,
                 )
                 .await?;
@@ -3859,9 +3869,9 @@ async fn handle_h3_request(
             Err(()) => {
                 let phase_start = std::time::Instant::now();
                 let mut reject_status = 503;
-                let mut reject_body =
-                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#
-                        .to_vec();
+                let mut reject_body = Bytes::from_static(
+                    br#"{"error":"Service temporarily unavailable (circuit breaker open)"}"#,
+                );
                 let mut rej_headers = HashMap::new();
                 crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
                     &plugins,
@@ -3879,7 +3889,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     reject_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &rej_headers,
                     initial_response_header_policy_plugins.as_ref(),
                 )
@@ -3919,7 +3929,7 @@ async fn handle_h3_request(
                     send_h3_finalized_reject_response(
                         &mut stream,
                         StatusCode::OK,
-                        &reject_body,
+                        reject_body.clone(),
                         &rej_headers,
                     )
                     .await?;
@@ -3931,7 +3941,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         reject_status,
-                        &reject_body,
+                        reject_body.clone(),
                         &rej_headers,
                     )
                     .await?;
@@ -4149,7 +4159,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await;
@@ -4168,7 +4178,7 @@ async fn handle_h3_request(
                         http_flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await?;
@@ -4193,7 +4203,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject.body,
+                    reject.body.clone(),
                     &headers,
                 )
                 .await;
@@ -4222,7 +4232,7 @@ async fn handle_h3_request(
                     http_flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject.body,
+                    reject.body.clone(),
                     &headers,
                 )
                 .await?;
@@ -4409,7 +4419,7 @@ async fn handle_h3_request(
         finalize_h3_gateway_error_headers(
             http_flavor,
             StatusCode::BAD_GATEWAY,
-            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            MESH_DISPATCH_REQUIRED_REJECT_BODY,
             &mut reason_headers,
             initial_response_header_policy_plugins.as_ref(),
         );
@@ -4419,7 +4429,7 @@ async fn handle_h3_request(
             http_flavor,
             grpc_web_response_content_type,
             StatusCode::BAD_GATEWAY,
-            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            Bytes::from_static(MESH_DISPATCH_REQUIRED_REJECT_BODY),
             &reason_headers,
         )
         .await;
@@ -4427,7 +4437,7 @@ async fn handle_h3_request(
             &mut ctx,
             http_flavor,
             StatusCode::BAD_GATEWAY,
-            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            MESH_DISPATCH_REQUIRED_REJECT_BODY,
             &reason_headers,
         );
         record_request(&state, reject_metric_status);
@@ -4438,7 +4448,7 @@ async fn handle_h3_request(
             http_flavor,
             grpc_web_response_content_type,
             StatusCode::BAD_GATEWAY,
-            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            Bytes::from_static(MESH_DISPATCH_REQUIRED_REJECT_BODY),
             &reason_headers,
         )
         .await?;
@@ -5317,8 +5327,9 @@ async fn handle_h3_request(
         {
             let reject_status =
                 StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
+            let reject_body = reject.body.clone();
             let reject_sent =
-                send_h3_reject_response(&mut stream, reject_status, &reject.body, &reject.headers)
+                send_h3_reject_response(&mut stream, reject_status, reject_body, &reject.headers)
                     .await
                     .is_ok();
 
@@ -6122,7 +6133,7 @@ async fn handle_h3_request(
             let Some(mut reject) = plugin_result_into_reject_parts(reject) else {
                 tracing::error!("Plugin result could not be converted to rejection parts");
                 record_request(&state, 500);
-                let mut body = b"Internal Server Error".to_vec();
+                let mut body = Bytes::from_static(b"Internal Server Error");
                 let mut headers = HashMap::new();
                 if crate::plugins::utils::synthetic_response::prepare_synthetic_response_wire(
                     &ctx.method,
@@ -6130,12 +6141,13 @@ async fn handle_h3_request(
                     &mut headers,
                     body.len(),
                 ) {
-                    body = Vec::new();
+                    // HEAD/204/205/304: drop capacity, no DATA frame.
+                    body = Bytes::new();
                 }
                 send_h3_reject_response(
                     &mut stream,
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &body,
+                    body,
                     &headers,
                 )
                 .await?;
@@ -6160,7 +6172,7 @@ async fn handle_h3_request(
                 http_flavor,
                 grpc_web_response_content_type,
                 http_status,
-                &reject.body,
+                reject.body.clone(),
                 &headers,
             )
             .await;
@@ -6188,7 +6200,7 @@ async fn handle_h3_request(
                 http_flavor,
                 grpc_web_response_content_type,
                 http_status,
-                &reject.body,
+                reject.body.clone(),
                 &headers,
             )
             .await?;
@@ -6606,7 +6618,7 @@ async fn handle_h3_request(
                         result.request_on_wire,
                         result.error_class,
                     ),
-                    body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                    body: crate::retry::ResponseBody::buffered(Vec::new()),
                     headers: HashMap::new(),
                     backend_resolved_ip: None,
                     error_class: result.error_class,
@@ -6731,7 +6743,9 @@ async fn handle_h3_request(
                     );
                     result = H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"backend address blocked by egress policy"}"#.to_vec(),
+                        body: Bytes::from_static(
+                            br#"{"error":"backend address blocked by egress policy"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::DispatchPolicyRejected),
@@ -7037,7 +7051,7 @@ async fn handle_h3_request(
                             response_headers.clear();
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
-                            response_body = b"Internal Server Error".to_vec();
+                            response_body = Bytes::from_static(b"Internal Server Error");
                             // Synthesized error body — backend trailers no
                             // longer apply (issue #1630).
                             response_trailers = None;
@@ -7129,7 +7143,7 @@ async fn handle_h3_request(
                             response_headers.clear();
                             response_headers
                                 .insert("content-type".to_string(), "application/json".to_string());
-                            response_body = b"Internal Server Error".to_vec();
+                            response_body = Bytes::from_static(b"Internal Server Error");
                             // Synthesized error body — backend trailers no
                             // longer apply (issue #1630).
                             response_trailers = None;
@@ -7278,7 +7292,7 @@ async fn handle_h3_request(
         let response_headers_sent = await_buffered_h3_write!(stream.send_response(resp));
         if response_headers_sent
             && !response_body.is_empty()
-            && await_buffered_h3_write!(stream.send_data(Bytes::from(response_body)))
+            && await_buffered_h3_write!(stream.send_data(response_body))
         {
             bytes_received = response_body_bytes;
         }
@@ -7455,7 +7469,7 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                         flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await;
@@ -7474,7 +7488,7 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                         flavor,
                         grpc_web_response_content_type,
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        b"Internal Server Error",
+                        Bytes::from_static(b"Internal Server Error"),
                         &HashMap::new(),
                     )
                     .await?;
@@ -7502,7 +7516,7 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                     flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await;
@@ -7531,7 +7545,7 @@ async fn run_h3_backend_path_plugins_or_send_reject(
                     flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &reject_body,
+                    reject_body.clone(),
                     &headers,
                 )
                 .await?;
@@ -7598,7 +7612,7 @@ async fn run_h3_backend_admission_or_send_reject(
                 flavor,
                 grpc_web_response_content_type,
                 http_status,
-                &rejection.body,
+                rejection.body.clone(),
                 &headers,
                 initial_response_header_policy_plugins,
             )
@@ -7637,7 +7651,7 @@ async fn run_h3_backend_admission_or_send_reject(
                 send_h3_finalized_reject_response(
                     stream,
                     StatusCode::OK,
-                    &rejection.body,
+                    rejection.body.clone(),
                     &headers,
                 )
                 .await?;
@@ -7649,7 +7663,7 @@ async fn run_h3_backend_admission_or_send_reject(
                     flavor,
                     grpc_web_response_content_type,
                     http_status,
-                    &rejection.body,
+                    rejection.body.clone(),
                     &headers,
                 )
                 .await?;
@@ -8033,6 +8047,10 @@ fn classify_h3_error(e: &crate::http3::client::H3PoolError) -> crate::retry::Err
 /// 504 `{"error":"Backend timeout"}` — matching the direct-H2 / HBONE /
 /// sidecar-mTLS read-timeout arms in `crate::proxy` — while every other
 /// failure keeps the generic 502 `{"error":"Backend unavailable"}`.
+/// The canonical H3 backend-failure body. Deliberately `&'static str`: the
+/// `send_h3_response` consumers want a string, and the buffered-dispatch
+/// consumers can reach `Bytes::from_static(..)` from the same static lifetime,
+/// so neither side has to copy the literal.
 fn h3_backend_failure_status_body(
     e: &crate::http3::client::H3PoolError,
 ) -> (StatusCode, &'static str) {
@@ -8236,7 +8254,7 @@ async fn run_h3_streaming_after_proxy_hooks(
             reject.body.len(),
         )
     {
-        reject.body = Vec::new();
+        reject.body = Bytes::new();
     }
     *plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     reject
@@ -8319,7 +8337,7 @@ async fn proxy_to_backend_h3_refined_response(
                 // buffered response path.
                 return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
                     status: reject_status.as_u16(),
-                    body: reject_body.as_bytes().to_vec(),
+                    body: Bytes::from_static(reject_body.as_bytes()),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -8360,7 +8378,7 @@ async fn proxy_to_backend_h3_refined_response(
             method,
             &crate::retry::BackendResponse {
                 status_code: response_status,
-                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                body: crate::retry::ResponseBody::buffered(Vec::new()),
                 headers: HashMap::new(),
                 connection_error: false,
                 backend_resolved_ip: None,
@@ -8439,7 +8457,7 @@ async fn collect_h3_open_response_body(
     {
         return H3BufferedDispatchResult {
             status: 502,
-            body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+            body: Bytes::from_static(br#"{"error":"Backend response body exceeds maximum size"}"#),
             headers: HashMap::new(),
             trailers: None,
             error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -8474,7 +8492,7 @@ async fn collect_h3_open_response_body(
                     // backend has not proved it lost H3 support.
                     return H3BufferedDispatchResult {
                         status: 504,
-                        body: br#"{"error":"Backend timeout"}"#.to_vec(),
+                        body: Bytes::from_static(br#"{"error":"Backend timeout"}"#),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ReadWriteTimeout),
@@ -8493,7 +8511,9 @@ async fn collect_h3_open_response_body(
                 {
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"Backend response body exceeds maximum size"}"#.to_vec(),
+                        body: Bytes::from_static(
+                            br#"{"error":"Backend response body exceeds maximum size"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -8518,7 +8538,9 @@ async fn collect_h3_open_response_body(
                     );
                     return H3BufferedDispatchResult {
                         status: 502,
-                        body: br#"{"error":"HTTP/3 backend response truncated"}"#.to_vec(),
+                        body: Bytes::from_static(
+                            br#"{"error":"HTTP/3 backend response truncated"}"#,
+                        ),
                         headers: HashMap::new(),
                         trailers: None,
                         error_class: Some(crate::retry::ErrorClass::ConnectionClosed),
@@ -8553,7 +8575,7 @@ async fn collect_h3_open_response_body(
                 }
                 return H3BufferedDispatchResult {
                     status: 502,
-                    body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                    body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(h3_error_class),
@@ -8590,7 +8612,7 @@ async fn collect_h3_open_response_body(
             }
             return H3BufferedDispatchResult {
                 status: 502,
-                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),
@@ -8601,7 +8623,7 @@ async fn collect_h3_open_response_body(
 
     H3BufferedDispatchResult {
         status: response_status,
-        body: response_body,
+        body: Bytes::from(response_body),
         headers: response_headers,
         trailers: response_trailers,
         error_class: None,
@@ -8728,10 +8750,14 @@ async fn stream_h3_open_response_to_client(
     {
         let reject_status =
             StatusCode::from_u16(reject.status_code).unwrap_or(StatusCode::BAD_GATEWAY);
-        let reject_sent =
-            send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers)
-                .await
-                .is_ok();
+        let reject_sent = send_h3_reject_response(
+            h3_stream,
+            reject_status,
+            reject.body.clone(),
+            &reject.headers,
+        )
+        .await
+        .is_ok();
         return Ok(H3StreamResult {
             status: reject.status_code,
             backend_status: response_status,
@@ -9606,7 +9632,7 @@ async fn dispatch_grpc_native_h3(
             stream,
             HttpFlavor::Grpc,
             reject_status,
-            &reject.body,
+            reject.body.clone(),
             &reject.headers,
         )
         .await
@@ -10749,10 +10775,14 @@ async fn proxy_to_backend_h3_streaming(
         // active-connection count for the selected target. Report the
         // disconnect in the result so the caller still records the (true
         // backend) outcome and releases the connection.
-        let reject_sent =
-            send_h3_reject_response(h3_stream, reject_status, &reject.body, &reject.headers)
-                .await
-                .is_ok();
+        let reject_sent = send_h3_reject_response(
+            h3_stream,
+            reject_status,
+            reject.body.clone(),
+            &reject.headers,
+        )
+        .await
+        .is_ok();
         return Ok(H3StreamResult {
             status: reject.status_code,
             // The backend already returned `response_status`; the after_proxy
@@ -11088,7 +11118,7 @@ async fn proxy_to_backend_h3_streaming(
 ///   `retry_on_connect_failure` can fire regardless of HTTP method.
 struct H3BufferedDispatchResult {
     status: u16,
-    body: Vec<u8>,
+    body: Bytes,
     headers: HashMap<String, String>,
     /// Backend response trailers (issue #1630), still unsanitized. The buffered
     /// native-H3 send path forwards them only when no response-body plugin
@@ -11126,7 +11156,7 @@ fn h3_buffered_result_from_backend_response(
         | crate::retry::ResponseBody::StreamingH3(_) => {
             return H3BufferedDispatchResult {
                 status: 502,
-                body: br#"{"error":"Backend unavailable"}"#.to_vec(),
+                body: Bytes::from_static(br#"{"error":"Backend unavailable"}"#),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(crate::retry::ErrorClass::ProtocolError),
@@ -11216,9 +11246,9 @@ async fn proxy_to_backend_h3(
                 );
                 return H3BufferedDispatchResult {
                     status: 502,
-                    body: r#"{"error":"Backend response body exceeds maximum size"}"#
-                        .as_bytes()
-                        .to_vec(),
+                    body: Bytes::from_static(
+                        br#"{"error":"Backend response body exceeds maximum size"}"#,
+                    ),
                     headers: HashMap::new(),
                     trailers: None,
                     error_class: Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
@@ -11232,7 +11262,7 @@ async fn proxy_to_backend_h3(
 
             H3BufferedDispatchResult {
                 status,
-                body: resp_body,
+                body: Bytes::from(resp_body),
                 headers: resp_headers,
                 // Forward backend trailers verbatim; the buffered send path
                 // strips response-direction hop-by-hop names before emitting
@@ -11273,7 +11303,7 @@ async fn proxy_to_backend_h3(
             let (reject_status, reject_body) = h3_backend_failure_status_body(&e);
             H3BufferedDispatchResult {
                 status: reject_status.as_u16(),
-                body: reject_body.as_bytes().to_vec(),
+                body: Bytes::from_static(reject_body.as_bytes()),
                 headers: HashMap::new(),
                 trailers: None,
                 error_class: Some(h3_error_class),
@@ -11366,7 +11396,7 @@ fn finalize_h3_gateway_error_headers(
 async fn send_h3_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     if reject_response_sets_content_type(headers) {
@@ -11383,7 +11413,7 @@ async fn send_h3_reject_response(
 async fn send_h3_finalized_reject_response(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_finalized_reject_response_with_recv_halt(stream, status, body, headers, true).await
@@ -11392,7 +11422,7 @@ async fn send_h3_finalized_reject_response(
 async fn send_h3_finalized_reject_response_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
@@ -11408,8 +11438,16 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
     // already applied shared HEAD/204/205/304 no-body preparation. Skip DATA
     // entirely when there is nothing to send so HEAD and no-body statuses never
     // emit an empty DATA frame before FIN.
+    //
+    // GHSA-5fp3-pp5p-c4gh: `body` is owned `Bytes`, moved straight into
+    // `send_data`. A cached synthetic `RejectBinary` payload keeps the shared
+    // allocation identity it carries through `RejectedResponseParts` and
+    // `apply_reject_after_proxy_and_synthetic_body_hooks` all the way to QUIC —
+    // no per-hit full-body copy at this boundary. Any slice-copying or
+    // owned-Vec conversion reintroduced here (or on a caller in this chain)
+    // restores the advisory; `h3_native_reject_bytes_share_tests` pins it.
     if !body.is_empty() {
-        stream.send_data(Bytes::copy_from_slice(body)).await?;
+        stream.send_data(body).await?;
     }
     stream.finish().await?;
     if halt_recv {
@@ -11425,7 +11463,7 @@ async fn send_h3_grpc_web_reject(
     _ctx: &mut RequestContext,
     response_content_type: &str,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_grpc_web_reject_with_recv_halt(
@@ -11448,7 +11486,7 @@ async fn send_h3_grpc_web_reject_with_recv_halt(
     _ctx: &mut RequestContext,
     response_content_type: &str,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
@@ -11460,24 +11498,27 @@ async fn send_h3_grpc_web_reject_with_recv_halt(
         return send_h3_finalized_reject_response_with_recv_halt(
             stream,
             normalized.http_status,
-            &normalized.body,
+            normalized.body,
             &normalized.headers,
             halt_recv,
         )
         .await;
     }
 
-    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, &body, headers);
     let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
         response_content_type,
         grpc_status,
         grpc_message.as_ref(),
     );
     crate::proxy::finalize_grpc_web_error_response_headers(&mut translated, &[], Some(headers));
+    // The gRPC-Web translator produced freshly framed bytes; move them (no copy
+    // of the original cached payload, which the translator never touched).
+    let translated_body = Bytes::from(translated.body);
     send_h3_finalized_reject_response_with_recv_halt(
         stream,
         StatusCode::OK,
-        &translated.body,
+        translated_body,
         &translated.headers,
         halt_recv,
     )
@@ -11491,7 +11532,7 @@ pub(crate) async fn run_h3_reject_response_committed_hooks(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> bool {
     run_h3_deadline_bounded_reject_committed_hooks_with_policy(
@@ -11514,7 +11555,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
@@ -11538,7 +11579,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
@@ -11567,37 +11608,42 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     // `adopt_gateway_rejection` rather than restarting provenance.
     ctx.begin_rejection_deadline_response_header_provenance(headers);
 
-    let (committed_status, committed_headers, committed_body) =
-        if let Some(content_type) = grpc_web_response_content_type {
-            // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
-            // committed observers (chargeback, exporters), matching the sender.
-            if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
-                let normalized =
-                    crate::proxy::normalize_reject_response(http_status, body, headers, true);
-                (normalized.http_status, normalized.headers, normalized.body)
-            } else {
-                let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
-                let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-                    content_type,
-                    grpc_status,
-                    grpc_message.as_ref(),
-                );
-                crate::proxy::finalize_grpc_web_error_response_headers(
-                    &mut translated,
-                    &[],
-                    Some(headers),
-                );
-                (StatusCode::OK, translated.headers, translated.body)
-            }
-        } else {
-            let normalized = crate::proxy::normalize_reject_response(
-                http_status,
-                body,
-                headers,
-                matches!(flavor, HttpFlavor::Grpc),
-            );
+    let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
+        grpc_web_response_content_type
+    {
+        // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
+        // committed observers (chargeback, exporters), matching the sender.
+        if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
+            let normalized =
+                crate::proxy::normalize_reject_response(http_status, body.clone(), headers, true);
             (normalized.http_status, normalized.headers, normalized.body)
-        };
+        } else {
+            let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, &body, headers);
+            let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+                content_type,
+                grpc_status,
+                grpc_message.as_ref(),
+            );
+            crate::proxy::finalize_grpc_web_error_response_headers(
+                &mut translated,
+                &[],
+                Some(headers),
+            );
+            (
+                StatusCode::OK,
+                translated.headers,
+                Bytes::from(translated.body),
+            )
+        }
+    } else {
+        let normalized = crate::proxy::normalize_reject_response(
+            http_status,
+            body.clone(),
+            headers,
+            matches!(flavor, HttpFlavor::Grpc),
+        );
+        (normalized.http_status, normalized.headers, normalized.body)
+    };
 
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
@@ -11609,7 +11655,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             ctx,
             committed_status.as_u16(),
             &committed_headers,
-            &committed_body,
+            committed_body.clone(),
             terminal_gateway_deadline,
         )
         .await
@@ -11625,13 +11671,13 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 plugins[index + 1..].to_vec(),
                 committed_status.as_u16(),
                 Arc::new(committed_headers.clone()),
-                Arc::new(committed_body.clone()),
+                committed_body.clone(),
             );
             return false;
         }
 
         let mut deadline_headers = headers.clone();
-        let mut deadline_body = body.to_vec();
+        let mut deadline_body = body.clone();
         let deadline_http_status = replace_buffered_h3_response_with_grpc_deadline(
             ctx,
             grpc_web_response_content_type,
@@ -11648,7 +11694,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             } else {
                 let normalized = crate::proxy::normalize_reject_response(
                     deadline_http_status,
-                    &deadline_body,
+                    deadline_body.clone(),
                     &deadline_headers,
                     matches!(flavor, HttpFlavor::Grpc),
                 );
@@ -11661,7 +11707,7 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
             plugins[index + 1..].to_vec(),
             deadline_status.as_u16(),
             Arc::new(deadline_headers),
-            Arc::new(deadline_body),
+            deadline_body,
         );
         return true;
     }
@@ -11713,7 +11759,7 @@ async fn finalize_h3_upload_deadline_rejection(
         flavor,
         grpc_web_response_content_type,
         http_status,
-        &reject.body,
+        reject.body.clone(),
         &reject.headers,
     )
     .await;
@@ -11741,7 +11787,7 @@ async fn finalize_h3_upload_deadline_rejection(
         flavor,
         grpc_web_response_content_type,
         http_status,
-        &reject.body,
+        reject.body.clone(),
         &reject.headers,
     )
     .await
@@ -11755,7 +11801,7 @@ async fn send_h3_plugin_reject_flavor_aware(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_plugin_reject_flavor_aware_with_recv_halt(
@@ -11780,14 +11826,14 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
     flavor: HttpFlavor,
     grpc_web_response_content_type: Option<&str>,
     http_status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if terminal_gateway_deadline {
         let mut deadline_headers = headers.clone();
-        let mut deadline_body = body.to_vec();
+        let mut deadline_body = body;
         let deadline_status = replace_buffered_h3_response_with_grpc_deadline(
             ctx,
             grpc_web_response_content_type,
@@ -11805,7 +11851,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                 send_h3_finalized_reject_response_with_recv_halt(
                     stream,
                     StatusCode::OK,
-                    &deadline_body,
+                    deadline_body,
                     &deadline_headers,
                     false,
                 )
@@ -11815,7 +11861,7 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
                     stream,
                     flavor,
                     deadline_status,
-                    &deadline_body,
+                    deadline_body,
                     &deadline_headers,
                     false,
                 )
@@ -12132,10 +12178,11 @@ async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
                 initial_response_header_policy_plugins,
                 None,
             );
+            let translated_body = Bytes::from(translated.body);
             send_h3_finalized_reject_response_with_recv_halt(
                 stream,
                 StatusCode::OK,
-                &translated.body,
+                translated_body,
                 &translated.headers,
                 halt_recv,
             )
@@ -12163,7 +12210,7 @@ async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
             send_h3_finalized_reject_response_with_recv_halt(
                 stream,
                 http_status,
-                http_body.as_bytes(),
+                Bytes::copy_from_slice(http_body.as_bytes()),
                 &headers,
                 halt_recv,
             )
@@ -12199,7 +12246,7 @@ async fn send_h3_reject_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
     http_status: StatusCode,
-    http_body: &[u8],
+    http_body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_reject_flavor_aware_with_recv_halt(
@@ -12217,7 +12264,7 @@ async fn send_h3_reject_flavor_aware_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
     http_status: StatusCode,
-    http_body: &[u8],
+    http_body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
@@ -12240,7 +12287,7 @@ async fn send_h3_finalized_reject_flavor_aware(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
     http_status: StatusCode,
-    http_body: &[u8],
+    http_body: Bytes,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_reject_flavor_aware_with_header_state(
@@ -12259,7 +12306,7 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     flavor: HttpFlavor,
     http_status: StatusCode,
-    http_body: &[u8],
+    http_body: Bytes,
     headers: &HashMap<String, String>,
     headers_finalized: bool,
     halt_recv: bool,
@@ -12319,8 +12366,10 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     strip_client_response_hop_by_hop_headers(&mut sanitized_headers);
     let headers = &sanitized_headers;
 
-    // Derive signalling from the sanitized response metadata.
-    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, http_body, headers);
+    // Derive signalling from the sanitized response metadata. Inspection only —
+    // the trailers-only gRPC reject drops the body, so this borrow never forces
+    // the owned `Bytes` payload to be copied.
+    let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, &http_body, headers);
 
     // Build a trailers-only gRPC error that preserves any custom headers
     // the plugin attached (e.g., rate-limit metadata), while forcing the
@@ -12405,7 +12454,7 @@ pub(crate) fn replace_buffered_h3_response_with_grpc_deadline(
     ctx: &mut RequestContext,
     grpc_web_response_content_type: Option<&str>,
     headers: &mut HashMap<String, String>,
-    body: &mut Vec<u8>,
+    body: &mut Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> StatusCode {
     crate::proxy::replace_buffered_grpc_response_with_deadline(
@@ -12558,6 +12607,7 @@ fn record_h3_flavor_aware_reject(state: &ProxyState, flavor: HttpFlavor, http_st
 #[cfg(test)]
 mod h3_request_body_timeout_tests {
     use crate::proxy::grpc_proxy::GATEWAY_DEADLINE_EXCEEDED_MESSAGE;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn completed_pre_policy_upload_returns_without_timeout() {
@@ -12613,7 +12663,7 @@ mod h3_request_body_timeout_tests {
             ("content-type".to_string(), "application/json".to_string()),
             ("x-correlation-id".to_string(), "request-123".to_string()),
         ]);
-        let mut body = b"backend response".to_vec();
+        let mut body = Bytes::from_static(b"backend response");
         ctx.mark_gateway_deadline_response_selected();
         ctx.begin_rejection_deadline_response_header_provenance(&headers);
 
@@ -12858,7 +12908,7 @@ mod h3_streaming_after_proxy_tests {
         .expect("after_proxy rejection should be surfaced");
 
         assert_eq!(reject.status_code, 451);
-        assert_eq!(reject.body, b"blocked by response policy");
+        assert_eq!(&*reject.body, b"blocked by response policy");
         assert_eq!(
             reject.headers.get("x-policy").map(String::as_str),
             Some("blocked")

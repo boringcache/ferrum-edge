@@ -866,6 +866,12 @@ fn run_gateway(cli: &cli::Cli) -> i32 {
         env_config.pool_shard_amount,
         env_config.log_delivery_max_tasks,
     );
+    // Process-wide retained-byte ceiling for observability sink instances.
+    // Installed before mode dispatch so the first plugin activation already
+    // reserves against the operator-configured total.
+    plugins::utils::byte_budget::initialize_process_retained_byte_ceiling(
+        env_config.log_delivery_max_retained_bytes,
+    );
     let observability_delivery_timeout =
         std::time::Duration::from_millis(env_config.log_shutdown_drain_timeout_ms);
     let gateway_exit_code: i32 = rt.block_on(async {

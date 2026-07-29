@@ -310,6 +310,17 @@ pub fn is_sensitive_metadata_key(key: &str) -> bool {
     is_sensitive_metadata_key_with_extras(key, extra_redacted_keys())
 }
 
+/// Returns true when the key matches an operator-supplied sensitive substring.
+///
+/// This narrower entry point lets credential-admission boundaries honor
+/// `FERRUM_LOG_REDACT_METADATA_KEYS` without inheriting the built-in log
+/// redactor's deliberately broad substring rules.
+pub(crate) fn is_operator_sensitive_metadata_key(key: &str) -> bool {
+    extra_redacted_keys()
+        .iter()
+        .any(|needle| contains_ascii_case_insensitive(key, needle))
+}
+
 /// Serde `serialize_with` adapter for `HashMap<String, String>` metadata
 /// fields on log summary structs. Replaces the value with
 /// `REDACTED_PLACEHOLDER` for any key that matches a sensitive substring.
