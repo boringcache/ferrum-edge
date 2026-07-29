@@ -5624,10 +5624,341 @@ async fn aggregate_batch_oversized_member_is_rejected_without_dropping_valid_sib
         .as_array()
         .expect("per-item admission must preserve valid siblings");
     assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["id"], "too-large");
+    // The oversized member is refused on its raw wire slice, before it is
+    // materialized, so its id is never read and never echoed.
+    assert_eq!(responses[0]["id"], Value::Null);
     assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(
+        !body.to_string().contains("too-large"),
+        "an oversized member's id must not be reflected: {body}"
+    );
     assert_eq!(responses[1]["id"], "valid");
     assert!(responses[1].get("result").is_some());
+}
+
+// --- Raw wire-byte per-member admission -----------------------------------
+//
+// `validation.max_batch_item_bytes` is a *wire*-byte cap: it is measured on the
+// member's exact raw JSON slice before that member is deserialized. The helpers
+// below build members whose raw representation is far larger than the
+// normalized reserialization a parse-then-measure implementation would compare
+// against, so each test fails closed only if the cap really is a wire cap.
+
+/// Exact batch framing: `[` + members joined by a single `,` + `]`. No
+/// whitespace or padding between members, so a byte-exact per-member assertion
+/// can never be satisfied (or defeated) by array separators.
+fn raw_batch(members: &[&str]) -> Vec<u8> {
+    format!("[{}]", members.join(",")).into_bytes()
+}
+
+fn canonical_member(id: &str) -> String {
+    serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "ping",
+        "params": {}
+    }))
+    .unwrap()
+}
+
+/// A `ping` member whose only excess is internal whitespace after the opening
+/// brace. Normalized reserialization drops every one of those bytes.
+fn whitespace_inflated_member(id: &str, padding: usize) -> String {
+    let canonical = canonical_member(id);
+    format!("{{{}{}", " ".repeat(padding), &canonical[1..])
+}
+
+/// A `ping` member padded with `\/` escapes: two wire bytes each that
+/// serde_json renders back as a single `/`.
+fn escape_inflated_member(id: &str, escapes: usize) -> String {
+    let mut member = String::new();
+    member.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"");
+    member.push_str(id);
+    member.push_str("\",\"method\":\"ping\",\"params\":{\"p\":\"");
+    member.push_str(&"\\/".repeat(escapes));
+    member.push_str("\"}}");
+    member
+}
+
+/// A `ping` member carrying an attacker-sized id.
+fn oversized_id_member(id_bytes: usize) -> String {
+    let mut member = String::new();
+    member.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",");
+    member.push_str("\"id\":\"");
+    member.push_str(&"A".repeat(id_bytes));
+    member.push_str("\"}");
+    member
+}
+
+/// Bytes a parse-then-measure implementation would have compared against.
+fn normalized_len(raw: &str) -> usize {
+    let value: Value = serde_json::from_str(raw).unwrap();
+    serde_json::to_vec(&value).unwrap().len()
+}
+
+fn batch_validation(item_bytes: usize) -> Value {
+    json!({
+        "max_batch_items": 8,
+        "max_batch_bytes": 65536,
+        "max_batch_item_bytes": item_bytes
+    })
+}
+
+const NOTIFICATION_MEMBER: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+
+#[tokio::test]
+async fn aggregate_batch_item_cap_counts_raw_whitespace_bytes() {
+    let oversized = whitespace_inflated_member("padded", 512);
+    let sibling = canonical_member("valid");
+    let item_cap = normalized_len(&oversized) + 32;
+    assert!(
+        oversized.len() > item_cap,
+        "the raw member must exceed the cap on the wire"
+    );
+    assert!(
+        normalized_len(&oversized) <= item_cap,
+        "a normalized reserialization of the same member must fit under the cap"
+    );
+
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[
+        oversized.as_str(),
+        NOTIFICATION_MEMBER,
+        sibling.as_str(),
+    ]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body
+        .as_array()
+        .expect("per-item admission must preserve valid siblings");
+    assert_eq!(
+        responses.len(),
+        2,
+        "the notification member must not gain a response: {body}"
+    );
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(
+        !body.to_string().contains("padded"),
+        "an unadmitted member's id must not be reflected: {body}"
+    );
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(responses[1].get("result").is_some());
+}
+
+#[tokio::test]
+async fn transparent_batch_item_cap_counts_raw_whitespace_bytes() {
+    let oversized = whitespace_inflated_member("padded", 512);
+    let sibling = canonical_member("valid");
+    let item_cap = normalized_len(&oversized) + 32;
+    assert!(oversized.len() > item_cap);
+    assert!(normalized_len(&oversized) <= item_cap);
+
+    let mut config = transparent_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[
+        oversized.as_str(),
+        NOTIFICATION_MEMBER,
+        sibling.as_str(),
+    ]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body
+        .as_array()
+        .expect("an inadmissible member must fail the batch closed");
+    assert_eq!(
+        responses.len(),
+        2,
+        "the notification member must not gain a response: {body}"
+    );
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(!body.to_string().contains("padded"));
+    assert_eq!(responses[1]["id"], "valid");
+    assert_eq!(responses[1]["error"]["code"], -32600);
+    assert!(
+        ctx.route_override_backend_host.is_none(),
+        "an inadmissible member must not be forwarded upstream"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_batch_item_cap_counts_raw_escape_bytes() {
+    let oversized = escape_inflated_member("escaped", 400);
+    let sibling = canonical_member("valid");
+    let item_cap = normalized_len(&oversized) + 32;
+    assert!(
+        oversized.len() > item_cap,
+        "escape sequences must be measured as written on the wire"
+    );
+    assert!(normalized_len(&oversized) <= item_cap);
+
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[oversized.as_str(), sibling.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("valid siblings must survive");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(!body.to_string().contains("escaped"));
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(responses[1].get("result").is_some());
+}
+
+#[tokio::test]
+async fn transparent_batch_item_cap_counts_raw_escape_bytes() {
+    let oversized = escape_inflated_member("escaped", 400);
+    let sibling = canonical_member("valid");
+    let item_cap = normalized_len(&oversized) + 32;
+    assert!(oversized.len() > item_cap);
+    assert!(normalized_len(&oversized) <= item_cap);
+
+    let mut config = transparent_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[oversized.as_str(), sibling.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("per-item error array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(!body.to_string().contains("escaped"));
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[tokio::test]
+async fn aggregate_batch_oversized_member_id_is_never_echoed() {
+    let oversized = oversized_id_member(4096);
+    let sibling = canonical_member("valid");
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(256);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[oversized.as_str(), sibling.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let rendered = body.to_string();
+    let responses = body.as_array().expect("valid siblings must survive");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(
+        !rendered.contains("AAAA"),
+        "an oversized id must never be materialized into the response"
+    );
+    assert!(
+        rendered.len() < oversized.len(),
+        "the bounded per-item error must be smaller than the refused member"
+    );
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(responses[1].get("result").is_some());
+}
+
+#[tokio::test]
+async fn transparent_batch_oversized_member_id_is_never_echoed() {
+    let oversized = oversized_id_member(4096);
+    let sibling = canonical_member("valid");
+    let mut config = transparent_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(256);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let batch = raw_batch(&[oversized.as_str(), sibling.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let rendered = body.to_string();
+    let responses = body.as_array().expect("per-item error array");
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(!rendered.contains("AAAA"));
+    assert_eq!(responses[1]["id"], "valid");
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[tokio::test]
+async fn aggregate_batch_item_cap_boundary_is_exact_on_raw_bytes() {
+    let member = canonical_member("boundary");
+    // Single-member batches: the only framing bytes are the outer brackets, so
+    // the assertion cannot be blurred by separators or inter-member padding.
+    let item_cap = member.len();
+
+    let mut config = aggregate_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let batch = raw_batch(&[member.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("at-limit member is admitted");
+    assert_eq!(responses[0]["id"], "boundary");
+    assert!(
+        responses[0].get("result").is_some(),
+        "a member exactly at max_batch_item_bytes must be admitted: {body}"
+    );
+
+    // Exactly one more raw byte, with no other change.
+    let over_limit = whitespace_inflated_member("boundary", 1);
+    assert_eq!(over_limit.len(), item_cap + 1);
+    let batch = raw_batch(&[over_limit.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("per-item error array");
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn transparent_batch_item_cap_boundary_is_exact_on_raw_bytes() {
+    let member = canonical_member("boundary");
+    let item_cap = member.len();
+
+    let mut config = transparent_config("http://github-mcp.example:8080/mcp");
+    config["validation"] = batch_validation(item_cap);
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+
+    let batch = raw_batch(&[member.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a member exactly at max_batch_item_bytes must be forwarded: {result:?}"
+    );
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("github-mcp.example")
+    );
+
+    let over_limit = whitespace_inflated_member("boundary", 1);
+    assert_eq!(over_limit.len(), item_cap + 1);
+    let batch = raw_batch(&[over_limit.as_str()]);
+    let (mut ctx, mut headers) = mcp_ctx_raw(batch);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("per-item error array");
+    assert_eq!(responses[0]["id"], Value::Null);
+    assert_eq!(responses[0]["error"]["code"], -32600);
+    assert!(ctx.route_override_backend_host.is_none());
 }
 
 #[tokio::test]

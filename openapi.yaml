@@ -22295,7 +22295,7 @@ components:
               format: int64
               minimum: 1
               default: 262144
-              description: "Maximum serialized bytes admitted for one JSON-RPC batch member. Oversized members yield a per-item Invalid Request while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
+              description: "Maximum raw wire bytes admitted for one JSON-RPC batch member. Measured on the member's exact raw JSON slice as received (internal whitespace and escape sequences included, array separators and surrounding inter-member whitespace excluded), before the member is deserialized, so a member cannot shrink under the cap by normalizing. Oversized members yield a bounded per-item Invalid Request with id null (their id is never materialized or reflected) while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
             max_batch_response_bytes:
               type: integer
               format: int64

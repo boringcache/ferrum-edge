@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use regex::Regex;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -318,6 +319,22 @@ struct McpEnvelope {
     #[allow(dead_code)] // Kept in the parsed envelope shape for error-response classification.
     error: Option<Value>,
     message_kind: McpMessageKind,
+}
+
+/// One JSON-RPC batch array member after raw-wire admission.
+///
+/// `validation.max_batch_item_bytes` is a *wire*-byte cap: it is enforced on
+/// the member's exact raw JSON slice (internal whitespace and escape sequences
+/// included) before that member is deserialized into a `Value`. A member that
+/// fails admission is never materialized and its id is never read, so an
+/// oversized attacker-controlled id can be neither cloned nor reflected.
+enum BatchMember {
+    /// The raw slice was within the per-member cap and materialized cleanly.
+    Admitted(Value),
+    /// The raw slice exceeded the per-member cap (or could not be
+    /// materialized). Yields a bounded `id: null` Invalid Request at this
+    /// member's input position.
+    Rejected,
 }
 
 #[derive(Clone)]
@@ -3257,15 +3274,11 @@ impl McpGateway {
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
-        batch: &[Value],
-        body_len: usize,
+        batch: &[BatchMember],
     ) -> PluginResult {
-        // JSON-RPC 2.0: an empty array is an invalid batch and yields a single
-        // Response object (not an array). Only whole-body unsafe caps reject the
-        // entire batch here; per-member shape/size defects become per-item errors.
-        if let Err(response) = self.admit_jsonrpc_batch(batch, body_len) {
-            return response;
-        }
+        // Whole-body byte, empty-array, and member-count admission already ran
+        // on the raw wire bytes in `admit_raw_jsonrpc_batch`; per-member
+        // shape/size defects are per-item errors from here on.
         if self.observability.emit_metadata {
             ctx.metadata
                 .insert("mcp.batch".to_string(), "true".to_string());
@@ -3291,7 +3304,7 @@ impl McpGateway {
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
-        batch: &[Value],
+        batch: &[BatchMember],
     ) -> PluginResult {
         let mut envelopes = Vec::with_capacity(batch.len());
         let mut invalid = false;
@@ -3415,7 +3428,7 @@ impl McpGateway {
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
-        batch: &[Value],
+        batch: &[BatchMember],
     ) -> PluginResult {
         let mut responses = Vec::new();
         // Exact serialized size of the response array accumulated so far:
@@ -3652,11 +3665,20 @@ impl McpGateway {
         response
     }
 
-    fn admit_jsonrpc_batch(&self, batch: &[Value], body_len: usize) -> Result<(), PluginResult> {
-        if batch.is_empty() {
-            return Err(json_rpc_error(None, -32600, "Invalid Request", None));
-        }
-        if body_len > self.validation.max_batch_bytes {
+    /// Raw admission for an array-shaped request body.
+    ///
+    /// The whole-body cap runs on the raw bytes first, then only the array
+    /// framing is parsed: every member is retained as a borrowed
+    /// `&RawValue` — its exact JSON wire slice — so the member-count gate and
+    /// `validation.max_batch_item_bytes` both run before any member funds a
+    /// `Value` tree. `RawValue::get()` excludes the array separators and the
+    /// inter-member whitespace surrounding the member, and includes the
+    /// member's internal whitespace and escape sequences verbatim, so a member
+    /// that is large on the wire cannot shrink under the cap by normalizing.
+    ///
+    /// Malformed array-shaped bodies and malformed members both fail closed.
+    fn admit_raw_jsonrpc_batch(&self, body: &[u8]) -> Result<Vec<BatchMember>, PluginResult> {
+        if body.len() > self.validation.max_batch_bytes {
             return Err(json_rpc_error(
                 None,
                 -32600,
@@ -3664,7 +3686,39 @@ impl McpGateway {
                 Some("JSON-RPC batch exceeded max_batch_bytes".to_string()),
             ));
         }
-        if batch.len() > self.validation.max_batch_items {
+        let raw_members: Vec<&RawValue> = match serde_json::from_slice(body) {
+            Ok(members) => members,
+            Err(_) => {
+                return Err(json_rpc_error(
+                    None,
+                    -32600,
+                    "Invalid MCP JSON-RPC request",
+                    None,
+                ));
+            }
+        };
+        self.admit_jsonrpc_batch(raw_members.len())?;
+        Ok(raw_members
+            .into_iter()
+            .map(|member| {
+                let raw = member.get();
+                if raw.len() > self.validation.max_batch_item_bytes {
+                    // Deliberately do not parse or read this member's id.
+                    return BatchMember::Rejected;
+                }
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(value) => BatchMember::Admitted(value),
+                    Err(_) => BatchMember::Rejected,
+                }
+            })
+            .collect())
+    }
+
+    fn admit_jsonrpc_batch(&self, batch_len: usize) -> Result<(), PluginResult> {
+        if batch_len == 0 {
+            return Err(json_rpc_error(None, -32600, "Invalid Request", None));
+        }
+        if batch_len > self.validation.max_batch_items {
             return Err(json_rpc_error(
                 None,
                 -32600,
@@ -3675,11 +3729,20 @@ impl McpGateway {
         Ok(())
     }
 
-    /// Per-member admission used by both transparent and aggregate batch paths.
-    /// Non-object / nested-array / oversized members become bounded Invalid
-    /// Request values (`id: null` when no member id is available).
-    fn validate_batch_member(&self, item: &Value) -> Result<McpEnvelope, Value> {
-        let member_id = item.get("id").cloned();
+    /// Per-member validation used by both transparent and aggregate batch
+    /// paths, after raw-wire admission. Members refused by the raw per-member
+    /// wire cap, and non-object / nested-array members, become bounded
+    /// `id: null` Invalid Request values; other malformed members reflect only
+    /// their already-materialized id.
+    fn validate_batch_member(&self, member: &BatchMember) -> Result<McpEnvelope, Value> {
+        let BatchMember::Admitted(item) = member else {
+            // The raw slice was never materialized, so there is no id to echo.
+            return Err(json_rpc_error_value(
+                None,
+                -32600,
+                "Invalid MCP JSON-RPC request",
+            ));
+        };
         if !item.is_object() {
             return Err(json_rpc_error_value(
                 None,
@@ -3687,23 +3750,7 @@ impl McpGateway {
                 "Invalid MCP JSON-RPC request",
             ));
         }
-        let item_bytes = match serde_json::to_vec(item) {
-            Ok(bytes) => bytes.len(),
-            Err(_) => {
-                return Err(json_rpc_error_value(
-                    member_id,
-                    -32600,
-                    "Invalid MCP JSON-RPC request",
-                ));
-            }
-        };
-        if item_bytes > self.validation.max_batch_item_bytes {
-            return Err(json_rpc_error_value(
-                member_id,
-                -32600,
-                "Invalid MCP JSON-RPC request",
-            ));
-        }
+        let member_id = item.get("id").cloned();
         parse_mcp_envelope_value(item)
             .map_err(|_| json_rpc_error_value(member_id, -32600, "Invalid MCP JSON-RPC request"))
     }
@@ -4310,27 +4357,21 @@ impl Plugin for McpGateway {
         // Enforce the advertised aggregate batch byte cap on the raw body,
         // before serde_json allocates a `Value` tree for it. A body whose first
         // non-whitespace byte is `[` is array-shaped, so an oversized batch is
-        // refused without paying parse cost. Array-shaped bodies that are
-        // malformed still fail closed on the parse below, and singleton bodies
-        // are untouched by this cap.
-        if Self::body_is_jsonrpc_batch_shaped(body) && body.len() > self.validation.max_batch_bytes
-        {
-            return json_rpc_error(
-                None,
-                -32600,
-                "Invalid Request",
-                Some("JSON-RPC batch exceeded max_batch_bytes".to_string()),
-            );
+        // refused without paying parse cost, and the per-member cap is then
+        // enforced on each member's raw wire slice before that member is
+        // materialized. Array-shaped bodies that are malformed still fail
+        // closed, and singleton bodies are untouched by these caps.
+        if Self::body_is_jsonrpc_batch_shaped(body) {
+            let batch = match self.admit_raw_jsonrpc_batch(body) {
+                Ok(batch) => batch,
+                Err(response) => return response,
+            };
+            return self.handle_jsonrpc_batch(ctx, headers, &batch).await;
         }
         let parsed: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
         };
-        if let Some(batch) = parsed.as_array() {
-            return self
-                .handle_jsonrpc_batch(ctx, headers, batch, body.len())
-                .await;
-        }
         let envelope = match parse_mcp_envelope_value(&parsed) {
             Ok(envelope) => envelope,
             Err(_) => return json_rpc_error(None, -32600, "Invalid MCP JSON-RPC request", None),
