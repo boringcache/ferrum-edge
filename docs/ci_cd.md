@@ -1094,8 +1094,10 @@ shapes and nothing else:
   and every other job's surfaces are unaffected. Every command, action pin,
   toolchain pin (`nightly-2025-07-01`), tool version (`cargo-fuzz 0.13.1`),
   target name, and libFuzzer bound (`-runs`, `-max_total_time`, `-max_len`,
-  `-timeout`, `-rss_limit_mb`) is part of the contract. All commands are inline,
-  so no repository-supplied script executes in this lane.
+  `-timeout`, `-rss_limit_mb`) is part of the contract. All automation commands
+  are inline and cannot be redirected through a repository-supplied script;
+  the read-only job necessarily compiles and executes pull-request-authored Rust
+  tests and fuzz targets.
 - `FUZZ_WORKFLOW` — the whole of `.github/workflows/fuzz.yml`. A repository
   that has not adopted it may omit it; once the trusted base carries it, a pull
   request may neither remove nor alter it. Whole-file

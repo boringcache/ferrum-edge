@@ -1652,8 +1652,9 @@ LIVE_SUITE_JOB_BINDING = {
 # Consequences of freezing the whole job rather than a predicate about it:
 #   * every command, action pin, toolchain pin, tool version, target list, and
 #     libFuzzer bound is part of the contract;
-#   * the job cannot be redirected at a repository-supplied script, so no
-#     pull-request-authored executable code runs in this lane;
+#   * the command surface cannot be redirected at a repository-supplied
+#     automation script; the explicit purpose of the read-only job is still to
+#     compile and execute pull-request-authored Rust tests and fuzz targets;
 #   * a repository that has not adopted the job may omit it, but once the
 #     trusted base carries it a pull request cannot remove it.
 CI_FUZZ_SMOKE_JOB_NAME = "fuzz-smoke"
