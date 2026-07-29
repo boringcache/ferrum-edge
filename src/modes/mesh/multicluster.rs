@@ -1426,9 +1426,18 @@ impl RemoteDiscoveryConfig {
 /// shared-secret remote-discovery path (`FERRUM_CP_DP_GRPC_JWT_ISSUER`).
 /// Returns an empty map for `None`/empty input; returns an error string on
 /// malformed JSON or an empty secret value.
+///
+/// `key_id` is `FERRUM_CP_DP_GRPC_JWT_KEY_ID`, stamped as the JWS `kid` on every
+/// resolved credential exactly as the shared-secret fallback path does
+/// (advisory GHSA-3f2j-wwqw-grmg). Without it a per-remote credential — the
+/// *recommended*, non-deprecated cross-cluster posture — would mint `kid`-less
+/// tokens that a peer control plane running a trust bundle refuses outright
+/// (`missing_key_id`), leaving only the deprecated shared-secret path able to
+/// reach such a peer.
 pub(crate) fn parse_remote_discovery_credentials(
     raw: Option<&str>,
     issuer: &str,
+    key_id: Option<&str>,
 ) -> Result<std::collections::HashMap<String, GrpcJwtSecret>, String> {
     let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(std::collections::HashMap::new());
@@ -1468,7 +1477,8 @@ pub(crate) fn parse_remote_discovery_credentials(
         }
         out.insert(
             reference,
-            GrpcJwtSecret::with_issuer(secret, issuer.to_string()),
+            GrpcJwtSecret::with_issuer(secret, issuer.to_string())
+                .with_key_id(key_id.map(str::to_string)),
         );
     }
     Ok(out)
@@ -3457,7 +3467,8 @@ mod tests {
         let secret_b = "b".repeat(40);
         let secret_c = "c".repeat(40);
         let raw = format!(r#"{{"b":"{secret_b}","c":"{secret_c}"}}"#);
-        let parsed = parse_remote_discovery_credentials(Some(&raw), issuer)
+        let key_id = "cluster-local";
+        let parsed = parse_remote_discovery_credentials(Some(&raw), issuer, Some(key_id))
             .expect("valid credential map parses");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed.get("b").map(|s| s.as_str()), Some(secret_b.as_str()));
@@ -3465,23 +3476,34 @@ mod tests {
         // Each resolved secret carries the supplied (shared CP-DP) issuer so the
         // remote CP accepts a token minted with it.
         assert_eq!(parsed.get("b").map(|s| s.issuer()), Some(issuer));
+        // ...and the JWS `kid`, so a peer CP running a namespace-bound trust
+        // bundle can select this cluster's credential. Without it every
+        // per-remote credential mints a `kid`-less token such a peer refuses
+        // (advisory GHSA-3f2j-wwqw-grmg).
+        assert_eq!(parsed.get("b").and_then(|s| s.key_id()), Some(key_id));
+        assert_eq!(parsed.get("c").and_then(|s| s.key_id()), Some(key_id));
+        // An unset FERRUM_CP_DP_GRPC_JWT_KEY_ID stays unset rather than
+        // becoming an empty `kid` no bundle can match.
+        let unstamped = parse_remote_discovery_credentials(Some(&raw), issuer, None)
+            .expect("valid credential map parses without a key id");
+        assert_eq!(unstamped.get("b").and_then(|s| s.key_id()), None);
     }
 
     #[test]
     fn parse_remote_discovery_credentials_none_and_empty_are_empty() {
         let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
         assert!(
-            parse_remote_discovery_credentials(None, issuer)
+            parse_remote_discovery_credentials(None, issuer, None)
                 .expect("None is ok")
                 .is_empty()
         );
         assert!(
-            parse_remote_discovery_credentials(Some(""), issuer)
+            parse_remote_discovery_credentials(Some(""), issuer, None)
                 .expect("empty is ok")
                 .is_empty()
         );
         assert!(
-            parse_remote_discovery_credentials(Some("  "), issuer)
+            parse_remote_discovery_credentials(Some("  "), issuer, None)
                 .expect("whitespace is ok")
                 .is_empty()
         );
@@ -3491,21 +3513,22 @@ mod tests {
     fn parse_remote_discovery_credentials_rejects_malformed_and_empty_secret() {
         let issuer = crate::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
         assert!(
-            parse_remote_discovery_credentials(Some("not json"), issuer).is_err(),
+            parse_remote_discovery_credentials(Some("not json"), issuer, None).is_err(),
             "malformed JSON is rejected"
         );
         assert!(
-            parse_remote_discovery_credentials(Some(r#"{"b":""}"#), issuer).is_err(),
+            parse_remote_discovery_credentials(Some(r#"{"b":""}"#), issuer, None).is_err(),
             "empty secret value is rejected"
         );
         assert!(
-            parse_remote_discovery_credentials(Some(r#"{"b":"short"}"#), issuer).is_err(),
+            parse_remote_discovery_credentials(Some(r#"{"b":"short"}"#), issuer, None).is_err(),
             "a secret below MIN_JWT_SECRET_LENGTH is rejected"
         );
         assert!(
             parse_remote_discovery_credentials(
                 Some(r#"{"":"a-32-char-secret-aaaaaaaaaaaaaaaaa"}"#),
-                issuer
+                issuer,
+                None
             )
             .is_err(),
             "empty credential reference is rejected"

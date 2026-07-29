@@ -10528,9 +10528,14 @@ async fn arm_mesh_runtime_startup(
                 );
             }
         }
+        // The `kid` rides on per-remote credentials exactly as it does on the
+        // shared-secret fallback above, so a peer CP running a namespace-bound
+        // trust bundle can select this cluster's credential either way
+        // (advisory GHSA-3f2j-wwqw-grmg).
         let remote_discovery_credentials = match multicluster::parse_remote_discovery_credentials(
             env_config.mesh_remote_discovery_credentials.as_deref(),
             &env_config.cp_dp_grpc_jwt_issuer,
+            env_config.cp_dp_grpc_jwt_key_id.as_deref(),
         ) {
             Ok(map) => std::sync::Arc::new(map),
             Err(err) => {

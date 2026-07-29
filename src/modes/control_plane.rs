@@ -2009,23 +2009,23 @@ pub async fn run(
                 }
             }
             // The legacy secret stays optional here: with a trust bundle
-            // configured it is no longer an authorization input. It is still
-            // read when present so cross-cluster mesh remote discovery — which
-            // mints its own audience-bound tokens — keeps working.
-            // Cross-cluster remote discovery still *mints* with this secret. An
-            // absent one leaves the minting key empty, which produces tokens no
-            // peer will accept — surface that as a warning rather than letting
-            // remote discovery fail opaquely at the peer.
-            let minting_secret = env_config.cp_dp_grpc_jwt_secret.clone().unwrap_or_default();
-            if minting_secret.is_empty() && env_config.mesh_cluster_audience.is_some() {
-                warn!(
-                    "FERRUM_MESH_CLUSTER_AUDIENCE is set but FERRUM_CP_DP_GRPC_JWT_SECRET is \
-                     absent. Cross-cluster mesh remote discovery mints its audience-bound tokens \
-                     with that secret, so peer clusters will reject them. Inbound authorization \
-                     is unaffected: it is served by FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH."
-                );
-            }
-            (minting_secret, CpDpVerifier::TrustBundle(bundle))
+            // configured it is no longer an authorization input, and CP mode
+            // mints nothing with it. Every server builder below is seeded with
+            // it purely so the pre-`.verifier(..)` shape stays uniform; the
+            // seeded `SharedSecret` arm is replaced before any request is
+            // served. An absent secret therefore leaves that seed empty, which
+            // `CpDpVerifier::with_decoding_key` refuses outright rather than
+            // verifying against an empty HS256 key.
+            //
+            // In particular this is NOT the cross-cluster remote-discovery
+            // minting key. That minting happens on a mesh-mode node
+            // (`modes::mesh` → `multicluster::fetch_remote_slice`).
+            // `FERRUM_MESH_CLUSTER_AUDIENCE` on a control plane is the
+            // *receiving* side's identity — it selects the audience policy this
+            // CP requires of inbound remote-discovery subscriptions, which the
+            // trust bundle verifies on its own. See the log below.
+            let seed_secret = env_config.cp_dp_grpc_jwt_secret.clone().unwrap_or_default();
+            (seed_secret, CpDpVerifier::TrustBundle(bundle))
         }
         None => {
             let secret = match env_config.cp_dp_grpc_jwt_secret.clone() {

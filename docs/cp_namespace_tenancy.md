@@ -272,16 +272,41 @@ Two client-side options, both applying equally to DP ConfigSync, native
   points at a token minted by a trusted issuer. The node presents it and holds
   no signing key, so it cannot mint an authorization for any namespace,
   including its own. The file is re-read on every connection attempt, so a
-  short-lived projected token rotates without a restart. The issuer sets `ns`,
-  `iss`, `exp`, and — for native `MeshSubscribe` — the local-mesh audience
-  `ferrum-mesh-subscribe:local`.
+  short-lived rotated token needs no restart.
+
+  The issuer — not the node — decides what the token asserts, so it must mint
+  to Ferrum's CP/DP token contract exactly. The CP requires:
+
+  | Claim | Requirement |
+  |---|---|
+  | `kid` (JWS header) | the trust-bundle credential to verify under; required on a trust-bundle CP |
+  | `iss` | exactly `FERRUM_CP_DP_GRPC_JWT_ISSUER` (default `ferrum-edge-cp-dp`) |
+  | `sub` | required (present; the node id by convention) |
+  | `iat` | required |
+  | `exp` | required and unexpired |
+  | `ns` | required by `Set`/`All` scope and by `FERRUM_CP_REQUIRE_NAMESPACE_CLAIM`; narrows the credential's allow-list |
+  | `aud` | **must be absent** on DP `ConfigSync` and xDS ADS; **must be exactly `ferrum-mesh-subscribe:local`** on native `MeshSubscribe` |
+
+  The `aud` rule is the easy one to get wrong, and it is enforced strictly:
+  `ConfigSync`/ADS run `ReservedForbidden`, so a token carrying *any* audience
+  is refused. A raw Kubernetes projected ServiceAccount token is therefore
+  **not** usable as-is — projected tokens always carry an `aud`, and they carry
+  the cluster's `iss` rather than Ferrum's. Mint a purpose-built token (a
+  short-lived one, refreshed into the file) instead. One token file also cannot
+  serve both a `ConfigSync` node and a native-mesh node, because their audience
+  requirements are mutually exclusive.
 - **Per-tenant self-mint (migration)** — the node keeps a *per-tenant* secret
   and sets `FERRUM_CP_DP_GRPC_JWT_KEY_ID` so its token names the credential the
   CP has bound to that tenant.
 
-Cross-cluster mesh remote discovery still self-mints (it needs a per-target
-audience) and therefore still requires `FERRUM_CP_DP_GRPC_JWT_SECRET`; its
-`kid` rides along so the peer CP can select the bound credential.
+Cross-cluster mesh remote discovery still self-mints, because it needs a
+per-target audience no external issuer can be asked for. It signs with either a
+per-`RemoteCluster` credential (`discovery_credential_ref` resolved against
+`FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS` — the recommended posture, since a
+credential for one cluster then cannot authenticate to another) or, failing
+that, the shared `FERRUM_CP_DP_GRPC_JWT_SECRET`. `FERRUM_CP_DP_GRPC_JWT_KEY_ID`
+rides on **both** paths, so a peer control plane running a trust bundle can
+select the credential it bound to this cluster either way.
 
 ### Rotate after upgrading
 
