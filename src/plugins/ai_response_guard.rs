@@ -2215,10 +2215,7 @@ fn collect_value(
 /// Charge the walk budget across the whole message tree without collecting
 /// string values. Used when `text_fields` already scopes which scalars are
 /// harvested, so out-of-scope clones are not paid for just to discard them.
-fn charge_message_tree(
-    message: &DynamicMessage,
-    budget: &mut GrpcWalkBudget,
-) -> Result<(), ()> {
+fn charge_message_tree(message: &DynamicMessage, budget: &mut GrpcWalkBudget) -> Result<(), ()> {
     budget.enter()?;
     for (_, value) in message.fields() {
         charge_value(value, budget)?;
