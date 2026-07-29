@@ -1690,9 +1690,8 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
         }
         let replacement_base = 1_000u64.saturating_add(generation.saturating_mul(file_count));
         for offset in 0..file_count {
-            let path = day_for_hook.join(planted_spool_name(
-                replacement_base.saturating_add(offset),
-            ));
+            let path =
+                day_for_hook.join(planted_spool_name(replacement_base.saturating_add(offset)));
             fs::write(path, vec![b'x'; file_len as usize])
                 .expect("peer writes replacement generation");
         }
@@ -1720,7 +1719,10 @@ fn quota_eviction_fails_closed_when_the_inventory_never_stabilizes() {
     // on every pass and then declined. The peer's final complete generation
     // remains, so capacity never happened to fall below the quota mid-test.
     for path in &planted {
-        assert!(!path.exists(), "the peer must replace the planted generation");
+        assert!(
+            !path.exists(),
+            "the peer must replace the planted generation"
+        );
     }
     let after = spool.scan_stats().unwrap();
     assert_eq!(after.files, file_count);
