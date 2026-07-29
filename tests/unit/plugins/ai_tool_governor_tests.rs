@@ -82,6 +82,23 @@ fn assert_no_metadata_contains(ctx: &RequestContext, needle: &str) {
     }
 }
 
+/// Assert that metadata owned by this plugin contains no raw governed value.
+///
+/// Request tests deliberately retain the proxy's `request_body` buffer in
+/// context metadata; that transport-owned copy is not emitted by the governor
+/// and must not make a governor-metadata leak assertion fail vacuously.
+fn assert_no_governor_metadata_contains(ctx: &RequestContext, needle: &str) {
+    for (key, value) in &ctx.metadata {
+        if !key.starts_with("ai_tool_governor.") {
+            continue;
+        }
+        assert!(
+            !value.contains(needle),
+            "governor metadata key {key:?} leaked {needle:?}: {value:?}"
+        );
+    }
+}
+
 /// Drive a full SSE body through an inspector, returning all forwarded bytes and
 /// whether the stream was terminated.
 async fn drive_stream(
@@ -9682,8 +9699,8 @@ async fn mcp_duplicate_tool_name_is_observed_in_dry_run() {
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_dry_run_ambiguity_observation(&ctx);
-    assert_no_metadata_contains(&ctx, "danger");
-    assert_no_metadata_contains(&ctx, "safe");
+    assert_no_governor_metadata_contains(&ctx, "danger");
+    assert_no_governor_metadata_contains(&ctx, "safe");
 }
 
 /// The rejection detail is a fixed reason that never echoes the governed body.
@@ -10407,8 +10424,8 @@ async fn ambiguous_tool_argument_string_is_observed_in_dry_run() {
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_dry_run_ambiguity_observation(&ctx);
-    assert_no_metadata_contains(&ctx, "rm -rf");
-    assert_no_metadata_contains(&ctx, "SHIBBOLETH");
+    assert_no_governor_metadata_contains(&ctx, "rm -rf");
+    assert_no_governor_metadata_contains(&ctx, "SHIBBOLETH");
 
     let enforce = make(json!({
         "mode": "enforce",
