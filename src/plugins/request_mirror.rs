@@ -148,7 +148,12 @@
 //!    max_mirrored_request_body_bytes`, or a lower ceiling.
 //!    An undeclared (chunked) body larger than the ceiling is still rejected by
 //!    the combined request-body limit — raise `max_mirrored_request_body_bytes`
-//!    when mirroring routes that accept larger streamed uploads.
+//!    when mirroring routes that accept larger streamed uploads. That combined
+//!    limit is checked against the *collected* body, and a buffered-body
+//!    normalizer (configured request decompression) runs afterwards, so an
+//!    inflated buffer can still land above the ceiling; such a request is
+//!    refused rather than truncated, and its `mirror_error` names the ceiling
+//!    instead of the aggregate budget.
 //!
 //! The permit and the byte reservation are owned values held across body
 //! buffering, dispatch, and the detached task. Every exit — client
@@ -307,6 +312,14 @@ const MIRROR_CONCURRENCY_DROP_ERROR: &str =
     "mirror request dropped because max_in_flight limit was reached";
 const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
     "mirror request dropped because max_retained_request_body_bytes budget was exhausted";
+/// Distinct from [`MIRROR_BODY_BUDGET_DROP_ERROR`]: the aggregate budget had
+/// room, but the collected body exceeded this instance's per-request ceiling.
+/// Reachable when a buffered-body normalizer (configured request decompression)
+/// inflates the stored buffer after the proxy's combined request-body limit
+/// already accepted the collected bytes. Naming the aggregate budget here would
+/// send the operator to a knob that cannot fix it.
+const MIRROR_BODY_CEILING_DROP_ERROR: &str =
+    "mirror request dropped because the collected body exceeded max_mirrored_request_body_bytes";
 const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
 const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
 
@@ -837,7 +850,10 @@ struct MirrorMetrics {
     cancellations: AtomicU64,
     /// Mirror attempts dropped at admission because `max_in_flight` was full.
     concurrency_drops: AtomicU64,
-    /// Mirror attempts dropped at admission because the byte budget was full.
+    /// Mirror attempts dropped at byte admission: either the aggregate
+    /// `max_retained_request_body_bytes` budget was full, or the collected body
+    /// exceeded the per-request `max_mirrored_request_body_bytes` ceiling. The
+    /// published `mirror_error` names which of the two refused the attempt.
     budget_drops: AtomicU64,
 }
 
@@ -2055,33 +2071,50 @@ impl Plugin for RequestMirror {
         // full-ceiling admission charge back into the budget, and refuse rather
         // than retain unbudgeted bytes if the body somehow exceeds what was
         // reserved or the plugin-local per-request ceiling.
+        //
+        // The two refusals are attributed separately. The proxy enforces the
+        // combined request-body limit on the *collected* body, but a buffered
+        // body normalizer runs after that check — configured request
+        // decompression can inflate the stored buffer past this instance's
+        // per-request ceiling. Reporting that as an exhausted aggregate budget
+        // would point the operator at `max_retained_request_body_bytes` when
+        // only `max_mirrored_request_body_bytes` can fix it.
         let body_lease = if observed_body_bytes > self.max_mirrored_request_body_bytes {
-            None
+            // Release the staged full-ceiling reservation now rather than
+            // holding it while the failure summary is published.
+            drop(prereserved_lease);
+            Err(MIRROR_BODY_CEILING_DROP_ERROR)
         } else {
             match prereserved_lease {
                 Some(mut lease) => {
                     if lease.reconcile(observed_body_bytes) {
-                        Some(lease)
+                        Ok(lease)
                     } else {
-                        None
+                        Err(MIRROR_BODY_BUDGET_DROP_ERROR)
                     }
                 }
-                None => self.body_budget.try_reserve(observed_body_bytes),
+                None => self
+                    .body_budget
+                    .try_reserve(observed_body_bytes)
+                    .ok_or(MIRROR_BODY_BUDGET_DROP_ERROR),
             }
         };
-        let Some(body_lease) = body_lease else {
-            self.metrics.bump_budget_drop();
-            warn!(
-                "request_mirror: dropping mirror request for {} {} because max_retained_request_body_bytes budget was exhausted",
-                method, mirror_url_for_log
-            );
-            drop(permit);
-            ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
-                self.plugin_config_id.clone(),
-                mirror_url_for_log,
-                MIRROR_BODY_BUDGET_DROP_ERROR,
-            )));
-            return PluginResult::Continue;
+        let body_lease = match body_lease {
+            Ok(lease) => lease,
+            Err(reason) => {
+                self.metrics.bump_budget_drop();
+                warn!(
+                    "request_mirror: dropped mirror request for {} {} after body collection: {}",
+                    method, mirror_url_for_log, reason
+                );
+                drop(permit);
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
+                    mirror_url_for_log,
+                    reason,
+                )));
+                return PluginResult::Continue;
+            }
         };
 
         let backend_timeout_ms = ctx

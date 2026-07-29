@@ -5419,3 +5419,66 @@ async fn advisory_undeclared_request_with_no_body_reconciles_the_ceiling_back_to
     .await
     .expect("the detached task must release its lease exactly once");
 }
+
+#[tokio::test]
+async fn advisory_body_inflated_past_the_ceiling_is_attributed_to_the_ceiling() {
+    // The proxy applies the combined request-body limit to the *collected*
+    // body, but a buffered-body normalizer (configured request decompression)
+    // runs afterwards and can inflate the stored buffer past this instance's
+    // per-request ceiling. That attempt must be refused rather than truncated
+    // or retained, its staged full-ceiling reservation must go back to the
+    // aggregate budget, and the published failure must name
+    // `max_mirrored_request_body_bytes` — an operator told the aggregate budget
+    // was exhausted would resize a knob that cannot fix it.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "mirror.local",
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 4,
+        "max_retained_request_body_bytes": 1024 * 1024,
+        "max_mirrored_request_body_bytes": 1024
+    }));
+
+    let mut ctx = advisory_ctx(Some(512));
+    plugin_utils::assert_continue(plugin.authorize(&mut ctx).await);
+    assert!(plugin.should_buffer_request_body(&ctx));
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        1024,
+        "admission reserves the full per-request ceiling"
+    );
+
+    // The buffered body the normalizer left behind is larger than the ceiling.
+    ctx.request_body_bytes = Some(bytes::Bytes::from(vec![b'z'; 4096]));
+    let mut headers = HashMap::new();
+    plugin_utils::assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let dropped = ctx
+        .collect_mirror_result()
+        .await
+        .expect("a refused mirror must publish an attributable result");
+    let error = dropped.mirror_error.clone().unwrap_or_default();
+    assert!(
+        error.contains("max_mirrored_request_body_bytes"),
+        "the drop must name the per-request ceiling, got {error:?}"
+    );
+    assert!(
+        !error.contains("max_retained_request_body_bytes"),
+        "the aggregate budget was never exhausted, got {error:?}"
+    );
+
+    let metrics = request_mirror_metrics_snapshot_for_test(&plugin);
+    assert_eq!(
+        metrics.dispatched, 0,
+        "a body above the ceiling must never be shadowed"
+    );
+    assert_eq!(
+        metrics.budget_drops, 1,
+        "the refusal is still a byte-admission drop"
+    );
+    assert_eq!(
+        request_mirror_retained_request_body_bytes_for_test(&plugin),
+        0,
+        "the staged ceiling reservation must be released, not leaked"
+    );
+}
