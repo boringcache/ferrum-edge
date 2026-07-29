@@ -13664,7 +13664,7 @@ components:
           description: Environment variable containing the SMTP AUTH username.
         password:
           type: string
-          description: SMTP AUTH password. Prefer `password_env`. Redacted on admin reads.
+          description: SMTP AUTH password. Prefer `password_env`. Redacted from lower-privilege plugin projections and audit records; full-admin reads remain raw by repository policy.
         password_env:
           type: string
           description: Environment variable containing the SMTP AUTH password.
