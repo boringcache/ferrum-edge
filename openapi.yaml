@@ -18974,18 +18974,25 @@ components:
             $ref: "#/components/schemas/OpenapiValidatorEncodingHeader"
           description: >
             Additional multipart part Header Objects. Present values are validated
-            against their schemas; an absent header fails only when its Header Object
-            sets required=true (the OpenAPI default is false). Only valid for
-            multipart/form-data. Must not redefine Content-Type, Content-Disposition,
-            or Content-Transfer-Encoding. Case-equivalent duplicate header names are
+            against their schemas (or against the single media type declared in a
+            Header Object `content` map after decoding under header-size limits);
+            an absent header fails only when its Header Object sets required=true
+            (the OpenAPI default is false). Only valid for multipart/form-data.
+            Must not redefine Content-Type, Content-Disposition, or
+            Content-Transfer-Encoding. Case-equivalent duplicate header names are
             rejected at construction and during API-spec extraction.
 
     OpenapiValidatorEncodingHeader:
       description: >
         Multipart Encoding Object header entry. A bare JSON Schema preserves
         Ferrum's historical required-header form. A Header Object is selected
-        by `schema` and is closed so misspelled presence controls cannot weaken
-        validation.
+        by exactly one of `schema` or `content` and is closed so misspelled
+        presence controls cannot weaken validation. Schema form accepts the
+        OAS schema-form fields (`style`/`explode`/`example`/`examples`); content
+        form accepts only the common fields plus `content`. Header-location
+        `allowEmptyValue` and `allowReserved` are rejected. The `content` form
+        requires exactly one concrete media type whose Media Type Object
+        carries `schema`.
       oneOf:
         - allOf:
             - $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
@@ -18997,6 +19004,8 @@ components:
         - type: object
           required: [schema]
           additionalProperties: false
+          not:
+            required: [content]
           properties:
             description:
               type: [string, "null"]
@@ -19005,20 +19014,64 @@ components:
               default: false
             deprecated:
               type: boolean
-            allowEmptyValue:
-              type: boolean
             style:
               type: string
               enum: [simple]
             explode:
-              type: boolean
-            allowReserved:
               type: boolean
             schema:
               $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
             example: true
             examples:
               type: object
+        - type: object
+          required: [content]
+          additionalProperties: false
+          not:
+            required: [schema]
+          properties:
+            description:
+              type: [string, "null"]
+            required:
+              type: boolean
+              default: false
+            deprecated:
+              type: boolean
+            content:
+              type: object
+              minProperties: 1
+              maxProperties: 1
+              propertyNames:
+                # Concrete type/subtype only: each side is an RFC 9110 token that
+                # is not exactly `*` (so `*/*` and `application/*` fail closed,
+                # while `*` remains allowed inside a longer token). Parameters
+                # require token names and token or quoted-string values.
+                pattern: '^(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)/(?:[!#$%&''+.^_`|~0-9A-Za-z-][!#$%&''*+.^_`|~0-9A-Za-z-]*|\*[!#$%&''*+.^_`|~0-9A-Za-z-]+)(?:[ \t]*;[ \t]*[!#$%&''*+.^_`|~0-9A-Za-z-]+=(?:[!#$%&''*+.^_`|~0-9A-Za-z-]+|"(?:[^"\\\x00-\x08\x0A-\x1F\x7F]|\\[^\x00-\x08\x0A-\x1F\x7F])*"))*[ \t]*$'
+              additionalProperties:
+                $ref: "#/components/schemas/OpenapiValidatorEncodingHeaderContentMedia"
+              description: >
+                OpenAPI Header Object content map. Exactly one concrete media
+                type is required (no `type/*` or `*/*`). The full key, including
+                any parameters, must be a valid RFC 9110 media type and HTTP
+                header value. The header value is decoded as that media type
+                under multipart header-size limits before schema validation.
+
+    OpenapiValidatorEncodingHeaderContentMedia:
+      type: object
+      required: [schema]
+      additionalProperties: false
+      not:
+        required: [example, examples]
+      description: >
+        Media Type Object inside an Encoding Header Object `content` map.
+        Encoding Objects are not valid on part headers; only schema (plus
+        mutually-exclusive optional example metadata) is accepted.
+      properties:
+        schema:
+          $ref: "#/components/schemas/OpenapiValidatorJsonSchema"
+        example: true
+        examples:
+          type: object
 
     RequestTerminationConfig:
       type: object

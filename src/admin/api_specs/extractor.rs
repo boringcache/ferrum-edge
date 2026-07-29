@@ -22,6 +22,7 @@ use crate::config::types::{
     OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES, json_depth, validate_resource_id,
 };
 use crate::config::types::{PluginAssociation, PluginConfig, PluginScope, Proxy, Upstream};
+use crate::util::media_type::is_concrete_http_media_type;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1655,19 +1656,19 @@ fn normalize_request_body_encoding(
     budget: &mut GeneratedOperationBudget,
     state: &mut ResolutionState,
 ) -> Result<Value, ExtractError> {
-    const HEADER_OBJECT_KEYS: &[&str] = &[
+    const HEADER_OBJECT_SCHEMA_KEYS: &[&str] = &[
         "description",
         "required",
         "deprecated",
-        "allowEmptyValue",
         "style",
         "explode",
-        "allowReserved",
         "schema",
-        "content",
         "example",
         "examples",
     ];
+    const HEADER_OBJECT_CONTENT_KEYS: &[&str] =
+        &["description", "required", "deprecated", "content"];
+    const HEADER_OBJECT_INVALID_KEYS: &[&str] = &["allowEmptyValue", "allowReserved"];
     let base = media_type
         .split(';')
         .next()
@@ -1902,8 +1903,53 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 };
+                let has_schema = header_object.contains_key("schema");
+                let has_content = header_object.contains_key("content");
+                if has_schema && has_content {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must not declare both schema and content"
+                        ),
+                    });
+                }
+                if !has_schema && !has_content {
+                    return Err(ExtractError::MalformedExtension {
+                        which: "requestBody.content.encoding",
+                        error: format!(
+                            "encoding['{property}'].headers['{header_name}'] must contain schema or content"
+                        ),
+                    });
+                }
+                for key in HEADER_OBJECT_INVALID_KEYS {
+                    if header_object.contains_key(*key) {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].{key} is not valid for Header Objects"
+                            ),
+                        });
+                    }
+                }
+                if has_content {
+                    for key in ["style", "explode", "example", "examples", "schema"] {
+                        if header_object.contains_key(key) {
+                            return Err(ExtractError::MalformedExtension {
+                                which: "requestBody.content.encoding",
+                                error: format!(
+                                    "encoding['{property}'].headers['{header_name}'].{key} is a schema-form Header Object field and is not valid with content"
+                                ),
+                            });
+                        }
+                    }
+                }
+                let allowed_keys = if has_content {
+                    HEADER_OBJECT_CONTENT_KEYS
+                } else {
+                    HEADER_OBJECT_SCHEMA_KEYS
+                };
                 for key in header_object.keys() {
-                    if !HEADER_OBJECT_KEYS.contains(&key.as_str()) {
+                    if !allowed_keys.contains(&key.as_str()) {
                         return Err(ExtractError::MalformedExtension {
                             which: "requestBody.content.encoding",
                             error: format!(
@@ -1923,44 +1969,16 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 }
-                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
-                    if let Some(value) = header_object.get(key)
-                        && !value.is_boolean()
-                    {
-                        return Err(ExtractError::MalformedExtension {
-                            which: "requestBody.content.encoding",
-                            error: format!(
-                                "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
-                            ),
-                        });
-                    }
-                }
-                if let Some(examples) = header_object.get("examples")
-                    && !examples.is_object()
+                if let Some(deprecated) = header_object.get("deprecated")
+                    && !deprecated.is_boolean()
                 {
                     return Err(ExtractError::MalformedExtension {
                         which: "requestBody.content.encoding",
                         error: format!(
-                            "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                            "encoding['{property}'].headers['{header_name}'].deprecated must be a boolean"
                         ),
                     });
                 }
-                if header_object.contains_key("content") {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'].content is not supported; use schema"
-                        ),
-                    });
-                }
-                let Some(header_schema) = header_object.get("schema") else {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'] must contain schema"
-                        ),
-                    });
-                };
                 if let Some(required) = header_object.get("required")
                     && !required.is_boolean()
                 {
@@ -1971,45 +1989,191 @@ fn normalize_request_body_encoding(
                         ),
                     });
                 }
-                if let Some(style) = header_object.get("style")
-                    && style.as_str() != Some("simple")
-                {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
-                        ),
-                    });
+                if !has_content {
+                    if let Some(style) = header_object.get("style")
+                        && style.as_str() != Some("simple")
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
+                            ),
+                        });
+                    }
+                    if let Some(explode) = header_object.get("explode")
+                        && !explode.is_boolean()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
+                            ),
+                        });
+                    }
+                    if let Some(examples) = header_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].examples must be an object"
+                            ),
+                        });
+                    }
                 }
-                if let Some(explode) = header_object.get("explode")
-                    && !explode.is_boolean()
-                {
-                    return Err(ExtractError::MalformedExtension {
-                        which: "requestBody.content.encoding",
-                        error: format!(
-                            "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
-                        ),
-                    });
-                }
-                let resolved_schema = resolve_refs(
-                    root,
-                    header_schema,
-                    &format!("{location}.schema"),
-                    MAX_SCHEMA_REF_DEPTH,
-                    resolver.document_base(),
-                    resolver,
-                    ResolveContext::Schema,
-                    state,
-                )?;
                 let mut normalized_header = header_object.clone();
-                normalized_header.insert(
-                    "schema".to_string(),
-                    normalize_schema_for_openapi(
+                if has_content {
+                    let content_object = header_object
+                        .get("content")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content must be an object"
+                            ),
+                        })?;
+                    if content_object.len() != 1 {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content must contain exactly one media type"
+                            ),
+                        });
+                    }
+                    let (content_media_type, media_value) = content_object.iter().next().ok_or_else(
+                        || ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content must contain exactly one media type"
+                            ),
+                        },
+                    )?;
+                    let content_media_location =
+                        format!("{location}.content['{content_media_type}']");
+                    validate_header_content_media_type_key(
+                        content_media_type,
+                        property,
+                        header_name,
+                    )?;
+                    let content_media_base = content_media_type
+                        .split(';')
+                        .next()
+                        .unwrap_or(content_media_type)
+                        .trim()
+                        .to_ascii_lowercase();
+                    if content_media_base == "multipart/form-data" {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'] is not a supported header content media type"
+                            ),
+                        });
+                    }
+                    budget.consume_key(content_media_type, &content_media_location)?;
+                    let media_object =
+                        media_value
+                            .as_object()
+                            .ok_or_else(|| ExtractError::MalformedExtension {
+                                which: "requestBody.content.encoding",
+                                error: format!(
+                                    "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'] must be a Media Type Object"
+                                ),
+                            })?;
+                    for key in media_object.keys() {
+                        if !matches!(key.as_str(), "schema" | "example" | "examples") {
+                            return Err(ExtractError::MalformedExtension {
+                                which: "requestBody.content.encoding",
+                                error: format!(
+                                    "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'] contains unsupported field '{key}'"
+                                ),
+                            });
+                        }
+                    }
+                    let Some(header_schema) = media_object.get("schema") else {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'] must contain schema"
+                            ),
+                        });
+                    };
+                    if let Some(examples) = media_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'].examples must be an object"
+                            ),
+                        });
+                    }
+                    if media_object.contains_key("example") && media_object.contains_key("examples")
+                    {
+                        return Err(ExtractError::MalformedExtension {
+                            which: "requestBody.content.encoding",
+                            error: format!(
+                                "encoding['{property}'].headers['{header_name}'].content['{content_media_type}'].example and .examples are mutually exclusive"
+                            ),
+                        });
+                    }
+                    let resolved_schema = resolve_refs(
+                        root,
+                        header_schema,
+                        &format!("{content_media_location}.schema"),
+                        MAX_SCHEMA_REF_DEPTH,
+                        resolver.document_base(),
+                        resolver,
+                        ResolveContext::Schema,
+                        state,
+                    )?;
+                    let mut normalized_media = media_object.clone();
+                    let normalized_schema = normalize_schema_for_openapi(
                         resolved_schema,
                         version,
                         SchemaDirection::Request,
-                    ),
-                );
+                    );
+                    budget.consume_map_entry(
+                        "schema",
+                        &normalized_schema,
+                        &content_media_location,
+                    )?;
+                    normalized_media.insert("schema".to_string(), normalized_schema);
+                    let mut normalized_content = Map::new();
+                    normalized_content
+                        .insert(content_media_type.clone(), Value::Object(normalized_media));
+                    normalized_header.remove("schema");
+                    normalized_header
+                        .insert("content".to_string(), Value::Object(normalized_content));
+                } else {
+                    let header_schema =
+                        header_object
+                            .get("schema")
+                            .ok_or_else(|| ExtractError::MalformedExtension {
+                                which: "requestBody.content.encoding",
+                                error: format!(
+                                    "encoding['{property}'].headers['{header_name}'] must contain schema"
+                                ),
+                            })?;
+                    let resolved_schema = resolve_refs(
+                        root,
+                        header_schema,
+                        &format!("{location}.schema"),
+                        MAX_SCHEMA_REF_DEPTH,
+                        resolver.document_base(),
+                        resolver,
+                        ResolveContext::Schema,
+                        state,
+                    )?;
+                    normalized_header.remove("content");
+                    normalized_header.insert(
+                        "schema".to_string(),
+                        normalize_schema_for_openapi(
+                            resolved_schema,
+                            version,
+                            SchemaDirection::Request,
+                        ),
+                    );
+                }
                 let normalized_header = Value::Object(normalized_header);
                 budget.consume_map_entry(header_name, &normalized_header, &location)?;
                 normalized_headers.insert(header_name.clone(), normalized_header);
@@ -2020,6 +2184,31 @@ fn normalize_request_body_encoding(
         out.insert(property.clone(), Value::Object(property_object));
     }
     Ok(Value::Object(out))
+}
+
+/// Fail closed on Header Object `content` map keys using the same concrete
+/// RFC 9110 media-type + HTTP header-value gate as plugin admission. Validates
+/// the full key (including parameter grammar) so malformed or control-bearing
+/// suffixes cannot be silently discarded after a `;` split.
+fn validate_header_content_media_type_key(
+    value: &str,
+    property: &str,
+    header_name: &str,
+) -> Result<(), ExtractError> {
+    let path = format!("encoding['{property}'].headers['{header_name}'].content['{value}']");
+    if value.parse::<http::HeaderValue>().is_err() {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("{path} must be a valid HTTP header value"),
+        });
+    }
+    if !is_concrete_http_media_type(value) {
+        return Err(ExtractError::MalformedExtension {
+            which: "requestBody.content.encoding",
+            error: format!("{path} must be a concrete media type"),
+        });
+    }
+    Ok(())
 }
 
 fn request_body_property_schema<'a>(schema: &'a Value, property: &str) -> Option<&'a Value> {
