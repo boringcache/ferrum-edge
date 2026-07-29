@@ -2009,11 +2009,11 @@ fn test_native_grpc_terminate_rejects_duplicate_json_members() {
 #[test]
 fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
     use ferrum_edge::plugins::serverless_function::test_helpers::{
-        build_native_grpc_terminate_response_error_code_test as build_code,
-        build_native_grpc_terminate_response_test as build,
         MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS_TEST as MAX_NAME,
         MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS_TEST as MAX_DETAIL,
         MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE_TEST as MAX_SAMPLE,
+        build_native_grpc_terminate_response_error_code_test as build_code,
+        build_native_grpc_terminate_response_test as build,
     };
 
     const MAX_BODY: usize = 1024 * 1024;
@@ -2024,9 +2024,8 @@ fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
 
     // Very long unknown key: fragment and complete diagnostic stay capped.
     let long_key = format!("x{}", "a".repeat(8 * 1024));
-    let long_body = format!(
-        r#"{{"grpc_status":0,"{long_key}":"BODY_ECHO_MARKER_SHOULD_NOT_APPEAR"}}"#
-    );
+    let long_body =
+        format!(r#"{{"grpc_status":0,"{long_key}":"BODY_ECHO_MARKER_SHOULD_NOT_APPEAR"}}"#);
     let detail = build(200, long_body.as_bytes(), MAX_BODY).unwrap_err();
     assert!(
         detail.chars().count() <= MAX_DETAIL,

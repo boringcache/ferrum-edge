@@ -2043,7 +2043,8 @@ fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
             c => c.to_string(),
         };
         let segment_chars = segment.chars().count();
-        if displayed.saturating_add(segment_chars) > MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS {
+        if displayed.saturating_add(segment_chars) > MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS
+        {
             if displayed < MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS {
                 out.push('…');
             }

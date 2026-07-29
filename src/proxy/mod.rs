@@ -17221,13 +17221,7 @@ pub(crate) fn normalize_reject_response_with_provenance(
     if let Some((grpc_status, grpc_message, trailers)) =
         intact_framed_unary_terminate_signal(framed_unary_provenance, status, &body, headers)
     {
-        return build_framed_grpc_unary_reject(
-            body,
-            headers,
-            trailers,
-            grpc_status,
-            grpc_message,
-        );
+        return build_framed_grpc_unary_reject(body, headers, trailers, grpc_status, grpc_message);
     }
 
     // Past this point no DATA is emitted. That is correct for exactly one
