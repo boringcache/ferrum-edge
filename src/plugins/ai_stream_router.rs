@@ -30,20 +30,21 @@
 //!   injection. Provider SSE is already OpenAI-shaped, so it streams through
 //!   unchanged (zero-overhead — no inspector).
 //! - `anthropic`: OpenAI Chat Completions request is translated to the Anthropic
-//!   Messages API streaming request (including assistant `tool_calls` and
-//!   matching `role: "tool"` results); Anthropic SSE events are normalized back
-//!   to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"` becomes
-//!   Anthropic `{"type":"none"}` with the tools list retained; unsupported
-//!   tool_choice values and forced tool use with manual extended thinking
-//!   (`thinking.type: "enabled"`) are rejected at admission. Adaptive thinking
-//!   may combine with OpenAI `required` / named choices. Provider `tool_use`
-//!   under a none constraint fails closed instead of becoming OpenAI
-//!   `tool_calls`. Normalization requires
-//!   Anthropic `message_stop` (or an explicit provider `error`) before emitting a
-//!   success-shaped terminal sequence; premature EOF / malformed events fail
-//!   closed with an upstream-error SSE frame. Requests that will be normalized
-//!   strip `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip /
-//!   br) or rejected before SSE parsing so response headers describe identity
+//!   Messages API streaming request (including assistant `tool_calls` /
+//!   matching `role: "tool"` results and legacy assistant `function_call` /
+//!   matching `role: "function"` results); Anthropic SSE events are normalized
+//!   back to OpenAI `chat.completion.chunk` SSE. OpenAI `tool_choice: "none"`
+//!   becomes Anthropic `{"type":"none"}` with the tools list retained;
+//!   unsupported tool_choice values and forced tool use with manual extended
+//!   thinking (`thinking.type: "enabled"`) are rejected at admission. Adaptive
+//!   thinking may combine with OpenAI `required` / named choices. Provider
+//!   `tool_use` under a none constraint fails closed instead of becoming OpenAI
+//!   `tool_calls`. Normalization requires Anthropic `message_stop` (or an
+//!   explicit provider `error`) before emitting a success-shaped terminal
+//!   sequence; premature EOF / malformed events fail closed with an
+//!   upstream-error SSE frame. Requests that will be normalized strip
+//!   `Accept-Encoding`, and residual `Content-Encoding` is decoded (gzip / br)
+//!   or rejected before SSE parsing so response headers describe identity
 //!   bytes.
 //! - `google_gemini`: config is accepted and validated but construction fails
 //!   with a clear "not yet implemented" error until the second phase lands.
@@ -794,12 +795,35 @@ struct ParsedToolCall {
     arguments: Value,
 }
 
+/// Upper bound on a legacy function-call `arguments` JSON string (bytes).
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 256 * 1024;
+
 fn valid_tool_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn legacy_tool_use_id(message_index: usize) -> String {
+    format!("call_legacy_{message_index}")
+}
+
+fn parse_legacy_tool_arguments_object(arguments: &str, field_path: &str) -> Result<Value, String> {
+    if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+        return Err(format!(
+            "{field_path} arguments exceed the maximum allowed size"
+        ));
+    }
+    let parsed: Value = serde_json::from_str(arguments).map_err(|_| {
+        // Field-specific only: never echo argument bytes (may hold credentials).
+        format!("{field_path} arguments are not valid JSON")
+    })?;
+    if !parsed.is_object() {
+        return Err(format!("{field_path} arguments must encode a JSON object"));
+    }
+    Ok(parsed)
 }
 
 fn parse_openai_tool_calls(
@@ -861,9 +885,10 @@ fn parse_openai_tool_calls(
                     "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
                 )
             })?;
-        let arguments: Value = serde_json::from_str(arguments).map_err(|error| {
+        let arguments: Value = serde_json::from_str(arguments).map_err(|_| {
+            // Field-specific only: never echo argument bytes (may hold credentials).
             format!(
-                "messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON: {error}"
+                "messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON"
             )
         })?;
         if !arguments.is_object() {
@@ -878,6 +903,46 @@ fn parse_openai_tool_calls(
         });
     }
     Ok(parsed)
+}
+
+/// Parse a legacy OpenAI assistant `function_call` into one Anthropic-bound tool use.
+///
+/// Absent / JSON `null` means no legacy call. A non-null value must be a single
+/// `{name, arguments}` object; parallel legacy calls are not representable.
+fn parse_openai_function_call(
+    message: &Value,
+    message_index: usize,
+) -> Result<Option<ParsedToolCall>, String> {
+    let Some(function_call_value) = message.get("function_call") else {
+        return Ok(None);
+    };
+    if function_call_value.is_null() {
+        return Ok(None);
+    }
+    let function_call = function_call_value
+        .as_object()
+        .ok_or_else(|| format!("messages[{message_index}].function_call must be an object"))?;
+    let name = function_call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| valid_tool_name(value))
+        .ok_or_else(|| {
+            format!("messages[{message_index}].function_call has invalid function name")
+        })?;
+    let arguments = function_call
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("messages[{message_index}].function_call.arguments must be a JSON string")
+        })?;
+    let field_path = format!("messages[{message_index}].function_call");
+    let arguments = parse_legacy_tool_arguments_object(arguments, &field_path)?;
+    let id = legacy_tool_use_id(message_index);
+    Ok(Some(ParsedToolCall {
+        id,
+        name: name.to_string(),
+        arguments,
+    }))
 }
 
 fn tool_result_text(content: &Value) -> Result<String, String> {
@@ -914,9 +979,14 @@ fn anthropic_text_content_blocks(text: &str) -> Vec<Value> {
 
 /// Validate OpenAI message history that will be translated to Anthropic.
 /// Fail closed on malformed tool calls/results rather than silently dropping them.
+///
+/// Modern (`tool_calls` / `role: "tool"`) and legacy (`function_call` /
+/// `role: "function"`) rounds may coexist when each round is complete. Crossing
+/// the result shape while either round is pending is rejected as ambiguous.
 fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
     let mut tool_call_ids = HashSet::new();
     let mut pending_tool_results = HashSet::new();
+    let mut pending_legacy: Option<(String, String)> = None;
     for (index, message) in messages.iter().enumerate() {
         let message_object = message
             .as_object()
@@ -925,30 +995,61 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("messages[{index}] missing string role"))?;
-        if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+        if !matches!(
+            role,
+            "system" | "developer" | "user" | "assistant" | "tool" | "function"
+        ) {
             return Err(format!("messages[{index}] has unsupported role '{role}'"));
         }
 
-        if message_object
-            .get("function_call")
-            .is_some_and(|value| !value.is_null())
-        {
-            return Err(format!(
-                "messages[{index}].function_call uses the unsupported legacy tool-call shape"
-            ));
-        }
         let has_tool_calls = message_object
             .get("tool_calls")
             .is_some_and(|value| !value.is_null());
+        let legacy_call = parse_openai_function_call(message, index)?;
+        let has_legacy_call = legacy_call.is_some();
+
+        if has_tool_calls && has_legacy_call {
+            return Err(format!(
+                "messages[{index}] must not combine tool_calls and function_call"
+            ));
+        }
+        if has_tool_calls && role != "assistant" {
+            return Err(format!(
+                "messages[{index}] tool_calls are only valid on assistant messages"
+            ));
+        }
+        if has_legacy_call && role != "assistant" {
+            return Err(format!(
+                "messages[{index}].function_call is only valid on assistant messages"
+            ));
+        }
+
+        if role == "function" && !pending_tool_results.is_empty() {
+            return Err(format!(
+                "messages[{index}] mixes modern tool_calls and legacy function_call history"
+            ));
+        }
+        if role == "tool" && pending_legacy.is_some() {
+            return Err(format!(
+                "messages[{index}] mixes modern tool_calls and legacy function_call history"
+            ));
+        }
         if role != "tool" && !pending_tool_results.is_empty() {
             return Err(format!(
                 "messages[{index}] appears before results for every preceding assistant tool call"
             ));
         }
+        if role != "function" && pending_legacy.is_some() {
+            return Err(format!(
+                "messages[{index}] appears before the result for the preceding assistant function_call"
+            ));
+        }
+
         match message_object.get("content") {
             Some(Value::String(_)) | Some(Value::Array(_)) => {}
-            Some(Value::Null) | None if role == "assistant" && has_tool_calls => {}
-            Some(Value::Null) | None if role == "tool" => {}
+            Some(Value::Null) | None
+                if role == "assistant" && (has_tool_calls || has_legacy_call) => {}
+            Some(Value::Null) | None if role == "tool" || role == "function" => {}
             _ if matches!(role, "system" | "developer" | "user" | "assistant") => {
                 return Err(format!(
                     "messages[{index}] content must be a string or content-parts array"
@@ -960,6 +1061,7 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
         if role == "assistant" {
             let tool_calls = parse_openai_tool_calls(message, index)?;
             if tool_calls.is_empty()
+                && legacy_call.is_none()
                 && flatten_content_text(message_object.get("content").unwrap_or(&Value::Null))
                     .is_empty()
             {
@@ -967,16 +1069,20 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
                     "messages[{index}] has no Anthropic-representable content"
                 ));
             }
-            for call in tool_calls {
+            if !tool_calls.is_empty() {
+                for call in tool_calls {
+                    if !tool_call_ids.insert(call.id.clone()) {
+                        return Err(format!("messages[{index}] repeats a tool-call id"));
+                    }
+                    pending_tool_results.insert(call.id);
+                }
+            }
+            if let Some(call) = legacy_call {
                 if !tool_call_ids.insert(call.id.clone()) {
                     return Err(format!("messages[{index}] repeats a tool-call id"));
                 }
-                pending_tool_results.insert(call.id);
+                pending_legacy = Some((call.id, call.name));
             }
-        } else if has_tool_calls {
-            return Err(format!(
-                "messages[{index}] tool_calls are only valid on assistant messages"
-            ));
         }
 
         if role == "tool" {
@@ -993,9 +1099,32 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
             tool_result_text(message_object.get("content").unwrap_or(&Value::Null))
                 .map_err(|error| format!("messages[{index}] {error}"))?;
         }
+
+        if role == "function" {
+            let name = message_object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| valid_tool_name(value))
+                .ok_or_else(|| format!("messages[{index}] function message has invalid name"))?;
+            let Some((_pending_id, pending_name)) = pending_legacy.take() else {
+                return Err(format!(
+                    "messages[{index}] function result has no unmatched preceding assistant function_call"
+                ));
+            };
+            if name != pending_name {
+                return Err(format!(
+                    "messages[{index}].name does not match the pending function_call"
+                ));
+            }
+            tool_result_text(message_object.get("content").unwrap_or(&Value::Null))
+                .map_err(|error| format!("messages[{index}] {error}"))?;
+        }
     }
     if !pending_tool_results.is_empty() {
         return Err("assistant tool calls are missing one or more tool results".to_string());
+    }
+    if pending_legacy.is_some() {
+        return Err("assistant function_call is missing its function result".to_string());
     }
     Ok(())
 }
@@ -1194,7 +1323,8 @@ fn resolve_anthropic_thinking(
 
 /// Translate an OpenAI Chat Completions streaming request into an Anthropic
 /// Messages API streaming request body. Preserves assistant `tool_calls` and
-/// matching `role: "tool"` results; rejects malformed history instead of
+/// matching `role: "tool"` results, plus legacy assistant `function_call` and
+/// matching `role: "function"` results; rejects malformed history instead of
 /// dropping it.
 fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, String> {
     let messages = openai_body
@@ -1211,6 +1341,7 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         .collect();
 
     let mut translated_messages = Vec::with_capacity(messages.len());
+    let mut pending_legacy_by_name: HashMap<String, String> = HashMap::new();
     let mut message_index = 0;
     while message_index < messages.len() {
         let message = &messages[message_index];
@@ -1246,6 +1377,41 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
             }));
             continue;
         }
+        if role == "function" {
+            let mut tool_results = Vec::new();
+            while message_index < messages.len()
+                && messages[message_index]["role"].as_str() == Some("function")
+            {
+                let function_message = &messages[message_index];
+                let name = function_message["name"]
+                    .as_str()
+                    .filter(|value| valid_tool_name(value))
+                    .ok_or_else(|| {
+                        format!("messages[{message_index}] function message has invalid name")
+                    })?;
+                let tool_use_id = pending_legacy_by_name.remove(name).ok_or_else(|| {
+                    format!(
+                        "messages[{message_index}] function result has no unmatched preceding assistant function_call"
+                    )
+                })?;
+                let mut block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": tool_result_text(&function_message["content"])
+                        .map_err(|error| format!("messages[{message_index}] {error}"))?,
+                });
+                if function_message.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    block["is_error"] = Value::Bool(true);
+                }
+                tool_results.push(block);
+                message_index += 1;
+            }
+            translated_messages.push(json!({
+                "role": "user",
+                "content": tool_results
+            }));
+            continue;
+        }
         if role != "user" && role != "assistant" {
             return Err(format!(
                 "messages[{message_index}] has unsupported role '{role}'"
@@ -1258,7 +1424,12 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
         } else {
             Vec::new()
         };
-        let content = if tool_calls.is_empty() {
+        let legacy_call = if role == "assistant" {
+            parse_openai_function_call(message, message_index)?
+        } else {
+            None
+        };
+        let content = if tool_calls.is_empty() && legacy_call.is_none() {
             if text.is_empty() && role == "assistant" {
                 return Err(format!(
                     "messages[{message_index}] has no Anthropic-representable content"
@@ -1275,6 +1446,15 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
                     "input": call.arguments,
                 }));
             }
+            if let Some(call) = legacy_call {
+                pending_legacy_by_name.insert(call.name.clone(), call.id.clone());
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call.id,
+                    "name": call.name,
+                    "input": call.arguments,
+                }));
+            }
             Value::Array(content)
         };
         translated_messages.push(json!({
@@ -1282,6 +1462,10 @@ fn translate_to_anthropic(openai_body: &Value, model: &str) -> Result<Vec<u8>, S
             "content": content,
         }));
         message_index += 1;
+    }
+
+    if !pending_legacy_by_name.is_empty() {
+        return Err("assistant function_call is missing its function result".to_string());
     }
 
     let max_tokens = anthropic_effective_max_tokens(openai_body);
