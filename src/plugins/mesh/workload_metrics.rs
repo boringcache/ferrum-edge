@@ -192,7 +192,7 @@ impl WorkloadMetrics {
     ) -> Result<Self, String> {
         // Production resolves custom env tags through the real process
         // environment at construction/reload only.
-        Self::new_with_http_client_and_env_lookup(config, http_client, std::env::var)
+        Self::new_with_http_client_and_env_lookup(config, http_client, |key| std::env::var(key))
     }
 
     /// Test seam: inject environment lookup outcomes without mutating the
