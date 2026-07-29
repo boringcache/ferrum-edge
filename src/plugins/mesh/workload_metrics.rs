@@ -1644,45 +1644,66 @@ fn is_location_token(segment: &str) -> bool {
     matches!(segment, "url" | "uri" | "dsn" | "connection")
 }
 
-/// Exact known compounds for undelimited / concatenated credential spellings.
+/// Known compounds for undelimited / concatenated credential spellings.
+const KNOWN_CREDENTIAL_COMPOUNDS: &[&str] = &[
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
+    "sessiontoken",
+    "accesstoken",
+    "idtoken",
+    "refreshtoken",
+    "bearertoken",
+    "clientid",
+    "clientsecret",
+    "clientkey",
+    "dburl",
+    "dburi",
+    "dbdsn",
+    "databaseurl",
+    "databaseuri",
+    "databasedsn",
+    "databaseconnection",
+    "connectionstring",
+    "mongodburi",
+    "mongouri",
+    "mysqlurl",
+    "postgresurl",
+    "postgresqluri",
+    "postgresqlurl",
+    "redisurl",
+    "redisuri",
+];
+
 fn is_known_credential_compound(segment: &str) -> bool {
-    matches!(
-        segment,
-        "apikey"
-            | "accesskey"
-            | "privatekey"
-            | "secretkey"
-            | "sessiontoken"
-            | "accesstoken"
-            | "idtoken"
-            | "refreshtoken"
-            | "bearertoken"
-            | "clientid"
-            | "clientsecret"
-            | "clientkey"
-            | "dburl"
-            | "dburi"
-            | "dbdsn"
-            | "databaseurl"
-            | "databaseuri"
-            | "databasedsn"
-            | "databaseconnection"
-            | "connectionstring"
-            | "mongodburi"
-            | "mongouri"
-            | "mysqlurl"
-            | "postgresurl"
-            | "postgresqluri"
-            | "postgresqlurl"
-            | "redisurl"
-            | "redisuri"
-    )
+    KNOWN_CREDENTIAL_COMPOUNDS.contains(&segment)
+}
+
+fn contains_known_credential_compound(segment: &str) -> bool {
+    KNOWN_CREDENTIAL_COMPOUNDS.iter().any(|compound| {
+        segment.match_indices(*compound).any(|(offset, _)| {
+            // `clientidentity` is a common non-credential dimension. Do not
+            // reinterpret its leading bytes as the `clientid` compound.
+            *compound != "clientid"
+                || !segment[offset + compound.len()..].starts_with("entity")
+        })
+    })
 }
 
 /// Bounded embedding detection for concatenated forms such as `mysecret`,
-/// `sessiontoken`, or `awssecretkey` without rejecting incidental substrings
-/// (`secretion`, `authentication`, `keyboard`).
+/// `sessiontoken`, or `awssecretkey` without treating short credential words
+/// as arbitrary substrings (`secretion`, `authentication`, `keyboard`).
 fn segment_embeds_credential_compound(segment: &str) -> bool {
+    // Exact credential compounds remain sensitive when a provider prefix or
+    // qualifier is concatenated around them (`AWSACCESSKEYID`,
+    // `AWSSECRETACCESSKEY`, `MYCLIENTSECRETJSON`). These compounds are specific
+    // enough to search as bounded literals; bare `key` / `secret` / `token`
+    // retain the narrower rules below.
+    if contains_known_credential_compound(segment) {
+        return true;
+    }
+
     // Long credential stems: accept as a suffix (`mysecret`) or when followed
     // by a known compound trailer (`awssecretkey`). Do not treat an arbitrary
     // mid-word occurrence as sensitive (`secretion`).
@@ -1695,7 +1716,8 @@ fn segment_embeds_credential_compound(segment: &str) -> bool {
         "credentials",
     ];
     const TRAILERS: &[&str] = &[
-        "key", "id", "url", "uri", "dsn", "string", "token", "secret",
+        "key", "id", "url", "uri", "dsn", "string", "token", "secret", "value", "json", "file",
+        "path",
     ];
 
     for stem in STEMS {
