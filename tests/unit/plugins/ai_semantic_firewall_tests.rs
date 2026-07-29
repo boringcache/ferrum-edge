@@ -5324,6 +5324,195 @@ async fn hold_deadline_is_not_reset_by_more_chunks() {
     );
 }
 
+/// Un-terminated SSE prefix used by the fail-open partial-hold regressions.
+/// No blank line, so it stays in `carry` and never becomes a ready window.
+const PARTIAL_EVENT_PREFIX: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"held partial";
+
+const PARTIAL_EVENT_SUFFIX: &[u8] = b" prose continues\"}}]}\n\n";
+
+#[tokio::test]
+async fn fail_open_hold_timeout_forwards_partial_event_bytes_exactly() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let ResponseStreamAction::Forward(first) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await
+    else {
+        panic!("absorbing a partial event must not cut under fail-open");
+    };
+    assert!(
+        first.is_empty(),
+        "partial bytes stay held until the deadline, got {:?}",
+        String::from_utf8_lossy(&first)
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward, not cut");
+    };
+    assert_eq!(
+        released.as_ref(),
+        PARTIAL_EVENT_PREFIX,
+        "fail-open expiry must forward the partial event's exact held bytes"
+    );
+}
+
+#[tokio::test]
+async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward the prefix");
+    };
+    assert_eq!(prefix_out.as_ref(), PARTIAL_EVENT_PREFIX);
+
+    // Remainder of the SAME event must not be held for semantic inspection —
+    // the already-forwarded prefix is no longer protected content.
+    let started = std::time::Instant::now();
+    let ResponseStreamAction::Forward(suffix_out) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await
+    else {
+        panic!("partial-event remainder must not cut");
+    };
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "remainder of an already-expired partial event must pass through immediately, waited {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        suffix_out.as_ref(),
+        PARTIAL_EVENT_SUFFIX,
+        "wire order preserves the exact suffix bytes"
+    );
+
+    // A later complete event resumes normal windowed inspection (timely clean).
+    let ResponseStreamAction::Forward(next) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    else {
+        panic!("subsequent events resume normal inspection");
+    };
+    assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
+}
+
+#[tokio::test]
+async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 100, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut forwarded = Vec::new();
+    let ResponseStreamAction::Forward(b) = inspector.on_chunk(PARTIAL_EVENT_PREFIX).await else {
+        panic!("initial partial absorb must not cut");
+    };
+    forwarded.extend_from_slice(&b);
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let ResponseStreamAction::Forward(b) = inspector.on_chunk(&[]).await else {
+        panic!("first expiry must fail open");
+    };
+    forwarded.extend_from_slice(&b);
+    assert_eq!(
+        &forwarded, PARTIAL_EVENT_PREFIX,
+        "first expiry must flush the original held bytes exactly once"
+    );
+
+    // Further drips of the same unterminated event are pass-through; sleeping
+    // past another deadline must not re-emit or re-retain the original prefix.
+    for piece in [b" more" as &[u8], b" drip", b" bytes"] {
+        let ResponseStreamAction::Forward(b) = inspector.on_chunk(piece).await else {
+            panic!("pass-through drip must not cut");
+        };
+        forwarded.extend_from_slice(&b);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let ResponseStreamAction::Forward(idle) = inspector.on_chunk(&[]).await else {
+            panic!("idle poke after pass-through must not cut");
+        };
+        assert!(
+            idle.is_empty(),
+            "already-forwarded prefix must not be retained across timer resets: {:?}",
+            String::from_utf8_lossy(&idle)
+        );
+    }
+
+    let mut expected = PARTIAL_EVENT_PREFIX.to_vec();
+    expected.extend_from_slice(b" more drip bytes");
+    assert_eq!(
+        forwarded, expected,
+        "wire order is the concatenation of the original prefix and later drips"
+    );
+    assert_eq!(
+        forwarded.windows(PARTIAL_EVENT_PREFIX.len()).filter(|w| *w == PARTIAL_EVENT_PREFIX).count(),
+        1,
+        "original bytes must appear exactly once on the wire"
+    );
+}
+
+#[tokio::test]
+async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Terminate(final_bytes) = inspector.on_chunk(&[]).await else {
+        panic!("fail-closed expiry must cut");
+    };
+    let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
+    assert!(
+        terminal.contains("ai_semantic_firewall_response_blocked"),
+        "cut emits the terminal error event, got {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("held partial"),
+        "fail-closed must leak no partial bytes: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("choices"),
+        "fail-closed must leak no partial SSE payload: {terminal:?}"
+    );
+
+    let ResponseStreamAction::Forward(post) = inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await
+    else {
+        panic!("post-cut chunks forward nothing");
+    };
+    assert!(post.is_empty());
+}
+
 #[tokio::test]
 async fn hold_timeout_publishes_fixed_cardinality_metadata() {
     use ferrum_edge::plugins::create_response_stream_inspector;

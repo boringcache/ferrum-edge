@@ -3413,6 +3413,15 @@ struct StreamWindowEngine {
     cleared_len: usize,
     /// Content offset the emitted-but-unverified window will clear to.
     pending_clears_to: Option<usize>,
+    /// After a fail-open hold timeout forwarded an un-terminated partial event,
+    /// remaining bytes of that same SSE event are forwarded uninspected until
+    /// the next event boundary. Later complete events resume normal inspection.
+    passthrough_to_event_end: bool,
+    /// At most two already-forwarded bytes retained solely to detect an SSE
+    /// blank-line boundary that spans chunk edges during
+    /// [`passthrough_to_event_end`]. Never re-emitted, never held awaiting a
+    /// semantic verdict, and never counted by the hold clock.
+    passthrough_tail: Vec<u8>,
 }
 
 impl StreamWindowEngine {
@@ -3428,7 +3437,50 @@ impl StreamWindowEngine {
             held: Vec::new(),
             cleared_len: 0,
             pending_clears_to: None,
+            passthrough_to_event_end: false,
+            passthrough_tail: Vec::new(),
         }
+    }
+
+    fn in_passthrough(&self) -> bool {
+        self.passthrough_to_event_end
+    }
+
+    /// Forward bytes of a fail-open mid-event remainder until the next SSE event
+    /// boundary. Returns `(forwarded, bytes_consumed_from_chunk)`. When the
+    /// boundary is reached, [`passthrough_to_event_end`] clears and any
+    /// unconsumed suffix of `chunk` is left for normal ingest.
+    ///
+    /// [`passthrough_tail`] is a copy of already-forwarded bytes used only to
+    /// detect a blank line that spans chunk edges — it is never re-emitted and
+    /// never held awaiting a semantic verdict.
+    fn ingest_passthrough(&mut self, chunk: &[u8]) -> (Vec<u8>, usize) {
+        debug_assert!(self.passthrough_to_event_end);
+        let mut scan = self.passthrough_tail.clone();
+        let prefix_len = scan.len();
+        scan.extend_from_slice(chunk);
+        if let Some(end) = next_event_end(&scan) {
+            self.passthrough_to_event_end = false;
+            self.passthrough_tail.clear();
+            // Forward only bytes from this chunk; the lookback was already sent.
+            let consumed = end.saturating_sub(prefix_len).min(chunk.len());
+            (chunk[..consumed].to_vec(), consumed)
+        } else {
+            // Keep a 2-byte lookback so `\n` + `\n` / `\n` + `\r\n` spanning a
+            // chunk edge is still recognized. Forward the entire chunk now so
+            // pass-through cannot re-accumulate an unbounded hold.
+            let keep = scan.len().min(2);
+            self.passthrough_tail = scan[scan.len() - keep..].to_vec();
+            (chunk.to_vec(), chunk.len())
+        }
+    }
+
+    /// Clear fail-open mid-event pass-through at end of stream. Lookback bytes
+    /// were already forwarded, so this returns nothing.
+    fn finish_passthrough(&mut self) -> Vec<u8> {
+        self.passthrough_to_event_end = false;
+        self.passthrough_tail.clear();
+        Vec::new()
     }
 
     /// Reassemble one complete SSE event into a held entry, recording whether it
@@ -3754,18 +3806,29 @@ impl StreamWindowEngine {
         self.pending_clears_to = None;
     }
 
-    /// Release every COMPLETE held event without inspecting it, leaving the
-    /// un-terminated `carry` in place so SSE framing is preserved (a partial
-    /// event is never handed to the client as if it were whole). Used only by
-    /// the fail-open hold-timeout path; returns the raw bytes to forward.
+    /// Release every byte that caused the current hold without inspecting it:
+    /// complete held events and any un-terminated `carry`. When `carry` was
+    /// non-empty, enter [`passthrough_to_event_end`] so the remainder of that
+    /// same SSE event is never absorbed as a fresh inspectable event (its
+    /// prefix already left the gateway uninspected). Used only by the fail-open
+    /// hold-timeout path; returns the raw bytes to forward immediately.
     fn force_release_held(&mut self) -> Vec<u8> {
-        let Some(last) = self.held.last() else {
-            return Vec::new();
+        let mut out = if let Some(last) = self.held.last() {
+            // Reuse `release()` so the cleared-offset rebase and overlap draining
+            // stay in exactly one place.
+            self.pending_clears_to = Some(last.content_len_after);
+            self.release()
+        } else {
+            self.discard_pending();
+            Vec::new()
         };
-        // Reuse `release()` so the cleared-offset rebase and overlap draining
-        // stay in exactly one place.
-        self.pending_clears_to = Some(last.content_len_after);
-        self.release()
+        if !self.carry.is_empty() {
+            out.extend_from_slice(&self.carry);
+            self.carry.clear();
+            self.passthrough_to_event_end = true;
+            self.passthrough_tail.clear();
+        }
+        out
     }
 
     /// Drop every held byte and the pending window. Called when the stream is
@@ -3777,6 +3840,9 @@ impl StreamWindowEngine {
         self.held.shrink_to_fit();
         self.carry.clear();
         self.carry.shrink_to_fit();
+        self.passthrough_to_event_end = false;
+        self.passthrough_tail.clear();
+        self.passthrough_tail.shrink_to_fit();
     }
 }
 
@@ -4099,8 +4165,10 @@ impl StreamInspector {
 
     /// Apply the configured policy for an expired hold in `block` mode. Records
     /// the fixed-cardinality counter, logs once, and either cuts (fail closed —
-    /// the held window is discarded and never reaches the client) or releases
-    /// the complete held events uninspected (fail open).
+    /// every held/partial byte is discarded and never reaches the client) or
+    /// releases every byte that caused the hold uninspected (fail open),
+    /// including any un-terminated carry, then pass-through until the next SSE
+    /// event boundary.
     fn on_hold_expired(&mut self, phase: &'static str) -> ResponseStreamAction {
         let Some(hold) = self.hold.as_mut() else {
             return ResponseStreamAction::Forward(Bytes::new());
@@ -4108,10 +4176,10 @@ impl StreamInspector {
         let action = hold.action;
         hold.stats.record(action);
         // Restart the clock either way: on a cut nothing more is held, and on a
-        // fail-open release the held events actually left the gateway, so the
-        // next hold is a new hold rather than an immediately-expired one. This
-        // is the ONLY reset path besides a clean release — arriving chunks never
-        // reset it.
+        // fail-open release every byte that caused this hold left the gateway
+        // (complete events and any partial carry), so the next hold is a new
+        // hold rather than an immediately-expired one. This is the ONLY reset
+        // path besides a clean release — arriving chunks never reset it.
         hold.restart();
         self.log_hold_timeout_once(phase, action);
         match action {
@@ -4420,6 +4488,16 @@ impl ResponseStreamInspector for StreamInspector {
             StreamEnforcement::Block => {
                 let mut consumed = 0usize;
                 let mut released = Vec::new();
+                // Fail-open mid-event remainder: forward until the next SSE
+                // boundary without re-entering the hold / semantic path.
+                if self.window.in_passthrough() {
+                    let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
+                    released.extend_from_slice(&fwd);
+                    consumed = consumed.saturating_add(took);
+                    if self.window.in_passthrough() {
+                        return ResponseStreamAction::Forward(Bytes::from(released));
+                    }
+                }
                 // A hold that already expired while the backend was silent is
                 // resolved BEFORE absorbing more attacker-controlled bytes, so
                 // arriving chunks can neither extend the hold nor grow the
@@ -4428,6 +4506,16 @@ impl ResponseStreamInspector for StreamInspector {
                     match self.on_hold_expired("accumulate") {
                         ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
                         terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    }
+                    // Expiry may have entered pass-through for a partial event;
+                    // drain any remainder already present in this same chunk.
+                    if self.window.in_passthrough() && consumed < chunk.len() {
+                        let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
+                        released.extend_from_slice(&fwd);
+                        consumed = consumed.saturating_add(took);
+                        if self.window.in_passthrough() {
+                            return ResponseStreamAction::Forward(Bytes::from(released));
+                        }
                     }
                 }
                 loop {
@@ -4489,6 +4577,9 @@ impl ResponseStreamInspector for StreamInspector {
         match self.config.enforcement {
             StreamEnforcement::Block => {
                 let mut released = Vec::new();
+                if self.window.in_passthrough() {
+                    released.extend_from_slice(&self.window.finish_passthrough());
+                }
                 loop {
                     let step = self.window.finish_step();
                     self.sync_hold();
