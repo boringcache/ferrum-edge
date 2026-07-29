@@ -2322,10 +2322,14 @@ pub struct RequestContext {
     /// this trusted upstream alias.
     pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
     /// When set, `mcp_gateway` must validate the buffered `tools/call` result
-    /// against the tool's compiled `outputSchema` before any caller-visible
-    /// response or audit publication. Kept out of public metadata so forgeable
-    /// keys cannot opt a response into or out of enforcement.
-    pub(crate) mcp_validate_tool_result: bool,
+    /// against this exact compiled `outputSchema` validator before any
+    /// caller-visible response or audit publication. The `Arc` is pinned from
+    /// the routed catalog entry at dispatch so public
+    /// `mcp.response_rewrite.*` metadata cannot substitute or clear
+    /// enforcement, and a later catalog refresh cannot change the in-flight
+    /// snapshot. Kept out of public metadata so forgeable keys cannot opt a
+    /// response into or out of enforcement.
+    pub(crate) mcp_validate_tool_result: Option<Arc<jsonschema::Validator>>,
     /// Set while `mcp_gateway` dispatches a member of an aggregate JSON-RPC
     /// batch. Routed handlers then validate policy without dialing upstream or
     /// returning `Continue`, because executing a batch member from
@@ -2747,7 +2751,7 @@ impl RequestContext {
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
             mcp_trusted_tool_name_rewrite: None,
-            mcp_validate_tool_result: false,
+            mcp_validate_tool_result: None,
             mcp_batch_forbids_upstream: false,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
@@ -3595,7 +3599,7 @@ impl RequestContext {
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
             mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
-            mcp_validate_tool_result: self.mcp_validate_tool_result,
+            mcp_validate_tool_result: self.mcp_validate_tool_result.clone(),
             mcp_batch_forbids_upstream: self.mcp_batch_forbids_upstream,
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),

@@ -2976,9 +2976,16 @@ impl McpGateway {
             self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
                 .await;
         }
-        let validate_tool_results =
-            self.validation.validate_tool_results && entry.output_validator.is_some();
-        ctx.mcp_validate_tool_result = validate_tool_results;
+        let pinned_output_validator = if self.validation.validate_tool_results {
+            entry.output_validator.clone()
+        } else {
+            None
+        };
+        let validate_tool_results = pinned_output_validator.is_some();
+        // Pin the exact compiled validator for this routed call. Final-body
+        // enforcement must not re-resolve identity through public
+        // `mcp.response_rewrite.*` metadata or a later catalog refresh.
+        ctx.mcp_validate_tool_result = pinned_output_validator;
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
         };
@@ -4012,7 +4019,7 @@ impl McpGateway {
         ctx.route_override_authority = None;
         ctx.mcp_trusted_tool_name_rewrite = None;
         ctx.mcp_response_resource_binding = None;
-        ctx.mcp_validate_tool_result = false;
+        ctx.mcp_validate_tool_result = None;
         ctx.mcp_batch_forbids_upstream = false;
         ctx.metadata.remove("mcp.server_id");
         ctx.metadata.remove("mcp.item_type");
@@ -4841,7 +4848,7 @@ impl Plugin for McpGateway {
         self.enabled
             && self.mode == McpGatewayMode::AggregateRouter
             && self.validation.validate_tool_results
-            && ctx.mcp_validate_tool_result
+            && ctx.mcp_validate_tool_result.is_some()
     }
 
     fn enforces_response_body_policy(
@@ -4859,7 +4866,7 @@ impl Plugin for McpGateway {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !ctx.mcp_validate_tool_result {
+        if ctx.mcp_validate_tool_result.is_none() {
             return PluginResult::Continue;
         }
         // Streamed SSE cannot be validated against a compiled output schema
@@ -4911,9 +4918,11 @@ impl Plugin for McpGateway {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !ctx.mcp_validate_tool_result {
+        // Authoritative enforcement identity is the validator Arc pinned at
+        // route time — never re-resolved through public rewrite metadata.
+        let Some(validator) = ctx.mcp_validate_tool_result.clone() else {
             return PluginResult::Continue;
-        }
+        };
         if body.len() > self.validation.max_upstream_response_bytes {
             return self.reject_invalid_tool_result(
                 ctx,
@@ -4930,6 +4939,14 @@ impl Plugin for McpGateway {
                 None,
                 "tool result content-type is not inspectable JSON",
             );
+        }
+        // Screen the exact decoded bytes before `serde_json` collapses
+        // duplicate members (last-wins). Other MCP clients may keep the first,
+        // so an ambiguous document would make the gateway validate a different
+        // `result` / `structuredContent` / nested value than the caller sees.
+        // `reason` is fixed-cardinality and never echoes body bytes.
+        if let Some(reason) = crate::util::json_dup_keys::slice_ambiguity(body) {
+            return self.reject_invalid_tool_result(ctx, None, reason);
         }
         let value: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
@@ -4953,79 +4970,29 @@ impl Plugin for McpGateway {
         }
         let result = &value["result"];
         // Legitimate tool execution errors are reported in-band with isError.
-        if result
-            .get("isError")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            return PluginResult::Continue;
-        }
-
-        let Some((public_name, _)) = ctx.mcp_trusted_tool_name_rewrite.clone() else {
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "missing trusted tool identity for result validation",
-            );
-        };
-        let session_hash = match ctx.metadata.get(METADATA_RESPONSE_REWRITE_SESSION_KEY) {
-            Some(session_hash) => session_hash.clone(),
-            None => {
+        // A non-boolean isError must not collapse to success, and isError:true
+        // requires an array `content` representation (MCP CallToolResult shape)
+        // rather than escaping with a bare flag.
+        match result.get("isError") {
+            None | Some(Value::Bool(false)) => {}
+            Some(Value::Bool(true)) => {
+                if !result.get("content").is_some_and(Value::is_array) {
+                    return self.reject_invalid_tool_result(
+                        ctx,
+                        response_id,
+                        "isError tool result requires array content",
+                    );
+                }
+                return PluginResult::Continue;
+            }
+            Some(_) => {
                 return self.reject_invalid_tool_result(
                     ctx,
                     response_id,
-                    "missing session binding for result validation",
+                    "isError must be a boolean",
                 );
             }
-        };
-        let expected_catalog_version = match ctx
-            .metadata
-            .get(METADATA_RESPONSE_REWRITE_CATALOG_VERSION_KEY)
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            Some(version) => version,
-            None => {
-                return self.reject_invalid_tool_result(
-                    ctx,
-                    response_id,
-                    "missing catalog version for result validation",
-                );
-            }
-        };
-        let Some(catalog_lock) = self
-            .session_catalogs_by_hash
-            .get(&session_hash)
-            .map(|catalog| Arc::clone(catalog.value()))
-        else {
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "catalog unavailable for result validation",
-            );
-        };
-        let catalog = catalog_lock.read().await;
-        if catalog.version != expected_catalog_version {
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "catalog changed before tool result validation",
-            );
         }
-        let Some(entry) = catalog.tools.get(&public_name) else {
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "tool missing from catalog during result validation",
-            );
-        };
-        let Some(validator) = entry.output_validator.as_ref() else {
-            // Staged flag requires a compiled schema; absence is fail-closed.
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "tool output schema unavailable during result validation",
-            );
-        };
 
         let payload = match extract_tool_result_validation_payload(
             result,
@@ -5036,7 +5003,7 @@ impl Plugin for McpGateway {
                 return self.reject_invalid_tool_result(ctx, response_id, reason);
             }
         };
-        match validate_json_schema(validator, &payload) {
+        match validate_json_schema(&validator, &payload) {
             Ok(()) => {
                 if self.observability.emit_metadata {
                     ctx.metadata.insert(
