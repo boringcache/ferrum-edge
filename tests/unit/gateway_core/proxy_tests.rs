@@ -3832,3 +3832,250 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
         "generic preserved statuses must retain native headers and body framing"
     );
 }
+
+/// `Content-Length` acceptance at the final wire boundary must be RFC 9110
+/// §8.6 `1*DIGIT`, not "whatever `u64::from_str` tolerates".
+///
+/// Rust's integer `FromStr` accepts a leading `+`, so a `Content-Length: +42`
+/// left on a streaming response map parses successfully and was therefore
+/// treated as an already-safe value: `needs_client_response_wire_sanitization`
+/// reported no work, the sanitizer preserved it verbatim, and the malformed
+/// field reached the client. On an H1 chain, one intermediary may read `+42` as
+/// `42`, another as `0`, and another may reject the message — the exact framing
+/// disagreement this boundary exists to remove.
+#[test]
+fn test_streaming_sanitizer_rejects_non_digit_content_length_spellings() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let framing = ClientResponseFraming::Streaming { status: 200 };
+
+    // Signed, non-numeric, and overflowing spellings are all refused. A
+    // streaming body is framed by the protocol's own end-of-body signal, so
+    // dropping an unverifiable length is the safe repair.
+    for value in [
+        "+42",
+        "+0",
+        "-1",
+        "4 2",
+        "42abc",
+        "0x2a",
+        "",
+        // One past u64::MAX: all digits, but not representable, comparable, or
+        // repairable by the gateway.
+        "18446744073709551616",
+    ] {
+        let mut headers = HashMap::from([
+            ("content-length".to_string(), value.to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert!(
+            needs_client_response_wire_sanitization(&headers, framing),
+            "{value:?} must be reported as needing repair, or the H3 hot path \
+             skips sanitization entirely and publishes it verbatim"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "{value:?} is not a valid Content-Length and must not reach the wire"
+        );
+        assert_eq!(
+            headers.get("x-ok").map(String::as_str),
+            Some("1"),
+            "unrelated headers must survive the repair"
+        );
+    }
+
+    // Bare 1*DIGIT (including leading zeroes, which the grammar permits) stays
+    // untouched — the stricter check must not start rewriting valid backends.
+    for value in ["0", "42", "042", "18446744073709551615"] {
+        let mut headers = HashMap::from([("content-length".to_string(), value.to_string())]);
+        assert!(
+            !needs_client_response_wire_sanitization(&headers, framing),
+            "{value:?} is a valid Content-Length and must stay on the hot path"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(value)
+        );
+    }
+
+    // A signed value under a mixed-case key must not be "repaired" into a
+    // canonical lowercase field carrying the same malformed number.
+    let mut mixed = HashMap::from([("Content-Length".to_string(), "+42".to_string())]);
+    sanitize_client_response_headers_for_wire(&mut mixed, framing);
+    assert!(
+        !mixed
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "case-repair must not rehome a non-1*DIGIT value onto the canonical key"
+    );
+}
+
+/// `ExactBody` must not accept a signed spelling as "already canonical" and
+/// skip the rewrite that publishes the authoritative length.
+#[test]
+fn test_exact_body_sanitizer_rewrites_signed_content_length() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let framing = ClientResponseFraming::ExactBody {
+        status: 200,
+        len: 42,
+    };
+    let mut headers = HashMap::from([("content-length".to_string(), "+42".to_string())]);
+    assert!(needs_client_response_wire_sanitization(&headers, framing));
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
+    assert_eq!(
+        headers.get("content-length").map(String::as_str),
+        Some("42"),
+        "ExactBody must publish the canonical decimal length it was given"
+    );
+}
+
+/// Buffered writers share one framing rule across H1/H2, native H3, and the H3
+/// cross-protocol bridge: the wire body is in hand, so its length is
+/// authoritative. `HEAD` is the sole exception — the representation length a
+/// `GET` would have returned must survive the empty wire body.
+#[test]
+fn test_buffered_response_framing_is_body_derived_except_head() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 200, 21),
+                ClientResponseFraming::ExactBody { len: 21, .. }
+            ),
+            "{method} buffered response must publish its exact body length"
+        );
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 403, 0),
+                ClientResponseFraming::ExactBody { len: 0, .. }
+            ),
+            "{method} empty buffered response must publish an authoritative zero"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_buffered_response(method, 200, 0),
+                ClientResponseFraming::Streaming { .. }
+            ),
+            "{method} must preserve the backend representation length"
+        );
+    }
+}
+
+/// A buffered gRPC response with no DATA frames is trailers-only regardless of
+/// which hook produced it, so `Content-Length` is removed rather than invented
+/// as `0` or preserved from a plugin-authored map.
+#[test]
+fn test_buffered_grpc_framing_is_trailers_only_on_empty_body() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    assert!(matches!(
+        ClientResponseFraming::for_buffered_grpc(200, 0),
+        ClientResponseFraming::TrailersOnly
+    ));
+    assert!(matches!(
+        ClientResponseFraming::for_buffered_grpc(200, 17),
+        ClientResponseFraming::ExactBody { len: 17, .. }
+    ));
+}
+
+/// Regression: a plugin reject on the buffered gRPC path must not publish a
+/// plugin-authored `Content-Length` on a response that sends zero DATA frames.
+///
+/// `normalize_reject_response(.., is_grpc_request = true)` copies every
+/// plugin-supplied header except content-type / grpc-status / grpc-message and
+/// returns an empty body, so a `Content-Length` in the reject map survives
+/// normalization. The buffered writers previously selected trailers-only
+/// framing from an `after_proxy_rejected` flag, which the `on_response_body`
+/// and `on_final_response_body` reject arms do not set — those arms therefore
+/// fell through to streaming framing, which canonicalizes and publishes the
+/// plugin value. Framing is now derived from the final body instead, so every
+/// reject arm is covered whether or not it shares a flag.
+#[test]
+fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
+    use ferrum_edge::_test_support::normalize_reject_response;
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let plugin_reject_headers = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("Content-Length".to_string(), "31337".to_string()),
+        ("x-plugin".to_string(), "1".to_string()),
+    ]);
+    let normalized = normalize_reject_response(
+        StatusCode::FORBIDDEN,
+        br#"{"error":"denied"}"#,
+        &plugin_reject_headers,
+        true,
+    );
+
+    // Precondition: normalization keeps the plugin's length and empties the body.
+    assert!(
+        normalized.body.is_empty(),
+        "a native gRPC reject normalizes to trailers-only with no DATA frames"
+    );
+    assert!(
+        normalized
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "precondition: the plugin-authored length survives reject normalization"
+    );
+
+    let framing = ClientResponseFraming::for_buffered_grpc(
+        normalized.http_status.as_u16(),
+        normalized.body.len(),
+    );
+    assert!(
+        matches!(framing, ClientResponseFraming::TrailersOnly),
+        "an empty buffered gRPC body must select trailers-only framing"
+    );
+
+    let mut headers = normalized.headers;
+    sanitize_client_response_headers_for_wire(&mut headers, framing);
+    assert!(
+        !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "no Content-Length may reach a trailers-only gRPC response"
+    );
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert_eq!(headers.get("x-plugin").map(String::as_str), Some("1"));
+
+    // The superseded selector: streaming framing would have canonicalized one
+    // of the plugin values straight onto the wire.
+    let mut streamed = normalize_reject_response(
+        StatusCode::FORBIDDEN,
+        br#"{"error":"denied"}"#,
+        &HashMap::from([("content-length".to_string(), "999".to_string())]),
+        true,
+    )
+    .headers;
+    sanitize_client_response_headers_for_wire(
+        &mut streamed,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert_eq!(
+        streamed.get("content-length").map(String::as_str),
+        Some("999"),
+        "guard the premise: streaming framing preserves the plugin length, which \
+         is why the buffered gRPC writers must not select it for an empty body"
+    );
+}

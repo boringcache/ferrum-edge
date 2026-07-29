@@ -7095,17 +7095,13 @@ async fn handle_h3_request(
         // Final protocol-aware strip after after_proxy / committed hooks
         // (RFC 9114 §4.2): hop-by-hop / Connection-listed fields plus
         // Content-Length derived from the buffered body (HEAD preserves a
-        // valid representation length instead of inventing 0).
-        let framing = if ctx.method.eq_ignore_ascii_case("HEAD") {
-            ClientResponseFraming::Streaming {
-                status: response_status,
-            }
-        } else {
-            ClientResponseFraming::ExactBody {
-                status: response_status,
-                len: response_body.len() as u64,
-            }
-        };
+        // valid representation length instead of inventing 0). Shared with the
+        // H3 cross-protocol bridge's buffered writer so the two cannot drift.
+        let framing = ClientResponseFraming::for_buffered_response(
+            &ctx.method,
+            response_status,
+            response_body.len(),
+        );
         sanitize_client_response_headers_for_wire(&mut response_headers, framing);
 
         // Build and send buffered response

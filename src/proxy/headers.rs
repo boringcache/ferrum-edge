@@ -778,6 +778,56 @@ impl ClientResponseFraming {
             },
         }
     }
+
+    /// Framing for a fully buffered client response whose body bytes are final.
+    ///
+    /// Shared by the H1/H2 buffered writer, the native HTTP/3 buffered writer,
+    /// and the HTTP/3 cross-protocol bridge so the three cannot drift: on a
+    /// buffered path the gateway holds the exact wire body, so a stale or
+    /// plugin-authored `Content-Length` is replaced rather than preserved.
+    ///
+    /// `HEAD` is the one exception — its wire body is empty by protocol while
+    /// `Content-Length` still describes the representation a `GET` would return,
+    /// so streaming framing keeps the backend value instead of overwriting it
+    /// with `0`.
+    #[inline]
+    pub fn for_buffered_response(method: &str, status: u16, body_len: usize) -> Self {
+        if method.eq_ignore_ascii_case("HEAD") {
+            Self::Streaming { status }
+        } else {
+            Self::ExactBody {
+                status,
+                len: body_len as u64,
+            }
+        }
+    }
+
+    /// Framing for a fully buffered **gRPC** response whose body bytes are final.
+    ///
+    /// An empty body means the response carries no DATA frames at all: either a
+    /// genuine native Trailers-Only response, or a gRPC error a plugin reject
+    /// produced in `after_proxy`, `on_response_body`, or `on_final_response_body`
+    /// (all three normalize to `body: []` with the plugin's own header map).
+    /// gRPC never frames with `Content-Length`, so the field is removed outright
+    /// — never invented as `0`, never preserved from a plugin-authored map.
+    ///
+    /// Keying on the final body rather than on which hook produced it is what
+    /// makes this total: the reject arms do not share a single flag, so any
+    /// phase-based discriminator silently misses the ones it does not enumerate.
+    ///
+    /// A non-empty buffered body publishes its exact length. gRPC has no `HEAD`,
+    /// so there is no representation-length case to preserve here.
+    #[inline]
+    pub fn for_buffered_grpc(status: u16, body_len: usize) -> Self {
+        if body_len == 0 {
+            Self::TrailersOnly
+        } else {
+            Self::ExactBody {
+                status,
+                len: body_len as u64,
+            }
+        }
+    }
 }
 
 /// Whether a plugin-produced map needs the full wire sanitizer for `framing`.
@@ -821,18 +871,43 @@ pub fn needs_client_response_wire_sanitization(
     }
 }
 
+/// Whether an existing value is already the exact canonical spelling
+/// [`set_content_length_header`] would write for `expected`.
+///
+/// Stricter than [`is_wire_valid_content_length`]: a leading zero is legal on
+/// the wire but is not what `u64::to_string()` produces, so `041` is reported as
+/// needing repair to keep the "already canonical" fast path honest.
 #[inline]
 fn canonical_content_length_matches(value: &str, expected: u64) -> bool {
     let bytes = value.as_bytes();
-    !bytes.is_empty()
+    is_wire_valid_content_length(value)
         && (bytes.len() == 1 || bytes[0] != b'0')
-        && bytes.iter().all(u8::is_ascii_digit)
         && value.parse::<u64>() == Ok(expected)
 }
 
 #[inline]
 fn status_forbids_response_body(status: u16) -> bool {
     matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
+}
+
+/// Whether a value is a legal `Content-Length` field value for the wire.
+///
+/// RFC 9110 §8.6 defines `Content-Length = 1*DIGIT`, so acceptance must be an
+/// explicit ASCII-digit check — **not** `parse::<u64>()` alone. Rust's integer
+/// `FromStr` accepts a leading `+`, so a plugin-authored `Content-Length: +42`
+/// parses successfully while being malformed on the wire: a recipient may read
+/// it as `42`, as `0`, or reject the message, and disagreeing intermediaries on
+/// an H1 chain is exactly the framing-desync primitive this boundary exists to
+/// remove. Overflowing values (more digits than `u64` holds) are likewise
+/// refused because the gateway cannot represent, compare, or repair them.
+///
+/// Leading zeroes remain accepted: `1*DIGIT` permits them and the value is
+/// unambiguous, so a valid backend spelling is preserved rather than rewritten.
+#[inline]
+fn is_wire_valid_content_length(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u64>().is_ok()
 }
 
 fn streaming_content_length_needs_repair(
@@ -844,13 +919,9 @@ fn streaming_content_length_needs_repair(
             continue;
         }
         count += 1;
-        let trimmed = value.trim();
-        if count > 1
-            || name != "content-length"
-            || trimmed != value
-            || trimmed.is_empty()
-            || trimmed.parse::<u64>().is_err()
-        {
+        // `is_wire_valid_content_length` subsumes the old trim comparison:
+        // a digits-only value cannot carry leading or trailing whitespace.
+        if count > 1 || name != "content-length" || !is_wire_valid_content_length(value) {
             return true;
         }
     }
@@ -863,11 +934,17 @@ fn streaming_content_length_needs_repair(
 /// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
 ///
 /// Already-safe common path: exactly one lowercase `content-length` whose value
-/// is untrimmed and parseable under the same acceptance policy as
-/// [`streaming_content_length_needs_repair`] is left untouched — no remove or
-/// reinsert allocation. Leading zeroes remain accepted (and preserved) because
-/// this path only requires `parse::<u64>()` success, matching the repair
-/// predicate rather than inventing a stricter decimal spelling.
+/// is a bare `1*DIGIT` string under the same acceptance policy as
+/// [`is_wire_valid_content_length`] is left untouched — no remove or reinsert
+/// allocation. Leading zeroes remain accepted (and preserved) because
+/// `1*DIGIT` permits them.
+///
+/// Repair only rehomes a value that is still an unambiguous decimal length once
+/// surrounding whitespace is removed. A spelling that is not `1*DIGIT` after
+/// trimming (a signed `+42`, a non-numeric string, an overflowing run of
+/// digits) is dropped outright rather than reinterpreted: on a streaming body
+/// the gateway has no way to verify the claim, and omitting the field leaves
+/// the response correctly framed by the protocol's own end-of-body signal.
 fn canonicalize_streaming_content_length(headers: &mut std::collections::HashMap<String, String>) {
     // Hot path: nothing to repair — keep existing key/value storage.
     if !streaming_content_length_needs_repair(headers) {
@@ -880,7 +957,10 @@ fn canonicalize_streaming_content_length(headers: &mut std::collections::HashMap
             continue;
         }
         count += 1;
-        let value = value.trim().parse::<u64>().ok();
+        let trimmed = value.trim();
+        let value = is_wire_valid_content_length(trimmed)
+            .then(|| trimmed.parse::<u64>().ok())
+            .flatten();
         if count == 1 {
             parsed = value;
         } else {

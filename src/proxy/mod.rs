@@ -24734,19 +24734,33 @@ async fn handle_proxy_request_inner(
 
                 // Build gRPC response with headers and trailers (splitting any
                 // newline-joined Set-Cookie into separate header lines).
-                // A plugin-replaced response is a trailers-only gRPC error whose
-                // header map came from the plugin, so remove Content-Length
-                // outright — never invent `0`, never keep a plugin-authored
-                // length on a response that carries no DATA frames. A genuine
-                // backend response keeps streaming framing so a valid backend
-                // representation length survives.
-                let grpc_framing = if after_proxy_rejected {
-                    headers_mod::ClientResponseFraming::TrailersOnly
-                } else {
-                    headers_mod::ClientResponseFraming::Streaming {
-                        status: response_status,
-                    }
-                };
+                //
+                // This path is fully buffered: `response_body` below IS the wire
+                // body, so framing is derived from it rather than from which
+                // plugin phase produced the response. An `after_proxy` reject is
+                // not the only way a plugin's header map reaches this builder —
+                // an `on_response_body` or `on_final_response_body` reject also
+                // replaces `response_headers` with `normalize_reject_response`
+                // output, which copies every plugin-supplied field except
+                // content-type / grpc-status / grpc-message. Keying on
+                // `after_proxy_rejected` therefore left those two arms on
+                // streaming framing, which preserves a plugin-authored
+                // `Content-Length` on a trailers-only gRPC response that carries
+                // no DATA frames at all.
+                //
+                //   - empty body: no DATA frames (native trailers-only, or a
+                //     plugin-replaced gRPC error). gRPC never frames with
+                //     Content-Length, so remove it outright — never invent `0`,
+                //     never keep a plugin-authored length.
+                //   - non-empty body: the buffered representation is
+                //     authoritative, so publish its exact length. Every rewrite
+                //     site already resyncs `content-length` to the new body, so
+                //     this agrees with them and overrides them only when they
+                //     have drifted.
+                let grpc_framing = headers_mod::ClientResponseFraming::for_buffered_grpc(
+                    response_status,
+                    response_body.len(),
+                );
                 headers_mod::sanitize_client_response_headers_for_wire(
                     &mut response_headers,
                     grpc_framing,
@@ -26591,6 +26605,11 @@ async fn handle_proxy_request_inner(
     // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
     // and derive or repair Content-Length from the actual body/status/method.
     // Gateway-owned Connection: close (drain/overload) is applied below.
+    // The buffered arms below apply the same rule as
+    // `ClientResponseFraming::for_buffered_response`, spelled out here because
+    // `method` has already moved into the transaction summary and only the
+    // precomputed `is_head` flag remains. Keep the three buffered writers
+    // (this one, native H3, and the H3 bridge) in agreement.
     let framing = match &response_body {
         // HEAD keeps a valid backend representation length; do not invent
         // Content-Length: 0 from the empty wire body.

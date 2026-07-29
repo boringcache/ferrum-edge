@@ -15758,6 +15758,16 @@ components:
                   `http[].headers.response.{set,add,remove}`). Same shape as
                   `request_transform` but applied on the response path via
                   the `response_transformer` plugin.
+
+                  Because this publishes onto the `response_transformer`
+                  write surface, it shares that plugin's closed destination
+                  set: add/update of a protocol-managed hop-by-hop or
+                  framing name (`connection`, `content-length`,
+                  `keep-alive`, `proxy-authenticate`, `proxy-connection`,
+                  `te`, `trailer`, `transfer-encoding`, `upgrade`,
+                  case-insensitive) is rejected at construction. Remove of
+                  those names remains allowed. `request_transform` keeps its
+                  existing contract.
                 items:
                   type: object
                   additionalProperties: false

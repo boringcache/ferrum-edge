@@ -2955,9 +2955,28 @@ where
             .await;
         }
 
+        // Buffered bridge response: `response_body` below IS the wire body, so
+        // publish its exact length instead of preserving whatever the backend or
+        // a plugin left on the map. `apply_buffered_plain_plugin_reject` installs
+        // the plugin's own reject header map verbatim, so under streaming framing
+        // a plugin-authored `Content-Length` would reach the H3 wire disagreeing
+        // with the DATA frames actually sent (malformed per RFC 9114 §4.1.2).
+        // `HEAD` keeps streaming framing so the backend representation length
+        // survives instead of being overwritten with `0` — same rule the native
+        // H3 buffered writer applies through the shared constructor.
+        let buffered_framing = ClientResponseFraming::for_buffered_response(
+            &ctx.method,
+            response_status,
+            response_body.len(),
+        );
         if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
             grpc_web_deadline_at,
-            send_response_headers(stream, response_status, &response_headers),
+            send_response_headers_with_framing(
+                stream,
+                response_status,
+                &response_headers,
+                buffered_framing,
+            ),
         )
         .await
         {
@@ -5173,16 +5192,37 @@ where
 
             let grpc_deadline_at = ctx.grpc_deadline_at();
             let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
+            // Buffered bridge response: `response_body` below IS the wire body,
+            // so framing is derived from it rather than from which plugin phase
+            // produced the response. `apply_buffered_grpc_plugin_reject` replaces
+            // `response_headers` with `normalize_h3_grpc_reject` output, which
+            // copies every plugin-supplied field except content-type /
+            // grpc-status / grpc-message — under streaming framing a
+            // plugin-authored `Content-Length` would survive onto a
+            // trailers-only response that sends no DATA frames, which RFC 9114
+            // §4.1.2 makes malformed. Mirrors the main buffered gRPC path.
+            let grpc_framing =
+                ClientResponseFraming::for_buffered_grpc(response_status, response_body.len());
             let header_write = if terminal_gateway_deadline {
                 crate::http3::stream_util::await_terminal_response_write_before_deadline(
                     grpc_deadline_at,
-                    send_response_headers(stream, response_status, &response_headers),
+                    send_response_headers_with_framing(
+                        stream,
+                        response_status,
+                        &response_headers,
+                        grpc_framing,
+                    ),
                 )
                 .await
             } else {
                 crate::http3::stream_util::await_response_write_before_deadline(
                     grpc_deadline_at,
-                    send_response_headers(stream, response_status, &response_headers),
+                    send_response_headers_with_framing(
+                        stream,
+                        response_status,
+                        &response_headers,
+                        grpc_framing,
+                    ),
                 )
                 .await
             };
@@ -6742,6 +6782,10 @@ where
     super::server::drain_h3_request_body(stream, max_bytes).await
 }
 
+/// Streaming-framed response headers: the body length is not known here, so a
+/// valid backend `Content-Length` is preserved and an invalid one is repaired.
+/// Buffered writers whose wire body is already in hand must use
+/// [`send_response_headers_with_framing`] instead.
 async fn send_response_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
     status: u16,
@@ -6752,10 +6796,29 @@ where
     // accepts both the full bidi stream and a `split()` send half.
     S: SendStream<Bytes>,
 {
+    send_response_headers_with_framing(
+        stream,
+        status,
+        headers,
+        ClientResponseFraming::Streaming { status },
+    )
+    .await
+}
+
+async fn send_response_headers_with_framing<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: u16,
+    headers: &HashMap<String, String>,
+    framing: ClientResponseFraming,
+) -> Result<(), anyhow::Error>
+where
+    // Send-only: emits `send_response` and nothing on the recv half, so it
+    // accepts both the full bidi stream and a `split()` send half.
+    S: SendStream<Bytes>,
+{
     // Final protocol-aware strip after after_proxy: connection-specific fields
     // are malformed on HTTP/3 (RFC 9114 §4.2). Clone only when sanitization is
     // needed so the common clean map stays allocation-free on this path.
-    let framing = ClientResponseFraming::Streaming { status };
     let mut owned_headers;
     let headers =
         if crate::proxy::headers::needs_client_response_wire_sanitization(headers, framing) {
