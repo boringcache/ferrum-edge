@@ -264,19 +264,29 @@ fn half_configured_credentials_are_refused() {
 
 #[test]
 fn credentials_resolve_through_the_env_convention() {
-    // SAFETY: single-threaded test-local env mutation, immediately consumed.
-    unsafe {
-        std::env::set_var("FERRUM_TEST_SMTP_USERNAME_3329", SMTP_USERNAME);
-        std::env::set_var("FERRUM_TEST_SMTP_PASSWORD_3329", SMTP_PASSWORD);
-    }
-    let channel = parse_email(json!({
-        "type": "email",
-        "smtp_host": "smtp.example.com",
-        "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
-        "password_env": "FERRUM_TEST_SMTP_PASSWORD_3329",
-        "from": "ferrum@example.com",
-        "to": ["oncall@example.com"]
-    }));
+    let mut env = HashMap::new();
+    env.insert(
+        "FERRUM_TEST_SMTP_USERNAME_3329".to_string(),
+        SMTP_USERNAME.to_string(),
+    );
+    env.insert(
+        "FERRUM_TEST_SMTP_PASSWORD_3329".to_string(),
+        SMTP_PASSWORD.to_string(),
+    );
+
+    let channel = ferrum_edge::_test_support::email_channel_new_with_env_for_test(
+        "ops_email",
+        &json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
+            "password_env": "FERRUM_TEST_SMTP_PASSWORD_3329",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }),
+        &env,
+    )
+    .expect("channel parses");
     assert!(channel.has_credentials());
 
     let debug = format!("{channel:?}");
@@ -286,20 +296,20 @@ fn credentials_resolve_through_the_env_convention() {
     );
     assert!(debug.contains("authenticated: true"), "{debug}");
 
-    let missing = parse_error(json!({
-        "type": "email",
-        "smtp_host": "smtp.example.com",
-        "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
-        "password_env": "FERRUM_TEST_SMTP_ABSENT_3329",
-        "from": "ferrum@example.com",
-        "to": ["oncall@example.com"]
-    }));
+    let missing = ferrum_edge::_test_support::email_channel_new_with_env_for_test(
+        "ops_email",
+        &json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "username_env": "FERRUM_TEST_SMTP_USERNAME_3329",
+            "password_env": "FERRUM_TEST_SMTP_ABSENT_3329",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }),
+        &env,
+    )
+    .expect_err("channel must be rejected");
     assert!(missing.contains("is not set"), "{missing}");
-
-    unsafe {
-        std::env::remove_var("FERRUM_TEST_SMTP_USERNAME_3329");
-        std::env::remove_var("FERRUM_TEST_SMTP_PASSWORD_3329");
-    }
 }
 
 #[test]

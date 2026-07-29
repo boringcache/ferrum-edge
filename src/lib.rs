@@ -5131,4 +5131,23 @@ pub mod _test_support {
     ) -> (std::net::SocketAddr, Arc<str>) {
         crate::http3::server::h3_client_identity(addr)
     }
+
+    /// Build an email channel with deterministic `*_env` resolution for unit
+    /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
+    /// and real `std::env::var`.
+    pub fn email_channel_new_with_env_for_test(
+        name: &str,
+        value: &serde_json::Value,
+        env: &HashMap<String, String>,
+    ) -> Result<crate::notifications::channels::EmailChannel, String> {
+        crate::notifications::channels::EmailChannel::new_with_env_lookup(
+            name,
+            value,
+            &|var| {
+                env.get(var)
+                    .cloned()
+                    .ok_or(std::env::VarError::NotPresent)
+            },
+        )
+    }
 }

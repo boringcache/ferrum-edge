@@ -234,6 +234,9 @@ fn build_channel(name: &str, def: &Value) -> Result<NotificationChannel, String>
     }
 }
 
+/// Injected lookup for `*_env` channel fields. Production passes `std::env::var`.
+pub(super) type EnvVarLookup<'a> = &'a dyn Fn(&str) -> Result<String, std::env::VarError>;
+
 /// Helper used by every channel that accepts either an inline value or a
 /// `*_env`-suffixed env-var reference. Returns the resolved string when one
 /// of the two is set; returns `Ok(None)` when neither is present.
@@ -247,6 +250,16 @@ pub(super) fn resolve_optional_string(
     key: &str,
     env_key: &str,
     channel: &str,
+) -> Result<Option<String>, String> {
+    resolve_optional_string_with_lookup(value, key, env_key, channel, &|name| std::env::var(name))
+}
+
+pub(super) fn resolve_optional_string_with_lookup(
+    value: &Value,
+    key: &str,
+    env_key: &str,
+    channel: &str,
+    env_lookup: EnvVarLookup<'_>,
 ) -> Result<Option<String>, String> {
     if let Some(v) = value.get(key) {
         let s = v
@@ -266,7 +279,7 @@ pub(super) fn resolve_optional_string(
                 "channel '{channel}': '{env_key}' must not be empty"
             ));
         }
-        let resolved = std::env::var(env_name).map_err(|_| {
+        let resolved = env_lookup(env_name).map_err(|_| {
             format!(
                 "channel '{channel}': env var '{env_name}' (referenced by '{env_key}') is not set"
             )

@@ -47,7 +47,7 @@ use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
 
 use super::super::notification::{Notification, NotificationField};
 use super::super::templating::{render_template_bounded, validate_template};
-use super::resolve_optional_string;
+use super::{EnvVarLookup, resolve_optional_string_with_lookup};
 use super::webhook::base_vars;
 
 /// Static plugin/subsystem label used for DNS-resolution diagnostics.
@@ -257,6 +257,14 @@ impl fmt::Debug for EmailChannel {
 #[allow(dead_code)] // Accessors are part of the reusable channel surface.
 impl EmailChannel {
     pub fn new(name: &str, value: &Value) -> Result<Self, String> {
+        Self::new_with_env_lookup(name, value, &|name| std::env::var(name))
+    }
+
+    pub(crate) fn new_with_env_lookup(
+        name: &str,
+        value: &Value,
+        env_lookup: EnvVarLookup<'_>,
+    ) -> Result<Self, String> {
         let raw_host = value
             .get("smtp_host")
             .and_then(Value::as_str)
@@ -314,8 +322,10 @@ impl EmailChannel {
             )
         })?;
 
-        let username = resolve_optional_string(value, "username", "username_env", name)?;
-        let password = resolve_optional_string(value, "password", "password_env", name)?;
+        let username =
+            resolve_optional_string_with_lookup(value, "username", "username_env", name, env_lookup)?;
+        let password =
+            resolve_optional_string_with_lookup(value, "password", "password_env", name, env_lookup)?;
         let credentials = match (username, password) {
             (Some(username), Some(password)) => {
                 validate_credential_component(&username, "username", name)?;
