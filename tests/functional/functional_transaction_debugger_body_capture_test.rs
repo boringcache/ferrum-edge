@@ -270,7 +270,9 @@ async fn functional_transaction_debugger_leaves_unknown_length_requests_streamin
     let _ = response.bytes().await;
 
     let unknown_length = r#""reason":"unknown_length""#;
-    let logs = harness.wait_for_logs(|output| output.contains(unknown_length)).await;
+    let logs = harness
+        .wait_for_logs(|output| output.contains(unknown_length))
+        .await;
     assert!(
         logs.contains(unknown_length),
         "chunked request must report an unknown_length omission:\n{logs}"

@@ -167,7 +167,11 @@ fn conditional_buffering_matrix() -> Vec<Row> {
         row("serverless_function", no_body_forward, ParityOnly),
         base("soap_ws_security", Exactly(Buffers)),
         base("transaction_debugger", Exactly(Streams)),
-        row("transaction_debugger", capture_request_bodies, Exactly(Buffers)),
+        row(
+            "transaction_debugger",
+            capture_request_bodies,
+            Exactly(Buffers),
+        ),
         base("waf", ParityOnly),
         row("waf", no_body_inspection, Exactly(Streams)),
     ]
