@@ -225,6 +225,16 @@ async fn handle_captured_connection(
             "Refusing a captured connection whose original destination is not a slice-declared \
              in-mesh workload address and port"
         );
+        // Same open-relay guard, same ADR counter as the inbound HBONE relay
+        // (issue #3334): `relay_destination_denied` is the destination-policy
+        // reason for exactly this rejection, and the counter is
+        // transport-agnostic, so an operator watching it sees captured-plaintext
+        // refusals too instead of a misleading zero. No HBONE handshake phase is
+        // recorded — this listener terminates no TLS and admits no CONNECT, so
+        // the three phases in the ADR increment-ownership contract do not apply.
+        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+        );
         drop(stream);
         return;
     };
