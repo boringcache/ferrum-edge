@@ -49,8 +49,8 @@ fn h3_reject_writer_skips_empty_data_frames() {
         .find("pub(crate) struct AfterProxyReject")
         .expect("shared reject finalizer boundary must remain present");
     assert!(
-        shared_finalizer[..shared_finalizer_end].contains("*body = Vec::new();"),
-        "shared no-body finalization must drop retained body allocation rather than Vec::clear()"
+        shared_finalizer[..shared_finalizer_end].contains("*body = Bytes::new();"),
+        "shared no-body finalization must drop retained body allocation rather than clear-in-place"
     );
     assert!(
         !shared_finalizer[..shared_finalizer_end].contains("body.clear();"),
@@ -68,8 +68,8 @@ fn h3_reject_writer_skips_empty_data_frames() {
         "streaming after_proxy rejections must also apply shared HEAD/no-body wire preparation"
     );
     assert!(
-        streaming_tail[..streaming_end].contains("reject.body = Vec::new();"),
-        "H3 streaming no-body finalization must drop retained body allocation rather than Vec::clear()"
+        streaming_tail[..streaming_end].contains("reject.body = Bytes::new();"),
+        "H3 streaming no-body finalization must drop retained body allocation rather than clear-in-place"
     );
     assert!(
         !streaming_tail[..streaming_end].contains("reject.body.clear();"),
@@ -197,7 +197,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .find("send_h3_plugin_reject_flavor_aware(")
         .expect("Content-Length rejection send");
     assert!(content_length_finalize < content_length_send);
-    assert!(content_length_fast_path.contains("&rejection.body"));
+    assert!(content_length_fast_path.contains("rejection.body.clone()"));
     assert!(content_length_fast_path.contains("&rejection.headers"));
 
     let terminal_dispatch = src
@@ -238,7 +238,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         !oversize.contains("halt_cancelled_h3_upload("),
         "oversize terminal upload must rely on the writer's post-HEADERS halt"
     );
-    assert!(oversize.contains("&rejection.body"));
+    assert!(oversize.contains("rejection.body.clone()"));
     assert!(oversize.contains("&rejection.headers"));
 
     let disconnected = terminal_dispatch
@@ -280,7 +280,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
         .expect("timed-out terminal upload must use the recv-halt-aware sender");
     assert!(timed_out_finalize < timed_out_send);
-    assert!(timed_out.contains("&rejection.body"));
+    assert!(timed_out.contains("rejection.body.clone()"));
     assert!(timed_out.contains("&rejection.headers"));
     assert!(
         timed_out.contains("false,\n                    )\n                    .await?;"),
@@ -590,7 +590,7 @@ fn h3_cross_protocol_buffered_grpc_writes_and_fin_are_deadline_bounded() {
         .expect("bounded buffered gRPC response arm");
     assert!(buffered.contains("await_response_write_before_deadline("));
     assert!(buffered.contains("await_terminal_response_write_before_deadline("));
-    assert!(buffered.contains("stream.send_data(Bytes::from(response_body))"));
+    assert!(buffered.contains("stream.send_data(response_body)"));
     assert!(buffered.contains("stream.send_trailers(trailer_map)"));
     assert!(
         buffered.matches("stream.finish()").count() >= 2,

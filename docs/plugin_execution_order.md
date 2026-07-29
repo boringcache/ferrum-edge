@@ -61,7 +61,7 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 3. authorize            │  AuthZ, OPA decisions, consumer rate limiting, WAF metadata
+│ 3. authorize            │  AuthZ, OPA decisions, consumer rate limiting, WAF metadata, request_mirror pre-buffer admission
 └────────────┬────────────┘
              │
              ▼
@@ -220,6 +220,28 @@ final authorization. An explicit operator-configured `mirror_path` still wins.
 Each configured mirror instance appends its own bounded result receiver; result
 logging is detached per instance, so later instances and mixed completion order
 cannot overwrite an earlier destination's outcome.
+
+A body-mirroring `request_mirror` instance additionally participates in the
+`authorize` phase, purely to decide mirror admission before the gateway
+collects a request body (advisory `GHSA-jv66-mq44-m9v3`). That hook never
+rejects — mirroring stays fail-open for the primary request. It advances the
+deterministic sampler once and, on selection, takes the instance's
+`max_in_flight` permit plus a `max_retained_request_body_bytes` reservation
+equal to the full positive `max_mirrored_request_body_bytes` ceiling (declared
+`Content-Length` is used only to skip already-oversized bodies before sampling;
+it never sizes the aggregate charge). `should_buffer_request_body` is then a
+pure read of that decision, so a
+`percentage: 0`, sampled-out, or saturated request keeps streaming and never
+allocates a mirror body. Its built-in priority follows the built-in rejecting
+authorization hooks. If an operator priority override or custom plugin places a
+rejecting hook later, the proxy still waits for the complete authorization
+phase before collecting the body; that rejection drops the staged permit and
+reservation without reading the upload, though it may consume a sampling slot.
+Instances with `mirror_request_body: false` or a zero-quantized `percentage`
+declare no body capability at all and stay out of the authorize list. The staged
+decision is left behind as a consumed marker after `before_proxy` takes the
+lease, so the buffering predicate answers consistently for the whole request.
+
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
 the external call. After each deferred pass, the gateway removes every case
@@ -677,7 +699,7 @@ Given all built-in plugins enabled, the execution order is:
 | 52 | `response_mock` | 3030 | before_proxy |
 | 53 | `grpc_deadline` | 3050 | receipt-time deadline preflight, before_proxy |
 | 54 | `load_testing` | 3070 | before_proxy |
-| 55 | `request_mirror` | 3075 | before_proxy |
+| 55 | `request_mirror` | 3075 | authorize (pre-buffer mirror admission; never rejects), before_proxy |
 | 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
 | 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
 | 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
@@ -697,7 +719,7 @@ Given all built-in plugins enabled, the execution order is:
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
+| 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
@@ -787,7 +809,7 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 **Header exposure** (`expose_headers: true`): When enabled, the plugin injects `x-ratelimit-limit`, `x-ratelimit-remaining`, and `x-ratelimit-window` headers on both upstream requests (`before_proxy`) and downstream responses (`after_proxy`). This lets backends and clients see current rate-limit state without additional lookups. Disabled by default so gateway admins control whether limit details are exposed. The limiter key/identity is deliberately never injected as a header: for `limit_by: "consumer"`/`"spiffe_identity"` it would disclose the gateway's internal notion of the caller identity (consumer username) or the peer workload SVID to the downstream client.
 
-**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, these plugins automatically fall back to local in-memory state and switch back when connectivity is restored. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
+**Redis mode** (`sync_mode: "redis"`): rate-limit counter plugins support only `local` and `redis` storage; database-backed counters are intentionally unsupported. `rate_limiting`, `ai_rate_limiter`, `graphql`, `grpc_method_router`, and `udp_rate_limiting` use Redis for coordinated counters across multiple gateway instances. `ws_rate_limiting` also supports Redis, but only to externalize its per-connection counters; because WebSocket connection IDs are process-local, it namespaces keys per gateway instance to avoid cross-instance collisions rather than sharing a portable connection budget across reconnects. When Redis is unavailable, behavior is governed by `redis_failure_policy`, which defaults to `fail_closed`: the plugin refuses with `503` rather than silently degrading to a per-process enforcement domain. `redis_failure_policy: "local_fallback"` is the explicit opt-in that falls back to local in-memory state and switches back when connectivity is restored. `request_deduplication` expresses the same choice through its own `on_redis_unavailable` field (also fail-closed by default) and does not accept `redis_failure_policy`; `ai_semantic_cache` keeps automatic local fallback because a cache miss carries no enforcement consequence. The shared client reconnects in the background under either policy. Redis Cluster is not supported and is screened rather than assumed: the client runs `INFO CLUSTER` on every newly established connection and reacts to `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN`; a proven Cluster endpoint is refused terminally for the life of the client. The Redis backend uses native RESP protocol commands (no Lua scripts), so it works with Redis, Valkey, DragonflyDB, KeyDB, or Garnet.
 
 ### OpenAPI validation runs after body validation (priority 2960)
 

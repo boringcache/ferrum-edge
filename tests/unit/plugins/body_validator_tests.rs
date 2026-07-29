@@ -5128,3 +5128,254 @@ async fn proto3_descriptors_are_unaffected_by_initialization_checks() {
     let result = plugin.on_final_request_body(&headers, &frame).await;
     assert_continue(result);
 }
+
+// ---------------------------------------------------------------------------
+// GHSA-c78j-5w9p-cpq6 — duplicate JSON object member names
+//
+// `serde_json` collapses duplicate members to the LAST value while many other
+// parsers keep the FIRST. `body_validator` evaluates the collapsed view but
+// forwards the ORIGINAL bytes, so a schema-passing document could still deliver
+// a schema-forbidden value to a first-key-wins backend. Ambiguity is therefore
+// rejected outright on both directions.
+// ---------------------------------------------------------------------------
+
+/// A schema that only permits `role: "safe"`.
+fn role_schema_plugin() -> BodyValidator {
+    json_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": { "role": { "type": "string", "enum": ["safe"] } },
+        "required": ["role"]
+    }))
+}
+
+/// The exact advisory reproduction: an earlier forbidden `role` and a later
+/// permitted one. `serde_json` validates the later value and would pass; the
+/// duplicate screen must reject before that.
+#[tokio::test]
+async fn duplicate_member_first_key_wins_differential_is_rejected_on_request() {
+    let body = r#"{"role":"admin","role":"safe"}"#;
+
+    // The differential is real: serde only sees the safe value.
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+    assert_eq!(parsed["role"], "safe");
+    assert_eq!(parsed.as_object().expect("object").len(), 1);
+
+    let plugin = role_schema_plugin();
+    let mut ctx = make_json_ctx(body);
+    let mut headers = make_json_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
+}
+
+/// The mirrored order is rejected too — nothing here depends on which spelling
+/// the schema happens to allow.
+#[tokio::test]
+async fn duplicate_member_last_key_wins_differential_is_rejected_on_request() {
+    let plugin = role_schema_plugin();
+    let mut ctx = make_json_ctx(r#"{"role":"safe","role":"admin"}"#);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+/// The rejection detail is the fixed-cardinality scanner reason and never
+/// echoes a member name or value from the body.
+#[tokio::test]
+async fn duplicate_member_rejection_detail_echoes_no_body_bytes() {
+    let plugin = role_schema_plugin();
+    let mut ctx = make_json_ctx(r#"{"role":"admin","role":"safe","SECRET":"VALUE"}"#);
+    let mut headers = make_json_headers();
+    let body = reject_body(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        body.contains("duplicate object member names"),
+        "detail should name the duplicate-member cause: {body}"
+    );
+    assert!(
+        !body.contains("SECRET"),
+        "detail leaked a member name: {body}"
+    );
+    assert!(!body.contains("VALUE"), "detail leaked a value: {body}");
+    assert!(!body.contains("admin"), "detail leaked a value: {body}");
+}
+
+/// A member spelled with a `u`-escape for the same code point is the SAME
+/// member. Comparing raw key bytes would miss this.
+#[tokio::test]
+async fn escaped_member_name_equal_to_a_literal_one_is_rejected() {
+    let escaped_r = format!("{}u0072", '\\');
+    let body = format!(r#"{{"role":"admin","{escaped_r}ole":"safe"}}"#);
+
+    // serde_json treats these as one member, so the bytes really are ambiguous.
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+    assert_eq!(parsed.as_object().expect("object").len(), 1);
+
+    let plugin = role_schema_plugin();
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+/// Nesting and arrays are covered: the screen walks the whole document, not
+/// just the top-level object.
+#[tokio::test]
+async fn duplicate_member_nested_inside_arrays_and_objects_is_rejected() {
+    let plugin = json_schema_plugin(serde_json::json!({ "type": "object" }));
+    for body in [
+        r#"{"role":"safe","nested":{"role":"admin","role":"safe"}}"#,
+        r#"{"role":"safe","items":[{"ok":1},{"role":"admin","role":"safe"}]}"#,
+        r#"{"role":"safe","a":{"b":{"c":[[{"x":1,"x":2}]]}}}"#,
+    ] {
+        let mut ctx = make_json_ctx(body);
+        let mut headers = make_json_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+    }
+}
+
+/// Clean documents — including ones that reuse a name in SIBLING objects or at
+/// different nesting levels — must still pass. The screen must not over-reject.
+#[tokio::test]
+async fn unambiguous_documents_still_pass_request_validation() {
+    let plugin = json_schema_plugin(serde_json::json!({ "type": "object" }));
+    for body in [
+        r#"{"role":"safe"}"#,
+        r#"{"a":{"a":{"a":1}}}"#,
+        r#"{"items":[{"role":"safe"},{"role":"safe"},{"role":"safe"}]}"#,
+        r#"{"a":1,"b":[1,2,3],"c":null,"d":true,"e":-1.5e3,"f":""}"#,
+    ] {
+        let mut ctx = make_json_ctx(body);
+        let mut headers = make_json_headers();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    }
+}
+
+/// The final backend-visible body (post request transforms) is screened too, so
+/// a transform cannot re-introduce ambiguity after `before_proxy` passed.
+#[tokio::test]
+async fn duplicate_member_in_final_request_body_is_rejected() {
+    let plugin = role_schema_plugin();
+    let headers = make_json_headers();
+    let result = plugin
+        .on_final_request_body(&headers, br#"{"role":"admin","role":"safe"}"#)
+        .await;
+    assert_reject(result, Some(400));
+
+    let clean = plugin
+        .on_final_request_body(&headers, br#"{"role":"safe"}"#)
+        .await;
+    assert_continue(clean);
+}
+
+/// A backend response with duplicate members is a differential in the other
+/// direction (the CLIENT is the first-key-wins parser), and fails closed with
+/// the response status.
+#[tokio::test]
+async fn duplicate_member_in_response_body_is_rejected() {
+    let plugin = response_schema_plugin(serde_json::json!({
+        "type": "object",
+        "properties": { "role": { "type": "string", "enum": ["safe"] } }
+    }));
+    let headers = response_json_headers();
+
+    let mut ctx = make_response_ctx();
+    let result = plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &headers,
+            br#"{"role":"admin","role":"safe"}"#,
+        )
+        .await;
+    assert_reject(result, Some(502));
+
+    let mut clean_ctx = make_response_ctx();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut clean_ctx, 200, &headers, br#"{"role":"safe"}"#)
+            .await,
+    );
+}
+
+/// Malformed input keeps its existing "invalid JSON" handling: the duplicate
+/// screen must not reclassify every parse error, and must never panic.
+#[tokio::test]
+async fn malformed_bodies_keep_invalid_json_handling() {
+    let plugin = json_schema_plugin(serde_json::json!({ "type": "object" }));
+    for body in ["{", "{\"a\":}", "not json at all", "{\"a\":1} trailing"] {
+        let mut ctx = make_json_ctx(body);
+        let mut headers = make_json_headers();
+        let rejection = reject_body(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            rejection.contains("Invalid JSON"),
+            "malformed body {body:?} should stay an invalid-JSON rejection: {rejection}"
+        );
+    }
+}
+
+/// The screen is non-recursive: a pathologically deep document is refused on a
+/// budget rather than overflowing the stack.
+#[tokio::test]
+async fn pathologically_deep_body_is_refused_without_stack_overflow() {
+    let plugin = json_schema_plugin(serde_json::json!({ "type": "object" }));
+    let depth = 50_000usize;
+    let mut body = String::with_capacity(depth * 2 + 16);
+    body.push_str("{\"a\":");
+    for _ in 0..depth {
+        body.push('[');
+    }
+    for _ in 0..depth {
+        body.push(']');
+    }
+    body.push('}');
+    let mut ctx = make_json_ctx(&body);
+    let mut headers = make_json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(400));
+}
+
+/// Narrow XML-activated config with `content_types: ["application/json"]` and
+/// no JSON schema/required fields: `before_proxy` still screens matching JSON,
+/// so the final backend-visible hook must too — a transform must not be able to
+/// reintroduce duplicate members after the first screen.
+#[tokio::test]
+async fn xml_activated_json_content_type_final_rejects_reintroduced_duplicates() {
+    let plugin = BodyValidator::new(&json!({
+        "validate_xml": true,
+        "content_types": ["application/json"]
+    }))
+    .unwrap();
+
+    let clean = r#"{"role":"safe"}"#;
+    let mut ctx = make_json_ctx(clean);
+    let mut headers = make_json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // Transform reintroduces ambiguity on the backend-visible bytes.
+    let ambiguous = br#"{"role":"admin","role":"safe"}"#;
+    assert_reject(
+        plugin.on_final_request_body(&headers, ambiguous).await,
+        Some(400),
+    );
+
+    // Unambiguous final body still passes (parity with before_proxy).
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, clean.as_bytes())
+            .await,
+    );
+
+    // XML gating preserved: XML content type is outside this content_types list.
+    let xml_headers = make_xml_headers();
+    assert_continue(plugin.on_final_request_body(&xml_headers, b"<root/>").await);
+}
+
+/// Protobuf-only configs must not treat arbitrary non-gRPC payloads as JSON on
+/// the final request-body hook (early Continue before the JSON branch).
+#[tokio::test]
+async fn protobuf_only_final_request_does_not_json_screen_non_grpc() {
+    let plugin = protobuf_plugin();
+    let headers = make_json_headers();
+    // Duplicate members would fail a JSON screen; protobuf-only must Continue.
+    assert_continue(
+        plugin
+            .on_final_request_body(&headers, br#"{"role":"admin","role":"safe"}"#)
+            .await,
+    );
+}

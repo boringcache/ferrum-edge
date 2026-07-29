@@ -2027,6 +2027,18 @@ pub struct RequestContext {
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
     pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
+    /// Per-request memo of duplicate-object-member screens over governed JSON
+    /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
+    /// `body_validator`, and `ai_tool_governor` can all inspect the same
+    /// buffered body in one hook stage; the first screen's verdict is staged
+    /// here so the chain scans it once.
+    ///
+    /// Entries are keyed on the body's SHA-256 digest and length — never on an
+    /// assertion a client, a backend, or `ctx.metadata` can write — so a
+    /// transform that rewrites the body is re-screened rather than inheriting a
+    /// stale verdict. Private for the same reason as the hash ledgers above: a
+    /// body digest must not reach transaction logs.
+    pub(crate) json_scan_memo: crate::util::json_dup_keys::JsonScanMemo,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -2281,6 +2293,24 @@ pub struct RequestContext {
     /// Collected by detached mirror logging so each destination emits its own
     /// `mirror: true` summary.
     pub mirror_result_rxs: Vec<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// Per-instance `request_mirror` body admission decided during the
+    /// `authorize` phase — before any request body is collected.
+    ///
+    /// Advisory `GHSA-jv66-mq44-m9v3`: sampling and bounded mirror admission
+    /// must run ahead of body collection so a percentage-zero, sampled-out, or
+    /// saturated request keeps streaming instead of buffering an attacker-sized
+    /// body that no shadow request will ever use. An admitted entry owns the
+    /// instance's concurrency permit and its reserved slice of the aggregate
+    /// retained-byte budget for the whole pre-`before_proxy` buffering window,
+    /// and releases both when the context is dropped on any early-return,
+    /// cancellation, or body-error path. `before_proxy` takes the entry exactly
+    /// once, so the lease is never released twice.
+    ///
+    /// Private (with `pub(crate)` accessors) so no plugin can forge, clear, or
+    /// observe another instance's admission. Its custom `Clone` intentionally
+    /// clears the staged value: response-side context clones must not release a
+    /// lease the live request still owns.
+    request_mirror_admissions: request_mirror::RequestMirrorAdmissions,
     /// One-shot HMAC work staged before request-body collection and consumed
     /// at authentication. This is private rather than transaction metadata so
     /// credential/signature/Consumer secret data cannot be forwarded or
@@ -2563,6 +2593,7 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
+            json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_tool_governor_redaction_memos: HashMap::new(),
@@ -2609,6 +2640,7 @@ impl RequestContext {
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             mirror_result_rxs: Vec::new(),
+            request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3381,6 +3413,9 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
+            // Carried into the final-request-body stage so every plugin in that
+            // stage shares one duplicate-key screen of the same body.
+            json_scan_memo: self.json_scan_memo.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),
@@ -3454,6 +3489,10 @@ impl RequestContext {
             // context before spawning cleanup) still emits every dispatched
             // mirror result.
             mirror_result_rxs: self.mirror_result_rxs.clone(),
+            // Mirror admission leases are owned by the live request context.
+            // Copying them here would double-release a permit / byte
+            // reservation when the clone is dropped.
+            request_mirror_admissions: request_mirror::RequestMirrorAdmissions::default(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -4214,6 +4253,43 @@ impl RequestContext {
         self.mirror_result_rxs.push(rx);
     }
 
+    /// Stage one `request_mirror` instance's pre-buffer admission decision.
+    ///
+    /// Called once per instance from the `authorize` phase. Replaces any
+    /// earlier entry for the same instance so a repeated evaluation cannot
+    /// accumulate two leases for one request.
+    pub(crate) fn stage_request_mirror_admission(
+        &mut self,
+        admission: request_mirror::RequestMirrorAdmission,
+    ) {
+        self.request_mirror_admissions.stage(admission);
+    }
+
+    /// Whether the given `request_mirror` instance was admitted for this
+    /// request and therefore needs the request body buffered.
+    ///
+    /// Read-only and idempotent: `should_buffer_request_body` is evaluated
+    /// several times per request and must never advance the sampler or acquire
+    /// capacity itself. It also keeps answering `true` after `before_proxy`
+    /// consumed the lease, because the proxy re-evaluates that predicate after
+    /// `before_proxy` and must not conclude the already-buffered body was never
+    /// required.
+    pub(crate) fn request_mirror_body_admitted(&self, instance_id: u64) -> bool {
+        self.request_mirror_admissions.body_admitted(instance_id)
+    }
+
+    /// Take one instance's staged admission, transferring ownership of its
+    /// permit and retained-byte lease to the caller. Returns `None` when the
+    /// `authorize` phase never ran for this instance (direct plugin invocation
+    /// in tests), which keeps `before_proxy` self-sufficient. A repeated take
+    /// yields the consumed marker, never a second lease.
+    pub(crate) fn take_request_mirror_admission(
+        &mut self,
+        instance_id: u64,
+    ) -> Option<request_mirror::RequestMirrorAdmission> {
+        self.request_mirror_admissions.take(instance_id)
+    }
+
     /// Return the stable authenticated identity for downstream policy and
     /// observability. Gateway-mapped Consumers take precedence over external
     /// identities emitted by plugins like `jwks_auth`.
@@ -4778,7 +4854,7 @@ pub async fn normalize_response_body_for_inspection(
     ctx: &mut RequestContext,
     response_status: u16,
     response_headers: &mut HashMap<String, String>,
-    response_body: &mut Vec<u8>,
+    response_body: &mut bytes::Bytes,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
 ) -> bool {
     // Seed provenance before the rewrite gate: a status that forbids body
@@ -4824,7 +4900,7 @@ pub async fn normalize_response_body_for_inspection(
         };
         if let Some(body) = body {
             response_headers.insert("content-length".to_string(), body.len().to_string());
-            *response_body = body;
+            *response_body = bytes::Bytes::from(body);
             normalized = true;
         }
         ctx.record_deadline_response_header_mutations(response_headers);

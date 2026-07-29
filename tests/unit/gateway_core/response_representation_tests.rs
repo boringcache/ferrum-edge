@@ -98,7 +98,7 @@ async fn run_backend_transform(
     let mut ctx = make_ctx();
     let mut status = status;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -111,7 +111,14 @@ async fn run_backend_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body, reason)
+    (
+        replaced,
+        transformed,
+        status,
+        headers,
+        body.to_vec(),
+        reason,
+    )
 }
 
 /// The secret must not survive in the bytes the client would receive.
@@ -287,7 +294,7 @@ async fn origin_encoding_is_read_from_the_snapshot_not_the_mutated_live_header()
     let mut status = 200;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
-    let mut body = gzip(br#"{"secret":"hunter2","keep":1}"#);
+    let mut body = bytes::Bytes::from(gzip(br#"{"secret":"hunter2","keep":1}"#));
 
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     // A later `after_proxy` header hook drops the encoding header.
@@ -363,7 +370,7 @@ async fn fragment_hidden_by_a_rewritten_status_is_still_rejected() {
     let mut ctx = make_ctx();
     let mut headers = json_headers();
     headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
-    let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2","keep":1}"#);
 
     stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
     // A later hook presents it as a complete response.
@@ -416,7 +423,7 @@ async fn run_synthetic_transform(
     let mut ctx = make_ctx();
     let mut status = status;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     apply_synthetic_response_body_hooks_for_test(
         &plugins,
         &mut ctx,
@@ -426,7 +433,7 @@ async fn run_synthetic_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (status, headers, body, reason)
+    (status, headers, body.to_vec(), reason)
 }
 
 /// A serverless provider answering `429` while echoing stale representation
@@ -561,7 +568,7 @@ async fn unstamped_backend_response_cannot_prove_its_representation_and_is_rejec
     let mut ctx = make_ctx();
     let mut status = 200;
     let mut headers = json_headers();
-    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2"}"#);
     // Deliberately no snapshot.
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -650,7 +657,7 @@ async fn unprotected_responses_are_never_rejected_by_the_gate() {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let mut body = original.clone();
+        let mut body = bytes::Bytes::from(original.clone());
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
         let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -825,7 +832,7 @@ async fn multiple_transformer_instances_all_apply_to_a_decoded_body() {
     let mut status = 200;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
-    let mut body = gzip(br#"{"secret":"hunter2","other":"s3cr3t","keep":1}"#);
+    let mut body = bytes::Bytes::from(gzip(br#"{"secret":"hunter2","other":"s3cr3t","keep":1}"#));
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -868,7 +875,7 @@ async fn grpc_web_representation_rejection_uses_the_grpc_web_error_shape() {
     let mut status = 206;
     let mut headers = json_headers();
     headers.insert("content-range".to_string(), "bytes 0-9/100".to_string());
-    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2"}"#);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -979,7 +986,7 @@ async fn identity_only_codings_are_not_reported_as_representation_rewrites() {
     );
     headers.insert("etag".to_string(), "\"identity-v1\"".to_string());
     let original_body = br#"{"keep":1}"#.to_vec();
-    let mut body = original_body.clone();
+    let mut body = bytes::Bytes::from(original_body.clone());
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     set_original_response_content_encoding_for_test(&mut ctx, "identity, identity");
 
@@ -1230,7 +1237,7 @@ async fn synthetic_body_preserves_the_first_terminal_rejection() {
     let mut ctx = make_ctx();
     let mut status = 200;
     let mut headers = json_headers();
-    let mut body = br#"{"id":"backend"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"id":"backend"}"#);
 
     apply_synthetic_response_body_hooks_for_test(
         &plugins,
@@ -1242,7 +1249,7 @@ async fn synthetic_body_preserves_the_first_terminal_rejection() {
     .await;
 
     assert_eq!(status, 502);
-    assert_eq!(body.as_slice(), br#"{"error":"first body rejection"}"#);
+    assert_eq!(&body[..], br#"{"error":"first body rejection"}"#);
     assert!(
         !final_invoked.load(Ordering::SeqCst),
         "final validators must not replace a previously selected terminal response"
@@ -1260,7 +1267,7 @@ async fn grpc_web_representation_rejection_applies_prefiltered_initial_policy() 
     let mut status = 200;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "zstd".to_string());
-    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2"}"#);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let replaced = transform_buffered_response_body_with_deadline_and_policy_for_test(
@@ -1294,7 +1301,7 @@ async fn synthetic_grpc_web_representation_rejection_applies_initial_policy() {
     let mut status = 200;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "zstd".to_string());
-    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2"}"#);
 
     apply_synthetic_response_body_hooks_for_test(
         &plugins,
@@ -1335,7 +1342,7 @@ async fn representation_rejection_preserves_opt_in_reject_decorators() {
     let mut headers = json_headers();
     headers.insert("content-range".to_string(), "bytes 0-19/512".to_string());
     headers.insert("etag".to_string(), "\"fragment-v1\"".to_string());
-    let mut body = br#"{"secret":"hunter2"}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2"}"#);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -1396,7 +1403,7 @@ async fn native_grpc_representation_rejection_strips_backend_headers() {
         "cache-control".to_string(),
         "public, max-age=600".to_string(),
     );
-    let mut body = b"\x00\x00\x00\x00\x05hello".to_vec();
+    let mut body = bytes::Bytes::from_static(b"\x00\x00\x00\x00\x05hello");
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -1465,7 +1472,7 @@ async fn native_grpc_rejection_survives_after_proxy_content_type_removal() {
         ),
         ("content-encoding".to_string(), "zstd".to_string()),
     ]);
-    let mut body = b"backend-response".to_vec();
+    let mut body = bytes::Bytes::from_static(b"backend-response");
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     assert!(
@@ -1537,7 +1544,7 @@ async fn grpc_representation_rejection_preserves_decorators_with_or_without_dead
                 ("etag".to_string(), "\"backend-v1\"".to_string()),
                 ("set-cookie".to_string(), "backend=secret".to_string()),
             ]);
-            let mut body = b"backend-response".to_vec();
+            let mut body = bytes::Bytes::from_static(b"backend-response");
             stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
             assert!(
@@ -1674,7 +1681,7 @@ async fn earlier_body_rejection_survives_the_representation_gate() {
     let rejection_body = br#"{"error":"forbidden","keep":1}"#.to_vec();
     let mut status = 403;
     let mut headers = json_headers();
-    let mut body = rejection_body.clone();
+    let mut body = bytes::Bytes::from(rejection_body.clone());
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -1714,7 +1721,7 @@ async fn backend_bytes_under_the_same_snapshot_are_still_rejected() {
     stamp_original_response_metadata_for_test(&mut ctx, 206, &headers);
 
     let mut status = 206;
-    let mut body = gzip(br#"{"secret":"hunter2"}"#);
+    let mut body = bytes::Bytes::from(gzip(br#"{"secret":"hunter2"}"#));
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -1883,7 +1890,7 @@ async fn run_with_accept_encoding(
     let mut ctx = ctx_with_client_accept_encoding(accept_encoding);
     let mut status = 200;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -1896,7 +1903,7 @@ async fn run_with_accept_encoding(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body, headers)
+    (replaced, status, reason, body.to_vec(), headers)
 }
 
 #[tokio::test]
@@ -2006,7 +2013,7 @@ async fn run_with_response_limit(
     ctx.max_response_body_size_bytes = max_response_body_size_bytes;
     let mut headers = gzip_json_headers();
     let mut status = 200;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -2019,7 +2026,7 @@ async fn run_with_response_limit(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// A highly compressible JSON document whose decoded size far exceeds a small
@@ -2128,7 +2135,7 @@ async fn run_with_request_hook_then_encoded_response(
     let plugins = redacting_plugins();
     let mut headers = gzip_json_headers();
     let mut status = 200;
-    let mut body = gzip(br#"{"secret":"hunter2","keep":1}"#);
+    let mut body = bytes::Bytes::from(gzip(br#"{"secret":"hunter2","keep":1}"#));
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -2141,7 +2148,7 @@ async fn run_with_request_hook_then_encoded_response(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 #[tokio::test]
@@ -2369,7 +2376,7 @@ async fn run_framed_response_with_relabelled_content_type(
     }
 
     let mut status = 200;
-    let mut body = grpc_frame(br#"{"secret":"hunter2","keep":1}"#);
+    let mut body = bytes::Bytes::from(grpc_frame(br#"{"secret":"hunter2","keep":1}"#));
 
     // The pristine snapshot sees the backend's own headers.
     let mut headers = HashMap::new();
@@ -2395,7 +2402,7 @@ async fn run_framed_response_with_relabelled_content_type(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// One relabelling case: the request flavor, the retained gRPC-Web type, the
@@ -2538,7 +2545,7 @@ async fn a_hook_added_json_type_still_claims_a_genuine_untyped_document() {
         stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
         // An `after_proxy` hook then labels it.
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+        let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2","keep":1}"#);
 
         let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
             &plugins,
@@ -2611,7 +2618,7 @@ async fn grpc_web_request_with_a_genuine_json_response_is_still_redacted() {
 
     let mut status = 200;
     let mut headers = json_headers();
-    let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+    let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2","keep":1}"#);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -2684,7 +2691,7 @@ async fn run_backend_transform_with_request_headers(
     }
     let mut status = status;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, transformed) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -2697,7 +2704,14 @@ async fn run_backend_transform_with_request_headers(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, transformed, status, headers, body, reason)
+    (
+        replaced,
+        transformed,
+        status,
+        headers,
+        body.to_vec(),
+        reason,
+    )
 }
 
 /// The bypass itself: an SSE-accepting request whose response another plugin
@@ -2863,7 +2877,7 @@ async fn relabelled_framed_grpc_declines_in_the_transform_too() {
 
     let mut status = 200;
     let document = br#"{"secret":"unreachable-state","keep":1}"#.to_vec();
-    let mut body = document.clone();
+    let mut body = bytes::Bytes::from(document.clone());
 
     // The backend's own type is framed gRPC, so the snapshot records framing.
     let mut headers = HashMap::new();
@@ -2940,7 +2954,7 @@ async fn run_gateway_generated_after_framed_grpc_backend(
     // `on_response_body` then replaced it with gateway-authored bytes.
     let mut status = status;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -2952,7 +2966,7 @@ async fn run_gateway_generated_after_framed_grpc_backend(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, body, reason)
+    (replaced, status, body.to_vec(), reason)
 }
 
 /// The finding: a stale framed-gRPC stamp must not suppress the claim over
@@ -3100,7 +3114,7 @@ async fn run_backend_transform_reporting_stamped_length(
     let mut ctx = make_ctx();
     let mut status = 200;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -3114,7 +3128,7 @@ async fn run_backend_transform_reporting_stamped_length(
     .await;
     (
         stamped_response_content_length_for_test(&ctx),
-        body,
+        body.to_vec(),
         headers,
     )
 }
@@ -3207,7 +3221,7 @@ async fn a_decoded_gateway_generated_body_is_never_given_a_backend_length_stamp(
     let mut status = 200;
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
-    let mut body = gzip(br#"{"secret":"hunter2","keep":1}"#);
+    let mut body = bytes::Bytes::from(gzip(br#"{"secret":"hunter2","keep":1}"#));
 
     apply_synthetic_response_body_hooks_for_test(
         &plugins,
@@ -3273,7 +3287,7 @@ async fn run_untyped_grpc_route_transform(
 
     let mut status = 200;
     let mut headers = response_headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -3287,7 +3301,7 @@ async fn run_untyped_grpc_route_transform(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// The three request shapes that reach the untyped branch: native gRPC, and
@@ -3530,7 +3544,7 @@ async fn grpc_route_json_replacement_keeps_completed_gateway_decorators() {
         let mut headers = json_headers();
         headers.insert("etag".to_string(), "\"backend-v1\"".to_string());
         headers.insert("set-cookie".to_string(), "backend=secret".to_string());
-        let mut body = br#"{"secret":"hunter2","keep":1}"#.to_vec();
+        let mut body = bytes::Bytes::from_static(br#"{"secret":"hunter2","keep":1}"#);
 
         assert!(
             !run_after_proxy_hooks_for_test(&plugins, &mut ctx, status, &mut headers).await,
@@ -4005,7 +4019,7 @@ async fn run_untyped_grpc_route_with_accept_encoding(
 
     let mut status = 200;
     let mut headers = HashMap::from([("content-encoding".to_string(), "gzip".to_string())]);
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
 
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
@@ -4019,7 +4033,7 @@ async fn run_untyped_grpc_route_with_accept_encoding(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body, headers)
+    (replaced, status, reason, body.to_vec(), headers)
 }
 
 /// The finding: an encoded framed RPC reply whose client sent `identity;q=0`.
@@ -4185,7 +4199,7 @@ async fn run_translated_grpc_web_lifecycle(
         "the test is vacuous unless `grpc_web` actually relabelled the live map"
     );
 
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
         &mut ctx,
@@ -4197,7 +4211,7 @@ async fn run_translated_grpc_web_lifecycle(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, body)
+    (replaced, status, reason, body.to_vec())
 }
 
 /// The bypass: an untyped backend answering a translated gRPC-Web request with a
@@ -4325,7 +4339,7 @@ async fn run_compressing_backend_rejection(
 
     let mut status = status;
     let mut headers = headers;
-    let mut body = body;
+    let mut body = bytes::Bytes::from(body);
     stamp_original_response_metadata_for_test(&mut ctx, status, &headers);
     let (replaced, _) = transform_buffered_response_body_with_deadline_full_for_test(
         &plugins,
@@ -4338,7 +4352,7 @@ async fn run_compressing_backend_rejection(
     )
     .await;
     let reason = representation_rejection_reason_for_test(&ctx).map(str::to_string);
-    (replaced, status, reason, headers, body)
+    (replaced, status, reason, headers, body.to_vec())
 }
 
 /// The control that makes the assertions below non-vacuous: with the SAME

@@ -82,6 +82,23 @@ fn assert_no_metadata_contains(ctx: &RequestContext, needle: &str) {
     }
 }
 
+/// Assert that metadata owned by this plugin contains no raw governed value.
+///
+/// Request tests deliberately retain the proxy's `request_body` buffer in
+/// context metadata; that transport-owned copy is not emitted by the governor
+/// and must not make a governor-metadata leak assertion fail vacuously.
+fn assert_no_governor_metadata_contains(ctx: &RequestContext, needle: &str) {
+    for (key, value) in &ctx.metadata {
+        if !key.starts_with("ai_tool_governor.") {
+            continue;
+        }
+        assert!(
+            !value.contains(needle),
+            "governor metadata key {key:?} leaked {needle:?}: {value:?}"
+        );
+    }
+}
+
 /// Drive a full SSE body through an inspector, returning all forwarded bytes and
 /// whether the stream was terminated.
 async fn drive_stream(
@@ -2298,6 +2315,35 @@ async fn uninspectable_body_conservatively_forces_reqwest_when_streaming_only() 
     assert!(plugin.forces_reqwest_dispatch(&ctx));
 }
 
+#[tokio::test]
+async fn enforce_streaming_only_ambiguity_does_not_claim_a_dry_run_decision() {
+    // This plugin governs only streaming responses. It tentatively scans the
+    // request to choose the inspectable dispatch path, but global mode is still
+    // enforce and request calls are outside its governance surface. Ambiguity
+    // must therefore preserve conservative dispatch without emitting the
+    // dry-run-only observation label.
+    let plugin = make(streaming_config(
+        json!({ "x": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"stream":true,"stream":false}"#.to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
+    assert!(
+        !ctx.metadata.contains_key(AMBIGUITY_METADATA_KEY),
+        "enforce-mode request triage must not claim a dry-run decision"
+    );
+    assert!(
+        !ctx.metadata.contains_key(AMBIGUITY_REASON_KEY),
+        "out-of-scope request triage must not emit an ambiguity policy reason"
+    );
+}
+
 #[test]
 fn streaming_marked_requests_still_buffer_json_fallbacks() {
     // An earlier plugin's `ai_request_streaming` marker (or an SSE Accept
@@ -4145,6 +4191,78 @@ async fn buffered_sse_ungovernable_call_fails_closed() {
             .await,
         Some(502),
     );
+}
+
+/// An ungovernable buffered SSE body must not stage a skip hash: otherwise a
+/// later `on_final_response_body` of the same bytes would hash-skip and
+/// Continue past the uninspectable screen (even after the initial Reject).
+#[tokio::test]
+async fn buffered_sse_ungovernable_never_stages_final_skip_hash() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+    // Same context + same body: must still fail closed. Staging a hash before
+    // the ungovernable screen would let this final re-check hash-skip.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Governable buffered SSE still stages a skip hash so an unchanged final body
+/// does not re-fire a `require_approval` webhook.
+#[tokio::test]
+async fn buffered_sse_governable_still_hash_skips_unchanged_final() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"report.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut sse_headers, body.as_bytes())
+            .await,
+    );
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .await,
+    );
+    server.verify().await;
 }
 
 /// A request whose `Content-Type` was stripped by a transform is still governed
@@ -9182,6 +9300,59 @@ async fn redact_args_amplification_clears_hash_on_transform() {
     );
 }
 
+/// Context-bearing response transform screens ambiguity through the shared
+/// per-request memo (exact BOM-stripped bytes), clears skip ledgers, and lets
+/// the final re-check fail closed — the same recovery as amplification failure.
+#[tokio::test]
+async fn transform_response_ambiguous_body_clears_hash_via_memo_screen() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "token" }]
+            }
+        }
+    }));
+    let clean = response_with_tool_call("filesystem.write", "{\"data\":\"my token here\"}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &clean)
+            .await,
+    );
+
+    // Large enough for the digest-keyed memo path; leading BOM is stripped
+    // before the screen (same bytes-as-key semantics as other context sites).
+    let padding = "x".repeat(8192);
+    let ambiguous = format!(
+        "\u{feff}{{\"pad\":\"{padding}\",\"choices\":[{{\"message\":{{\"tool_calls\":[\
+{{\"id\":\"c1\",\"type\":\"function\",\"function\":{{\
+\"name\":\"filesystem.write\",\"name\":\"other\",\"arguments\":\"{{}}\"}}}}]}}}}]}}"
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                ambiguous.as_bytes(),
+                Some("application/json"),
+                &json_headers(),
+            )
+            .await
+            .is_none(),
+        "ambiguous transform body must decline rewrite"
+    );
+
+    // Skip ledgers cleared: final re-check must not hash-skip the ambiguous
+    // client-visible bytes. A second screen of the same BOM-stripped payload on
+    // this context reuses the memo entry rather than inheriting a stale pass.
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), ambiguous.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
 #[tokio::test]
 async fn aggregate_redacted_arguments_cannot_exceed_response_limit() {
     let plugin = make(amplifying_redact_config("enforce"));
@@ -9438,4 +9609,954 @@ async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
             "probe should be a no-op: {probe}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// GHSA-c78j-5w9p-cpq6 — duplicate JSON object member names
+//
+// `serde_json` collapses duplicate members to the LAST value; many parsers keep
+// the FIRST. This plugin governs the collapsed view and forwards the ORIGINAL
+// bytes, so a duplicated tool name or argument member lets a first-key-wins
+// consumer execute something policy never saw. Governed JSON is therefore
+// screened for duplicate members on every surface, and ambiguity joins the
+// uninspectable class: fail closed in enforce, observe in dry-run.
+// ---------------------------------------------------------------------------
+
+const AMBIGUITY_METADATA_KEY: &str = "ai_tool_governor.decision";
+const AMBIGUITY_REASON_KEY: &str = "ai_tool_governor.uninspectable_reason";
+const AMBIGUITY_REASON_VALUE: &str = "ambiguous_json";
+
+/// Positive dry-run ambiguity contract: forward unchanged, record
+/// `decision=dry_run` + fixed `uninspectable_reason`, never claim deny.
+fn assert_dry_run_ambiguity_observation(ctx: &RequestContext) {
+    assert_eq!(
+        ctx.metadata.get(AMBIGUITY_METADATA_KEY).map(String::as_str),
+        Some("dry_run"),
+        "dry-run ambiguity must record decision=dry_run, got {:?}",
+        ctx.metadata.get(AMBIGUITY_METADATA_KEY)
+    );
+    assert_eq!(
+        ctx.metadata.get(AMBIGUITY_REASON_KEY).map(String::as_str),
+        Some(AMBIGUITY_REASON_VALUE),
+        "dry-run ambiguity must record the fixed reason, got {:?}",
+        ctx.metadata.get(AMBIGUITY_REASON_KEY)
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.mode")
+            .map(String::as_str),
+        Some("dry_run")
+    );
+}
+
+/// A raw JSON-RPC `tools/call` body whose `params` carries an earlier `danger`
+/// name and a later `safe` one. Built as raw text because `serde_json::json!`
+/// cannot express a duplicated member.
+const MCP_DUPLICATE_TOOL_NAME: &str = concat!(
+    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":"#,
+    r#"{"name":"danger","name":"safe","arguments":{}}}"#
+);
+
+fn mcp_governor(mode: &str) -> AiToolGovernor {
+    make(json!({
+        "mode": mode,
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }))
+}
+
+/// Advisory reproduction 3: the governor evaluates `safe` and would forward the
+/// original bytes, which a first-key-wins consumer reads as `danger`.
+#[tokio::test]
+async fn mcp_duplicate_tool_name_fails_closed_in_enforce() {
+    // The differential is real: serde only ever sees the safe name.
+    let parsed: Value = serde_json::from_str(MCP_DUPLICATE_TOOL_NAME).expect("valid JSON");
+    assert_eq!(parsed["params"]["name"], "safe");
+
+    let plugin = mcp_governor("enforce");
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        MCP_DUPLICATE_TOOL_NAME.to_string(),
+    );
+    let mut headers = json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+/// Dry-run observes without disrupting traffic and without claiming
+/// enforcement.
+#[tokio::test]
+async fn mcp_duplicate_tool_name_is_observed_in_dry_run() {
+    let plugin = mcp_governor("dry_run");
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        MCP_DUPLICATE_TOOL_NAME.to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_governor_metadata_contains(&ctx, "danger");
+    assert_no_governor_metadata_contains(&ctx, "safe");
+}
+
+/// The rejection detail is a fixed reason that never echoes the governed body.
+#[tokio::test]
+async fn mcp_duplicate_rejection_detail_echoes_no_body_bytes() {
+    let plugin = mcp_governor("enforce");
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"method":"tools/call","params":{"name":"danger","name":"safe","secret":"SHIBBOLETH"}}"#
+            .to_string(),
+    );
+    let mut headers = json_headers();
+    let body = match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject { body, .. } => body,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert!(
+        body.contains("duplicate JSON object member names"),
+        "detail should name the cause: {body}"
+    );
+    assert!(
+        !body.contains("SHIBBOLETH"),
+        "detail leaked body bytes: {body}"
+    );
+    // The plugin's own metadata must not echo the body either. `request_body`
+    // is the proxy's own buffered copy, not something this plugin wrote.
+    for (key, value) in &ctx.metadata {
+        if key == "request_body" {
+            continue;
+        }
+        assert!(
+            !value.contains("SHIBBOLETH"),
+            "metadata key {key:?} leaked body bytes: {value:?}"
+        );
+    }
+}
+
+/// A duplicate ANYWHERE in the governed request document is caught, including
+/// inside nested `arguments` objects and JSON-RPC batch array entries.
+#[tokio::test]
+async fn duplicate_members_nested_in_request_are_rejected() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    for body in [
+        r#"{"method":"tools/call","params":{"name":"safe","arguments":{"cmd":"rm","cmd":"ls"}}}"#,
+        r#"[{"method":"tools/call","params":{"name":"safe","arguments":{}}},{"method":"tools/call","params":{"name":"danger","name":"safe","arguments":{}}}]"#,
+        r#"{"method":"tools/call","params":{"name":"safe","arguments":{"a":[[{"k":1,"k":2}]]}}}"#,
+    ] {
+        let mut ctx = json_post_ctx();
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        let mut headers = json_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    }
+}
+
+/// Unambiguous governed requests still flow — including a document that reuses
+/// the same member name in sibling objects.
+#[tokio::test]
+async fn unambiguous_governed_requests_still_flow() {
+    let plugin = mcp_governor("enforce");
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"method":"tools/call","params":{"name":"safe","arguments":{"items":[{"k":1},{"k":2}]}}}"#
+            .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+/// The FINAL backend-visible request body is screened too, so a request
+/// transform cannot re-introduce ambiguity after `before_proxy` cleared it.
+#[tokio::test]
+async fn duplicate_members_in_final_request_body_fail_closed() {
+    let plugin = mcp_governor("enforce");
+    let mut ctx = json_post_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &json_headers(),
+            MCP_DUPLICATE_TOOL_NAME.as_bytes(),
+        )
+        .await;
+    assert_reject(result, Some(502));
+}
+
+/// A tool call whose `arguments` arrive as a JSON STRING is a second document
+/// the enclosing screen cannot see into. An ambiguous one makes the call
+/// ungovernable rather than being evaluated on a last-wins collapse.
+#[tokio::test]
+async fn ambiguous_tool_argument_string_makes_a_request_call_ungovernable() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "run": { "action": "allow", "required_args": ["cmd"] } },
+        "inspect": { "a2a_methods": true, "mcp_tool_calls": false, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "run",
+            "params": r#"{"cmd":"rm -rf /","cmd":"ls"}"#
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+/// A response body whose objects carry duplicate members cannot be governed:
+/// the CLIENT is the first-key-wins parser here.
+#[tokio::test]
+async fn duplicate_members_in_buffered_response_fail_closed() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let body = concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// The duplicate-key verdict cannot depend on `serde_json::Value` accepting the
+/// entire body. A valid document can exceed serde's recursive materialization
+/// limit while remaining acceptable to a downstream parser; extra nesting must
+/// not turn a root duplicate tool name into an unparseable-response bypass.
+#[tokio::test]
+async fn duplicate_response_stays_fail_closed_past_serde_value_depth_limit() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    let depth = 200usize;
+    let mut body = String::from(concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"padding":"#
+    ));
+    for _ in 0..depth {
+        body.push('[');
+    }
+    for _ in 0..depth {
+        body.push(']');
+    }
+    body.push('}');
+
+    assert!(
+        serde_json::from_str::<Value>(&body).is_err(),
+        "fixture must exceed serde_json::Value's recursive depth limit"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Dry-run forwards the same body untouched.
+#[tokio::test]
+async fn duplicate_members_in_buffered_response_are_forwarded_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let body = concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+    assert_no_metadata_contains(&ctx, "safe");
+}
+
+/// A response tool call whose `arguments` STRING is ambiguous joins the
+/// ungovernable class, exactly like a missing `function.name`.
+#[tokio::test]
+async fn ambiguous_response_tool_argument_string_fails_closed() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "deploy": { "action": "allow", "required_args": ["env"] } }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", r#"{"env":"prod","env":"dev"}"#);
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut json_headers(), &body)
+            .await,
+        Some(502),
+    );
+
+    // The unambiguous equivalent still passes.
+    let mut clean_ctx = create_test_context();
+    let clean = response_with_tool_call("deploy", r#"{"env":"prod"}"#);
+    assert_continue(
+        plugin
+            .on_response_body(&mut clean_ctx, 200, &mut json_headers(), &clean)
+            .await,
+    );
+}
+
+const SSE_DUPLICATE_MEMBER_FRAMES: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+    "\"function\":{\"name\":\"danger\",\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+/// A LIVE SSE `data:` payload with duplicate members cuts the stream in enforce
+/// mode, and no held frame reaches the client.
+#[tokio::test]
+async fn live_sse_duplicate_member_frame_cuts_the_stream_in_enforce() {
+    let plugin = make(streaming_config(
+        json!({ "get_weather": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let bytes = SSE_DUPLICATE_MEMBER_FRAMES.as_bytes();
+    let (first, second) = bytes.split_at(bytes.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, second]).await;
+
+    assert!(
+        terminated,
+        "an ambiguous SSE data payload must cut the stream in enforce mode"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("danger"),
+        "the ambiguous frame must not be released: {text}"
+    );
+    assert!(
+        !text.contains("get_weather"),
+        "held tool-call bytes must not be released: {text}"
+    );
+}
+
+/// Dry-run releases the same stream unchanged.
+#[tokio::test]
+async fn live_sse_duplicate_member_frame_is_released_in_dry_run() {
+    let mut config = streaming_config(
+        json!({ "get_weather": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    );
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = SSE_DUPLICATE_MEMBER_FRAMES.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not disrupt the stream");
+    assert_eq!(out, bytes, "dry-run must forward the body unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+    assert_no_metadata_contains(&ctx, "get_weather");
+}
+
+/// The BUFFERED SSE path mirrors the live inspector: the same body delivered
+/// buffered is equally ungovernable.
+#[tokio::test]
+async fn buffered_sse_duplicate_member_frame_fails_closed() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" }, "danger": { "action": "deny" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut headers,
+                SSE_DUPLICATE_MEMBER_FRAMES.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+}
+
+/// A JSON-shaped body under an SSE label AND a `Content-Encoding` takes the
+/// decode-then-govern branch of `on_response_body`. The DECODED bytes must be
+/// screened for duplicate members before they are governed (and before their
+/// hash is staged for the terminal re-check): otherwise the plugin evaluates
+/// the `serde_json` last-wins view, forwards bytes a first-key-wins client
+/// reads as the denied call, and the terminal hook hash-skips them.
+#[tokio::test]
+async fn encoded_sse_labeled_json_with_duplicate_members_fails_closed() {
+    let plugin = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    // The differential is real: serde only ever sees the ALLOWED name.
+    let parsed: Value = serde_json::from_str(ENCODED_SSE_AMBIGUOUS_JSON).expect("valid JSON");
+    assert_eq!(
+        parsed["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "safe"
+    );
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(ENCODED_SSE_AMBIGUOUS_JSON.as_bytes()),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Control: the same branch still governs normally — the unambiguous
+    // equivalent with the allowed call is forwarded, so the rejection above is
+    // the duplicate-member screen and not a blanket refusal of this route.
+    let clean = ENCODED_SSE_AMBIGUOUS_JSON.replace(r#""name":"danger","#, "");
+    let mut clean_ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut clean_ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(clean.as_bytes()),
+            )
+            .await,
+    );
+}
+
+/// Dry-run parity on the same encoded, SSE-labeled, JSON-shaped branch: observe
+/// without disrupting the response.
+#[tokio::test]
+async fn encoded_sse_labeled_json_with_duplicate_members_forwards_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "danger": { "action": "deny" }, "safe": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut encoded_sse_headers(),
+                &gzip(ENCODED_SSE_AMBIGUOUS_JSON.as_bytes()),
+            )
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+}
+
+/// Chat Completions JSON carrying a duplicated `function.name`, mislabeled
+/// `text/event-stream` and compressed.
+const ENCODED_SSE_AMBIGUOUS_JSON: &str = concat!(
+    r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+    r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+    r#"{"name":"danger","name":"safe","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+);
+
+fn encoded_sse_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers
+}
+
+/// Streaming argument deltas reassemble into an ambiguous arguments document:
+/// the accumulated string is screened, so the batch is ungovernable and the
+/// stream is cut before the held frames are released.
+#[tokio::test]
+async fn streaming_reassembled_ambiguous_arguments_cut_the_stream() {
+    let plugin = make(streaming_config(
+        json!({ "run": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"cmd\\\":\\\"rm\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"\\\",\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(
+        terminated,
+        "reassembled ambiguous arguments must cut the stream"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("rm"),
+        "held ambiguous argument bytes leaked: {text}"
+    );
+}
+
+/// A JSON-shaped body delivered under an SSE label is held in full and governed
+/// at end-of-stream; ambiguity there also cuts the stream rather than releasing
+/// the held bytes.
+#[tokio::test]
+async fn json_shaped_stream_with_duplicate_members_cuts_the_stream() {
+    let plugin = make(streaming_config(
+        json!({ "danger": { "action": "deny" }, "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(
+        terminated,
+        "an ambiguous JSON-shaped stream must cut the stream in enforce mode"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out).contains("danger"),
+        "held JSON body must not be released"
+    );
+}
+
+/// Two governor instances inspecting the SAME body in the same phase both fail
+/// closed. The shared per-request screen memo is a cache, never a decision: it
+/// must not let a second plugin inherit a pass.
+#[tokio::test]
+async fn shared_screen_memo_does_not_let_a_second_plugin_inherit_a_pass() {
+    let first = mcp_governor("enforce");
+    let second = mcp_governor("enforce");
+
+    // A body large enough to engage the digest-keyed memo path.
+    let padding = "x".repeat(8192);
+    let clean = format!(
+        r#"{{"pad":"{padding}","method":"tools/call","params":{{"name":"safe","arguments":{{}}}}}}"#
+    );
+    let ambiguous = format!(
+        r#"{{"pad":"{padding}","method":"tools/call","params":{{"name":"danger","name":"safe","arguments":{{}}}}}}"#
+    );
+
+    // First: a clean body passes both plugins and seeds the memo.
+    let mut ctx = json_post_ctx();
+    let headers = json_headers();
+    assert_continue(
+        first
+            .on_final_request_body_with_context(&mut ctx, &headers, clean.as_bytes())
+            .await,
+    );
+    assert_continue(
+        second
+            .on_final_request_body_with_context(&mut ctx, &headers, clean.as_bytes())
+            .await,
+    );
+
+    // Then a rewritten (ambiguous) body on the SAME context: the memo is keyed
+    // on the body digest, so neither plugin inherits the earlier pass.
+    let mut ctx = json_post_ctx();
+    assert_reject(
+        first
+            .on_final_request_body_with_context(&mut ctx, &headers, ambiguous.as_bytes())
+            .await,
+        Some(502),
+    );
+    let mut ctx = json_post_ctx();
+    assert_continue(
+        first
+            .on_final_request_body_with_context(&mut ctx, &headers, clean.as_bytes())
+            .await,
+    );
+    assert_reject(
+        second
+            .on_final_request_body_with_context(&mut ctx, &headers, ambiguous.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Malformed governed JSON keeps its existing handling and never panics; the
+/// screen must not reclassify parse failures as ambiguity.
+#[tokio::test]
+async fn malformed_governed_bodies_do_not_panic() {
+    let plugin = mcp_governor("enforce");
+    for body in [
+        "{",
+        "{\"method\":}",
+        "{\"method\":\"tools/call\"} trailing",
+        "\u{feff}{\"method\":\"tools/call\",\"params\":{\"name\":\"safe\"}}",
+    ] {
+        let mut ctx = json_post_ctx();
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        let mut headers = json_headers();
+        // Enforce mode fails closed on ANY uninspectable governed body, so the
+        // assertion here is only that it is a controlled rejection.
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    }
+}
+
+/// The screen is non-recursive: a pathologically deep governed body is refused
+/// on a budget rather than overflowing the stack.
+#[tokio::test]
+async fn pathologically_deep_governed_body_is_refused_without_stack_overflow() {
+    let plugin = mcp_governor("enforce");
+    let depth = 50_000usize;
+    let mut body = String::with_capacity(depth * 2 + 64);
+    body.push_str(r#"{"method":"tools/call","params":{"name":"safe","arguments":"#);
+    for _ in 0..depth {
+        body.push('[');
+    }
+    for _ in 0..depth {
+        body.push(']');
+    }
+    body.push_str("}}");
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert("request_body".to_string(), body);
+    let mut headers = json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+/// Final backend-visible request ambiguity: dry-run forwards and records the
+/// fixed observation; enforce still rejects.
+#[tokio::test]
+async fn final_request_duplicate_members_are_observed_in_dry_run() {
+    let enforce = mcp_governor("enforce");
+    let mut enforce_ctx = json_post_ctx();
+    assert_reject(
+        enforce
+            .on_final_request_body_with_context(
+                &mut enforce_ctx,
+                &json_headers(),
+                MCP_DUPLICATE_TOOL_NAME.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+
+    let plugin = mcp_governor("dry_run");
+    let mut ctx = json_post_ctx();
+    let body = MCP_DUPLICATE_TOOL_NAME.as_bytes();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body)
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// Trailing-event Ambiguous arm: an incomplete final `data:` event with
+/// duplicate members is classified only at `on_end`. Dry-run forwards it and
+/// records the observation; enforce cuts.
+#[tokio::test]
+async fn trailing_sse_duplicate_member_frame_is_observed_in_dry_run() {
+    // Complete stop event, then an ambiguous payload left in the carry (no
+    // trailing blank line) so classification happens in `on_end`.
+    let trailing = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"danger\",\"name\":\"safe\",\"arguments\":\"{}\"}}]}}]}"
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "safe": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[trailing.as_bytes()]).await;
+    assert!(
+        enforce_terminated,
+        "trailing ambiguous event must cut the stream in enforce"
+    );
+    assert!(
+        !String::from_utf8_lossy(&enforce_out).contains("danger"),
+        "enforce must not release the ambiguous trailing frame"
+    );
+
+    let mut config = streaming_config(
+        json!({ "safe": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    );
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = trailing.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not cut on trailing ambiguity");
+    assert_eq!(out, bytes, "dry-run must forward trailing bytes unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// Fully-held JSON-shaped stream with duplicate members: dry-run forwards
+/// byte-for-byte and records the fixed observation; enforce cuts.
+#[tokio::test]
+async fn json_shaped_stream_duplicate_members_are_observed_in_dry_run() {
+    let body = concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "danger": { "action": "deny" }, "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[body.as_bytes()]).await;
+    assert!(enforce_terminated);
+    assert!(!String::from_utf8_lossy(&enforce_out).contains("danger"));
+
+    let mut config = streaming_config(
+        json!({ "danger": { "action": "deny" }, "get_weather": { "action": "allow" } }),
+        "deny",
+    );
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(
+        !terminated,
+        "dry-run must not cut a JSON-shaped ambiguous body"
+    );
+    assert_eq!(out, bytes, "dry-run must forward the held JSON unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// String-form tool argument ambiguity on the request path: dry-run forwards
+/// and records the observation; enforce rejects.
+#[tokio::test]
+async fn ambiguous_tool_argument_string_is_observed_in_dry_run() {
+    let config = json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "run": { "action": "allow", "required_args": ["cmd"] } },
+        "inspect": { "a2a_methods": true, "mcp_tool_calls": false, "response_tool_calls": false }
+    });
+    let plugin = make(config);
+    let mut ctx = json_post_ctx();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "run",
+        "params": r#"{"cmd":"rm -rf /","cmd":"ls"}"#
+    })
+    .to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_governor_metadata_contains(&ctx, "rm -rf");
+    assert_no_governor_metadata_contains(&ctx, "SHIBBOLETH");
+
+    let enforce = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "run": { "action": "allow", "required_args": ["cmd"] } },
+        "inspect": { "a2a_methods": true, "mcp_tool_calls": false, "response_tool_calls": false }
+    }));
+    let mut enforce_ctx = json_post_ctx();
+    enforce_ctx
+        .metadata
+        .insert("request_body".to_string(), body);
+    let mut enforce_headers = json_headers();
+    assert_reject(
+        enforce
+            .before_proxy(&mut enforce_ctx, &mut enforce_headers)
+            .await,
+        Some(502),
+    );
+}
+
+/// Streaming reassembled argument string with duplicate members: dry-run
+/// releases held frames and records the observation; enforce cuts.
+#[tokio::test]
+async fn streaming_reassembled_ambiguous_arguments_are_observed_in_dry_run() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"cmd\\\":\\\"rm\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"\\\",\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "run": { "action": "allow" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[body.as_bytes()]).await;
+    assert!(enforce_terminated);
+    assert!(!String::from_utf8_lossy(&enforce_out).contains("rm"));
+
+    let mut config = streaming_config(json!({ "run": { "action": "allow" } }), "deny");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(
+        !terminated,
+        "dry-run must release reassembled ambiguous args"
+    );
+    assert_eq!(out, bytes, "dry-run must forward held frames unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "rm");
+    assert_no_metadata_contains(&ctx, "ls");
+}
+
+/// Multiple mid-stream ambiguous frames must not grow metadata cardinality.
+#[tokio::test]
+async fn multiple_sse_ambiguous_frames_keep_fixed_observation_cardinality() {
+    let frames = concat!(
+        "data: {\"a\":1,\"a\":2}\n\n",
+        "data: {\"b\":1,\"b\":2}\n\n",
+        "data: {\"c\":1,\"c\":2}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut config = streaming_config(json!({}), "deny");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = frames.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated);
+    assert_eq!(out, bytes);
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    let reason = ctx
+        .metadata
+        .get(AMBIGUITY_REASON_KEY)
+        .expect("reason present");
+    assert_eq!(reason, AMBIGUITY_REASON_VALUE);
+    assert!(
+        !reason.contains(','),
+        "repeated ambiguous frames must not grow reason cardinality: {reason}"
+    );
+}
+
+/// Buffered SSE duplicate-member frame: dry-run forwards and records the
+/// fixed observation (parity with the live inspector).
+#[tokio::test]
+async fn buffered_sse_duplicate_member_frame_is_observed_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" }, "danger": { "action": "deny" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut headers,
+                SSE_DUPLICATE_MEMBER_FRAMES.as_bytes(),
+            )
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
 }

@@ -3,8 +3,8 @@
 //! Provides:
 //! - [`Notification`] — generic notification payload (title, body, severity,
 //!   k/v fields, lifecycle action). No alert-specific fields.
-//! - [`NotificationChannel`] — Slack / Teams / Discord / generic Webhook
-//!   transport implementations sharing a uniform `dispatch` surface.
+//! - [`NotificationChannel`] — Slack / Teams / Discord / generic Webhook /
+//!   SMTP email transport implementations sharing a uniform `dispatch` surface.
 //! - [`channels::parse_channels`] — JSON-driven config parser used by any
 //!   subsystem that wants to expose a `channels: { name -> def }` block to
 //!   operators.
