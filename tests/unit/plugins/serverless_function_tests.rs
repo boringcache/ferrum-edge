@@ -2059,18 +2059,26 @@ fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
     let mut control_unknown = serde_json::Map::new();
     control_unknown.insert("grpc_status".to_string(), json!(0));
     control_unknown.insert(
-        "bad\nkey\u{7}".to_string(),
+        "bad\nkey\u{7}'fake\u{2028}line\u{2029}paragraph".to_string(),
         json!("VALUE_MUST_NOT_ECHO"),
     );
     let control_unknown = serde_json::to_vec(&Value::Object(control_unknown)).unwrap();
     let detail = build(200, &control_unknown, MAX_BODY).unwrap_err();
     assert!(
-        !detail.contains('\n') && !detail.contains('\r') && !detail.contains('\u{7}'),
+        !detail.contains('\n')
+            && !detail.contains('\r')
+            && !detail.contains('\u{7}')
+            && !detail.contains('\u{2028}')
+            && !detail.contains('\u{2029}'),
         "raw control bytes must not reach the diagnostic: {detail:?}"
     );
     assert!(
-        detail.contains("\\n") && detail.contains("\\u{0007}"),
-        "controls must be escaped for operators: {detail:?}"
+        detail.contains("\\n")
+            && detail.contains("\\u{0007}")
+            && detail.contains("\\'fake")
+            && detail.contains("\\u{2028}")
+            && detail.contains("\\u{2029}"),
+        "controls, delimiters, and Unicode separators must be escaped for operators: {detail:?}"
     );
     assert!(
         !detail.contains("VALUE_MUST_NOT_ECHO"),

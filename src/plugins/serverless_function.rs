@@ -2024,8 +2024,9 @@ fn sanitize_grpc_terminate_message(message: &str) -> String {
 }
 
 /// Render a function-controlled field name for an operator diagnostic: control
-/// characters become single-line escapes, and the displayed fragment is capped
-/// at [`MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS`].
+/// characters, Unicode line separators, and the surrounding quote delimiter
+/// become single-line escapes, and the displayed fragment is capped at
+/// [`MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS`].
 fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
     let mut out = String::new();
     let mut displayed = 0usize;
@@ -2034,7 +2035,10 @@ fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
             '\n' => "\\n".to_string(),
             '\r' => "\\r".to_string(),
             '\t' => "\\t".to_string(),
+            '\'' => "\\'".to_string(),
             '\\' => "\\\\".to_string(),
+            '\u{2028}' => "\\u{2028}".to_string(),
+            '\u{2029}' => "\\u{2029}".to_string(),
             c if c.is_control() => format!("\\u{{{:04x}}}", c as u32),
             c => c.to_string(),
         };
@@ -2056,7 +2060,13 @@ fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
 fn bound_grpc_terminate_operator_detail(detail: String) -> String {
     let single_line: String = detail
         .chars()
-        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let char_count = single_line.chars().count();
     if char_count <= MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS {
