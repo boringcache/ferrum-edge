@@ -4171,6 +4171,7 @@ pub mod _test_support {
                 body: normalized.body,
                 grpc_status: normalized.grpc_status,
                 grpc_message: normalized.grpc_message,
+                grpc_trailers: normalized.grpc_trailers,
             },
             grpc_web_error,
         )
