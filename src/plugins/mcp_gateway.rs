@@ -4773,6 +4773,14 @@ impl Plugin for McpGateway {
             );
             return None;
         }
+        // Screen the exact upstream bytes before any serde materialization can
+        // collapse duplicate members. Returning `None` preserves those bytes
+        // for the authoritative final hook, which will reject the same
+        // ambiguity (reusing the bounded memo for larger bodies) when
+        // outputSchema enforcement is active.
+        if ctx.json_scan_memo.ambiguity(body).is_some() {
+            return None;
+        }
 
         let method = ctx.metadata.get(METADATA_RESPONSE_REWRITE_METHOD_KEY)?;
         if !matches!(
@@ -4946,7 +4954,7 @@ impl Plugin for McpGateway {
         // so an ambiguous document would make the gateway validate a different
         // `result` / `structuredContent` / nested value than the caller sees.
         // `reason` is fixed-cardinality and never echoes body bytes.
-        if let Some(reason) = crate::util::json_dup_keys::slice_ambiguity(body) {
+        if let Some(reason) = ctx.json_scan_memo.ambiguity(body) {
             return self.reject_invalid_tool_result(ctx, None, reason);
         }
         let value: Value = match serde_json::from_slice(body) {

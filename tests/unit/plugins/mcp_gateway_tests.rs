@@ -8918,6 +8918,18 @@ async fn validate_tool_results_rejects_duplicate_json_keys() {
         let mut ctx =
             route_validated_tool_call(&plugin, &session_id, 980 + offset as i64 * 2).await;
         let headers = known_json_response_headers(body);
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    body,
+                    Some("application/json"),
+                    &headers,
+                )
+                .await
+                .is_none(),
+            "{case}: response rewrite must not materialize ambiguous raw JSON"
+        );
         let (status, response, _) = reject_json(
             plugin
                 .on_final_response_body(&mut ctx, 200, &headers, body)
