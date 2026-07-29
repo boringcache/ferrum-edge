@@ -17551,6 +17551,13 @@ mod tests {
 
     #[test]
     fn node_waypoint_udp_scoped_operator_authz_override_disables_udp_service() {
+        with_mesh_env(
+            &[],
+            node_waypoint_udp_scoped_operator_authz_override_disables_udp_service_inner,
+        );
+    }
+
+    fn node_waypoint_udp_scoped_operator_authz_override_disables_udp_service_inner() {
         let spiffe = "spiffe://cluster.local/ns/default/sa/dns";
         let mut svc = http_mesh_service("dns", 53, spiffe);
         svc.ports[0].protocol = AppProtocol::Udp;
