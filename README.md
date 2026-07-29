@@ -349,7 +349,7 @@ Auto-detects OpenAI, Anthropic, Google Gemini, Cohere, Mistral, and AWS Bedrock 
 
 ### Centralized Rate Limiting
 
-`rate_limiting` and `ai_rate_limiter` support centralized mode via `sync_mode: "redis"` for coordinated limits across multiple gateway instances. `ws_rate_limiting` also supports `sync_mode: "redis"`, but only to externalize per-connection frame counters under a per-plugin/gateway-instance Redis namespace — budgets are not shared across instances or portable across reconnects/rebuilds. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Redis TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` settings.
+`rate_limiting` and `ai_rate_limiter` support centralized mode via `sync_mode: "redis"` for coordinated limits across multiple gateway instances. When the centralized store cannot be consulted, `redis_failure_policy` decides: `fail_closed` (default) refuses, `local_fallback` explicitly opts into per-process budgets. Redis Cluster is not supported and is screened at connect — see [docs/plugins.md](docs/plugins.md#rate_limiting). `ws_rate_limiting` also supports `sync_mode: "redis"`, but only to externalize per-connection frame counters under a per-plugin/gateway-instance Redis namespace — budgets are not shared across instances or portable across reconnects/rebuilds. Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). Redis TLS uses gateway-level `FERRUM_TLS_CA_BUNDLE_PATH` and `FERRUM_TLS_NO_VERIFY` settings.
 
 ### Custom Plugins
 

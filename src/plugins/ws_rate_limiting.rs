@@ -12,10 +12,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::utils::rate_limit::{
-    RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, WsFrameRateAlgorithm, WsRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, validate_ws_frame_rate_params,
+    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    WsFrameRateAlgorithm, WsRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    debug_assert_rate_limit_redis_keys, validate_ws_frame_rate_params,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{Plugin, PluginHttpClient, ProxyProtocol, WS_ONLY_PROTOCOLS, WebSocketFrameDirection};
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -26,14 +26,14 @@ const WS_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
 /// Closed top-level key set for `ws_rate_limiting` plugin config.
 ///
 /// Must stay aligned with OpenAPI `WsRateLimitingConfig`,
-/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
+/// [`RATE_LIMIT_REDIS_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
 /// `frames_per_secod`/`redis_tsl` otherwise loaded silently as the default
 /// frame budget or plaintext Redis transport.
 pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "frames_per_second",
     "burst_size",
     "close_reason",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_tls",
     "redis_url",
@@ -43,6 +43,7 @@ pub const WS_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 const MAX_STATE_ENTRIES: usize = 50_000;
@@ -82,10 +83,11 @@ impl WsRateLimiting {
         let object = config
             .as_object()
             .ok_or_else(|| "ws_rate_limiting: config must be an object".to_string())?;
+        debug_assert_rate_limit_redis_keys();
         debug_assert_closed_root_keys(
             WS_RATE_LIMITING_CONFIG_KEYS,
             WS_RATE_LIMITING_POLICY_CONFIG_KEYS,
-            REDIS_PLUGIN_CONFIG_KEYS,
+            RATE_LIMIT_REDIS_CONFIG_KEYS,
         );
         reject_unknown_keys(
             object,
@@ -138,6 +140,15 @@ impl WsRateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective `redis_failure_policy` for advisory coverage. Not a production
+    /// API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
     }
 
     /// Controllable-time seed for external cleanup tests. Not a production API.
@@ -246,6 +257,17 @@ impl WsRateLimiting {
         if outcome.allowed {
             return None;
         }
+
+        // A fail-closed refusal (centralized enforcement unavailable under
+        // `redis_failure_policy: "fail_closed"`) closes the connection just like
+        // an exceeded budget — a frame stream has no other refusal channel. It is
+        // not a budget overrun, so it neither increments `rate_limit_exceeded`
+        // nor logs here; the shared backend already emits the bounded
+        // once-per-outage warning.
+        if outcome.enforcement_unavailable {
+            return Some(self.policy_close());
+        }
+
         super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
         let dir_label = match direction {
