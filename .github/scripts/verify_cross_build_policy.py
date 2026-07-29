@@ -1673,12 +1673,13 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
     timeout-minutes: 30
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache, but this isolated fuzz
-    # job does not install it. Disable both Cargo wrapper inputs explicitly so
-    # toolchain discovery cannot fail before the pinned jobs run.
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
@@ -1716,6 +1717,39 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
               -rss_limit_mb=512
           done
 """
+
+# Adopting the byte-frozen job above is only half of the gate: a lane nothing
+# observes is not a gate at all, so the first adoption must also make
+# `fuzz-smoke` a required input of the `test` aggregate. That aggregate is read
+# as Cross-sensitive by the pull-request scan, so its per-job digest surface
+# moves the moment those lines land, and `compare_pr_workflow_job` rejected the
+# complete adoption while accepting the useless half of it.
+#
+# Exactly three lines are admitted, each anchored to the trusted-base line it
+# must immediately follow. Anchoring is what keeps this from becoming a general
+# licence to edit the aggregate: the admission can only *insert* these three
+# byte-exact lines at these three positions, and the digest comparison that
+# follows still sees every other byte of the job. A missing line, a duplicated
+# line, a tampered result expression, a relocated line, or any unrelated
+# aggregate edit leaves a digest difference or raises an error of its own.
+CI_AGGREGATE_JOB_NAME = "test"
+CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS = (
+    (
+        "needs list",
+        "      - lint\n",
+        "      - fuzz-smoke\n",
+    ),
+    (
+        "result summary row",
+        '          add_row "Lint" "${{ needs.lint.result }}"\n',
+        '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+    ),
+    (
+        "required-gate assertion",
+        '          require_success "Lint" "${{ needs.lint.result }}"\n',
+        '          require_success "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+    ),
+)
 
 # The scheduled sanitizer lane is a whole-file contract rather than a job
 # contract: the file's triggers, permissions, and concurrency are as
@@ -1769,12 +1803,13 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    # The repository-root Cargo config selects sccache, but this isolated fuzz
-    # job does not install it. Disable both Cargo wrapper inputs explicitly so
-    # toolchain discovery cannot fail before the pinned jobs run.
+    # The repository-root Cargo config selects sccache and host linker flags,
+    # but this isolated fuzz job installs neither sccache nor mold. Disable both
+    # Cargo wrapper inputs and inherited rustflags explicitly.
     env:
       RUSTC_WRAPPER: ""
       CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -9105,6 +9140,112 @@ def without_admitted_job_surfaces(
     )
 
 
+class FuzzAggregateWiring(NamedTuple):
+    """How one revision of `ci.yml` wires the admitted fuzz gate.
+
+    `state` is `"absent"` when the aggregate carries none of the admitted
+    references, `"present"` when it carries exactly all three at their anchored
+    positions, and `"invalid"` for anything between. `contents` is the workflow
+    with the admitted lines withheld, and is the *unmodified* input for every
+    state but `"present"`, so a partial or tampered wiring keeps the digest
+    difference it produced.
+    """
+
+    state: str
+    contents: str
+    errors: list[str]
+
+
+def ci_fuzz_smoke_aggregate_wiring(contents: str, source: str) -> FuzzAggregateWiring:
+    """Classify, and withhold, the admitted fuzz wiring in the `test` aggregate.
+
+    Absence is allowed for the same reason the job itself may be absent: the
+    lane is opt-in. Presence is allowed only as the three byte-exact lines in
+    `CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`, each immediately after its anchor, and
+    only when the `fuzz-smoke` job it requires is itself present and
+    byte-identical to the frozen contract. Nothing else about the aggregate is
+    exempted: the caller still compares the withheld rendering byte for byte
+    against the trusted base, so any other edit to the job is still rejected.
+    """
+
+    block, failures = extract_job_block(
+        contents,
+        source,
+        CI_AGGREGATE_JOB_NAME,
+        required=False,
+    )
+    if failures:
+        return FuzzAggregateWiring("invalid", contents, failures)
+    if block is None:
+        return FuzzAggregateWiring("absent", contents, [])
+    if not any(
+        added in block for _, _, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS
+    ):
+        return FuzzAggregateWiring("absent", contents, [])
+
+    errors: list[str] = []
+    withheld = block
+    for label, anchor, added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        occurrences = withheld.count(added)
+        if occurrences != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must carry the admitted "
+                f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} exactly once "
+                f"({added.strip()!r} appears {occurrences} times)"
+            )
+            continue
+        if withheld.count(anchor + added) != 1:
+            errors.append(
+                f"{source} job {CI_AGGREGATE_JOB_NAME!r} must place the admitted "
+                f"{CI_FUZZ_SMOKE_JOB_NAME!r} {label} immediately after "
+                f"{anchor.strip()!r}"
+            )
+            continue
+        withheld = withheld.replace(anchor + added, anchor, 1)
+    if CI_FUZZ_SMOKE_JOB_NAME not in admitted_ci_job_names(contents, source):
+        errors.append(
+            f"{source} job {CI_AGGREGATE_JOB_NAME!r} requires the "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} gate, so that job must be present and "
+            "byte-identical to the admitted fuzz-smoke contract"
+        )
+    if errors:
+        return FuzzAggregateWiring("invalid", contents, errors)
+
+    start = contents.find(block)
+    if start < 0:
+        return FuzzAggregateWiring(
+            "invalid",
+            contents,
+            [f"{source} job {CI_AGGREGATE_JOB_NAME!r} cannot be isolated"],
+        )
+    return FuzzAggregateWiring(
+        "present",
+        contents[:start] + withheld + contents[start + len(block) :],
+        [],
+    )
+
+
+def ci_fuzz_smoke_aggregate_removal_errors(
+    baseline_state: str,
+    proposed_state: str,
+    source: str,
+) -> list[str]:
+    """Keep the admitted aggregate wiring once the trusted base has adopted it.
+
+    Withholding the three lines from both sides is symmetric, so a pull request
+    that simply deletes them would compare equal. This is the check that makes
+    the admission one-way.
+    """
+
+    if baseline_state == "present" and proposed_state != "present":
+        return [
+            f"{source} cannot remove or alter the admitted "
+            f"{CI_FUZZ_SMOKE_JOB_NAME!r} wiring in the "
+            f"{CI_AGGREGATE_JOB_NAME!r} aggregate after the trusted base adopts it"
+        ]
+    return []
+
+
 def frozen_fuzz_workflow_errors(contents: str, source: str) -> list[str]:
     """Require `fuzz.yml`, when present, to be the frozen scheduled lane.
 
@@ -13563,13 +13704,39 @@ def compare_pr_workflow_job(
                 "because it schedules the protected ARM64 invocation"
             )
 
+    # The `test` aggregate is Cross-sensitive to the pull-request scan, so its
+    # digest surface moves when the mandatory `fuzz-smoke` gate wiring lands.
+    # Only the three anchored, byte-exact admitted lines are withheld, and they
+    # are withheld from both sides, so the digest comparison below still reads
+    # every other byte of the aggregate on both revisions.
+    baseline_wiring = FuzzAggregateWiring("absent", merge_base_contents, [])
+    proposed_wiring = FuzzAggregateWiring("absent", proposed_contents, [])
+    if source == "CI workflow":
+        baseline_wiring = ci_fuzz_smoke_aggregate_wiring(
+            merge_base_contents,
+            f"merge-base {source}",
+        )
+        proposed_wiring = ci_fuzz_smoke_aggregate_wiring(
+            proposed_contents,
+            f"proposed {source}",
+        )
+        errors.extend(baseline_wiring.errors)
+        errors.extend(proposed_wiring.errors)
+        errors.extend(
+            ci_fuzz_smoke_aggregate_removal_errors(
+                baseline_wiring.state,
+                proposed_wiring.state,
+                source,
+            )
+        )
+
     baseline_surfaces, baseline_surface_failures = pr_workflow_job_surfaces(
-        merge_base_contents,
+        baseline_wiring.contents,
         f"merge-base {source}",
         job_name,
     )
     proposed_surfaces, proposed_surface_failures = pr_workflow_job_surfaces(
-        proposed_contents,
+        proposed_wiring.contents,
         f"proposed {source}",
         job_name,
     )
@@ -22187,15 +22354,16 @@ pre_build = []
             failures.append(
                 f"the admitted {admitted_label} requests write permission"
             )
-        wrapper_override_block = (
+        cargo_override_block = (
             '    env:\n'
             '      RUSTC_WRAPPER: ""\n'
             '      CARGO_BUILD_RUSTC_WRAPPER: ""\n'
+            '      RUSTFLAGS: ""\n'
         )
-        if wrapper_override_block not in admitted_text:
+        if cargo_override_block not in admitted_text:
             failures.append(
-                f"the admitted {admitted_label} no longer disables both "
-                "repository sccache wrapper inputs"
+                f"the admitted {admitted_label} no longer disables repository "
+                "sccache wrapper inputs and inherited linker rustflags"
             )
     if (
         "\non:\n  schedule:\n    - cron: '30 6 * * 1'\n  workflow_dispatch:\n"
@@ -22280,6 +22448,264 @@ pre_build = []
             failures.append(f"a {tamper_name} fuzz-smoke job was not rejected")
         if admitted_ci_job_names(tampered, "CI workflow"):
             failures.append(f"a {tamper_name} fuzz-smoke job was still admitted")
+
+    # ------------------------------------------------------------------
+    # Initial adoption of the fuzz gate in the required `test` aggregate
+    # ------------------------------------------------------------------
+    # The shape of pull request #3448: the byte-frozen `fuzz-smoke` job plus the
+    # three aggregate lines that turn it into a required gate. The aggregate
+    # dispatches an opaque shell executable, exactly as the real one does, so it
+    # is Cross-sensitive and its per-job digest surface genuinely moves when the
+    # wiring lands. That premise is asserted rather than assumed: without it
+    # every case below would pass for the wrong reason.
+    aggregate_planner_job = (
+        "  ci-plan:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Plan\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          planner=pr_ci_plan.py\n"
+        "          planner_dir=.github/scripts\n"
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan-self-test"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          {ISOLATED_PLANNER_LAUNCHER} --self-test\n"
+        '          planner_dir=".github/scripts"\n'
+        '          trusted_dir="$RUNNER_TEMP/pr-ci-plan"\n'
+        '          planner_dir="$trusted_dir"\n'
+        f"          {ISOLATED_PLANNER_LAUNCHER} --event-name pull_request\n"
+    )
+    aggregate_lint_job = (
+        "  lint:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo lint\n"
+    )
+    aggregate_job = (
+        "  test:\n"
+        "    name: Tests\n"
+        "    needs:\n"
+        "      - ci-plan\n"
+        "      - lint\n"
+        "      - build-binaries\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Verify required CI aggregate wiring\n"
+        "        run: python3 .github/scripts/verify_required_ci.py\n"
+        "\n"
+        "      - name: Summarize required CI results\n"
+        "        run: |\n"
+        "          set -euo pipefail\n"
+        "          summarize=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          "$summarize" build --target aarch64-unknown-linux-gnu\n'
+        '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n'
+        '          add_row "Lint" "${{ needs.lint.result }}"\n'
+        '          add_row "Native binaries" "${{ needs.build-binaries.result }}"\n'
+        '          require_success "CI plan" "${{ needs.ci-plan.result }}"\n'
+        '          require_success "Lint" "${{ needs.lint.result }}"\n'
+        '          require_success "Native binaries" "${{ needs.build-binaries.result }}"\n'
+    )
+    aggregate_wired_job = aggregate_job
+    for _, aggregate_anchor, aggregate_added in CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS:
+        if aggregate_anchor not in aggregate_wired_job:
+            failures.append(
+                "the aggregate self-test fixture no longer carries the anchor "
+                f"{aggregate_anchor.strip()!r} the fuzz wiring attaches to"
+            )
+            continue
+        aggregate_wired_job = aggregate_wired_job.replace(
+            aggregate_anchor,
+            aggregate_anchor + aggregate_added,
+            1,
+        )
+    aggregate_prologue = (
+        "name: CI\non:\n  pull_request:\nenv:\n  FIXED_INPUT: approved\njobs:\n"
+    )
+    aggregate_baseline = (
+        aggregate_prologue + aggregate_planner_job + aggregate_lint_job + aggregate_job
+    )
+    aggregate_adopted = (
+        aggregate_prologue
+        + aggregate_planner_job
+        + aggregate_lint_job
+        + CI_FUZZ_SMOKE_JOB
+        + aggregate_wired_job
+    )
+    aggregate_surfaces, aggregate_surface_failures = pr_workflow_job_surfaces(
+        aggregate_baseline,
+        "self-test CI workflow",
+        "build-arm64-cross",
+    )
+    if aggregate_surface_failures or not any(
+        surface.startswith(f"job:{CI_AGGREGATE_JOB_NAME}:")
+        for surface in aggregate_surfaces
+    ):
+        failures.append(
+            "the aggregate self-test fixture no longer produces the "
+            "Cross-sensitive digest surface the real comparison rejected"
+        )
+    if ci_fuzz_smoke_aggregate_wiring(
+        aggregate_baseline,
+        "self-test CI workflow",
+    ) != FuzzAggregateWiring("absent", aggregate_baseline, []):
+        failures.append("an unadopted aggregate was not read as absent wiring")
+    adopted_wiring = ci_fuzz_smoke_aggregate_wiring(
+        aggregate_adopted,
+        "self-test CI workflow",
+    )
+    if adopted_wiring.state != "present" or adopted_wiring.errors:
+        failures.append("the admitted aggregate fuzz wiring was rejected")
+    elif ci_fuzz_smoke_aggregate_wiring(
+        adopted_wiring.contents,
+        "self-test CI workflow",
+    ).state != "absent":
+        failures.append("withholding left an admitted aggregate reference behind")
+    if compare_pr_workflow_job(
+        aggregate_baseline,
+        aggregate_adopted,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "initial adoption of the byte-frozen fuzz job plus its required "
+            "aggregate wiring was rejected"
+        )
+    # Ordinary maintenance after adoption keeps working, and the admission does
+    # not travel to any other part of the aggregate.
+    aggregate_unrelated_job = aggregate_adopted.replace(
+        "  lint:\n",
+        "  extra-tests:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo extra\n"
+        "  lint:\n",
+        1,
+    )
+    if compare_pr_workflow_job(
+        aggregate_adopted,
+        aggregate_unrelated_job,
+        "CI workflow",
+        "build-arm64-cross",
+    ):
+        failures.append(
+            "an unrelated added job was rejected after the fuzz gate was adopted"
+        )
+
+    aggregate_rejections: dict[str, str] = {
+        "missing needs entry": aggregate_adopted.replace(
+            "      - fuzz-smoke\n",
+            "",
+            1,
+        ),
+        "missing summary row": aggregate_adopted.replace(
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            "",
+            1,
+        ),
+        "missing required-gate assertion": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            "",
+            1,
+        ),
+        "tampered result expression": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            '          require_success "Fuzz Smoke" "${{ needs.lint.result }}"\n',
+            1,
+        ),
+        "advisory instead of required gate": aggregate_adopted.replace(
+            '          require_success "Fuzz Smoke" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke advisory" '
+            '"${{ needs.fuzz-smoke.result }}"\n',
+            1,
+        ),
+        "duplicated summary row": aggregate_adopted.replace(
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n'
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            1,
+        ),
+        "relocated summary row": aggregate_adopted.replace(
+            '          add_row "Lint" "${{ needs.lint.result }}"\n'
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n',
+            '          add_row "Fuzz Smoke" "${{ needs.fuzz-smoke.result }}"\n'
+            '          add_row "Lint" "${{ needs.lint.result }}"\n',
+            1,
+        ),
+        "unrelated aggregate edit": aggregate_adopted.replace(
+            '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n',
+            '          add_row "CI plan" "${{ needs.ci-plan.result }}"\n'
+            '          eval "${{ github.event.pull_request.title }}"\n',
+            1,
+        ),
+        "dropped aggregate anchor": aggregate_adopted.replace(
+            '          require_success "Lint" "${{ needs.lint.result }}"\n',
+            "",
+            1,
+        ),
+        "tampered fuzz job": aggregate_adopted.replace(
+            "-max_total_time=8",
+            "-max_total_time=800",
+            1,
+        ),
+        "wiring without the admitted job": (
+            aggregate_prologue
+            + aggregate_planner_job
+            + aggregate_lint_job
+            + aggregate_wired_job
+        ),
+    }
+    for aggregate_case, aggregate_proposed in aggregate_rejections.items():
+        if aggregate_proposed == aggregate_adopted:
+            failures.append(
+                f"the {aggregate_case} aggregate self-test mutation is stale"
+            )
+            continue
+        if not compare_pr_workflow_job(
+            aggregate_baseline,
+            aggregate_proposed,
+            "CI workflow",
+            "build-arm64-cross",
+        ):
+            failures.append(f"a {aggregate_case} fuzz-gate adoption was not rejected")
+    # Once the trusted base carries the wiring, no pull request may take it back
+    # out. Withholding is symmetric, so this is the check that makes the
+    # admission one-way rather than a two-way exemption.
+    for aggregate_case, aggregate_proposed in (
+        ("whole adoption", aggregate_baseline),
+        (
+            "needs edge",
+            aggregate_adopted.replace("      - fuzz-smoke\n", "", 1),
+        ),
+        (
+            "required-gate assertion",
+            aggregate_adopted.replace(
+                '          require_success "Fuzz Smoke" '
+                '"${{ needs.fuzz-smoke.result }}"\n',
+                "",
+                1,
+            ),
+        ),
+    ):
+        if not compare_pr_workflow_job(
+            aggregate_adopted,
+            aggregate_proposed,
+            "CI workflow",
+            "build-arm64-cross",
+        ):
+            failures.append(
+                f"removal of the adopted fuzz-gate {aggregate_case} was not rejected"
+            )
+    if not ci_fuzz_smoke_aggregate_removal_errors(
+        "present",
+        "absent",
+        "CI workflow",
+    ):
+        failures.append("adopted aggregate fuzz wiring could be removed")
+    if ci_fuzz_smoke_aggregate_removal_errors("absent", "present", "CI workflow"):
+        failures.append("initial adoption of the aggregate fuzz wiring was rejected")
 
     # Withholding is scoped to the admitted job alone: a top-level surface and
     # every other job's surface survive the admission untouched.
