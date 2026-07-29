@@ -2995,11 +2995,10 @@ pub struct PluginPhaseData {
     /// `rate_limiting`, and `ai_rate_limiter` all declare bounded name sets;
     /// `cors` (+ the cache-internal finalizer) declares the open-ended
     /// `access-control-` prefix together with `vary`;
-    /// `response_transformer` and `ai_stream_router` declare `Unbounded` —
-    /// the former because route-override transforms are published at request
-    /// time, the latter because Anthropic SSE normalization invalidates
-    /// open-ended checksum-prefix families that no single prefix list here
-    /// currently models.
+    /// `ai_stream_router` declares its bounded representation-metadata names
+    /// plus the open-ended checksum prefixes; `response_transformer` declares
+    /// `Unbounded` because route-override transforms are published at request
+    /// time.
     pub response_trailer_policy_names: Arc<Vec<String>>,
     /// Case-insensitive ASCII prefixes whose response-header policy also binds
     /// the TRAILER section, unioned from

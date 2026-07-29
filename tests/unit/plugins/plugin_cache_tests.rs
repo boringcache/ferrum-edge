@@ -2761,8 +2761,8 @@ async fn test_request_view_classifies_response_trailer_policy_by_capability() {
     );
 
     // `ai_stream_router` invalidates open-ended checksum-prefix families when
-    // normalizing Anthropic SSE, so it also fails closed rather than pretending
-    // a finite exact-name list covers `x-amz-checksum-*` / `x-checksum-*`.
+    // normalizing Anthropic SSE. The policy models those families directly,
+    // preserving unrelated application trailers.
     let stream_router = make_plugin_config_with_json(
         "asr",
         "ai_stream_router",
@@ -2786,13 +2786,27 @@ async fn test_request_view_classifies_response_trailer_policy_by_capability() {
         .unwrap()
         .request_view("ferrum", "p1", ProxyProtocol::Http);
     assert!(
-        view.response_trailer_policy_names().is_empty(),
-        "Unbounded must not contribute bounded names"
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "content-encoding")
     );
     assert!(
-        view.capabilities()
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "x-goog-hash")
+    );
+    assert_eq!(
+        view.response_trailer_policy_prefixes(),
+        &[
+            "x-amz-checksum-".to_string(),
+            "x-checksum-".to_string(),
+        ]
+    );
+    assert!(
+        !view
+            .capabilities()
             .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
-        "ai_stream_router must classify as Unbounded response-trailer policy"
+        "enumerable names and prefixes must not drop unrelated trailers"
     );
 }
 

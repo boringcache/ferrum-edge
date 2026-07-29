@@ -311,12 +311,16 @@ them against the response-header policy actually in force for the request:
   none.
 - **Fail-closed arm.** A plugin whose governed field set is not enumerable at
   config time declares `ResponseTrailerPolicy::Unbounded` and the whole trailer
-  section is dropped. Two built-ins are in this class:
+  section is dropped. One built-in is in this class:
 
   | Plugin | Why the set is not enumerable |
   | --- | --- |
   | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
-  | `ai_stream_router` | Anthropic SSE normalization removes `content-encoding` / `content-length`, invalidates every content-bound validator/digest/signature plus the open-ended `x-amz-checksum-*` / `x-checksum-*` families, and rewrites `vary` — prefix-derived names cannot be listed as finite exact names |
+
+  `ai_stream_router` does not need this arm: Anthropic SSE normalization
+  declares the shared finite representation-metadata inventory plus the
+  `x-amz-checksum-*` / `x-checksum-*` prefixes through
+  `NamesAndPrefixes`, so unrelated application trailers remain intact.
 
 **On a plain response no field name is exempt, `grpc-*` included.** Reserved-field
 handling is selected *structurally* by the dispatch the gateway already

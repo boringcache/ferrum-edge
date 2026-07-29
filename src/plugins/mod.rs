@@ -265,7 +265,7 @@ pub fn apply_initial_response_header_policies(
 
 /// Representation metadata that becomes invalid whenever a buffered response
 /// transform replaces the client-visible bytes.
-const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "accept-ranges",
     "content-range",
     "content-md5",
@@ -282,7 +282,16 @@ const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "content-signature",
     "content-signature-input",
     "content-checksum",
+    "x-goog-hash",
+    "x-ms-content-crc64",
 ];
+
+/// Open-ended response-header families invalidated by a representation rewrite.
+///
+/// Kept beside [`TRANSFORM_INVALIDATED_RESPONSE_HEADERS`] so response
+/// transformers and trailer-policy declarations consume the same inventory.
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES: &[&str] =
+    &["x-amz-checksum-", "x-checksum-"];
 
 fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     value
@@ -295,10 +304,9 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
     TRANSFORM_INVALIDATED_RESPONSE_HEADERS
         .iter()
         .any(|header| name.eq_ignore_ascii_case(header))
-        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
-        || starts_with_ascii_case_insensitive(name, "x-checksum-")
-        || name.eq_ignore_ascii_case("x-goog-hash")
-        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+        || TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ascii_case_insensitive(name, prefix))
 }
 
 /// Whether buffered response bytes may be rewritten while preserving the
@@ -1181,12 +1189,10 @@ pub enum ResponseTrailerPolicy<'a> {
         names: &'a [String],
         prefixes: &'a [String],
     },
-    /// The governed field set is not enumerable at config time. Examples:
-    /// rules published at request time by another plugin
-    /// (`response_transformer`), and open-ended prefix families invalidated by
-    /// a representation rewrite (`ai_stream_router`'s
-    /// `x-amz-checksum-*` / `x-checksum-*`). Trailer-forwarding paths fail
-    /// closed and drop the whole backend trailer section.
+    /// The governed field set is not enumerable at config time. The built-in
+    /// example is `response_transformer`, whose route-override rules are
+    /// published at request time. Trailer-forwarding paths fail closed and drop
+    /// the whole backend trailer section.
     Unbounded,
 }
 
@@ -6992,9 +6998,8 @@ pub trait Plugin: Send + Sync {
     /// open-ended prefix family is owned together with discrete names outside
     /// it (CORS `access-control-*` plus `vary`); reserve
     /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
-    /// listed even that way — request-time route overrides
-    /// (`response_transformer`) and multi-prefix representation invalidation
-    /// (`ai_stream_router`'s content-bound checksum families).
+    /// listed even that way — currently request-time route overrides from
+    /// `response_transformer`.
     fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
         ResponseTrailerPolicy::None
     }

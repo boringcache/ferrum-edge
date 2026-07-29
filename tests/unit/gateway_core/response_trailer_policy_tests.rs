@@ -492,7 +492,7 @@ fn streaming_relay_unbounded_policy_fails_closed_without_evidence() {
 #[test]
 fn streaming_relay_unbounded_drops_trailer_only_representation_metadata() {
     // Streaming H3 commits initial HEADERS before TRAILERS exist. Without
-    // `ai_stream_router`'s Unbounded ownership, a trailer-only
+    // an unbounded policy owner, a trailer-only
     // `content-encoding` / validator / `x-amz-checksum-*` reconciles as
     // absent→absent and reintroduces representation metadata the normalization
     // already invalidated on the header channel.
