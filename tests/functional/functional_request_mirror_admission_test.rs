@@ -187,10 +187,11 @@ async fn request_mirror_admits_before_body_collection_on_h1_h2_and_h3() {
 
 /// Client cancellation mid-body must return the reserved aggregate capacity.
 ///
-/// `/cancel` is sized so one declared `Content-Length` reservation consumes the
-/// instance's entire `max_retained_request_body_bytes`. If the abort leaked the
-/// lease, no later request on that instance could ever be admitted again.
-/// HTTP/1.1 only -- see the module-level limitation note.
+/// `/cancel` sizes `max_retained_request_body_bytes` to one
+/// `max_mirrored_request_body_bytes` ceiling so a single admitted request
+/// consumes the instance's entire aggregate budget until its lease releases.
+/// If the abort leaked the lease, no later request on that instance could ever
+/// be admitted again. HTTP/1.1 only -- see the module-level limitation note.
 #[ignore]
 #[tokio::test]
 async fn request_mirror_releases_reserved_capacity_when_a_client_cancels() {
@@ -772,8 +773,8 @@ fn admission_config(
         "mirror_timeout_ms": 300000,
         "max_mirrored_request_body_bytes": CEILING
     });
-    // One declared full-ceiling reservation consumes the entire aggregate
-    // budget, so a leaked lease is immediately visible.
+    // One full-ceiling admission consumes the entire aggregate budget, so a
+    // leaked lease is immediately visible.
     let cancel = serde_json::json!({
         "mirror_host": "127.0.0.1",
         "mirror_port": cancel_port,

@@ -132,14 +132,17 @@
 //!    A request that already declares more than the ceiling is skipped before
 //!    sampling: it keeps streaming and is not mirrored, rather than truncating
 //!    the shadow payload or turning shadow policy into a client-visible `413`.
-//!    Otherwise admission reserves the declared `Content-Length` clamped to the
-//!    ceiling, and the whole ceiling for every request that does not declare
-//!    one. That reservation is fail-closed and method-independent: HTTP/2 and
-//!    HTTP/3 may carry DATA with neither `Content-Length` nor
-//!    `Transfer-Encoding`, so a header-only `GET`/`HEAD`/`OPTIONS` is charged
-//!    the ceiling too rather than being assumed bodyless. `before_proxy` then
-//!    reconciles the reservation to the observed length, returning the surplus
-//!    (down to `0` for an empty body) to the aggregate budget. The tradeoff:
+//!    Otherwise every admitted request reserves the whole positive plugin-local
+//!    ceiling before collection — regardless of method, protocol, missing or
+//!    present `Content-Length`, or a declared zero/small length. Declared size
+//!    is untrusted for aggregate accounting: H3 drains under the collection
+//!    ceiling without enforcing equality with `Content-Length`, and Hyper's H2
+//!    `Incoming` length is likewise not the Ferrum allocation bound. Charging
+//!    only an attacker-declared byte would let many concurrent tiny declarations
+//!    each allocate up to the ceiling before `before_proxy` reconciliation,
+//!    exceeding `max_retained_request_body_bytes`. `before_proxy` then reconciles
+//!    the reservation to the observed length, returning the surplus (down to
+//!    `0` for an empty body) to the aggregate budget exactly once. The tradeoff:
 //!    mirroring mostly-bodyless traffic at high concurrency wants
 //!    `max_retained_request_body_bytes` sized against `max_in_flight ×
 //!    max_mirrored_request_body_bytes`, or a lower ceiling.
@@ -179,7 +182,7 @@
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed; bytes are discarded after sizing so keep-alive pools can reclaim the socket. |
 //! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
-//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read: the declared `Content-Length` clamped to the per-request ceiling, otherwise the whole ceiling) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. Size against `max_in_flight × max_mirrored_request_body_bytes` when mirroring undeclared traffic at high concurrency. |
+//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read: every admitted request reserves the whole `max_mirrored_request_body_bytes` ceiling) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. Size against `max_in_flight × max_mirrored_request_body_bytes` when mirroring at high concurrency. |
 //! | `max_mirrored_request_body_bytes` | u64 | `10485760` (10 MiB) | Positive plugin-local ceiling on one mirrored request body, applied even when the global request-body limit is unlimited (`0`). An explicit value above `max_retained_request_body_bytes` is rejected at construction; the default clamps down to it instead, so a smaller aggregate budget alone never fails construction. Applies only to requests this instance admitted. |
 //! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
@@ -527,10 +530,10 @@ impl MirrorBodyBudget {
     ///
     /// Reservation happens BEFORE the body is collected (advisory
     /// `GHSA-jv66-mq44-m9v3`), so callers reserve the worst case they can be
-    /// forced to retain — the declared `Content-Length` clamped to the
-    /// plugin-local per-request ceiling, or that ceiling when the length is not
-    /// declared. [`MirrorBodyLease::reconcile`] shrinks the lease to the
-    /// observed length once the body exists.
+    /// forced to retain — the full plugin-local per-request ceiling for every
+    /// admitted request. Declared `Content-Length` is never trusted for this
+    /// charge. [`MirrorBodyLease::reconcile`] shrinks the lease to the observed
+    /// length once the body exists.
     fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<MirrorBodyLease> {
         if !self.try_add(bytes) {
             return None;
@@ -617,10 +620,11 @@ impl MirrorBodyLease {
     /// Resize the reservation to the observed body length.
     ///
     /// Shrinking always succeeds and returns the surplus immediately. Growing
-    /// (possible only when the declared `Content-Length` under-reported the
-    /// real body) is bounded by the same budget and returns `false` when it
-    /// cannot be covered, so the mirror attempt is dropped instead of retaining
-    /// unbudgeted bytes.
+    /// (possible on the rare fallback path that reserved less than the observed
+    /// body) is bounded by the same budget and returns `false` when it cannot
+    /// be covered, so the mirror attempt is dropped instead of retaining
+    /// unbudgeted bytes. Pre-buffer admission always reserves the full ceiling,
+    /// so the authorize → before_proxy path only shrinks.
     fn reconcile(&mut self, actual: u64) -> bool {
         if actual == self.reserved {
             return true;
@@ -1240,13 +1244,13 @@ impl RequestMirror {
                 })
                 .transpose()?;
         // A per-request ceiling above the aggregate budget could never be
-        // admitted for an unknown-length upload (admission reserves the full
-        // ceiling up front), so the instance would silently never mirror a
-        // body. An explicit operator value that contradicts the aggregate
-        // budget is rejected at construction; the *default* ceiling instead
-        // clamps down to the configured budget, so an existing config that
-        // only sets a small `max_retained_request_body_bytes` keeps loading
-        // rather than failing startup on a key it never set.
+        // admitted (admission reserves the full ceiling up front), so the
+        // instance would silently never mirror a body. An explicit operator
+        // value that contradicts the aggregate budget is rejected at
+        // construction; the *default* ceiling instead clamps down to the
+        // configured budget, so an existing config that only sets a small
+        // `max_retained_request_body_bytes` keeps loading rather than failing
+        // startup on a key it never set.
         let max_mirrored_request_body_bytes = match configured_max_mirrored_request_body_bytes {
             Some(configured) => {
                 if configured > max_retained_request_body_bytes {
@@ -1384,35 +1388,27 @@ impl RequestMirror {
 
     /// Bytes to reserve from the aggregate budget before the body is read.
     ///
-    /// Fail-closed (advisory `GHSA-jv66-mq44-m9v3`): reservation is a function
-    /// of the *declared* framing only, never of the request method.
+    /// Fail-closed (advisory `GHSA-jv66-mq44-m9v3`): every otherwise admitted
+    /// body-mirroring request reserves the full positive plugin-local ceiling,
+    /// regardless of method, protocol, missing/present `Content-Length`, or a
+    /// declared zero/small length. Declared size is untrusted for aggregate
+    /// accounting — H3's collector enforces the collection ceiling without
+    /// requiring equality with `Content-Length`, and Hyper's H2 `Incoming`
+    /// length is not Ferrum's allocation bound — so charging only an
+    /// attacker-declared byte would let many concurrent tiny declarations each
+    /// allocate up to the ceiling before `before_proxy` reconciliation,
+    /// exceeding `max_retained_request_body_bytes`.
     ///
-    /// A declared `Content-Length` is the exact retained size for HTTP/1.1 and
-    /// HTTP/2 (both enforce the declared framing), so reserving it clamped to
-    /// the plugin-local ceiling keeps the budget's effective concurrency honest
-    /// for ordinary uploads — including a declared `0`, which reserves nothing.
-    ///
-    /// Every other admitted request reserves the whole plugin-local ceiling,
-    /// which is the most it can be allowed to retain. That deliberately
-    /// includes header-only `GET`/`HEAD`/`OPTIONS` requests that declare
-    /// neither `Content-Length` nor `Transfer-Encoding`: HTTP/2 and HTTP/3 can
-    /// carry DATA frames with no framing headers at all (the H1/H2 collector's
-    /// empty fast path is guarded by `Body::is_end_stream()` for exactly that
-    /// reason, and H3 drains DATA independently of those headers), so method
-    /// plus missing headers is not evidence that no bytes will be buffered.
-    /// Inferring "bodyless" here would let many concurrent undeclared requests
-    /// each allocate up to the ceiling before `before_proxy` could charge them,
-    /// which is the aggregate bound this budget exists to enforce.
-    ///
-    /// The tradeoff is accepted and bounded: a header-only undeclared request
-    /// briefly holds the ceiling, and `before_proxy` reconciliation returns the
-    /// surplus (down to `0` for an empty body) as soon as the observed length
-    /// is known. Operators mirroring mostly-bodyless traffic at high
-    /// concurrency should size `max_retained_request_body_bytes` against
+    /// Oversized declared lengths are skipped *before* this reservation (see
+    /// [`Self::authorize`]). The tradeoff is accepted and bounded: a tiny or
+    /// bodyless request briefly holds the ceiling, and `before_proxy`
+    /// reconciliation returns the surplus (down to `0` for an empty body)
+    /// exactly once as soon as the observed length is known. Operators
+    /// mirroring mostly-bodyless traffic at high concurrency should size
+    /// `max_retained_request_body_bytes` against
     /// `max_in_flight × max_mirrored_request_body_bytes`, or lower the ceiling.
-    fn reserved_body_bytes(&self, declared_length: Option<u64>) -> u64 {
-        let ceiling = self.max_mirrored_request_body_bytes;
-        declared_length.map_or(ceiling, |declared| declared.min(ceiling))
+    fn reserved_body_bytes(&self) -> u64 {
+        self.max_mirrored_request_body_bytes
     }
 
     /// Snapshot of the per-instance mirror lifecycle counters for external
@@ -1855,10 +1851,7 @@ impl Plugin for RequestMirror {
             MirrorAdmissionState::NotSelected
         } else {
             match self.mirror_in_flight.clone().try_acquire_owned() {
-                Ok(permit) => match self
-                    .body_budget
-                    .try_reserve(self.reserved_body_bytes(declared_length))
-                {
+                Ok(permit) => match self.body_budget.try_reserve(self.reserved_body_bytes()) {
                     Some(lease) => MirrorAdmissionState::Admitted { permit, lease },
                     None => {
                         self.metrics.bump_budget_drop();
@@ -2059,10 +2052,9 @@ impl Plugin for RequestMirror {
         };
         let observed_body_bytes = body_bytes.as_ref().map_or(0, |body| body.len() as u64);
         // Reconcile the pre-buffer reservation with the real length: shrink the
-        // common case (declared length, or an under-filled ceiling reservation)
-        // back into the budget, and refuse rather than retain unbudgeted bytes
-        // if the body somehow exceeds what was reserved or the plugin-local
-        // per-request ceiling.
+        // full-ceiling admission charge back into the budget, and refuse rather
+        // than retain unbudgeted bytes if the body somehow exceeds what was
+        // reserved or the plugin-local per-request ceiling.
         let body_lease = if observed_body_bytes > self.max_mirrored_request_body_bytes {
             None
         } else {

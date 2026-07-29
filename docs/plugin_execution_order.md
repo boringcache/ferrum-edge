@@ -226,8 +226,11 @@ A body-mirroring `request_mirror` instance additionally participates in the
 collects a request body (advisory `GHSA-jv66-mq44-m9v3`). That hook never
 rejects — mirroring stays fail-open for the primary request. It advances the
 deterministic sampler once and, on selection, takes the instance's
-`max_in_flight` permit plus a `max_retained_request_body_bytes` reservation.
-`should_buffer_request_body` is then a pure read of that decision, so a
+`max_in_flight` permit plus a `max_retained_request_body_bytes` reservation
+equal to the full positive `max_mirrored_request_body_bytes` ceiling (declared
+`Content-Length` is used only to skip already-oversized bodies before sampling;
+it never sizes the aggregate charge). `should_buffer_request_body` is then a
+pure read of that decision, so a
 `percentage: 0`, sampled-out, or saturated request keeps streaming and never
 allocates a mirror body. Its built-in priority follows the built-in rejecting
 authorization hooks. If an operator priority override or custom plugin places a

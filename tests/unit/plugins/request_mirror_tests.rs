@@ -4341,7 +4341,9 @@ async fn advisory_saturated_permits_keep_the_request_streaming() {
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
-        "max_in_flight": 1
+        "max_in_flight": 1,
+        "max_retained_request_body_bytes": 8192,
+        "max_mirrored_request_body_bytes": 2048
     }));
 
     // Hold the single permit by keeping the admitted context alive.
@@ -4351,7 +4353,7 @@ async fn advisory_saturated_permits_keep_the_request_streaming() {
     assert_eq!(
         request_mirror_retained_request_body_bytes_for_test(&plugin),
         2048,
-        "admission charges the declared length before any body is read"
+        "admission charges the full per-request ceiling before any body is read"
     );
 
     // A concurrent request finds the permit occupied. It must not buffer.
@@ -4447,9 +4449,9 @@ async fn advisory_aggregate_budget_bounds_concurrent_unknown_length_uploads() {
 #[tokio::test]
 async fn advisory_full_aggregate_budget_refuses_then_reuses_released_capacity() {
     // Exactness at a saturated budget, independent of pointer width: one
-    // undeclared upload reserves the whole ceiling, the next positive
-    // reservation must be refused *without mutating* the aggregate, and the
-    // released capacity must become reusable.
+    // admission reserves the whole ceiling, the next reservation (including a
+    // declared zero or tiny Content-Length) must be refused *without mutating*
+    // the aggregate, and the released capacity must become reusable.
     let plugin = advisory_plugin(json!({
         "mirror_host": "mirror.local",
         "percentage": 100.0,
@@ -4467,12 +4469,12 @@ async fn advisory_full_aggregate_budget_refuses_then_reuses_released_capacity() 
         4096
     );
 
-    for declared in [None, Some(1), Some(4096)] {
+    for declared in [None, Some(0), Some(1), Some(4096)] {
         let mut refused = advisory_ctx(declared);
         plugin_utils::assert_continue(plugin.authorize(&mut refused).await);
         assert!(
             !plugin.should_buffer_request_body(&refused),
-            "a positive reservation against a full budget must be refused"
+            "a reservation against a full budget must be refused even for declared={declared:?}"
         );
         assert_eq!(
             request_mirror_retained_request_body_bytes_for_test(&plugin),
@@ -4480,15 +4482,6 @@ async fn advisory_full_aggregate_budget_refuses_then_reuses_released_capacity() 
             "a refused reservation must not mutate the aggregate"
         );
     }
-
-    // A declared zero-length body reserves nothing, so it is still admitted.
-    let mut empty = advisory_ctx(Some(0));
-    plugin_utils::assert_continue(plugin.authorize(&mut empty).await);
-    assert!(plugin.should_buffer_request_body(&empty));
-    assert_eq!(
-        request_mirror_retained_request_body_bytes_for_test(&plugin),
-        4096
-    );
 
     drop(full);
     assert_eq!(
@@ -4545,14 +4538,14 @@ async fn advisory_aggregate_budget_is_exact_at_the_u64_max_boundary() {
         u64::MAX
     );
 
-    // Every positive reservation now overflows the ceiling and must fail closed
-    // without mutating the aggregate — including the smallest possible one.
-    for declared in [None, Some(1), Some(u64::MAX)] {
+    // Every further reservation now overflows the ceiling and must fail closed
+    // without mutating the aggregate — including a declared zero/tiny length.
+    for declared in [None, Some(0), Some(1), Some(u64::MAX)] {
         let mut refused = advisory_ctx(declared);
         plugin_utils::assert_continue(plugin.authorize(&mut refused).await);
         assert!(
             !plugin.should_buffer_request_body(&refused),
-            "a positive reservation at the u64::MAX boundary must be refused"
+            "a reservation at the u64::MAX boundary must be refused for declared={declared:?}"
         );
         assert_eq!(
             request_mirror_retained_request_body_bytes_for_test(&plugin),
@@ -4631,7 +4624,9 @@ async fn advisory_cancelled_request_releases_admission_without_dispatch() {
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
-        "max_in_flight": 1
+        "max_in_flight": 1,
+        "max_retained_request_body_bytes": 8192,
+        "max_mirrored_request_body_bytes": 4096
     }));
 
     // Admitted, then the request dies before `before_proxy` (client
@@ -4680,7 +4675,9 @@ async fn advisory_repeated_authorize_replaces_same_instance_admission() {
         "mirror_host": "mirror.local",
         "percentage": 100.0,
         "mirror_request_body": true,
-        "max_in_flight": 2
+        "max_in_flight": 2,
+        "max_retained_request_body_bytes": 8192,
+        "max_mirrored_request_body_bytes": 4096
     }));
 
     let mut ctx = advisory_ctx(Some(4096));
@@ -4766,7 +4763,9 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         &json!({
             "mirror_host": "mirror-a.local",
             "percentage": 100.0,
-            "mirror_request_body": true
+            "mirror_request_body": true,
+            "max_retained_request_body_bytes": 8192,
+            "max_mirrored_request_body_bytes": 2048
         }),
         PluginHttpClient::default(),
         Some("advisory-mirror-a"),
@@ -4776,7 +4775,9 @@ async fn advisory_multiple_instances_stage_and_take_independently() {
         &json!({
             "mirror_host": "mirror-b.local",
             "percentage": 100.0,
-            "mirror_request_body": true
+            "mirror_request_body": true,
+            "max_retained_request_body_bytes": 8192,
+            "max_mirrored_request_body_bytes": 2048
         }),
         PluginHttpClient::default(),
         Some("advisory-mirror-b"),
@@ -5212,9 +5213,10 @@ async fn advisory_undeclared_request_reserves_the_ceiling_regardless_of_method()
     // Fail-closed reservation: HTTP/2 and HTTP/3 requests may carry DATA frames
     // with neither `Content-Length` nor `Transfer-Encoding`, so method plus
     // missing framing headers is NOT evidence that no mirror bytes will be
-    // buffered. Every admitted request without a declared length must therefore
-    // charge the whole plugin-local ceiling BEFORE body collection, so the
-    // aggregate budget really bounds concurrent transient prebuffers.
+    // buffered. Every admitted request must charge the whole plugin-local
+    // ceiling BEFORE body collection (declared length is never trusted for the
+    // charge), so the aggregate budget really bounds concurrent transient
+    // prebuffers.
     let plugin = advisory_plugin(json!({
         "mirror_host": "mirror.local",
         "percentage": 100.0,
@@ -5273,32 +5275,99 @@ async fn advisory_undeclared_request_reserves_the_ceiling_regardless_of_method()
         0,
         "every reservation must release exactly once"
     );
+}
 
-    // A declared `Content-Length: 0` is authoritative framing, so it reserves
-    // nothing and cannot starve mirror coverage for genuinely bodyless traffic.
-    let mut declared_zero = advisory_ctx(Some(0));
-    declared_zero.method = "GET".to_string();
-    plugin_utils::assert_continue(plugin.authorize(&mut declared_zero).await);
-    assert!(plugin.should_buffer_request_body(&declared_zero));
-    assert_eq!(
-        request_mirror_retained_request_body_bytes_for_test(&plugin),
-        0,
-        "a declared zero-length body reserves nothing"
-    );
+#[tokio::test]
+async fn advisory_tiny_or_zero_declared_length_still_reserves_the_full_ceiling() {
+    // Declared Content-Length must not size the aggregate reservation: an H3
+    // (or H2) client can advertise 0/1 byte and still send up to the collection
+    // ceiling. With an aggregate budget of exactly one ceiling, a tiny/zero
+    // declaration must still consume that whole ceiling at admission so a
+    // concurrent sibling is refused; after observed-body reconciliation or
+    // context drop, capacity must be reusable.
+    let plugin = advisory_plugin(json!({
+        "mirror_host": "127.0.0.1",
+        "mirror_port": 9,
+        "percentage": 100.0,
+        "mirror_request_body": true,
+        "max_in_flight": 8,
+        "max_retained_request_body_bytes": 1024,
+        "max_mirrored_request_body_bytes": 1024,
+        "mirror_timeout_ms": 1
+    }));
 
-    // A declared bounded length reserves exactly that length.
-    let mut declared_bounded = advisory_ctx(Some(256));
-    plugin_utils::assert_continue(plugin.authorize(&mut declared_bounded).await);
-    assert_eq!(
-        request_mirror_retained_request_body_bytes_for_test(&plugin),
-        256
-    );
-    drop(declared_bounded);
-    drop(declared_zero);
-    assert_eq!(
-        request_mirror_retained_request_body_bytes_for_test(&plugin),
-        0
-    );
+    let mut expected_dispatched = 0u64;
+    for declared in [Some(0u64), Some(1u64)] {
+        let mut first = advisory_ctx(declared);
+        plugin_utils::assert_continue(plugin.authorize(&mut first).await);
+        assert!(
+            plugin.should_buffer_request_body(&first),
+            "declared={declared:?} must still be admitted when capacity remains"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            1024,
+            "declared={declared:?} must charge the full ceiling at admission"
+        );
+
+        let mut refused = advisory_ctx(declared);
+        plugin_utils::assert_continue(plugin.authorize(&mut refused).await);
+        assert!(
+            !plugin.should_buffer_request_body(&refused),
+            "a second concurrent request must be refused while one ceiling is held"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            1024,
+            "a refused sibling must not mutate the aggregate"
+        );
+
+        // Observed-body reconciliation returns the surplus and frees capacity.
+        let observed = declared.unwrap_or(0) as usize;
+        first.request_body_bytes = if observed == 0 {
+            None
+        } else {
+            Some(bytes::Bytes::from(vec![b'x'; observed]))
+        };
+        let mut headers = HashMap::new();
+        plugin_utils::assert_continue(plugin.before_proxy(&mut first, &mut headers).await);
+        expected_dispatched += 1;
+        assert_eq!(
+            request_mirror_metrics_snapshot_for_test(&plugin).dispatched,
+            expected_dispatched,
+            "reconciliation must not turn a tiny-body mirror into a drop"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            observed as u64,
+            "surplus must return after observed-body reconciliation"
+        );
+
+        let _ = first.collect_mirror_result().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while request_mirror_retained_request_body_bytes_for_test(&plugin) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached task must release the reconciled lease exactly once");
+
+        let mut reused = advisory_ctx(declared);
+        plugin_utils::assert_continue(plugin.authorize(&mut reused).await);
+        assert!(
+            plugin.should_buffer_request_body(&reused),
+            "capacity must be reusable after reconciliation/drop for declared={declared:?}"
+        );
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            1024
+        );
+        drop(reused);
+        assert_eq!(
+            request_mirror_retained_request_body_bytes_for_test(&plugin),
+            0
+        );
+    }
 }
 
 #[tokio::test]
