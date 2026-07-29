@@ -1,4 +1,15 @@
-//! Local raw-TCP Sidecar inbound relay.
+//! Local raw-TCP captured-inbound relay.
+//!
+//! Two callers share it. The Sidecar inbound listener routes REDIRECT-captured
+//! plaintext here (the original path, described below), and the NodeWaypoint
+//! transparent inbound capture listener
+//! ([`crate::proxy::node_waypoint_ingress_capture`], issue #3287) hands off a
+//! per-connection synthesized entry. The two differ only in what the entry
+//! carries: the NodeWaypoint entry sets `socket_mark` (the dial leaves the host
+//! netns and must be recognized by the pod-veth guard) and
+//! `node_waypoint_policy_scope` (that listener serves many pods, so the
+//! destination workload's policy scope cannot be inferred from the listener).
+//! Sidecar entries leave both `None` and behave exactly as before.
 //!
 //! When Sidecar inbound TLS is disabled or absent in permissive mode, the
 //! inbound listener can receive REDIRECT-captured plaintext TCP for local
@@ -185,10 +196,19 @@ pub(crate) async fn handle_mesh_tcp_inbound(
     // traffic — so `mesh_authz` treats `listen_port` as the inbound
     // destination port (parity with the materialized HTTP inbound path).
     stream_ctx.mesh_direction = Some(MeshTrafficDirection::Inbound);
-    // The constructor intentionally leaves per-pod scope absent because
-    // Sidecar topology never installs the node-waypoint resolver;
-    // `mesh_authz` evaluates mesh-wide + namespace/selector policies against
-    // the connection identity.
+    // Per-pod policy scope of the DESTINATION workload, present only for the
+    // NodeWaypoint transparent inbound capture relay (issue #3287): that
+    // listener serves every enrolled pod on the node, so `mesh_authz` (which
+    // runs with `per_pod_policy_scoping` on for NodeWaypoint) has no other way
+    // to know whose namespace/selector-scoped policies to evaluate — without it
+    // every captured connection is denied `scope_missing` as soon as one scoped
+    // policy exists.
+    //
+    // Sidecar routes carry `None` and are unchanged: that topology never
+    // installs the node-waypoint resolver, `per_pod_policy_scoping` is off, and
+    // `mesh_authz` narrowed its policy set at construction against the proxy's
+    // own identity.
+    stream_ctx.node_waypoint_policy_scope = entry.node_waypoint_policy_scope.clone();
     // Populate the first-byte snapshot captured above before hooks run.
     stream_ctx.first_bytes = first_bytes;
     stream_ctx.first_bytes_kind = first_bytes_kind;

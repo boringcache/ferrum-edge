@@ -441,17 +441,36 @@ The capture listener terminates nothing. It:
 1. recovers the original destination from `getsockname()` (there is no NAT to
    consult) and refuses anything that carries no captured destination — it is
    not a general-purpose relay anyone on the node may address;
-2. consults the **live PeerAuthentication posture for the recovered app port**
-   (the same `modes_by_port` table the mesh inbound TLS selector reads). Direct
-   captured plaintext is admitted only where that posture permits it: under
-   `STRICT` it is refused and the peer must arrive over authenticated mesh
-   transport instead. Enabling the redirect therefore does not weaken STRICT;
-3. applies the same open-relay guard as the inbound HBONE relay — the
-   destination must be a slice-declared in-mesh workload address and port;
+2. resolves that destination to **exactly one slice-declared in-mesh workload**
+   — the same open-relay guard the inbound HBONE relay applies, tightened to a
+   single unambiguous workload. No matching workload, or two records claiming
+   the address with divergent identity, closes the connection. This gate runs
+   first because both gates below are properties of that workload, not of the
+   listener;
+3. consults the **live PeerAuthentication posture of that exact destination
+   workload** on the captured app port, resolved from the workload's own
+   namespace/labels with the canonical resolver (`WorkloadSelector` >
+   `Namespace` > mesh-wide, port override inside the winner). It is deliberately
+   *not* the listener-wide `modes_by_port` table: one NodeWaypoint listener
+   serves every enrolled pod on the node, so a port-keyed posture would let a
+   `PERMISSIVE` pod admit direct plaintext to a `STRICT` pod that happens to
+   share the app port. Direct captured plaintext is admitted only where the
+   destination's own posture permits it; under `STRICT` it is refused and the
+   peer must arrive over authenticated mesh transport instead. Enabling the
+   redirect therefore does not weaken STRICT;
 4. runs the L4 `on_stream_connect` chain, including the mesh-injected
    `__mesh_authz`, with the captured **app** port as the authorization
-   destination, then relays byte-for-byte. Application TLS is carried opaquely
-   and is never mistaken for mesh TLS.
+   destination and the destination workload's policy scope stamped on the
+   stream context — so namespace/selector-scoped `AuthorizationPolicy` rules are
+   evaluated against the captured destination rather than denied `scope_missing`
+   — then relays byte-for-byte. Application TLS is carried opaquely and is never
+   mistaken for mesh TLS.
+
+Every one of those gates is fail-closed: an unresolvable or ambiguous
+destination, or a posture that cannot be established, closes the connection
+instead of relaying it under some other workload's policy. Sidecar inbound
+relay entries are unaffected — they carry no socket mark and no destination
+scope, exactly as before.
 
 The backend dial carries `SO_MARK = 0x734`, so the pod-veth `ferrum_tc_inbound`
 guard admits it as an authorized relay dial and the ingress redirect bypasses it
@@ -475,8 +494,12 @@ DaemonSet from the single `nodeAgent.ingressRedirectIfaces` value. Setting them
 by hand outside the chart means setting them on both pods. Startup fails closed
 if the two contracts cannot agree: the node-agent rejects a zero, non-wildcard,
 HBONE-colliding, or outbound-capture-colliding capture port before it attaches
-anything, and a capture listener that cannot bind (including a failed
-`IP_TRANSPARENT`) fails the proxy's listener readiness. For the same reason
+anything; the **mesh proxy** independently refuses to start when the redirect is
+requested and `FERRUM_MESH_INBOUND_LISTEN_ADDR` is malformed, zero-port, or
+non-wildcard (validated with a field-specific error at the top of the serving
+path, because listener *planning* is infallible and would otherwise only warn
+and drop the listener); and a capture listener that cannot bind (including a
+failed `IP_TRANSPARENT`) fails the proxy's listener readiness. For the same reason
 `nodeAgent.ingressRedirectIfaces` requires `ambient.enabled=true` with
 `ambient.env.FERRUM_MESH_TOPOLOGY=node_waypoint` — the redirect fails closed, so
 enabling it without a capture listener on the node would drop all in-scope
@@ -497,14 +520,36 @@ packet first and the redirect would black-hole. Table
 `33134` is distinct from the UDP TPROXY table `33133`, so tearing one path down
 never reaps the other, and deletion always names the exact priority and table
 rather than flushing. Routing is installed **before** the classifier is attached
-and removed **after** it is detached, so neither ordering can strand an assigned
-packet with no local route. Every unsuccessful startup path unwinds the same
-way — a partially applied routing install (the `ip` batch is not atomic), a
-failed attach on any one interface, and a `validate_startup_ready` failure that
-lands after the classifier attached all remove the Ferrum-owned rule and route
-by exact priority and table, detaching the classifier first where one is live.
-An inert leftover rule still claims the fwmark, so it is never left behind. A
-failure to install routing, or to attach on any one interface, is fatal: the
+and removed only once the classifier is **provably gone**, so neither ordering
+can strand an assigned packet with no local route.
+
+Teardown is retry-safe, and asymmetric on purpose. A live classifier *without*
+its routing is the harmful half-state — it keeps assigning packets to the
+capture socket while `main` forwards them to the pod, so they reach neither
+endpoint — whereas an inert leftover rule only claims the fwmark. So:
+
+- a failed detach **retains** its attachment (the tc links are owned by the
+  backend, not by the program's link map, and a failed netlink delete is rebuilt
+  from the filter's `(ifname, attach type, priority, handle)` identity), so
+  `cleanup_all` is a genuine second attempt rather than a no-op;
+- the Ferrum-owned rule and route are removed **after** that retry, and only
+  when nothing is still recorded as attached. If the classifier still cannot be
+  proven gone, the routing is deliberately left in place and the failure is
+  logged with the manual remediation (`tc filter del dev <iface> ingress`);
+- every unsuccessful startup path follows the same order — a failed attach on
+  any one interface and a `validate_startup_ready` failure that lands after the
+  classifier attached both detach first and release the routing through that
+  single gate. The one exception is a partially applied routing install (the
+  `ip` batch is not atomic): no classifier has attached there, so the
+  Ferrum-owned rule/route is removed in place.
+
+Removal always names the exact priority and table, never flushes, and is
+best-effort — but not unobserved: a teardown `ip` command that runs and exits
+non-zero for any reason other than "no such rule/route" is reported with its
+(bounded) stderr, because Ferrum-owned routing left claiming the fwmark can
+interfere with other software and would silently pre-satisfy a later reinstall.
+
+A failure to install routing, or to attach on any one interface, is fatal: the
 node-agent unwinds what it installed, reports
 `ferrum_mesh_node_topology_degraded{reason="node_waypoint_ingress_redirect_unavailable"}`,
 and refuses readiness rather than serving a half-installed redirect. The image

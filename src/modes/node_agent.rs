@@ -587,8 +587,11 @@ pub(crate) fn ingress_redirect_routing_teardown_commands(ipv6: bool) -> Vec<Vec<
 /// in together or not at all. Only the idempotence `rule del` is best-effort.
 ///
 /// Failure is **partial by nature**: an earlier command can be in place when a
-/// later route fails. Every caller therefore removes the Ferrum-owned routing
-/// on the error path — see `initialize_backend_after_load`.
+/// later route fails, so `initialize_backend_after_load` removes the
+/// Ferrum-owned routing in place on that path — safe there because no
+/// classifier has attached yet. Once a classifier IS attached, removal moves to
+/// [`release_ingress_redirect_routing`], which runs after `cleanup_all` has
+/// retried the detach and withholds the removal while a classifier may be live.
 fn install_ingress_redirect_routing(supports_ipv6: bool) -> Result<(), String> {
     #[cfg(test)]
     let result = ingress_redirect_routing_seam::install(supports_ipv6);
@@ -601,6 +604,10 @@ fn install_ingress_redirect_routing(supports_ipv6: bool) -> Result<(), String> {
 /// it runs on shutdown and on every unsuccessful startup path, where a missing
 /// rule is the expected outcome, and a failure must never mask the original
 /// error.
+///
+/// Do NOT call this directly from a path where a classifier may be attached —
+/// go through [`release_ingress_redirect_routing`], which gates on the
+/// classifier being provably gone.
 fn remove_ingress_redirect_routing() {
     #[cfg(test)]
     ingress_redirect_routing_seam::remove();
@@ -738,15 +745,90 @@ fn install_ingress_redirect_routing_impl(_supports_ipv6: bool) -> Result<(), Str
     Err("the NodeWaypoint inbound tc ingress redirect is Linux-only".to_string())
 }
 
+/// Teardown stays **best-effort** — it runs on shutdown and on every
+/// unsuccessful startup path, where "nothing to remove" is the expected outcome
+/// and a failure must never mask the original error. But best-effort is not the
+/// same as unobserved: a command that RUNS and exits non-zero for a reason other
+/// than "no such rule/route" means Ferrum-owned policy routing is still claiming
+/// the redirect fwmark, which can interfere with other software on the node and
+/// will silently pre-satisfy a later reinstall.
+///
+/// So each command's exit status is inspected and reported. The diagnostic is
+/// bounded (`ip`'s stderr, trimmed, first line only, capped) and carries nothing
+/// operator-sensitive: the argv is Ferrum's own fixed rule/route/table/priority
+/// constants and `ip` reports only netlink-level failures.
 #[cfg(all(target_os = "linux", not(test)))]
 fn remove_ingress_redirect_routing_impl() {
+    /// Upper bound on the `ip` stderr text folded into a log line.
+    const MAX_TEARDOWN_STDERR_BYTES: usize = 200;
+
     for ipv6 in [false, true] {
         for args in ingress_redirect_routing_teardown_commands(ipv6) {
-            if let Err(e) = std::process::Command::new("ip").args(&args).output() {
-                debug!(args = ?args, error = %e, "Inbound redirect routing teardown command failed");
+            match std::process::Command::new("ip").args(&args).output() {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => {
+                    let stderr = bounded_command_stderr(&output.stderr, MAX_TEARDOWN_STDERR_BYTES);
+                    // An absent rule/route is the normal, expected teardown
+                    // outcome (idempotent delete), so it stays at debug; any
+                    // other non-zero exit leaves Ferrum-owned routing behind and
+                    // is surfaced.
+                    if teardown_stderr_is_absent_entry(&stderr) {
+                        debug!(
+                            args = ?args,
+                            status = ?output.status.code(),
+                            stderr = %stderr,
+                            "Inbound redirect routing teardown found nothing to remove"
+                        );
+                    } else {
+                        warn!(
+                            args = ?args,
+                            status = ?output.status.code(),
+                            stderr = %stderr,
+                            "Inbound redirect routing teardown command exited non-zero; the \
+                             Ferrum-owned rule/route may still claim the redirect fwmark. Remove \
+                             it manually with the same `ip` arguments if it persists."
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        args = ?args,
+                        error = %e,
+                        "Could not run the inbound redirect routing teardown command; the \
+                         Ferrum-owned rule/route may still claim the redirect fwmark"
+                    );
+                }
             }
         }
     }
+}
+
+/// First line of a command's stderr, trimmed and capped at `max_bytes` on a
+/// character boundary. Keeps a teardown diagnostic bounded no matter what the
+/// tool wrote.
+#[cfg(all(target_os = "linux", not(test)))]
+fn bounded_command_stderr(stderr: &[u8], max_bytes: usize) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
+
+/// Whether an `ip rule del` / `ip route del` failure means the entry simply was
+/// not there. iproute2 has no stable exit code for this, so match its messages.
+#[cfg(all(target_os = "linux", not(test)))]
+fn teardown_stderr_is_absent_entry(stderr: &str) -> bool {
+    let lowered = stderr.to_ascii_lowercase();
+    lowered.contains("no such file or directory")
+        || lowered.contains("no such process")
+        || lowered.contains("cannot find")
+        || lowered.contains("rtnetlink answers: no such")
 }
 
 #[cfg(all(not(target_os = "linux"), not(test)))]
@@ -1257,7 +1339,10 @@ async fn run_with_backend(
     // (normal shutdown, Kubernetes client construction failure, and Drop on
     // any other exit). Do not call `cleanup_all` on a second path.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
-    let mut owner = InitializedBackendOwner::new(backend);
+    let mut owner = InitializedBackendOwner::new(
+        backend,
+        config.capture_contract.ingress_redirect_enabled(),
+    );
 
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
@@ -1299,7 +1384,10 @@ where
     I: IntoIterator<Item = PodAttachmentState>,
 {
     initialize_backend(backend, config, metrics.as_ref())?;
-    let mut owner = InitializedBackendOwner::borrowed(backend);
+    let mut owner = InitializedBackendOwner::borrowed(
+        backend,
+        config.capture_contract.ingress_redirect_enabled(),
+    );
     let startup_ready = Arc::new(AtomicBool::new(false));
     let cni_config = CniListenerConfig {
         enabled: false,
@@ -6522,14 +6610,24 @@ fn initialize_backend(
         return Err(anyhow::Error::msg(e));
     }
 
+    // Single owner of the inbound-redirect ROUTING teardown across this
+    // function. Set once the routing is installed and cleared the moment it is
+    // removed, so exactly one path removes it: the in-place removal on a
+    // partially-applied install (no classifier ever attached there), or the
+    // rollback sweep below — which runs AFTER `cleanup_all` has retried the
+    // classifier detach, because routing must never be pulled out from under a
+    // classifier that may still be live.
+    let routing_installed = std::cell::Cell::new(false);
+
     // Programs (and any bpffs pins created during load) are live. Every
     // subsequent failure must roll back via `cleanup_all` before returning so
     // a crashed/retried startup cannot leave stale Ferrum maps under
     // `/sys/fs/bpf/ferrum`. The guard also covers an unwind out of the init
     // steps. `run_with_backend` takes ownership only after this function
     // returns Ok, so exactly one of the two owners ever cleans up.
-    let mut rollback = LoadedBackendRollback::new(backend);
-    match initialize_backend_after_load(rollback.backend_mut(), config, metrics) {
+    let mut rollback = LoadedBackendRollback::new(backend, &routing_installed);
+    match initialize_backend_after_load(rollback.backend_mut(), config, metrics, &routing_installed)
+    {
         Ok(()) => {
             rollback.commit();
             Ok(())
@@ -6545,6 +6643,7 @@ fn initialize_backend_after_load(
     backend: &mut dyn EbpfBackend,
     config: &NodeAgentConfig,
     metrics: &NodeAgentMetrics,
+    routing_installed: &std::cell::Cell<bool>,
 ) -> Result<(), anyhow::Error> {
     let require_sock_ops = config.capture_contract.proxy_mode == NodeAgentProxyMode::NodeWaypoint;
     if let Err(e) = backend.update_capture_config(&config.capture_contract.bpf_capture_config()) {
@@ -6683,6 +6782,11 @@ fn initialize_backend_after_load(
             // this path too — an inert leftover priority/table entry still
             // claims the fwmark, which can interfere with other software that
             // uses it (and would silently pre-satisfy a later reinstall).
+            //
+            // Safe to remove IN PLACE, unlike every other failure path below:
+            // no classifier has been attached yet, so there is nothing live that
+            // could be stranded by the routing going away first. The flag stays
+            // false so the rollback sweep does not remove it a second time.
             remove_ingress_redirect_routing();
             metrics.set_topology_degraded("node_waypoint_ingress_redirect_unavailable");
             metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
@@ -6692,14 +6796,29 @@ fn initialize_backend_after_load(
                  (`ip`) is present in the node-agent image and the container has NET_ADMIN."
             );
         }
+        // From here on the routing exists and the rollback owns removing it,
+        // after `cleanup_all` has retried the classifier detach.
+        routing_installed.set(true);
         for iface in &config.capture_contract.ingress_redirect_ifaces {
             if let Err(e) = backend.attach_ingress_redirect(iface) {
-                // Fail closed and unwind the routing we just installed: a
-                // half-attached redirect would capture inbound traffic on some
-                // interfaces and not others, which is exactly the ambiguous
-                // state this feature exists to remove.
-                let _ = backend.detach_ingress_redirect();
-                remove_ingress_redirect_routing();
+                // Fail closed and unwind: a half-attached redirect would capture
+                // inbound traffic on some interfaces and not others, which is
+                // exactly the ambiguous state this feature exists to remove.
+                //
+                // Detach here, but do NOT remove the routing yet: if this detach
+                // fails, the classifier attached to an earlier interface is
+                // still live, and removing its local-delivery routing would
+                // strand every packet it assigns. The rollback sweep removes the
+                // routing after `cleanup_all` has retried the detach, and
+                // withholds it if the classifier still cannot be proven gone.
+                if let Err(detach_err) = backend.detach_ingress_redirect() {
+                    warn!(
+                        error = %detach_err,
+                        "Failed to detach the NodeWaypoint inbound tc ingress redirect while \
+                         unwinding a failed attach; cleanup will retry before its routing is \
+                         removed"
+                    );
+                }
                 metrics.set_topology_degraded("node_waypoint_ingress_redirect_unavailable");
                 metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
                 anyhow::bail!(
@@ -6724,18 +6843,18 @@ fn initialize_backend_after_load(
     if let Err(e) = backend.validate_startup_ready(require_sock_ops) {
         // Startup is not ready, so nothing may keep steering inbound traffic:
         // unwind the redirect in the same order shutdown uses — detach the
-        // classifier FIRST, then remove the routing it depended on — so no
-        // window exists where packets are marked but no longer locally
-        // delivered.
-        if ingress_redirect_enabled {
-            if let Err(detach_err) = backend.detach_ingress_redirect() {
-                warn!(
-                    error = %detach_err,
-                    "Failed to detach the NodeWaypoint inbound tc ingress redirect while unwinding \
-                     a failed startup validation"
-                );
-            }
-            remove_ingress_redirect_routing();
+        // classifier FIRST, and only remove the routing it depended on once the
+        // classifier is provably gone — so no window exists where packets are
+        // assigned but no longer locally delivered. The routing removal itself
+        // is the rollback sweep's, after `cleanup_all` retries this detach.
+        if ingress_redirect_enabled
+            && let Err(detach_err) = backend.detach_ingress_redirect()
+        {
+            warn!(
+                error = %detach_err,
+                "Failed to detach the NodeWaypoint inbound tc ingress redirect while unwinding \
+                 a failed startup validation; cleanup will retry before its routing is removed"
+            );
         }
         if require_sock_ops && e.contains("SOCK_OPS") {
             metrics.set_topology_degraded("node_waypoint_sock_ops_unavailable");
@@ -6757,18 +6876,25 @@ fn initialize_backend_after_load(
 /// nothing owns them yet, so any exit — error return **or unwind** — must
 /// `cleanup_all` exactly once. `commit` hands the window off to
 /// [`InitializedBackendOwner`] instead.
-struct LoadedBackendRollback<'a> {
+struct LoadedBackendRollback<'a, 'r> {
     backend: &'a mut dyn EbpfBackend,
     /// Cleared by the first of `commit`/`roll_back`/`Drop`, so cleanup is
     /// exactly-once no matter which one wins.
     armed: bool,
+    /// Shared with `initialize_backend_after_load`: `true` once the
+    /// inbound-redirect policy routing is installed and not yet removed. This
+    /// rollback is its single removal owner from that point on, and removes it
+    /// only AFTER `cleanup_all` (which retries the classifier detach) and only
+    /// when no classifier is still recorded as attached.
+    routing_installed: &'r std::cell::Cell<bool>,
 }
 
-impl<'a> LoadedBackendRollback<'a> {
-    fn new(backend: &'a mut dyn EbpfBackend) -> Self {
+impl<'a, 'r> LoadedBackendRollback<'a, 'r> {
+    fn new(backend: &'a mut dyn EbpfBackend, routing_installed: &'r std::cell::Cell<bool>) -> Self {
         Self {
             backend,
             armed: true,
+            routing_installed,
         }
     }
 
@@ -6777,9 +6903,12 @@ impl<'a> LoadedBackendRollback<'a> {
     }
 
     /// Initialization succeeded: disarm without cleanup so the caller's
-    /// `InitializedBackendOwner` becomes the single cleanup owner.
+    /// `InitializedBackendOwner` becomes the single cleanup owner. The routing
+    /// stays installed — it is now the running agent's, torn down by
+    /// `shutdown_backend_state`.
     fn commit(mut self) {
         self.armed = false;
+        self.routing_installed.set(false);
     }
 
     /// Roll back now. Cleanup errors are warned alongside the original cause
@@ -6794,10 +6923,20 @@ impl<'a> LoadedBackendRollback<'a> {
                  original error preserved"
             );
         }
+        self.release_routing("startup rollback");
+    }
+
+    /// Remove the Ferrum-owned inbound-redirect routing, once and only once
+    /// `cleanup_all` has run and left no classifier recorded as attached.
+    fn release_routing(&mut self, context: &'static str) {
+        if !self.routing_installed.replace(false) {
+            return;
+        }
+        release_ingress_redirect_routing(&*self.backend, context);
     }
 }
 
-impl Drop for LoadedBackendRollback<'_> {
+impl Drop for LoadedBackendRollback<'_, '_> {
     fn drop(&mut self) {
         // Only reached on an unwind out of the init steps; the error and
         // success paths disarm first. `cleanup_all` is synchronous, so this is
@@ -6812,7 +6951,34 @@ impl Drop for LoadedBackendRollback<'_> {
                 "Failed to roll back BPF state while unwinding out of node-agent initialization"
             );
         }
+        self.release_routing("startup unwind");
     }
+}
+
+/// Remove the Ferrum-owned inbound-redirect policy routing — but only once no
+/// classifier can still be live.
+///
+/// The ordering is the whole point. A live classifier WITHOUT its local-delivery
+/// routing is the harmful half-state: it keeps assigning packets to the capture
+/// socket while the `main` table forwards them to the pod, so they reach neither
+/// endpoint. An inert leftover `ip rule`/`ip route` is harmless by comparison
+/// (it only claims the redirect fwmark). So when the detach did not provably
+/// succeed — after `cleanup_all` has already retried it — the routing is
+/// deliberately RETAINED and the operator is told how to finish the teardown.
+fn release_ingress_redirect_routing(backend: &dyn EbpfBackend, context: &'static str) {
+    if backend.ingress_redirect_attached() {
+        warn!(
+            context,
+            table = NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
+            "The NodeWaypoint inbound tc ingress redirect classifier is still attached after \
+             cleanup retried its detach, so its local-delivery routing is deliberately RETAINED: \
+             removing it now would strand every packet the classifier still assigns. Remove the \
+             classifier manually (`tc filter del dev <iface> ingress`); the leftover `ip rule` / \
+             `ip route` entries are inert until then."
+        );
+        return;
+    }
+    remove_ingress_redirect_routing();
 }
 
 /// Single owner of `cleanup_all` after successful `initialize_backend`.
@@ -6841,22 +7007,32 @@ struct InitializedBackendOwner<'a> {
     /// no-op. This is the whole exactly-once mechanism; there is no second
     /// cleanup owner after `initialize_backend` returns `Ok`.
     cleaned_up: bool,
+    /// Whether this agent installed the inbound-redirect policy routing.
+    ///
+    /// `initialize_backend` hands routing ownership over on success, so every
+    /// exit from here — normal shutdown, a late startup/runtime error, or `Drop`
+    /// — releases it through [`release_ingress_redirect_routing`]. Without this
+    /// the non-shutdown exits would leave an inert Ferrum-owned rule/route
+    /// claiming the redirect fwmark.
+    ingress_redirect_enabled: bool,
 }
 
 impl InitializedBackendOwner<'static> {
-    fn new(backend: Box<dyn EbpfBackend>) -> Self {
+    fn new(backend: Box<dyn EbpfBackend>, ingress_redirect_enabled: bool) -> Self {
         Self {
             backend: InitializedBackend::Owned(backend),
             cleaned_up: false,
+            ingress_redirect_enabled,
         }
     }
 }
 
 impl<'a> InitializedBackendOwner<'a> {
-    fn borrowed(backend: &'a mut dyn EbpfBackend) -> Self {
+    fn borrowed(backend: &'a mut dyn EbpfBackend, ingress_redirect_enabled: bool) -> Self {
         Self {
             backend: InitializedBackend::Borrowed(backend),
             cleaned_up: false,
+            ingress_redirect_enabled,
         }
     }
 
@@ -6898,6 +7074,7 @@ impl<'a> InitializedBackendOwner<'a> {
                 "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
             );
         }
+        self.release_ingress_redirect_routing(context);
     }
 
     fn cleanup_once_preserving(&mut self, original: &anyhow::Error, context: &'static str) {
@@ -6913,6 +7090,18 @@ impl<'a> InitializedBackendOwner<'a> {
                 "Failed to cleanup BPF state after error; original error preserved"
             );
         }
+        self.release_ingress_redirect_routing(context);
+    }
+
+    /// Release the inbound-redirect routing after `cleanup_all` has retried the
+    /// classifier detach. `shutdown_pods` does its own ordered release inside
+    /// [`shutdown_backend_state`] and latches `cleaned_up`, so the two never
+    /// both run.
+    fn release_ingress_redirect_routing(&mut self, context: &'static str) {
+        if !self.ingress_redirect_enabled {
+            return;
+        }
+        release_ingress_redirect_routing(&*self.backend.as_mut(), context);
     }
 }
 
@@ -6977,21 +7166,25 @@ fn shutdown_backend_state(
     config: &NodeAgentConfig,
 ) {
     detach_enrolled_pods(backend, pod_states, config);
+    let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
     // Detach the node-level ingress redirect BEFORE removing its routing: with
     // the classifier gone no further packets are assigned, so the window
     // between the two steps cannot strand an assigned packet with no local
-    // route. `cleanup_all` also detaches idempotently as a backstop.
-    if config.capture_contract.ingress_redirect_enabled() {
-        if let Err(e) = backend.detach_ingress_redirect() {
-            warn!(
-                error = %e,
-                context = "shutdown",
-                "Failed to detach the inbound tc ingress redirect; inbound traffic for enrolled \
-                 pods may be steered at a listener that is going away until the classifier is \
-                 removed manually (`tc filter del dev <iface> ingress`)"
-            );
-        }
-        remove_ingress_redirect_routing();
+    // route. `cleanup_all` below RETRIES a failed detach (the links are owned by
+    // the backend, so a failure keeps its attachment recorded), and the routing
+    // removal is deferred until after that retry — and skipped entirely if the
+    // classifier still cannot be proven gone.
+    if ingress_redirect_enabled
+        && let Err(e) = backend.detach_ingress_redirect()
+    {
+        warn!(
+            error = %e,
+            context = "shutdown",
+            "Failed to detach the inbound tc ingress redirect; inbound traffic for enrolled \
+             pods may be steered at a listener that is going away until the classifier is \
+             removed manually (`tc filter del dev <iface> ingress`). Cleanup will retry before \
+             its local-delivery routing is removed."
+        );
     }
     if let Err(cleanup_err) = backend.cleanup_all() {
         warn!(
@@ -6999,6 +7192,9 @@ fn shutdown_backend_state(
             context = "shutdown",
             "Failed to cleanup BPF state; pins may remain under bpffs until the next successful cleanup"
         );
+    }
+    if ingress_redirect_enabled {
+        release_ingress_redirect_routing(&*backend, "shutdown");
     }
 }
 
@@ -7191,7 +7387,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let sampled = init.sampled;
-        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = init.config.capture_contract.ingress_redirect_enabled();
+        let owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         // Production path: `run_with_backend` funnels a kube-client error here.
         let err = owner.fail_with(anyhow::anyhow!("injected kube client construction failure"));
         observed(&watch, sampled, Some(err.to_string()))
@@ -7206,7 +7403,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let (config, sampled) = (init.config, init.sampled);
-        let mut owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = config.capture_contract.ingress_redirect_enabled();
+        let mut owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
         owner.shutdown_pods(&pod_states, &config);
         // Drop must observe the latched flag and NOT clean up a second time.
@@ -7227,7 +7425,8 @@ pub mod startup_cleanup_test_seams {
             Err(probe) => return probe,
         };
         let sampled = init.sampled;
-        let owner = InitializedBackendOwner::new(Box::new(init.backend));
+        let ingress_redirect = init.config.capture_contract.ingress_redirect_enabled();
+        let owner = InitializedBackendOwner::new(Box::new(init.backend), ingress_redirect);
         let err = owner.fail_with(anyhow::anyhow!("original injected startup failure"));
         observed(&watch, sampled, Some(err.to_string()))
     }
@@ -8271,6 +8470,134 @@ mod tests {
         assert!(
             detach < remove,
             "classifier must detach before its routing is removed: {entries:?}"
+        );
+    }
+
+    /// A failed detach must NOT release the local-delivery routing. A live
+    /// classifier without its routing assigns packets to the capture socket
+    /// that the `main` table then forwards to the pod, so they reach neither
+    /// endpoint — strictly worse than an inert leftover `ip rule`/`ip route`.
+    /// `cleanup_all` gets the retry, and only its success releases the routing.
+    #[test]
+    fn a_failed_detach_retains_the_routing_and_cleanup_retries_it() {
+        let op_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ingress_redirect_routing_seam::activate_with_log(false, Some(op_log.clone()));
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_validate_startup_ready: true,
+            // Only the FIRST detach fails; `cleanup_all`'s retry succeeds.
+            fail_detach_ingress_redirect_times: 1,
+            op_log: Some(op_log.clone()),
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        let _err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("failed startup validation must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+        let entries = op_log.lock().unwrap().clone();
+
+        assert_eq!(
+            backend.ingress_redirect_detach_calls, 2,
+            "cleanup_all must RETRY the failed detach rather than treating the dropped link ids \
+             as already gone: {entries:?}"
+        );
+        assert!(
+            !backend.ingress_redirect_attached(),
+            "the retry succeeded, so nothing may still be recorded as attached"
+        );
+        assert_eq!(
+            calls.removals, 1,
+            "the routing is released exactly once, after the retry proved the classifier gone"
+        );
+        let last_detach = entries
+            .iter()
+            .rposition(|op| op == "detach_ingress_redirect")
+            .expect("classifier detached");
+        let remove = entries
+            .iter()
+            .position(|op| op == "remove_ingress_redirect_routing")
+            .expect("routing removed once the classifier was gone");
+        assert!(
+            last_detach < remove,
+            "the routing must only be removed after the SUCCESSFUL detach: {entries:?}"
+        );
+    }
+
+    /// When even `cleanup_all`'s retry cannot detach the classifier, the
+    /// routing is deliberately RETAINED (fail-safe half-state) instead of being
+    /// removed under a classifier that is still assigning packets.
+    #[test]
+    fn a_permanently_failing_detach_withholds_the_routing_teardown() {
+        ingress_redirect_routing_seam::activate(false);
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_validate_startup_ready: true,
+            fail_detach_ingress_redirect_times: usize::MAX,
+            ..MockEbpfBackend::default()
+        };
+        let metrics = NodeAgentMetrics::default();
+
+        let _err = with_env_vars(&[("FERRUM_NODE_AGENT_NODE_IP", "192.0.2.10")], || {
+            initialize_backend(&mut backend, &config, &metrics)
+                .expect_err("failed startup validation must fail startup")
+        });
+        let calls = ingress_redirect_routing_seam::take_calls();
+
+        assert_eq!(calls.installs, 1);
+        assert!(
+            backend.ingress_redirect_attached(),
+            "a failed detach must KEEP its attachment recorded so the routing gate can see it"
+        );
+        assert_eq!(
+            calls.removals, 0,
+            "routing must never be pulled out from under a classifier that may still be live"
+        );
+    }
+
+    /// Normal shutdown uses the same ordering: detach, then `cleanup_all` (the
+    /// retry), then release the routing.
+    #[test]
+    fn shutdown_releases_the_routing_only_after_cleanup_confirms_the_detach() {
+        let op_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ingress_redirect_routing_seam::activate_with_log(false, Some(op_log.clone()));
+        let config = node_waypoint_redirect_config("/sys/fs/cgroup".to_string(), false);
+        let mut backend = MockEbpfBackend {
+            fail_detach_ingress_redirect_times: 1,
+            op_log: Some(op_log.clone()),
+            ..MockEbpfBackend::default()
+        };
+        backend
+            .attach_ingress_redirect("eth0")
+            .expect("attach the classifier");
+        let pod_states: DashMap<String, PodAttachmentState> = DashMap::new();
+
+        shutdown_backend_state(&mut backend, &pod_states, &config);
+
+        let calls = ingress_redirect_routing_seam::take_calls();
+        let entries = op_log.lock().unwrap().clone();
+        assert_eq!(
+            backend.ingress_redirect_detach_calls, 2,
+            "shutdown detaches, then cleanup_all retries: {entries:?}"
+        );
+        assert!(!backend.ingress_redirect_attached());
+        assert_eq!(
+            calls.removals, 1,
+            "the routing is released exactly once on shutdown"
+        );
+        let last_detach = entries
+            .iter()
+            .rposition(|op| op == "detach_ingress_redirect")
+            .expect("classifier detached");
+        let remove = entries
+            .iter()
+            .position(|op| op == "remove_ingress_redirect_routing")
+            .expect("routing removed on shutdown");
+        assert!(
+            last_detach < remove,
+            "shutdown must not remove routing before the classifier is gone: {entries:?}"
         );
     }
 

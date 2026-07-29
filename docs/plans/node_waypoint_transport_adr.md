@@ -205,14 +205,23 @@ captured application bytes at L4. That does not weaken this section's rule,
 because the captured connection is then subject to destination policy before
 any byte reaches the app:
 
-- the live PeerAuthentication posture for the recovered app port must admit
-  plaintext, so `STRICT` still refuses direct plaintext and forces the peer onto
-  authenticated mesh transport;
 - the recovered destination must pass the **same** open-relay guard as the
   inbound HBONE relay (a slice-declared in-mesh workload address and port),
-  counted as `relay_destination_denied` on rejection;
+  tightened to exactly one unambiguous workload identity, counted as
+  `relay_destination_denied` on rejection. This runs first: one capture listener
+  serves every enrolled pod on the node, so the two gates below are properties
+  of that workload, not of the listener;
+- the effective PeerAuthentication posture of **that destination workload** on
+  the captured app port must admit plaintext — resolved from the workload's own
+  namespace/labels, never from a listener-wide per-port table, so a `PERMISSIVE`
+  pod cannot admit plaintext to a `STRICT` pod sharing the app port. `STRICT`
+  still refuses direct plaintext and forces the peer onto authenticated mesh
+  transport;
 - the L4 `on_stream_connect` chain — including `__mesh_authz` — runs with the
-  captured app port as the authorization destination.
+  captured app port as the authorization destination and that workload's
+  `PolicyScopeCache` stamped on the stream context, so namespace/selector-scoped
+  policies are evaluated against the captured destination rather than denied
+  `scope_missing`.
 
 The relay's own backend dial carries the same NodeWaypoint inbound-auth mark, so
 the pod-veth guard admits it and the redirect bypasses it as already-relayed. An

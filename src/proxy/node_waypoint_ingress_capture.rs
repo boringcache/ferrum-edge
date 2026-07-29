@@ -24,20 +24,33 @@
 //!    off-listener address. A direct dial to the capture port itself resolves
 //!    to the listener's own address and is refused — this listener is not a
 //!    general-purpose relay anyone on the node may address.
-//! 2. **PeerAuthentication.** The live posture for the recovered *app port*
-//!    (`ProxyState::mesh_inbound_tls_policy`, the same table the mesh inbound
-//!    TLS selector reads) must admit plaintext. Under `STRICT` it does not, so
-//!    direct plaintext is refused and the peer must come over authenticated
-//!    mesh transport (HBONE) instead. This is the whole reason the redirect can
-//!    be enabled without weakening STRICT.
-//! 3. **Ownership.** The destination must be a slice-declared in-mesh workload
-//!    address+port — the same open-relay guard the inbound HBONE relay uses, so
-//!    an operator cannot turn this socket into a proxy to arbitrary hosts.
+//! 2. **Ownership and destination identity.** The destination must resolve to
+//!    exactly one slice-declared in-mesh workload address+port
+//!    ([`crate::proxy::build_node_waypoint_capture_relay_entry`]) — the same
+//!    open-relay guard the inbound HBONE relay uses, tightened to a single
+//!    unambiguous workload. This runs FIRST because the two gates below are
+//!    both properties of that workload, not of the listener.
+//! 3. **PeerAuthentication.** The effective inbound posture of **that exact
+//!    workload** on the captured app port must admit plaintext. Resolved from
+//!    the workload's own namespace/labels against the live slice's
+//!    PeerAuthentication set — deliberately NOT from the listener-wide
+//!    `ProxyState::mesh_inbound_tls_policy` port table, which is keyed by port
+//!    alone and would let a `PERMISSIVE` pod admit direct plaintext to a
+//!    `STRICT` pod that happens to share the app port. Under `STRICT` the
+//!    connection is refused and the peer must come over authenticated mesh
+//!    transport (HBONE) instead. This is the whole reason the redirect can be
+//!    enabled without weakening STRICT.
 //! 4. **Authorization.** The relay hands off to
 //!    [`crate::proxy::mesh_tcp_inbound::handle_mesh_tcp_inbound`], which runs
 //!    the L4 `on_stream_connect` chain (including the mesh-injected
 //!    `__mesh_authz`) with the captured **app** port as the authorization
-//!    destination, then relays byte-for-byte and emits the disconnect summary.
+//!    destination and the destination workload's `PolicyScopeCache` stamped on
+//!    the stream context, then relays byte-for-byte and emits the disconnect
+//!    summary.
+//!
+//! Every one of these is fail-CLOSED: an unresolvable destination, an ambiguous
+//! one, or a posture that cannot be established closes the connection rather
+//! than relaying it under some other workload's policy.
 //!
 //! The backend dial carries `SO_MARK = NODE_WAYPOINT_INBOUND_AUTH_MARK`, so the
 //! pod-veth `ferrum_tc_inbound` guard admits it as an authorized relay dial and
@@ -164,20 +177,14 @@ fn captured_original_dst(
     Some(local)
 }
 
-/// The live PeerAuthentication posture for a captured app port.
+/// Whether a resolved destination-workload PeerAuthentication mode admits
+/// direct plaintext on the capture path.
 ///
-/// Reads the same `modes_by_port` / `default_mode` table the mesh inbound TLS
-/// selector uses, so the redirect can never admit plaintext on a port the mesh
-/// considers STRICT. One `ArcSwap` load per accepted connection, off the
-/// request path.
-fn captured_plaintext_admitted(state: &ProxyState, app_port: u16) -> (bool, MtlsMode) {
-    let policy = state.mesh_inbound_tls_policy.load();
-    let mode = policy
-        .modes_by_port
-        .get(&app_port)
-        .copied()
-        .unwrap_or(policy.default_mode);
-    (super::mtls_mode_accepts_plaintext(mode), mode)
+/// `mtls_mode_accepts_plaintext` admits both PERMISSIVE and DISABLE (DISABLE
+/// means "no mesh TLS", i.e. plaintext is expected, not refused); STRICT is the
+/// mode that forbids exactly this.
+fn captured_plaintext_admitted(mode: MtlsMode) -> bool {
+    super::mtls_mode_accepts_plaintext(mode)
 }
 
 async fn handle_captured_connection(
@@ -197,33 +204,18 @@ async fn handle_captured_connection(
         return;
     };
 
-    let (plaintext_admitted, mode) = captured_plaintext_admitted(state, orig_dst.port());
-    if !plaintext_admitted {
-        // STRICT for this app port — the only mode that reaches here, since
-        // `mtls_mode_accepts_plaintext` admits both PERMISSIVE and DISABLE
-        // (DISABLE means "no mesh TLS", i.e. plaintext is expected, not
-        // refused). Direct plaintext is exactly what STRICT forbids, so the
-        // connection is closed; the peer must arrive over authenticated mesh
-        // transport instead. This is a policy outcome, not an error, so it
-        // stays at debug with no request-derived content beyond the peer IP.
-        debug!(
-            client_ip = %remote_addr.ip(),
-            app_port = orig_dst.port(),
-            ?mode,
-            "Refusing captured direct plaintext: the PeerAuthentication posture for this app port \
-             requires verified mesh transport"
-        );
-        drop(stream);
-        return;
-    }
-
+    // ONE epoch load backs the ownership guard, the destination workload's
+    // PeerAuthentication posture, and the policy scope handed to authz, so a
+    // concurrent slice apply can never pair one workload's posture with
+    // another's scope.
     let epoch = state.request_epoch.load();
-    let Some(entry) = super::build_node_waypoint_capture_relay_entry(orig_dst, &epoch) else {
+    let Some(destination) = super::build_node_waypoint_capture_relay_entry(orig_dst, &epoch) else {
         debug!(
             client_ip = %remote_addr.ip(),
             %orig_dst,
-            "Refusing a captured connection whose original destination is not a slice-declared \
-             in-mesh workload address and port"
+            "Refusing a captured connection whose original destination does not resolve to exactly \
+             one slice-declared in-mesh workload address and port; without the exact destination \
+             workload there is no PeerAuthentication posture or policy scope to enforce"
         );
         // Same open-relay guard, same ADR counter as the inbound HBONE relay
         // (issue #3334): `relay_destination_denied` is the destination-policy
@@ -239,15 +231,35 @@ async fn handle_captured_connection(
         return;
     };
 
+    if !captured_plaintext_admitted(destination.mtls_mode) {
+        // STRICT for THIS destination workload on this app port. The posture is
+        // per-workload, not per-port: another pod on the same node serving the
+        // same app port under PERMISSIVE does not admit plaintext here. The peer
+        // must arrive over authenticated mesh transport instead. This is a
+        // policy outcome, not an error, so it stays at debug with no
+        // request-derived content beyond the peer IP.
+        debug!(
+            client_ip = %remote_addr.ip(),
+            %orig_dst,
+            app_port = orig_dst.port(),
+            mode = ?destination.mtls_mode,
+            "Refusing captured direct plaintext: the PeerAuthentication posture of the destination \
+             workload requires verified mesh transport"
+        );
+        drop(stream);
+        return;
+    }
+
     // Hand off to the shared captured-inbound relay: L4 authorization chain on
-    // the captured app port, marked backend dial, byte-for-byte relay, and the
-    // stream disconnect/transaction lifecycle.
+    // the captured app port with the destination workload's policy scope,
+    // marked backend dial, byte-for-byte relay, and the stream
+    // disconnect/transaction lifecycle.
     super::mesh_tcp_inbound::handle_mesh_tcp_inbound(
         stream,
         remote_addr,
         state,
         &epoch,
-        &entry,
+        &destination.entry,
         orig_dst,
     )
     .await;
@@ -275,5 +287,211 @@ mod tests {
         let err = crate::modes::mesh::validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap())
             .unwrap_err();
         assert!(err.contains("non-zero port"), "{err}");
+    }
+
+    mod destination_policy {
+        use std::collections::HashMap;
+
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MtlsMode, PeerAuthentication, Workload, WorkloadPort,
+            WorkloadSelector,
+        };
+        use crate::proxy::resolve_node_waypoint_capture_destination;
+
+        const APP_PORT: u16 = 8080;
+
+        fn trust_domain() -> TrustDomain {
+            TrustDomain::new("cluster.local").expect("trust domain")
+        }
+
+        fn workload(namespace: &str, service: &str, address: &str, app: &str) -> Workload {
+            let td = trust_domain();
+            let mut labels = HashMap::new();
+            labels.insert("app".to_string(), app.to_string());
+            Workload {
+                spiffe_id: SpiffeId::from_parts(&td, &format!("ns/{namespace}/sa/{service}"))
+                    .expect("spiffe id"),
+                selector: WorkloadSelector {
+                    labels,
+                    namespace: Some(namespace.to_string()),
+                },
+                service_name: service.to_string(),
+                addresses: vec![address.to_string()],
+                ports: vec![WorkloadPort {
+                    port: APP_PORT,
+                    protocol: AppProtocol::Http,
+                    name: None,
+                }],
+                trust_domain: td,
+                namespace: namespace.to_string(),
+                network: None,
+                cluster: None,
+                weight: None,
+                locality: None,
+                service_account: None,
+                pod_uid: None,
+                node_waypoint: None,
+                remote_provenance: false,
+            }
+        }
+
+        /// A selector-scoped PeerAuthentication targeting `app=<app>` in
+        /// `namespace`.
+        fn selector_peer_auth(
+            name: &str,
+            namespace: &str,
+            app: &str,
+            mode: MtlsMode,
+        ) -> PeerAuthentication {
+            let mut labels = HashMap::new();
+            labels.insert("app".to_string(), app.to_string());
+            PeerAuthentication {
+                name: name.to_string(),
+                namespace: namespace.to_string(),
+                scope: None,
+                selector: Some(WorkloadSelector {
+                    labels,
+                    namespace: Some(namespace.to_string()),
+                }),
+                mtls_mode: mode,
+                port_overrides: HashMap::new(),
+            }
+        }
+
+        /// Two pods on one node share app port 8080 through the SAME capture
+        /// listener. One is STRICT, the other PERMISSIVE. Because a NodeWaypoint
+        /// listener is shared, a port-keyed posture table would give both pods
+        /// whichever mode won the port — so this pins that the posture is
+        /// resolved per DESTINATION WORKLOAD and that the permissive neighbour
+        /// can never admit direct plaintext to the strict one.
+        #[test]
+        fn two_workloads_sharing_an_app_port_do_not_cross_apply_peer_authentication() {
+            let mesh = MeshConfig {
+                workloads: vec![
+                    workload("payments", "ledger", "10.244.1.7", "ledger"),
+                    workload("payments", "reports", "10.244.1.8", "reports"),
+                ],
+                peer_authentications: vec![
+                    selector_peer_auth("ledger-strict", "payments", "ledger", MtlsMode::Strict),
+                    selector_peer_auth(
+                        "reports-permissive",
+                        "payments",
+                        "reports",
+                        MtlsMode::Permissive,
+                    ),
+                ],
+                ..MeshConfig::default()
+            };
+
+            let strict = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                &mesh,
+            )
+            .expect("the strict workload's destination still resolves");
+            assert_eq!(
+                strict.mtls_mode,
+                MtlsMode::Strict,
+                "the STRICT pod's posture must not be relaxed by a PERMISSIVE pod that happens \
+                 to share the app port on this node"
+            );
+            assert!(
+                !super::super::captured_plaintext_admitted(strict.mtls_mode),
+                "captured direct plaintext to a STRICT workload must be refused"
+            );
+
+            let permissive = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.8:{APP_PORT}").parse().unwrap(),
+                &mesh,
+            )
+            .expect("the permissive workload's destination resolves");
+            assert_eq!(permissive.mtls_mode, MtlsMode::Permissive);
+            assert!(
+                super::super::captured_plaintext_admitted(permissive.mtls_mode),
+                "the PERMISSIVE pod is unaffected by its STRICT neighbour"
+            );
+        }
+
+        /// The relay entry must carry the destination workload's scope: stream
+        /// `mesh_authz` runs with `per_pod_policy_scoping` on for NodeWaypoint,
+        /// so an absent scope denies every captured connection `scope_missing`
+        /// as soon as one namespace/selector-scoped policy exists.
+        #[test]
+        fn the_capture_relay_entry_stamps_the_destination_workload_scope() {
+            let mesh = MeshConfig {
+                workloads: vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                ..MeshConfig::default()
+            };
+            let destination = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                &mesh,
+            )
+            .expect("destination resolves");
+
+            let scope = destination
+                .entry
+                .node_waypoint_policy_scope
+                .as_ref()
+                .expect("the capture relay must stamp the destination workload's policy scope");
+            assert_eq!(scope.namespace, "payments");
+            assert_eq!(scope.labels.get("app").map(String::as_str), Some("ledger"));
+            assert_eq!(
+                destination.entry.socket_mark,
+                Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK)
+            );
+            // No PeerAuthentication at all is Istio's PERMISSIVE default.
+            assert_eq!(destination.mtls_mode, MtlsMode::Permissive);
+        }
+
+        /// Fail closed when the destination cannot be pinned to exactly one
+        /// workload identity: no slice record at all, or two records claiming
+        /// the address with divergent policy identity (picking either would
+        /// silently choose whose policy applies).
+        #[test]
+        fn an_unresolvable_or_ambiguous_destination_is_refused() {
+            let known = workload("payments", "ledger", "10.244.1.7", "ledger");
+            let mesh = MeshConfig {
+                workloads: vec![known.clone()],
+                ..MeshConfig::default()
+            };
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.9.9:{APP_PORT}").parse().unwrap(),
+                    &mesh,
+                )
+                .is_none(),
+                "an address no slice workload declares must be refused, not relayed"
+            );
+
+            // Duplicate records for ONE pod are normal (several services backed
+            // by the same workload) and must still resolve.
+            let duplicate = MeshConfig {
+                workloads: vec![known.clone(), known.clone()],
+                ..MeshConfig::default()
+            };
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                    &duplicate,
+                )
+                .is_some(),
+                "identical duplicate workload records collapse to one scope"
+            );
+
+            let impostor = workload("attacker", "spoof", "10.244.1.7", "spoof");
+            let ambiguous = MeshConfig {
+                workloads: vec![known, impostor],
+                ..MeshConfig::default()
+            };
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                    &ambiguous,
+                )
+                .is_none(),
+                "two divergent workload identities on one address are ambiguous and must fail \
+                 closed rather than pick whose policy applies"
+            );
+        }
     }
 }

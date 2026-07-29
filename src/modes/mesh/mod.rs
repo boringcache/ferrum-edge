@@ -839,25 +839,28 @@ impl MeshRuntimeConfig {
     /// (issue #3287), emitted only when the node-agent's eBPF tc ingress
     /// redirect is configured on this node.
     ///
-    /// Gated to `NodeWaypoint` alone: `ServiceWaypoint` serves a named set of
-    /// services over HBONE and has no node-agent installing a per-node tc
-    /// classifier, so binding a transparent capture socket there would claim a
-    /// port for a datapath that never delivers to it. `EastWestGateway` and the
-    /// gateways are likewise out of scope.
+    /// Topology gating lives in
+    /// [`MeshRuntimeConfig::transparent_inbound_capture_requested`], shared with
+    /// the serving-path validator so the two can never disagree about whether
+    /// this listener is required.
     ///
     /// The address deliberately reuses `FERRUM_MESH_INBOUND_LISTEN_ADDR` — the
     /// same variable the node-agent reads to learn the redirect's steer target
     /// (see [`node_waypoint_ingress_capture_addr`]), so the two processes share
-    /// one source of truth. A malformed or non-wildcard value warn-skips here
-    /// because this helper is infallible (read-only predicates call it too);
-    /// `serve_mesh_runtime` re-validates the same value with `?` before binding,
-    /// so on the serving path a bad setting fails startup rather than silently
-    /// dropping the listener.
+    /// one source of truth.
+    ///
+    /// This helper is INFALLIBLE because read-only predicates and tests call
+    /// `listener_plan()`, so a malformed / zero-port / non-wildcard value can
+    /// only warn-and-skip here. That would be a silent black hole on its own —
+    /// the node-agent's classifier still steers every enrolled pod's inbound
+    /// traffic at that port and the packets are dropped fail-closed — so the
+    /// SERVING path validates the same value with `?` before anything binds:
+    /// [`MeshRuntimeConfig::validate_transparent_inbound_capture_settings`],
+    /// called from `prepare_mesh_runtime_before_owner`. A bad setting therefore
+    /// aborts mesh startup with a field-specific error instead of leaving the
+    /// proxy ready with only HBONE.
     fn transparent_inbound_capture_listener(&self) -> Option<MeshListener> {
-        if self.topology != MeshTopology::NodeWaypoint {
-            return None;
-        }
-        if !crate::modes::node_agent::node_waypoint_ingress_redirect_configured() {
+        if !self.transparent_inbound_capture_requested() {
             return None;
         }
         let addr = match node_waypoint_ingress_capture_addr() {
@@ -876,6 +879,43 @@ impl MeshRuntimeConfig {
             kind: MeshListenerKind::TransparentInboundCapture,
             addr,
         })
+    }
+
+    /// Whether this process is supposed to bind the NodeWaypoint transparent
+    /// inbound capture listener at all.
+    ///
+    /// Gated to `NodeWaypoint` alone: `ServiceWaypoint` serves a named set of
+    /// services over HBONE and has no node-agent installing a per-node tc
+    /// classifier, so binding a transparent capture socket there would claim a
+    /// port for a datapath that never delivers to it. `EastWestGateway` and the
+    /// gateways are likewise out of scope. Default-off beyond that: the
+    /// redirect must be explicitly requested via
+    /// `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES`.
+    fn transparent_inbound_capture_requested(&self) -> bool {
+        self.topology == MeshTopology::NodeWaypoint
+            && crate::modes::node_agent::node_waypoint_ingress_redirect_configured()
+    }
+
+    /// Fail-closed validation of the NodeWaypoint transparent inbound capture
+    /// settings, for the SERVING path only (issue #3287).
+    ///
+    /// `listener_plan()` cannot fail — read-only predicates call it — so an
+    /// invalid `FERRUM_MESH_INBOUND_LISTEN_ADDR` would there merely warn and
+    /// drop the listener, leaving the proxy ready with HBONE alone while the
+    /// node-agent's `ferrum_tc_ingress_redirect` keeps steering every enrolled
+    /// pod's inbound traffic at a port nothing is listening on (the classifier
+    /// drops in-scope packets fail-closed). That is a node-wide inbound black
+    /// hole reported as healthy, so the serving path calls this with `?` and
+    /// aborts startup with a field-specific error instead.
+    ///
+    /// A no-op unless the redirect is actually requested for this topology, so
+    /// the default-off posture is unchanged.
+    pub(crate) fn validate_transparent_inbound_capture_settings(&self) -> Result<(), String> {
+        if !self.transparent_inbound_capture_requested() {
+            return Ok(());
+        }
+        let addr = node_waypoint_ingress_capture_addr()?;
+        validate_ingress_capture_addr(addr)
     }
 
     /// The optional UDP TPROXY capture listener (F3 §3.3), emitted on the two
@@ -9698,6 +9738,21 @@ fn prepare_mesh_runtime_before_owner(
     // (which a later `?` would have left running for in-process retries/tests).
     crate::capture::udp_capture_settings_from_env()
         .map_err(|e| anyhow::anyhow!("Invalid mesh UDP capture settings: {e}"))?;
+
+    // Same contract for the NodeWaypoint transparent inbound capture listener
+    // (issue #3287). `transparent_inbound_capture_listener()` feeding
+    // `listener_plan()` is infallible for the same reason, so on its own a
+    // malformed / zero-port / non-wildcard FERRUM_MESH_INBOUND_LISTEN_ADDR would
+    // warn-and-skip and let the proxy come up ready with HBONE alone — while the
+    // node-agent's `ferrum_tc_ingress_redirect` keeps steering every enrolled
+    // pod's inbound traffic at that port, where the classifier drops it fail
+    // closed. Validate here so an operator config error aborts mesh startup with
+    // a field-specific message instead of black-holing the node's inbound.
+    runtime
+        .validate_transparent_inbound_capture_settings()
+        .map_err(|e| {
+            anyhow::anyhow!("Invalid NodeWaypoint inbound capture listener settings: {e}")
+        })?;
 
     if peek_mesh_startup_fault_inject() == MeshStartupFaultInject::BeforeOwner {
         let _ = take_mesh_startup_fault_inject();
@@ -23144,6 +23199,87 @@ mod tests {
         assert!(validate_ingress_capture_addr("[::]:15006".parse().unwrap()).is_ok());
         assert!(validate_ingress_capture_addr("10.0.0.5:15006".parse().unwrap()).is_err());
         assert!(validate_ingress_capture_addr("0.0.0.0:0".parse().unwrap()).is_err());
+    }
+
+    /// The serving path must FAIL, not warn-skip, when the redirect is armed
+    /// but the capture address cannot be bound as the classifier's steer
+    /// target. `listener_plan()` is infallible by design, so without the
+    /// separate validator the proxy would come up ready with HBONE alone while
+    /// `ferrum_tc_ingress_redirect` keeps dropping every enrolled pod's inbound
+    /// traffic fail-closed. This drives the exact helper
+    /// `prepare_mesh_runtime_before_owner` applies with `?`.
+    #[test]
+    fn an_unbindable_capture_address_fails_the_serving_path_instead_of_warn_skipping() {
+        for (addr, expected) in [("0.0.0.0:0", "non-zero port"), ("10.0.0.5:15006", "wildcard")] {
+            with_mesh_env(
+                &[
+                    ("FERRUM_MODE", "mesh"),
+                    ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                    (
+                        "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                        "secret-padding-for-32-char-min!!",
+                    ),
+                    ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                    ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
+                    ("FERRUM_MESH_INBOUND_LISTEN_ADDR", addr),
+                ],
+                || {
+                    let env = EnvConfig::from_env().expect("mesh env config");
+                    let runtime =
+                        MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+
+                    // The plan silently omits it — that is exactly why the
+                    // serving path cannot rely on planning alone.
+                    assert!(
+                        !runtime.listener_plan().iter().any(|listener| listener.kind
+                            == MeshListenerKind::TransparentInboundCapture),
+                        "an invalid capture address warn-skips in the infallible plan"
+                    );
+
+                    let err = runtime
+                        .validate_transparent_inbound_capture_settings()
+                        .expect_err("the serving path must refuse to start");
+                    assert!(err.contains("FERRUM_MESH_INBOUND_LISTEN_ADDR"), "{err}");
+                    assert!(err.contains(expected), "{err}");
+                },
+            );
+        }
+    }
+
+    /// Default-off is preserved: with no redirect requested the validator is a
+    /// no-op even for an address the redirect would refuse, and NodeWaypoint
+    /// keeps its HBONE-only plan.
+    #[test]
+    fn the_capture_validator_is_inert_when_the_redirect_is_not_requested() {
+        with_mesh_env(
+            &[
+                ("FERRUM_MODE", "mesh"),
+                ("FERRUM_DP_CP_GRPC_URLS", "http://cp:50051"),
+                (
+                    "FERRUM_CP_DP_GRPC_JWT_SECRET",
+                    "secret-padding-for-32-char-min!!",
+                ),
+                ("FERRUM_MESH_TOPOLOGY", "node_waypoint"),
+                ("FERRUM_MESH_INBOUND_LISTEN_ADDR", "10.0.0.5:15006"),
+            ],
+            || {
+                let env = EnvConfig::from_env().expect("mesh env config");
+                let runtime =
+                    MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
+                assert!(
+                    runtime
+                        .validate_transparent_inbound_capture_settings()
+                        .is_ok()
+                );
+                assert!(
+                    !runtime
+                        .listener_plan()
+                        .iter()
+                        .any(|listener| listener.kind
+                            == MeshListenerKind::TransparentInboundCapture)
+                );
+            },
+        );
     }
 
     #[test]

@@ -399,6 +399,13 @@ impl BpfMaps {
     /// reachable port (a black hole, since in-scope traffic fails closed).
     /// Clearing an absent map is a no-op so teardown still succeeds against an
     /// older ELF.
+    ///
+    /// A key-iteration error is likewise a **hard error**, never skipped: the
+    /// scan is what finds the stale keys, so swallowing an error would return
+    /// success from a narrowing update that never removed the withdrawn
+    /// `(pod, port)` — leaving a port the operator just took out of
+    /// `containerPorts` still redirectable, with the caller's retry ledger
+    /// cleared because the write "succeeded".
     pub fn replace_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
         let addr = ipv4_to_nbo_key(ip);
         let Some(pod_inbound_ports) = self.pod_inbound_ports.as_mut() else {
@@ -410,11 +417,19 @@ impl BpfMaps {
             ));
         };
 
-        let stale: Vec<InboundRedirectKey4> = pod_inbound_ports
-            .keys()
-            .filter_map(Result::ok)
-            .filter(|key| key.addr == addr && !ports.contains(&key.port))
-            .collect();
+        let mut stale: Vec<InboundRedirectKey4> = Vec::new();
+        for key in pod_inbound_ports.keys() {
+            let key = key.map_err(|e| {
+                format!(
+                    "Failed to scan FERRUM_POD_INBOUND_PORTS for stale inbound redirect ports of \
+                     {ip}: {e}. Refusing to report the scope replaced: a withdrawn port may still \
+                     be redirectable."
+                )
+            })?;
+            if key.addr == addr && !ports.contains(&key.port) {
+                stale.push(key);
+            }
+        }
         for key in stale {
             tolerate_missing_map_remove(pod_inbound_ports.remove(&key), || {
                 format!("inbound redirect port {ip}:{}", key.port)
@@ -445,11 +460,19 @@ impl BpfMaps {
             ));
         };
 
-        let stale: Vec<InboundRedirectKey6> = pod_inbound_ports6
-            .keys()
-            .filter_map(Result::ok)
-            .filter(|key| key.addr == addr && !ports.contains(&key.port))
-            .collect();
+        let mut stale: Vec<InboundRedirectKey6> = Vec::new();
+        for key in pod_inbound_ports6.keys() {
+            let key = key.map_err(|e| {
+                format!(
+                    "Failed to scan FERRUM_POD_INBOUND_PORTS6 for stale inbound redirect ports of \
+                     {ip}: {e}. Refusing to report the scope replaced: a withdrawn port may still \
+                     be redirectable."
+                )
+            })?;
+            if key.addr == addr && !ports.contains(&key.port) {
+                stale.push(key);
+            }
+        }
         for key in stale {
             tolerate_missing_map_remove(pod_inbound_ports6.remove(&key), || {
                 format!("IPv6 inbound redirect port {ip}:{}", key.port)

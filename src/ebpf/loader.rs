@@ -20,9 +20,14 @@ use aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::programs::sock_ops::SockOpsLinkId;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::tc::SchedClassifierLinkId;
+use aya::programs::tc::{SchedClassifierLink, SchedClassifierLinkId};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-use aya::programs::{CgroupAttachMode, CgroupSockAddr, SchedClassifier, SockOps, TcAttachType};
+// `Link` is the trait that owns `SchedClassifierLink::detach`; the
+// ingress-redirect teardown owns its links rather than tracking link ids, so it
+// calls that method directly.
+use aya::programs::{
+    CgroupAttachMode, CgroupSockAddr, Link, SchedClassifier, SockOps, TcAttachType,
+};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use aya::{Ebpf, EbpfLoader};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -67,6 +72,36 @@ struct PodLinks {
     tc_link_ids: Vec<SchedClassifierLinkId>,
 }
 
+/// One node-level tc ingress-redirect classifier attachment.
+///
+/// The link is **owned here**, taken out of the program's link map right after
+/// attach, instead of being tracked by `SchedClassifierLinkId` alone. That is
+/// load-bearing for retry: aya's `SchedClassifier::detach(id)` removes the link
+/// from the program's map and then consumes it, so after a FAILED detach the id
+/// refers to nothing (`ProgramError::NotAttached` on any retry) and the failure
+/// is unrecoverable and — worse — invisible. Owning the link lets a failed
+/// detach reconstruct an equivalent one from its netlink filter identity
+/// (`ifname`, attach type, priority, handle) so `cleanup_all` really is the
+/// backstop its callers treat it as.
+///
+/// Owning it also means the link is NOT torn down when the `Ebpf` object is
+/// dropped; this struct's own `Drop` (via `SchedClassifierLink`) is the final
+/// best-effort detach.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+struct IngressRedirectLink {
+    /// Interface the classifier is attached to, so failures are reported (and
+    /// retried) per interface.
+    iface: String,
+    /// The owned link, or `None` when a failed detach consumed it and no
+    /// equivalent could be rebuilt (the interface disappeared, or the link was
+    /// a TCX fd link — whose detach is infallible, so this is unreachable in
+    /// practice). The entry is still RETAINED in that case: the kernel filter
+    /// may be live, and reporting "detached" would let the node-agent pull the
+    /// local-delivery routing out from under a classifier that is still
+    /// assigning sockets — the exact harmful half-state.
+    link: Option<SchedClassifierLink>,
+}
+
 /// Real aya-backed eBPF loader. Only available on Linux with `--features ebpf`.
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub struct AyaEbpfBackend {
@@ -79,9 +114,10 @@ pub struct AyaEbpfBackend {
     /// callers detach explicitly if needed).
     sock_ops_link_id: Option<SockOpsLinkId>,
     /// Node-level tc ingress redirect attachments, keyed by interface so a
-    /// detach can be reported per interface. These are node-scoped, not
-    /// per-pod, so they deliberately live outside `pod_links`.
-    ingress_redirect_link_ids: Vec<(String, SchedClassifierLinkId)>,
+    /// detach can be reported (and retried) per interface. These are
+    /// node-scoped, not per-pod, so they deliberately live outside `pod_links`.
+    /// An entry survives a failed detach — see [`IngressRedirectLink`].
+    ingress_redirect_links: Vec<IngressRedirectLink>,
     orig_dst_maps_pinned: bool,
     /// Tracks whether at least one trusted node source IP has been installed
     /// for each family, so enrollment can surface a per-family gap (the
@@ -99,7 +135,7 @@ impl AyaEbpfBackend {
             maps: None,
             pod_links: HashMap::new(),
             sock_ops_link_id: None,
-            ingress_redirect_link_ids: Vec::new(),
+            ingress_redirect_links: Vec::new(),
             orig_dst_maps_pinned: false,
             node_source_ipv4_present: false,
             node_source_ipv6_present: false,
@@ -380,8 +416,25 @@ impl EbpfBackend for AyaEbpfBackend {
         let link_id = prog.attach(iface, TcAttachType::Ingress).map_err(|e| {
             format!("Failed to attach '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress: {e}")
         })?;
-        self.ingress_redirect_link_ids
-            .push((iface.to_string(), link_id));
+        // Take ownership of the link immediately. See [`IngressRedirectLink`]:
+        // a link id alone is single-use, so keeping it in the program's map
+        // would make a failed detach unrecoverable and unobservable.
+        //
+        // `take_link` can only fail if the id is absent from the map, which
+        // cannot happen for an id `attach` just returned; treat it as an attach
+        // failure and record nothing, so no phantom "attached" entry pins the
+        // local-delivery routing. The link stays owned by the program and is
+        // detached when `Ebpf` is dropped by `cleanup_all`.
+        let link = prog.take_link(link_id).map_err(|e| {
+            format!(
+                "Attached '{INGRESS_REDIRECT_PROGRAM}' to '{iface}' ingress but could not take \
+                 ownership of its link: {e}"
+            )
+        })?;
+        self.ingress_redirect_links.push(IngressRedirectLink {
+            iface: iface.to_string(),
+            link: Some(link),
+        });
 
         info!(
             program = INGRESS_REDIRECT_PROGRAM,
@@ -390,39 +443,80 @@ impl EbpfBackend for AyaEbpfBackend {
         Ok(())
     }
 
+    /// Detach every attached ingress-redirect classifier, **retaining every
+    /// attachment that did not provably come down**.
+    ///
+    /// Needs no program lookup at all: the links are owned here (see
+    /// [`IngressRedirectLink`]), so there is no `program_mut` / type-conversion
+    /// step that could drop the whole set before a single detach was attempted.
+    ///
+    /// A per-interface failure keeps its entry — rebuilt from the link's netlink
+    /// filter identity when possible, so `cleanup_all`'s retry is a real second
+    /// attempt rather than a no-op — and keeps
+    /// [`Self::ingress_redirect_attached`] reporting `true`, which is what stops
+    /// the node-agent from removing the local-delivery routing while a
+    /// classifier may still be assigning sockets.
     fn detach_ingress_redirect(&mut self) -> Result<(), String> {
-        let links = std::mem::take(&mut self.ingress_redirect_link_ids);
-        if links.is_empty() {
+        if self.ingress_redirect_links.is_empty() {
             return Ok(());
         }
-        let Some(bpf) = self.bpf.as_mut() else {
-            // Programs were never loaded (or were already torn down): the links
-            // cannot outlive the `Ebpf` object, so there is nothing live left.
-            return Ok(());
-        };
-        let prog: Result<&mut SchedClassifier, String> = bpf
-            .program_mut(INGRESS_REDIRECT_PROGRAM)
-            .ok_or_else(|| format!("BPF program '{INGRESS_REDIRECT_PROGRAM}' not found"))
-            .and_then(|program| {
-                program
-                    .try_into()
-                    .map_err(|e| format!("'{INGRESS_REDIRECT_PROGRAM}' type mismatch: {e}"))
-            });
-        let prog = prog?;
 
         // Detach every interface, collecting failures instead of returning on
         // the first one: a partially-detached redirect is the dangerous state,
         // so each remaining link must still get its detach attempt.
         let mut errors = Vec::new();
-        for (iface, link_id) in links {
-            match prog.detach(link_id) {
+        let mut retained = Vec::new();
+        for entry in std::mem::take(&mut self.ingress_redirect_links) {
+            let IngressRedirectLink { iface, link } = entry;
+            let Some(link) = link else {
+                // A previous detach consumed the link without succeeding and
+                // nothing could be rebuilt. There is no handle to retry with,
+                // but the kernel filter may still be live, so keep reporting it.
+                errors.push(format!(
+                    "{iface}: no retryable link handle remains after an earlier failed detach"
+                ));
+                retained.push(IngressRedirectLink { iface, link: None });
+                continue;
+            };
+            // Capture the netlink filter identity BEFORE `detach` consumes the
+            // link. `Link::detach` takes `self`, so without this the handle is
+            // gone the moment the netlink delete fails.
+            let rebuild = match (link.attach_type(), link.priority(), link.handle()) {
+                (Ok(attach_type), Ok(priority), Ok(handle)) => {
+                    Some((attach_type, priority, handle))
+                }
+                // A TCX fd link, whose detach is infallible — it can never reach
+                // the rebuild path below.
+                _ => None,
+            };
+            match link.detach() {
                 Ok(()) => debug!(
                     program = INGRESS_REDIRECT_PROGRAM,
                     iface, "NodeWaypoint inbound tc ingress redirect detached"
                 ),
-                Err(e) => errors.push(format!("{iface}: {e}")),
+                Err(e) => {
+                    errors.push(format!("{iface}: {e}"));
+                    let rebuilt = rebuild.and_then(|(attach_type, priority, handle)| {
+                        SchedClassifierLink::attached(&iface, attach_type, priority, handle).ok()
+                    });
+                    if rebuilt.is_none() {
+                        warn!(
+                            program = INGRESS_REDIRECT_PROGRAM,
+                            iface,
+                            "Could not rebuild a retryable handle for the failed ingress redirect \
+                             detach; the classifier is still reported attached so its \
+                             local-delivery routing is retained"
+                        );
+                    }
+                    retained.push(IngressRedirectLink {
+                        iface,
+                        link: rebuilt,
+                    });
+                }
             }
         }
+        self.ingress_redirect_links = retained;
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -431,6 +525,10 @@ impl EbpfBackend for AyaEbpfBackend {
                 errors.join(", ")
             ))
         }
+    }
+
+    fn ingress_redirect_attached(&self) -> bool {
+        !self.ingress_redirect_links.is_empty()
     }
 
     fn update_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
@@ -604,12 +702,22 @@ impl EbpfBackend for AyaEbpfBackend {
 
     fn cleanup_all(&mut self) -> Result<(), String> {
         // Detach the node-level ingress redirect explicitly and BEFORE dropping
-        // `Ebpf`. Dropping the owner does tear the links down, but an explicit
-        // detach keeps the failure observable: a classifier left steering
+        // `Ebpf`. This is the genuine retry the callers treat it as: the links
+        // are owned by this backend (not by the program's link map, which
+        // `self.bpf = None` below would tear down), so a link that failed to
+        // detach earlier is attempted again here — and if it fails again it
+        // STAYS recorded. `ingress_redirect_attached()` therefore keeps
+        // reporting a possibly-live classifier after cleanup, which is what the
+        // node-agent keys its routing teardown off: a classifier left steering
         // traffic at a listener that is shutting down would black-hole inbound
-        // traffic for every enrolled pod on the node.
+        // traffic for every enrolled pod on the node, and removing its
+        // local-delivery routing first would strand assigned packets.
         if let Err(e) = self.detach_ingress_redirect() {
-            warn!(error = %e, "Failed to detach the inbound tc ingress redirect during cleanup");
+            warn!(
+                error = %e,
+                "Failed to detach the inbound tc ingress redirect during cleanup; it stays \
+                 recorded as attached so its local-delivery routing is retained"
+            );
         }
         self.pod_links.clear();
         self.sock_ops_link_id = None;

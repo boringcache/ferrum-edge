@@ -2121,16 +2121,55 @@ fn build_inbound_hbone_relay_proxy(
     ))
 }
 
-/// Build the captured-inbound relay entry for a NodeWaypoint connection the
-/// eBPF tc ingress redirect steered into the transparent capture listener
-/// (issue #3287).
+/// A captured NodeWaypoint inbound connection resolved against the live slice:
+/// the relay entry to hand to `handle_mesh_tcp_inbound`, plus the
+/// PeerAuthentication posture of the **exact** destination workload.
+///
+/// The two are produced together on purpose. One NodeWaypoint capture listener
+/// serves every enrolled pod on the node, so neither the posture nor the policy
+/// scope may be read from anything listener-wide: both are properties of the
+/// single workload that owns the recovered original destination, and both are
+/// resolved from the SAME `RequestEpoch` load so a slice reload can never pair
+/// one workload's posture with another's scope.
+pub(crate) struct NodeWaypointCaptureDestination {
+    pub(crate) entry: Arc<crate::router_cache::MeshTcpInboundEntry>,
+    /// Effective inbound PeerAuthentication mode for the destination workload
+    /// on the captured app port. `Strict` means direct plaintext must be
+    /// refused even if some other workload on the same port is `Permissive`.
+    pub(crate) mtls_mode: crate::modes::mesh::config::MtlsMode,
+}
+
+/// Resolve a NodeWaypoint connection the eBPF tc ingress redirect steered into
+/// the transparent capture listener (issue #3287) against the live slice.
 ///
 /// NodeWaypoint materializes no inbound routes (its inbound surface is the
 /// HBONE relay), so the relay target is synthesized per connection from the
 /// recovered original destination — the direct-plaintext counterpart of
 /// [`build_inbound_hbone_relay_proxy`], and gated by the **same** open-relay
 /// guard: the destination must be a slice-declared in-mesh workload address and
-/// port. Returns `None` when it is not, and the caller closes the connection.
+/// port.
+///
+/// Beyond that guard this resolution is **destination-exact and fail-closed**,
+/// which the HBONE relay does not have to be: HBONE authenticates its peer and
+/// authorizes with the destination-scope machinery on the request path, whereas
+/// this listener admits unauthenticated direct plaintext and is therefore the
+/// only thing standing between a node-local peer and the workload. So:
+///
+/// * The destination address must match **exactly one** slice workload identity.
+///   No match (including the loopback case the open-relay guard tolerates for
+///   HBONE) and divergent matches both return `None`: without the exact
+///   workload there is no PeerAuthentication posture and no policy scope to
+///   enforce, and evaluating another workload's policy would be worse than
+///   refusing.
+/// * The returned [`NodeWaypointCaptureDestination::mtls_mode`] is resolved from
+///   that workload's own namespace/labels via the canonical PeerAuthentication
+///   resolver, never from the listener-wide per-port table — two pods can share
+///   an app port with opposite postures, and a `Permissive` neighbour must not
+///   admit plaintext to a `Strict` workload.
+/// * The entry carries that workload's [`crate::modes::mesh::runtime::PolicyScopeCache`]
+///   so stream `mesh_authz` evaluates namespace/selector-scoped policies against
+///   the captured destination instead of failing every connection closed as
+///   `scope_missing`.
 ///
 /// The dial is marked `NODE_WAYPOINT_INBOUND_AUTH_MARK` so the pod-veth
 /// `ferrum_tc_inbound` guard admits it as an authorized relay dial, and the
@@ -2139,30 +2178,65 @@ fn build_inbound_hbone_relay_proxy(
 pub(crate) fn build_node_waypoint_capture_relay_entry(
     orig_dst: SocketAddr,
     epoch: &crate::request_epoch::RequestEpoch,
-) -> Option<Arc<crate::router_cache::MeshTcpInboundEntry>> {
-    let mesh = epoch.config.mesh.as_deref()?;
+) -> Option<NodeWaypointCaptureDestination> {
+    resolve_node_waypoint_capture_destination(orig_dst, epoch.config.mesh.as_deref()?)
+}
+
+/// Slice-only core of [`build_node_waypoint_capture_relay_entry`], split out so
+/// the destination-exactness and PeerAuthentication rules can be pinned without
+/// standing up a full `RequestEpoch`.
+pub(crate) fn resolve_node_waypoint_capture_destination(
+    orig_dst: SocketAddr,
+    mesh: &crate::modes::mesh::config::MeshConfig,
+) -> Option<NodeWaypointCaptureDestination> {
     let host = orig_dst.ip().to_string();
     if !inbound_hbone_relay_destination_allowed(&host, orig_dst.port(), Some(mesh)) {
         return None;
     }
-    // Name the relay after the owning workload when the slice declares one, so
-    // the synthesized proxy id, authorization namespace, and logs identify the
-    // real service instead of a bare address. A loopback destination (permitted
-    // by the guard on a declared app port) has no address match; fall back to
-    // the mesh namespace.
-    let workload = mesh
+    // Exactly one workload identity may own the captured address. Duplicate
+    // records for one pod (several services backed by the same workload) are
+    // normal and agree on namespace/labels/SPIFFE, so they collapse to one
+    // scope; genuinely DIVERGENT records are an ambiguity we cannot resolve
+    // safely, and picking the first would silently choose whose policy applies.
+    let mut destination: Option<(
+        &crate::modes::mesh::config::Workload,
+        crate::modes::mesh::runtime::PolicyScopeCache,
+    )> = None;
+    for workload in mesh
         .workloads
         .iter()
-        .find(|workload| workload.addresses.iter().any(|addr| addr == &host));
-    let (namespace, service_name) = match workload {
-        Some(workload) => (workload.namespace.clone(), workload.service_name.clone()),
-        None => (String::new(), "node-waypoint-capture".to_string()),
-    };
+        .filter(|workload| workload.addresses.iter().any(|addr| addr == &host))
+    {
+        let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
+        if let Some((_, existing)) = destination.as_ref() {
+            if existing != &candidate {
+                return None;
+            }
+            continue;
+        }
+        destination = Some((workload, candidate));
+    }
+    let (workload, policy_scope) = destination?;
+    // Canonical PeerAuthentication resolution (WorkloadSelector > Namespace >
+    // MeshWide, port override inside the winner, fail-secure same-tier tie
+    // break) against the DESTINATION workload's authoritative namespace/labels
+    // as the slice declares them. The slice-level `labels_ambiguous` escalation
+    // does not apply here: that guards the DP's inference of its OWN identity,
+    // while these labels come straight off the workload record.
+    let mtls_mode = crate::modes::mesh::slice::resolve_effective_mtls_mode(
+        &mesh.peer_authentications,
+        &policy_scope.namespace,
+        &policy_scope.labels,
+        orig_dst.port(),
+    );
+    // Name the relay after the owning workload so the synthesized proxy id,
+    // authorization namespace, and logs identify the real service instead of a
+    // bare address.
     let route = crate::modes::mesh::config::MeshInboundTcpRoute {
         match_port: orig_dst.port(),
         backend_addr: orig_dst,
-        namespace,
-        service_name,
+        namespace: workload.namespace.clone(),
+        service_name: workload.service_name.clone(),
         service_fqdn: format!("{host}:{}", orig_dst.port()),
         // The capture relay never peeks: it is protocol-agnostic by
         // construction (the captured stream may be HTTP, a server-first binary
@@ -2172,14 +2246,18 @@ pub(crate) fn build_node_waypoint_capture_relay_entry(
         first_bytes_inspect: false,
     };
     let relay_proxy = Arc::new(crate::modes::mesh::mesh_inbound_tcp_relay_proxy(&route));
-    Some(Arc::new(crate::router_cache::MeshTcpInboundEntry {
-        relay_proxy,
-        backend_addr: orig_dst,
-        service_fqdn: route.service_fqdn,
-        tls_inspect: false,
-        first_bytes_inspect: false,
-        socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
-    }))
+    Some(NodeWaypointCaptureDestination {
+        entry: Arc::new(crate::router_cache::MeshTcpInboundEntry {
+            relay_proxy,
+            backend_addr: orig_dst,
+            service_fqdn: route.service_fqdn,
+            tls_inspect: false,
+            first_bytes_inspect: false,
+            socket_mark: Some(crate::ebpf::NODE_WAYPOINT_INBOUND_AUTH_MARK),
+            node_waypoint_policy_scope: Some(Arc::new(policy_scope)),
+        }),
+        mtls_mode,
+    })
 }
 
 #[allow(dead_code)]

@@ -826,7 +826,25 @@ pub trait EbpfBackend: Send + Sync {
     /// attached. Used when the redirect is turned off on reload and by
     /// shutdown cleanup, so a disabled redirect never leaves a live classifier
     /// steering traffic at a listener that is going away.
+    ///
+    /// **Retry contract:** an attachment that did not provably come down must
+    /// stay recorded, so a later call (notably from `cleanup_all`) really is a
+    /// second attempt and [`Self::ingress_redirect_attached`] keeps reporting
+    /// it. Dropping a failed attachment would report success while the
+    /// classifier is still assigning sockets.
     fn detach_ingress_redirect(&mut self) -> Result<(), String>;
+
+    /// Whether any node-level ingress redirect classifier is still recorded as
+    /// attached — i.e. a detach was never attempted, or was attempted and did
+    /// not succeed.
+    ///
+    /// The node-agent gates the local-delivery **routing** teardown on this.
+    /// A live classifier without its routing is the harmful half-state: the
+    /// classifier keeps assigning packets to the capture socket while the
+    /// `main` table forwards them to the pod, so they reach neither endpoint.
+    /// Inert leftover routing is the safe one, so routing is removed only once
+    /// this reports `false`.
+    fn ingress_redirect_attached(&self) -> bool;
 
     /// Replace the declared inbound TCP application ports of an enrolled IPv4
     /// pod. Without a matching `(address, port)` entry the tc ingress redirect
@@ -1018,6 +1036,13 @@ pub struct MockEbpfBackend {
     /// node-agent fails closed (capture unavailable) rather than reporting a
     /// redirect that is not installed.
     pub fail_attach_ingress_redirect: bool,
+    /// Number of upcoming `detach_ingress_redirect` calls that fail (each call
+    /// decrements). A failed detach RETAINS `ingress_redirect_attachments`,
+    /// mirroring the real backend's retry contract, so tests can prove that
+    /// (a) the routing teardown is withheld while a classifier may be live and
+    /// (b) `cleanup_all`'s retry is a real second attempt that releases the
+    /// routing once it succeeds.
+    pub fail_detach_ingress_redirect_times: usize,
     /// When `true`, `update_pod_inbound_port` (and the v6 variant) fail, so
     /// tests can prove a pod whose redirect scope could not be written is not
     /// left flagged for redirect.
@@ -1162,8 +1187,22 @@ impl EbpfBackend for MockEbpfBackend {
     fn detach_ingress_redirect(&mut self) -> Result<(), String> {
         self.ingress_redirect_detach_calls += 1;
         self.record_operation("detach_ingress_redirect".to_string());
+        if self.fail_detach_ingress_redirect_times > 0 {
+            // Model the real backend's retry contract: a failed detach RETAINS
+            // its attachments, so the next call is a genuine second attempt and
+            // `ingress_redirect_attached()` keeps reporting them.
+            self.fail_detach_ingress_redirect_times -= 1;
+            return Err(format!(
+                "injected ingress redirect detach failure for {:?}",
+                self.ingress_redirect_attachments
+            ));
+        }
         self.ingress_redirect_attachments.clear();
         Ok(())
+    }
+
+    fn ingress_redirect_attached(&self) -> bool {
+        !self.ingress_redirect_attachments.is_empty()
     }
 
     fn update_pod_inbound_ports(&mut self, ip: Ipv4Addr, ports: &[u16]) -> Result<(), String> {
@@ -1319,6 +1358,16 @@ impl EbpfBackend for MockEbpfBackend {
 
     fn cleanup_all(&mut self) -> Result<(), String> {
         self.cleanup_all_calls = self.cleanup_all_calls.saturating_add(1);
+        // Mirror the real backend: cleanup RETRIES the ingress-redirect detach
+        // before wiping anything, and a still-failing detach leaves the
+        // attachment recorded. This is what makes the node-agent's
+        // "routing teardown only once no classifier may be live" ordering
+        // testable against the mock.
+        if !self.ingress_redirect_attachments.is_empty()
+            && let Err(e) = self.detach_ingress_redirect()
+        {
+            self.operations.push(format!("cleanup_detach_failed:{e}"));
+        }
         // Snapshot before the wipe so post-cleanup assertions stay meaningful.
         // Only the FIRST cleanup records: a second call would overwrite the
         // pre-rollback view with an already-empty one.
