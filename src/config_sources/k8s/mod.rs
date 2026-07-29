@@ -454,14 +454,6 @@ pub(crate) struct K8sAccumulator {
     explicit_workload_services: HashSet<K8sServiceKey>,
     explicit_service_entries: HashSet<K8sServiceKey>,
     pub(crate) gateway_api_conflict_losers: HashMap<K8sResourceKey, Vec<GatewayApiRouteConflict>>,
-    /// Source route `kind` (`HTTPRoute` / `GRPCRoute`) of every Gateway API
-    /// route proxy materialized so far. Gateway API v1.5.1 forbids merging
-    /// between GRPCRoutes and HTTPRoutes, so the same-`(hosts, listen path)`
-    /// collapse in `gateway_api::upsert_http_route_resources` must never fold
-    /// a proxy of one kind into a proxy of the other. This is the second line
-    /// of defense: the whole-route cross-kind conflict resolution should have
-    /// already rejected the losing route before it materializes anything.
-    pub(crate) gateway_api_route_proxy_kinds: HashMap<NamespacedResourceId, String>,
     pub(crate) gateway_api_listener_policies:
         HashMap<GatewayApiListenerKey, GatewayApiListenerPolicy>,
     gateway_api_gateway_classes: HashMap<String, bool>,
@@ -495,7 +487,6 @@ impl K8sAccumulator {
             explicit_workload_services: HashSet::new(),
             explicit_service_entries: HashSet::new(),
             gateway_api_conflict_losers: HashMap::new(),
-            gateway_api_route_proxy_kinds: HashMap::new(),
             gateway_api_listener_policies: HashMap::new(),
             gateway_api_gateway_classes: HashMap::new(),
             namespace_labels: HashMap::new(),

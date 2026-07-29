@@ -149,16 +149,20 @@ pub(super) fn translate(
         // that cannot be a listen path land on the `/` listener as ordered
         // `mesh_route_dispatch` rules, so the same-(hosts, listen_path)
         // collapse is what preserves rule ordering and fall-through between
-        // gRPC rules of the *same* kind.
+        // rules.
         //
         // Gateway API v1.5.1 `GRPCRouteRule` is explicit that "Merging MUST
-        // not be done between GRPCRoutes and HTTPRoutes", so the collapse is
-        // keyed on the source route kind and an HTTPRoute/GRPCRoute overlap on
-        // one listener is instead resolved as a whole-route conflict before
-        // either object materializes (see `cross_kind_route_conflicts`).
+        // not be done between GRPCRoutes and HTTPRoutes". That prohibition is
+        // enforced where it applies — an HTTPRoute/GRPCRoute overlap on one
+        // resolved listener is resolved as a whole-route conflict before
+        // either object materializes (see `cross_kind_route_conflicts`), so
+        // the loser contributes no proxy to collapse in the first place. Two
+        // routes that Gateway API requires be accepted *together* (disjoint
+        // listeners) are a Ferrum representation problem, not a merge the
+        // spec forbids; see `can_merge_http_route_proxy`.
         "HTTPRoute" | "GRPCRoute" => {
             let (proxies, plugins) = http_route_resources(object, acc)?;
-            upsert_http_route_resources(acc, proxies, plugins, &object.kind);
+            upsert_http_route_resources(acc, proxies, plugins);
             Ok(true)
         }
         "TCPRoute" => {
@@ -1294,7 +1298,6 @@ fn upsert_http_route_resources(
     acc: &mut K8sAccumulator,
     proxies: Vec<Proxy>,
     plugins: Vec<PluginConfig>,
-    route_kind: &str,
 ) {
     let mut plugins_by_proxy: HashMap<NamespacedResourceId, Vec<PluginConfig>> = HashMap::new();
     for plugin in plugins {
@@ -1313,18 +1316,12 @@ fn upsert_http_route_resources(
     }
 
     for proxy in proxies {
-        let proxy_key = namespaced_resource_key(&proxy.namespace, &proxy.id);
-        let route_plugins = proxy_key
-            .clone()
+        let route_plugins = namespaced_resource_key(&proxy.namespace, &proxy.id)
             .and_then(|key| plugins_by_proxy.remove(&key))
             .unwrap_or_default();
-        if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins, route_kind) {
+        if !merge_http_route_proxy(acc, proxy.clone(), &route_plugins) {
             acc.upsert_proxy(proxy, SourceKind::GatewayApi);
             acc.config.plugin_configs.extend(route_plugins);
-            if let Some(key) = proxy_key {
-                acc.gateway_api_route_proxy_kinds
-                    .insert(key, route_kind.to_string());
-            }
         }
     }
 
@@ -1337,13 +1334,12 @@ fn merge_http_route_proxy(
     acc: &mut K8sAccumulator,
     proxy: Proxy,
     route_plugins: &[PluginConfig],
-    route_kind: &str,
 ) -> bool {
     let Some(existing_index) = acc
         .config
         .proxies
         .iter()
-        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy, route_kind))
+        .position(|existing| can_merge_http_route_proxy(acc, existing, &proxy))
     else {
         return false;
     };
@@ -1422,23 +1418,41 @@ fn merge_http_route_proxy(
     true
 }
 
-/// Gateway API v1.5.1 `GRPCRouteRule`: "Merging MUST not be done between
-/// GRPCRoutes and HTTPRoutes." The same-`(hosts, listen path)` collapse is
-/// therefore keyed on the source route kind as well; a proxy whose kind was
-/// never recorded (not a Gateway API route proxy) is never a merge target.
-fn can_merge_http_route_proxy(
-    acc: &K8sAccumulator,
-    existing: &Proxy,
-    proxy: &Proxy,
-    route_kind: &str,
-) -> bool {
+/// May the incoming route proxy collapse onto an existing Gateway API route
+/// proxy claiming the same `(namespace, hosts, listen path)`?
+///
+/// The collapse is deliberately **not** keyed on the source route kind.
+/// Gateway API v1.5.1 `GRPCRouteRule` states "Merging MUST not be done between
+/// GRPCRoutes and HTTPRoutes", but that prohibition is about the two kinds
+/// coexisting on one listener, and it is already enforced upstream of
+/// materialization: `cross_kind_route_conflicts` rejects the whole losing Route
+/// on a shared resolved listener, so its matches are suppressed and it
+/// contributes no proxy here at all.
+///
+/// What reaches this function cross-kind is the opposite case — an HTTPRoute
+/// and a GRPCRoute that Gateway API requires be accepted *together* because
+/// `allowedRoutes.kinds`, a `sectionName`/`port` pin, or separate Gateways send
+/// them to different listeners. Ferrum materializes HTTP-family routes as
+/// port-agnostic `(hosts, listen path)` proxies, so those two accepted routes
+/// have exactly one route-table slot available to them. Refusing the collapse
+/// does not give them a slot each; it emits two proxies with an identical
+/// `(hosts, listen path)`, which `GatewayConfig::validate_unique_listen_paths`
+/// rejects — and that validator aborts the *entire* config reload, not just
+/// these routes. Since a pathless GRPCRoute always lands on `/` and an
+/// HTTPRoute `PathPrefix: /` rule does too, that is the ordinary "HTTP listener
+/// plus gRPC listener on one Gateway" topology.
+///
+/// Collapsing them instead keeps both routes serving and stays safe because the
+/// two kinds' predicates remain intact and disjoint inside the shared ordered
+/// dispatch-rule list: every emitted GRPCRoute rule carries the native-gRPC
+/// `content-type` gate (see `grpc_dispatch_match_criteria_for`), so it can only
+/// select gRPC calls, while non-gRPC traffic falls through to the HTTPRoute's
+/// own rules and default backend.
+fn can_merge_http_route_proxy(acc: &K8sAccumulator, existing: &Proxy, proxy: &Proxy) -> bool {
     acc.proxy_source(&existing.namespace, &existing.id) == Some(SourceKind::GatewayApi)
         && existing.namespace == proxy.namespace
         && existing.listen_path == proxy.listen_path
         && existing.hosts == proxy.hosts
-        && namespaced_resource_key(&existing.namespace, &existing.id)
-            .and_then(|key| acc.gateway_api_route_proxy_kinds.get(&key))
-            .is_some_and(|kind| kind == route_kind)
 }
 
 fn dispatch_plugin_index(
@@ -9111,6 +9125,106 @@ mod tests {
                 result.warnings
             );
             assert!(result.config.validate_unique_listen_paths().is_ok());
+        }
+    }
+
+    /// The same kind-disjoint topology as above, but with both Routes on the
+    /// listen path they most commonly occupy: a pathless GRPCRoute predicate
+    /// *always* materializes on `/`, and an HTTPRoute with no `matches` (or a
+    /// `PathPrefix: /` rule) does too. Gateway API requires both Routes to be
+    /// accepted here — they never share a listener — while Ferrum has exactly
+    /// one port-agnostic `(hosts, listen path)` slot for them.
+    ///
+    /// Emitting a proxy each would make `validate_unique_listen_paths` reject
+    /// the whole config reload, so the two collapse into one ordered dispatch
+    /// list instead. That stays correct because the gRPC rule carries the
+    /// native-gRPC `content-type` gate: gRPC calls reach the GRPCRoute backend
+    /// and everything else falls through to the HTTPRoute's default backend.
+    #[test]
+    fn cross_kind_routes_on_kind_disjoint_listeners_share_the_root_listen_path() {
+        let gateway = cross_kind_gateway(serde_json::json!([
+            {
+                "name": "web",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}]
+                }
+            },
+            {
+                "name": "grpc",
+                "port": 8080,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "GRPCRoute"}]
+                }
+            }
+        ]));
+        let http_route = cross_kind_http_route(serde_json::json!({"name": "edge"}), None);
+        let grpc_route = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge"}),
+            serde_json::json!({"method": "SayHello"}),
+        );
+
+        for objects in [
+            vec![gateway.clone(), http_route.clone(), grpc_route.clone()],
+            vec![grpc_route.clone(), http_route.clone(), gateway.clone()],
+        ] {
+            let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("Gateway API forbids merging")),
+                "kind-disjoint listeners are not a shared listener: {:?}",
+                result.warnings
+            );
+            assert!(
+                result.config.validate_unique_listen_paths().is_ok(),
+                "two accepted Routes on one `(hosts, listen path)` slot must not abort the \
+                 whole config reload: {:?}",
+                result.config.validate_unique_listen_paths()
+            );
+
+            assert_eq!(
+                result.config.proxies.len(),
+                1,
+                "both Routes occupy the single `/` route-table slot"
+            );
+            let proxy = grpc_catch_all_proxy(&result);
+            assert_eq!(
+                proxy.backend_port,
+                8080,
+                "the HTTPRoute keeps the default backend for non-gRPC traffic"
+            );
+
+            let plugin = grpc_dispatch_plugin(&result, proxy);
+            assert_eq!(
+                plugin.config["reject_unmatched"].as_bool(),
+                Some(false),
+                "the HTTPRoute contributes an unconditional match, so unmatched traffic must \
+                 fall through to its backend rather than 404"
+            );
+            let rules = plugin.config["rules"].as_array().expect("rules are an array");
+            assert_eq!(rules.len(), 1, "only the GRPCRoute carries a predicate");
+            assert_eq!(
+                rules[0]["destination"]["backend_port"].as_u64(),
+                Some(50051),
+                "gRPC calls still reach the GRPCRoute backend"
+            );
+            assert_eq!(
+                rules[0]["match"]["uri"]["regex"].as_str(),
+                Some("/[^/]+/SayHello"),
+                "the GRPCRoute predicate survives the collapse verbatim"
+            );
+            assert_eq!(
+                rules[0]["match"]["headers"]["content-type"]["regex"].as_str(),
+                Some(GRPC_CONTENT_TYPE_GATE_REGEX),
+                "the collapse must not drop the gate that keeps plain HTTP off the gRPC backend"
+            );
         }
     }
 
