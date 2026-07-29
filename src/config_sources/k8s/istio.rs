@@ -3,19 +3,20 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::identity::spiffe::SpiffeId;
+use crate::modes::mesh::access_log_filter::parse_access_log_filter_expression;
 use crate::modes::mesh::config::{
-    AccessLogFilter, AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig,
-    MeshConsistentHash, MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint,
-    MeshJwtRule, MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover,
-    MeshLocalityLbSetting, MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
-    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
-    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
-    MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
-    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
-    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
-    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
-    mesh_condition_has_values, validate_mesh_condition_ip_block,
+    AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshConsistentHash,
+    MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
+    MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
+    MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSimpleLb, MeshSubset,
+    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
+    MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride, MtlsMode,
+    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
+    ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
+    TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
+    is_mesh_condition_ip_key, is_supported_mesh_condition_key, mesh_condition_has_values,
+    validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -5197,154 +5198,6 @@ fn proxy_config(
     })
 }
 
-/// Parse simple filter expressions like `response.code >= 400` into an
-/// [`AccessLogFilter`]. Returns `Ok(None)` for expressions without supported
-/// access-log predicates and `Err` for malformed supported predicates.
-fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLogFilter>, String> {
-    if expr.contains("||") {
-        return Err(
-            "Telemetry access log filter expressions with '||' are not supported".to_string(),
-        );
-    }
-
-    let mut filter = AccessLogFilter {
-        status_code_min: None,
-        status_code_max: None,
-        min_latency_ms: None,
-        errors_only: false,
-    };
-    let mut matched = false;
-
-    // Split on && to handle compound expressions
-    for part in expr.split("&&") {
-        let part = part.trim();
-        if part.starts_with("response.code") || part.starts_with("response.status") {
-            let Some(val) = extract_numeric_comparison(part) else {
-                return Err(
-                    "Telemetry access log response.code filter must use a numeric comparison"
-                        .to_string(),
-                );
-            };
-            apply_status_code_comparison(&mut filter, val)?;
-            matched = true;
-        } else if part.starts_with("response.duration") {
-            let Some(val) = extract_numeric_comparison(part) else {
-                return Err(
-                    "Telemetry access log response.duration filter must use a numeric comparison"
-                        .to_string(),
-                );
-            };
-            match val {
-                Comparison::Gte(n) => {
-                    merge_min_latency_ms(&mut filter.min_latency_ms, n)?;
-                }
-                Comparison::Gt(n) => {
-                    merge_min_latency_ms(&mut filter.min_latency_ms, comparison_increment(n)?)?;
-                }
-                Comparison::Lte(_) | Comparison::Lt(_) | Comparison::Eq(_) => {
-                    return Err(
-                        "Telemetry access log response.duration filters only support '>' and '>='"
-                            .to_string(),
-                    );
-                }
-            }
-            matched = true;
-        }
-    }
-
-    if matched { Ok(Some(filter)) } else { Ok(None) }
-}
-
-fn apply_status_code_comparison(
-    filter: &mut AccessLogFilter,
-    comparison: Comparison,
-) -> Result<(), String> {
-    match comparison {
-        Comparison::Gte(n) => merge_status_code_min(&mut filter.status_code_min, n)?,
-        Comparison::Gt(n) => {
-            merge_status_code_min(&mut filter.status_code_min, comparison_increment(n)?)?
-        }
-        Comparison::Lte(n) => merge_status_code_max(&mut filter.status_code_max, n)?,
-        Comparison::Lt(n) => {
-            merge_status_code_max(&mut filter.status_code_max, comparison_decrement(n)?)?
-        }
-        Comparison::Eq(n) => {
-            merge_status_code_min(&mut filter.status_code_min, n)?;
-            merge_status_code_max(&mut filter.status_code_max, n)?;
-        }
-    }
-    Ok(())
-}
-
-fn merge_status_code_min(current: &mut Option<u16>, value: i64) -> Result<(), String> {
-    let value = status_code_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.max(value)));
-    Ok(())
-}
-
-fn merge_status_code_max(current: &mut Option<u16>, value: i64) -> Result<(), String> {
-    let value = status_code_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.min(value)));
-    Ok(())
-}
-
-fn merge_min_latency_ms(current: &mut Option<u64>, value: i64) -> Result<(), String> {
-    let value = duration_value(value)?;
-    *current = Some(current.map_or(value, |existing| existing.max(value)));
-    Ok(())
-}
-
-fn status_code_value(value: i64) -> Result<u16, String> {
-    u16::try_from(value).map_err(|_| {
-        format!("Telemetry access log response code filter value {value} is outside 0..=65535")
-    })
-}
-
-fn duration_value(value: i64) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| {
-        format!("Telemetry access log duration filter value {value} must be non-negative")
-    })
-}
-
-fn comparison_increment(value: i64) -> Result<i64, String> {
-    value
-        .checked_add(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} overflows"))
-}
-
-fn comparison_decrement(value: i64) -> Result<i64, String> {
-    value
-        .checked_sub(1)
-        .ok_or_else(|| format!("Telemetry access log comparison value {value} underflows"))
-}
-
-enum Comparison {
-    Gte(i64),
-    Gt(i64),
-    Lte(i64),
-    Lt(i64),
-    Eq(i64),
-}
-
-fn extract_numeric_comparison(expr: &str) -> Option<Comparison> {
-    let ops = [">=", "<=", ">", "<", "=="];
-    for op in ops {
-        if let Some(idx) = expr.find(op) {
-            let val_str = expr[idx + op.len()..].trim();
-            let val: i64 = val_str.parse().ok()?;
-            return match op {
-                ">=" => Some(Comparison::Gte(val)),
-                ">" => Some(Comparison::Gt(val)),
-                "<=" => Some(Comparison::Lte(val)),
-                "<" => Some(Comparison::Lt(val)),
-                "==" => Some(Comparison::Eq(val)),
-                _ => None,
-            };
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7740,8 +7593,8 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_access_log_filter_with_or_is_rejected() {
-        let err = translate_k8s_objects(
+    fn telemetry_access_log_filter_with_or_translates() {
+        let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
                 serde_json::json!({
@@ -7754,9 +7607,164 @@ mod tests {
             )],
             options(),
         )
-        .expect_err("OR filters should fail closed");
+        .expect("OR filters should translate");
 
-        assert!(err.to_string().contains("with '||' are not supported"));
+        let mesh = result.config.mesh.expect("mesh config");
+        let access_logging = mesh.telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .expect("access logging");
+        let filter = access_logging.filter.as_ref().expect("filter");
+        assert!(filter.expression.is_some());
+        assert_eq!(filter.status_code_min, None);
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_or_errors_or_slow_example() {
+        let filter = parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
+            .expect_err("unsupported duration identifier should fail closed");
+        assert!(filter.contains("unsupported identifier"));
+
+        let filter = parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
+            .expect("parses")
+            .expect("filter");
+        assert!(filter.expression.is_some());
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_malformed_operator_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >> 500"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("malformed operator should fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_reload_update_delete_round_trip() {
+        let initial = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 500 || response.duration >= 1000"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("initial translate");
+
+        let updated = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": "response.code >= 400 && response.code <= 499"
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect("updated translate");
+
+        let removed = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{ "disabled": false }]
+                }),
+            )],
+            options(),
+        )
+        .expect("removed translate");
+
+        let initial_filter = initial
+            .config
+            .mesh
+            .as_ref()
+            .unwrap()
+            .telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .unwrap()
+            .filter
+            .as_ref()
+            .unwrap();
+        assert!(initial_filter.expression.is_some());
+
+        let updated_filter = updated
+            .config
+            .mesh
+            .as_ref()
+            .unwrap()
+            .telemetry_resources[0]
+            .config
+            .access_logging
+            .as_ref()
+            .unwrap()
+            .filter
+            .as_ref()
+            .unwrap();
+        assert!(updated_filter.expression.is_none());
+        assert_eq!(updated_filter.status_code_min, Some(400));
+        assert_eq!(updated_filter.status_code_max, Some(499));
+
+        assert!(
+            removed
+                .config
+                .mesh
+                .as_ref()
+                .unwrap()
+                .telemetry_resources[0]
+                .config
+                .access_logging
+                .as_ref()
+                .unwrap()
+                .filter
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_expression_bomb_is_rejected() {
+        let mut expr = "response.code >= 500".to_string();
+        for _ in 0..=crate::modes::mesh::access_log_filter::MAX_ACCESS_LOG_FILTER_NESTING {
+            expr = format!("({expr})");
+        }
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": { "expression": expr }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("bomb input should fail closed");
+        assert!(err.to_string().contains("maximum nesting depth"));
     }
 
     #[test]

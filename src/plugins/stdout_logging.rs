@@ -25,6 +25,12 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tracing::warn;
 
+use crate::modes::mesh::access_log_filter::{
+    AccessLogFilterContext, StreamAccessLogFilterContext, evaluate_access_log_filter_expr,
+    evaluate_access_log_filter_expr_for_stream,
+};
+use crate::modes::mesh::config::AccessLogFilterExpr;
+
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -35,6 +41,12 @@ pub struct StdoutLogging {
 }
 
 struct Filter {
+    flat: FlatFilter,
+    expression: Option<AccessLogFilterExpr>,
+}
+
+#[derive(Default)]
+struct FlatFilter {
     status_code_min: Option<u16>,
     status_code_max: Option<u16>,
     min_latency_ms: Option<u64>,
@@ -64,6 +76,7 @@ impl StdoutLogging {
                         "status_code_max",
                         "min_latency_ms",
                         "errors_only",
+                        "expression",
                     ],
                 )?;
                 let status_code_min = parse_optional_u16(filter_config, "status_code_min")?;
@@ -76,12 +89,21 @@ impl StdoutLogging {
                             .to_string(),
                     );
                 }
+                let expression = match filter_config.get("expression") {
+                    None | Some(Value::Null) => None,
+                    Some(value) => Some(serde_json::from_value(value.clone()).map_err(|err| {
+                        format!("stdout_logging: filter.expression is invalid: {err}")
+                    })?),
+                };
                 Some(Filter {
-                    status_code_min,
-                    status_code_max,
-                    min_latency_ms: parse_optional_u64(filter_config, "min_latency_ms")?,
-                    errors_only: parse_optional_bool(filter_config, "errors_only")?
-                        .unwrap_or(false),
+                    flat: FlatFilter {
+                        status_code_min,
+                        status_code_max,
+                        min_latency_ms: parse_optional_u64(filter_config, "min_latency_ms")?,
+                        errors_only: parse_optional_bool(filter_config, "errors_only")?
+                            .unwrap_or(false),
+                    },
+                    expression,
                 })
             }
             Some(_) => return Err("stdout_logging: filter must be an object".to_string()),
@@ -95,6 +117,40 @@ impl StdoutLogging {
         let Some(filter) = &self.filter else {
             return true;
         };
+        if let Some(expr) = &filter.expression {
+            return evaluate_access_log_filter_expr(
+                expr,
+                AccessLogFilterContext {
+                    response_status_code: summary.response_status_code,
+                    latency_total_ms: summary.latency_total_ms,
+                    is_terminal_failure: summary.is_terminal_failure(),
+                },
+            );
+        }
+        Self::flat_filter_matches_transaction(&filter.flat, summary)
+    }
+
+    /// Apply the configured stream-family predicates to a finalized summary.
+    pub fn should_log_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
+        let Some(filter) = &self.filter else {
+            return true;
+        };
+        if let Some(expr) = &filter.expression {
+            return evaluate_access_log_filter_expr_for_stream(
+                expr,
+                StreamAccessLogFilterContext {
+                    duration_ms: summary.duration_ms,
+                    has_error: summary.error_class.is_some() || summary.connection_error.is_some(),
+                },
+            );
+        }
+        Self::flat_filter_matches_stream(&filter.flat, summary)
+    }
+
+    fn flat_filter_matches_transaction(
+        filter: &FlatFilter,
+        summary: &TransactionSummary,
+    ) -> bool {
         if let Some(min) = filter.status_code_min
             && summary.response_status_code < min
         {
@@ -116,11 +172,10 @@ impl StdoutLogging {
         true
     }
 
-    /// Apply the configured stream-family predicates to a finalized summary.
-    pub fn should_log_stream_transaction(&self, summary: &StreamTransactionSummary) -> bool {
-        let Some(filter) = &self.filter else {
-            return true;
-        };
+    fn flat_filter_matches_stream(
+        filter: &FlatFilter,
+        summary: &StreamTransactionSummary,
+    ) -> bool {
         if filter.status_code_min.is_some() || filter.status_code_max.is_some() {
             return false;
         }
@@ -418,5 +473,40 @@ mod tests {
             Some(ErrorClass::ConnectionTimeout)
         )));
         assert!(!plugin.should_log_transaction(&http_summary(503, 250.0, None)));
+    }
+
+    #[test]
+    fn expression_filter_logs_errors_or_slow_requests() {
+        let plugin = StdoutLogging::new(&json!({
+            "filter": {
+                "expression": {
+                    "op": "or",
+                    "left": { "op": "status_code_min", "value": 500 },
+                    "right": { "op": "min_latency_ms", "value": 1000 }
+                }
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(plugin.should_log_transaction(&http_summary(503, 10.0, None)));
+        assert!(plugin.should_log_transaction(&http_summary(200, 1500.0, None)));
+        assert!(!plugin.should_log_transaction(&http_summary(200, 10.0, None)));
+    }
+
+    #[test]
+    fn expression_filter_short_circuits_or_branches() {
+        let plugin = StdoutLogging::new(&json!({
+            "filter": {
+                "expression": {
+                    "op": "or",
+                    "left": { "op": "status_code_min", "value": 500 },
+                    "right": { "op": "min_latency_ms", "value": 999_999 }
+                }
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(plugin.should_log_transaction(&http_summary(503, 1.0, None)));
+        assert!(!plugin.should_log_transaction(&http_summary(200, 1.0, None)));
     }
 }

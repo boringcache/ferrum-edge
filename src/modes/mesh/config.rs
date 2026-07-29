@@ -1080,6 +1080,10 @@ fn default_true() -> bool {
 }
 
 /// Simple access log filter operating on transaction summary fields.
+///
+/// Pure conjunctions of supported predicates are stored in the flat fields.
+/// Expressions containing `||` compile to the optional [`AccessLogFilterExpr`]
+/// tree instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessLogFilter {
     /// Only log responses with status code >= this value.
@@ -1092,8 +1096,11 @@ pub struct AccessLogFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_latency_ms: Option<u64>,
     /// Only log requests that resulted in an error.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub errors_only: bool,
+    /// Boolean expression compiled from an Istio Telemetry `filter.expression`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression: Option<super::access_log_filter::AccessLogFilterExpr>,
 }
 
 // ── ProxyConfig ───────────────────────────────────────────────────────────
