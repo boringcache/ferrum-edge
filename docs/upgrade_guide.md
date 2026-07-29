@@ -278,18 +278,19 @@ one fail-closed replay-partition contract
   callers only; authenticated callers always bind their address, and there is no
   opt-out. A caller whose canonical address cannot be derived bypasses the cache
   (and is not deduplicated).
-- **`request_deduplication` can no longer share a proxy with a route-dispatch
-  plugin.** `ai_stream_router`, `mcp_gateway`, `a2a_gateway`, and
-  `mesh_route_dispatch` all select the effective destination *after* the dedup
-  lookup, and nothing available at lookup time witnesses the route policy they
-  will apply — a record read back after a reload, a restart, or from another
-  replica through shared Redis could replay a representation produced against a
-  different backend. The pair now fails admission in database, control-plane,
-  data-plane, and file modes, and again at plugin-cache construction. Audit
-  every proxy carrying `request_deduplication` before cutover; the remedy is to
-  split the two behaviors across separate proxies. Deduplication's priority is
-  deliberately not moved after the dispatchers: it exists to refuse
-  re-execution of a side effect *before* any of it happens.
+- **`request_deduplication` moved from priority `2750` to `3010`.** It now runs
+  after route dispatch and request-transformer header/query rules, so its
+  logical key binds the effective destination and its fingerprint binds the
+  outbound headers/query. It remains before terminate-mode
+  `serverless_function`, preserving ownership before that external operation.
+  Audit compositions and priority overrides: every same-protocol header/query
+  mutator at or after deduplication is rejected. A deferred request-body
+  transformer is also rejected because `before_proxy` cannot witness its final
+  wire bytes; the exception is a transformer that proves its final output is
+  exactly the body already produced by pre-`before_proxy` normalization. A
+  plugin that still changes headers later remains incompatible even when its
+  body normalization is observable. `mcp_gateway` remains incompatible because
+  its skipped response rewrite depends on mutable live discovery state.
 - **`ai_semantic_cache` lookup moved to the final-request-body stage, priority
   `2996` → `4057`.** Lookup previously ran in `before_proxy`, ahead of
   `request_transformer` (3000) and every `transform_request_body` hook, so the

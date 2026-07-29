@@ -1527,6 +1527,10 @@ impl Plugin for CompressionPlugin {
         self.config.decompress_request
     }
 
+    fn final_request_body_matches_pre_before_proxy_normalization(&self) -> bool {
+        self.config.decompress_request
+    }
+
     /// The validation in `before_proxy` / early normalization decompresses
     /// arbitrary (possibly non-UTF-8) bytes, so it reads
     /// `ctx.request_body_bytes` rather than the UTF-8

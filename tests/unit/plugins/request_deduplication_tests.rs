@@ -413,6 +413,9 @@ fn test_new_default_config() {
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "request_deduplication");
     assert_eq!(plugin.priority(), priority::REQUEST_DEDUPLICATION);
+    assert!(priority::MESH_ROUTE_DISPATCH < priority::REQUEST_TRANSFORMER);
+    assert!(priority::REQUEST_TRANSFORMER < priority::REQUEST_DEDUPLICATION);
+    assert!(priority::REQUEST_DEDUPLICATION < priority::SERVERLESS_FUNCTION);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_response_body_buffering());
     assert!(!plugin.is_auth_plugin());
@@ -5309,6 +5312,33 @@ async fn test_reused_key_different_raw_query_returns_409() {
 }
 
 #[tokio::test]
+async fn test_reused_key_different_outbound_query_returns_409() {
+    let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    first_ctx.set_raw_query_string("tenant=client".to_string());
+    first_ctx.publish_transformed_query(
+        "tenant=blue".to_string(),
+        HashMap::from([("tenant".to_string(), "blue".to_string())]),
+    );
+    let mut first_headers = keyed_headers("outbound-query-key", "api.example", 11);
+
+    let mut second_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
+    second_ctx.set_raw_query_string("tenant=client".to_string());
+    second_ctx.publish_transformed_query(
+        "tenant=green".to_string(),
+        HashMap::from([("tenant".to_string(), "green".to_string())]),
+    );
+    let mut second_headers = keyed_headers("outbound-query-key", "api.example", 11);
+
+    assert_reused_key_for_different_request_conflicts(
+        &mut first_ctx,
+        &mut first_headers,
+        &mut second_ctx,
+        &mut second_headers,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn test_reused_key_different_route_affecting_header_returns_409() {
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
     let mut first_headers = keyed_headers("route-header-key", "api.example", 11);
@@ -5986,7 +6016,7 @@ async fn test_fingerprints_and_logical_keys_do_not_expose_secrets() {
     assert!(matches!(result, PluginResult::Continue));
 
     let (logical_key, fingerprint) = request_identity(&plugin, &ctx).unwrap();
-    assert!(logical_key.starts_with("v5:"));
+    assert!(logical_key.starts_with("v6:"));
     assert!(fingerprint.starts_with("sha256-"));
     for secret in [
         "super-secret-body",

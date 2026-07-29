@@ -10,7 +10,7 @@
 //! /`on_sink_error` = `reject`) the plugin never blocks or rejects traffic.
 //!
 //! Runs at priority `AI_TRANSCRIPT_AUDIT` (2740): after authentication and
-//! authorization, but before `request_deduplication` (2750) and reject-capable
+//! authorization, but before `request_deduplication` (3010) and reject-capable
 //! AI guardrails, so cached replays and blocked prompts can still be audited.
 //! It also remains before `ai_semantic_cache` (4057) / `ai_federation` (4060).
 //! The audit candidate is staged in `before_proxy` over the

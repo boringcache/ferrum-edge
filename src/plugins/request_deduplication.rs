@@ -81,13 +81,11 @@
 //! `mcp_gateway` resolves public resource/tool/prompt URIs against a
 //! per-downstream-session catalog it re-lists from upstream whenever its
 //! discovery TTL expires; entries appear, disappear, get remapped, or become
-//! ambiguous with no config edit and no plugin-cache rebuild. Worse, this
-//! plugin's `before_proxy` short-circuits at priority
-//! `priorities::REQUEST_DEDUPLICATION`, ahead of `priorities::MCP_GATEWAY`, so
-//! a replay is served without MCP validating or routing the request against the
-//! current catalog at all. No digest available before the lookup can witness
-//! that state, and deriving one would mean an upstream round trip under a
-//! per-session lock on the hot path.
+//! ambiguous with no config edit and no plugin-cache rebuild. Even though MCP
+//! request validation/routing now runs before deduplication, a finalized replay
+//! deliberately skips MCP's later response-body rewrite. No construction-time
+//! digest can witness the live catalog that rewrite consumes, and deriving one
+//! would mean persisting or re-listing mutable upstream session state.
 //!
 //! Rather than replay under an unprovable policy, the composition is refused:
 //! [`validate_composition`] rejects the pair at config admission and at
@@ -95,23 +93,6 @@
 //! pre-existing data, `ResponsePresentationPolicy::Dynamic` collapses the
 //! proxy's presentation digest to `None` at runtime, which fails both storage
 //! and replay closed through the rules above.
-//!
-//! The same refusal — for a different reason — covers every plugin that selects
-//! the *destination*. This plugin's `before_proxy` runs at
-//! `priorities::REQUEST_DEDUPLICATION`, ahead of `ai_stream_router`,
-//! `mcp_gateway`, `a2a_gateway`, and `mesh_route_dispatch`, so the destination
-//! partition it binds is the pre-dispatch one. Binding the request inputs those
-//! plugins route on does **not** substitute for the destination: a route
-//! decision is a function of the request *and* the live route policy, and a
-//! deduplication record outlives that policy. The record is read back across a
-//! configuration reload, across a restart, and — with `sync_mode: redis` —
-//! across replicas that are not on the same generation. Two byte-identical
-//! requests can therefore select different destinations while presenting equal
-//! fingerprints, which the previous "equal inputs imply equal destination"
-//! argument silently assumed away. Nothing available at lookup time witnesses
-//! the route policy that a *later* plugin will apply, so the composition is
-//! refused structurally rather than proven. See
-//! [`UNWITNESSABLE_DESTINATION_PLUGINS`].
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -151,16 +132,15 @@ const CLEANUP_INTERVAL_SECS: u64 = 30;
 /// run.
 const CLEANUP_NEVER: u64 = u64::MAX;
 
-/// Bumped to `v5` when the logical key gained the mandatory replay-partition
-/// contract (authorization-context fingerprint, anonymous caller address,
-/// effective post-routing destination). Entries keyed under an earlier
-/// contract can never be reached again, which is the intended fail-closed
-/// outcome: no pre-contract retained result may be replayed.
-const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v5";
-/// Bumped to `v3` when credential headers moved from "excluded for scoped
-/// callers" to "bound as digests", so a same-subject/different-scope credential
-/// can no longer match an earlier fingerprint.
-const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v3";
+/// Bumped to `v6` when lookup moved after routing/request-transformer shaping
+/// and the fingerprint began preferring the published outbound query. Entries
+/// keyed under an earlier lifecycle contract can never be reached again, which
+/// is the intended fail-closed outcome: no pre-contract retained result may be
+/// replayed or converted into a false conflict.
+const DEDUP_LOGICAL_KEY_VERSION: &str = "ferrum-dedup-logical-v6";
+/// Bumped to `v4` when query fingerprinting moved from the raw inbound query to
+/// the request-transformer-published outbound query when present.
+const DEDUP_FINGERPRINT_VERSION: &str = "ferrum-dedup-fingerprint-v4";
 /// Version stamped into every Redis operation record. A peer running an older
 /// or newer record format is treated as a conflict rather than being parsed
 /// optimistically, so a rolling upgrade can never publish through a fence the
@@ -326,55 +306,16 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
-/// Plugins that select or rewrite the effective destination *after*
-/// `request_deduplication` has already decided whether to replay, and whose
-/// decision therefore cannot be witnessed at lookup time.
-///
-/// A dedup key binds the pre-dispatch destination plus the request inputs. That
-/// is not equivalent to binding the post-dispatch destination: these plugins
-/// route on the live route policy as well as on the request, and a dedup record
-/// survives config reload, process restart, and (under `sync_mode: redis`)
-/// replicas on different generations. Equal request bytes at two different times
-/// can select two different backends, so a replay can return a representation
-/// the current policy would never have produced.
-///
-/// Every current destination mutator is listed:
-///
-/// * `ai_stream_router` — selects the provider host/authority/path per request
-///   from its configured routing rules;
-/// * `mcp_gateway` — rewrites host/authority/path from live upstream discovery
-///   state (also in [`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`] for its response
-///   rewrite);
-/// * `mesh_route_dispatch` — selects `route_override_upstream_id` /
-///   backend host / authority from the live mesh route table;
-/// * `a2a_gateway` — terminates and serves its own endpoint, so a replay
-///   returns bytes the gateway never re-evaluated against the current agent
-///   card.
-///
-/// Deduplication's priority is deliberately *not* moved to run after them: it
-/// exists to refuse re-execution of a side effect before any of it happens, and
-/// a late lookup would defeat that. Widening this list is the correct response
-/// to a new destination mutator; narrowing it requires a concrete proof that the
-/// mutator's decision is a pure function of inputs already in the dedup key and
-/// stays so across reload and across replicas.
-pub const UNWITNESSABLE_DESTINATION_PLUGINS: &[&str] = &[
-    "a2a_gateway",
-    "ai_stream_router",
-    "mcp_gateway",
-    "mesh_route_dispatch",
-];
-
-/// Whether an effective instance's hooks actually apply, for both composition
-/// lists. An instance that is merged but inert neither rewrites a response nor
-/// selects a destination, so it cannot make deduplication unprovable.
+/// Whether an effective instance's hooks actually apply. An instance that is
+/// merged but inert does not rewrite a response and cannot make deduplication
+/// provenance unprovable.
 fn plugin_hooks_are_active(plugin: &crate::config::types::PluginConfig) -> bool {
     if !plugin.enabled {
         return false;
     }
     match plugin.plugin_name.as_str() {
         // `mcp_gateway` retains an explicit, validated inner enable switch.
-        // When false, none of its request or response hooks apply, so there is
-        // neither a dynamic presentation policy nor a destination rewrite.
+        // When false, none of its request or response hooks apply.
         "mcp_gateway" => {
             plugin
                 .config
@@ -387,24 +328,14 @@ fn plugin_hooks_are_active(plugin: &crate::config::types::PluginConfig) -> bool 
 }
 
 /// Reject composing `request_deduplication` with a plugin whose response-body
-/// presentation policy — or whose effective destination — cannot be proven
-/// stable for a retained representation.
-///
-/// Two independent refusals share this entry point:
-///
-/// * [`UNWITNESSABLE_DESTINATION_PLUGINS`] — the plugin picks the destination
-///   after deduplication has already decided whether to replay;
-/// * [`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`] — the plugin's response rewrite
-///   is derived from live runtime state.
+/// presentation policy cannot be proven stable for a retained representation.
 ///
 /// A dedup replay is a *finalized* representation: the synthetic replay path
-/// skips ordinary presentation transforms, and `request_deduplication`'s
-/// `before_proxy` short-circuits ahead of every plugin with a higher priority
-/// value — including `mcp_gateway`. So a hit is served without the MCP catalog
-/// ever being consulted, under a public-URI mapping that this gateway refreshes
-/// from upstream on its own schedule. There is no digest that can witness that
-/// state, so the composition is refused here rather than silently replaying
-/// bytes whose producing policy cannot be established.
+/// skips ordinary presentation transforms. MCP's public-URI rewrite is derived
+/// from a live catalog that this gateway refreshes from upstream on its own
+/// schedule. There is no static digest that can witness that state, so the
+/// composition is refused here rather than silently replaying bytes whose
+/// producing policy cannot be established.
 ///
 /// Runtime plugin-cache construction repeats this check as a fail-closed
 /// backstop, and `ResponsePresentationPolicy::Dynamic` degrades the request
@@ -482,33 +413,7 @@ pub fn validate_composition(
         if dedup_ids.is_empty() {
             continue;
         }
-        // A name in both lists is reported once, under the destination reason:
-        // it is the stronger refusal (the replay is not merely presented under a
-        // stale policy, it may belong to a different backend altogether) and a
-        // duplicate error for one pair only obscures the fix.
-        for name in UNWITNESSABLE_DESTINATION_PLUGINS {
-            let dispatch_ids = effective_ids(proxy, name);
-            if dispatch_ids.is_empty() {
-                continue;
-            }
-            errors.push(format!(
-                "request_deduplication cannot be composed with {name} on proxy '{}': \
-                 deduplication runs before {name} selects the effective destination, so a \
-                 stored record cannot witness the route policy that will serve a miss. \
-                 A record read back after a configuration reload, after a restart, or from \
-                 another replica through shared Redis may therefore replay a representation \
-                 produced against a different backend. \
-                 request_deduplication: {}; {name}: {}. \
-                 Disable one of them on this proxy",
-                proxy.id,
-                dedup_ids.join(", "),
-                dispatch_ids.join(", ")
-            ));
-        }
         for dynamic_name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
-            if UNWITNESSABLE_DESTINATION_PLUGINS.contains(dynamic_name) {
-                continue;
-            }
             let dynamic_ids = effective_ids(proxy, dynamic_name);
             if dynamic_ids.is_empty() {
                 continue;
@@ -1262,32 +1167,12 @@ impl RequestDeduplication {
     /// refusal's `reason()` is a compiled-in static string safe to emit in a
     /// debug line.
     ///
-    /// ## The lookup is pre-routing, and that is handled structurally
-    ///
-    /// This plugin's `before_proxy` runs at priority
-    /// [`super::priority::REQUEST_DEDUPLICATION`], ahead of every route-dispatch
-    /// plugin, so the destination partition bound here is the *pre-dispatch*
-    /// one.
-    ///
-    /// Binding the inputs those plugins route on — method, authority, path, raw
-    /// query, request headers, and the exact backend-visible request body, all
-    /// of which [`Self::build_request_fingerprint`] covers — does **not** make
-    /// the pre-dispatch destination equivalent to the post-dispatch one. A route
-    /// decision is a function of the request *and* the live route policy, while a
-    /// deduplication record outlives that policy: it is read back after a
-    /// configuration reload, after a restart, and under `sync_mode: redis` by
-    /// replicas that are not on the same generation. Two byte-identical requests
-    /// separated by a route policy change select different destinations while
-    /// presenting equal fingerprints, so a fingerprint match is not proof of a
-    /// shared destination.
-    ///
-    /// Rather than assume it away, the composition is refused: every plugin that
-    /// can still change the destination after this lookup is listed in
-    /// [`UNWITNESSABLE_DESTINATION_PLUGINS`] and rejected by
-    /// [`validate_composition`] at config admission and at plugin-cache
-    /// construction. What remains is a proxy whose destination is fixed by
-    /// configuration for the life of the plugin generation, and the destination
-    /// partition bound here is that destination.
+    /// The built-in priority runs after route dispatch and request
+    /// header/query transformation, so both the logical key and request
+    /// fingerprint bind their effective output. Plugin-cache admission rejects
+    /// any same-protocol header/query mutator that would run at or after this
+    /// lookup, and rejects any deferred request-body transformer whose
+    /// finalized wire bytes cannot be observed during `before_proxy`.
     fn build_key(
         &self,
         ctx: &RequestContext,
@@ -1318,7 +1203,7 @@ impl RequestDeduplication {
         hasher.text("idempotency_key", idempotency_value);
 
         let mut key = String::with_capacity(67);
-        key.push_str("v5:");
+        key.push_str("v6:");
         key.push_str(&hasher.hex());
         Ok(key)
     }
@@ -1382,7 +1267,16 @@ impl RequestDeduplication {
         hasher.text("method", &ctx.method.to_ascii_uppercase());
         hasher.text("authority", &canonical_authority(headers));
         hasher.text("path", &ctx.path);
-        hasher.text("query", ctx.raw_query_string().unwrap_or(""));
+        // The built-in priority places deduplication after request_transformer,
+        // so bind the published outbound query when one exists. Falling back
+        // to the raw wire query preserves synthetic/direct test contexts and
+        // requests whose query was not transformed.
+        hasher.text(
+            "query",
+            ctx.outbound_query_string()
+                .or_else(|| ctx.raw_query_string())
+                .unwrap_or(""),
+        );
         // The fingerprint must also witness the effective destination: a
         // header-selected route rewrite changes what the backend would do with
         // an otherwise identical request, and a conflicting fingerprint is what

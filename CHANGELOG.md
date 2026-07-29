@@ -82,16 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     was labelled anonymous and `anonymous_caller_scope: shared` could drop its
     canonical-address binding — the one relaxation that is meant to apply only
     to callers who presented nothing.
-  - **`request_deduplication` refuses composition it cannot witness.** Its
-    lookup runs at priority 2750, before every plugin that selects the effective
-    destination, so its key binds the *pre-dispatch* destination. Equal request
-    inputs do not witness the live route policy, and a dedup record outlives that
-    policy across configuration reload, restart, and `sync_mode: redis` replicas
-    on different generations — so the previous "equal inputs imply equal
-    destination" argument is withdrawn. `ai_stream_router`, `mcp_gateway`,
-    `a2a_gateway`, and `mesh_route_dispatch` are now rejected on the same proxy
-    as `request_deduplication`, at config admission and again at plugin-cache
-    construction, with an error naming both plugin config IDs and the proxy.
+  - **`request_deduplication` now witnesses routing and request shaping.** Its
+    lookup moved from priority `2750` to `3010`, after route dispatch and
+    request-transformer header/query rules but before terminate-mode serverless
+    execution. Its logical key now binds the effective destination and its
+    fingerprint binds the outbound query. Admission rejects every
+    same-protocol header/query mutator at or after deduplication (including
+    priority overrides), and rejects deferred request-body transformers whose
+    final wire bytes were not already established by pre-`before_proxy`
+    normalization.
   - **Body-bearing response caching is refused.** `cacheable_methods` now
     accepts only the bodyless retrieval methods `GET` and `HEAD`; a
     body-bearing method is rejected at admission, and at runtime any request
@@ -122,10 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** key derivation changed in all three plugins, so entries stored
     by a previous build are unreachable — the intended fail-closed outcome for
     anything keyed under the weaker partition. `response_caching` configs that
-    listed a body-bearing `cacheable_methods` entry now fail admission, and a
-    proxy composing `request_deduplication` with `ai_stream_router`,
-    `mcp_gateway`, `a2a_gateway`, or `mesh_route_dispatch` now fails admission.
-    `ai_semantic_cache` moves from priority `2996` to `4057`: a `before_proxy`
+    listed a body-bearing `cacheable_methods` entry now fail admission.
+    `request_deduplication` priority overrides and deferred body-transform
+    compositions that hide final backend-visible request state now fail
+    admission; `mcp_gateway` remains incompatible because its response rewrite
+    is derived from mutable live discovery state. `ai_semantic_cache` moves
+    from priority `2996` to `4057`: a `before_proxy`
     short-circuit that previously lost to a cache hit (`serverless_function`,
     `response_mock`) now wins, and a priority override placing the cache at or
     before a co-located `ai_prompt_compressor` re-opens the bypass this change

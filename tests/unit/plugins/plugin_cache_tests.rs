@@ -3376,7 +3376,7 @@ async fn transcript_audit_must_precede_every_request_deduplication_instance() {
         .expect("default audit priority must stage before deduplication");
     PluginCache::new(&valid).expect("runtime cache must accept the safe order");
 
-    for invalid_priority in [2750, 2800] {
+    for invalid_priority in [3010, 3020] {
         let mut audit = audit_config();
         audit.priority_override = Some(invalid_priority);
         let invalid = make_config(
@@ -3514,7 +3514,7 @@ fn candidate_serverless_pure_capabilities_still_reject_unsafe_order_and_body_egr
 
 #[test]
 fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
-    for serverless_priority in [2700, 2750] {
+    for serverless_priority in [2700, 3010] {
         let mut serverless = make_plugin_config_with_json(
             "terminal-function",
             "serverless_function",
@@ -3547,6 +3547,172 @@ fn terminate_serverless_must_run_after_every_request_deduplication_instance() {
         assert!(error.contains("serverless_function"), "{error}");
         assert!(error.contains("request_deduplication"), "{error}");
     }
+}
+
+#[test]
+fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body() {
+    let dedup = || {
+        make_plugin_config(
+            "dedup",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let mut late_headers = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "x-operation",
+                "value": "v2"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_headers.priority_override = Some(3010);
+    let late_headers_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![dedup(), late_headers],
+    );
+    let late_headers_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(
+            &late_headers_config,
+            None,
+        )
+        .expect_err("deduplication must observe request-transformer header/query output");
+    assert!(
+        late_headers_error.contains("fingerprint headers/query"),
+        "{late_headers_error}"
+    );
+
+    let mut late_query = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "operation",
+                "value": "v2"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_query.priority_override = Some(3020);
+    let late_query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![dedup(), late_query],
+    );
+    let late_query_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(
+            &late_query_config,
+            None,
+        )
+        .expect_err("query-only mutation after deduplication must be rejected");
+    assert!(
+        late_query_error.contains("fingerprint headers/query"),
+        "{late_query_error}"
+    );
+
+    let safe_query = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "query",
+                        "key": "operation",
+                        "value": "v2"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe_query, None)
+        .expect("the default transformer order runs before deduplication");
+    PluginCache::new(&safe_query)
+        .expect("runtime construction must accept the observable query-transform order");
+
+    let late_headers_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "compression"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "compression",
+                "compression",
+                json!({}),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let late_headers_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(
+            &late_headers_config,
+            None,
+        )
+        .expect_err("a later built-in header mutation must be rejected");
+    assert!(
+        late_headers_error.contains("compression")
+            && late_headers_error.contains("fingerprint headers/query"),
+        "{late_headers_error}"
+    );
+    let runtime_error = PluginCache::new(&late_headers_config)
+        .err()
+        .expect("runtime construction must repeat the later-header refusal");
+    assert!(
+        runtime_error.contains("compression")
+            && runtime_error.contains("fingerprint headers/query"),
+        "{runtime_error}"
+    );
+
+    let body_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
+        vec![
+            dedup(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "operation",
+                        "value": "rewritten"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&body_config, None)
+            .expect_err("candidate admission must reject a post-lookup body policy");
+    assert!(
+        candidate_error.contains("backend-visible body policy"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&body_config)
+        .err()
+        .expect("runtime construction must repeat the body-policy refusal");
+    assert!(
+        runtime_error.contains("backend-visible body policy"),
+        "{runtime_error}"
+    );
 }
 
 #[test]
@@ -9707,15 +9873,15 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
         vec![make_proxy(
             "p1",
             "/api",
-            vec!["dedup", "grpc-web", "method-router", "deadline"],
+            vec!["cache", "grpc-web", "method-router", "deadline"],
         )],
         vec![
-            make_plugin_config(
-                "dedup",
-                "request_deduplication",
+            make_plugin_config_with_json(
+                "cache",
+                "response_caching",
+                json!({"ttl_seconds": 60}),
                 PluginScope::Proxy,
                 Some("p1"),
-                true,
             ),
             make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
             make_plugin_config(
@@ -9740,7 +9906,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     assert!(
         view.plugins
             .iter()
-            .any(|name| name == "request_deduplication")
+            .any(|name| name == "response_caching")
     );
     assert!(view.plugins.iter().any(|name| name == "grpc_web"));
     assert_eq!(
@@ -9812,7 +9978,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
         !reloaded_view
             .plugins
             .iter()
-            .any(|name| name == "request_deduplication")
+            .any(|name| name == "response_caching")
     );
     assert_eq!(
         reloaded_view

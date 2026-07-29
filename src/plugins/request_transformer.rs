@@ -515,6 +515,10 @@ impl Plugin for RequestTransformer {
         !self.header_rules.is_empty() || self.apply_route_overrides
     }
 
+    fn modifies_request_query(&self) -> bool {
+        !self.query_rules.is_empty()
+    }
+
     fn modifies_request_body(&self) -> bool {
         !self.body_rules.is_empty()
     }

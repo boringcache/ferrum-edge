@@ -6269,8 +6269,8 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
-/// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
+/// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), request_deduplication (3010), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
@@ -6308,7 +6308,6 @@ pub mod priority {
     pub const MESH_AUTHZ: u16 = 2075;
     pub const OPA: u16 = 2080;
     pub const ADAPTIVE_CONCURRENCY: u16 = 2090;
-    pub const REQUEST_DEDUPLICATION: u16 = 2750;
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
@@ -6350,6 +6349,10 @@ pub mod priority {
     /// override after `before_proxy`.
     pub const MESH_ROUTE_DISPATCH: u16 = 2995;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
+    /// Runs after ordinary admission, route dispatch, and request header/query
+    /// transformation so the idempotency fingerprint observes their effective
+    /// output, while remaining before terminate-mode serverless execution.
+    pub const REQUEST_DEDUPLICATION: u16 = 3010;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;
     pub const GRPC_DEADLINE: u16 = 3050;
@@ -6685,6 +6688,16 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` if this plugin may rewrite the backend-visible query
+    /// string during `before_proxy`.
+    ///
+    /// Replay plugins use this independently from header mutation: a
+    /// query-only transformer still changes the operation even when it does not
+    /// require a cloned header map.
+    fn modifies_request_query(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin may transform the request body before
     /// it is sent to the backend. The gateway uses this hint to call
     /// `transform_request_body` only when needed.
@@ -6738,6 +6751,17 @@ pub trait Plugin: Send + Sync {
     /// Ordinary body transforms that only need to affect the backend-visible
     /// bytes should keep using `transform_request_body` instead.
     fn normalizes_buffered_request_body_before_before_proxy(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when this plugin's early normalization produces exactly
+    /// the bytes its later request-body transform will forward.
+    ///
+    /// This is a narrow replay-safety capability, not a general declaration
+    /// that normalization occurs. A plugin must return `true` only when every
+    /// successful later transform is the already-published normalized body,
+    /// with no request-time policy or mutable state able to rewrite it again.
+    fn final_request_body_matches_pre_before_proxy_normalization(&self) -> bool {
         false
     }
 

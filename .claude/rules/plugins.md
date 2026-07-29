@@ -49,18 +49,15 @@ paths:
   chargeback uses `chargeback::bounded_billing_identity` (prefix + SHA-256
   digest of the complete value; marker-bearing values always digested).
 - Exception: `request_deduplication` may not be effective on the same proxy as
-  `mcp_gateway` (its public-URI rewrite comes from live upstream discovery state
-  that no persisted digest can witness — `DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`,
-  mirrored at runtime by `ResponsePresentationPolicy::Dynamic`) **or** as any
-  route-dispatch plugin (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`,
-  `mesh_route_dispatch` — `UNWITNESSABLE_DESTINATION_PLUGINS`). Dedup looks up at
-  priority 2750, before all of them, so its key binds the *pre-dispatch*
-  destination; equal request inputs do not witness the live route policy, and a
-  dedup record outlives that policy across reload, restart, and shared-Redis
-  replicas. Both refusals share
-  `request_deduplication::validate_composition`, called from config admission
-  and from plugin-cache construction. A new destination mutator must be added to
-  the list.
+  `mcp_gateway`; its response rewrite comes from live upstream discovery state
+  that no persisted digest can witness (`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`,
+  mirrored at runtime by `ResponsePresentationPolicy::Dynamic`).
+  Deduplication runs at priority 3010, after route dispatch and
+  `request_transformer` header/query rules but before terminate-mode
+  `serverless_function`. Plugin-cache admission rejects every same-protocol
+  header/query mutator at or after deduplication, including priority overrides,
+  and rejects any deferred request-body transformer whose final bytes are not
+  exactly the body produced by the pre-`before_proxy` normalization phase.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order
