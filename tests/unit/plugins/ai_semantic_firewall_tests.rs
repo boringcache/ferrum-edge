@@ -5414,6 +5414,42 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
 }
 
 #[tokio::test]
+async fn fail_open_partial_event_detects_boundary_split_across_timeout_release() {
+    let server = nonmatching_embedding_server().await;
+    let firewall = plugin(&hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    let mut prefix = PARTIAL_EVENT_PREFIX.to_vec();
+    prefix.extend_from_slice(b"\"}}]}\n");
+    assert!(matches!(
+        inspector.on_chunk(&prefix).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let ResponseStreamAction::Forward(prefix_out) = inspector.on_chunk(&[]).await else {
+        panic!("fail-open expiry must forward the prefix");
+    };
+    assert_eq!(prefix_out.as_ref(), prefix);
+
+    // This leading LF completes the blank line whose first LF was in the
+    // already-forwarded timeout prefix. The following event must leave
+    // pass-through and resume ordinary governed inspection.
+    let mut boundary_and_next = b"\n".to_vec();
+    boundary_and_next.extend_from_slice(GOVERNED_CLEAN_EVENT);
+    let ResponseStreamAction::Forward(out) = inspector.on_chunk(&boundary_and_next).await else {
+        panic!("split boundary plus clean event must forward");
+    };
+    assert_eq!(out.as_ref(), boundary_and_next);
+}
+
+#[tokio::test]
 async fn fail_open_drip_cannot_retain_original_bytes_across_timer_resets() {
     let firewall = plugin(&hold_config(
         "http://127.0.0.1:9/v1/embeddings",

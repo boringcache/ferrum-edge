@@ -3824,9 +3824,14 @@ impl StreamWindowEngine {
         };
         if !self.carry.is_empty() {
             out.extend_from_slice(&self.carry);
+            // The first bytes of the next chunk may complete a blank-line
+            // boundary that started in this already-forwarded prefix. Retain
+            // only a detection copy of the final two bytes before clearing the
+            // held carry; they must never be emitted a second time.
+            let keep = self.carry.len().min(2);
+            self.passthrough_tail = self.carry[self.carry.len() - keep..].to_vec();
             self.carry.clear();
             self.passthrough_to_event_end = true;
-            self.passthrough_tail.clear();
         }
         out
     }
