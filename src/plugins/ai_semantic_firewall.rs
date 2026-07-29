@@ -3341,10 +3341,10 @@ impl StreamHoldStats {
 /// Live hold-deadline state for one streamed response.
 ///
 /// The clock is anchored to the moment un-released content first entered the
-/// gateway's hold and is **never** refreshed by the arrival of more chunks —
-/// only an actual release (bytes leaving for the client) or an expiry that
-/// already applied its policy restarts it. A backend that drip-feeds bytes
-/// therefore cannot extend the hold indefinitely.
+/// gateway's hold and is **never** refreshed by the arrival of more chunks or
+/// by a partial release that leaves older bytes behind. It clears only when the
+/// current hold is fully drained, or after an expiry applies its policy. A
+/// backend that drip-feeds bytes therefore cannot extend the hold indefinitely.
 struct HoldState {
     budget: Duration,
     action: HoldTimeoutAction,
@@ -3382,8 +3382,9 @@ impl HoldState {
         }
     }
 
-    /// Restart the clock after content actually left the gateway (or after an
-    /// expiry already applied its policy), so the next hold gets a full budget.
+    /// Clear the clock after an expiry has applied a terminal policy and drained
+    /// or discarded the whole hold. Clean releases use [`Self::sync`] so a
+    /// partial release cannot refresh older bytes that remain held.
     fn restart(&mut self) {
         self.started = None;
     }
@@ -4189,12 +4190,15 @@ impl StreamInspector {
         if self.config.enforcement == StreamEnforcement::Detect {
             return;
         }
+        // The historic unbounded path pays only this Option check; do not walk
+        // the held-event vector unless a deadline is configured.
+        let Some(hold) = self.hold.as_mut() else {
+            return;
+        };
         // Un-released wire bytes: complete held events plus the un-terminated
         // `carry`. Zero exactly when nothing is awaiting a verdict.
         let held = self.window.input_window_bytes();
-        if let Some(hold) = self.hold.as_mut() {
-            hold.sync(held);
-        }
+        hold.sync(held);
     }
 
     /// Emit the one-time sanitized hold-timeout warning. Fixed fields only — no
@@ -4249,14 +4253,11 @@ impl StreamInspector {
         }
     }
 
-    /// Release the pending window's held bytes downstream and restart the hold
-    /// clock: those bytes reached the client, so whatever is held next is a new
-    /// hold with a full budget.
+    /// Release the pending window's held bytes downstream and synchronize the
+    /// clock. If older bytes remain in `held`/`carry`, they keep the original
+    /// deadline; only a fully drained hold lets the next bytes start a new one.
     fn release_clean(&mut self) -> ResponseStreamAction {
         let released = self.window.release();
-        if let Some(hold) = self.hold.as_mut() {
-            hold.restart();
-        }
         self.sync_hold();
         ResponseStreamAction::Forward(Bytes::from(released))
     }
@@ -4585,6 +4586,21 @@ impl ResponseStreamInspector for StreamInspector {
                             }
                             terminate @ ResponseStreamAction::Terminate(_) => return terminate,
                         }
+                        // `act_on_window` can itself expire the hold while
+                        // awaiting a verdict. A fail-open expiry may have
+                        // forwarded a partial SSE event and entered
+                        // pass-through; consume the remainder from THIS same
+                        // transport chunk before normal ingest can reinterpret
+                        // it as a fresh event.
+                        if self.window.in_passthrough() && consumed < chunk.len() {
+                            let (fwd, took) =
+                                self.window.ingest_passthrough(&chunk[consumed..]);
+                            released.extend_from_slice(&fwd);
+                            consumed = consumed.saturating_add(took);
+                            if self.window.in_passthrough() {
+                                return ResponseStreamAction::Forward(Bytes::from(released));
+                            }
+                        }
                     }
                     if consumed >= chunk.len() && !step.progressed {
                         break;
@@ -4658,6 +4674,12 @@ impl ResponseStreamInspector for StreamInspector {
                             }
                             terminate @ ResponseStreamAction::Terminate(_) => return terminate,
                         }
+                        // A verdict timeout can enter fail-open pass-through
+                        // after the pre-loop check. End-of-stream has no later
+                        // chunk that could clear that state, so finish it now.
+                        if self.window.in_passthrough() {
+                            released.extend_from_slice(&self.window.finish_passthrough());
+                        }
                     }
                     if !step.progressed && !step.window_ready {
                         break;
@@ -4677,6 +4699,14 @@ impl ResponseStreamInspector for StreamInspector {
                 }
                 ResponseStreamAction::Forward(Bytes::new())
             }
+        }
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.terminated = true;
+        self.window.discard_held();
+        if let Some(hold) = self.hold.as_mut() {
+            hold.restart();
         }
     }
 }

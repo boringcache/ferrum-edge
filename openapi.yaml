@@ -20496,10 +20496,10 @@ components:
               description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
             max_hold_ms:
               type: integer
-              format: uint64
+              format: uint
               minimum: 1
               maximum: 300000
-              description: "Absolute deadline, in milliseconds, on how long response content may be held awaiting a semantic verdict. Independent of max_window_bytes, provider.request_timeout_ms, and any transport timeout: the budget covers the time the bytes have already been held plus the semantic round-trip (including queueing for a detect-mode admission permit). The clock is anchored when un-released content first enters the hold and is never refreshed by further chunks, so a drip-feeding backend cannot extend it; it restarts only when content is actually released to the client. On expiry the in-flight evaluation is cancelled and streaming.on_hold_timeout decides. Omit the field to leave the hold unbounded (the historic behavior); 0 and values above 300000 are rejected."
+              description: "Absolute deadline, in milliseconds, on how long response content may be held awaiting a semantic verdict. Independent of max_window_bytes, provider.request_timeout_ms, and any transport timeout: the budget covers the time the bytes have already been held plus the semantic round-trip (including queueing for a detect-mode admission permit). The clock is anchored when un-released content first enters the hold and is never refreshed by further chunks or by a partial release that leaves older bytes held, so a drip-feeding backend cannot extend it. It clears only when the current hold is fully released, so the next hold receives a fresh budget. On expiry the in-flight evaluation is cancelled and streaming.on_hold_timeout decides. Omit the field to leave the hold unbounded (the historic behavior); 0 and values above 300000 are rejected."
             on_hold_timeout:
               type: string
               enum: [on_error, cut, forward]

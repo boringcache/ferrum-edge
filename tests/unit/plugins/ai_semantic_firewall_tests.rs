@@ -5233,6 +5233,99 @@ async fn hold_deadline_fails_open_when_configured_to_forward() {
 }
 
 #[tokio::test]
+async fn fail_open_verdict_timeout_drains_same_chunk_remainder_in_passthrough() {
+    let server = stalled_embedding_server().await;
+    let max_window_bytes = CLEAN_SENTENCE_EVENT.len() + 16;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        // Keep the ordinary error posture strict so reinterpreting the partial
+        // second event would expose the regression as an incorrect cut.
+        "reject",
+        json!({
+            "max_hold_ms": 120,
+            "on_hold_timeout": "forward",
+            "max_window_bytes": max_window_bytes,
+            "overlap_bytes": 16
+        }),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    // The first bounded ingest includes one complete inspectable event and a
+    // prefix of the second. Its semantic wait expires inside `act_on_window`;
+    // fail-open releases that prefix and must pass the rest of this same
+    // transport chunk through to the event boundary without re-inspecting it.
+    let mut coalesced = CLEAN_SENTENCE_EVENT.to_vec();
+    coalesced.extend_from_slice(CLEAN_SENTENCE_EVENT);
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+        panic!("explicit fail-open timeout must not cut a coalesced SSE chunk");
+    };
+    assert_eq!(
+        released.as_ref(),
+        coalesced.as_slice(),
+        "the timed-out event prefix and same-chunk remainder must preserve exact wire order"
+    );
+}
+
+#[tokio::test]
+async fn partial_clean_release_does_not_refresh_older_held_bytes() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_responder = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(move |_request: &Request| {
+            let response = ResponseTemplate::new(200)
+                .set_body_json(json!({"data": [{"index": 0, "embedding": [0.0, 1.0]}]}));
+            if calls_for_responder.fetch_add(1, Ordering::Relaxed) == 0 {
+                response.set_delay(Duration::from_millis(250))
+            } else {
+                response.set_delay(Duration::from_secs(30))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let max_window_bytes = CLEAN_SENTENCE_EVENT.len() + 16;
+    let config = hold_config(
+        &format!("{}/v1/embeddings", server.uri()),
+        "reject",
+        json!({
+            "max_hold_ms": 400,
+            "on_hold_timeout": "forward",
+            "max_window_bytes": max_window_bytes,
+            "overlap_bytes": 16
+        }),
+    );
+    let firewall = plugin(&config);
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+    let mut coalesced = CLEAN_SENTENCE_EVENT.to_vec();
+    coalesced.extend_from_slice(CLEAN_SENTENCE_EVENT);
+
+    let started = std::time::Instant::now();
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
+        panic!("the configured fail-open deadline must not cut");
+    };
+    let elapsed = started.elapsed();
+
+    assert_eq!(released.as_ref(), coalesced.as_slice());
+    assert!(
+        calls.load(Ordering::Relaxed) >= 2,
+        "the first window must complete cleanly before the second stalls"
+    );
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "bytes already held behind a partial release must keep the original 400ms deadline, waited {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn hold_deadline_default_policy_follows_on_error() {
     let server = stalled_embedding_server().await;
     let endpoint = format!("{}/v1/embeddings", server.uri());
@@ -5411,6 +5504,34 @@ async fn fail_open_partial_event_remainder_is_passthrough_preserving_wire_order(
         panic!("subsequent events resume normal inspection");
     };
     assert_eq!(next.as_ref(), GOVERNED_CLEAN_EVENT);
+}
+
+#[tokio::test]
+async fn downstream_cut_discards_held_state_and_stops_the_inspector() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+    inspector.on_downstream_terminated();
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_SUFFIX).await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
+    assert!(matches!(
+        inspector.on_end().await,
+        ResponseStreamAction::Forward(bytes) if bytes.is_empty()
+    ));
 }
 
 #[tokio::test]
