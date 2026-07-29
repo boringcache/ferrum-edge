@@ -17216,14 +17216,18 @@ pub(crate) fn normalize_reject_response_with_provenance(
     // trailers-only, so an untrusted body is never reflected onto the wire.
     // `body` is handed over as owned shared `Bytes`, so the authorized frame
     // reaches the wire without a copy; the trailers-only fall-through below
-    // borrows it and then drops it.
-    let authorized_framed = framed_unary_provenance
-        .authorized_trailers(status, &body)
-        .and_then(|trailers| {
-            try_normalize_framed_grpc_unary_reject(body.clone(), headers, trailers)
-        });
-    if let Some(framed) = authorized_framed {
-        return framed;
+    // borrows it and then drops it. The predicates that decide intactness are
+    // shared with H3 reject logging via [`intact_framed_unary_terminate_signal`].
+    if let Some((grpc_status, grpc_message, trailers)) =
+        intact_framed_unary_terminate_signal(framed_unary_provenance, status, &body, headers)
+    {
+        return build_framed_grpc_unary_reject(
+            body,
+            headers,
+            trailers,
+            grpc_status,
+            grpc_message,
+        );
     }
 
     // Past this point no DATA is emitted. That is correct for exactly one
@@ -17327,27 +17331,17 @@ pub(crate) fn normalize_reject_response_with_provenance(
 /// can hold CORS fields, gateway-managed values, and internal bridge fields
 /// that belong in the HEADERS block (or nowhere) rather than in trailers. Those
 /// headers are preserved in the initial block minus terminal/hop-by-hop names.
-fn try_normalize_framed_grpc_unary_reject(
+///
+/// Callers must have already obtained `(grpc_status, grpc_message, trailers)`
+/// from [`intact_framed_unary_terminate_signal`] so the owned normalizer and
+/// the borrowed H3 logging path cannot drift on the shared predicates.
+fn build_framed_grpc_unary_reject(
     body: Bytes,
     headers: &HashMap<String, String>,
     authored_trailers: &HashMap<String, String>,
-) -> Option<NormalizedRejectResponse> {
-    if body.is_empty() {
-        return None;
-    }
-    let content_type = headers.get("content-type")?;
-    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
-        return None;
-    }
-    if !bytes_are_single_uncompressed_unary_grpc_frame(&body) {
-        return None;
-    }
-    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
-    let grpc_message = authored_trailers
-        .get("grpc-message")
-        .map(|message| sanitize_grpc_message(message))
-        .filter(|message| !message.is_empty());
-
+    grpc_status: u32,
+    grpc_message: Option<String>,
+) -> NormalizedRejectResponse {
     let mut initial_headers = HashMap::with_capacity(headers.len());
     for (key, value) in headers {
         let lower = key.to_ascii_lowercase();
@@ -17394,7 +17388,7 @@ fn try_normalize_framed_grpc_unary_reject(
         }
     }
 
-    Some(NormalizedRejectResponse {
+    NormalizedRejectResponse {
         http_status: StatusCode::OK,
         headers: initial_headers,
         // The authorized frame keeps the caller's allocation identity: the DATA
@@ -17403,7 +17397,39 @@ fn try_normalize_framed_grpc_unary_reject(
         grpc_status: Some(grpc_status),
         grpc_message,
         grpc_trailers: trailers,
-    })
+    }
+}
+
+/// Borrowed inspection of whether an authorizing terminate rejection is still
+/// the intact framed unary representation.
+///
+/// Shared by the owned normalizer and H3 reject logging so both agree on
+/// authored HTTP status, byte-exact frame equality, native `content-type`, a
+/// single uncompressed unary frame, terminal status parsing, and message
+/// sanitization — without requiring a full-body copy on the logging path.
+pub(crate) fn intact_framed_unary_terminate_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<(u32, Option<String>, &'a HashMap<String, String>)> {
+    let authored_trailers = framed_unary_provenance.authorized_trailers(status, body)?;
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers.get("content-type")?;
+    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return None;
+    }
+    if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    let grpc_message = authored_trailers
+        .get("grpc-message")
+        .map(|message| sanitize_grpc_message(message))
+        .filter(|message| !message.is_empty());
+    Some((grpc_status, grpc_message, authored_trailers))
 }
 
 /// Shared predicate for "this normalized rejection is a framed unary gRPC

@@ -2001,6 +2001,177 @@ fn test_native_grpc_terminate_rejects_duplicate_json_members() {
     assert_eq!(headers.get("x-a").map(String::as_str), Some("first"));
 }
 
+/// Hostile or compromised function output can put near-body-sized keys, control
+/// characters, and arbitrarily many unknown members into the terminate JSON.
+/// Operator diagnostics must stay bounded, single-line, and free of value/body
+/// echo while keeping field-specific refusals under the fixed client-visible
+/// class.
+#[test]
+fn test_native_grpc_terminate_bounds_hostile_operator_diagnostics() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::{
+        build_native_grpc_terminate_response_error_code_test as build_code,
+        build_native_grpc_terminate_response_test as build,
+        MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS_TEST as MAX_NAME,
+        MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS_TEST as MAX_DETAIL,
+        MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE_TEST as MAX_SAMPLE,
+    };
+
+    const MAX_BODY: usize = 1024 * 1024;
+    // Pin the ceilings so a silent widen cannot regress the log-bound contract.
+    assert_eq!(MAX_DETAIL, 256);
+    assert_eq!(MAX_NAME, 64);
+    assert_eq!(MAX_SAMPLE, 3);
+
+    // Very long unknown key: fragment and complete diagnostic stay capped.
+    let long_key = format!("x{}", "a".repeat(8 * 1024));
+    let long_body = format!(
+        r#"{{"grpc_status":0,"{long_key}":"BODY_ECHO_MARKER_SHOULD_NOT_APPEAR"}}"#
+    );
+    let detail = build(200, long_body.as_bytes(), MAX_BODY).unwrap_err();
+    assert!(
+        detail.chars().count() <= MAX_DETAIL,
+        "complete diagnostic exceeds {MAX_DETAIL}: len={}",
+        detail.chars().count()
+    );
+    assert!(
+        !detail.contains('\n') && !detail.contains('\r'),
+        "diagnostic must be single-line: {detail:?}"
+    );
+    assert!(
+        !detail.contains("BODY_ECHO_MARKER_SHOULD_NOT_APPEAR"),
+        "must never echo field values: {detail:?}"
+    );
+    assert!(
+        !detail.contains(&"a".repeat(MAX_NAME + 1)),
+        "displayed field-name fragment must be capped: {detail:?}"
+    );
+    assert!(
+        detail.contains("unknown gRPC terminate response field"),
+        "keeps the unknown-field refusal: {detail:?}"
+    );
+    assert_eq!(
+        build_code(200, long_body.as_bytes(), MAX_BODY).unwrap_err(),
+        "invalid_grpc_terminate_response"
+    );
+
+    // Newline/control characters in an unknown key and in an invalid trailer
+    // name must render as single-line escapes, never as raw control bytes.
+    let mut control_unknown = serde_json::Map::new();
+    control_unknown.insert("grpc_status".to_string(), json!(0));
+    control_unknown.insert(
+        "bad\nkey\u{7}".to_string(),
+        json!("VALUE_MUST_NOT_ECHO"),
+    );
+    let control_unknown = serde_json::to_vec(&Value::Object(control_unknown)).unwrap();
+    let detail = build(200, &control_unknown, MAX_BODY).unwrap_err();
+    assert!(
+        !detail.contains('\n') && !detail.contains('\r') && !detail.contains('\u{7}'),
+        "raw control bytes must not reach the diagnostic: {detail:?}"
+    );
+    assert!(
+        detail.contains("\\n") && detail.contains("\\u{0007}"),
+        "controls must be escaped for operators: {detail:?}"
+    );
+    assert!(
+        !detail.contains("VALUE_MUST_NOT_ECHO"),
+        "must never echo values: {detail:?}"
+    );
+    assert_eq!(
+        build_code(200, &control_unknown, MAX_BODY).unwrap_err(),
+        "invalid_grpc_terminate_response"
+    );
+
+    let mut control_trailer = serde_json::Map::new();
+    control_trailer.insert("grpc_status".to_string(), json!(0));
+    let mut trailers = serde_json::Map::new();
+    trailers.insert(
+        "bad\nname".to_string(),
+        json!("TRAILER_VALUE_MUST_NOT_ECHO"),
+    );
+    control_trailer.insert("trailers".to_string(), Value::Object(trailers));
+    let control_trailer = serde_json::to_vec(&Value::Object(control_trailer)).unwrap();
+    let detail = build(200, &control_trailer, MAX_BODY).unwrap_err();
+    assert!(
+        !detail.contains('\n') && !detail.contains('\r'),
+        "trailer-name diagnostic must be single-line: {detail:?}"
+    );
+    assert!(
+        detail.contains("\\n"),
+        "newline in trailer name must be escaped: {detail:?}"
+    );
+    assert!(
+        !detail.contains("TRAILER_VALUE_MUST_NOT_ECHO"),
+        "must never echo trailer values: {detail:?}"
+    );
+    assert!(
+        detail.chars().count() <= MAX_DETAIL,
+        "trailer-name diagnostic exceeds bound: {detail:?}"
+    );
+    assert_eq!(
+        build_code(200, &control_trailer, MAX_BODY).unwrap_err(),
+        "invalid_grpc_terminate_response"
+    );
+
+    // Many unknown keys: sample + count only; later names and all values stay out.
+    let mut many = serde_json::Map::new();
+    many.insert("grpc_status".to_string(), json!(0));
+    for i in 0..32 {
+        many.insert(
+            format!("zz_unknown_{i:02}"),
+            json!(format!("secret-value-{i}-must-not-echo")),
+        );
+    }
+    // Lexicographically first unknowns under sorted Map iteration are the
+    // zz_unknown_00.. samples; a later distinctive name must not appear once
+    // the sample is full.
+    many.insert(
+        "zz_unknown_99_late".to_string(),
+        json!("LATE_VALUE_MUST_NOT_ECHO"),
+    );
+    let many_body = serde_json::to_vec(&Value::Object(many)).unwrap();
+    let detail = build(200, &many_body, MAX_BODY).unwrap_err();
+    assert!(
+        detail.contains("(33)") || detail.contains(&format!("({})", 33)),
+        "reports the total unknown count: {detail:?}"
+    );
+    assert!(
+        detail.contains('…') || detail.contains(", …"),
+        "marks that the sample is truncated: {detail:?}"
+    );
+    // At most MAX_SAMPLE unknown name fragments appear.
+    let sampled = (0..32)
+        .filter(|i| detail.contains(&format!("zz_unknown_{i:02}")))
+        .count();
+    assert!(
+        sampled <= MAX_SAMPLE,
+        "sampled {sampled} names, cap is {MAX_SAMPLE}: {detail:?}"
+    );
+    assert!(
+        !detail.contains("zz_unknown_99_late"),
+        "must not join the unbounded inventory: {detail:?}"
+    );
+    for i in 0..32 {
+        assert!(
+            !detail.contains(&format!("secret-value-{i}-must-not-echo")),
+            "must never echo values: {detail:?}"
+        );
+    }
+    assert!(!detail.contains("LATE_VALUE_MUST_NOT_ECHO"));
+    assert!(
+        detail.chars().count() <= MAX_DETAIL,
+        "many-unknown diagnostic exceeds bound: len={}",
+        detail.chars().count()
+    );
+    assert!(
+        !detail.contains('\n') && !detail.contains('\r'),
+        "many-unknown diagnostic must be single-line"
+    );
+    assert_eq!(
+        build_code(200, &many_body, MAX_BODY).unwrap_err(),
+        "invalid_grpc_terminate_response"
+    );
+}
+
 /// Custom trailers are gRPC metadata, not arbitrary HTTP fields. Enforce the
 /// protocol's narrower name/value grammar and binary-metadata encoding before
 /// the response is authorized to reach a native gRPC stream.
@@ -2539,6 +2710,52 @@ fn test_invalidated_status_only_terminate_drops_all_authored_metadata() {
         logged_grpc_message.as_deref(),
         Some("gateway: authorized gRPC terminate response was invalidated"),
         "H3 logging must record the fail-closed wire signal, not the stale authored success"
+    );
+}
+
+/// Direct-H3 reject logging must agree with the wire normalizer on an intact
+/// framed terminate response, and must do so through the shared borrowed
+/// predicate rather than a full-body copy of the authorized frame.
+#[test]
+fn test_h3_reject_log_framed_terminate_matches_wire_signal() {
+    use ferrum_edge::_test_support::{
+        h3_reject_log_signal_for_test, normalize_reject_response_with_context,
+        set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    // A multi-KiB frame makes a reintroduced full-body copy in the log path
+    // materially expensive; the behavioral pin is log/wire agreement, and the
+    // static source test forbids `Bytes::copy_from_slice(http_body)` there.
+    let message = vec![0xab; 64 * 1024];
+    let framed = frame_terminate_message(&message);
+    let mut trailers = framed_grpc_terminate_trailers();
+    trailers.insert("grpc-message".to_string(), "ok%20done".to_string());
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(&mut ctx, &framed, trailers);
+
+    let mut headers = framed_grpc_terminate_reject_headers();
+    headers.insert("grpc-message".to_string(), "ok%20done".to_string());
+
+    let normalized =
+        normalize_reject_response_with_context(&ctx, StatusCode::OK, &framed, &headers, true);
+    assert_eq!(normalized.grpc_status, Some(0));
+    assert_eq!(normalized.grpc_message.as_deref(), Some("ok%20done"));
+    assert_eq!(normalized.body.as_ref(), framed.as_ref());
+
+    let (log_status, logged_grpc_status, logged_grpc_message) =
+        h3_reject_log_signal_for_test(&mut ctx, StatusCode::OK, &framed, &headers);
+    assert_eq!(log_status, 200);
+    assert_eq!(
+        logged_grpc_status.as_deref(),
+        Some("0"),
+        "H3 logging must record the same grpc-status the wire emits"
+    );
+    assert_eq!(
+        logged_grpc_message.as_deref(),
+        normalized.grpc_message.as_deref(),
+        "H3 logging must record the same sanitized grpc-message the wire emits"
     );
 }
 

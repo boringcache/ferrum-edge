@@ -12291,24 +12291,17 @@ pub(crate) fn h3_reject_log_status_and_metadata(
 
     let provenance = crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx);
     let (grpc_status, grpc_message) = if provenance.is_authorizing() {
-        // Logging-only normalization, so this branch owns a copy of the body
-        // rather than widening every caller's parameter to `Bytes`. It is gated
-        // on an active serverless-terminate authorization, so the ordinary
-        // reject-logging path stays allocation-free.
-        let normalized = crate::proxy::normalize_reject_response_with_provenance(
-            http_status,
-            Bytes::copy_from_slice(http_body),
-            headers,
-            true,
+        // Borrowed inspection only: share the exact intact-framed predicates
+        // with the owned normalizer so log and wire cannot drift, without a
+        // full-body copy of an authorized (up to multi-MiB) frame merely to
+        // read grpc-status/message for transaction metadata.
+        if let Some((status, message, _)) = crate::proxy::intact_framed_unary_terminate_signal(
             provenance,
-        );
-        if crate::proxy::framed_unary_reject_parts(&normalized).is_some() {
-            (
-                normalized
-                    .grpc_status
-                    .unwrap_or(crate::proxy::grpc_proxy::grpc_status::INTERNAL),
-                normalized.grpc_message.map(std::borrow::Cow::Owned),
-            )
+            http_status,
+            http_body,
+            headers,
+        ) {
+            (status, message.map(std::borrow::Cow::Owned))
         } else {
             h3_non_framed_grpc_reject_signal_with_provenance(
                 http_status,

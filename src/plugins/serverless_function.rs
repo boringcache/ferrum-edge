@@ -155,6 +155,15 @@ const GRPC_TERMINATE_RESPONSE_FIELDS: &[&str] = &[
     "status_details_base64",
     "trailers",
 ];
+/// Max characters of one function-controlled field-name fragment rendered into
+/// an operator diagnostic. A hostile key must not dominate the log line.
+const MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS: usize = 64;
+/// Max characters of a complete terminate-contract operator diagnostic. Caps
+/// the log record even when several field fragments are present.
+const MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS: usize = 256;
+/// How many unknown top-level member names may appear in the diagnostic sample.
+/// The full inventory is never collected or joined solely for logging.
+const MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE: usize = 3;
 
 #[derive(Debug)]
 struct InvocationFailure {
@@ -2014,6 +2023,93 @@ fn sanitize_grpc_terminate_message(message: &str) -> String {
         .to_string()
 }
 
+/// Render a function-controlled field name for an operator diagnostic: control
+/// characters become single-line escapes, and the displayed fragment is capped
+/// at [`MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS`].
+fn render_grpc_terminate_diagnostic_field_name(name: &str) -> String {
+    let mut out = String::new();
+    let mut displayed = 0usize;
+    for ch in name.chars() {
+        let segment = match ch {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            '\\' => "\\\\".to_string(),
+            c if c.is_control() => format!("\\u{{{:04x}}}", c as u32),
+            c => c.to_string(),
+        };
+        let segment_chars = segment.chars().count();
+        if displayed.saturating_add(segment_chars) > MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS {
+            if displayed < MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS {
+                out.push('…');
+            }
+            break;
+        }
+        displayed = displayed.saturating_add(segment_chars);
+        out.push_str(&segment);
+    }
+    out
+}
+
+/// Bound a terminate-contract operator detail to a single line of at most
+/// [`MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS`] characters.
+fn bound_grpc_terminate_operator_detail(detail: String) -> String {
+    let single_line: String = detail
+        .chars()
+        .map(|c| if matches!(c, '\r' | '\n') { ' ' } else { c })
+        .collect();
+    let char_count = single_line.chars().count();
+    if char_count <= MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS {
+        return single_line;
+    }
+    let keep = MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS.saturating_sub(1);
+    let truncated: String = single_line.chars().take(keep).collect();
+    format!("{truncated}…")
+}
+
+/// Fail-closed terminate-contract refusal under the fixed client-visible class.
+/// The operator detail is bounded and single-line; the client only sees `code`.
+fn invalid_grpc_terminate_response(operator_detail: impl Into<String>) -> InvocationFailure {
+    InvocationFailure::new(
+        "invalid_grpc_terminate_response",
+        bound_grpc_terminate_operator_detail(operator_detail.into()),
+    )
+}
+
+/// Diagnostic for unknown top-level contract members: a deterministic bounded
+/// sample plus a count, never an unbounded joined inventory of names.
+/// Returns `None` when every member is recognized.
+fn unknown_grpc_terminate_fields_detail<'a>(
+    unknown_keys: impl Iterator<Item = &'a str>,
+) -> Option<String> {
+    let mut unknown_count = 0usize;
+    let mut sample: Vec<&'a str> = Vec::with_capacity(MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE);
+    for key in unknown_keys {
+        unknown_count += 1;
+        if sample.len() < MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE {
+            sample.push(key);
+        }
+    }
+    if unknown_count == 0 {
+        return None;
+    }
+    let mut rendered = String::from("unknown gRPC terminate response field(s) (");
+    rendered.push_str(&unknown_count.to_string());
+    rendered.push_str("): ");
+    for (index, key) in sample.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push('\'');
+        rendered.push_str(&render_grpc_terminate_diagnostic_field_name(key));
+        rendered.push('\'');
+    }
+    if unknown_count > sample.len() {
+        rendered.push_str(", …");
+    }
+    Some(rendered)
+}
+
 /// Encode a sanitized status message into the canonical `grpc-message` wire
 /// form required by the gRPC HTTP/2 mapping:
 ///
@@ -2179,23 +2275,16 @@ fn build_native_grpc_terminate_response(
     // any byte of the inspected document, so this stays operator-safe even
     // though the function response is attacker-influencable through the request.
     if let Some(reason) = crate::util::json_dup_keys::slice_ambiguity(body) {
-        return Err(InvocationFailure::new(
-            "invalid_grpc_terminate_response",
-            format!("gRPC terminate function response is ambiguous: {reason}"),
-        ));
+        return Err(invalid_grpc_terminate_response(format!(
+            "gRPC terminate function response is ambiguous: {reason}"
+        )));
     }
 
     let parsed: Value = serde_json::from_slice(body).map_err(|_| {
-        InvocationFailure::new(
-            "invalid_grpc_terminate_response",
-            "gRPC terminate function response must be a JSON object",
-        )
+        invalid_grpc_terminate_response("gRPC terminate function response must be a JSON object")
     })?;
     let object = parsed.as_object().ok_or_else(|| {
-        InvocationFailure::new(
-            "invalid_grpc_terminate_response",
-            "gRPC terminate function response must be a JSON object",
-        )
+        invalid_grpc_terminate_response("gRPC terminate function response must be a JSON object")
     })?;
 
     // Reject unsupported streaming / compression contract shapes explicitly
@@ -2213,34 +2302,29 @@ fn build_native_grpc_terminate_response(
         ));
     }
 
-    let mut unknown: Vec<&str> = object
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !GRPC_TERMINATE_RESPONSE_FIELDS.contains(key))
-        .collect();
-    unknown.sort_unstable();
-    if !unknown.is_empty() {
-        return Err(InvocationFailure::new(
-            "invalid_grpc_terminate_response",
-            format!(
-                "unknown gRPC terminate response field(s): {}",
-                unknown.join(", ")
-            ),
-        ));
+    // Never collect/sort/join an unbounded inventory of unknown names solely for
+    // logging. serde_json::Map iterates in sorted key order, so the first
+    // sample slots are deterministic; only a bounded sample plus a count is
+    // rendered, and each name fragment is escaped/capped.
+    if let Some(detail) = unknown_grpc_terminate_fields_detail(
+        object
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !GRPC_TERMINATE_RESPONSE_FIELDS.contains(key)),
+    ) {
+        return Err(invalid_grpc_terminate_response(detail));
     }
 
     let grpc_status = object
         .get("grpc_status")
         .and_then(Value::as_u64)
         .ok_or_else(|| {
-            InvocationFailure::new(
-                "invalid_grpc_terminate_response",
+            invalid_grpc_terminate_response(
                 "gRPC terminate response requires integer 'grpc_status'",
             )
         })?;
     if grpc_status > u64::from(u32::MAX) {
-        return Err(InvocationFailure::new(
-            "invalid_grpc_terminate_response",
+        return Err(invalid_grpc_terminate_response(
             "gRPC terminate 'grpc_status' is out of range",
         ));
     }
@@ -2268,12 +2352,9 @@ fn build_native_grpc_terminate_response(
                 // the wire: percent-encoding expands a byte threefold, so
                 // bounding the pre-encoding string would admit a ~24 KiB field.
                 if encoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
-                    return Err(InvocationFailure::new(
-                        "invalid_grpc_terminate_response",
-                        format!(
-                            "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes once percent-encoded"
-                        ),
-                    ));
+                    return Err(invalid_grpc_terminate_response(format!(
+                        "gRPC terminate 'grpc_message' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes once percent-encoded"
+                    )));
                 }
                 // Custom trailers are field-value validated below; hold the
                 // protocol-owned message to the same bar. Percent-encoding
@@ -2283,8 +2364,7 @@ fn build_native_grpc_terminate_response(
                 // trailer construction, where `HeaderValue::from_str` errors are
                 // discarded.
                 if HeaderValue::from_str(&encoded).is_err() {
-                    return Err(InvocationFailure::new(
-                        "invalid_grpc_terminate_response",
+                    return Err(invalid_grpc_terminate_response(
                         "gRPC terminate 'grpc_message' is not a valid HTTP field value",
                     ));
                 }
@@ -2292,8 +2372,7 @@ fn build_native_grpc_terminate_response(
             }
         }
         Some(_) => {
-            return Err(InvocationFailure::new(
-                "invalid_grpc_terminate_response",
+            return Err(invalid_grpc_terminate_response(
                 "gRPC terminate 'grpc_message' must be a string",
             ));
         }
@@ -2315,15 +2394,12 @@ fn build_native_grpc_terminate_response(
                         max_message_bytes,
                         "max_response_body_bytes",
                     )
-                    .map_err(|detail| {
-                        InvocationFailure::new("invalid_grpc_terminate_response", detail)
-                    })?,
+                    .map_err(invalid_grpc_terminate_response)?,
                 )
             }
         }
         Some(_) => {
-            return Err(InvocationFailure::new(
-                "invalid_grpc_terminate_response",
+            return Err(invalid_grpc_terminate_response(
                 "gRPC terminate 'message_base64' must be a string",
             ));
         }
@@ -2349,9 +2425,7 @@ fn build_native_grpc_terminate_response(
                     MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES,
                     &details_limit_label,
                 )
-                .map_err(|detail| {
-                    InvocationFailure::new("invalid_grpc_terminate_response", detail)
-                })?;
+                .map_err(invalid_grpc_terminate_response)?;
                 // grpc-status-details-bin is a binary trailer; re-encode the
                 // validated bytes so only well-formed base64 reaches the wire.
                 let reencoded = base64::engine::general_purpose::STANDARD.encode(decoded);
@@ -2359,20 +2433,16 @@ fn build_native_grpc_terminate_response(
                 // decoded ceiling above is derived from this one, so a future
                 // change to either constant cannot silently widen the wire cap.
                 if reencoded.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
-                    return Err(InvocationFailure::new(
-                        "invalid_grpc_terminate_response",
-                        format!(
-                            "gRPC terminate 'status_details_base64' re-encodes to more than \
-                             {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
-                        ),
-                    ));
+                    return Err(invalid_grpc_terminate_response(format!(
+                        "gRPC terminate 'status_details_base64' re-encodes to more than \
+                         {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                    )));
                 }
                 Some(reencoded)
             }
         }
         Some(_) => {
-            return Err(InvocationFailure::new(
-                "invalid_grpc_terminate_response",
+            return Err(invalid_grpc_terminate_response(
                 "gRPC terminate 'status_details_base64' must be a string",
             ));
         }
@@ -2390,18 +2460,14 @@ fn build_native_grpc_terminate_response(
 
     if let Some(trailers_value) = object.get("trailers") {
         let trailers = trailers_value.as_object().ok_or_else(|| {
-            InvocationFailure::new(
-                "invalid_grpc_terminate_response",
+            invalid_grpc_terminate_response(
                 "gRPC terminate 'trailers' must be an object of string values",
             )
         })?;
         if trailers.len() > MAX_GRPC_TERMINATE_CUSTOM_TRAILERS {
-            return Err(InvocationFailure::new(
-                "invalid_grpc_terminate_response",
-                format!(
-                    "gRPC terminate 'trailers' exceeds {MAX_GRPC_TERMINATE_CUSTOM_TRAILERS} entries"
-                ),
-            ));
+            return Err(invalid_grpc_terminate_response(format!(
+                "gRPC terminate 'trailers' exceeds {MAX_GRPC_TERMINATE_CUSTOM_TRAILERS} entries"
+            )));
         }
         // HTTP/gRPC metadata names are case-insensitive, so `X-Foo` and `x-foo`
         // are the SAME trailer. JSON object members are not: both survive
@@ -2417,69 +2483,54 @@ fn build_native_grpc_terminate_response(
         // members.
         let mut seen_trailer_names: HashSet<String> = HashSet::with_capacity(trailers.len());
         for (name, value) in trailers {
+            let displayed_name = render_grpc_terminate_diagnostic_field_name(name);
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!("gRPC terminate trailer name '{name}' is not a valid HTTP field name"),
-                )
+                invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer name '{displayed_name}' is not a valid HTTP field name"
+                ))
             })?;
             let lower = header_name.as_str();
+            let displayed_lower = render_grpc_terminate_diagnostic_field_name(lower);
             if !crate::plugins::grpc_web::is_grpc_metadata_name(lower) {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!(
-                        "gRPC terminate trailer name '{name}' is outside the gRPC metadata name alphabet"
-                    ),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer name '{displayed_name}' is outside the gRPC metadata name alphabet"
+                )));
             }
             if !seen_trailer_names.insert(lower.to_string()) {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!(
-                        "gRPC terminate 'trailers' declares '{lower}' more than once; \
-                         trailer names are case-insensitive"
-                    ),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate 'trailers' declares '{displayed_lower}' more than once; \
+                     trailer names are case-insensitive"
+                )));
             }
             if is_reserved_grpc_terminate_trailer_name(lower) {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!(
-                        "gRPC terminate trailer '{lower}' is protocol-owned; use the dedicated contract fields"
-                    ),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' is protocol-owned; use the dedicated contract fields"
+                )));
             }
             let value = value.as_str().ok_or_else(|| {
-                InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!("gRPC terminate trailer '{lower}' must be a string"),
-                )
+                invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' must be a string"
+                ))
             })?;
             if value.len() > MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!(
-                        "gRPC terminate trailer '{lower}' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
-                    ),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' exceeds {MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES} bytes"
+                )));
             }
             if !crate::plugins::grpc_web::is_valid_trailer_value(value)
                 || HeaderValue::from_str(value).is_err()
             {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!("gRPC terminate trailer '{lower}' is not a valid gRPC ASCII value"),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate trailer '{displayed_lower}' is not a valid gRPC ASCII value"
+                )));
             }
             if lower.ends_with("-bin") && !crate::plugins::grpc_web::is_base64_metadata_value(value)
             {
-                return Err(InvocationFailure::new(
-                    "invalid_grpc_terminate_response",
-                    format!(
-                        "gRPC terminate binary trailer '{lower}' must contain standard base64, with or without padding"
-                    ),
-                ));
+                return Err(invalid_grpc_terminate_response(format!(
+                    "gRPC terminate binary trailer '{displayed_lower}' must contain standard base64, with or without padding"
+                )));
             }
+            // Values are validated above and never interpolated into diagnostics.
             response_headers.insert(lower.to_string(), value.to_string());
         }
     }
@@ -2496,29 +2547,24 @@ fn build_native_grpc_terminate_response(
     // The diagnostic is fixed text: it names no trailer, echoes no value, and so
     // cannot leak attacker- or function-supplied material into operator logs.
     let block_bytes = grpc_terminate_terminal_block_bytes(&response_headers).ok_or_else(|| {
-        InvocationFailure::new(
-            "invalid_grpc_terminate_response",
+        invalid_grpc_terminate_response(
             "gRPC terminate terminal metadata block size is not representable",
         )
     })?;
     if block_bytes > MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES {
-        return Err(InvocationFailure::new(
-            "invalid_grpc_terminate_response",
-            format!(
-                "gRPC terminate terminal metadata exceeds the {MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES}-byte \
-                 aggregate header-list budget (names + values + 32 bytes per field)"
-            ),
-        ));
+        return Err(invalid_grpc_terminate_response(format!(
+            "gRPC terminate terminal metadata exceeds the {MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES}-byte \
+             aggregate header-list budget (names + values + 32 bytes per field)"
+        )));
     }
 
     let framed_body = match message_bytes {
         Some(message) => frame_uncompressed_unary_grpc_message(&message)
-            .map_err(|detail| InvocationFailure::new("invalid_grpc_terminate_response", detail))?,
+            .map_err(invalid_grpc_terminate_response)?,
         None => Bytes::new(),
     };
     if framed_body.len() > max_response_body_bytes {
-        return Err(InvocationFailure::new(
-            "invalid_grpc_terminate_response",
+        return Err(invalid_grpc_terminate_response(
             "framed gRPC terminate response exceeds max_response_body_bytes",
         ));
     }
@@ -2631,6 +2677,19 @@ pub mod test_helpers {
             .map(|_| ())
             .map_err(|failure| failure.code)
     }
+
+    /// Complete operator-diagnostic character ceiling for terminate-contract
+    /// refusals. Pinned by hostile-input diagnostic tests.
+    pub const MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS_TEST: usize =
+        MAX_GRPC_TERMINATE_OPERATOR_DETAIL_CHARS;
+
+    /// Per field-name fragment character ceiling inside those diagnostics.
+    pub const MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS_TEST: usize =
+        MAX_GRPC_TERMINATE_DIAGNOSTIC_FIELD_NAME_CHARS;
+
+    /// Maximum unknown top-level names sampled into the diagnostic.
+    pub const MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE_TEST: usize =
+        MAX_GRPC_TERMINATE_UNKNOWN_FIELD_SAMPLE;
 }
 
 #[async_trait]
