@@ -2188,17 +2188,17 @@ pub(crate) fn build_node_waypoint_capture_relay_entry(
     epoch: &crate::request_epoch::RequestEpoch,
 ) -> Option<NodeWaypointCaptureDestination> {
     let mesh = epoch.config.mesh.as_deref()?;
-    // Capture destination authz readiness once per connection at synthesis so
-    // `handle_mesh_tcp_inbound` can fail closed without scanning the plugin
-    // chain on the connect hot path. Require the mesh-managed reserved id: an
-    // operator global mesh_authz alone is not destination/slice-fed capture
-    // enforcement.
-    let has_destination_mesh_authz = epoch.config.plugin_configs.iter().any(|plugin| {
-        plugin.id == crate::modes::mesh::MESH_AUTHZ_PLUGIN_ID
-            && plugin.plugin_name == "mesh_authz"
-            && plugin.enabled
-            && plugin.scope == crate::config::types::PluginScope::Global
-    });
+    // Stamp destination-authz readiness onto the synthesized entry so
+    // `handle_mesh_tcp_inbound` can fail closed before the backend dial. This
+    // is an O(1) read of a bit the plugin cache precomputed for this
+    // generation — NOT a config-vector or plugin-vector scan: the connect path
+    // must not walk `config.plugin_configs` or the built chain (hot-path
+    // invariant). The bit is true only when the mesh-managed reserved
+    // `__mesh_authz` row is enabled AND its runtime policy is provably in the
+    // prebuilt global TCP chain this relay resolves; an operator-authored
+    // global `mesh_authz` never satisfies it. See
+    // `PluginCacheInner::node_waypoint_destination_authz_ready`.
+    let has_destination_mesh_authz = epoch.plugin_cache.node_waypoint_destination_authz_ready();
     resolve_node_waypoint_capture_destination(orig_dst, mesh, has_destination_mesh_authz)
 }
 

@@ -50,12 +50,28 @@ use crate::request_epoch::RequestEpoch;
 use crate::router_cache::MeshTcpInboundEntry;
 
 /// Fail-closed gate for NodeWaypoint transparent capture: refuse before the
-/// backend dial when the entry requires destination mesh authz and the
-/// synthesizing epoch did not carry an enabled mesh-managed `__mesh_authz`.
+/// backend dial unless the mesh-managed `__mesh_authz` runtime policy is
+/// positively proven present in the global TCP chain this connection will run.
+///
+/// Both inputs are O(1) bits precomputed per plugin-cache generation, so this
+/// adds no per-connection scan:
+/// - `entry.has_destination_mesh_authz` is what the SYNTHESIZING generation saw
+///   when the relay entry was built.
+/// - `epoch_destination_authz_ready` is what the generation actually serving
+///   this connection reports.
+///
+/// Requiring both closes the otherwise-representable skew where an entry is
+/// built under a ready generation and handled under one that no longer carries
+/// the managed policy.
+///
 /// Sidecar entries leave `requires_destination_mesh_authz` false and keep the
 /// historical empty-chain fast path.
-pub(crate) fn capture_requires_destination_authz_refusal(entry: &MeshTcpInboundEntry) -> bool {
-    entry.requires_destination_mesh_authz && !entry.has_destination_mesh_authz
+pub(crate) fn capture_requires_destination_authz_refusal(
+    entry: &MeshTcpInboundEntry,
+    epoch_destination_authz_ready: bool,
+) -> bool {
+    entry.requires_destination_mesh_authz
+        && !(entry.has_destination_mesh_authz && epoch_destination_authz_ready)
 }
 
 pub(crate) async fn handle_mesh_tcp_inbound(
@@ -90,9 +106,13 @@ pub(crate) async fn handle_mesh_tcp_inbound(
 
     // NodeWaypoint transparent capture admits unauthenticated direct plaintext.
     // Never take the Sidecar empty-chain fast path for those entries, and fail
-    // closed when the synthesizing epoch lacked mesh-managed destination authz
-    // (precomputed on the entry — no hot-path plugin scan).
-    if capture_requires_destination_authz_refusal(entry) {
+    // closed unless the mesh-managed destination authz policy is provably in
+    // the chain resolved above. Both operands are generation-level bits
+    // precomputed by the plugin cache — no hot-path config or plugin scan.
+    if capture_requires_destination_authz_refusal(
+        entry,
+        epoch.plugin_cache.node_waypoint_destination_authz_ready(),
+    ) {
         warn!(
             service = %entry.service_fqdn,
             orig_dst = %orig_dst,
@@ -660,18 +680,31 @@ mod tests {
     #[test]
     fn sidecar_entries_never_refuse_for_missing_destination_authz() {
         let entry = sample_entry(false, false);
-        assert!(!capture_requires_destination_authz_refusal(&entry));
+        // Sidecar keeps the historical empty-chain fast path under either
+        // generation readiness value.
+        assert!(!capture_requires_destination_authz_refusal(&entry, false));
+        assert!(!capture_requires_destination_authz_refusal(&entry, true));
     }
 
     #[test]
     fn capture_entries_refuse_when_mesh_managed_authz_is_absent() {
         let entry = sample_entry(true, false);
-        assert!(capture_requires_destination_authz_refusal(&entry));
+        assert!(capture_requires_destination_authz_refusal(&entry, true));
+        assert!(capture_requires_destination_authz_refusal(&entry, false));
     }
 
     #[test]
     fn capture_entries_proceed_when_mesh_managed_authz_is_present() {
         let entry = sample_entry(true, true);
-        assert!(!capture_requires_destination_authz_refusal(&entry));
+        assert!(!capture_requires_destination_authz_refusal(&entry, true));
+    }
+
+    /// The entry was synthesized under a ready generation, but the generation
+    /// serving the connection no longer proves the managed policy is in its
+    /// global TCP chain. That skew must fail closed before the backend dial.
+    #[test]
+    fn capture_entries_refuse_when_the_serving_generation_is_not_ready() {
+        let entry = sample_entry(true, true);
+        assert!(capture_requires_destination_authz_refusal(&entry, false));
     }
 }

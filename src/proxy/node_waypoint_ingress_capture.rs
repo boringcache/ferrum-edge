@@ -513,9 +513,11 @@ mod tests {
             assert!(!destination.entry.has_destination_mesh_authz);
             assert!(
                 crate::proxy::mesh_tcp_inbound::capture_requires_destination_authz_refusal(
-                    &destination.entry
+                    &destination.entry,
+                    true,
                 ),
-                "capture handler must refuse when mesh-managed authz was absent at synthesis"
+                "capture handler must refuse when mesh-managed authz was absent at synthesis, \
+                 even if the serving generation is itself ready"
             );
         }
 
