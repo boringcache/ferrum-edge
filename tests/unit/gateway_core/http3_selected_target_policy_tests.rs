@@ -523,7 +523,7 @@ async fn h3_grpc_web_reject_commits_final_wire_shape_once_before_log() {
         HttpFlavor::Grpc,
         Some("application/grpc-web-text+proto"),
         StatusCode::FORBIDDEN,
-        br#"{"error":"blocked"}"#,
+        bytes::Bytes::from_static(br#"{"error":"blocked"}"#),
         &reject_headers,
     )
     .await;
@@ -616,7 +616,7 @@ async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hook
                 HttpFlavor::Grpc,
                 grpc_web_content_type,
                 StatusCode::FORBIDDEN,
-                br#"{"error":"blocked"}"#,
+                bytes::Bytes::from_static(br#"{"error":"blocked"}"#),
                 &headers,
             ),
         )

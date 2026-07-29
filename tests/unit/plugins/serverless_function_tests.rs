@@ -1282,6 +1282,90 @@ fn test_normalize_reject_preserves_framed_unary_grpc_body() {
     );
 }
 
+/// GHSA-5fp3-pp5p-c4gh compatibility: the authorized terminate frame must reach
+/// the wire representation as the SAME shared allocation the plugin authored,
+/// not a copy of it. The reject-normalization boundary is where the two
+/// behaviors meet — provenance decides that DATA is legal, and the shared-`Bytes`
+/// migration decides that emitting it costs a refcount bump rather than a
+/// full-body copy. A 256 KiB message makes a regression an unmistakable pointer
+/// change rather than an allocator coincidence.
+#[test]
+fn test_framed_unary_reject_shares_the_authored_frame_allocation() {
+    use ferrum_edge::_test_support::{
+        normalize_reject_response_bytes_with_context, set_serverless_grpc_terminate_frame_for_test,
+    };
+    use http::StatusCode;
+
+    let message = Bytes::from(vec![0xa7u8; 256 * 1024]);
+    let framed = frame_terminate_message(&message);
+    let framed_ptr = framed.as_ptr() as usize;
+    let headers = framed_grpc_terminate_reject_headers();
+
+    let mut ctx = create_test_context();
+    set_serverless_grpc_terminate_frame_for_test(
+        &mut ctx,
+        &framed,
+        framed_grpc_terminate_trailers(),
+    );
+
+    let normalized = normalize_reject_response_bytes_with_context(
+        &ctx,
+        StatusCode::OK,
+        framed.clone(),
+        &headers,
+        true,
+    );
+
+    assert_eq!(normalized.body.len(), framed.len());
+    assert_eq!(
+        normalized.body.as_ptr() as usize,
+        framed_ptr,
+        "the authorized terminate frame must be shared, not copied, into the reject representation"
+    );
+    assert_eq!(
+        normalized
+            .grpc_trailers
+            .get("grpc-status")
+            .map(String::as_str),
+        Some("0"),
+        "sharing the frame must not cost the mandatory terminal trailers"
+    );
+}
+
+/// Source canary for the direct-H3 framed writer: it rebuilds its own response
+/// from the raw reject map, so it is the one emitter that can silently
+/// reintroduce a per-reject copy at the QUIC boundary while every shared helper
+/// stays clean.
+#[test]
+fn test_h3_framed_unary_writer_moves_the_shared_frame_to_quic() {
+    let server = include_str!("../../../src/http3/server.rs");
+    let start = server
+        .find("async fn send_h3_reject_flavor_aware_with_header_state(")
+        .expect("direct-H3 flavor-aware reject writer must remain present");
+    let tail = &server[start..];
+    let end = tail
+        .find("pub(crate) fn h3_framed_unary_initial_response(")
+        .expect("direct-H3 writer boundary must remain present");
+    let writer = &tail[..end];
+
+    assert!(
+        writer.contains("http_body: Bytes,"),
+        "the direct-H3 reject writer must accept the owned shared body"
+    );
+    assert!(
+        writer.contains("stream.send_data(framed_body).await?;"),
+        "the authorized terminate frame must be moved into QUIC send_data"
+    );
+    assert!(
+        !writer.contains("copy_from_slice"),
+        "the direct-H3 reject writer must not copy the authorized terminate frame"
+    );
+    assert!(
+        writer.contains("stream.send_trailers(trailers).await?;"),
+        "framed unary DATA must still be followed by the terminal trailers block"
+    );
+}
+
 #[test]
 fn test_h3_framed_unary_reject_emits_each_cookie_as_a_separate_header() {
     let mut headers = framed_grpc_terminate_reject_headers();

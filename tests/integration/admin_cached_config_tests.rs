@@ -3236,6 +3236,9 @@ async fn test_backup_returns_full_config() {
     assert_eq!(body["counts"]["upstreams"], 1);
     assert_eq!(body["counts"]["proxies"], 1);
     assert_eq!(body["counts"]["plugin_configs"], 1);
+    assert_eq!(body["counts"]["api_specs"], 0);
+    assert_eq!(body["api_specs"]["section_version"], "1");
+    assert!(body["api_specs"]["items"].as_array().unwrap().is_empty());
 
     // Verify actual data
     assert_eq!(body["proxies"].as_array().unwrap().len(), 1);
@@ -3304,6 +3307,192 @@ async fn test_backup_resource_filter() {
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(body["counts"]["consumers"], 1);
     assert_eq!(body["counts"]["proxies"], 0);
+
+    // api_specs without owning/generated resource classes must fail closed
+    // with 400 before emitting a self-invalid backup artifact.
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=api_specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"].as_str(),
+        Some(
+            "Filtered backups that include api_specs must also include proxies, upstreams, and plugin_configs"
+        )
+    );
+    assert!(body.get("proxies").is_none());
+    assert!(body.get("api_specs").is_none());
+
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/backup?resources=api_specs,proxies,upstreams",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"].as_str(),
+        Some(
+            "Filtered backups that include api_specs must also include proxies, upstreams, and plugin_configs"
+        )
+    );
+
+    // Complete api_specs dependency set is allowed (consumers optional).
+    let (status, body, _) = admin_get(
+        &base_url,
+        "/backup?resources=api_specs,proxies,upstreams,plugin_configs",
+        &token,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(body["counts"]["proxies"], 1);
+    assert_eq!(body["counts"]["upstreams"], 1);
+    assert_eq!(body["counts"]["plugin_configs"], 1);
+    assert_eq!(body["counts"]["consumers"], 0);
+    assert_eq!(body["api_specs"]["section_version"], "1");
+}
+
+#[tokio::test]
+async fn backup_with_api_specs_serializes_through_namespace_admission() {
+    use std::time::Duration;
+
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Hold the same local admission mutex the durable guard acquires first.
+    let held = ferrum_edge::_test_support::lock_namespace_config_admission_for_test("ferrum").await;
+    let client = reqwest::Client::new();
+    let mut blocked = tokio::spawn({
+        let base_url = base_url.clone();
+        let token = token.clone();
+        async move {
+            client
+                .get(format!("{base_url}/backup"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+        }
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut blocked)
+            .await
+            .is_err(),
+        "full backup that emits api_specs must wait on namespace config admission"
+    );
+
+    // Filtered omit of api_specs does not take the guard and must proceed.
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=proxies", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "filtered omit of api_specs must not require admission: {body:?}"
+    );
+    assert_eq!(body["source"], "database");
+    assert_eq!(body["api_specs"]["items"].as_array().unwrap().len(), 0);
+
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(5), blocked)
+        .await
+        .expect("backup completes after admission release")
+        .expect("backup task joins")
+        .expect("backup HTTP succeeds");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("backup JSON");
+    assert_eq!(body["source"], "database");
+    assert_eq!(body["api_specs"]["section_version"], "1");
+}
+
+#[tokio::test]
+async fn backup_api_specs_fails_closed_when_admission_lease_cannot_be_acquired() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("backup_admission.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Remove the durable lease table so acquisition fails closed (Err), rather
+    // than contending (None → retry). Resource-filtered omit must still work.
+    sqlx::query("DROP TABLE config_admission_locks")
+        .execute(&pool)
+        .await
+        .expect("drop admission lease table");
+
+    let (status, body, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"].as_str(),
+        Some("Backup aborted: config admission unavailable")
+    );
+    assert!(
+        body.get("proxies").is_none(),
+        "acquisition failure must not emit a backup body: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains("config_admission_locks")
+            && !body.to_string().contains("sqlite")
+            && !body.to_string().contains(&db_url),
+        "admission failure must stay redacted: {body:?}"
+    );
+
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=proxies", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "filtered omit of api_specs must not require the lease table: {body:?}"
+    );
+    assert_eq!(body["source"], "database");
+}
+
+#[tokio::test]
+async fn backup_admission_lease_loss_is_observed_fail_closed() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("backup_loss.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite");
+    let db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(db);
+
+    let guard = ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test(
+        db.clone(),
+        "ferrum",
+    )
+    .await
+    .expect("acquire admission for loss probe");
+
+    // Loss after the export future completes must surface as Lost (the same
+    // completion arm handle_backup maps to 503 without emitting the body).
+    let completion = guard
+        .run_to_completion_while_held(async {
+            guard.force_lose();
+            "assembled-backup-body"
+        })
+        .await
+        .expect("observer runs");
+    match completion {
+        ferrum_edge::_test_support::TestNamespaceConfigAdmissionCompletion::Lost(body) => {
+            assert_eq!(body, "assembled-backup-body");
+        }
+        ferrum_edge::_test_support::TestNamespaceConfigAdmissionCompletion::Held(_) => {
+            panic!("forced lease loss must not report Held");
+        }
+    }
+
+    // Loss before work starts fails closed without producing a body.
+    let before = guard
+        .run_to_completion_while_held(async { "should-not-run" })
+        .await;
+    assert!(
+        before.is_err(),
+        "lost lease before export must fail closed: {before:?}"
+    );
 }
 
 #[tokio::test]
@@ -4368,23 +4557,195 @@ async fn test_restore_surfaces_corrupt_snapshot_row_as_data_integrity() {
     assert_eq!(replacement_count, 0, "restore import must not start");
 }
 
-/// `api_specs` are admin-only metadata outside `GatewayConfig`, so a config
-/// rollback cannot restore them. A failed restore that rolls back must surface
-/// how many specs the operator has to re-submit rather than silently dropping
+/// Successful restore recreates API specs (and ownership) from the versioned
+/// backup section — including JSON and YAML documents — instead of deleting
 /// them.
 #[tokio::test]
-async fn test_restore_reports_api_specs_not_restored_on_rollback() {
+async fn test_backup_restore_roundtrip_preserves_api_specs_json_and_yaml() {
     let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_restore_apispec.db");
+    let db_path = temp_dir.path().join("test_restore_apispec_roundtrip.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+
+    for (spec_id, proxy_id, listen_path, format, raw) in [
+        (
+            "spec-json",
+            "proxy-json",
+            "/spec-json",
+            ferrum_edge::config::types::SpecFormat::Json,
+            br#"{"openapi":"3.1.0","info":{"title":"JSON API","version":"1.0.0"},"paths":{}}"#
+                .as_slice(),
+        ),
+        (
+            "spec-yaml",
+            "proxy-yaml",
+            "/spec-yaml",
+            ferrum_edge::config::types::SpecFormat::Yaml,
+            b"openapi: \"3.0.3\"\ninfo:\n  title: YAML API\n  version: \"2.0.0\"\npaths: {}\n"
+                .as_slice(),
+        ),
+    ] {
+        // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": proxy_id,
+            "namespace": "ferrum",
+            "backend_host": "backend.example.com",
+            "backend_port": 443,
+            "listen_path": listen_path
+        }))
+        .expect("proxy deserialization failed");
+        let bundle = ferrum_edge::ExtractedBundle {
+            proxy,
+            upstream: None,
+            plugins: vec![],
+        };
+        let spec = ferrum_edge::config::types::ApiSpec {
+            id: spec_id.to_string(),
+            namespace: "ferrum".to_string(),
+            proxy_id: proxy_id.to_string(),
+            spec_version: if matches!(format, ferrum_edge::config::types::SpecFormat::Json) {
+                "3.1.0".to_string()
+            } else {
+                "3.0.3".to_string()
+            },
+            spec_format: format,
+            spec_content: ferrum_edge::admin::spec_codec::compress_gzip(raw)
+                .expect("compress failed"),
+            content_encoding: "gzip".to_string(),
+            uncompressed_size: raw.len() as u64,
+            content_hash: ferrum_edge::admin::spec_codec::sha256_hex(raw),
+            title: Some("API".to_string()),
+            info_version: Some("1.0.0".to_string()),
+            description: None,
+            contact_name: None,
+            contact_email: None,
+            license_name: None,
+            license_identifier: None,
+            tags: vec![],
+            server_urls: vec![],
+            operation_count: 0,
+            resource_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db.submit_api_spec_bundle(&bundle, &spec)
+            .await
+            .expect("Failed to seed api_spec bundle");
+    }
+
+    // Other-namespace spec must not leak into the default-namespace backup.
+    {
+        let proxy: Proxy = serde_json::from_value(json!({
+            "id": "proxy-other-ns",
+            "namespace": "tenant-b",
+            "backend_host": "backend.example.com",
+            "backend_port": 443,
+            "listen_path": "/other"
+        }))
+        .expect("proxy deserialization failed");
+        let bundle = ferrum_edge::ExtractedBundle {
+            proxy,
+            upstream: None,
+            plugins: vec![],
+        };
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"Other","version":"1"},"paths":{}}"#;
+        let spec = ferrum_edge::config::types::ApiSpec {
+            id: "spec-other-ns".to_string(),
+            namespace: "tenant-b".to_string(),
+            proxy_id: "proxy-other-ns".to_string(),
+            spec_version: "3.1.0".to_string(),
+            spec_format: ferrum_edge::config::types::SpecFormat::Json,
+            spec_content: ferrum_edge::admin::spec_codec::compress_gzip(raw).expect("compress"),
+            content_encoding: "gzip".to_string(),
+            uncompressed_size: raw.len() as u64,
+            content_hash: ferrum_edge::admin::spec_codec::sha256_hex(raw),
+            title: Some("Other".to_string()),
+            info_version: Some("1".to_string()),
+            description: None,
+            contact_name: None,
+            contact_email: None,
+            license_name: None,
+            license_identifier: None,
+            tags: vec![],
+            server_urls: vec![],
+            operation_count: 0,
+            resource_hash: String::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        db.submit_api_spec_bundle(&bundle, &spec)
+            .await
+            .expect("Failed to seed other-namespace api_spec");
+    }
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "backup failed: {:?}",
+        backup
+    );
+    assert_eq!(backup["counts"]["api_specs"], 2);
+    assert_eq!(backup["api_specs"]["section_version"], "1");
+    assert_eq!(backup["api_specs"]["items"].as_array().unwrap().len(), 2);
+    let backed_ids: Vec<&str> = backup["api_specs"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(
+        !backed_ids.contains(&"spec-other-ns"),
+        "backup must stay namespace-scoped: {:?}",
+        backed_ids
+    );
+
+    let (status, restore_body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &backup).await;
+    assert_eq!(status, 200, "restore failed: {:?}", restore_body);
+    assert_eq!(restore_body["restored"]["api_specs"], 2);
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs?limit=50", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let items = specs["items"].as_array().expect("api-specs items array");
+    assert_eq!(
+        items.len(),
+        2,
+        "both specs must survive round-trip: {:?}",
+        specs
+    );
+
+    let (status, proxy, _) = admin_get(&base_url, "/proxies/proxy-json", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        proxy["api_spec_id"].as_str(),
+        Some("spec-json"),
+        "ownership tag must be preserved: {:?}",
+        proxy
+    );
+}
+
+/// A failed restore rolls API specs back from the recovery snapshot together
+/// with config resources.
+#[tokio::test]
+async fn test_restore_rollback_restores_api_specs() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_apispec_rollback.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .expect("Failed to connect to test database");
     let pool = db.pool();
 
-    // Seed a proxy + its owning api_spec directly through the backend so the
-    // namespace carries admin-only metadata before the restore.
+    // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
     let proxy: Proxy = serde_json::from_value(json!({
         "id": "spec-proxy",
         "namespace": "ferrum",
@@ -4428,19 +4789,10 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         .await
         .expect("Failed to seed api_spec bundle");
 
-    // Corrupt summary metadata that the item-listing path must deserialize.
-    // Restore only needs the authoritative count, so this admin-only row must
-    // not block the raw config snapshot or the repair operation.
-    sqlx::query("UPDATE api_specs SET spec_format = 'corrupt' WHERE id = 'spec-1'")
-        .execute(&pool)
-        .await
-        .expect("Failed to corrupt api_spec summary metadata");
-
     let state = db_admin_state(&tc, db, None);
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    // Force the import phase to fail so the restore rolls back.
     sqlx::query(
         "CREATE TRIGGER fail_restore_apispec BEFORE INSERT ON proxies \
          WHEN NEW.id = 'restore-fail' \
@@ -4458,7 +4810,11 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
             "backend_host": "localhost",
             "backend_port": 8080,
             "strip_listen_path": true
-        }]
+        }],
+        "api_specs": {
+            "section_version": "1",
+            "items": []
+        }
     });
     let (status, body) =
         admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
@@ -4470,111 +4826,88 @@ async fn test_restore_reports_api_specs_not_restored_on_rollback() {
         "config rollback should complete: {:?}",
         body
     );
-    assert_eq!(
-        body["api_specs_not_restored"].as_u64(),
-        Some(1),
-        "restore must report the api_specs it could not restore: {:?}",
-        body
-    );
-    assert!(body.get("api_specs_lost").is_none());
-    let note = body["api_specs_note"].as_str().unwrap_or_default();
     assert!(
-        note.contains("POST /api-specs") && note.contains("GET /api-specs"),
-        "restore must give a usable re-submit and current-list recovery path: {:?}",
+        body.get("api_specs_not_restored").is_none(),
+        "completed rollback must restore api_specs: {:?}",
         body
     );
 
-    // The config resource itself was restored by rollback.
     let (status, _, _) = admin_get(&base_url, "/proxies/spec-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(
-        status,
-        reqwest::StatusCode::OK,
-        "the spec-owned proxy must survive rollback as a plain resource"
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "api_spec must be restored by rollback: {:?}",
+        specs
     );
 }
 
-/// A rollback response reports the authoritative API spec count even when the
-/// namespace contains more rows than the normal list page size.
+/// Legacy backups that omit the api_specs section must not silently delete
+/// existing specs: require an explicit confirmation flag.
 #[tokio::test]
-async fn test_restore_reports_authoritative_api_spec_count_beyond_page_size() {
-    let total_specs = 501;
-
+async fn test_restore_legacy_backup_requires_api_spec_deletion_confirmation() {
     let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();
-    let db_path = temp_dir.path().join("test_restore_apispec_trunc.db");
+    let db_path = temp_dir.path().join("test_restore_apispec_preflight.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
     let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
         .await
         .expect("Failed to connect to test database");
-    let pool = db.pool();
 
-    // Seed enough specs (and their owning proxies) to exceed the normal list
-    // page size. Bundles go straight through the backend.
-    for i in 0..total_specs {
-        let proxy: Proxy = serde_json::from_value(json!({
-            "id": format!("spec-proxy-{i}"),
-            "namespace": "ferrum",
-            "backend_host": "backend.example.com",
-            "backend_port": 443,
-            "listen_path": format!("/spec-{i}")
-        }))
-        .expect("proxy deserialization failed");
-        let bundle = ferrum_edge::ExtractedBundle {
-            proxy,
-            upstream: None,
-            plugins: vec![],
-        };
-        let content = format!("minimal owned spec {i}");
-        let content_bytes = content.as_bytes();
-        let spec = ferrum_edge::config::types::ApiSpec {
-            id: format!("spec-{i}"),
-            namespace: "ferrum".to_string(),
-            proxy_id: format!("spec-proxy-{i}"),
-            spec_version: "3.1.0".to_string(),
-            spec_format: ferrum_edge::config::types::SpecFormat::Json,
-            spec_content: ferrum_edge::admin::spec_codec::compress_gzip(content_bytes)
-                .expect("compress failed"),
-            content_encoding: "gzip".to_string(),
-            uncompressed_size: content_bytes.len() as u64,
-            content_hash: ferrum_edge::admin::spec_codec::sha256_hex(content_bytes),
-            title: Some(format!("Test API {i}")),
-            info_version: Some("1.0.0".to_string()),
-            description: None,
-            contact_name: None,
-            contact_email: None,
-            license_name: None,
-            license_identifier: None,
-            tags: vec![],
-            server_urls: vec![],
-            operation_count: 0,
-            resource_hash: String::new(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        };
-        db.submit_api_spec_bundle(&bundle, &spec)
-            .await
-            .expect("Failed to seed api_spec bundle");
-    }
+    // Ownership tags are server-managed; submit_api_spec_bundle stamps them.
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "spec-proxy",
+        "namespace": "ferrum",
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "listen_path": "/spec-proxy"
+    }))
+    .expect("proxy deserialization failed");
+    let bundle = ferrum_edge::ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let content = b"preflight owned spec";
+    let spec = ferrum_edge::config::types::ApiSpec {
+        id: "spec-1".to_string(),
+        namespace: "ferrum".to_string(),
+        proxy_id: "spec-proxy".to_string(),
+        spec_version: "3.1.0".to_string(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(content)
+            .expect("compress failed"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: content.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(content),
+        title: Some("Test API".to_string()),
+        info_version: Some("1.0.0".to_string()),
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    db.submit_api_spec_bundle(&bundle, &spec)
+        .await
+        .expect("Failed to seed api_spec bundle");
 
     let state = db_admin_state(&tc, db, None);
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    // Force the import phase to fail so the restore rolls back and the api_specs
-    // recovery report is produced.
-    sqlx::query(
-        "CREATE TRIGGER fail_restore_apispec_trunc BEFORE INSERT ON proxies \
-         WHEN NEW.id = 'restore-fail' \
-         BEGIN SELECT RAISE(FAIL, 'injected restore persistence failure'); END",
-    )
-    .execute(&pool)
-    .await
-    .expect("Failed to install restore fault-injection trigger");
-
-    let restore_payload = json!({
+    let legacy_payload = json!({
         "proxies": [{
-            "id": "restore-fail",
-            "listen_path": "/new",
+            "id": "legacy-proxy",
+            "listen_path": "/legacy",
             "backend_scheme": "http",
             "backend_host": "localhost",
             "backend_port": 8080,
@@ -4582,25 +4915,251 @@ async fn test_restore_reports_authoritative_api_spec_count_beyond_page_size() {
         }]
     });
     let (status, body) =
-        admin_post(&base_url, "/restore?confirm=true", &token, &restore_payload).await;
-
-    assert_eq!(status, 500, "Failed restore response: {:?}", body);
+        admin_post(&base_url, "/restore?confirm=true", &token, &legacy_payload).await;
+    assert_eq!(status, 409, "legacy restore must preflight: {:?}", body);
+    assert_eq!(body["api_specs_at_risk"], 1);
     assert_eq!(
-        body["rollback"].as_str(),
-        Some("completed"),
-        "config rollback should complete: {:?}",
+        body["confirmation_required"].as_str(),
+        Some("confirm_api_spec_deletion=true")
+    );
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "preflight must leave existing specs untouched: {:?}",
+        specs
+    );
+
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true&confirm_api_spec_deletion=true",
+        &token,
+        &legacy_payload,
+    )
+    .await;
+    assert_eq!(status, 200, "confirmed legacy restore failed: {:?}", body);
+    assert_eq!(body["restored"]["api_specs"], 0);
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(0),
+        "confirmed legacy restore may delete specs: {:?}",
+        specs
+    );
+}
+
+/// Crafted restore payloads must not bypass POST/PUT metadata/document
+/// admission: forbidden tags and declared-format mismatches are rejected
+/// before any durable delete, leaving the prior namespace intact.
+#[tokio::test]
+async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_apispec_hostile.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+
+    let proxy: Proxy = serde_json::from_value(json!({
+        "id": "kept-proxy",
+        "namespace": "ferrum",
+        "backend_host": "backend.example.com",
+        "backend_port": 443,
+        "listen_path": "/kept"
+    }))
+    .expect("proxy deserialization failed");
+    let bundle = ferrum_edge::ExtractedBundle {
+        proxy,
+        upstream: None,
+        plugins: vec![],
+    };
+    let kept_raw = br#"{"openapi":"3.1.0","info":{"title":"Kept","version":"1"},"paths":{}}"#;
+    let kept_spec = ferrum_edge::config::types::ApiSpec {
+        id: "kept-spec".to_string(),
+        namespace: "ferrum".to_string(),
+        proxy_id: "kept-proxy".to_string(),
+        spec_version: "3.1.0".to_string(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(kept_raw)
+            .expect("compress failed"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: kept_raw.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(kept_raw),
+        title: Some("Kept".to_string()),
+        info_version: Some("1".to_string()),
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec!["public".to_string()],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+    db.submit_api_spec_bundle(&bundle, &kept_spec)
+        .await
+        .expect("Failed to seed kept api_spec bundle");
+
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let hostile_raw = br#"{"openapi":"3.1.0","info":{"title":"Hostile","version":"1"},"paths":{}}"#;
+    let compressed =
+        ferrum_edge::admin::spec_codec::compress_gzip(hostile_raw).expect("compress hostile");
+    let hostile_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&compressed)
+    };
+    let hostile_payload = json!({
+        "proxies": [{
+            "id": "hostile-proxy",
+            "listen_path": "/hostile",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "api_spec_id": "hostile-spec"
+        }],
+        "api_specs": {
+            "section_version": "1",
+            "items": [{
+                "id": "hostile-spec",
+                "namespace": "ferrum",
+                "proxy_id": "hostile-proxy",
+                "spec_version": "3.1.0",
+                "spec_format": "json",
+                "spec_content_base64": hostile_b64,
+                "content_encoding": "gzip",
+                "uncompressed_size": hostile_raw.len() as u64,
+                "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(hostile_raw),
+                "title": "Hostile",
+                "info_version": "1",
+                "tags": ["api_v1"],
+                "server_urls": [],
+                "operation_count": 0,
+                "resource_hash": "a".repeat(64),
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }]
+        }
+    });
+
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &hostile_payload).await;
+    assert_eq!(
+        status, 400,
+        "hostile tag restore must be rejected: {:?}",
         body
     );
-    // The authoritative total is reported without paginating identities.
-    assert_eq!(
-        body["api_specs_not_restored"].as_u64(),
-        Some(total_specs as u64),
-        "api_specs_not_restored must be the authoritative total: {:?}",
-        body["api_specs_not_restored"]
+    let errors = body["validation_errors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        errors.iter().any(|e| e
+            .as_str()
+            .is_some_and(|s| s.contains("tag contains forbidden character"))),
+        "expected forbidden-tag validation error, got {:?}",
+        body
     );
-    assert!(body.get("api_specs_lost").is_none());
-    let note = body["api_specs_note"].as_str().unwrap_or_default();
-    assert!(note.contains("POST /api-specs") && note.contains("GET /api-specs"));
+    assert!(
+        body.to_string().contains("existing config was NOT deleted"),
+        "rejection must advertise pre-delete failure: {:?}",
+        body
+    );
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "hostile restore must leave prior specs untouched: {:?}",
+        specs
+    );
+    assert_eq!(specs["items"][0]["id"], "kept-spec");
+
+    // Declared JSON with non-JSON body must also fail closed pre-delete.
+    let yaml_raw = b"openapi: \"3.0.3\"\ninfo:\n  title: y\n  version: \"1\"\npaths: {}\n";
+    let yaml_compressed =
+        ferrum_edge::admin::spec_codec::compress_gzip(yaml_raw).expect("compress yaml");
+    let mismatch_b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&yaml_compressed)
+    };
+    let mismatch_payload = json!({
+        "proxies": [{
+            "id": "mismatch-proxy",
+            "listen_path": "/mismatch",
+            "backend_scheme": "http",
+            "backend_host": "localhost",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "api_spec_id": "mismatch-spec"
+        }],
+        "api_specs": {
+            "section_version": "1",
+            "items": [{
+                "id": "mismatch-spec",
+                "namespace": "ferrum",
+                "proxy_id": "mismatch-proxy",
+                "spec_version": "3.0.3",
+                "spec_format": "json",
+                "spec_content_base64": mismatch_b64,
+                "content_encoding": "gzip",
+                "uncompressed_size": yaml_raw.len() as u64,
+                "content_hash": ferrum_edge::admin::spec_codec::sha256_hex(yaml_raw),
+                "title": "y",
+                "info_version": "1",
+                "tags": [],
+                "server_urls": [],
+                "operation_count": 0,
+                "resource_hash": "a".repeat(64),
+                "created_at": chrono::Utc::now().to_rfc3339(),
+                "updated_at": chrono::Utc::now().to_rfc3339()
+            }]
+        }
+    });
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &mismatch_payload,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "format-mismatch restore must be rejected: {:?}",
+        body
+    );
+    let errors = body["validation_errors"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        errors.iter().any(|e| e.as_str().is_some_and(|s| {
+            s.contains("document is not valid JSON for declared spec_format")
+        })),
+        "expected declared-format validation error, got {:?}",
+        body
+    );
+
+    let (status, specs, _) = admin_get(&base_url, "/api-specs", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        specs["items"].as_array().map(|a| a.len()),
+        Some(1),
+        "format-mismatch restore must leave prior specs untouched: {:?}",
+        specs
+    );
 }
 
 /// When `delete_all_resources` fails on an ATOMIC backend (SQL runs the clear in
