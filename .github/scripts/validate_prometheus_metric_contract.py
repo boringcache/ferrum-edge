@@ -222,6 +222,7 @@ def load_contract(root: Path) -> list[dict]:
             or not help_text
             or help_text != help_text.strip()
             or "\n" in help_text
+            or help_text.endswith("\\n")
             or "|" in help_text
         ):
             fail("Missing metric help", name)

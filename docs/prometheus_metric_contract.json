@@ -1479,9 +1479,10 @@
   {
     "name": "ferrum_mesh_node_waypoint_asserted_identity_total",
     "type": "counter",
-    "help": "Asserted source-identity decisions on inbound NodeWaypoint HBONE. Rejection reasons are compile-time-bounded; SPIFFE IDs never appear as labels.\\n",
+    "help": "Asserted source-identity decisions on inbound NodeWaypoint HBONE. Rejection reasons are compile-time-bounded; SPIFFE IDs never appear as labels.",
     "labels": [
       "result",
+      "reason",
       "gateway_namespace"
     ],
     "subsystem": "mesh_node_waypoint",
@@ -1492,7 +1493,7 @@
   {
     "name": "ferrum_mesh_node_waypoint_destination_policy_rejections_total",
     "type": "counter",
-    "help": "Destination-side AuthorizationPolicy / scope / open-relay rejections on NodeWaypoint. Distinct from asserted-identity rejections.\\n",
+    "help": "Destination-side AuthorizationPolicy / scope / open-relay rejections on NodeWaypoint. Distinct from asserted-identity rejections.",
     "labels": [
       "reason",
       "gateway_namespace"
@@ -1505,7 +1506,7 @@
   {
     "name": "ferrum_mesh_node_waypoint_hbone_handshakes_total",
     "type": "counter",
-    "help": "NodeWaypoint HBONE handshake outcomes by phase. One failed session increments exactly one phase (inbound_tls XOR inbound_connect on the destination; outbound_dial is independent on the source).\\n",
+    "help": "NodeWaypoint HBONE handshake outcomes by phase. One failed session increments exactly one phase (inbound_tls XOR inbound_connect on the destination; outbound_dial is independent on the source).",
     "labels": [
       "phase",
       "result",
@@ -1519,7 +1520,7 @@
   {
     "name": "ferrum_mesh_node_waypoint_missing_destination_metadata_total",
     "type": "counter",
-    "help": "Secured NodeWaypoint service targets skipped because Workload.node_waypoint metadata was absent.\\n",
+    "help": "Secured NodeWaypoint service targets skipped because Workload.node_waypoint metadata was absent.",
     "labels": [
       "gateway_namespace"
     ],
@@ -1531,7 +1532,7 @@
   {
     "name": "ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total",
     "type": "counter",
-    "help": "Prohibited plaintext fallback attempts blocked under identity-backed NodeWaypoint (fail-closed instead of retaining a plaintext backend).\\n",
+    "help": "Prohibited plaintext fallback attempts blocked under identity-backed NodeWaypoint (fail-closed instead of retaining a plaintext backend).",
     "labels": [
       "gateway_namespace"
     ],

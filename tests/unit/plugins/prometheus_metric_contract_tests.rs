@@ -696,6 +696,11 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
         );
         assert!(!fam.help.is_empty(), "{} missing help", fam.name);
         assert!(
+            !fam.help.ends_with("\\n"),
+            "{} HELP includes the exposition line terminator",
+            fam.name
+        );
+        assert!(
             matches!(
                 fam.bundled.as_str(),
                 "alert" | "dashboard" | "alert_and_dashboard" | "documented_only"
@@ -759,6 +764,16 @@ fn prometheus_metric_contract_is_sorted_unique_and_well_formed() {
     let entries = &contract["ferrum_api_chargeback_registry_entries"];
     assert_eq!(entries.metric_type, "gauge");
     assert!(entries.labels.is_empty());
+    let asserted_identity =
+        &contract["ferrum_mesh_node_waypoint_asserted_identity_total"];
+    assert_eq!(
+        asserted_identity.labels,
+        BTreeSet::from([
+            "gateway_namespace".into(),
+            "reason".into(),
+            "result".into(),
+        ])
+    );
 }
 
 #[test]
