@@ -28,6 +28,12 @@ jobs:
           toolchain: nightly-2025-07-01
 
       - name: Generate the standalone fuzz-workspace lockfile
+        env:
+          # The repository root config uses sccache as rustc-wrapper, but this
+          # resolution-only bootstrap job intentionally installs no compiler
+          # cache daemon. An explicit empty override makes Cargo query rustc
+          # directly instead of failing before dependency resolution.
+          RUSTC_WRAPPER: ""
         run: cargo generate-lockfile --manifest-path fuzz/Cargo.toml
 
       - name: Upload generated lockfile
