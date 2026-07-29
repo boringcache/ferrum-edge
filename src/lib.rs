@@ -3370,6 +3370,7 @@ pub mod _test_support {
             policy_names,
             policy_prefixes,
             crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
             unbounded_policy,
         );
         surviving_trailer_lines_for_test(&map)
@@ -3434,6 +3435,45 @@ pub mod _test_support {
             &pre_policy,
             governance,
             crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
+        );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Like [`reconcile_streaming_backend_trailers_for_test`], but for a NATIVE
+    /// gRPC terminal trailer section (`dispatch_grpc_native_h3` and the
+    /// H3-to-H2 cross-protocol gRPC bridge).
+    ///
+    /// Same governance, one structural difference: the three reserved terminal
+    /// fields (`grpc-status` / `grpc-message` / `grpc-status-details-bin`)
+    /// survive so generic response-header rules cannot corrupt protocol status.
+    /// Every other field stays application metadata and is fully governed.
+    pub fn reconcile_streaming_native_grpc_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            policy_prefixes: &[],
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
         );
         surviving_trailer_lines_for_test(&map)
     }
@@ -3496,6 +3536,42 @@ pub mod _test_support {
             std::sync::Arc::new(policy_names.to_vec()),
             std::sync::Arc::new(policy_prefixes.to_vec()),
             crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
+            unbounded_policy,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        governor.reconcile(&mut map);
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Like [`govern_streaming_h2_backend_trailers_for_test`], but for the
+    /// NATIVE gRPC terminal trailer section carried by the direct-H2 gRPC pool
+    /// relay and the mesh-mTLS `StreamingH2` relay.
+    pub fn govern_streaming_h2_native_grpc_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            crate::proxy::headers::ResponseTrailerGovernance {
+                policy_names,
+                policy_prefixes: &[],
+                unbounded: unbounded_policy,
+            },
+            header_phases_can_mutate,
+        );
+        let governor = crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+            final_headers.clone(),
+            pre_policy,
+            std::sync::Arc::new(policy_names.to_vec()),
+            std::sync::Arc::new(Vec::new()),
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
             unbounded_policy,
         );
         crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);

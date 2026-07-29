@@ -6,9 +6,16 @@
 //! header map, so a backend trailer repeating a governed field name lands on
 //! the wire after the policy boundary. The reconciliation here is the boundary
 //! that closes that gap on the buffered native-HTTP/3 send path, on the plain
-//! native/refined HTTP/3 streaming relays, AND on the plain direct-HTTP/2
-//! streaming relay, without punishing chains that apply no response-header
-//! policy at all (issue #2941 — auth/logging-only plugins keep their trailers).
+//! native/refined HTTP/3 streaming relays, on the plain direct-HTTP/2 streaming
+//! relay, and — for application metadata only — on every NATIVE STREAMING gRPC
+//! relay (GHSA-r78v-rc86-6r86), without punishing chains that apply no
+//! response-header policy at all (issue #2941 — auth/logging-only plugins keep
+//! their trailers).
+//!
+//! Reserved-field handling is selected STRUCTURALLY by the call site
+//! (`TrailerSectionKind`), never from a trailer's own name: on a native gRPC
+//! terminal section the three reserved status fields survive, and on a plain
+//! response the very same names get no exemption at all.
 //!
 //! The streaming relays commit their initial HEADERS frame before the backend's
 //! trailers exist, so they retain the pre-policy header map instead of
@@ -19,8 +26,10 @@
 use std::collections::HashMap;
 
 use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_for_test as govern_h2;
+use ferrum_edge::_test_support::govern_streaming_h2_native_grpc_trailers_for_test as govern_h2_grpc;
 use ferrum_edge::_test_support::reconcile_backend_trailers_with_response_policy_for_test as reconcile;
 use ferrum_edge::_test_support::reconcile_streaming_backend_trailers_for_test as reconcile_streaming;
+use ferrum_edge::_test_support::reconcile_streaming_native_grpc_trailers_for_test as reconcile_grpc;
 
 fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
     pairs
@@ -264,12 +273,11 @@ fn unbounded_policy_drops_trailer_only_representation_metadata() {
 
 #[test]
 fn a_grpc_named_trailer_gets_no_exemption_from_the_unbounded_arm() {
-    // Every path that reaches this reconciliation carries a PLAIN-flavor
-    // response — native gRPC finishes its own trailers in
-    // `dispatch_grpc_native_h3` on H3 and is excluded from the governor on the
-    // direct-H2 arm. So a `grpc-*` trailer here is an ordinary backend field,
-    // and exempting it by NAME would hand any non-gRPC backend a one-word bypass
-    // of a fail-closed response-header policy.
+    // `reconcile` here is the PLAIN-section entry point. Reserved-field handling
+    // is selected structurally by the call site (`TrailerSectionKind`), never by
+    // the trailer's own name, so on a plain response a `grpc-*` trailer is an
+    // ordinary backend field. Exempting it by NAME would hand any non-gRPC
+    // backend a one-word bypass of a fail-closed response-header policy.
     let backend = headers(&[("content-type", "text/plain")]);
     let surviving = reconcile(
         &[
@@ -933,24 +941,90 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
 }
 
 #[test]
-fn native_grpc_and_grpc_web_h2_dispatches_are_never_reconciled() {
+fn native_grpc_h2_is_governed_while_grpc_web_stays_excluded() {
     let src = include_str!("../../../src/proxy/mod.rs");
     let gate = src
         .split("let h2_streaming_trailer_policy = ")
         .nth(1)
         .expect("streaming H2 trailer policy gate")
-        .split("Some((pre_policy, unbounded))")
+        .split("Some((pre_policy, section, unbounded))")
         .next()
         .expect("bounded gate region");
+    // GHSA-r78v-rc86-6r86: native gRPC on this arm (the mesh-mTLS relay) is
+    // GOVERNED — its application metadata crosses the same boundary — and is
+    // selected as a gRPC terminal section so the reserved status fields survive.
     assert!(
-        gate.contains("!streaming_h2_native_grpc")
-            && gate.contains("!grpc_request_is_web_translated"),
-        "native gRPC reserved terminal metadata and gRPC-Web adaptation must stay \
-         outside the response-header trailer boundary"
+        !gate.contains("!streaming_h2_native_grpc"),
+        "native gRPC must no longer be excluded from the trailer boundary"
+    );
+    assert!(
+        gate.contains("TrailerSectionKind::NativeGrpcTerminal")
+            && gate.contains("TrailerSectionKind::PlainResponse"),
+        "the streaming H2 arm must pick its trailer section structurally from \
+         `streaming_h2_native_grpc`"
+    );
+    // Translated gRPC-Web still carries its terminal metadata in a final DATA
+    // frame governed by the pristine Trailers-Only snapshot, so it stays out.
+    assert!(
+        gate.contains("!grpc_request_is_web_translated"),
+        "gRPC-Web adaptation must stay outside the response-header trailer boundary"
     );
     assert!(
         gate.contains("PrePolicyResponseHeaders::capture_for_streaming("),
-        "the plain streaming H2 relay must capture the pristine backend header view"
+        "the streaming H2 relay must capture the pristine backend header view"
+    );
+}
+
+#[test]
+fn the_direct_grpc_pool_streaming_relay_installs_a_native_grpc_governor() {
+    // The advisory's primary reproduction: `GrpcResponseKind::Streaming` runs
+    // `after_proxy` on the initial header map, commits the HEADERS frame, and
+    // then forwards the backend trailer section through the body. Every one of
+    // its three mutually-exclusive body constructors must carry the governor.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    let arm = src
+        .split("Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {")
+        .nth(1)
+        .expect("native gRPC streaming arm")
+        .split("Ok(GrpcResponseKind::Buffered(grpc_resp)) => {")
+        .next()
+        .expect("bounded native gRPC streaming arm");
+    let capture_at = arm
+        .find("let grpc_streaming_pre_policy_headers =")
+        .expect("native gRPC streaming pre-policy capture");
+    let after_proxy_at = arm
+        .find("run_after_proxy_hooks(")
+        .expect("native gRPC streaming after_proxy phase");
+    let seal_at = arm
+        .find("let mut grpc_streaming_trailer_governor = None;")
+        .expect("native gRPC streaming governor seal");
+    assert!(
+        capture_at < after_proxy_at,
+        "the pre-policy capture must precede the first response-header phase"
+    );
+    assert!(
+        after_proxy_at < seal_at,
+        "the governor must be sealed after the response-header phases"
+    );
+    assert!(
+        arm.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "the native gRPC streaming relay must seal a gRPC terminal section"
+    );
+    let region = &arm[seal_at..];
+    let constructors = region
+        .matches("_h2_body_strip_hop_by_hop_trailers(")
+        .count();
+    let governed = region
+        .matches("grpc_streaming_trailer_governor.take()")
+        .count();
+    assert_eq!(
+        constructors, 3,
+        "native gRPC streaming body construction must keep its three \
+         mutually-exclusive constructors: {constructors}"
+    );
+    assert_eq!(
+        governed, constructors,
+        "every native gRPC streaming body constructor must receive the governor"
     );
 }
 
@@ -1043,4 +1117,241 @@ fn every_streaming_h2_dispatch_site_installs_the_sealed_governor() {
         seal.contains("response_trailer_policy_prefixes_shared()"),
         "the seal must carry the precomputed policy-prefix Arc into the governor"
     );
+}
+
+
+// ── Native gRPC terminal sections (GHSA-r78v-rc86-6r86) ─────────────────────
+//
+// A streaming gRPC response runs `after_proxy` on the initial header map only,
+// then forwards the backend's terminal metadata later. The advisory reproduces
+// exactly that: a `response_transformer` rule removing `x-internal-debug` is a
+// no-op because the backend sends the field only as a trailer. These pin the
+// two halves of the fix — application metadata is governed, protocol-required
+// terminal status is not.
+
+#[test]
+fn an_unbounded_policy_drops_grpc_trailer_only_application_metadata() {
+    // `response_transformer` declares `Unbounded`: its rule set includes
+    // request-scoped route overrides whose field names do not exist at config
+    // time, so application metadata fails closed.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[
+            ("grpc-status", "0"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+            ("x-tenant-shard", "eu-3"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+    );
+    assert!(
+        !has(&surviving, "x-internal-debug"),
+        "trailer-only gRPC application metadata must not bypass an unbounded \
+         response-header policy: {surviving:?}"
+    );
+    assert!(
+        !has(&surviving, "x-tenant-shard"),
+        "every non-reserved gRPC trailer field must fail closed: {surviving:?}"
+    );
+}
+
+#[test]
+fn reserved_grpc_terminal_fields_survive_the_unbounded_arm() {
+    // Generic header policy must never corrupt or suppress valid terminal
+    // status: dropping these would ship a truncated RPC with no outcome.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[
+            ("grpc-status", "9"),
+            ("grpc-message", "FAILED_PRECONDITION"),
+            ("grpc-status-details-bin", "AAECAw"),
+            ("x-internal-debug", "leak"),
+        ],
+        &backend,
+        &backend,
+        &names(&["grpc-status", "grpc-message", "grpc-status-details-bin"]),
+        true,
+        true,
+    );
+    assert_eq!(
+        surviving.len(),
+        3,
+        "exactly the three reserved terminal fields must survive: {surviving:?}"
+    );
+    for reserved in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        assert!(
+            has(&surviving, reserved),
+            "{reserved} must survive even a declared name AND the unbounded arm: {surviving:?}"
+        );
+    }
+}
+
+#[test]
+fn a_grpc_trailer_removal_declared_by_name_is_applied_to_application_metadata() {
+    // The bounded shape: the backend sent `x-internal-debug` ONLY as a trailer,
+    // so the policy's removal was a no-op on the initial header map and only
+    // the config-time declaration can catch it.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[
+            ("grpc-status", "0"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+            ("x-request-id", "rpc-77"),
+        ],
+        &backend,
+        &backend,
+        &names(&["x-internal-debug"]),
+        false,
+        false,
+    );
+    assert!(!has(&surviving, "x-internal-debug"), "{surviving:?}");
+    assert!(has(&surviving, "grpc-status"), "{surviving:?}");
+    assert!(
+        has(&surviving, "x-request-id"),
+        "an undeclared, unmutated gRPC trailer must still pass through: {surviving:?}"
+    );
+}
+
+#[test]
+fn an_observed_header_removal_governs_the_matching_grpc_trailer() {
+    // The backend sent `x-internal-debug` in BOTH the initial headers and the
+    // terminal metadata; the policy removed the header. The trailer copy must
+    // not undo that.
+    let before = headers(&[
+        ("content-type", "application/grpc"),
+        ("x-internal-debug", "backend-trace-9f2a"),
+    ]);
+    let after = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[("grpc-status", "0"), ("x-internal-debug", "backend-trace-9f2a")],
+        &before,
+        &after,
+        &[],
+        false,
+        true,
+    );
+    assert!(!has(&surviving, "x-internal-debug"), "{surviving:?}");
+    assert!(has(&surviving, "grpc-status"), "{surviving:?}");
+}
+
+#[test]
+fn an_auth_only_chain_preserves_grpc_application_trailers() {
+    // Issue #2941 pass-through must survive on the gRPC section too: nothing in
+    // this chain can mutate a response header, so the terminal metadata is
+    // forwarded exactly as the backend sent it.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[
+            ("grpc-status", "0"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+            ("x-request-id", "rpc-77"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        false,
+        false,
+    );
+    assert_eq!(surviving.len(), 3, "surviving trailers: {surviving:?}");
+}
+
+#[test]
+fn a_grpc_prefixed_but_unreserved_trailer_is_still_application_metadata() {
+    // The reserved set is an EXACT three-name inventory, not a `grpc-` prefix.
+    // `grpc-encoding` and friends are application metadata and stay governed —
+    // otherwise the exemption would widen into the bypass it exists to avoid.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = reconcile_grpc(
+        &[
+            ("grpc-status", "0"),
+            ("grpc-encoding", "gzip"),
+            ("grpc-accept-encoding", "identity"),
+            ("grpc-status-detail", "smuggled"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+    );
+    assert_eq!(
+        surviving.len(),
+        1,
+        "only the exact reserved names may be exempt: {surviving:?}"
+    );
+    assert!(has(&surviving, "grpc-status"), "{surviving:?}");
+}
+
+#[test]
+fn the_plain_section_still_grants_no_exemption_to_the_same_names() {
+    // The mirror of the case above: identical trailers, identical policy, PLAIN
+    // section. Nothing survives — the exemption is structural, not name-based,
+    // so a plain backend cannot buy protection by naming its trailer
+    // `grpc-status`.
+    let backend = headers(&[("content-type", "text/plain")]);
+    let grpc_trailers = [
+        ("grpc-status", "0"),
+        ("grpc-message", "ok"),
+        ("grpc-status-details-bin", "AAECAw"),
+    ];
+    let plain = reconcile_streaming(&grpc_trailers, &backend, &backend, &[], true, true);
+    assert!(
+        plain.is_empty(),
+        "the plain streaming section must exempt no name: {plain:?}"
+    );
+    let governed = reconcile_grpc(&grpc_trailers, &backend, &backend, &[], true, true);
+    assert_eq!(
+        governed.len(),
+        3,
+        "the same trailers on a native gRPC section must survive: {governed:?}"
+    );
+}
+
+#[test]
+fn the_owned_h2_governor_applies_the_same_grpc_section_rules() {
+    // The direct-H2 gRPC pool relay and the mesh-mTLS `StreamingH2` relay hand
+    // their body to hyper and return, so the boundary travels as an owned
+    // governor. It must reach the identical outcome as the inline H3 relays.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let surviving = govern_h2_grpc(
+        &[
+            ("grpc-status", "5"),
+            ("grpc-message", "NOT_FOUND"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+            // Hop-by-hop names are stripped before the governor runs.
+            ("proxy-authenticate", "Basic"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+    );
+    assert_eq!(surviving.len(), 2, "surviving trailers: {surviving:?}");
+    assert!(has(&surviving, "grpc-status"), "{surviving:?}");
+    assert!(has(&surviving, "grpc-message"), "{surviving:?}");
+}
+
+#[test]
+fn duplicate_case_variants_on_a_grpc_trailer_still_fail_closed() {
+    // Ambiguity is unprovable, so it stays governed on the gRPC section too.
+    // The reserved fields are unaffected.
+    let before = headers(&[
+        ("content-type", "application/grpc"),
+        ("x-internal-debug", "one"),
+        ("X-Internal-Debug", "two"),
+    ]);
+    let surviving = reconcile_grpc(
+        &[("grpc-status", "0"), ("x-internal-debug", "one")],
+        &before,
+        &before,
+        &[],
+        false,
+        true,
+    );
+    assert!(!has(&surviving, "x-internal-debug"), "{surviving:?}");
+    assert!(has(&surviving, "grpc-status"), "{surviving:?}");
 }

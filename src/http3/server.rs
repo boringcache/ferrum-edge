@@ -49,8 +49,9 @@ use crate::proxy::headers::{
     GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
     ResponseTrailerPolicyWitness, apply_response_headers, is_backend_request_strip_header,
     is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
-    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    TrailerSectionKind, reconcile_backend_trailers_with_response_policy,
+    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
@@ -497,6 +498,9 @@ struct H3StreamingTrailerPolicy<'a> {
     pre_policy: &'a PrePolicyResponseHeaders,
     /// Config-time declarations plus the fail-closed unbounded arm.
     governance: ResponseTrailerGovernance<'a>,
+    /// Plain response trailers, or a native gRPC terminal section. Selected by
+    /// the relay from the dispatch it committed to, never from a trailer name.
+    section: TrailerSectionKind,
 }
 
 /// Failure side for [`finish_h3_response_with_backend_trailers`].
@@ -573,6 +577,7 @@ where
                 trailer_policy.pre_policy,
                 trailer_policy.governance,
                 GatewayOwnedResponseHeaders::default(),
+                trailer_policy.section,
             );
             if removed > 0 {
                 debug!(
@@ -4587,6 +4592,7 @@ async fn handle_h3_request(
             backend_admission_plugins.as_ref(),
             &mut plugin_execution_ns,
             initial_response_header_policy_plugins.as_ref(),
+            response_trailer_governance,
         )
         .await;
     }
@@ -4624,6 +4630,7 @@ async fn handle_h3_request(
                 initial_response_header_policy_plugins.as_ref(),
                 backend_admission_plugins.as_ref(),
                 sticky_cookie_needed,
+                response_trailer_governance,
             )
             .await?
         } else {
@@ -4820,6 +4827,7 @@ async fn handle_h3_request(
                 response_committed_plugins: plugin_cache_view.response_committed_plugins(),
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
+                response_trailer_governance,
             })
             .await?
         };
@@ -5744,6 +5752,9 @@ async fn handle_h3_request(
                             final_headers: &response_headers,
                             pre_policy: &pre_policy_response_headers,
                             governance: response_trailer_governance,
+                            // Plain-flavor relay: `use_native_h3_pool` requires
+                            // `HttpFlavor::Plain`, so no field name is exempt here.
+                            section: TrailerSectionKind::PlainResponse,
                         },
                     )
                     .await
@@ -7197,6 +7208,9 @@ async fn handle_h3_request(
                 plugin_cache_view.response_trailer_policy_names(),
                 plugin_cache_view.response_trailer_policy_prefixes(),
                 GatewayOwnedResponseHeaders::default(),
+                // Buffered native-H3 send path: plain flavor only (a native gRPC
+                // dispatch goes to `dispatch_grpc_native_h3`), so no exemption.
+                TrailerSectionKind::PlainResponse,
                 unbounded_trailer_policy,
             );
             if removed > 0 {
@@ -8940,6 +8954,8 @@ async fn stream_h3_open_response_to_client(
                     final_headers: &response_headers,
                     pre_policy: &pre_policy_response_headers,
                     governance: trailer_governance,
+                    // Plain-flavor relay: no field name is exempt here.
+                    section: TrailerSectionKind::PlainResponse,
                 },
             )
             .await
@@ -9048,6 +9064,13 @@ async fn dispatch_grpc_native_h3(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugin_execution_ns: &mut u64,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    // Config-time response-trailer governance, precomputed per reload. Native
+    // gRPC terminal metadata crosses the response-header policy boundary exactly
+    // like a plain streaming relay's trailer section (GHSA-r78v-rc86-6r86): the
+    // initial HEADERS frame commits before the trailers exist, so `after_proxy`
+    // and sticky-cookie injection have already gone on the wire. Only the three
+    // RESERVED terminal fields are exempt — see `TrailerSectionKind`.
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<(), anyhow::Error> {
     // Backend admission (gRPC rejects are emitted as trailers-only errors).
     let mut backend_admission_permits = match run_h3_backend_admission_or_send_reject(
@@ -9459,6 +9482,30 @@ async fn dispatch_grpc_native_h3(
     let backend_header_grpc_status = pristine_initial_terminal_metadata
         .grpc_status()
         .map(str::to_owned);
+
+    // Response-trailer policy boundary for the NATIVE H3 gRPC relay
+    // (GHSA-r78v-rc86-6r86). Captured HERE, on the pristine backend header map,
+    // because every response-header phase below — `after_proxy`, sticky-cookie
+    // injection, the `content-length` strip, the reserved-terminal-metadata
+    // strip, and the final hop-by-hop strip — runs afterwards and is on the wire
+    // long before the backend's TRAILERS frame arrives.
+    //
+    // The gate mirrors the plain relays: with no plugin able to touch response
+    // headers, no sticky cookie, and no `content-length` for the gateway to
+    // strip, nothing on this path can mutate a header, so the snapshot would be
+    // compared against itself and the #2941 pass-through stands. `content-length`
+    // is in the gate because the gateway removes it unconditionally below, which
+    // is exactly the present->absent shape a backend `content-length` TRAILER
+    // would undo. Hop-by-hop names need no gate entry: they are stripped from
+    // the trailer section before reconciliation, so they can never reach it.
+    // Reserved terminal metadata needs none either — it is exempt by section.
+    let grpc_pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        response_trailer_governance,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || response_headers.contains_key("content-length"),
+    );
 
     // Response body size ceiling (Content-Length fast path). Backend RESPONSE
     // bytes are bounded by `max_response_body_size_bytes` — the same limit the
@@ -10176,6 +10223,28 @@ async fn dispatch_grpc_native_h3(
                         })
                     });
                     strip_response_hop_by_hop_trailers(&mut trailers);
+                    // Last point where the response-header policy boundary can
+                    // still bind this RPC's terminal metadata. `grpc_trailer_status`
+                    // above is already latched from the pristine trailer block, so
+                    // backend-health classification is unaffected either way — and
+                    // the reserved status/message/details fields are exempt by
+                    // section, so a governed drop can never truncate the RPC
+                    // outcome. Runs once, on the trailer frame only.
+                    let removed = reconcile_streaming_backend_trailers(
+                        &mut trailers,
+                        &response_headers,
+                        &grpc_pre_policy_response_headers,
+                        response_trailer_governance,
+                        GatewayOwnedResponseHeaders::default(),
+                        TrailerSectionKind::NativeGrpcTerminal,
+                    );
+                    if removed > 0 {
+                        debug!(
+                            removed,
+                            "native H3 gRPC: dropped trailer application metadata \
+                             governed by response header policy"
+                        );
+                    }
                     let finish_outcome = if !trailers.is_empty() {
                         // `send_trailers` only writes the trailer HEADERS frame;
                         // `finish()` is required to FIN the QUIC send side so the
@@ -10934,6 +11003,8 @@ async fn proxy_to_backend_h3_streaming(
                     final_headers: &response_headers,
                     pre_policy: &pre_policy_response_headers,
                     governance: trailer_governance,
+                    // Plain-flavor relay: no field name is exempt here.
+                    section: TrailerSectionKind::PlainResponse,
                 },
             )
             .await

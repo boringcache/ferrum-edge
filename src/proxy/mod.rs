@@ -23385,6 +23385,47 @@ async fn handle_proxy_request_inner(
 
                 // after_proxy plugins run on headers only (body is not yet in memory).
                 let mut response_headers: HashMap<String, String> = grpc_streaming.headers;
+                // Response-trailer policy boundary for the NATIVE gRPC STREAMING
+                // relay (GHSA-r78v-rc86-6r86). This is the path the advisory
+                // reproduces: `after_proxy` runs below on the INITIAL header map
+                // only, the HEADERS frame is committed, and the backend's terminal
+                // metadata arrives later through the streaming body — so a
+                // trailer-only `x-internal-debug` would sail past a
+                // `response_transformer` remove/update rule the operator
+                // configured. Captured HERE, on the pristine backend header map,
+                // before any response-header phase runs.
+                //
+                // Only the three RESERVED terminal fields
+                // (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) are
+                // exempt at reconcile time; every other trailer field is gRPC
+                // application metadata and is governed. `content-length` is in the
+                // capture gate because the gRPC deadline strip and the gRPC-Web
+                // translation both remove it below.
+                let grpc_streaming_unbounded_trailer_policy =
+                    capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+                // `content-length` is in this gate because the gRPC deadline
+                // strip and the gRPC-Web translation both remove it below.
+                let grpc_streaming_header_phases_can_mutate =
+                    !plugins.is_empty() || response_headers.contains_key("content-length");
+                // No evidence, no declaration, and no fail-closed arm means the
+                // reconciliation is provably a no-op, so the boundary is skipped
+                // entirely and the response pays no header-map clone. This can
+                // only SKIP work the reconciliation would not have done; every
+                // signal that could drop a trailer keeps it installed.
+                let grpc_streaming_trailer_policy_can_act = grpc_streaming_header_phases_can_mutate
+                    || grpc_streaming_unbounded_trailer_policy
+                    || !plugin_cache_view.response_trailer_policy_names().is_empty()
+                    || !plugin_cache_view.response_trailer_policy_prefixes().is_empty();
+                let grpc_streaming_pre_policy_headers =
+                    headers_mod::PrePolicyResponseHeaders::capture_for_streaming(
+                        &response_headers,
+                        headers_mod::ResponseTrailerGovernance {
+                            policy_names: plugin_cache_view.response_trailer_policy_names(),
+                            policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
+                            unbounded: grpc_streaming_unbounded_trailer_policy,
+                        },
+                        grpc_streaming_header_phases_can_mutate,
+                    );
                 let grpc_header_status =
                     grpc_proxy::grpc_status_from_maps(&EMPTY_HEADERS, &response_headers);
                 if let Some(grpc_status) = grpc_header_status {
@@ -23813,6 +23854,30 @@ async fn handle_proxy_request_inner(
                 // applies per frame. See `grpc_streaming_response_deadline` —
                 // shared with the mesh-mTLS `StreamingH2` relay so the two
                 // regimes cannot drift.
+                //
+                // Seal the native-gRPC trailer boundary captured before
+                // `after_proxy` ran. `response_headers` above is exactly the map
+                // that went on the wire (this arm writes nothing straight onto the
+                // builder, so `GatewayOwnedResponseHeaders` stays empty). The
+                // governor is owned because the body outlives this handler: the
+                // backend TRAILERS frame is read later, on a different task. It is
+                // consulted only on that single frame — never per DATA frame — and
+                // `TrailerSectionKind::NativeGrpcTerminal` keeps the reserved
+                // status fields intact so the RPC outcome, its trailer-time
+                // classification, and gRPC-Web translation below are unaffected.
+                let mut grpc_streaming_trailer_governor = None;
+                if grpc_streaming_trailer_policy_can_act {
+                    grpc_streaming_trailer_governor =
+                        Some(headers_mod::StreamingResponseTrailerGovernor::new(
+                            response_headers.clone(),
+                            grpc_streaming_pre_policy_headers,
+                            plugin_cache_view.response_trailer_policy_names_shared(),
+                            plugin_cache_view.response_trailer_policy_prefixes_shared(),
+                            headers_mod::GatewayOwnedResponseHeaders::default(),
+                            headers_mod::TrailerSectionKind::NativeGrpcTerminal,
+                            grpc_streaming_unbounded_trailer_policy,
+                        ));
+                }
                 let body = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
@@ -23821,12 +23886,7 @@ async fn handle_proxy_request_inner(
                         cl,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
-                        // Native gRPC: `grpc-status` / `grpc-message` and the
-                        // application's terminal metadata are RESERVED trailer
-                        // semantics, not backend-supplied header fields, so this
-                        // dispatch is never response-policy reconciled — the same
-                        // boundary `dispatch_grpc_native_h3` draws on HTTP/3.
-                        None,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 } else if state.max_response_body_size_bytes > 0 {
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -23836,7 +23896,7 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
-                        None,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
@@ -23845,7 +23905,7 @@ async fn handle_proxy_request_inner(
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
-                        None,
+                        grpc_streaming_trailer_governor.take(),
                     )
                 };
                 let mut body = body;
@@ -25826,26 +25886,29 @@ async fn handle_proxy_request_inner(
     // with `{"remove": ["x-powered-by"]}` is a NO-OP on the initial header map
     // when the backend sent `x-powered-by` only as a trailer.
     //
-    // Two dispatches are deliberately excluded, drawing the same line
-    // `dispatch_grpc_native_h3` draws on HTTP/3:
+    // Native gRPC on this arm (`streaming_h2_native_grpc`, the mesh-mTLS relay)
+    // is ALSO governed, as `TrailerSectionKind::NativeGrpcTerminal`: only
+    // `grpc-status` / `grpc-message` / `grpc-status-details-bin` are
+    // protocol-required and exempt, while the rest of the terminal block is gRPC
+    // application metadata crossing the same policy boundary — the case
+    // GHSA-r78v-rc86-6r86 reports.
     //
-    // * native gRPC (`streaming_h2_native_grpc`, the mesh-mTLS relay) — its
-    //   trailer block is RESERVED terminal metadata (`grpc-status`,
-    //   `grpc-message`, application metadata), not backend-supplied header
-    //   fields;
-    // * translated gRPC-Web (`grpc_request_is_web_translated`) — its terminal
-    //   metadata is adapted into a final DATA frame, and the pristine
-    //   Trailers-Only snapshot already governs what may appear there.
-    //
-    // Everything else on this arm is a plain HTTP/2 response, so a trailer
-    // here is an ordinary backend field with no name-based exemption.
+    // ONE dispatch stays excluded: translated gRPC-Web
+    // (`grpc_request_is_web_translated`). Its terminal metadata is adapted into a
+    // final DATA frame rather than a TRAILERS frame, and the pristine
+    // Trailers-Only snapshot already governs what may appear there, so this
+    // wrapper stays a pure hop-by-hop filter and passes `None`.
     //
     // Capture is here, on the PRISTINE backend header map: the gRPC-Web bridge
     // promotion and every response-header phase below run after this point.
     let h2_streaming_trailer_policy = if matches!(&response_body, ResponseBody::StreamingH2(_))
-        && !streaming_h2_native_grpc
         && !grpc_request_is_web_translated
     {
+        let section = if streaming_h2_native_grpc {
+            headers_mod::TrailerSectionKind::NativeGrpcTerminal
+        } else {
+            headers_mod::TrailerSectionKind::PlainResponse
+        };
         let unbounded = capabilities.has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
         // The gateway's builder-only response writes (`via`, `alt-svc`,
         // `X-Gateway-Error`, `X-Gateway-Upstream-Status`) are wire mutations
@@ -25866,9 +25929,19 @@ async fn handle_proxy_request_inner(
                 policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
                 unbounded,
             },
-            !plugins.is_empty() || sticky_cookie_needed || gateway_writes_builder_only_headers,
+            !plugins.is_empty()
+                || sticky_cookie_needed
+                || gateway_writes_builder_only_headers
+                // The streaming gRPC-deadline strip below removes
+                // `content-length` from the wire map AFTER this capture, so a
+                // backend `content-length` trailer would otherwise reconcile as
+                // absent->absent and re-declare a length the gateway
+                // deliberately dropped. Only reachable with a client gRPC
+                // deadline, i.e. only on the native-gRPC section.
+                || (grpc_request_deadline.is_some()
+                    && response_headers.contains_key("content-length")),
         );
-        Some((pre_policy, unbounded))
+        Some((pre_policy, section, unbounded))
     } else {
         None
     };
@@ -26640,7 +26713,7 @@ async fn handle_proxy_request_inner(
     // streaming response; the body wrapper reads it only on the single
     // TRAILERS frame.
     let mut h2_streaming_trailer_governor = None;
-    if let Some((pre_policy, unbounded)) = h2_streaming_trailer_policy {
+    if let Some((pre_policy, section, unbounded)) = h2_streaming_trailer_policy {
         let mut final_headers = response_headers.clone();
         let mut gateway_owned_headers = headers_mod::GatewayOwnedResponseHeaders::default();
         if backend_resp.connection_error {
@@ -26672,6 +26745,7 @@ async fn handle_proxy_request_inner(
             plugin_cache_view.response_trailer_policy_names_shared(),
             plugin_cache_view.response_trailer_policy_prefixes_shared(),
             gateway_owned_headers,
+            section,
             unbounded,
         ));
     }

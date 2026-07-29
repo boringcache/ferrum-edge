@@ -122,9 +122,11 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    apply_response_headers, has_client_response_hop_by_hop_headers,
+    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
+    TrailerSectionKind, apply_response_headers, has_client_response_hop_by_hop_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
-    strip_client_response_hop_by_hop_headers, strip_response_hop_by_hop_trailers,
+    reconcile_streaming_backend_trailers, strip_client_response_hop_by_hop_headers,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;
@@ -219,6 +221,11 @@ where
     pub response_committed_plugins: &'a [Arc<dyn Plugin>],
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
+    /// Config-time response-trailer governance, precomputed per reload. Used by
+    /// the STREAMING gRPC relay, whose terminal metadata crosses the
+    /// response-header policy boundary after the initial HEADERS frame is
+    /// already on the wire (GHSA-r78v-rc86-6r86).
+    pub response_trailer_governance: ResponseTrailerGovernance<'a>,
 }
 
 fn record_cross_protocol_connection_start(
@@ -612,6 +619,7 @@ where
         response_committed_plugins,
         requires_response_stream_hooks,
         sticky_cookie_needed,
+        response_trailer_governance,
     } = request;
     let backend_start = Instant::now();
     let raw_prebuffered_body_bytes = raw_prebuffered_body_bytes.unwrap_or_else(|| {
@@ -757,6 +765,7 @@ where
                 requires_response_body_buffering,
                 response_committed_plugins,
                 sticky_cookie_needed,
+                response_trailer_governance,
             )
             .await
         }
@@ -3453,6 +3462,11 @@ async fn handle_h3_grpc_streaming_response<S>(
     // to classify a resulting response-body error as a CLIENT abort rather than a
     // backend fault (codex P2). `None` on the buffered-request path (no pump).
     frontend_upload_failed: Option<&Arc<AtomicBool>>,
+    // Config-time response-trailer governance. Native gRPC terminal metadata on
+    // this bridge crosses the response-header policy boundary exactly like a
+    // plain streaming relay's trailer section (GHSA-r78v-rc86-6r86); only the
+    // three RESERVED terminal fields are exempt.
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: SendStream<Bytes>,
@@ -3529,6 +3543,25 @@ where
                     .cloned()
                     .collect::<HashSet<String>>()
             });
+
+    // Response-trailer policy boundary for the H3-to-H2 native gRPC STREAMING
+    // bridge (GHSA-r78v-rc86-6r86). Captured on the PRISTINE backend header map,
+    // before `after_proxy`, sticky-cookie injection, the gRPC-Web initial
+    // metadata take, and the `content-length` strips below — all of which are on
+    // the wire before the backend's TRAILERS frame is read.
+    //
+    // Same gate as the plain relays: with no plugin able to touch response
+    // headers, no sticky cookie, and no `content-length` for the gateway to
+    // strip, nothing here can mutate a header, so the #2941 pass-through stands.
+    // Hop-by-hop names are stripped from the trailer section before
+    // reconciliation and can never reach it, so they need no gate entry.
+    let grpc_pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &streaming.headers,
+        response_trailer_governance,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || streaming.headers.contains_key("content-length"),
+    );
 
     // Streaming variant: pool returned a live hyper Incoming. Run
     // after_proxy + sticky cookie on headers BEFORE streaming
@@ -3837,6 +3870,27 @@ where
         // client through the TRAILERS frame.
         let had_trailers = !trailers.is_empty();
         strip_response_hop_by_hop_trailers(&mut trailers);
+        // Last point where the response-header policy boundary can still bind
+        // this RPC's terminal metadata (GHSA-r78v-rc86-6r86). `grpc_trailer_status`
+        // is already latched from the pristine trailer block above, so backend
+        // health / admission classification is unaffected, and the three reserved
+        // terminal fields are exempt by section — a governed drop can never
+        // truncate the RPC outcome. Runs once, on the trailer frame only.
+        let removed = reconcile_streaming_backend_trailers(
+            &mut trailers,
+            &streaming.headers,
+            &grpc_pre_policy_response_headers,
+            response_trailer_governance,
+            GatewayOwnedResponseHeaders::default(),
+            TrailerSectionKind::NativeGrpcTerminal,
+        );
+        if removed > 0 {
+            debug!(
+                removed,
+                "cross-protocol H3 gRPC streaming: dropped backend trailer application metadata \
+                 governed by response header policy"
+            );
+        }
         if !trailers.is_empty() {
             let trailer_write = if client_deadline_expired {
                 // The timer already selected these canonical status-4 trailers.
@@ -4063,6 +4117,7 @@ async fn dispatch_grpc<S>(
     requires_response_body_buffering: bool,
     response_committed_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
     S: RecvStream + SendStream<Bytes>,
@@ -5415,6 +5470,7 @@ where
                 // Buffered-request path: the body was fully drained + size-checked
                 // before dispatch, so there is no streaming pump / client-abort flag.
                 None,
+                response_trailer_governance,
             )
             .await
         }
@@ -5546,6 +5602,7 @@ pub(crate) async fn dispatch_grpc_streaming(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
     sticky_cookie_needed: bool,
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error> {
     let mut stream = stream;
     let current_target = upstream_target.cloned().map(Arc::new);
@@ -5780,6 +5837,7 @@ pub(crate) async fn dispatch_grpc_streaming(
                 backend_url,
                 final_backend_resolved_ip.clone(),
                 Some(&frontend_upload_failed),
+                response_trailer_governance,
             )
             .await
         }

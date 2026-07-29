@@ -3458,6 +3458,170 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
     );
 }
 
+/// Native-H3 gRPC config carrying a `response_transformer`, which declares
+/// `ResponseTrailerPolicy::Unbounded` — its `after_proxy` also applies
+/// `mesh_route_dispatch` route overrides whose field names do not exist until
+/// the request runs, so the governed set is not enumerable at config time.
+fn file_mode_yaml_for_h3_grpc_with_response_transformer(port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "plugins": [{"plugin_config_id": "h3-grpc-response-transformer"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "h3-grpc-response-transformer",
+            "plugin_name": "response_transformer",
+            "scope": "proxy",
+            "proxy_id": "scripted-h3",
+            "enabled": true,
+            "config": {
+                "rules": [{
+                    "target": "header",
+                    "operation": "remove",
+                    "key": "x-internal-debug",
+                }],
+            },
+        }],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// GHSA-r78v-rc86-6r86 — native H3 gRPC streaming.
+//
+// The advisory's reproduction: `response_transformer` removes
+// `x-internal-debug`, the backend sends that field ONLY in the terminal
+// metadata, and the streaming path runs `after_proxy` on the initial headers
+// alone. Before the fix the trailer sailed straight past the operator's rule.
+//
+// Both halves are asserted here, because a fix that simply dropped the whole
+// trailer section would be worse than the bug: the RESERVED terminal fields
+// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) must survive so
+// the client still learns the RPC outcome.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_grpc_streaming_governs_application_metadata_only() {
+    let ca = TestCa::new("phase-h3-grpc-trailer-policy").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend =
+        spawn_grpc_probe_tcp_backend(tcp_res.into_listener(), cert.clone(), key.clone());
+
+    let frame = grpc_frame(b"stream-msg-1");
+
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-type", "application/grpc".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from(frame.clone())))
+        .step(H3Step::RespondTrailers(vec![
+            ("grpc-status", "9".to_string()),
+            ("grpc-message", "FAILED_PRECONDITION".to_string()),
+            ("grpc-status-details-bin", "AQID".to_string()),
+            // Trailer-ONLY application metadata: the removal rule is a no-op on
+            // the initial header map, so only the trailer boundary can bind it.
+            ("x-internal-debug", "backend-trace-9f2a".to_string()),
+            ("x-tenant-shard", "eu-3".to_string()),
+        ]))
+        .step(H3Step::StallFor(Duration::from_secs(1)))
+        .spawn()
+        .expect("spawn h3 backend");
+
+    let (harness, _ca_pem, _https_port) = spawn_h3_harness_with_explicit_https_port_and_config(
+        file_mode_yaml_for_h3_grpc_with_response_transformer(backend_port),
+        false,
+        Some(1),
+    )
+    .await;
+
+    let entry = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("fetch capability entry")
+        .expect("registry populated within timeout");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "expected h3=supported for the native H3 gRPC trailer-policy case; entry: {entry:#?}"
+    );
+
+    let resp = match h3_grpc_post(&harness, "/api/echo.Echo/ServerStream", grpc_frame(b"go")).await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("native H3 gRPC trailer-policy request failed: {e}\n--- logs ---\n{logs}");
+        }
+    };
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    let backend_errors = h3_backend.step_errors().await;
+    assert_eq!(resp.status.as_u16(), 200, "status; --- logs ---\n{logs}");
+    assert_eq!(
+        resp.body_bytes.as_ref(),
+        frame.as_slice(),
+        "the streamed gRPC frame must still be relayed byte-for-byte"
+    );
+
+    // Reserved terminal metadata survives: generic header policy must never
+    // corrupt or suppress a valid RPC outcome.
+    assert_eq!(
+        resp.trailer("grpc-status"),
+        Some("9"),
+        "grpc-status must survive response-header governance; trailers: {:#?}\n\
+         backend errors: {backend_errors:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("grpc-message"),
+        Some("FAILED_PRECONDITION"),
+        "grpc-message must survive; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("grpc-status-details-bin"),
+        Some("AQID"),
+        "grpc-status-details-bin must survive; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+
+    // Application metadata does NOT: `response_transformer` is unbounded, so the
+    // non-reserved terminal fields fail closed.
+    assert_eq!(
+        resp.trailer("x-internal-debug"),
+        None,
+        "trailer-only gRPC application metadata must not bypass the \
+         response_transformer header policy; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.trailer("x-tenant-shard"),
+        None,
+        "every non-reserved gRPC trailer field must fail closed under an \
+         unbounded policy; trailers: {:#?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Issue #2939 — plain native-H3 streaming mid-body non-graceful abort
 // downgrades capability so the next request bridges to TCP instead of
@@ -4341,12 +4505,13 @@ async fn h3_streaming_unbounded_response_policy_drops_backend_trailers() {
     assert_eq!(resp.trailer("x-powered-by"), None);
 }
 
-// A `grpc-*` trailer NAME earns no exemption on a reconciled path. Every H3 path
-// that reaches the reconciliation is plain-flavor — a native gRPC dispatch
-// finishes its own trailers in `dispatch_grpc_native_h3` and is never
-// reconciled — so this backend is an ordinary HTTP backend that merely happens
-// to name its trailer `grpc-status`. Without the fix that one word would carry
-// it past a fail-closed response-header policy.
+// A `grpc-*` trailer NAME earns no exemption on a PLAIN response. Reserved-field
+// handling is selected structurally from the dispatch the gateway committed to,
+// never from the trailer's own name, and this proxy is an ordinary HTTP backend
+// that merely happens to name its trailer `grpc-status`. Without that rule the
+// one word would carry it past a fail-closed response-header policy. The mirror
+// case — the SAME names surviving on a real native gRPC dispatch — is
+// `h3_native_grpc_streaming_governs_application_metadata_only` below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn h3_streaming_grpc_named_trailer_from_a_plain_backend_is_not_exempt() {

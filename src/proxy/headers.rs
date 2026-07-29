@@ -645,30 +645,53 @@ pub(crate) fn strip_response_hop_by_hop_trailers(trailers: &mut http::HeaderMap)
     }
 }
 
-// Deliberately NO name-based exemption for gRPC control trailers
-// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`).
-//
-// Every path that reaches this reconciliation carries PLAIN-flavor responses,
-// on both protocols that reach it:
-//
-// * HTTP/3 — `use_native_h3_pool` and the buffered native-H3 send path both
-//   require `backend_http_flavor == HttpFlavor::Plain`, and a native gRPC
-//   dispatch goes to `dispatch_grpc_native_h3`, which inlines its own trailer
-//   finish and is never reconciled.
-// * Direct HTTP/2 streaming (`ResponseBody::StreamingH2`, reconciled through
-//   `StreamingResponseTrailerGovernor` inside `proxy::body::StripHopByHopTrailers`)
-//   — `handle_proxy_request_inner` installs the governor only when the response
-//   is neither native gRPC (`streaming_h2_native_grpc`, the mesh-mTLS relay) nor
-//   translated gRPC-Web (`grpc_request_is_web_translated`); both pass `None` and
-//   keep the wrapper a pure hop-by-hop filter.
-//
-// No reconciled path therefore carries protocol-required native gRPC status, and
-// a name-only exemption would instead let ANY non-gRPC backend smuggle a
-// governed field past an observed or unbounded response-header policy simply by
-// naming its trailer `grpc-status`. Native gRPC status correctness is preserved
-// where it actually lives — in `dispatch_grpc_native_h3`, the mesh-mTLS
-// streaming-H2 relay, and the H2 cross-protocol gRPC bridge, none of which call
-// this function.
+/// Which trailer-section semantics one reconciliation is applying.
+///
+/// This is the ONLY thing that can exempt a trailer field name, and it is chosen
+/// STRUCTURALLY by each call site from the dispatch it already committed to —
+/// never from the trailer's own name, and never from a request header a client
+/// controls. A plain response therefore cannot buy protection for a field by
+/// calling it `grpc-status`; that would hand any backend a one-word bypass of
+/// the response-header policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailerSectionKind {
+    /// Plain HTTP/HTTP-3 response trailers. Every field is ordinary
+    /// backend-supplied response metadata and NO field name is exempt —
+    /// `grpc-status` included.
+    PlainResponse,
+    /// A native gRPC TERMINAL trailer section, on a dispatch the gateway itself
+    /// selected as native gRPC.
+    ///
+    /// Only the three reserved fields
+    /// (`grpc-status` / `grpc-message` / `grpc-status-details-bin`) carry
+    /// protocol-required RPC outcome; dropping or rewriting them would destroy
+    /// the client's view of the call, so they survive governance unconditionally.
+    /// EVERY other field in that section is gRPC application metadata — exactly
+    /// what GHSA-r78v-rc86-6r86 reports as bypassing `response_transformer` —
+    /// and is governed exactly like a plain trailer field, including the
+    /// fail-closed `Unbounded` arm.
+    NativeGrpcTerminal,
+}
+
+impl TrailerSectionKind {
+    /// Whether this field is protocol-required terminal status that generic
+    /// response-header governance must not touch.
+    ///
+    /// `http::HeaderName::as_str` is always lowercase, so the exact-match
+    /// inventory shared with the buffered gRPC paths
+    /// (`grpc_proxy::is_reserved_grpc_terminal_metadata`) is authoritative here.
+    /// It is an EXACT three-name set, not a `grpc-` prefix: `grpc-encoding`,
+    /// `grpc-accept-encoding`, and any other `grpc-`-named field are application
+    /// metadata and stay governed.
+    fn field_is_reserved(self, field: &str) -> bool {
+        match self {
+            Self::PlainResponse => false,
+            Self::NativeGrpcTerminal => {
+                crate::proxy::grpc_proxy::is_reserved_grpc_terminal_metadata(field)
+            }
+        }
+    }
+}
 
 /// Outcome of a case-insensitive lookup into a plugin-facing header map.
 ///
@@ -974,6 +997,10 @@ pub(crate) struct StreamingResponseTrailerGovernor {
     /// none of those builder writes fired. Never includes hop-by-hop
     /// `connection`.
     gateway_owned_headers: GatewayOwnedResponseHeaders,
+    /// Plain response trailers, or a native gRPC terminal section whose three
+    /// reserved status fields survive governance. Fixed at construction from the
+    /// dispatch the handler already chose — never from a trailer name.
+    section: TrailerSectionKind,
     /// At least one plugin declared `ResponseTrailerPolicy::Unbounded`.
     unbounded: bool,
 }
@@ -985,6 +1012,7 @@ impl StreamingResponseTrailerGovernor {
         policy_names: std::sync::Arc<Vec<String>>,
         policy_prefixes: std::sync::Arc<Vec<String>>,
         gateway_owned_headers: GatewayOwnedResponseHeaders,
+        section: TrailerSectionKind,
         unbounded: bool,
     ) -> Self {
         Self {
@@ -993,6 +1021,7 @@ impl StreamingResponseTrailerGovernor {
             policy_names,
             policy_prefixes,
             gateway_owned_headers,
+            section,
             unbounded,
         }
     }
@@ -1011,6 +1040,7 @@ impl StreamingResponseTrailerGovernor {
                 unbounded: self.unbounded,
             },
             self.gateway_owned_headers,
+            self.section,
         )
     }
 }
@@ -1026,12 +1056,16 @@ impl StreamingResponseTrailerGovernor {
 /// `gateway_owned_headers` is the plain streaming-HTTP/2 builder-ownership bitset
 /// (empty on the native-H3 relays, which fold gateway writes into the shared
 /// header map before reconciling).
+///
+/// `section` selects reserved-field handling structurally — see
+/// [`TrailerSectionKind`].
 pub(crate) fn reconcile_streaming_backend_trailers(
     trailers: &mut http::HeaderMap,
     response_headers: &std::collections::HashMap<String, String>,
     pre_policy: &PrePolicyResponseHeaders,
     governance: ResponseTrailerGovernance<'_>,
     gateway_owned_headers: GatewayOwnedResponseHeaders,
+    section: TrailerSectionKind,
 ) -> usize {
     let witness = pre_policy.witness(trailers);
     reconcile_backend_trailers_with_response_policy(
@@ -1041,6 +1075,7 @@ pub(crate) fn reconcile_streaming_backend_trailers(
         governance.policy_names,
         governance.policy_prefixes,
         gateway_owned_headers,
+        section,
         governance.unbounded,
     )
 }
@@ -1051,13 +1086,16 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// `after_proxy` and every later response-header phase see only the INITIAL
 /// header map. A backend trailer carrying a governed field name arrives after
 /// that boundary, so without this reconciliation it reintroduces exactly what
-/// the policy removed — or contradicts what the policy set — on the wire. Three
-/// families of path cross that boundary: the buffered native-HTTP/3 send path,
-/// the plain native/refined HTTP/3 STREAMING relays, and the plain direct-HTTP/2
-/// streaming relay. Both streaming families reach this function through
-/// [`reconcile_streaming_backend_trailers`] — the H3 relays inline, the H2 relay
-/// through the owned [`StreamingResponseTrailerGovernor`] its response body
-/// carries.
+/// the policy removed — or contradicts what the policy set — on the wire. The
+/// paths that cross it are the buffered native-HTTP/3 send path, the plain
+/// native/refined HTTP/3 STREAMING relays, the plain direct-HTTP/2 streaming
+/// relay, and — via [`TrailerSectionKind::NativeGrpcTerminal`] — every native
+/// STREAMING gRPC relay (the direct-H2 gRPC pool path, the mesh-mTLS
+/// `StreamingH2` relay, the H3-to-H2 cross-protocol gRPC bridge, and
+/// `dispatch_grpc_native_h3`). The streaming families reach this function
+/// through [`reconcile_streaming_backend_trailers`] — the H3 relays inline, the
+/// H2 relays through the owned [`StreamingResponseTrailerGovernor`] their
+/// response body carries.
 ///
 /// Independent signals decide "governed", because none alone is sufficient:
 ///
@@ -1081,14 +1119,18 @@ pub(crate) fn reconcile_streaming_backend_trailers(
 /// whose governed field set is not enumerable at config time: every field is
 /// treated as governed.
 ///
-/// There is NO field-name exemption of any kind, gRPC control trailers included.
-/// Every reconciled path carries plain-flavor responses on both protocols that
-/// reach it (see the module-level note above this function), so a `grpc-*`
-/// trailer here is an ordinary backend-supplied field, and exempting it by name
-/// would hand any backend a one-word bypass of the response-header policy.
+/// The ONLY exemption is `section` — see [`TrailerSectionKind`]. On a
+/// [`TrailerSectionKind::PlainResponse`] section there is no field-name
+/// exemption of any kind, `grpc-*` names included: exempting a name there would
+/// hand any backend a one-word bypass of the response-header policy. On a
+/// [`TrailerSectionKind::NativeGrpcTerminal`] section — reachable only because
+/// the gateway itself dispatched native gRPC — the three reserved terminal
+/// fields survive so generic rules cannot corrupt protocol status, and
+/// everything else in that section stays fully governed.
 ///
 /// Removal is loop-until-absent so a trailer name repeated across several field
 /// lines cannot leave a surviving duplicate behind.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reconcile_backend_trailers_with_response_policy(
     trailers: &mut http::HeaderMap,
     response_headers: &std::collections::HashMap<String, String>,
@@ -1096,11 +1138,18 @@ pub(crate) fn reconcile_backend_trailers_with_response_policy(
     policy_names: &[String],
     policy_prefixes: &[String],
     gateway_owned_headers: GatewayOwnedResponseHeaders,
+    section: TrailerSectionKind,
     unbounded_policy: bool,
 ) -> usize {
     let mut to_remove: Vec<http::HeaderName> = Vec::new();
     for name in trailers.keys() {
         let field = name.as_str();
+        if section.field_is_reserved(field) {
+            // Protocol-required native gRPC terminal status. Never governed:
+            // dropping it would ship a truncated RPC with no outcome, and
+            // rewriting it would report an outcome the backend never produced.
+            continue;
+        }
         let explicitly_named = policy_names
             .iter()
             .any(|policy| policy.eq_ignore_ascii_case(field));

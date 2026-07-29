@@ -12,6 +12,7 @@ Ferrum Edge accepts HTTP/3 client traffic on a dedicated QUIC listener and proxi
 - [Coalescing and frame cadence](#coalescing-and-frame-cadence)
 - [gRPC trailers over H3](#grpc-trailers-over-h3)
 - [Backend trailers and response header policy](#backend-trailers-and-response-header-policy)
+  - [Native gRPC terminal metadata](#native-grpc-terminal-metadata)
 - [WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)](#websocket-over-http3-rfc-9220-extended-connect)
 - [QUIC connection migration](#quic-connection-migration)
 - [Header size limits](#header-size-limits)
@@ -64,7 +65,7 @@ When the matched proxy has `backend_scheme: https`, the concrete backend target 
 - Response body: streamed back via `CoalescingH3Body` / `DirectH3Body` with the coalesce knobs below.
 - Zero copies of the body to userspace at either end; h3's chunks are `Bytes` pass-throughs.
 
-The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`: the gRPC request frames stream over `request_streaming_body()`, the response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded verbatim (after response-direction hop-by-hop stripping). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, and client-streaming RPCs are supported (the request stream is drained before the response is read, exactly like the cross-protocol bridge buffers it), while full bidirectional streaming and the retry/body-buffering cases fall through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
+The same native QUIC fast path now also serves **`Grpc`** flavor via `dispatch_grpc_native_h3()`: the gRPC request frames stream over `request_streaming_body()`, the response body streams back through the shared QUIC coalescer, and the terminal `grpc-status` / `grpc-message` trailer is forwarded after response-direction hop-by-hop stripping and response-header-policy reconciliation of its application metadata (the reserved status fields always survive — see [Native gRPC terminal metadata](#native-grpc-terminal-metadata)). This is the **only** path that can reach an H3-only gRPC backend, because the gRPC pool (`GrpcConnectionPool`) speaks only HTTP/2 (h2 TLS / h2c). It is gated to the streamable case (no retry / body-plugin buffering, no reqwest-forcing plugin); unary, server-streaming, and client-streaming RPCs are supported (the request stream is drained before the response is read, exactly like the cross-protocol bridge buffers it), while full bidirectional streaming and the retry/body-buffering cases fall through to the H2 gRPC bridge. Every downstream DATA/coalescer write is deadline-biased: expiry before the first client-visible DATA completes with `grpc-status: 4`, including simultaneous readiness, while expiry after any visible DATA resets because a length-prefixed message may be partial. CB / passive-health key off the HTTP transport status (gRPC failures ride on HTTP 200); the adaptive-concurrency sample maps a non-OK backend `grpc-status` to a 5xx, matching the H2 streaming gRPC bridge.
 
 The streaming request-body pool path retries a stale cached H3 connection only when `H3PoolError::request_on_wire()` is false. At that boundary `send_request` did not open a backend stream and the borrowed frontend body has not been polled, so reconnecting to the same target is safe. Post-wire failures are never replayed: body bytes may already have reached the backend, and automatically retrying a gRPC `POST` could execute it twice. The same pre-wire reconnect covers the hyper-`Incoming` streaming variants used by the H1/H2 frontend → H3 backend path (`request_streaming_incoming_body` / `request_with_target_streaming_incoming_body`): because the `Incoming` body is moved into the request, a pre-wire failure hands the still-unpolled body back to the pool caller alongside the error, and the caller replays it once on a fresh connection under the same `request_on_wire()` gate.
 
@@ -193,7 +194,7 @@ The coalesce loop is identical across the two paths — source of bytes differs 
 `grpc-status` and `grpc-message` are mandatory gRPC signalling carried in HTTP trailers (RFC 9110 §6.5). The H3 crate supports trailers via `RequestStream::send_trailers(HeaderMap)` at the client-facing end. On the backend side:
 
 - **Buffered gRPC response** — the gRPC pool extracts trailers into a `HashMap<String, String>` before returning; the bridge converts them to a `HeaderMap` and sends via `send_trailers()` after the data frames.
-- **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()`.
+- **Streaming gRPC response** — the bridge polls hyper `Incoming::frame()`; when a `Frame::trailers()` variant is seen, the `HeaderMap` is stashed, the data loop exits cleanly, and the stashed trailers are forwarded via `send_trailers()` — after response-direction hop-by-hop stripping and response-header-policy reconciliation of the section's application metadata. `grpc-status`, `grpc-message`, and `grpc-status-details-bin` are reserved and always survive that reconciliation; see [Native gRPC terminal metadata](#native-grpc-terminal-metadata).
 
 Buffered response hooks receive a compatibility view containing both initial
 headers and trailers. Before the H3 response is written, Ferrum restores the
@@ -317,16 +318,24 @@ them against the response-header policy actually in force for the request:
   | `response_transformer` | `after_proxy` also applies `mesh_route_dispatch` route overrides whose field names do not exist until the request runs |
   | `ai_stream_router` | Anthropic SSE normalization removes `content-encoding` / `content-length`, invalidates every content-bound validator/digest/signature plus the open-ended `x-amz-checksum-*` / `x-checksum-*` families, and rewrites `vary` — prefix-derived names cannot be listed as finite exact names |
 
-**No field name is exempt, `grpc-*` included.** Every reconciled path carries a
-plain-flavor response. On H3 that is structural: the native H3 pool branches
-require `HttpFlavor::Plain`, and a native gRPC dispatch inlines its own trailer
-finish in `dispatch_grpc_native_h3` and is never reconciled here (see
-[gRPC trailers over H3](#grpc-trailers-over-h3)). The
-[direct-H2 streaming relay](#direct-http2-streaming) draws the same line by
-excluding native gRPC and translated gRPC-Web from the boundary. A `grpc-status`
-trailer on a reconciled path is therefore an ordinary backend-supplied field, and
-exempting it by name would let any non-gRPC backend bypass an observed or
-fail-closed response-header policy with a single well-chosen trailer name.
+**On a plain response no field name is exempt, `grpc-*` included.** Reserved-field
+handling is selected *structurally* by the dispatch the gateway already
+committed to (`TrailerSectionKind`), never from the trailer's own name. On a
+plain-flavor path — the buffered native-H3 send path, the plain native/refined
+H3 streaming relays, and the plain [direct-H2 streaming
+relay](#direct-http2-streaming) — a `grpc-status` trailer is an ordinary
+backend-supplied field, and exempting it by name would let any non-gRPC backend
+bypass an observed or fail-closed response-header policy with a single
+well-chosen trailer name.
+
+**On a native gRPC terminal section, exactly three fields are reserved.**
+`grpc-status`, `grpc-message`, and `grpc-status-details-bin` carry the RPC
+outcome and survive governance unconditionally, so a generic header rule can
+never corrupt or suppress valid terminal status. That is an exact three-name
+inventory, not a `grpc-` prefix: `grpc-encoding`, `grpc-accept-encoding`, and
+every other field in the section are gRPC **application metadata** and are
+governed exactly like a plain trailer field, fail-closed `Unbounded` arm
+included. See [Native gRPC terminal metadata](#native-grpc-terminal-metadata).
 
 An auth/logging-only chain — `key_auth`, `stdout_logging`, ACLs, or a rate
 limiter with response-header exposure disabled — declares no names and mutates
@@ -362,7 +371,8 @@ three signals. Three details differ from the buffered path:
   itself sent. Synthesizing that field also counts as a response-header phase
   for the evidence decision above, so the parity holds even for an
   auth/logging-only chain. The special native-gRPC content-type path is
-  untouched: it lives in `dispatch_grpc_native_h3`, which is not reconciled.
+  untouched: `dispatch_grpc_native_h3` never synthesizes a default
+  `content-type`, because gRPC carries its own.
 - **Ambiguous duplicates fail closed.** A plugin may synthesize several case
   variants of one field name (`x-name` beside `X-Name`) in the string header
   map. A field counts as untouched only when the pre-policy and final maps each
@@ -373,9 +383,9 @@ three signals. Three details differ from the buffered path:
 Everything else is unchanged: the trailer read timeout and its error
 classification, connection/accounting release, H3 capability downgrade on
 trailer-boundary transport faults, and client-disconnect semantics all behave
-exactly as before. Native gRPC over H3 inlines its own trailer finish and is not
-reconciled here, so `grpc-status` stays protocol-correct on the path that
-actually carries it.
+exactly as before. Native gRPC over H3 inlines its own trailer finish and
+reconciles there instead, as a gRPC terminal section — see
+[Native gRPC terminal metadata](#native-grpc-terminal-metadata).
 
 Both the buffered and streaming paths strip response-direction hop-by-hop
 trailer names **before** reconciling. Either order drops the same fields from
@@ -394,8 +404,50 @@ handler returns, so the boundary travels with the body as an owned
 That owned form also carries an allocation-free per-response
 `gateway_owned_headers` bitset for the end-to-end builder writes (`via`,
 `alt-svc`, `X-Gateway-*`) so an exact-value pre-seed cannot bypass them. Native
-gRPC (mesh-mTLS) and translated gRPC-Web on that arm are excluded exactly as
-`dispatch_grpc_native_h3` is excluded here.
+gRPC (the mesh-mTLS relay) on that arm is governed as a gRPC terminal section;
+translated gRPC-Web is excluded, because its terminal metadata is adapted into a
+final DATA frame that the pristine Trailers-Only snapshot already governs.
+
+### Native gRPC terminal metadata
+
+Advisory GHSA-r78v-rc86-6r86: a streaming gRPC response runs `after_proxy` on
+the **initial** header map only, commits its HEADERS frame, and forwards the
+backend's terminal metadata later. A `response_transformer` rule that removes or
+redacts `x-internal-debug` is therefore a no-op when the backend sends that field
+only as a trailer — the operator's trust boundary is crossed by streaming alone,
+since forcing the same response to buffer applies the rule correctly.
+
+Every native streaming gRPC relay now applies the same three governance signals
+to its terminal metadata, at the trailer frame and before the trailers reach the
+client:
+
+| Relay | Where it reconciles |
+| --- | --- |
+| Direct HTTP/2 gRPC pool (`GrpcResponseKind::Streaming`) | owned `StreamingResponseTrailerGovernor` inside `proxy::body::StripHopByHopTrailers`, installed on all three body constructors |
+| Mesh-mTLS `StreamingH2` relay | the same owned governor on the plain streaming-H2 arm |
+| H3 client → H2 gRPC backend bridge | inline in `handle_h3_grpc_streaming_response`, before `send_trailers` |
+| Native H3 gRPC backend (`dispatch_grpc_native_h3`) | inline, before `send_h3_grpc_trailers_and_finish_before_deadline` |
+
+Reserved-field behavior is uniform across all four: `grpc-status`,
+`grpc-message`, and `grpc-status-details-bin` are never dropped or rewritten, so
+status classification, deadline handling, backend-health accounting, and
+gRPC-Web translation are unaffected — each relay latches the backend
+`grpc-status` from the pristine trailer block *before* reconciling. Everything
+else in the section is application metadata: it is dropped when a plugin
+declared its name (or prefix), when the per-request witness proves the chain
+mutated the matching header, or — for an `Unbounded` chain such as
+`response_transformer`, whose governed names do not exist until the request runs
+— unconditionally. The response plugin chain is **not** re-run at trailer time:
+`after_proxy` has side effects and `response_transformer` consumes
+request-scoped route overrides, so each relay carries a precomputed,
+request-scoped boundary to the trailer frame instead.
+
+An auth/logging-only chain still forwards gRPC application trailers untouched,
+exactly as before (issue #2941).
+
+Translated gRPC-Web remains outside this boundary on every path: its terminal
+metadata is adapted into a final DATA frame, and the pristine Trailers-Only
+snapshot already governs what may appear there.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

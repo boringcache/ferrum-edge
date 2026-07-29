@@ -1706,9 +1706,11 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         "streaming governance must keep the fail-closed unbounded arm"
     );
 
-    // Native gRPC over H3 inlines its own trailer finish so the backend
-    // `grpc-status` stays protocol-correct; it must not be pulled into the
-    // response-header policy boundary.
+    // GHSA-r78v-rc86-6r86: native gRPC over H3 inlines its own trailer finish,
+    // but that trailer section crosses the SAME response-header policy boundary
+    // — its application metadata was the advisory's reproduction. It must
+    // reconcile, and it must do so as a NATIVE GRPC TERMINAL section so the
+    // reserved status fields survive.
     let grpc = src
         .split("async fn dispatch_grpc_native_h3(")
         .nth(1)
@@ -1717,9 +1719,83 @@ fn streaming_h3_relays_reconcile_backend_trailers_with_response_policy() {
         .next()
         .expect("bounded native gRPC H3 dispatch");
     assert!(
-        !grpc.contains("reconcile_streaming_backend_trailers(")
-            && !grpc.contains("H3StreamingTrailerPolicy {"),
-        "native gRPC H3 trailer status must not be reconciled as header policy"
+        grpc.contains("reconcile_streaming_backend_trailers("),
+        "native gRPC H3 application metadata must be reconciled against the \
+         response-header policy"
+    );
+    assert!(
+        grpc.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "native gRPC H3 must reconcile as a gRPC terminal section so grpc-status \
+         survives"
+    );
+    assert!(
+        !grpc.contains("TrailerSectionKind::PlainResponse"),
+        "native gRPC H3 must not reconcile any trailer section as plain"
+    );
+    // Evidence must predate every response-header phase, and the reconciliation
+    // must run before the trailers reach the client.
+    let capture_at = grpc
+        .find("let grpc_pre_policy_response_headers =")
+        .expect("native gRPC H3 pre-policy capture");
+    let after_proxy_at = grpc
+        .find("run_h3_streaming_after_proxy_hooks(")
+        .expect("native gRPC H3 after_proxy phase");
+    let reconcile_at = grpc
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("native gRPC H3 reconciliation");
+    let send_at = grpc
+        .find("send_h3_grpc_trailers_and_finish_before_deadline(")
+        .expect("native gRPC H3 trailer send");
+    assert!(
+        capture_at < after_proxy_at,
+        "the pre-policy capture must precede the first response-header phase"
+    );
+    assert!(
+        reconcile_at < send_at,
+        "native gRPC H3 trailers must be reconciled before they are sent"
+    );
+}
+
+#[test]
+fn the_h3_to_h2_grpc_streaming_bridge_governs_its_terminal_metadata() {
+    // The advisory's second reproduction: an H3 client against an H2 gRPC
+    // backend. The bridge commits its initial HEADERS frame, runs `after_proxy`
+    // on headers only, then forwards the backend trailer section verbatim.
+    let src = include_str!("../../../src/http3/cross_protocol.rs");
+    let relay = src
+        .split("async fn handle_h3_grpc_streaming_response<S>(")
+        .nth(1)
+        .expect("cross-protocol H3 gRPC streaming relay")
+        .split("\nasync fn dispatch_grpc<S>(")
+        .next()
+        .expect("bounded cross-protocol H3 gRPC streaming relay");
+    assert!(
+        relay.contains("reconcile_streaming_backend_trailers("),
+        "the H3->H2 gRPC bridge must reconcile its trailer section"
+    );
+    assert!(
+        relay.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "the H3->H2 gRPC bridge must reconcile as a gRPC terminal section"
+    );
+    let capture_at = relay
+        .find("let grpc_pre_policy_response_headers =")
+        .expect("bridge pre-policy capture");
+    let after_proxy_at = relay
+        .find("crate::proxy::run_after_proxy_hooks(")
+        .expect("bridge after_proxy phase");
+    let reconcile_at = relay
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("bridge reconciliation");
+    let send_at = relay
+        .find("stream.send_trailers(trailers)")
+        .expect("bridge trailer send");
+    assert!(
+        capture_at < after_proxy_at,
+        "the bridge capture must precede the first response-header phase"
+    );
+    assert!(
+        reconcile_at < send_at,
+        "the bridge must reconcile before sending trailers"
     );
 }
 
@@ -1816,23 +1892,39 @@ fn the_trailer_reconciliation_exempts_no_field_name() {
         .next()
         .expect("bounded reconciliation function");
 
-    // A name-based exemption here is a bypass, not a protocol accommodation:
-    // every reconciled path carries a PLAIN-flavor response — the H3 relays
-    // require `HttpFlavor::Plain` (`use_native_h3_pool` and the buffered send
-    // path alike) and native gRPC finishes its own trailers in
-    // `dispatch_grpc_native_h3`, while the direct-H2 arm excludes native gRPC
-    // and translated gRPC-Web from the governor entirely. So a non-gRPC
-    // backend could otherwise smuggle a governed field past an observed or
-    // unbounded policy by naming its trailer `grpc-status`.
+    // A NAME-based exemption here is a bypass, not a protocol accommodation: a
+    // non-gRPC backend could smuggle a governed field past an observed or
+    // unbounded policy just by naming its trailer `grpc-status`. Reserved-field
+    // handling must therefore be reached STRUCTURALLY, through the `section`
+    // the call site chose from the dispatch it committed to — never from a
+    // literal field name in this function.
     assert!(
         !body.contains("grpc-status")
             && !body.contains("grpc-message")
             && !body.contains("GRPC_CONTROL_TRAILER_NAMES"),
-        "the reconciliation must not exempt any field name: {body}"
+        "the reconciliation must not name any exempt field: {body}"
     );
+    // Exactly one early-out, and it must be the structural section check.
+    assert_eq!(
+        body.matches("continue;").count(),
+        1,
+        "the reconciliation must have exactly one early-out: {body}"
+    );
+    let early_out = body
+        .split("continue;")
+        .next()
+        .expect("region above the early-out");
+    let guard = early_out
+        .rsplit("if ")
+        .next()
+        .expect("early-out guard")
+        .lines()
+        .next()
+        .expect("early-out guard line");
     assert!(
-        !body.contains("continue;"),
-        "the reconciliation must reach the governance decision for every trailer name"
+        guard.contains("section.field_is_reserved("),
+        "the only early-out must be the structural section check, not a name \
+         comparison: {guard}"
     );
     // Governance stays the union of every independent signal. Asserted term by
     // term rather than as one formatted line so `cargo fmt` rewrapping the
