@@ -58,6 +58,12 @@ paths:
   header/query mutator at or after deduplication, including priority overrides,
   and rejects any deferred request-body transformer whose final bytes are not
   exactly the body produced by the pre-`before_proxy` normalization phase.
+- `response_caching` likewise requires the proxy's private proof that the
+  complete GET/HEAD upload is empty before lookup, binds the complete
+  backend-visible headers/query, rejects later header/query mutation, and
+  rejects deferred body transforms that could synthesize bytes after lookup.
+  Configured request decompression remains compatible because its exact final
+  body is published during pre-`before_proxy` normalization.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

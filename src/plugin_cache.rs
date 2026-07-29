@@ -346,6 +346,56 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
             }
         }
 
+        for response_cache in plugins.iter().filter(|plugin| {
+            plugin.supported_protocols().contains(&protocol)
+                && plugin.name() == "response_caching"
+        }) {
+            if let Some(transformer) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "response_caching"
+                    // gRPC-Web body translation is owned only for its
+                    // content-types (normally POST). Response caching admits
+                    // only GET/HEAD and additionally requires an observed empty
+                    // upload, so the two request-time populations are disjoint.
+                    && plugin.name() != "grpc_web"
+                    && plugin.modifies_request_body()
+                    && !plugin.final_request_body_matches_pre_before_proxy_normalization()
+            }) {
+                return Err(format!(
+                    "response_caching cannot be combined with deferred request-body \
+                     transformer '{}' for protocol {:?} on the same proxy; cache lookup runs \
+                     during before_proxy and only admits a transport-proven empty body, so a \
+                     later transform could synthesize backend-visible bytes after lookup",
+                    transformer.name(),
+                    protocol
+                ));
+            }
+
+            if let Some(later_mutator) = plugins.iter().find(|plugin| {
+                plugin.supported_protocols().contains(&protocol)
+                    && plugin.name() != "response_caching"
+                    // Compression's later header projection is a deterministic
+                    // removal/normalization of fields already bound by the
+                    // cache key; it cannot introduce an unbound origin-visible
+                    // dimension. Response caching intentionally composes with
+                    // compression to retain final encoded representations.
+                    && plugin.name() != "compression"
+                    && plugin.priority() >= response_cache.priority()
+                    && (plugin.modifies_request_headers() || plugin.modifies_request_query())
+            }) {
+                return Err(format!(
+                    "request mutation plugin '{}' at effective priority {} must run before \
+                     every response_caching instance for protocol {:?}; response_caching \
+                     priority {} would select a retained response before the final \
+                     backend-visible headers/query exist",
+                    later_mutator.name(),
+                    later_mutator.priority(),
+                    protocol,
+                    response_cache.priority()
+                ));
+            }
+        }
+
         for side_effecting_plugin in plugins.iter().filter(|plugin| {
             plugin.supported_protocols().contains(&protocol)
                 && plugin.requires_prior_request_deduplication()
@@ -2872,6 +2922,7 @@ const SECURITY_COMPOSITION_PLUGIN_NAMES: &[&str] = &[
     "otel_tracing",
     "rate_limiting",
     "request_deduplication",
+    "response_caching",
     "request_transformer",
     "serverless_function",
     "sse",

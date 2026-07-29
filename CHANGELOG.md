@@ -31,8 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     includes custom header locations configured by `key_auth`, `jwt_auth`,
     `jwks_auth`, and `oauth2_introspection`. Present credential-bearing query
     parameters are privately digested before authentication/transformer
-    stripping and remain mandatory caller dimensions even when ordinary query
-    fields are excluded from a response-cache key.
+    stripping and remain mandatory caller dimensions independently of the
+    response cache's legacy `cache_key_include_query` setting.
   - **Every caller binds canonical caller context.** A new
     `anonymous_caller_scope` option (`caller_address` default, `shared` opt-out)
     binds the gateway-resolved canonical peer address, which the origin observes
@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     non-credential request header, with credential values digested), so
     cross-namespace and header/query-only tenant collisions are closed for both
     exact and semantic lookup scopes.
+    `response_caching` now binds the same complete backend-visible request
+    context unconditionally: effective outbound query and every non-hop-by-hop
+    request header are key dimensions even when `cache_key_include_query` is
+    `false`. That option is retained only as a legacy keyspace toggle.
   - **`ai_semantic_cache` lookup moved to the final-request-body stage**
     (priority `2996` → `4057`). It previously looked up in `before_proxy`,
     ahead of `request_transformer` (3000) and every `transform_request_body`
@@ -92,11 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     final wire bytes were not already established by pre-`before_proxy`
     normalization.
   - **Body-bearing response caching is refused.** `cacheable_methods` now
-    accepts only the bodyless retrieval methods `GET` and `HEAD`; a
-    body-bearing method is rejected at admission, and at runtime any request
-    declaring a body bypasses lookup and storage. Cache lookup happens before
-    the exact backend-visible request body exists, so a pre-transform digest
-    could not describe what is actually sent.
+    accepts only `GET` and `HEAD`; a body-bearing method is rejected at
+    admission. At runtime the H1/H2/H3 transport must observe the complete
+    upload and privately prove the final pre-`before_proxy` body is empty before
+    lookup. Header heuristics cannot prove this for H2/H3 DATA without
+    `Content-Length`. Non-empty or unproven bodies bypass lookup and storage,
+    and composition admission rejects deferred body transformers that could
+    synthesize bytes after lookup.
   - **Canonical length-framed key serialization replaces raw delimiters.**
     `ai_semantic_cache` no longer joins roles, content, and broader fields with
     literal `:`, `|`, and newline bytes, and `response_caching` no longer
@@ -122,10 +128,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     by a previous build are unreachable — the intended fail-closed outcome for
     anything keyed under the weaker partition. `response_caching` configs that
     listed a body-bearing `cacheable_methods` entry now fail admission.
-    `request_deduplication` priority overrides and deferred body-transform
-    compositions that hide final backend-visible request state now fail
-    admission; `mcp_gateway` remains incompatible because its response rewrite
-    is derived from mutable live discovery state. `ai_semantic_cache` moves
+    `request_deduplication` and `response_caching` priority overrides and
+    deferred body-transform compositions that hide final backend-visible
+    request state now fail admission; `mcp_gateway` remains incompatible
+    because its response rewrite is derived from mutable live discovery state.
+    `ai_semantic_cache` moves
     from priority `2996` to `4057`: a `before_proxy`
     short-circuit that previously lost to a cache hit (`serverless_function`,
     `response_mock`) now wins, and a priority override placing the cache at or

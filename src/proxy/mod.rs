@@ -21692,6 +21692,22 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
+    // A replay lookup may run before final request-body hooks, so it needs a
+    // transport-owned proof that the complete body is empty. Method/framing
+    // headers alone are insufficient for H2 GET/HEAD streams that carry DATA
+    // without Content-Length. Publish the proof only after any early body
+    // normalization has produced the representation every before_proxy hook
+    // will observe.
+    ctx.set_replay_request_body_empty_proven(
+        before_proxy_body_requirements.required
+            && match &client_request_body {
+                ClientRequestBody::Streaming(request) => {
+                    hyper::body::Body::is_end_stream(request.body())
+                }
+                ClientRequestBody::Buffered(buffered) => buffered.body.is_empty(),
+            },
+    );
+
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
     // When no plugin modifies headers, pass &mut ctx.headers directly to avoid
     // an expensive per-request HashMap clone on the hot path.

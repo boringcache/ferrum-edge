@@ -320,6 +320,18 @@ one fail-closed replay-partition contract
   were previously sharing one completion will now miss. Only transport/hop-by-hop
   framing fields Ferrum provably regenerates for the backend hop are excluded;
   `Host`/authority is bound as its own field.
+- **`response_caching` now binds the complete request context too.** The
+  backend-effective query and every non-hop-by-hop request header are mandatory
+  key dimensions. `cache_key_include_query: false` remains accepted only to
+  rotate/partition legacy keyspaces; it no longer allows responses to be shared
+  across origin-visible query values. Header/query priority overrides that run
+  at or after `response_caching` and deferred request-body transformers now fail
+  configuration admission.
+- **GET/HEAD cache lookup now requires an observed empty upload.** Ferrum drains
+  the complete H1/H2/H3 request body before cache lookup and bypasses when it is
+  non-empty or cannot be proven empty. This closes H2/H3 GET-with-DATA replay
+  even when no `Content-Length` is present. Expect those requests to reach the
+  origin instead of receiving or populating a cached response.
 - **Tracing and correlation request headers are now key dimensions.** An earlier
   revision excluded `traceparent`, `tracestate`, `b3`, `X-B3-*`, `X-Request-Id`,
   `X-Correlation-Id` and friends by reusing the *response*-cache sanitation

@@ -226,6 +226,15 @@ pub mod _test_support {
         ctx.set_request_headers_to_redact(Arc::new(headers));
     }
 
+    /// Model the transport-owned empty-body proof for direct plugin lifecycle
+    /// tests that do not enter through an HTTP proxy body-drain path.
+    pub fn set_replay_request_body_empty_proven_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        proven: bool,
+    ) {
+        ctx.set_replay_request_body_empty_proven(proven);
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {

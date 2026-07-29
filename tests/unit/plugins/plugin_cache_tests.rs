@@ -3713,6 +3713,114 @@ fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body()
 }
 
 #[test]
+fn response_caching_rejects_unwitnessable_request_mutation_order_and_body() {
+    let cache = || {
+        make_plugin_config(
+            "cache",
+            "response_caching",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let mut late_query = make_plugin_config_with_json(
+        "transform",
+        "request_transformer",
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "query",
+                "key": "tenant",
+                "value": "later"
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late_query.priority_override = Some(3600);
+    let late_query_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![cache(), late_query],
+    );
+    let candidate_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_query_config,
+        None,
+    )
+    .expect_err("cache lookup must run after the final query mutation");
+    assert!(
+        candidate_error.contains("before the final backend-visible headers/query"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&late_query_config)
+        .err()
+        .expect("runtime construction must repeat the mutation-order refusal");
+    assert!(
+        runtime_error.contains("before the final backend-visible headers/query"),
+        "{runtime_error}"
+    );
+
+    let safe_query = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![
+            cache(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "query",
+                        "key": "tenant",
+                        "value": "earlier"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&safe_query, None)
+        .expect("default query transformation precedes cache lookup");
+    PluginCache::new(&safe_query).expect("runtime cache must accept the observable order");
+
+    let body_config = make_config(
+        vec![make_proxy("p1", "/api", vec!["cache", "transform"])],
+        vec![
+            cache(),
+            make_plugin_config_with_json(
+                "transform",
+                "request_transformer",
+                json!({
+                    "rules": [{
+                        "operation": "add",
+                        "target": "body",
+                        "key": "tenant",
+                        "value": "synthesized"
+                    }]
+                }),
+                PluginScope::Proxy,
+                Some("p1"),
+            ),
+        ],
+    );
+    let candidate_error =
+        validate_plugin_composition_candidate_with_real_ip_header_for_test(&body_config, None)
+            .expect_err("a post-lookup body transform must fail closed");
+    assert!(
+        candidate_error.contains("later transform could synthesize backend-visible bytes"),
+        "{candidate_error}"
+    );
+    let runtime_error = PluginCache::new(&body_config)
+        .err()
+        .expect("runtime cache must repeat the body-policy refusal");
+    assert!(
+        runtime_error.contains("later transform could synthesize backend-visible bytes"),
+        "{runtime_error}"
+    );
+}
+
+#[test]
 fn safe_serverless_dedup_order_and_pre_proxy_override_are_admitted() {
     let terminate_default = make_config(
         vec![make_proxy("p1", "/api", vec!["dedup", "terminal-function"])],
@@ -8960,6 +9068,10 @@ fn test_response_caching_requires_response_body_buffering() {
     assert!(
         cache.requires_response_body_buffering("ferrum", "p1"),
         "response_caching should require response body buffering"
+    );
+    assert!(
+        cache.requires_request_body_buffering("ferrum", "p1"),
+        "response_caching must observe the complete GET/HEAD upload before lookup"
     );
 }
 

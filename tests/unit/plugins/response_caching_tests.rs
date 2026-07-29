@@ -14,7 +14,7 @@ use ferrum_edge::_test_support::{
     response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
-    set_replay_credential_headers_for_test,
+    set_replay_credential_headers_for_test, set_replay_request_body_empty_proven_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -47,6 +47,7 @@ fn make_ctx(method: &str, path: &str) -> RequestContext {
         path.to_string(),
     );
     ctx.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
+    set_replay_request_body_empty_proven_for_test(&mut ctx, true);
     ctx
 }
 
@@ -2570,10 +2571,10 @@ async fn test_different_raw_queries_different_cache() {
     assert_eq!(body, b"page-1-data");
 }
 
-// === Query-insensitive caching ===
+// === Complete backend-visible query partition ===
 
 #[tokio::test]
-async fn test_query_excluded_from_cache_key() {
+async fn legacy_query_toggle_cannot_exclude_backend_visible_query() {
     let plugin = plugin_with_config(json!({
         "cache_key_include_query": false
     }));
@@ -2589,12 +2590,16 @@ async fn test_query_excluded_from_cache_key() {
         .on_final_response_body(&mut ctx1, 200, &rh, b"same-data")
         .await;
 
-    // ?page=2 should be a HIT (query excluded from key)
+    // The legacy toggle still rotates the keyspace, but it cannot authorize
+    // cross-query replay when the origin receives and may vary on the query.
     let mut ctx2 = make_ctx_with_query("GET", "/api/items", &[("page", "2")]);
     ctx2.matched_proxy = Some(std::sync::Arc::new(create_test_proxy()));
     let mut h2 = HashMap::new();
     let result = plugin.before_proxy(&mut ctx2, &mut h2).await;
-    assert!(is_reject(&result));
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a different backend-visible query must miss even when the legacy flag is false"
+    );
 }
 
 // === HEAD method cacheable ===
@@ -5018,6 +5023,32 @@ async fn test_body_bearing_cacheable_method_is_refused_at_admission() {
     );
 }
 
+/// Direct plugin calls and any transport path that has not observed the
+/// complete upload must fail closed. In particular, absence of body framing
+/// headers is not proof for an H2/H3 GET whose DATA frames may arrive later.
+#[tokio::test]
+async fn test_cache_lookup_requires_transport_owned_empty_body_proof() {
+    let plugin = default_plugin();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/items".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut headers = HashMap::new();
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&plugin, &ctx, "BYPASS");
+    assert!(
+        !ctx.metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key")),
+        "an unproven upload must not stage a lookup or storage key"
+    );
+}
+
 /// Even for an admissible method, a request that declares a body bypasses both
 /// lookup and storage: the pre-transform bytes are not the ones sent upstream.
 #[tokio::test]
@@ -5447,6 +5478,7 @@ async fn test_observe_then_after_proxy_does_not_double_invalidate() {
 /// Seed one cacheable GET through the full lifecycle using an explicitly built
 /// context, then return that context's staged base key.
 async fn seed_public_entry(plugin: &ResponseCaching, ctx: &mut RequestContext, body: &[u8]) {
+    set_replay_request_body_empty_proven_for_test(ctx, true);
     let mut headers = ctx.headers.clone();
     assert!(matches!(
         plugin.before_proxy(ctx, &mut headers).await,
@@ -5463,6 +5495,7 @@ async fn seed_public_entry(plugin: &ResponseCaching, ctx: &mut RequestContext, b
 }
 
 async fn lookup_is_hit(plugin: &ResponseCaching, ctx: &mut RequestContext) -> bool {
+    set_replay_request_body_empty_proven_for_test(ctx, true);
     let mut headers = ctx.headers.clone();
     is_reject(&plugin.before_proxy(ctx, &mut headers).await)
 }
@@ -5893,6 +5926,58 @@ async fn replay_partition_isolates_query_and_path_delimiters() {
     assert!(
         !lookup_is_hit(&plugin, &mut shifted).await,
         "path/query boundary must be unambiguous"
+    );
+}
+
+#[tokio::test]
+async fn replay_partition_binds_unconfigured_backend_visible_headers() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut tenant_a = make_ctx("GET", "/reports");
+    tenant_a
+        .headers
+        .insert("x-tenant-policy".to_string(), "read-only".to_string());
+    seed_public_entry(&plugin, &mut tenant_a, b"tenant-a-view").await;
+
+    let mut tenant_b = make_ctx("GET", "/reports");
+    tenant_b
+        .headers
+        .insert("x-tenant-policy".to_string(), "admin".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut tenant_b).await,
+        "an origin-visible header must partition replay without relying on Vary"
+    );
+
+    let mut same = make_ctx("GET", "/reports");
+    same.headers
+        .insert("x-tenant-policy".to_string(), "read-only".to_string());
+    assert!(lookup_is_hit(&plugin, &mut same).await);
+}
+
+#[tokio::test]
+async fn replay_partition_binds_effective_transformed_query() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cache_key_include_query": false
+    }));
+
+    let mut tenant_a = make_ctx_with_raw_query("GET", "/reports", "tenant=wire");
+    tenant_a.publish_transformed_query(
+        "tenant=a".to_string(),
+        HashMap::from([("tenant".to_string(), "a".to_string())]),
+    );
+    seed_public_entry(&plugin, &mut tenant_a, b"tenant-a-view").await;
+
+    let mut tenant_b = make_ctx_with_raw_query("GET", "/reports", "tenant=wire");
+    tenant_b.publish_transformed_query(
+        "tenant=b".to_string(),
+        HashMap::from([("tenant".to_string(), "b".to_string())]),
+    );
+    assert!(
+        !lookup_is_hit(&plugin, &mut tenant_b).await,
+        "the backend-effective transformed query must partition replay"
     );
 }
 

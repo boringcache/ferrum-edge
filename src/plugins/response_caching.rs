@@ -1384,8 +1384,10 @@ impl ResponseCaching {
     ///   rewritten path. `response_caching` runs at
     ///   [`super::priority::RESPONSE_CACHING`], after every route-dispatch
     ///   plugin, so this is the destination that will actually serve a miss;
-    /// * **request target** — normalized authority, method, path, and the raw
-    ///   query exactly as received (no parsing, sorting, or percent-decoding);
+    /// * **request context** — original authority, method, path, effective
+    ///   outbound query, and every backend-visible request header. Query and
+    ///   header transforms that ran before this plugin are therefore part of
+    ///   the partition; only hop-by-hop fields Ferrum regenerates are omitted;
     /// * **caller authorization context** — see
     ///   [`replay_partition::append_caller_partition`]. Authenticated callers
     ///   bind a fingerprint of the credential material and mechanism, not a
@@ -1419,27 +1421,17 @@ impl ResponseCaching {
         let mut hasher = PartitionHasher::new(RESPONSE_CACHING_BASE_KEY_DOMAIN);
         replay_partition::append_destination_partition(&mut hasher, ctx);
 
-        // Normalized request authority. Multi-host proxies (`hosts: [...]`)
-        // must not collide; `host:port` and bracketed IPv6 literals are framed,
-        // never parsed for delimiters.
-        hasher.optional_text(
-            "host",
-            request_headers
-                .get("host")
-                .map(|host| host.to_ascii_lowercase())
-                .as_deref(),
-        );
-        hasher.text("method", &ctx.method);
-        hasher.text("path", &ctx.path);
+        // This legacy option no longer permits an origin-visible query to be
+        // omitted from a replay key. Keep the setting in the digest so changing
+        // it still rotates the keyspace, then bind the complete effective
+        // request context unconditionally below.
         hasher.bool_value("include_query", self.config.cache_key_include_query);
-        if self.config.cache_key_include_query {
-            hasher.optional_text("query", ctx.raw_query_string());
-        }
         // `cache_key_include_consumer` no longer decides whether callers are
         // isolated — the caller partition below is unconditional. It is kept in
         // the digest so flipping it still produces a disjoint keyspace rather
         // than silently reusing entries minted under the other setting.
         hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
+        replay_partition::append_request_context_partition(&mut hasher, ctx, request_headers);
         replay_partition::append_caller_partition(
             &mut hasher,
             ctx,
@@ -2333,6 +2325,18 @@ impl Plugin for ResponseCaching {
         true
     }
 
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        true
+    }
+
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.is_cacheable_method(&ctx.method)
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Skip body buffering for SSE requests (`Accept: text/event-stream`).
         // Buffering an unbounded event stream would collect frames until the
@@ -2392,12 +2396,13 @@ impl Plugin for ResponseCaching {
         // before invoking `before_proxy` (zero-alloc when no plugin modifies
         // headers). The `headers` parameter is the single source of truth
         // during this phase.
-        // A request that carries a body has no complete partition here: the
-        // exact backend-visible bytes are only final at `on_final_request_body`,
-        // after this hook. `cacheable_methods` already refuses body-bearing
-        // methods at admission; this is the runtime half of the same rule and
-        // also covers a GET/HEAD that declares a body.
-        if request_declares_body(headers) {
+        // A request that carries a body has no complete partition here. The
+        // proxy must first observe the entire H1/H2/H3 upload and publish a
+        // private empty-body proof; method and framing headers alone cannot
+        // establish emptiness because H2/H3 GET/HEAD streams may carry DATA
+        // without Content-Length. The header check remains defense in depth
+        // for inconsistent or malformed framing views.
+        if !ctx.replay_request_body_empty_proven() || request_declares_body(headers) {
             self.clear_lookup_staging(ctx);
             self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
@@ -2970,11 +2975,13 @@ mod tests {
     }
 
     fn make_ctx(method: &str, path: &str) -> RequestContext {
-        RequestContext::new(
+        let mut ctx = RequestContext::new(
             "127.0.0.1".to_string(),
             method.to_string(),
             path.to_string(),
-        )
+        );
+        ctx.set_replay_request_body_empty_proven(true);
+        ctx
     }
 
     #[tokio::test]

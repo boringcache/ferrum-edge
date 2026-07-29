@@ -1947,6 +1947,16 @@ pub struct RequestContext {
     /// proxy applies [`crate::proxy::query_string_after_plugin_strips`] again
     /// as defense in depth when composing the canonical backend-visible query.
     outbound_query_string: Option<String>,
+    /// Whether the proxy has observed the complete request-body stream and
+    /// proven that the final pre-`before_proxy` representation is empty.
+    ///
+    /// Header heuristics cannot establish this for HTTP/2 or HTTP/3: a
+    /// GET/HEAD request may omit `Content-Length` and still carry DATA. Replay
+    /// plugins that select a retained response before final body hooks must
+    /// require this private transport-owned proof rather than trusting method
+    /// or framing headers. Kept out of public metadata so a client or plugin
+    /// cannot forge cache eligibility.
+    replay_request_body_empty_proven: bool,
     /// Whether either decoded or raw query-param materialization has already
     /// populated `query_params`. Keeps materialization one-shot while preserving
     /// `raw_query_string` for inspection.
@@ -2682,6 +2692,7 @@ impl RequestContext {
             headers_materialized: false,
             raw_query_string: None,
             outbound_query_string: None,
+            replay_request_body_empty_proven: false,
             query_params_materialized: false,
             query_params: HashMap::new(),
             matched_proxy: None,
@@ -3466,9 +3477,10 @@ impl RequestContext {
     /// classification path are moved into this context so the authoritative
     /// wire transform can consume them without recomputing or retaining a
     /// prompt-sized copy on the real context. Only `metadata` and selected
-    /// policy state are copied back by the proxy caller, so this deliberately
-    /// skips raw headers, raw query strings, parsed query maps, prebuffered body
-    /// bytes, and mirror receivers.
+    /// policy state are copied back by the proxy caller. It carries the shared
+    /// raw-header view, query state, and transport-owned empty-body proof needed
+    /// by replay partitioning, but deliberately skips prebuffered body bytes and
+    /// mirror receivers.
     pub(crate) fn clone_for_final_request_body_hooks(&mut self) -> Self {
         Self {
             client_ip: self.client_ip.clone(),
@@ -3495,6 +3507,7 @@ impl RequestContext {
             headers_materialized: true,
             raw_query_string: self.raw_query_string.clone(),
             outbound_query_string: self.outbound_query_string.clone(),
+            replay_request_body_empty_proven: self.replay_request_body_empty_proven,
             // Carry the materialization state with the query strings. Leaving
             // the flag `false` next to a published outbound query would let a
             // later materialization pass resurrect the *pre-transform* raw
@@ -4331,6 +4344,23 @@ impl RequestContext {
     #[inline]
     pub fn outbound_query_string(&self) -> Option<&str> {
         self.outbound_query_string.as_deref()
+    }
+
+    /// Publish the transport's proof that the complete request body is empty.
+    ///
+    /// Only the proxy body-drain paths call this in production. A `false`
+    /// value is the fail-closed default for synthetic contexts and request
+    /// shapes whose upload cannot be collected before `before_proxy`.
+    #[inline]
+    pub(crate) fn set_replay_request_body_empty_proven(&mut self, proven: bool) {
+        self.replay_request_body_empty_proven = proven;
+    }
+
+    /// Whether the transport has proven an empty final pre-`before_proxy`
+    /// request-body representation.
+    #[inline]
+    pub(crate) fn replay_request_body_empty_proven(&self) -> bool {
+        self.replay_request_body_empty_proven
     }
 
     /// Record the client's original request target after canonicalization
