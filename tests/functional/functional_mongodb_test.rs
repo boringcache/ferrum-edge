@@ -1924,14 +1924,10 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
     /// Mongo client from the URL (never reuses a client cloned from the test
     /// runtime — that pattern can deadlock when the outer runtime is tearing
     /// down). Joins only up to `CHANGE_STREAM_TEST_DROP_JOIN_BUDGET`, then detaches.
-    fn spawn_bounded_mongo_cleanup<F>(
-        label: &'static str,
-        mongo_url: String,
-        work: F,
-    ) where
-        F: FnOnce(MongoClient) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = ()> + Send>,
-            > + Send
+    fn spawn_bounded_mongo_cleanup<F>(label: &'static str, mongo_url: String, work: F)
+    where
+        F: FnOnce(MongoClient) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
             + 'static,
     {
         let finished = Arc::new(AtomicBool::new(false));
@@ -1953,7 +1949,8 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
                             return;
                         };
                         options.connect_timeout = Some(CHANGE_STREAM_TEST_MONGO_CONNECT_TIMEOUT);
-                        options.server_selection_timeout = Some(CHANGE_STREAM_TEST_MONGO_SERVER_SELECTION_TIMEOUT);
+                        options.server_selection_timeout =
+                            Some(CHANGE_STREAM_TEST_MONGO_SERVER_SELECTION_TIMEOUT);
                         let Ok(client) = MongoClient::with_options(options) else {
                             return;
                         };
