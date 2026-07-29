@@ -596,7 +596,7 @@ fn scalar_to_json(
                 .ok_or_else(|| BoundedYamlError::Parse("invalid !!int scalar".to_string()));
         }
         if tag == "tag:yaml.org,2002:float" {
-            return float_to_json(value)?;
+            return float_to_json(value);
         }
         if tag.starts_with("tag:yaml.org,2002:") || tag.starts_with('!') {
             // Non-core / local tags are not representable in OpenAPI JSON.
@@ -910,7 +910,7 @@ unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, BoundedYamlE
     }
 }
 
-unsafe fn optional_cstr(ptr: *const sys::yaml_char_t) -> Result<Option<String>, BoundedYamlError> {
+unsafe fn optional_cstr(ptr: *const u8) -> Result<Option<String>, BoundedYamlError> {
     let Some(nn) = NonNull::new(ptr as *mut i8) else {
         return Ok(None);
     };
