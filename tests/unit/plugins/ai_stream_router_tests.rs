@@ -3526,7 +3526,6 @@ async fn test_anthropic_legacy_function_call_history_round_trip() {
 
 #[tokio::test]
 async fn test_anthropic_legacy_function_call_with_null_content_and_text_parts_result() {
-    let plugin = build(openai_and_anthropic_config());
     let body = json!({
         "model": "claude-3-5-sonnet",
         "stream": true,
