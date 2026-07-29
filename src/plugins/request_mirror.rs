@@ -582,11 +582,11 @@ impl MirrorBodyBudget {
     /// would panic in debug or wedge the budget in release.
     fn release(&self, bytes: u64) {
         if bytes > 0
-            && let Err(current) = self.used.fetch_update(
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-                |current| current.checked_sub(bytes),
-            )
+            && let Err(current) =
+                self.used
+                    .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                        current.checked_sub(bytes)
+                    })
         {
             warn!(
                 current,
