@@ -4423,7 +4423,9 @@ async fn grpc_web_translated_response_is_never_rewritten_as_text() {
         PluginResult::Reject { .. }
     ));
     assert_eq!(
-        ctx.metadata.get("ai_response_guard_rejected").map(|s| s.as_str()),
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .map(|s| s.as_str()),
         Some("grpc_web_translation_blocks_redaction")
     );
 
