@@ -3032,7 +3032,9 @@ fn recorded_value_range(masked: &MaskedSource, start: usize, end: usize) -> (usi
                     let name: String = masked.chars[start..i].iter().collect();
                     let name = name.trim().trim_start_matches(['%', '?']);
                     let is_field_name = !name.is_empty()
-                        && name.chars().all(|c| is_ident_char(c) || c == '.' || c == ':')
+                        && name
+                            .chars()
+                            .all(|c| is_ident_char(c) || c == '.' || c == ':')
                         && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
                     if is_field_name {
                         return (i + 1, end);
