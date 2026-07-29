@@ -183,8 +183,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTPRoute's same-`(hostname, listen path)` collapse **within their own kind**,
   so rule/match ordering and fall-through are preserved. Gateway API v1.5.1
   forbids merging rules between GRPCRoutes and HTTPRoutes: an HTTPRoute and a
-  GRPCRoute attached to the same listener with any intersecting hostname now
-  resolve to exactly one accepted Route — oldest `metadata.creationTimestamp`,
+  GRPCRoute attached to the same resolved listener with any intersecting
+  hostname now resolve to exactly one accepted Route on that listener and
+  hostname — oldest `metadata.creationTimestamp`,
   then `{namespace}/{name}`, then `kind` (the last only breaks a total tie: the
   two kinds may share a name and `creationTimestamp` has second granularity),
   independent of rule paths and of the order objects are observed in — and the losing Route materializes no proxy, upstream,
@@ -201,9 +202,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)
   or any other non-`Exact` `method.type`, a `method` block with neither
-  `service` nor `method`, an `Exact` operand that is empty, over 1024
-  characters, or outside the v1.5.1 CRD grammars, a non-native-gRPC
-  `content-type` predicate, a non-`Exact` header match, or an explicit
+  `service` nor `method`, an `Exact` operand that is empty, over 1024 bytes
+  (the CRD `MaxLength=1024`), present but not a string, or outside the v1.5.1
+  CRD grammars, a non-native-gRPC `content-type` predicate, a non-`Exact`
+  header match, a match entry carrying both `method` and Ferrum's hand-authored
+  `path` extension (Ferrum cannot represent their conjunction, so honoring
+  either half alone would widen the match), or an explicit
   `method: null` / `headers: null` (an explicit null is malformed input, not an
   omission, and must not widen into the any-gRPC-call or headerless match —
   omitting either field keeps its documented meaning) — are dropped fail

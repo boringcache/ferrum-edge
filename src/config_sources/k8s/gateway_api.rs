@@ -1858,6 +1858,14 @@ const GRPC_EXPLICIT_NULL_METHOD: &str = "matches[].method must not be null; omit
 const GRPC_EXPLICIT_NULL_HEADERS: &str = "matches[].headers must not be null; omit the field to match without header predicates, or \
      supply an array of Exact header matches";
 
+/// Diagnostic for a match entry carrying both the CRD `method` predicate and
+/// Ferrum's hand-authored `path` extension. The two describe different
+/// predicates and Ferrum cannot represent their conjunction, so honoring
+/// either one alone would silently drop the other half and widen the match.
+const GRPC_METHOD_AND_PATH_CONFLICT: &str = "matches[] must not carry both 'method' and the Ferrum 'path' extension; Ferrum cannot \
+     represent their conjunction, and honoring either alone would widen the predicate. Use an \
+     Exact service / method match (the CRD shape) or the path extension, not both";
+
 /// Upper bound on an `Exact` GRPCRoute `method.service` / `method.method`
 /// literal, matching the Gateway API v1.5.1 `GRPCMethodMatch` CRD, where both
 /// fields carry `MaxLength=1024`. Anything longer cannot have been admitted by
@@ -1920,19 +1928,22 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
     // `method: null` as absent would widen the predicate to the any-gRPC-call
     // match, exactly the fail-open this parser exists to prevent. Omission stays
     // valid and keeps its documented meaning.
-    let plan = match entry.get("method") {
-        Some(method) if method.is_null() => {
-            return Err(GRPC_EXPLICIT_NULL_METHOD.to_string());
-        }
-        Some(method) => grpc_route_method_plan(method)?,
-        // `path` is not a GRPCRoute CRD field; it is retained as a Ferrum
-        // extension for hand-authored specs that pin an HTTP listen path
-        // directly. A CRD-shaped route reaches the gRPC-shape branch below.
-        None => match entry.get("path") {
-            Some(path) => grpc_route_extension_path_plan(path)?,
-            None => GrpcRouteMatchPlan::UriRegex {
-                pattern: grpc_any_call_pattern(),
-            },
+    //
+    // `path` is not a GRPCRoute CRD field; it is retained as a Ferrum extension
+    // for hand-authored specs that pin an HTTP listen path directly. It is
+    // mutually exclusive with `method`: the plan is a single listen path *or* a
+    // single URI predicate, so honoring one of the two would silently discard
+    // the other half of the operator's conjunction and widen the match.
+    let method_value = entry.get("method");
+    if method_value.is_some_and(Value::is_null) {
+        return Err(GRPC_EXPLICIT_NULL_METHOD.to_string());
+    }
+    let plan = match (method_value, entry.get("path")) {
+        (Some(_), Some(_)) => return Err(GRPC_METHOD_AND_PATH_CONFLICT.to_string()),
+        (Some(method), None) => grpc_route_method_plan(method)?,
+        (None, Some(path)) => grpc_route_extension_path_plan(path)?,
+        (None, None) => GrpcRouteMatchPlan::UriRegex {
+            pattern: grpc_any_call_pattern(),
         },
     };
 
@@ -2004,12 +2015,33 @@ fn grpc_route_extension_path_plan(path: &Value) -> Result<GrpcRouteMatchPlan, St
     }
 }
 
+/// Read an optional `method.service` / `method.method` operand.
+///
+/// A *present* non-string — including an explicit null — is malformed operator
+/// input, not an omission. Silently reading it as absent is a fail-open:
+/// `{"service": 1, "method": "SayHello"}` would degrade from the exact
+/// `=/{service}/{method}` listener to the far broader method-only
+/// `/[^/]+/SayHello` predicate, and `{"service": "pkg.Svc", "method": null}`
+/// would degrade to the whole-service `/pkg.Svc/` prefix. Both widen the match
+/// the operator wrote, which is exactly what this parser exists to prevent.
+/// Omission keeps its documented meaning.
+fn grpc_method_operand<'a>(method: &'a Value, field: &str) -> Result<Option<&'a str>, String> {
+    match method.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(_) => Err(format!(
+            "matches[].method.{field} must be a string; omit the field instead of supplying null \
+             or a non-string value, which would widen the predicate"
+        )),
+    }
+}
+
 fn grpc_route_method_plan(method: &Value) -> Result<GrpcRouteMatchPlan, String> {
     if method.as_object().is_none() {
         return Err("matches[].method must be an object".to_string());
     }
-    let service = string_field(method, "service");
-    let name = string_field(method, "method");
+    let service = grpc_method_operand(method, "service")?;
+    let name = grpc_method_operand(method, "method")?;
     if service.is_none() && name.is_none() {
         return Err("matches[].method requires at least one of service / method".to_string());
     }
@@ -2072,9 +2104,13 @@ fn validate_grpc_operand_bounds(field: &str, value: &str) -> Result<(), String> 
     if value.is_empty() {
         return Err(format!("matches[].method.{field} must not be empty"));
     }
+    // Byte length, not `chars().count()`: this is the O(1) DoS guard that runs
+    // before any grammar walk. Both CRD grammars are ASCII-only, so for an
+    // operand the API server could have admitted the two are identical, and a
+    // multi-byte operand is rejected by the grammar regardless.
     if value.len() > MAX_GRPC_METHOD_OPERAND_LENGTH {
         return Err(format!(
-            "matches[].method.{field} must not exceed {MAX_GRPC_METHOD_OPERAND_LENGTH} characters"
+            "matches[].method.{field} must not exceed {MAX_GRPC_METHOD_OPERAND_LENGTH} bytes"
         ));
     }
     Ok(())
@@ -8472,6 +8508,31 @@ mod tests {
             (
                 serde_json::json!({"headers": [{"name": "x"}]}),
                 "matches[].headers[].value is required",
+            ),
+            // A present non-string operand must not read as an omission: that
+            // would silently degrade an exact `=/pkg.Svc/SayHello` listener
+            // into the far broader method-only or service-only shape.
+            (
+                serde_json::json!({"method": {"service": 1, "method": "SayHello"}}),
+                "matches[].method.service must be a string",
+            ),
+            (
+                serde_json::json!({"method": {"service": "pkg.Svc", "method": null}}),
+                "matches[].method.method must be a string",
+            ),
+            (
+                serde_json::json!({"method": {"service": ["pkg.Svc"], "method": "SayHello"}}),
+                "matches[].method.service must be a string",
+            ),
+            // The CRD `method` predicate and Ferrum's hand-authored `path`
+            // extension are mutually exclusive: honoring either alone would
+            // discard the other half of the conjunction and widen the match.
+            (
+                serde_json::json!({
+                    "method": {"service": "pkg.Svc", "method": "SayHello"},
+                    "path": {"type": "PathPrefix", "value": "/pkg.Svc"}
+                }),
+                "must not carry both 'method' and the Ferrum 'path' extension",
             ),
         ] {
             let reason = grpc_route_match(&entry)

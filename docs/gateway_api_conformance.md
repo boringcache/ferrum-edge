@@ -217,11 +217,13 @@ hand-authored one that it would have rejected never reaches routing state:
 
 - `method.type: RegularExpression`, and any `method.type` other than `Exact`.
 - A `method` block with neither `service` nor `method`.
-- An `Exact` `service` that is empty, longer than 1024 characters, or does not
+- An `Exact` `service` that is empty, longer than 1024 bytes (the CRD's
+  `MaxLength=1024`; both grammars are ASCII-only, so bytes and characters
+  coincide for any operand the API server could have admitted), or does not
   match `^\.?[a-z_][a-z_0-9]*(\.[a-z_][a-z_0-9]*)*$` (applied
   case-insensitively) — so a leading digit or hyphen, an empty dotted segment,
   a path separator, a percent escape, or whitespace is refused.
-- An `Exact` `method` that is empty, longer than 1024 characters, or does not
+- An `Exact` `method` that is empty, longer than 1024 bytes, or does not
   match `^[A-Za-z_][A-Za-z_0-9]*$` — a single protobuf identifier, so a dot or
   hyphen is refused here even though `service` allows the dot.
 - A `content-type` header match whose value is not a native gRPC media type — it
@@ -235,6 +237,15 @@ hand-authored one that it would have rejected never reaches routing state:
   *Omitting* either field keeps its documented meaning — an omitted `method`
   matches any gRPC call on the route's hostnames, and omitted `headers` adds no
   header predicate.
+- A **present but non-string** `method.service` or `method.method` (including an
+  explicit null). Reading it as an omission would silently degrade an exact
+  `=/{service}/{method}` listener into the far broader method-only or
+  service-only shape.
+- A match entry carrying **both** `method` and Ferrum's hand-authored
+  `matches[].path` extension. `path` is not a GRPCRoute CRD field (the API
+  server prunes it), and Ferrum's plan is a single listen path *or* a single URI
+  predicate, so honoring either half alone would discard the other and widen the
+  match. Use one or the other.
 
 Refusal warnings never echo the operator-supplied operand or header value back,
 since both are unbounded, attacker-influenceable input.
