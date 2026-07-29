@@ -1737,8 +1737,9 @@ FUZZ_WORKFLOW = r"""name: Fuzz
 #     is interpolated into a command;
 #   * every libFuzzer run is bounded in wall time, input length, per-input
 #     timeout, and resident set size;
-#   * crash artifacts are size- and count-bounded BEFORE upload, are uploaded
-#     from one fixed path, and expire quickly;
+#   * crash artifacts are rejected if any path is a symlink or other
+#     non-regular object, then size- and count-bounded BEFORE upload, uploaded
+#     from one fixed path, and expired quickly;
 #   * no Cross toolchain, aarch64 target, unpinned tool install, or release
 #     publication path is reachable from this file.
 
@@ -1832,6 +1833,17 @@ jobs:
           directory="artifacts/$FUZZ_TARGET"
           if [ ! -d "$directory" ]; then
             exit 0
+          fi
+          # upload-artifact follows symbolic links by default. Reject the root
+          # path and every descendant unless it is a directory or regular file,
+          # so the fixed upload path cannot escape into unrelated runner state.
+          if [ -L "$directory" ]; then
+            echo "::error::the crash artifact directory must not be a symbolic link" >&2
+            exit 1
+          fi
+          if find "$directory" \( -type l -o \( ! -type d ! -type f \) \) -print -quit | grep -q .; then
+            echo "::error::crash artifacts must contain only directories and regular files" >&2
+            exit 1
           fi
           if find "$directory" -type f -size +64k -print -quit | grep -q .; then
             echo "::error::a crash artifact exceeds 64 KiB; triage and redact it locally" >&2
@@ -22113,6 +22125,10 @@ pre_build = []
         "ungated artifact publication": (
             "        if: always() && steps.bound.outcome == 'success'\n",
             "        if: always()\n",
+        ),
+        "symlink-following artifact publication": (
+            '          if [ -L "$directory" ]; then\n',
+            '          if false; then\n',
         ),
         "local action substitution": (
             "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7",

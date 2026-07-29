@@ -1105,8 +1105,9 @@ shapes and nothing else:
   read-only at workflow and job level, references no secret, pins every action
   to a full commit SHA, bounds every libFuzzer run in wall time / input length /
   per-input timeout / RSS, re-checks the matrix target against a literal
-  allowlist before it reaches a command line, and bounds crash artifacts by size
-  and count **before** publication — with the upload gated on that bounding step
+  allowlist before it reaches a command line, rejects symlinks and other
+  non-regular crash-artifact objects, and bounds regular artifacts by size and
+  count **before** publication — with the upload gated on that bounding step
   having succeeded, from one fixed path, at short retention.
 
 Neither admitted shape names the protected ARM64 target or the Cross executable,
