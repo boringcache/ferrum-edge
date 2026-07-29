@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Machine-readable vendored-patch lifecycle inventory at
+  `docs/vendored-patch-lifecycle.json`, enforced on every PR and weekly
+  `dependency-audit` run by `scripts/check_vendored_patch_lifecycle.py`. The
+  inventory records owner, upstream filing state (or deliberate-fork staging ref),
+  co-retirement groups, compatible-release test status, and the shared retirement
+  checklist for all eleven current `[patch.crates-io]` logical patches. Unfiled
+  deliberate forks are flagged for upstream filing or dated owner reaffirmation
+  rather than tracked only in GitHub issue #3335.
+
 ### Security
 
 - Plugin egress no longer inherits ambient proxy configuration

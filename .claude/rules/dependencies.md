@@ -8,8 +8,9 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `[patch.crates-io]` in `Cargo.toml`: `reqwest 0.13.3`, `h3 0.0.8` (three
   patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
-  the inventory table in `docs/dependency-policy.md`. Keep them, the
-  `[patch.crates-io]` block, and `scripts/check_vendored_patch_status.sh` in sync.
+  the inventory table in `docs/dependency-policy.md` plus a matching entry in
+  `docs/vendored-patch-lifecycle.json`. Keep them, the
+  `[patch.crates-io]` block, and `scripts/check_vendored_patch_lifecycle.py` in sync.
 - Vendoring is a last resort: prefer a dependency bump, feature flag, or
   gateway-side workaround. A new vendored patch requires a written retirement
   plan and a behavioral regression test.

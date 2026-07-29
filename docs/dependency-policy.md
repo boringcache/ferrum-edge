@@ -3,8 +3,10 @@
 This document is the single policy for how Ferrum Edge manages third-party
 dependencies and, in particular, the **vendored, patched copies** of upstream
 crates it carries in `vendor/**`. It is the human half of the governance; the
-machine half is `deny.toml`, the scheduled `.github/workflows/dependency-audit.yml`
-workflow, and the drift guard in `tests/integration/vendor_integrity_tests.rs`.
+machine half is `deny.toml`, [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json),
+the scheduled `.github/workflows/dependency-audit.yml` workflow,
+`scripts/check_vendored_patch_lifecycle.py`, and the drift guard in
+`tests/integration/vendor_integrity_tests.rs`.
 
 > TL;DR — vendored patches must be **auditable** (pinned + drift-tested),
 > **tracked** (an upstream PR — or a governed [deliberate-fork record](#deliberate-fork-policy-and-sla)
@@ -30,9 +32,11 @@ feature flag, or a gateway-side workaround first.
 
 ## Vendored crate inventory
 
-Each row is the authoritative tracking record. Keep this table, the
-`[patch.crates-io]` block in `Cargo.toml`, the per-patch docs, and the
-`PATCHES` array in `scripts/check_vendored_patch_status.sh` in sync.
+Each row is the authoritative human summary. Keep this table, the
+[`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json) machine
+inventory, the `[patch.crates-io]` block in `Cargo.toml`, the per-patch docs, and
+`scripts/check_vendored_patch_lifecycle.py` in sync. CI fails when any surface
+drifts.
 
 | Crate | Vendored ver. | Patch | Upstream issue / PR | Owner | Reason | Removal trigger | Docs |
 |---|---|---|---|---|---|---|---|
@@ -48,8 +52,8 @@ Each row is the authoritative tracking record. Keep this table, the
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::set_fragment_accounting()` | **Deliberate fork** — unfiled upstream ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Same accounting gap on the async wrapper, which hides the codec behind `SplitStream` after `split()` | Upstream ships the equivalent delegator alongside the tungstenite hook | [docs/upstream-tungstenite-patches/004-…](upstream-tungstenite-patches/004-fragment-accounting/README.md) |
 | `dimpl` | 0.6.1 | Full leaf-first certificate-chain transport and zeroizing private-key ownership | **Deliberate fork** — unfiled upstream; base commit `37bb0fa83f4167420729de5ea71c61852f82e9ed` ([policy](#deliberate-fork-policy-and-sla)) | `@jeremyjpj0916` | Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary `Vec<u8>` owners | Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths | [docs/upstream-dimpl-patches/001-…](upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/README.md) |
 
-> Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
-> and the vendored-patch scripts are owned via
+> Ownership note: `vendor/`, `deny.toml`, this doc, `docs/vendored-patch-lifecycle.json`,
+> `docs/upstream-*-patches/`, and the vendored-patch scripts are owned via
 > [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
 > docs. Patches carried without an upstream PR, including the tungstenite frame
@@ -62,7 +66,8 @@ Each row is the authoritative tracking record. Keep this table, the
 
 Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
 tungstenite #556 / tokio-tungstenite #380); the weekly
-`scripts/check_vendored_patch_status.sh` polls those and goes red when one
+`scripts/check_vendored_patch_status.sh` (backed by
+`docs/vendored-patch-lifecycle.json`) polls those and goes red when one
 merges. Fork-only patches currently include **h3 002** (Extended CONNECT
 `:protocol=websocket`), **h3 003** (`peek_recv_trailers`), the tungstenite
 frame-limit origin extension, **tungstenite `auto_pong`** (transparent Ping
@@ -78,8 +83,8 @@ zeroization). They are not untracked TODOs; they are carried as
 - **Review cadence (SLA).** Every weekly `dependency-audit` run lists each
   fork-only patch as `NOT YET FILED`. At each run the owner either (a) files the
   upstream issue/PR and records the numbers in the inventory table, the per-patch
-  `README.md` Status block, **and** the `PATCHES` array in
-  `scripts/check_vendored_patch_status.sh`, or (b) leaves it as a conscious
+  `README.md` Status block, **and**
+  [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json), or (b) leaves it as a conscious
   re-affirmation that the fork is still the right call.
 - **Hard checkpoint — no unfiled fork ships in a stable release.** A fork-only
   patch (no upstream PR link) may **not** survive the first tagged stable release
@@ -163,9 +168,15 @@ demand:
 - **advisories** — re-runs the `cargo deny` gate against the freshly-fetched
   advisory DB (catches new advisories with no PR), runs the expiry check, and
   runs `cargo audit` as an independent second opinion.
+- **lifecycle-parity** — `scripts/check_vendored_patch_lifecycle.py` verifies
+  that every patch row in `docs/vendored-patch-lifecycle.json` matches
+  `Cargo.toml`, `vendor/`, the inventory table here, and per-patch READMEs.
+  The per-PR `dependency-audit` job runs the same parity gate.
 - **upstream-patch-status** — `scripts/check_vendored_patch_status.sh` queries
   each tracked upstream PR. The run goes **red when an upstream PR has merged**
-  (a retirement signal) and reports each crate's latest crates.io release.
+  (a retirement signal — run the compatible-release test before deleting vendor
+  copies) and reports each crate's latest crates.io release plus deliberate-fork
+  reaffirmation gaps.
 
 ### 5. Behavioral regression tests for the patched behaviors
 
@@ -223,8 +234,8 @@ adding, retiring, or changing a vendored patch.
 5. Add a behavioral regression test for the fixed behavior and wire it into the
    `Vendored Patch Regressions` CI job when it lives outside the normal root
    test matrix.
-6. Add a row to the inventory table above and to the `PATCHES` array in
-   `scripts/check_vendored_patch_status.sh`.
+6. Add a row to the inventory table above and a matching entry to
+   [`docs/vendored-patch-lifecycle.json`](vendored-patch-lifecycle.json).
 7. Regenerate the drift manifest: `scripts/update_vendor_integrity.sh`.
 8. File the upstream issue/PR and record the numbers.
 
@@ -249,7 +260,8 @@ and tungstenite, *both* co-vendored patches must be ready — see the table).
 4. Move `docs/upstream-<crate>-patches/NNN-…/` to `…/_retired/NNN-…/` with a
    `STATUS.md` (merge commit + registry version), or delete per that crate's
    README.
-5. Remove the inventory row + the `scripts/check_vendored_patch_status.sh` entry.
+5. Remove the inventory row and the matching `docs/vendored-patch-lifecycle.json`
+   entry.
 6. Regenerate the drift manifest (now smaller) and keep the gateway call sites —
    they use the upstream API by design.
 7. Run the behavioral regression tests; they must still pass.
@@ -368,6 +380,8 @@ a shell as a shortcut.
 
 ## See also
 
+- `docs/vendored-patch-lifecycle.json` — machine-readable owner/upstream/retirement
+  inventory enforced by `scripts/check_vendored_patch_lifecycle.py`.
 - `deny.toml` — the gate configuration and current exceptions.
 - `SECURITY.md` — vulnerability reporting and severity timelines.
 - `docs/upstream-reqwest-patches/`, `docs/upstream-h3-patches/`,

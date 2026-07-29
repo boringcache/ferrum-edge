@@ -37,7 +37,7 @@ keep the upstream default.
 1. Open an issue on [snapview/tungstenite-rs](https://github.com/snapview/tungstenite-rs) describing the transparent-proxy use case and proposing `WebSocketConfig::auto_pong` (default `true`).
 2. Push a fork branch with the patch applied and open a PR.
 3. Record the issue + PR numbers here, in `docs/dependency-policy.md`, and in
-   `scripts/check_vendored_patch_status.sh`.
+   `docs/vendored-patch-lifecycle.json`.
 
 ## Retirement
 

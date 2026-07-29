@@ -1,0 +1,379 @@
+{
+  "schema_version": 1,
+  "description": "Machine-readable vendored-patch lifecycle inventory. Human prose remains in docs/dependency-policy.md and per-patch READMEs; this file is the contract CI enforces against Cargo.toml, vendor/, scripts/check_vendored_patch_lifecycle.py, and the policy inventory table.",
+  "retirement_checklist": [
+    "Bump registry dependency versions in Cargo.toml and Cargo.lock when a compatible upstream release is identified.",
+    "Validate behavior on a branch that removes the relevant patch before merging retirement.",
+    "Preserve Ferrum behavioral regression tests; drop vendor-only tests that no longer apply.",
+    "Respect co-retirement groups — retire grouped patches in the same change.",
+    "Remove the matching [patch.crates-io] entries and vendor directories.",
+    "Update docs/dependency-policy.md, per-patch READMEs, docs/vendored-patch-lifecycle.json, vendor/VENDOR_INTEGRITY.sha256, and mirrored standalone [patch.crates-io] tables (tests/performance/mesh/Cargo.toml)."
+  ],
+  "co_retirement_groups": [
+    {
+      "id": "h3-all",
+      "description": "All three logical h3 patches share vendor/h3-0.0.8-ferrum-patched and must retire together.",
+      "patch_ids": [
+        "h3-001-recv-frame-drain-on-quic-close",
+        "h3-002-extended-connect-websocket-protocol",
+        "h3-003-peek-buffered-trailers-before-fin"
+      ]
+    },
+    {
+      "id": "tungstenite-lossless-takeover",
+      "description": "Lossless raw takeover APIs must ship in compatible tungstenite and tokio-tungstenite releases before retirement.",
+      "patch_ids": [
+        "tungstenite-001-lossless-takeover",
+        "tokio-tungstenite-001-lossless-takeover"
+      ]
+    },
+    {
+      "id": "tungstenite-fragment-accounting",
+      "description": "Fragment accounting hook and async delegator retire together.",
+      "patch_ids": [
+        "tungstenite-004-fragment-accounting",
+        "tokio-tungstenite-004-fragment-accounting-delegator"
+      ]
+    }
+  ],
+  "patches": [
+    {
+      "id": "reqwest-001-per-request-connect-timeout",
+      "label": "reqwest per-request connect_timeout",
+      "crate": "reqwest",
+      "vendored_version": "0.13.3",
+      "vendor_path": "vendor/reqwest-0.13.3-ferrum-patched",
+      "docs_path": "docs/upstream-reqwest-patches/001-per-request-connect-timeout/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Pool keys exclude request-only connect/read timeouts, so sibling proxies can share one client; without per-request connect timeout the first proxy's timeout leaks to all.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "seanmonstar/reqwest",
+        "pr_number": 3017,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "PR #3017 merges and ships in a release we consume.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/connection_pool_tests.rs::test_connect_timeout_does_not_fragment_pool",
+        "tests/integration/connection_pool_tests.rs::test_pooled_client_exposes_per_request_connect_timeout"
+      ]
+    },
+    {
+      "id": "h3-001-recv-frame-drain-on-quic-close",
+      "label": "h3 frame-drain on QUIC close",
+      "crate": "h3",
+      "vendored_version": "0.0.8",
+      "vendor_path": "vendor/h3-0.0.8-ferrum-patched",
+      "docs_path": "docs/upstream-h3-patches/001-recv-frame-drain-on-quic-close/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "io_uring batching of STREAM(FIN) + CONNECTION_CLOSE(H3_NO_ERROR) dropped a buffered HEADERS frame, producing a false 502 on graceful close.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "hyperium/h3",
+        "pr_number": 339,
+        "issue_number": 338,
+        "fork_ref": "jeremyjpj0916/h3@fix/recv-frame-drain-on-quic-close"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Fix ships in an h3 release and patches 002/003 are also retired.",
+        "co_retirement_group": "h3-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/http3_integration_tests.rs::h3_buffered_response_survives_graceful_close_race",
+        "tests/integration/http3_integration_tests.rs::h3_goaway_after_complete_body_is_treated_as_graceful",
+        "tests/integration/http3_integration_tests.rs::h3_stream_reset_after_partial_body_is_not_treated_as_graceful",
+        "tests/functional/scripted_backend_h3_tests.rs",
+        "vendor/h3-0.0.8-ferrum-patched (frame unit tests)"
+      ]
+    },
+    {
+      "id": "h3-002-extended-connect-websocket-protocol",
+      "label": "h3 Extended CONNECT :protocol=websocket",
+      "crate": "h3",
+      "vendored_version": "0.0.8",
+      "vendor_path": "vendor/h3-0.0.8-ferrum-patched",
+      "docs_path": "docs/upstream-h3-patches/002-extended-connect-websocket-protocol/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Stock h3 0.0.8 rejects :protocol=websocket at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": "jeremyjpj0916/h3@feat/extended-connect-websocket-protocol"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream files and merges the variant and patches 001/003 are also retired.",
+        "co_retirement_group": "h3-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/functional/functional_websocket_test.rs (HTTP/3 Extended CONNECT)"
+      ]
+    },
+    {
+      "id": "h3-003-peek-buffered-trailers-before-fin",
+      "label": "h3 peek buffered trailers before FIN",
+      "crate": "h3",
+      "vendored_version": "0.0.8",
+      "vendor_path": "vendor/h3-0.0.8-ferrum-patched",
+      "docs_path": "docs/upstream-h3-patches/003-peek-buffered-trailers-before-fin/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "poll_recv_trailers buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "hyperium/h3",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": "jeremyjpj0916/h3@feat/peek-buffered-trailers-before-fin"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream files and merges the API and patches 001/002 are also retired.",
+        "co_retirement_group": "h3-all",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "tests/integration/http3_integration_tests.rs (delayed-FIN trailer preservation)"
+      ]
+    },
+    {
+      "id": "tungstenite-001-lossless-takeover",
+      "label": "tungstenite lossless raw takeover",
+      "crate": "tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Tunnel mode lost backend bytes coalesced with the 101 response when dropping to raw relay.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "snapview/tungstenite-rs",
+        "pr_number": 556,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Both this and tokio-tungstenite-001 ship in compatible releases.",
+        "co_retirement_group": "tungstenite-lossless-takeover",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tungstenite-0.29.0-ferrum-patched (into_inner_with_read_buffer)"
+      ]
+    },
+    {
+      "id": "tungstenite-002-frame-limit-origin",
+      "label": "tungstenite distinct frame-limit origin",
+      "crate": "tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "Equal frame/message ceilings otherwise lose which parser boundary rejected input and can emit the wrong configured close reason.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "snapview/tungstenite-rs",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships equivalent frame-vs-message capacity attribution, or the gateway no longer needs distinct policy reasons.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tungstenite-0.29.0-ferrum-patched (size_limit_hit)"
+      ]
+    },
+    {
+      "id": "tungstenite-003-optional-auto-pong",
+      "label": "tungstenite optional auto_pong",
+      "crate": "tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/003-optional-auto-pong/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "Stock framer auto-answers Ping while the gateway also forwards it, so one Ping yields two Pongs and a hung backend still looks healthy.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "snapview/tungstenite-rs",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships equivalent default-true auto-Pong opt-out, or the gateway no longer needs transparent Ping/Pong.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tungstenite-0.29.0-ferrum-patched (auto_pong)",
+        "tests/unit/gateway_core/websocket_auto_pong_tests.rs",
+        "tests/functional/functional_websocket_test.rs"
+      ]
+    },
+    {
+      "id": "tungstenite-004-fragment-accounting",
+      "label": "tungstenite fragment accounting and incomplete-message bounds",
+      "crate": "tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/004-fragment-accounting/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "The reader only sees reassembled messages, so fragmented frames bypass per-message admission policy and are unbounded in count and duration.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "snapview/tungstenite-rs",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships an equivalent pre-reassembly fragment hook and independent incomplete-message count/duration bounds.",
+        "co_retirement_group": "tungstenite-fragment-accounting",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tungstenite-0.29.0-ferrum-patched (fragment / incomplete_message)",
+        "tests/unit/gateway_core/websocket_fragment_metering_tests.rs"
+      ]
+    },
+    {
+      "id": "tokio-tungstenite-001-lossless-takeover",
+      "label": "tokio-tungstenite lossless raw takeover",
+      "crate": "tokio-tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tokio-tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/",
+      "owner": "Ferrum Edge maintainers",
+      "owner_github": null,
+      "reason": "Same lossless-takeover gap on the async wrapper.",
+      "upstream": {
+        "filing": "filed",
+        "github_repo": "snapview/tokio-tungstenite",
+        "pr_number": 380,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Both this and tungstenite-001 ship in compatible releases.",
+        "co_retirement_group": "tungstenite-lossless-takeover",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tokio-tungstenite-0.29.0-ferrum-patched (into_inner_with_read_buffer)"
+      ]
+    },
+    {
+      "id": "tokio-tungstenite-004-fragment-accounting-delegator",
+      "label": "tokio-tungstenite fragment accounting delegator",
+      "crate": "tokio-tungstenite",
+      "vendored_version": "0.29.0",
+      "vendor_path": "vendor/tokio-tungstenite-0.29.0-ferrum-patched",
+      "docs_path": "docs/upstream-tungstenite-patches/004-fragment-accounting/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "Same accounting gap on the async wrapper, which hides the codec behind SplitStream after split().",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "snapview/tokio-tungstenite",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": null
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships the equivalent delegator alongside the tungstenite hook.",
+        "co_retirement_group": "tungstenite-fragment-accounting",
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/tokio-tungstenite-0.29.0-ferrum-patched (fragment accounting delegator)"
+      ]
+    },
+    {
+      "id": "dimpl-001-certificate-chain-and-key-zeroization",
+      "label": "dimpl certificate chains and key zeroization",
+      "crate": "dimpl",
+      "vendored_version": "0.6.1",
+      "vendor_path": "vendor/dimpl-0.6.1-ferrum-patched",
+      "docs_path": "docs/upstream-dimpl-patches/001-certificate-chain-and-key-zeroization/",
+      "owner": "@jeremyjpj0916",
+      "owner_github": "jeremyjpj0916",
+      "reason": "Published releases expose only one local certificate and retain endpoint/fallback credential bytes in ordinary Vec<u8> owners.",
+      "upstream": {
+        "filing": "deliberate_fork_unfiled",
+        "github_repo": "algesten/dimpl",
+        "pr_number": null,
+        "issue_number": null,
+        "fork_ref": "37bb0fa83f4167420729de5ea71c61852f82e9ed"
+      },
+      "reaffirmation": null,
+      "retirement": {
+        "trigger": "Upstream ships compatible full-chain DTLS 1.2/1.3 transport, peer-chain output, and drop-time key zeroization on all ownership paths.",
+        "co_retirement_group": null,
+        "compatible_release_test": {
+          "status": "not_started",
+          "notes": null
+        }
+      },
+      "regression_tests": [
+        "vendor/dimpl-0.6.1-ferrum-patched/tests/auto/credential_security.rs"
+      ]
+    }
+  ]
+}
