@@ -12667,6 +12667,52 @@ components:
     # Per-plugin configuration schemas. The `config` field on PluginConfig
     # accepts one of these depending on the `plugin_name` value.
 
+    AccessLogFilterExpression:
+      description: >-
+        Bounded boolean predicate tree for stdout logging. Runtime validation
+        rejects trees larger than 32 nodes. This form is mutually exclusive
+        with the flat stdout filter predicates.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [op, left, right]
+          properties:
+            op:
+              type: string
+              enum: [and, or]
+            left:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
+            right:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
+        - type: object
+          additionalProperties: false
+          required: [op, value]
+          properties:
+            op:
+              type: string
+              enum: [status_code_min, status_code_max]
+            value:
+              type: integer
+              minimum: 0
+              maximum: 65535
+        - type: object
+          additionalProperties: false
+          required: [op, value]
+          properties:
+            op:
+              type: string
+              const: min_latency_ms
+            value:
+              type: integer
+              minimum: 0
+        - type: object
+          additionalProperties: false
+          required: [op]
+          properties:
+            op:
+              type: string
+              const: errors_only
+
     StdoutLoggingConfig:
       type: [object, "null"]
       additionalProperties: false
@@ -12678,7 +12724,8 @@ components:
           description: >-
             Optional predicate that suppresses log entries before they are
             serialized. All present fields must match for an entry to be
-            logged. When omitted, every transaction is logged.
+            logged. The expression form is mutually exclusive with the flat
+            predicates. When omitted, every transaction is logged.
           properties:
             status_code_min:
               type: integer
@@ -12704,6 +12751,8 @@ components:
                 grpc_status. Stream summaries require error_class or
                 connection_error. Status and latency predicates remain
                 independent and must also match.
+            expression:
+              $ref: "#/components/schemas/AccessLogFilterExpression"
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:

@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::modes::mesh::access_log_filter::{
     AccessLogFilterContext, StreamAccessLogFilterContext, evaluate_access_log_filter_expr,
-    evaluate_access_log_filter_expr_for_stream,
+    evaluate_access_log_filter_expr_for_stream, validate_access_log_filter_expr,
 };
 use crate::modes::mesh::config::AccessLogFilterExpr;
 
@@ -89,19 +89,42 @@ impl StdoutLogging {
                             .to_string(),
                     );
                 }
+                let min_latency_ms = parse_optional_u64(filter_config, "min_latency_ms")?;
+                let errors_only =
+                    parse_optional_bool(filter_config, "errors_only")?.unwrap_or(false);
                 let expression = match filter_config.get("expression") {
                     None | Some(Value::Null) => None,
-                    Some(value) => Some(serde_json::from_value(value.clone()).map_err(|err| {
-                        format!("stdout_logging: filter.expression is invalid: {err}")
-                    })?),
+                    Some(value) => {
+                        let expression =
+                            serde_json::from_value(value.clone()).map_err(|err| {
+                                format!("stdout_logging: filter.expression is invalid: {err}")
+                            })?;
+                        validate_access_log_filter_expr(&expression).map_err(|err| {
+                            format!("stdout_logging: filter.expression is invalid: {err}")
+                        })?;
+                        Some(expression)
+                    }
                 };
+                let has_flat_predicate_key = [
+                    "status_code_min",
+                    "status_code_max",
+                    "min_latency_ms",
+                    "errors_only",
+                ]
+                .iter()
+                .any(|key| filter_config.contains_key(*key));
+                if expression.is_some() && has_flat_predicate_key {
+                    return Err(
+                        "stdout_logging: filter.expression cannot be combined with flat filter predicates"
+                            .to_string(),
+                    );
+                }
                 Some(Filter {
                     flat: FlatFilter {
                         status_code_min,
                         status_code_max,
-                        min_latency_ms: parse_optional_u64(filter_config, "min_latency_ms")?,
-                        errors_only: parse_optional_bool(filter_config, "errors_only")?
-                            .unwrap_or(false),
+                        min_latency_ms,
+                        errors_only,
                     },
                     expression,
                 })

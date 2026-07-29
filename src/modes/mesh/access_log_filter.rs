@@ -119,6 +119,38 @@ pub fn access_log_filter_has_expression(filter: &AccessLogFilter) -> bool {
     filter.expression.is_some()
 }
 
+/// Validate a serialized expression tree at the plugin/config boundary.
+///
+/// Istio expressions already cross the bounded parser above, but operators can
+/// configure `stdout_logging.filter.expression` directly. Keep that path under
+/// the same node ceiling so the recursive hot-path evaluator has a proven
+/// bound regardless of where the configuration originated.
+pub fn validate_access_log_filter_expr(expr: &AccessLogFilterExpr) -> Result<(), String> {
+    let mut pending = vec![expr];
+    let mut node_count = 0usize;
+    while let Some(node) = pending.pop() {
+        node_count += 1;
+        if node_count > MAX_ACCESS_LOG_FILTER_AST_NODES {
+            return Err(format!(
+                "access log filter expression exceeds maximum AST node count of \
+                 {MAX_ACCESS_LOG_FILTER_AST_NODES}"
+            ));
+        }
+        match node {
+            AccessLogFilterExpr::And { left, right }
+            | AccessLogFilterExpr::Or { left, right } => {
+                pending.push(right);
+                pending.push(left);
+            }
+            AccessLogFilterExpr::StatusCodeMin { .. }
+            | AccessLogFilterExpr::StatusCodeMax { .. }
+            | AccessLogFilterExpr::MinLatencyMs { .. }
+            | AccessLogFilterExpr::ErrorsOnly => {}
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedExpr {
     And(Box<ParsedExpr>, Box<ParsedExpr>),
