@@ -2192,10 +2192,19 @@ impl DnsCache {
         // protected even if its hostname collector includes placeholders.
         //
         // Deduplicate by hostname for query coalescing. Keep the first override
-        // and the shortest per-proxy TTL seen so the initial publish schedules
-        // proactive refresh for the most aggressive consumer; longer-TTL peers
-        // still evaluate freshness independently on later resolves.
-        let mut seen: HashMap<String, (Option<String>, Option<u64>)> = HashMap::new();
+        // plus the full observed TTL-policy range. The one lookup uses the
+        // shortest explicit TTL for proactive refresh, then records the longest
+        // explicit and default/global/native policies on the shared row so
+        // age eviction cannot discard data still fresh for a warmup consumer
+        // that has not sent its first request yet.
+        struct WarmupPolicy {
+            override_ip: Option<String>,
+            shortest_explicit_ttl: Option<u64>,
+            longest_explicit_ttl: Option<u64>,
+            default_consumer_observed: bool,
+        }
+
+        let mut seen: HashMap<String, WarmupPolicy> = HashMap::new();
         for (host, override_ip, ttl) in hostnames {
             if host.trim().is_empty() {
                 continue;
@@ -2203,24 +2212,36 @@ impl DnsCache {
             let key = dns_hostname_key(&host).into_owned();
             match seen.entry(key) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert((override_ip, ttl));
+                    slot.insert(WarmupPolicy {
+                        override_ip,
+                        shortest_explicit_ttl: ttl,
+                        longest_explicit_ttl: ttl,
+                        default_consumer_observed: ttl.is_none(),
+                    });
                 }
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    let (existing_override, existing_ttl) = slot.get_mut();
-                    if existing_override.is_none() && override_ip.is_some() {
-                        *existing_override = override_ip;
+                    let policy = slot.get_mut();
+                    if policy.override_ip.is_none() && override_ip.is_some() {
+                        policy.override_ip = override_ip;
                     }
-                    *existing_ttl = match (*existing_ttl, ttl) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (None, other) | (other, None) => other,
-                    };
+                    if let Some(ttl) = ttl {
+                        policy.shortest_explicit_ttl = Some(
+                            policy
+                                .shortest_explicit_ttl
+                                .map_or(ttl, |existing| existing.min(ttl)),
+                        );
+                        policy.longest_explicit_ttl = Some(
+                            policy
+                                .longest_explicit_ttl
+                                .map_or(ttl, |existing| existing.max(ttl)),
+                        );
+                    } else {
+                        policy.default_consumer_observed = true;
+                    }
                 }
             }
         }
-        let unique: Vec<_> = seen
-            .into_iter()
-            .map(|(host, (override_ip, ttl))| (host, override_ip, ttl))
-            .collect();
+        let unique: Vec<_> = seen.into_iter().collect();
 
         if unique.is_empty() {
             debug!("DNS warmup: no hostnames to resolve");
@@ -2235,11 +2256,29 @@ impl DnsCache {
         );
 
         stream::iter(unique)
-            .for_each_concurrent(self.warmup_concurrency, |(host, override_ip, ttl)| {
+            .for_each_concurrent(self.warmup_concurrency, |(host, policy)| {
                 let cache = self.clone();
                 async move {
-                    match cache.resolve(&host, override_ip.as_deref(), ttl).await {
-                        Ok(addr) => debug!("DNS warmup: {} -> {}", host, addr),
+                    match cache
+                        .resolve(
+                            &host,
+                            policy.override_ip.as_deref(),
+                            policy.shortest_explicit_ttl,
+                        )
+                        .await
+                    {
+                        Ok(addr) => {
+                            let cache_key = dns_hostname_key(&host);
+                            if let Some(entry) = cache.cache.get(cache_key.as_ref()) {
+                                if let Some(longest) = policy.longest_explicit_ttl {
+                                    entry.note_per_proxy_ttl(Some(longest));
+                                }
+                                if policy.default_consumer_observed {
+                                    entry.note_per_proxy_ttl(None);
+                                }
+                            }
+                            debug!("DNS warmup: {} -> {}", host, addr);
+                        }
                         Err(e) => warn!("DNS warmup failed for {}: {}", host, e),
                     }
                 }
@@ -4391,12 +4430,55 @@ mod tests {
                     .load_shortest_per_proxy_ttl(),
                 Some(1)
             );
+            assert_eq!(
+                cache
+                    .cache
+                    .get("127.0.0.1")
+                    .expect("warmed")
+                    .load_longest_per_proxy_ttl(),
+                Some(600),
+                "warmup must retain the longest advertised policy before first traffic"
+            );
 
             tokio::time::sleep(Duration::from_secs(2)).await;
             let now = Instant::now();
             let entry = cache.cache.get("127.0.0.1").expect("warmed row");
             assert!(cache.consumer_fresh_until(&entry, Some(600)) > now);
             assert!(cache.consumer_fresh_until(&entry, Some(1)) <= now);
+        }
+
+        for hostnames in [
+            vec![
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+                ("127.0.0.1".to_string(), None, None),
+            ],
+            vec![
+                ("127.0.0.1".to_string(), None, None),
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+            ],
+        ] {
+            let cache = DnsCache::new(DnsConfig {
+                ttl_override_seconds: Some(3600),
+                min_ttl_seconds: 1,
+                stale_ttl_seconds: 0,
+                ..DnsConfig::default()
+            });
+            cache.warmup(hostnames).await;
+            let entry = cache.cache.get("127.0.0.1").expect("warmed");
+            assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(1));
+            assert!(
+                entry.load_default_consumer_observed(),
+                "warmup must retain a default/global/native consumer in either order"
+            );
+            assert_eq!(
+                cache.shared_retention_ttl(
+                    entry.native_ttl,
+                    entry.load_longest_per_proxy_ttl(),
+                    entry.load_default_consumer_observed(),
+                ),
+                Duration::from_secs(3600),
+                "default/global retention must be known before first traffic"
+            );
         }
     }
 
