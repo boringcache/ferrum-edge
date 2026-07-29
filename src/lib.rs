@@ -28,6 +28,7 @@ pub mod date_cache;
 pub mod dns;
 pub mod dtls;
 pub mod ebpf;
+#[cfg(feature = "fuzzing")]
 pub mod fuzz_support;
 pub mod grpc;
 pub mod health_check;

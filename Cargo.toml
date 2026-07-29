@@ -270,6 +270,7 @@ aya-log = { version = "0.2", optional = true }
 # builds that never use external secret providers.
 [features]
 default = []
+fuzzing = []
 acme = ["dep:instant-acme", "dep:hyper-rustls"]
 pkcs11 = ["dep:cryptoki"]
 cloud-secrets = ["secrets-vault", "secrets-aws", "secrets-gcp", "secrets-azure"]

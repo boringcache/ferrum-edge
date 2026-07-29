@@ -3,8 +3,7 @@ use ferrum_edge::fuzz_support::{
     fuzz_translate_k8s_json, fuzz_validate_plugin_config, mesh_udp_frame_round_trip,
     smoke_invariants, traceparent_round_trip_invariant, MAX_FUZZ_INPUT_BYTES,
 };
-use ferrum_edge::proxy::mesh_udp_frame::{encode_datagram, pop_framed_datagram, MAX_FRAME_PAYLOAD};
-use bytes::BytesMut;
+use ferrum_edge::proxy::mesh_udp_frame::MAX_FRAME_PAYLOAD;
 use proptest::prelude::*;
 
 #[test]
@@ -39,11 +38,7 @@ proptest! {
 
 #[test]
 fn encode_pop_round_trip_empty_datagram() {
-    let mut wire = BytesMut::new();
-    encode_datagram(&mut wire, b"").unwrap();
-    let mut buf = wire;
-    let frame = pop_framed_datagram(&mut buf).expect("empty frame");
-    assert!(frame.is_empty());
+    mesh_udp_frame_round_trip(b"").expect("empty frame round-trip");
 }
 
 #[test]

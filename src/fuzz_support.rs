@@ -4,9 +4,7 @@
 //! with explicit input, recursion, allocation, and iteration budgets so the
 //! fuzz lane can exercise hostile inputs without widening the production API.
 
-use std::collections::HashMap;
-
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use serde_json::Value;
 
 use crate::config::file_loader::decode_and_validate_config_document;
@@ -182,6 +180,5 @@ pub fn smoke_invariants() -> Result<(), String> {
     fuzz_decode_config_document(config)?;
     let plugin = serde_json::json!({"origins": ["*"]});
     validate_plugin_config("cors", &plugin).map_err(|error| error)?;
-    let _ = HashMap::<String, String>::new();
     Ok(())
 }

@@ -45,7 +45,8 @@ pub enum ProxyProtocolResult {
 }
 
 /// Maximum in-memory PROXY header size accepted by [`parse_proxy_protocol_header_bytes`].
-pub const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize =
+#[cfg(feature = "fuzzing")]
+pub(crate) const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize =
     V1_MAX_LEN.max(V2_SIG.len() + 4 + V2_MAX_ADDR_LEN as usize);
 
 /// Error variants for PROXY protocol parsing.
@@ -53,6 +54,7 @@ pub const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize =
 pub enum ProxyProtocolError {
     /// The supplied byte slice exceeded the safety cap for in-memory parsing.
     #[error("PROXY protocol header exceeds safety cap of {0} bytes")]
+    #[cfg(feature = "fuzzing")]
     InputTooLong(usize),
     /// The header did not begin with a valid v1 or v2 signature.
     #[error("invalid PROXY protocol signature")]
@@ -304,7 +306,8 @@ where
 /// Production listeners use the async stream reader; this entry point exists for
 /// unit tests and the adversarial fuzz lane. Oversized inputs fail closed before
 /// allocation beyond the declared address block.
-pub fn parse_proxy_protocol_header_bytes(
+#[cfg(feature = "fuzzing")]
+pub(crate) fn parse_proxy_protocol_header_bytes(
     data: &[u8],
 ) -> Result<ProxyProtocolResult, ProxyProtocolError> {
     if data.len() > PROXY_PROTOCOL_MAX_HEADER_BYTES {

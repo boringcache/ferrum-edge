@@ -651,6 +651,7 @@ pub fn load_config_from_file(
 ///
 /// Skips filesystem stability checks and namespace filtering. Intended for the
 /// adversarial fuzz lane and deterministic parser tests — not production load.
+#[cfg(feature = "fuzzing")]
 pub fn decode_and_validate_config_document(
     content: &str,
     cert_expiry_warning_days: u64,

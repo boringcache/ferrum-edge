@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.9"
-ferrum-edge = { path = ".." }
+ferrum-edge = { path = "..", features = ["fuzzing"] }
 
 [dev-dependencies]
 proptest = "=1.6.0"

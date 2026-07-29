@@ -90,7 +90,7 @@ pub fn encode_datagram(out: &mut BytesMut, payload: &[u8]) -> std::io::Result<()
 ///
 /// Returns `Some(payload)` when a full frame is present (payload may be empty),
 /// or `None` when fewer than `LEN_PREFIX + payload_len` bytes are buffered.
-pub fn pop_framed_datagram(buf: &mut BytesMut) -> Option<Bytes> {
+pub(crate) fn pop_framed_datagram(buf: &mut BytesMut) -> Option<Bytes> {
     if buf.len() < LEN_PREFIX {
         return None;
     }
