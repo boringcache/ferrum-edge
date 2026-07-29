@@ -722,7 +722,8 @@ fn compact_snapshot_lifecycle_measured(
         );
         return false;
     }
-    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events(&emission_guard)
+    let Some((events, overflow_count, overflow_retained_bytes)) =
+        lifecycle.prepare_compaction_events(&emission_guard)
     else {
         // Serialize failure: keep the Full generation intact and retry later.
         // `prepare_compaction_events` already restaged its borrowed overflow.
@@ -755,7 +756,11 @@ fn compact_snapshot_lifecycle_measured(
         );
         // The staged overflow was taken out of the accumulator by preparation
         // and exists nowhere else; hand it back before dropping `events`.
-        lifecycle.restage_compaction_overflow(events, overflow_count);
+        lifecycle.restage_compaction_overflow(
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
         return false;
     }
 
@@ -779,6 +784,7 @@ fn compact_snapshot_lifecycle_measured(
     if events.is_empty() {
         // Nothing pending to hand off; the generation is already durable. Retire
         // it as a successful finalization rather than leaking a Full entry.
+        lifecycle.accumulator.clear_for_compaction();
         lifecycle.finalized.store(true, Ordering::Release);
         unregister_full_snapshot_generation(lifecycle.generation);
         // Release this generation's emission lock before compacting *other*
@@ -1864,14 +1870,16 @@ impl SnapshotLifecycle {
     fn prepare_compaction_events(
         &self,
         _emission_guard: &MutexGuard<'_, ()>,
-    ) -> Option<(Vec<ChargeEvent>, usize)> {
+    ) -> Option<(Vec<ChargeEvent>, usize, usize)> {
         let snapshot_id = new_ulid();
         let received_at = unix_timestamp_nanos();
         // Compaction owns the staged overflow going forward, so take it rather
         // than cloning it: a clone would be a second uncharged full-batch copy
         // that coexists with the still-staged originals.
-        let mut events = self.accumulator.take_overflow_pending();
-        let overflow_count = events.len();
+        let taken = self.accumulator.take_overflow_pending();
+        let overflow_count = taken.events.len();
+        let overflow_retained_bytes = taken.retained_bytes;
+        let mut events = taken.events;
         match self.accumulator.prepare_deltas(
             &self.config,
             &self.node_id,
@@ -1880,7 +1888,7 @@ impl SnapshotLifecycle {
         ) {
             Ok(prepared) => {
                 events.extend(prepared.events);
-                Some((events, overflow_count))
+                Some((events, overflow_count, overflow_retained_bytes))
             }
             Err(error) => {
                 self.runtime
@@ -1890,7 +1898,11 @@ impl SnapshotLifecycle {
                 // overflow would clear accumulator totals that failed to
                 // serialize. Return the borrowed overflow to bounded staging so
                 // no pending billing delta is lost on this path.
-                self.restage_compaction_overflow(events, overflow_count);
+                self.restage_compaction_overflow(
+                    events,
+                    overflow_count,
+                    overflow_retained_bytes,
+                );
                 None
             }
         }
@@ -1899,11 +1911,21 @@ impl SnapshotLifecycle {
     /// Give the borrowed staged overflow back to bounded staging.
     ///
     /// `SnapshotLifecycle::generation` is `runtime.generation`, so this is the
-    /// same restore the periodic and final emitters use. The returned events
-    /// re-reserve exactly the bytes `take_overflow_pending` released, so no
-    /// uncharged copy is created.
-    fn restage_compaction_overflow(&self, events: Vec<ChargeEvent>, overflow_count: usize) {
-        restage_borrowed_overflow(&self.accumulator, &self.runtime, events, overflow_count);
+    /// same restore the periodic and final emitters use. The byte reservation
+    /// remains continuously charged while the events are borrowed, so restore
+    /// cannot be refused by unrelated process-wide ceiling pressure.
+    fn restage_compaction_overflow(
+        &self,
+        events: Vec<ChargeEvent>,
+        overflow_count: usize,
+        overflow_retained_bytes: usize,
+    ) {
+        restage_borrowed_overflow(
+            &self.accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
     }
 
     async fn finalize_attempt(&self, deadline: Instant) -> bool {
@@ -9175,6 +9197,18 @@ struct PreparedSnapshot {
     emitted_totals: Vec<(SnapshotMetadata, u64, SnapshotTotals)>,
 }
 
+/// Staged overflow moved out of the accumulator while its existing byte charge
+/// remains owned by the accumulator.
+///
+/// Keeping the reservation in place closes a loss window: if a spool write
+/// fails, another sink cannot consume this process-ceiling capacity while the
+/// events are borrowed and make restoration of the already-admitted billing
+/// deltas fail.
+struct TakenOverflow {
+    events: Vec<ChargeEvent>,
+    retained_bytes: usize,
+}
+
 #[cfg(test)]
 type CleanupAfterStaleCheckHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -9214,8 +9248,9 @@ pub struct SnapshotAccumulator {
     /// is dropped without an explicit clear cannot leak the charge.
     process_retained: GrowableProcessReservation,
     overflow_pending: Mutex<Vec<ChargeEvent>>,
-    /// Overflow subset of `retained_bytes`, tracked separately so `take`/`clear`
-    /// release exactly the staged portion from the combined counter.
+    /// Overflow subset of `retained_bytes`, tracked separately so a take can
+    /// transfer logical ownership without releasing the charge, while
+    /// durable commit or clear releases exactly the staged portion.
     overflow_pending_bytes: AtomicUsize,
     /// Async snapshot-overflow jobs that can still re-stage an event after a
     /// durable spool failure. Full→Compact and finalization must wait for these
@@ -9576,8 +9611,9 @@ impl SnapshotAccumulator {
             Err(poisoned) => poisoned.into_inner(),
         };
         pending.push(event);
-        // Track the staged portion of the combined reservation so `take`/`clear`
-        // release exactly these bytes.
+        // Track the staged portion of the combined reservation so take can
+        // transfer ownership and durable commit or clear can release exactly
+        // these bytes.
         self.overflow_pending_bytes
             .fetch_add(bytes, Ordering::AcqRel);
         true
@@ -9588,19 +9624,81 @@ impl SnapshotAccumulator {
         self.stage_overflow_event(event)
     }
 
-    fn take_overflow_pending(&self) -> Vec<ChargeEvent> {
+    /// Deterministic external-test probe for borrowed overflow ownership.
+    ///
+    /// Returns `(taken_events, taken_bytes, held_while_taken,
+    /// competing_byte_admitted, pending_after_restore, held_after_restore)`.
+    /// Tests set `ceiling.max()` to the staged charge before calling this. A
+    /// correct take keeps the ceiling saturated, so the competing byte is
+    /// refused and restoration cannot need a second admission.
+    #[allow(dead_code)]
+    pub fn probe_taken_overflow_ownership_for_tests(
+        &self,
+        ceiling: &'static RetainedByteCeiling,
+    ) -> (usize, usize, usize, bool, usize, usize) {
+        let taken = self.take_overflow_pending();
+        let taken_events = taken.events.len();
+        let taken_bytes = taken.retained_bytes;
+        let held_while_taken = self.process_retained.held();
+        let competing = ceiling.try_acquire(1);
+        let competing_byte_admitted = competing.is_some();
+        drop(competing);
+        self.restore_taken_overflow(taken);
+        (
+            taken_events,
+            taken_bytes,
+            held_while_taken,
+            competing_byte_admitted,
+            self.overflow_pending_len(),
+            self.process_retained.held(),
+        )
+    }
+
+    fn take_overflow_pending(&self) -> TakenOverflow {
         let mut pending = match self.overflow_pending.lock() {
             Ok(pending) => pending,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let drained = std::mem::take(&mut *pending);
-        // Release exactly the staged overflow portion from the combined
-        // retained-byte counter while holding the lock so a concurrent stage
-        // cannot have its bytes released out from under it.
-        let released = self.overflow_pending_bytes.swap(0, Ordering::AcqRel);
-        self.retained_bytes.fetch_sub(released, Ordering::AcqRel);
-        self.process_retained.shrink_by(released);
-        drained
+        TakenOverflow {
+            events: std::mem::take(&mut *pending),
+            // Move the logical ownership out of `overflow_pending`, but keep
+            // both byte reservations charged until durable success commits the
+            // take or failure restores it. A concurrent stage starts a fresh
+            // `overflow_pending_bytes` subtotal without being released by this
+            // take.
+            retained_bytes: self.overflow_pending_bytes.swap(0, Ordering::AcqRel),
+        }
+    }
+
+    /// Commit a successfully persisted overflow take, releasing the reservation
+    /// that stayed charged while the events were outside the accumulator.
+    fn commit_taken_overflow(&self, retained_bytes: usize) {
+        if retained_bytes == 0 {
+            return;
+        }
+        self.retained_bytes
+            .fetch_sub(retained_bytes, Ordering::AcqRel);
+        self.process_retained.shrink_by(retained_bytes);
+    }
+
+    /// Restore a failed overflow take without any new byte admission.
+    ///
+    /// The old events precede concurrently staged ones, preserving retry order.
+    /// Their retained-byte charge never left the accumulator, so restoration
+    /// cannot fail under process-wide ceiling pressure.
+    fn restore_taken_overflow(&self, mut taken: TakenOverflow) {
+        if taken.events.is_empty() {
+            debug_assert_eq!(taken.retained_bytes, 0);
+            return;
+        }
+        let mut pending = match self.overflow_pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        taken.events.append(&mut pending);
+        *pending = taken.events;
+        self.overflow_pending_bytes
+            .fetch_add(taken.retained_bytes, Ordering::AcqRel);
     }
 
     /// Staged overflow events still awaiting durable handoff.
@@ -10139,11 +10237,14 @@ fn emit_periodic_snapshot(
     // Take the staged overflow instead of cloning it, and move the prepared
     // deltas rather than copying them: both were previously duplicated into a
     // third uncharged full-batch vector.
-    let mut events = accumulator.take_overflow_pending();
-    let overflow_count = events.len();
+    let taken = accumulator.take_overflow_pending();
+    let overflow_count = taken.events.len();
+    let overflow_retained_bytes = taken.retained_bytes;
+    let mut events = taken.events;
     events.extend(delta_events);
     let event_count = events.len();
     if event_count == 0 {
+        accumulator.commit_taken_overflow(overflow_retained_bytes);
         return Ok(0);
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -10151,7 +10252,12 @@ fn emit_periodic_snapshot(
         runtime
             .metrics
             .record_failure(FailureReason::Serialize, error.clone());
-        restage_borrowed_overflow(accumulator, runtime, events, overflow_count);
+        restage_borrowed_overflow(
+            accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
         return Err(error);
     };
     // Bind the result first so the borrow of `events` ends before the failure
@@ -10172,7 +10278,12 @@ fn emit_periodic_snapshot(
             error = %error,
             "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
         );
-        restage_borrowed_overflow(accumulator, runtime, events, overflow_count);
+        restage_borrowed_overflow(
+            accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
         return Err(error);
     }
     // Snapshot mode requires the spool. It is the durable commit point before
@@ -10181,6 +10292,7 @@ fn emit_periodic_snapshot(
     // queue worker without losing or double-charging the snapshot: replay is
     // idempotent on event_id. The staged overflow was already taken above, so
     // durable success simply keeps it taken.
+    accumulator.commit_taken_overflow(overflow_retained_bytes);
     accumulator.commit_emitted_totals(&emitted_totals);
     runtime
         .metrics
@@ -10248,10 +10360,13 @@ fn emit_final_snapshot_to_spool(
         events: delta_events,
         emitted_totals,
     } = prepared;
-    let mut events = accumulator.take_overflow_pending();
-    let overflow_count = events.len();
+    let taken = accumulator.take_overflow_pending();
+    let overflow_count = taken.events.len();
+    let overflow_retained_bytes = taken.retained_bytes;
+    let mut events = taken.events;
     events.extend(delta_events);
     if events.is_empty() {
+        accumulator.commit_taken_overflow(overflow_retained_bytes);
         return true;
     }
     let Some(spool) = runtime.spool.as_ref() else {
@@ -10259,7 +10374,12 @@ fn emit_final_snapshot_to_spool(
             FailureReason::Serialize,
             "snapshot finalization requires an available spool",
         );
-        restage_borrowed_overflow(accumulator, runtime, events, overflow_count);
+        restage_borrowed_overflow(
+            accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
         return false;
     };
     // Bind the result first so the borrow of `events` ends before the failure
@@ -10280,9 +10400,15 @@ fn emit_final_snapshot_to_spool(
             error = %error,
             "Chargeback sink could not durably spool its final snapshot; generation state retained"
         );
-        restage_borrowed_overflow(accumulator, runtime, events, overflow_count);
+        restage_borrowed_overflow(
+            accumulator,
+            events,
+            overflow_count,
+            overflow_retained_bytes,
+        );
         return false;
     }
+    accumulator.commit_taken_overflow(overflow_retained_bytes);
     accumulator.commit_emitted_totals(&emitted_totals);
     runtime
         .metrics
@@ -10651,15 +10777,20 @@ fn reserve_delta_projection(
 /// by the accumulator.
 fn restage_borrowed_overflow(
     accumulator: &SnapshotAccumulator,
-    runtime: &SinkRuntime,
     mut events: Vec<ChargeEvent>,
     overflow_count: usize,
+    overflow_retained_bytes: usize,
 ) {
     if overflow_count == 0 {
+        debug_assert_eq!(overflow_retained_bytes, 0);
         return;
     }
     events.truncate(overflow_count);
-    stage_overflow_events_or_reject(accumulator, &runtime.metrics, runtime.generation, events);
+    accumulator.restore_taken_overflow(TakenOverflow {
+        events,
+        retained_bytes: overflow_retained_bytes,
+    });
+    invalidate_status_cache();
 }
 
 /// Attacker-shaped copies of one accumulator identity that a delta projection

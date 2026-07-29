@@ -7123,6 +7123,52 @@ fn snapshot_accumulator_releases_its_process_charge_when_overflow_is_drained() {
 }
 
 #[test]
+fn borrowed_snapshot_overflow_keeps_its_process_reservation_until_commit() {
+    let ceiling = leaked_chargeback_test_ceiling(1024 * 1024);
+    let accumulator =
+        SnapshotAccumulator::with_limits_shards_and_ceiling(4, 512 * 1024, 4, ceiling);
+
+    assert!(
+        accumulator.stage_overflow_event_for_tests(sample_event("borrowed-overflow")),
+        "staging must be admitted below the ceiling"
+    );
+    let staged_bytes = accumulator.process_retained_bytes_for_tests();
+    assert!(staged_bytes > 0);
+    ceiling.set_max_unclamped_for_test(staged_bytes);
+
+    let (
+        taken_events,
+        taken_bytes,
+        held_while_taken,
+        competing_byte_admitted,
+        pending_after_restore,
+        held_after_restore,
+    ) = accumulator.probe_taken_overflow_ownership_for_tests(ceiling);
+
+    assert_eq!(taken_events, 1);
+    assert_eq!(taken_bytes, staged_bytes);
+    assert_eq!(
+        held_while_taken, staged_bytes,
+        "borrowing staged billing deltas must not release their shared charge"
+    );
+    assert!(
+        !competing_byte_admitted,
+        "another sink must not consume capacity owned by borrowed billing deltas"
+    );
+    assert_eq!(
+        pending_after_restore, 1,
+        "failed handoff restoration must preserve the exact billing event"
+    );
+    assert_eq!(
+        held_after_restore, staged_bytes,
+        "restoration must reuse the continuous reservation without a second admission"
+    );
+
+    accumulator.clear_for_compaction_for_tests();
+    assert_eq!(ceiling.used(), 0, "the restored charge releases exactly once");
+}
+
+#[test]
 fn compact_snapshot_recovery_owns_its_reservation_and_restores_deltas_on_a_failed_retry() {
     let ceiling = leaked_chargeback_test_ceiling(1024 * 1024);
     let events: Vec<ChargeEvent> = (0..12)
