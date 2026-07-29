@@ -2878,7 +2878,9 @@ impl Plugin for AiResponseGuard {
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
-        self.should_buffer_response_body(ctx)
+        // An enrolled native-gRPC method is governed by framing and descriptor,
+        // never by a backend-controlled response media-type label.
+        self.should_buffer_response_body(ctx) && !ctx.is_native_grpc_request()
     }
 
     fn should_release_response_body_under_retries(
@@ -2888,6 +2890,7 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !ctx.is_native_grpc_request()
             && original_response_is_event_stream(ctx, response_headers)
     }
 
@@ -2898,6 +2901,7 @@ impl Plugin for AiResponseGuard {
         response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
+            && !ctx.is_native_grpc_request()
             && original_response_is_event_stream(ctx, response_headers)
     }
 
@@ -2909,7 +2913,8 @@ impl Plugin for AiResponseGuard {
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         self.should_buffer_response_body(ctx)
-            && !content_type.is_some_and(is_text_event_stream_media_type)
+            && (ctx.is_native_grpc_request()
+                || !content_type.is_some_and(is_text_event_stream_media_type))
     }
 
     async fn after_proxy(
@@ -2918,7 +2923,8 @@ impl Plugin for AiResponseGuard {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if self.should_buffer_response_body(ctx)
+        if !ctx.is_native_grpc_request()
+            && self.should_buffer_response_body(ctx)
             && original_response_is_event_stream(ctx, response_headers)
         {
             // This plugin's buffered SSE parser cannot safely decide an

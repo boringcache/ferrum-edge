@@ -3600,6 +3600,46 @@ fn grpc_buffering_vote_is_limited_to_enrolled_methods() {
     assert!(plugin.should_buffer_response_body(&ctx_with_content_type("POST", "application/json")));
 }
 
+#[tokio::test]
+async fn grpc_enrolled_method_never_releases_on_sse_content_type() {
+    let plugin = grpc_guard("reject");
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
+
+    assert!(
+        !plugin.may_release_response_body_under_retries(&ctx),
+        "native gRPC enrollment must remain buffered while retries are active"
+    );
+    assert!(!plugin.should_release_response_body_under_retries(
+        &ctx, 200, &headers
+    ));
+    assert!(
+        !plugin.should_release_response_body_before_content_type_rewrite(&ctx, 200, &headers)
+    );
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &headers,
+    ));
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let body = grpc_frame(&hello_response_bytes("contact mislabeled@example.com"));
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut headers, &body)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "the descriptor guard must inspect framed bytes regardless of a misleading SSE label"
+    );
+}
+
 #[test]
 fn grpc_config_requires_descriptor_and_methods() {
     for invalid in [
