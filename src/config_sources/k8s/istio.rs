@@ -7554,8 +7554,12 @@ mod tests {
 
         let message = err.to_string();
         assert!(
-            message.contains("cannot copy sensitive environment variable"),
+            message.contains("cannot copy a credential-bearing environment variable"),
             "expected sensitive env-var rejection, got {message}"
+        );
+        assert!(
+            !message.contains("FERRUM_ADMIN_JWT_SECRET"),
+            "credential-bearing environment variable name must not be echoed"
         );
     }
 

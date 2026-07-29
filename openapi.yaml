@@ -15788,11 +15788,15 @@ components:
             present UTF-8 value overrides any matching `custom_tags` default;
             a missing variable keeps that default when present and otherwise
             omits the tag. Credential-bearing environment variable names
-            (including secret/password/token names and operator-configured
-            sensitive metadata names) are rejected. Non-UTF-8 or >1024-byte
-            values fail construction closed. Resolved values are never logged.
-            This map, `custom_tags`, and `custom_header_tags` may contain at
-            most 32 distinct tag names combined.
+            (including secret/password/token/key/credential names, database
+            connection locations, client credential identifiers, and
+            operator-configured sensitive metadata names) are rejected.
+            Non-UTF-8 or >1024-byte values fail construction closed. Selected
+            values are deliberately emitted as custom transaction and trace
+            metadata; diagnostics never include resolved values or rejected
+            credential-bearing variable names. This map, `custom_tags`, and
+            `custom_header_tags` may contain at most 32 distinct tag names
+            combined.
         metrics:
           type: object
           description: |

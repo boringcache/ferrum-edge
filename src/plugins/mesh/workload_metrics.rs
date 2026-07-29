@@ -1445,7 +1445,8 @@ fn validate_custom_tags(
 ///
 /// Istio/Envoy semantics: a present variable overrides any literal default in
 /// `custom_tags`; a missing variable keeps the default when one was translated,
-/// otherwise the tag is omitted. Resolved values are never logged.
+/// otherwise the tag is omitted. Resolved values are deliberately emitted as
+/// custom telemetry metadata, but diagnostics must never include their values.
 fn resolve_custom_env_tags(
     custom_tags: &mut HashMap<String, String>,
     custom_env_tags: &HashMap<String, String>,
@@ -1493,12 +1494,57 @@ fn validate_env_var_name(tag: &str, env_var: &str) -> Result<(), String> {
             "workload_metrics: custom tag '{tag}' has invalid environment variable name '{env_var}'"
         ));
     }
-    if is_sensitive_metadata_key(env_var) {
+    if is_sensitive_environment_variable_name(env_var) {
         return Err(format!(
-            "workload_metrics: custom tag '{tag}' cannot copy sensitive environment variable '{env_var}'"
+            "workload_metrics: custom tag '{tag}' cannot copy a credential-bearing environment variable"
         ));
     }
     Ok(())
+}
+
+/// Environment names need a stricter credential boundary than log-metadata
+/// keys. In particular, database URLs and access/client identifiers can expose
+/// credentials even though their names intentionally do not match the shared
+/// metadata redaction classifier's narrower `token` rules.
+fn is_sensitive_environment_variable_name(name: &str) -> bool {
+    if is_sensitive_metadata_key(name) {
+        return true;
+    }
+
+    let mut has_database_source = false;
+    let mut has_location = false;
+    let mut has_client = false;
+    let mut has_id = false;
+
+    for segment in name.split('_') {
+        if segment.eq_ignore_ascii_case("secret")
+            || segment.eq_ignore_ascii_case("password")
+            || segment.eq_ignore_ascii_case("passwd")
+            || segment.eq_ignore_ascii_case("token")
+            || segment.eq_ignore_ascii_case("credential")
+            || segment.eq_ignore_ascii_case("credentials")
+            || segment.eq_ignore_ascii_case("key")
+            || segment.eq_ignore_ascii_case("dsn")
+            || segment.eq_ignore_ascii_case("connection")
+        {
+            return true;
+        }
+
+        has_database_source |= segment.eq_ignore_ascii_case("db")
+            || segment.eq_ignore_ascii_case("database")
+            || segment.eq_ignore_ascii_case("mongo")
+            || segment.eq_ignore_ascii_case("mongodb")
+            || segment.eq_ignore_ascii_case("mysql")
+            || segment.eq_ignore_ascii_case("postgres")
+            || segment.eq_ignore_ascii_case("postgresql")
+            || segment.eq_ignore_ascii_case("redis");
+        has_location |=
+            segment.eq_ignore_ascii_case("url") || segment.eq_ignore_ascii_case("uri");
+        has_client |= segment.eq_ignore_ascii_case("client");
+        has_id |= segment.eq_ignore_ascii_case("id");
+    }
+
+    (has_database_source && has_location) || (has_client && has_id)
 }
 
 fn validate_custom_tag_name(name: &str) -> Result<(), String> {
@@ -2035,15 +2081,38 @@ mod tests {
                 .contains("invalid environment variable name")
         );
 
-        let sensitive = WorkloadMetrics::new(&json!({
-            "custom_env_tags": {"credential": "AWS_SESSION_TOKEN"}
-        }));
-        assert!(
-            sensitive
-                .err()
-                .expect("sensitive env var name")
-                .contains("cannot copy sensitive environment variable")
-        );
+        for env_var in [
+            "FERRUM_ADMIN_JWT_SECRET",
+            "AWS_SESSION_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AZURE_CLIENT_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "FERRUM_DB_URL",
+            "DATABASE_URL",
+            "MONGODB_URI",
+            "DATABASE_DSN",
+            "DATABASE_CONNECTION_STRING",
+        ] {
+            let sensitive = WorkloadMetrics::new(&json!({
+                "custom_env_tags": {"credential": env_var}
+            }));
+            let error = sensitive.err().expect("sensitive env var name");
+            assert!(
+                error.contains("cannot copy a credential-bearing environment variable"),
+                "expected credential-bearing env rejection, got {error}"
+            );
+            assert!(
+                !error.contains(env_var),
+                "sensitive environment variable name must not be echoed"
+            );
+        }
+
+        for env_var in ["ISTIO_META_CLUSTER_ID", "ISTIO_META_ZONE", "FERRUM_REGION"] {
+            assert!(
+                validate_env_var_name("dimension", env_var).is_ok(),
+                "ordinary telemetry dimension {env_var} must remain allowed"
+            );
+        }
 
         for invalid in [
             json!(null),
