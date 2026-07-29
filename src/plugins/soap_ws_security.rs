@@ -3299,8 +3299,7 @@ impl SoapWsSecurity {
             }
             reference_ids.push(ref_id);
         }
-        let raw_occurrences =
-            count_raw_id_occurrences(document.envelope, &reference_ids)?;
+        let raw_occurrences = count_raw_id_occurrences(document.envelope, &reference_ids)?;
 
         let mut coverage = ReferenceCoverage::default();
         for (index, reference) in references.iter().enumerate() {
