@@ -129,6 +129,8 @@ struct LokiFlushConfig {
     ceiling: &'static RetainedByteCeiling,
 }
 
+type LokiProvisionalAdmission = (Arc<str>, BTreeMap<String, String>, Arc<LokiByteLease>);
+
 struct LokiByteLease {
     used_bytes: Arc<AtomicUsize>,
     /// Current retained charge. Atomic so a provisional reservation can shrink
@@ -719,7 +721,7 @@ fn admit_under_byte_budget<T, F>(
     value: &T,
     kind: &str,
     build_labels: F,
-) -> Option<(Arc<str>, BTreeMap<String, String>, Arc<LokiByteLease>)>
+) -> Option<LokiProvisionalAdmission>
 where
     T: serde::Serialize,
     F: FnOnce() -> BTreeMap<String, String>,
