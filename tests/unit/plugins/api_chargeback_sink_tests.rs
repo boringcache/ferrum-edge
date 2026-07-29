@@ -6917,19 +6917,19 @@ fn spool_replay_worklist_reservation_is_independent_of_row_count() {
         "the bound must cover every halving level"
     );
 
-    // The worklist charge is the same for one row and for a million: the old
-    // O(lines) reservation is what could strand a healthy artifact.
-    let small = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
-    let large = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
-    assert_eq!(small, large);
+    // The worklist charge is fixed, and it is already part of the peak for a
+    // single-row artifact.
     let worklist = (entries * entry_bytes) as u64;
+    let one_row = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
     assert!(
-        small >= worklist,
+        one_row >= worklist,
         "the peak accounting must include the fixed worklist reservation"
     );
 
-    // Row-count growth costs only the line index, never a per-line worklist slot.
-    let one_row = spool_replay_peak_bytes_for_tests(1_024, 1).unwrap();
+    // Row-count growth costs only the line index and one row separator each —
+    // never a per-line worklist slot. The old O(lines) worklist reservation is
+    // what this delta would have exposed, and it is what could strand a healthy
+    // high-row-count artifact.
     let many_rows = spool_replay_peak_bytes_for_tests(1_024, 1_001).unwrap();
     assert_eq!(
         many_rows - one_row,

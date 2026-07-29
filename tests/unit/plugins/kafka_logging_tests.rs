@@ -1551,8 +1551,28 @@ fn kafka_downstream_leases_of_multiple_instances_share_one_ceiling() {
     assert!(first_ceiling_used > 0);
     assert_eq!(first_after_destroy, 0);
 
-    // A second instance charges the same aggregate counter rather than getting a
-    // private allowance.
+    // Saturate the shared ceiling from outside any `kafka_logging` instance. The
+    // next instance's own 1 MiB per-instance budget is entirely free, so only an
+    // *aggregate* bound can refuse its record leases — a private per-instance
+    // allowance would admit them. Running the probes sequentially would not
+    // distinguish the two, because each one fully drains before the next starts.
+    let hold = ceiling
+        .try_acquire(8 * 1024 * 1024)
+        .expect("the shared ceiling can be saturated");
+    let refused = kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2);
+    assert!(
+        refused.is_err(),
+        "a second instance must be refused by the shared ceiling while it is saturated"
+    );
+    assert_eq!(
+        ceiling.used(),
+        8 * 1024 * 1024,
+        "a refused instance must leave only the pre-existing hold charged"
+    );
+
+    // Capacity recovers for the next instance once the hold releases.
+    drop(hold);
+    assert_eq!(ceiling.used(), 0);
     let (_, second_ceiling_used, _, second_after_destroy) =
         kafka_logging_probe_downstream_lease_ownership_for_test(ceiling, 2)
             .expect("librdkafka downstream-ownership probe must run");
