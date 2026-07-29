@@ -444,6 +444,11 @@ impl<'a> ExpressionParser<'a> {
 
 fn canonicalize_access_log_filter(parsed: ParsedExpr) -> Result<Option<AccessLogFilter>, String> {
     let canonical = canonicalize_parsed_expr(parsed)?;
+    // Parser node accounting charges one node per equality atom, but
+    // `response.code == N` expands into And(min, max) (three final nodes).
+    // Re-validate the post-canonical tree so the documented 32-node hot-path
+    // bound is enforced fail-closed before the filter is returned.
+    validate_access_log_filter_expr(&canonical)?;
     if let Some(flat) = flatten_and_only(&canonical)? {
         return Ok(Some(flat));
     }
@@ -461,63 +466,23 @@ fn canonicalize_parsed_expr(parsed: ParsedExpr) -> Result<AccessLogFilterExpr, S
         ParsedExpr::And(left, right) => {
             let left = canonicalize_parsed_expr(*left)?;
             let right = canonicalize_parsed_expr(*right)?;
-            Ok(flatten_expr(AccessLogFilterExpr::And {
+            // Preserve the parser's left-associative shape. Same-operator
+            // reassociation must not recurse into an identical tree or
+            // three-or-more term chains stack-overflow during translation.
+            Ok(AccessLogFilterExpr::And {
                 left: Box::new(left),
                 right: Box::new(right),
-            }))
+            })
         }
         ParsedExpr::Or(left, right) => {
             let left = canonicalize_parsed_expr(*left)?;
             let right = canonicalize_parsed_expr(*right)?;
-            Ok(flatten_expr(AccessLogFilterExpr::Or {
+            Ok(AccessLogFilterExpr::Or {
                 left: Box::new(left),
                 right: Box::new(right),
-            }))
+            })
         }
         ParsedExpr::Atom(atom) => atom_to_expr(atom),
-    }
-}
-
-fn flatten_expr(expr: AccessLogFilterExpr) -> AccessLogFilterExpr {
-    match expr {
-        AccessLogFilterExpr::And { left, right } => {
-            let left = flatten_expr(*left);
-            let right = flatten_expr(*right);
-            match (left, right) {
-                (AccessLogFilterExpr::And { left: l, right: r }, other)
-                | (other, AccessLogFilterExpr::And { left: l, right: r }) => {
-                    flatten_expr(AccessLogFilterExpr::And {
-                        left: Box::new(flatten_expr(AccessLogFilterExpr::And {
-                            left: l,
-                            right: r,
-                        })),
-                        right: Box::new(other),
-                    })
-                }
-                (left, right) => AccessLogFilterExpr::And {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-            }
-        }
-        AccessLogFilterExpr::Or { left, right } => {
-            let left = flatten_expr(*left);
-            let right = flatten_expr(*right);
-            match (left, right) {
-                (AccessLogFilterExpr::Or { left: l, right: r }, other)
-                | (other, AccessLogFilterExpr::Or { left: l, right: r }) => {
-                    flatten_expr(AccessLogFilterExpr::Or {
-                        left: Box::new(flatten_expr(AccessLogFilterExpr::Or { left: l, right: r })),
-                        right: Box::new(other),
-                    })
-                }
-                (left, right) => AccessLogFilterExpr::Or {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-            }
-        }
-        leaf => leaf,
     }
 }
 
@@ -610,10 +575,10 @@ fn status_comparison_to_expr(comparison: Comparison) -> Result<AccessLogFilterEx
         }),
         Comparison::Eq(n) => {
             let value = status_code_value(n)?;
-            Ok(flatten_expr(AccessLogFilterExpr::And {
+            Ok(AccessLogFilterExpr::And {
                 left: Box::new(AccessLogFilterExpr::StatusCodeMin { value }),
                 right: Box::new(AccessLogFilterExpr::StatusCodeMax { value }),
-            }))
+            })
         }
     }
 }
