@@ -2432,19 +2432,37 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                     match Pin::new(&mut this.recv_stream).poll_recv_trailers_map(cx) {
                         Poll::Ready(Ok(Some(mut trailers))) => {
                             this.state = H3FrameSourceState::Done;
-                            crate::proxy::headers::strip_response_hop_by_hop_trailers(
-                                &mut trailers,
-                            );
-                            // Last point on this relay where the response-header
-                            // policy boundary can still bind the trailer section:
-                            // the initial header block went to the client before
-                            // the first DATA frame, so `after_proxy`,
-                            // sticky-cookie injection, and the gateway's own
-                            // builder writes are all already committed. Runs once
-                            // per response, on the trailer frame only, and is
-                            // skipped entirely (`None`) whenever no signal could
-                            // drop a field.
-                            this.govern_trailers(&mut trailers, "fin");
+                            // A preceding delayed-FIN peek already stripped and
+                            // governed the exact buffered trailer block. Reuse
+                            // that safe snapshot when FIN arrives before the
+                            // outer timeout instead of governing and logging the
+                            // same backend metadata twice. If the progress slot
+                            // was unavailable (for example, a poisoned mutex),
+                            // fall back to the authoritative map returned here.
+                            let governed_peek = if this.peeked_pending_trailers {
+                                this.progress
+                                    .as_ref()
+                                    .and_then(|progress| progress.take_pending_trailers())
+                            } else {
+                                None
+                            };
+                            if let Some(governed_peek) = governed_peek {
+                                trailers = governed_peek;
+                            } else {
+                                crate::proxy::headers::strip_response_hop_by_hop_trailers(
+                                    &mut trailers,
+                                );
+                                // Last point on this relay where the
+                                // response-header policy boundary can still bind
+                                // the trailer section: the initial header block
+                                // went to the client before the first DATA frame,
+                                // so `after_proxy`, sticky-cookie injection, and
+                                // the gateway's own builder writes are all
+                                // already committed. Runs once per response, on
+                                // the trailer frame only, and is skipped entirely
+                                // (`None`) whenever no signal could drop a field.
+                                this.govern_trailers(&mut trailers, "fin");
+                            }
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
                         Poll::Ready(Ok(None)) => {
@@ -3668,13 +3686,14 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
 /// natively, so this is safe.
 pub(crate) struct StripHopByHopTrailers<B> {
     inner: B,
-    /// Response-trailer policy boundary for a PLAIN streaming HTTP/2 response.
+    /// Response-trailer policy boundary for a streaming HTTP/2 response.
     ///
-    /// `None` on every other path, which keeps the wrapper a pure hop-by-hop
-    /// filter: native gRPC (whose `grpc-status` / `grpc-message` trailers are
-    /// reserved terminal metadata, not backend-supplied header fields) and
-    /// gRPC-Web (whose terminal metadata is adapted into a DATA frame) pass
-    /// `None` exactly as they did before governance existed.
+    /// Plain HTTP uses `TrailerSectionKind::PlainResponse`; native gRPC and
+    /// translated gRPC-Web install a governor with
+    /// `TrailerSectionKind::NativeGrpcTerminal`, which always preserves the
+    /// three protocol-reserved status fields and governs the remaining metadata
+    /// before the outer gRPC-Web adapter can encode it. `None` keeps paths with
+    /// no actionable policy as a pure hop-by-hop filter.
     governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
 }
 
@@ -4654,6 +4673,58 @@ mod tests {
             }
             other => panic!("expected trailer frame, got {other:?}"),
         }
+        assert!(source.is_done());
+    }
+
+    #[test]
+    fn h3_frame_source_reuses_governed_peek_when_delayed_fin_arrives() {
+        let progress = Arc::new(H3ReadProgress::default());
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("x-trace", "abc".parse().unwrap());
+        trailers.insert("transfer-encoding", "chunked".parse().unwrap());
+        let authoritative = trailers.clone();
+        let mut source = H3FrameSource::new(
+            MockH3RecvStream::new(
+                vec![MockH3DataStep::End],
+                vec![
+                    MockH3TrailerStep::PendingWithBuffered(trailers),
+                    MockH3TrailerStep::Trailers(authoritative),
+                ],
+            ),
+            Arc::from("GET"),
+            200,
+            None,
+            Some(Arc::clone(&progress)),
+        );
+
+        // The first trailer poll peeks the fully decoded map while h3 is still
+        // withholding it for the delayed stream FIN. The stored snapshot is
+        // already stripped and governed.
+        assert!(matches!(poll_source(&mut source), Poll::Pending));
+        {
+            let slot = progress
+                .pending_trailers
+                .lock()
+                .expect("pending trailer slot");
+            let peeked = slot.as_ref().expect("peeked trailer snapshot");
+            assert_eq!(peeked.get("x-trace").unwrap(), "abc");
+            assert!(peeked.get("transfer-encoding").is_none());
+        }
+
+        // FIN makes the authoritative map available. The source must consume
+        // the already-safe snapshot instead of governing the same block again.
+        match poll_source(&mut source) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let emitted = frame.trailers_ref().expect("trailer frame");
+                assert_eq!(emitted.get("x-trace").unwrap(), "abc");
+                assert!(emitted.get("transfer-encoding").is_none());
+            }
+            other => panic!("expected delayed-FIN trailer frame, got {other:?}"),
+        }
+        assert!(
+            progress.take_pending_trailers().is_none(),
+            "the governed peek must be consumed when the authoritative frame arrives",
+        );
         assert!(source.is_done());
     }
 
