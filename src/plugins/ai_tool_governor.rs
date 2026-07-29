@@ -1796,7 +1796,13 @@ impl AiToolGovernor {
         engine: &GovernorEngine,
         metadata: &mut HashMap<String, String>,
     ) {
-        if !engine.observability.emit_metadata {
+        // This label describes observation without enforcement and is valid
+        // only for global dry-run mode. In particular, an enforce-mode plugin
+        // configured for streaming-response inspection only may tentatively
+        // scan an ambiguous request to choose a safe dispatch path, but that
+        // request is outside its governance surface and must not be mislabeled
+        // as a dry-run policy decision.
+        if engine.mode != Mode::DryRun || !engine.observability.emit_metadata {
             return;
         }
         metadata.insert("ai_tool_governor.enabled".to_string(), "true".to_string());

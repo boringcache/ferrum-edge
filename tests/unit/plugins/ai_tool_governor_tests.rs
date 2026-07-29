@@ -2298,6 +2298,35 @@ async fn uninspectable_body_conservatively_forces_reqwest_when_streaming_only() 
     assert!(plugin.forces_reqwest_dispatch(&ctx));
 }
 
+#[tokio::test]
+async fn enforce_streaming_only_ambiguity_does_not_claim_a_dry_run_decision() {
+    // This plugin governs only streaming responses. It tentatively scans the
+    // request to choose the inspectable dispatch path, but global mode is still
+    // enforce and request calls are outside its governance surface. Ambiguity
+    // must therefore preserve conservative dispatch without emitting the
+    // dry-run-only observation label.
+    let plugin = make(streaming_config(
+        json!({ "x": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"stream":true,"stream":false}"#.to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
+    assert!(
+        !ctx.metadata.contains_key(AMBIGUITY_METADATA_KEY),
+        "enforce-mode request triage must not claim a dry-run decision"
+    );
+    assert!(
+        !ctx.metadata.contains_key(AMBIGUITY_REASON_KEY),
+        "out-of-scope request triage must not emit an ambiguity policy reason"
+    );
+}
+
 #[test]
 fn streaming_marked_requests_still_buffer_json_fallbacks() {
     // An earlier plugin's `ai_request_streaming` marker (or an SSE Accept
