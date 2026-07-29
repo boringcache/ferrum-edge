@@ -162,7 +162,8 @@ fn split_sample_prefix(line: &str) -> Option<&str> {
                 if b == b'\\' {
                     if i + 1 >= bytes.len() {
                         panic!(
-                            "malformed exposition sample line: trailing escape in label value: {line}"
+                            "malformed exposition sample line: trailing escape in label value: \
+                             {line}"
                         );
                     }
                     i += 2;
@@ -194,35 +195,67 @@ fn split_sample_prefix(line: &str) -> Option<&str> {
     if i >= bytes.len() || !bytes[i].is_ascii_whitespace() {
         panic!("malformed exposition sample line: missing value separator: {line}");
     }
-    Some(&line[..i])
+    let prefix_end = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        panic!("malformed exposition sample line: missing sample value: {line}");
+    }
+    Some(&line[..prefix_end])
 }
 
 fn parse_label_keys(label_body: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     let bytes = label_body.as_bytes();
     let mut i = 0usize;
+    let mut first = true;
     while i < bytes.len() {
-        while i < bytes.len() && (bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
             break;
         }
+        if !first {
+            if bytes[i] != b',' {
+                panic!("malformed exposition label block: missing comma in {label_body:?}");
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                panic!("malformed exposition label block: trailing comma in {label_body:?}");
+            }
+        }
         let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            panic!("malformed exposition label block: invalid label key in {label_body:?}");
+        }
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
             i += 1;
         }
-        if i >= bytes.len() {
+        let key = &label_body[key_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
             panic!("malformed exposition label block: missing '=' in {label_body:?}");
         }
-        let key = label_body[key_start..i].trim();
-        if key.is_empty() {
-            panic!("malformed exposition label block: empty key in {label_body:?}");
+        if !keys.insert(key.to_string()) {
+            panic!("malformed exposition label block: duplicate label key {key} in {label_body:?}");
         }
-        keys.insert(key.to_string());
         i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         if i >= bytes.len() || bytes[i] != b'"' {
-            panic!("malformed exposition label block: expected quoted value for key {key} in {label_body:?}");
+            panic!(
+                "malformed exposition label block: expected quoted value for key {key} in \
+                 {label_body:?}"
+            );
         }
         i += 1;
         let mut closed = false;
@@ -231,6 +264,12 @@ fn parse_label_keys(label_body: &str) -> BTreeSet<String> {
             if b == b'\\' {
                 if i + 1 >= bytes.len() {
                     panic!("malformed exposition label block: trailing escape in {label_body:?}");
+                }
+                if !matches!(bytes[i + 1], b'\\' | b'"' | b'n') {
+                    panic!(
+                        "malformed exposition label block: invalid escape in value for key {key} \
+                         in {label_body:?}"
+                    );
                 }
                 i += 2;
                 continue;
@@ -243,8 +282,11 @@ fn parse_label_keys(label_body: &str) -> BTreeSet<String> {
             i += 1;
         }
         if !closed {
-            panic!("malformed exposition label block: unclosed value for key {key} in {label_body:?}");
+            panic!(
+                "malformed exposition label block: unclosed value for key {key} in {label_body:?}"
+            );
         }
+        first = false;
     }
     keys
 }
@@ -1069,5 +1111,25 @@ ferrum_api_escape_fixture_total{note=\"quote: \\\" and slash: \\\\\",proxy_id=\"
     assert_eq!(
         parsed["ferrum_api_escape_fixture_total"].labels,
         BTreeSet::from(["note".into(), "proxy_id".into()])
+    );
+}
+
+#[test]
+fn exposition_label_parser_rejects_ambiguous_or_truncated_samples() {
+    for malformed in [
+        r#"first="one"second="two""#,
+        r#"first="one","#,
+        r#"first="one",first="two""#,
+        r#"first="bad\q""#,
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| parse_label_keys(malformed)).is_err(),
+            "malformed label block was accepted: {malformed:?}"
+        );
+    }
+    assert!(
+        std::panic::catch_unwind(|| split_sample_prefix(r#"ferrum_fixture{key="value"} "#))
+            .is_err(),
+        "sample without a value was accepted"
     );
 }
