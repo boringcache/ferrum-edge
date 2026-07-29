@@ -639,7 +639,17 @@ where
     /// capacity helpers still operate on it, and a policy change rebuilds the
     /// instance.
     failure_policy: RedisFailurePolicy,
-    redis_healthy: Arc<AtomicBool>,
+    /// Edge-detection mirror for the observer's recovery log line **only**.
+    ///
+    /// Admission is gated on `RedisLimiter::is_available` — the client's own
+    /// semantic signal — and never on this flag. Gating on both used to latch a
+    /// second recovery delay: an ordinary command failure makes the client
+    /// unavailable, the client republishes availability at most one health
+    /// interval later, and this independent observer needed a further interval
+    /// before it mirrored the recovery. Under the fail-closed default that
+    /// turned routine socket recycling into roughly two intervals of blanket
+    /// refusals. The mirror is now purely a logging latch.
+    observed_available: Arc<AtomicBool>,
     fallback_warned: Arc<AtomicBool>,
     /// Abort handle for the failover health observer; aborted on Drop.
     health_observer_abort: Option<tokio::task::AbortHandle>,
@@ -656,7 +666,7 @@ where
         fallback: LocalLimiter<K, A>,
         failure_policy: RedisFailurePolicy,
     ) -> Self {
-        let redis_healthy = Arc::new(AtomicBool::new(true));
+        let observed_available = Arc::new(AtomicBool::new(true));
         let fallback_warned = Arc::new(AtomicBool::new(false));
 
         let mut limiter = Self {
@@ -664,7 +674,7 @@ where
             primary,
             fallback,
             failure_policy,
-            redis_healthy,
+            observed_available,
             fallback_warned,
             health_observer_abort: None,
         };
@@ -705,21 +715,22 @@ where
 
     #[cfg(test)]
     pub async fn check(&self, local_key: K, redis_key: &str, op: &A::Op) -> RateLimitOutcome {
-        if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
+        // Single authoritative gate: the client's own semantic availability. It
+        // reads false while the topology is terminal, so a refused endpoint can
+        // never be consulted, and it reads true the moment the client itself
+        // recovers — no second observer interval in front of admission.
+        if self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
                 // Re-check the terminal flag at the success boundary: a task
                 // that proved an unsupported topology while this operation was
-                // in flight must not be overruled by its result (the client
-                // already fails such commands; this keeps `redis_healthy` from
-                // latching true for a refused endpoint).
+                // in flight must not be overruled by its result.
                 Ok(result) if !self.primary.is_topology_unsupported() => {
-                    self.redis_healthy.store(true, Ordering::Relaxed);
                     self.fallback_warned.store(false, Ordering::Relaxed);
                     return result;
                 }
-                Ok(_) | Err(()) => {
-                    self.redis_healthy.store(false, Ordering::Relaxed);
-                }
+                // The client marked itself unavailable (or terminal) on this
+                // failure, so the next request re-reads that signal directly.
+                Ok(_) | Err(()) => {}
             }
         }
 
@@ -739,18 +750,15 @@ where
         op: &A::Op,
         max_entries: usize,
     ) -> Option<RateLimitOutcome> {
-        if self.redis_healthy.load(Ordering::Relaxed) && self.primary.is_available() {
+        // See `check`: `is_available()` is the only admission gate, and a
+        // concurrent topology rejection wins over an in-flight success.
+        if self.primary.is_available() {
             match self.primary.check(redis_key, op).await {
-                // See `check`: a concurrent topology rejection wins over an
-                // in-flight success.
                 Ok(result) if !self.primary.is_topology_unsupported() => {
-                    self.redis_healthy.store(true, Ordering::Relaxed);
                     self.fallback_warned.store(false, Ordering::Relaxed);
                     return Some(result);
                 }
-                Ok(_) | Err(()) => {
-                    self.redis_healthy.store(false, Ordering::Relaxed);
-                }
+                Ok(_) | Err(()) => {}
             }
         }
 
@@ -804,9 +812,16 @@ where
         self.health_observer_abort.clone()
     }
 
+    /// Log-only observer: reports the availability edge once per outage.
+    ///
+    /// It deliberately gates nothing. Admission reads
+    /// `RedisLimiter::is_available` directly on every request, so a recovery
+    /// this task has not observed yet is already eligible for centralized
+    /// enforcement; the task exists so operators still get one "recovered" line
+    /// per outage even for a policy that sees no traffic in between.
     fn spawn_health_observer(&mut self) {
         let plugin_name = self.plugin_name;
-        let redis_healthy = Arc::clone(&self.redis_healthy);
+        let observed_available = Arc::clone(&self.observed_available);
         let fallback_warned = Arc::clone(&self.fallback_warned);
         // Observe availability without retaining the full Redis client (and its
         // cached connections / credentials) after this limiter is dropped. The
@@ -828,7 +843,7 @@ where
             loop {
                 tokio::time::sleep(interval).await;
                 let is_available = availability.is_available();
-                let was_healthy = redis_healthy.swap(is_available, Ordering::Relaxed);
+                let was_healthy = observed_available.swap(is_available, Ordering::Relaxed);
                 if is_available && !was_healthy {
                     fallback_warned.store(false, Ordering::Relaxed);
                     info!(plugin = plugin_name, "Redis rate limiting recovered");

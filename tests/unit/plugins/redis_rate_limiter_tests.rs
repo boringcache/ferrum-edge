@@ -1792,6 +1792,10 @@ enum InfoBehavior {
     /// node after Ferrum already screened and cached a connection to it, so the
     /// re-screen on the post-disconnect reconnect is what must catch it.
     PayloadThenCluster(&'static str),
+    /// Answer the first `n` screens with this text, then report Cluster
+    /// topology. Models an endpoint that a whole warm pool screened cleanly
+    /// before the *background recovery probe* is the task that proves Cluster.
+    PayloadForFirstScreens(&'static str, usize),
 }
 
 const CLUSTER_INFO: &str = "# Cluster\r\ncluster_enabled:1\r\n";
@@ -1878,6 +1882,16 @@ async fn spawn_screened_redis_server_with_drop(
                                     }
                                     InfoBehavior::PayloadThenCluster(first) => {
                                         let text = if screen_index == 0 {
+                                            first
+                                        } else {
+                                            CLUSTER_INFO
+                                        };
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::PayloadForFirstScreens(first, clean_screens) => {
+                                        let text = if screen_index < clean_screens {
                                             first
                                         } else {
                                             CLUSTER_INFO
@@ -2174,6 +2188,305 @@ async fn a_recovery_probe_completing_after_a_rejection_advertises_no_recovery() 
     let _ = server.shutdown.send(());
 }
 
+/// The background recovery probe can be the task that *proves* Cluster
+/// topology. When it is, the slots a previously healthy pool cached must be
+/// released there and then — not retained until the whole client generation
+/// drops. The probe owns only a `Weak` handle to the pool, which is exactly
+/// enough to clear it.
+#[tokio::test]
+async fn a_recovery_probe_proving_cluster_topology_clears_every_cached_pool_slot() {
+    const POOL_SIZE: usize = 3;
+    // Every warm-pool screen passes; the next screen (the recovery probe's)
+    // reports Cluster.
+    let clean = "# Cluster\r\ncluster_enabled:0\r\n";
+    let info = InfoBehavior::PayloadForFirstScreens(clean, POOL_SIZE);
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Probe once per second so the rejection lands promptly.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = POOL_SIZE;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // Arm the recovery checker FIRST: marking unavailable also clears the pool,
+    // so warming afterwards is what leaves populated slots for the probe to
+    // find. The recovery loop sleeps one interval before its first probe.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+    assert_eq!(client.warm_pool_for_test().await, POOL_SIZE);
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        POOL_SIZE,
+        "the probe must start from a fully populated cache"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), POOL_SIZE);
+    let warm_dials = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(warm_dials, POOL_SIZE);
+
+    for _ in 0..6_000 {
+        if client.is_topology_unsupported() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        client.is_topology_unsupported(),
+        "the recovery probe's own screen must prove Cluster topology"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "a rejection proven by the recovery probe must release every cached slot"
+    );
+    assert!(!client.is_available());
+    assert!(!client.observer_sees_available_for_test());
+
+    // Terminal: nothing re-establishes a slot, and the endpoint is never
+    // redialed for policy work.
+    assert_eq!(client.warm_pool_for_test().await, 0);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+    let probe_dials = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(
+        probe_dials,
+        warm_dials + 1,
+        "only the recovery probe's own connection may follow the warm pool"
+    );
+
+    // Two further probe intervals: the loop must stay parked on the terminal
+    // state rather than pinging, reconnecting, or repopulating the cache.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+    assert!(client.is_topology_unsupported());
+    assert!(!client.is_available());
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        probe_dials,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Failover admission must not latch a second recovery interval (GHSA-87rq) ─
+//
+// The failover limiter used to gate admission on BOTH the client's semantic
+// availability and its own health-observer mirror. An ordinary command failure
+// makes the client unavailable; the client republishes availability at most one
+// health interval later, and the independent observer then needed a further
+// interval before its mirror agreed. Under the fail-closed default that turned
+// routine socket recycling into roughly two intervals of blanket refusals.
+// `is_available()` is now the only admission gate.
+
+/// One RESP round trip of the limiter's sliding window: the client sends
+/// `MULTI` / `GET` / `INCRBY` / `EXPIRE` / `EXEC` as a single pipeline, so a
+/// well-formed answer is `+OK`, three `+QUEUED`s, and the `EXEC` array.
+const TRANSACTION_PREAMBLE: &[u8] = b"+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n";
+/// `EXEC` array for a first-request window: `GET` nil, `INCRBY` → 1, `EXPIRE` → 1.
+const TRANSACTION_SUCCESS: &[u8] = b"*3\r\n$-1\r\n:1\r\n:1\r\n";
+/// A plain (non-Cluster) server error on `EXEC` — the ordinary retryable
+/// failure a recycled socket produces, not a topology proof.
+const TRANSACTION_FAILURE: &[u8] = b"-ERR simulated transient backend failure\r\n";
+const MULTI_CMD: &[u8] = b"$5\r\nMULTI\r\n";
+
+struct TransactionServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    accepts: Arc<AtomicUsize>,
+    transactions: Arc<AtomicUsize>,
+}
+
+/// Screens clean on every connection, fails the FIRST sliding-window
+/// transaction with a plain server error, and answers every later transaction
+/// normally.
+async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let transactions = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let transactions_task = Arc::clone(&transactions);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let transactions = Arc::clone(&transactions_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let chunk = &buf[..n];
+                            let mut reply: Vec<u8> = Vec::new();
+                            if chunk_contains(chunk, INFO_CMD) {
+                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                let len = text.len();
+                                reply.extend_from_slice(
+                                    format!("${len}\r\n{text}\r\n").as_bytes(),
+                                );
+                            } else if chunk_contains(chunk, MULTI_CMD) {
+                                let index = transactions.fetch_add(1, Ordering::Relaxed);
+                                reply.extend_from_slice(TRANSACTION_PREAMBLE);
+                                if index == 0 {
+                                    reply.extend_from_slice(TRANSACTION_FAILURE);
+                                } else {
+                                    reply.extend_from_slice(TRANSACTION_SUCCESS);
+                                }
+                            } else {
+                                for _ in 0..command_count(chunk) {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    TransactionServer {
+        port,
+        shutdown: shutdown_tx,
+        accepts,
+        transactions,
+    }
+}
+
+/// Once the client's availability signal recovers, the very next admission is
+/// eligible for centralized enforcement — no observer tick in between. A
+/// terminal topology rejection still can never be overruled.
+#[tokio::test]
+async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+        RedisFailurePolicy,
+    };
+
+    let server = spawn_first_transaction_fails_redis_server().await;
+    let accepts = Arc::clone(&server.accepts);
+    let transactions = Arc::clone(&server.transactions);
+
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+                "redis_pool_size": 1,
+                // Long enough that neither the client's recovery checker nor the
+                // failover observer can tick during this test: every transition
+                // below is one this test performs explicitly.
+                "redis_health_check_interval_seconds": 3600,
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    assert_eq!(
+        backend.redis_failure_policy(),
+        Some(RedisFailurePolicy::FailClosed),
+        "this coverage is about the fail-closed default's recovery latency"
+    );
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("failover backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1_000,
+        duration: Duration::from_secs(60),
+    }]);
+
+    // 1. The first centralized transaction fails, so the client marks itself
+    //    unavailable and the fail-closed policy refuses. This is the transition
+    //    that used to drive the failover mirror false as well.
+    let first = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("fail-closed refusal is an outcome, not a capacity denial");
+    assert!(!first.allowed);
+    assert!(first.enforcement_unavailable);
+    assert!(!client.is_available());
+    assert!(!client.is_topology_unsupported());
+    assert_eq!(transactions.load(Ordering::Relaxed), 1);
+    let dials_after_outage = accepts.load(Ordering::Relaxed);
+    assert_eq!(dials_after_outage, 1);
+
+    // 2. The client itself recovers — what a successful recovery probe does.
+    //    No observer tick can have happened: its interval is an hour away.
+    assert!(client.publish_reachable_for_test());
+    assert!(client.is_available());
+
+    // 3. The very next admission must be centrally enforced. Before the fix the
+    //    limiter also required its own observer mirror to agree, so this
+    //    admission was refused for up to another whole health interval.
+    let second = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        second.allowed && !second.enforcement_unavailable,
+        "admission must be centrally enforced as soon as the client is available \
+         again, without waiting for the failover observer's own interval"
+    );
+    assert_eq!(
+        transactions.load(Ordering::Relaxed),
+        2,
+        "the recovered admission must actually reach Redis"
+    );
+    assert!(accepts.load(Ordering::Relaxed) > dials_after_outage);
+
+    // 4. A terminal topology rejection can never be overruled: no publication
+    //    restores availability, and admission never redials the endpoint.
+    client.mark_topology_unsupported_for_test();
+    assert!(!client.publish_reachable_for_test());
+    assert!(!client.is_available());
+    let dials_after_rejection = accepts.load(Ordering::Relaxed);
+    let refused = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-b".to_string(),
+            || "{ferrum%3Atest:identity-b}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(!refused.allowed);
+    assert!(refused.enforcement_unavailable);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials_after_rejection,
+        "a refused topology must not be redialed by admission"
+    );
+    assert_eq!(
+        transactions.load(Ordering::Relaxed),
+        2,
+        "no policy command may run against a refused endpoint"
+    );
+    assert!(client.is_topology_unsupported());
+
+    let _ = server.shutdown.send(());
+}
+
 // ── Cached pool must not transparently reconnect (GHSA-87rq root review) ──
 //
 // redis-rs `ConnectionManager` re-establishes its physical socket internally.
@@ -2394,10 +2707,9 @@ async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
 // topology reason, Redis error). Hashes/encodings are NOT an acceptable
 // substitute — they are still per-identity correlators.
 
-/// Static canary over the limiter surfaces that talk to the shared Redis client.
-#[test]
-fn limiter_log_statements_never_carry_identity_bearing_keys() {
-    let sources: [(&str, &str); 8] = [
+/// The eight limiter surfaces that talk to the shared Redis client.
+fn identity_log_guard_sources() -> [(&'static str, &'static str); 8] {
+    [
         (
             "src/plugins/utils/redis_rate_limiter.rs",
             include_str!("../../../src/plugins/utils/redis_rate_limiter.rs"),
@@ -2435,44 +2747,542 @@ fn limiter_log_statements_never_carry_identity_bearing_keys() {
             "src/plugins/grpc_method_router.rs",
             include_str!("../../../src/plugins/grpc_method_router.rs"),
         ),
-    ];
+    ]
+}
 
-    // `tracing` field syntax for an identity-bearing key, in every spelling the
-    // limiter surfaces have used. The `%`/`?` sigils are required so an ordinary
-    // `let previous_key = ...` binding is not a false positive — only a value
-    // actually recorded into a log event matches.
-    let banned_fields = [
-        "rate_limit_key = %",
-        "rate_limit_key = ?",
-        "previous_key = %",
-        "previous_key = ?",
-        "current_key = %",
-        "current_key = ?",
-        "count_key = %",
-        "count_key = ?",
-        "total_key = %",
-        "total_key = ?",
-        "curr_key = %",
-        "prev_key = %",
-        "redis_key = %",
-        "key = %key",
-        "key = ?key",
-        "key = %curr",
-        "key = %prev",
-        "key = %redis_key",
-        "key = %self.make",
-        // Reversible encodings / digests are not an acceptable substitute.
-        "key_hash = %",
-        "key_digest = %",
-        "key_b64 = %",
-    ];
+/// Rust source with comments blanked out and string/char literal spans marked.
+///
+/// The mask is what makes the field/paren structure below trustworthy: a `,`,
+/// `(`, or `//` inside a literal is text, not syntax.
+struct MaskedSource {
+    chars: Vec<char>,
+    in_literal: Vec<bool>,
+}
 
-    for (path, source) in sources {
-        for banned in banned_fields {
-            assert!(
-                !source.contains(banned),
-                "{path} logs an identity-bearing rate-limit key field: {banned}"
-            );
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn mask_source(source: &str) -> MaskedSource {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = chars.clone();
+    let mut in_literal = vec![false; chars.len()];
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Line comment.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out[i] = ' ';
+                i += 1;
+            }
+            continue;
         }
+
+        // Block comment (Rust allows nesting).
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut depth = 1usize;
+            out[i] = ' ';
+            out[i + 1] = ' ';
+            i += 2;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                if chars[i] != '\n' {
+                    out[i] = ' ';
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Raw string: r"…", r#"…"#, br#"…"#.
+        if (c == 'r' || c == 'b') && (i == 0 || !is_ident_char(chars[i - 1])) {
+            let mut j = i + 1;
+            let raw = c == 'r' || chars.get(j) == Some(&'r');
+            if c == 'b' && chars.get(j) == Some(&'r') {
+                j += 1;
+            }
+            let hash_start = j;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            let hashes = j - hash_start;
+            if raw && chars.get(j) == Some(&'"') {
+                let mut k = j + 1;
+                loop {
+                    if k >= chars.len() {
+                        break;
+                    }
+                    if chars[k] == '"'
+                        && (1..=hashes).all(|offset| chars.get(k + offset) == Some(&'#'))
+                    {
+                        k += hashes + 1;
+                        break;
+                    }
+                    k += 1;
+                }
+                for slot in in_literal.iter_mut().take(k.min(chars.len())).skip(i) {
+                    *slot = true;
+                }
+                i = k;
+                continue;
+            }
+        }
+
+        // Ordinary (or byte) string literal.
+        if c == '"' {
+            let mut j = i;
+            in_literal[j] = true;
+            j += 1;
+            while j < chars.len() {
+                in_literal[j] = true;
+                if chars[j] == '\\' {
+                    if j + 1 < chars.len() {
+                        in_literal[j + 1] = true;
+                    }
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '"' {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        // Char literal — distinguished from a lifetime by its closing quote.
+        if c == '\'' {
+            let escaped = chars.get(i + 1) == Some(&'\\');
+            if escaped || chars.get(i + 2) == Some(&'\'') {
+                let mut j = i + 1;
+                in_literal[i] = true;
+                while j < chars.len() {
+                    in_literal[j] = true;
+                    if chars[j] == '\\' {
+                        if j + 1 < chars.len() {
+                            in_literal[j + 1] = true;
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == '\'' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    MaskedSource {
+        chars: out,
+        in_literal,
+    }
+}
+
+/// Macro names whose arguments become log records.
+const TRACING_MACROS: [&str; 12] = [
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+    "span",
+    "trace_span",
+    "debug_span",
+    "info_span",
+    "warn_span",
+    "error_span",
+];
+
+/// Byte ranges of the argument list of every tracing macro invocation.
+fn tracing_argument_spans(masked: &MaskedSource) -> Vec<(usize, usize)> {
+    let chars = &masked.chars;
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] != '!' || masked.in_literal[i] {
+            i += 1;
+            continue;
+        }
+        // Macro name immediately before the `!` (path-qualified names such as
+        // `tracing::warn!` reduce to their last segment).
+        let mut name_start = i;
+        while name_start > 0 && is_ident_char(chars[name_start - 1]) {
+            name_start -= 1;
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        let mut open = i + 1;
+        while open < chars.len() && chars[open].is_whitespace() {
+            open += 1;
+        }
+        if !TRACING_MACROS.contains(&name.as_str()) || chars.get(open) != Some(&'(') {
+            i += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut j = open;
+        let mut close = None;
+        while j < chars.len() {
+            if !masked.in_literal[j] {
+                match chars[j] {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let Some(close) = close else { break };
+        spans.push((open + 1, close));
+        i = close + 1;
+    }
+
+    spans
+}
+
+/// Top-level (comma-separated) argument ranges inside one invocation.
+fn top_level_fields(masked: &MaskedSource, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut fields = Vec::new();
+    let mut depth = 0usize;
+    let mut field_start = start;
+    let mut i = start;
+    while i < end {
+        if !masked.in_literal[i] {
+            match masked.chars[i] {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    fields.push((field_start, i));
+                    field_start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if field_start < end {
+        fields.push((field_start, end));
+    }
+    fields
+}
+
+/// The range of the *value* a field records.
+///
+/// `name = expr` records `expr`; a shorthand field (`%key`, `?key`, `key`) and
+/// a message/format argument record themselves. Only values are inspected, so
+/// an innocuous value under a key-ish field name is not a false positive.
+fn recorded_value_range(masked: &MaskedSource, start: usize, end: usize) -> (usize, usize) {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < end {
+        if !masked.in_literal[i] {
+            match masked.chars[i] {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                '=' if depth == 0 => {
+                    let prev = masked.chars[start..i]
+                        .iter()
+                        .rev()
+                        .find(|c| !c.is_whitespace())
+                        .copied();
+                    // `==`, `!=`, `<=`, `>=`, `=>` are operators, not a field
+                    // assignment.
+                    if matches!(prev, Some('=' | '!' | '<' | '>'))
+                        || masked.chars.get(i + 1) == Some(&'=')
+                        || masked.chars.get(i + 1) == Some(&'>')
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    let name: String = masked.chars[start..i].iter().collect();
+                    let name = name.trim().trim_start_matches(['%', '?']);
+                    let is_field_name = !name.is_empty()
+                        && name.chars().all(|c| is_ident_char(c) || c == '.' || c == ':')
+                        && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
+                    if is_field_name {
+                        return (i + 1, end);
+                    }
+                    return (start, end);
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    (start, end)
+}
+
+/// Identifier tokens a value expression references, including inline format
+/// captures (`"… {key} …"`). Literal *text* is otherwise ignored, so a message
+/// that merely says "rate key" is not a finding.
+fn value_expression_tokens(masked: &MaskedSource, start: usize, end: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut i = start;
+
+    while i < end {
+        if masked.in_literal[i] {
+            let literal_start = i;
+            while i < end && masked.in_literal[i] {
+                i += 1;
+            }
+            let text: String = masked.chars[literal_start..i].iter().collect();
+            let bytes: Vec<char> = text.chars().collect();
+            let mut k = 0usize;
+            while k < bytes.len() {
+                if bytes[k] == '{' {
+                    if bytes.get(k + 1) == Some(&'{') {
+                        k += 2;
+                        continue;
+                    }
+                    if let Some(offset) = bytes[k + 1..].iter().position(|c| *c == '}') {
+                        let inner: String = bytes[k + 1..k + 1 + offset].iter().collect();
+                        let capture = inner.split(':').next().unwrap_or("").trim().to_string();
+                        if !capture.is_empty()
+                            && capture.chars().all(is_ident_char)
+                            && !capture.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        {
+                            tokens.push(capture);
+                        }
+                        k += offset + 2;
+                        continue;
+                    }
+                }
+                k += 1;
+            }
+            continue;
+        }
+        let c = masked.chars[i];
+        if is_ident_char(c) {
+            current.push(c);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Documented operator configuration that merely *contains* "key" and carries no
+/// enforcement identity.
+const NON_IDENTITY_TOKENS: [&str; 4] = ["key_prefix", "key_prefixes", "contains_key", "keys"];
+
+/// Identity-bearing value names that do not spell "key".
+const IDENTITY_TOKENS: [&str; 8] = [
+    "identity",
+    "authenticated_identity",
+    "consumer",
+    "consumer_id",
+    "principal",
+    "spiffe_id",
+    "client_ip",
+    "peer_ip",
+];
+
+/// Whether an identifier used as a recorded value carries an enforcement
+/// identity.
+///
+/// SCREAMING_SNAKE_CASE names are exempt: a compile-time constant is a fixed
+/// string, so it cannot be a per-identity correlator however it is spelled.
+fn is_identity_bearing_token(token: &str) -> bool {
+    if token
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    if NON_IDENTITY_TOKENS.contains(&lower.as_str()) {
+        return false;
+    }
+    lower == "key"
+        || lower.ends_with("_key")
+        || lower.starts_with("key_")
+        || lower.contains("_key_")
+        || IDENTITY_TOKENS.contains(&lower.as_str())
+}
+
+/// Every identity-bearing token recorded as a value by a tracing macro, with the
+/// 1-based line of the field it appears in.
+fn identity_bearing_log_values(source: &str) -> Vec<(usize, String, String)> {
+    let masked = mask_source(source);
+    let mut newline_offsets: Vec<usize> = Vec::new();
+    for (index, c) in masked.chars.iter().enumerate() {
+        if *c == '\n' {
+            newline_offsets.push(index);
+        }
+    }
+    let line_of = |index: usize| newline_offsets.partition_point(|nl| *nl < index) + 1;
+
+    let mut findings = Vec::new();
+    for (start, end) in tracing_argument_spans(&masked) {
+        for (field_start, field_end) in top_level_fields(&masked, start, end) {
+            let (value_start, value_end) = recorded_value_range(&masked, field_start, field_end);
+            for token in value_expression_tokens(&masked, value_start, value_end) {
+                if is_identity_bearing_token(&token) {
+                    let field: String = masked.chars[field_start..field_end].iter().collect();
+                    findings.push((
+                        line_of(field_start),
+                        token,
+                        field.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// Number of tracing invocations the scanner recognized — a self-check that the
+/// guard is actually reading these files rather than silently parsing nothing.
+fn tracing_invocation_count(source: &str) -> usize {
+    tracing_argument_spans(&mask_source(source)).len()
+}
+
+/// Static canary over the limiter surfaces that talk to the shared Redis client.
+///
+/// This is a canary, not a proof: it enforces one concrete boundary — no
+/// identity-bearing identifier may appear in an expression a `tracing` macro
+/// records as a value, in any field name, including shorthand fields, `%`/`?`
+/// render forms, and inline format captures. Code that reaches a log through
+/// something other than a literal tracing macro in these eight files (a helper
+/// that formats a string elsewhere, a `Display` impl that embeds a key) is
+/// outside what it can see.
+#[test]
+fn limiter_log_statements_never_carry_identity_bearing_keys() {
+    for (path, source) in identity_log_guard_sources() {
+        let findings = identity_bearing_log_values(source);
+        assert!(
+            findings.is_empty(),
+            "{path} records identity-bearing values in tracing macros: {findings:?}"
+        );
+    }
+}
+
+/// The scanner must actually parse these files. Without this, a parser bug that
+/// finds zero invocations would make the canary above pass vacuously forever.
+#[test]
+fn identity_log_guard_reads_every_governed_source() {
+    for (path, source) in identity_log_guard_sources() {
+        assert!(
+            tracing_invocation_count(source) > 0,
+            "{path}: the identity-log guard found no tracing macro invocations"
+        );
+    }
+
+    // The known non-identity operator field must be *seen and allowed*, not
+    // missed: it proves the scanner reaches real recorded values.
+    let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let masked = mask_source(redis);
+    let mut saw_key_prefix_value = false;
+    for (start, end) in tracing_argument_spans(&masked) {
+        for (field_start, field_end) in top_level_fields(&masked, start, end) {
+            let (value_start, value_end) = recorded_value_range(&masked, field_start, field_end);
+            if value_expression_tokens(&masked, value_start, value_end)
+                .iter()
+                .any(|token| token == "key_prefix")
+            {
+                saw_key_prefix_value = true;
+            }
+        }
+    }
+    assert!(
+        saw_key_prefix_value,
+        "the guard must reach `key_prefix = %self.config.key_prefix` and allow it"
+    );
+}
+
+/// Bypass spellings the previous substring canary could not see, plus the
+/// non-findings it must not flag.
+#[test]
+fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
+    let caught = [
+        // Arbitrary field name — the whole point of the strengthening.
+        r#"fn f() { warn!(anything_at_all = %key, "denied"); }"#,
+        r#"fn f() { warn!(rate_key = %redis_key, "denied"); }"#,
+        // Shorthand fields, both render sigils and the bare form.
+        r#"fn f() { warn!(%key, "denied"); }"#,
+        r#"fn f() { warn!(?redis_key, "denied"); }"#,
+        r#"fn f() { warn!(curr_key, "denied"); }"#,
+        // Expressions, not just bindings.
+        r#"fn f() { info!(detail = ?self.make_redis_key(id), "x"); }"#,
+        r#"fn f() { warn!(detail = %format!("{}", prev_key), "x"); }"#,
+        // Digests and encodings are still per-identity correlators.
+        r#"fn f() { warn!(fingerprint = %sha256(count_key), "x"); }"#,
+        // Inline format captures in the message itself.
+        r#"fn f() { debug!("window for {key} tripped"); }"#,
+        // Path-qualified macro.
+        r#"fn f() { tracing::warn!(field = %total_key, "x"); }"#,
+        // Identity values that do not spell "key".
+        r#"fn f() { warn!(who = %authenticated_identity, "x"); }"#,
+    ];
+    for source in caught {
+        assert!(
+            !identity_bearing_log_values(source).is_empty(),
+            "guard missed an identity-bearing log value: {source}"
+        );
+    }
+
+    let allowed = [
+        // Documented non-identity operator config.
+        r#"fn f() { warn!(key_prefix = %self.config.key_prefix, "x"); }"#,
+        // Ordinary bindings and non-tracing macros are not log records.
+        r#"fn f() { let previous_key = b(); assert!(!previous_key.is_empty()); }"#,
+        r#"fn f() { panic!("{previous_key}"); }"#,
+        r#"fn f() { let msg = format!("{count_key}"); }"#,
+        // A message that merely *mentions* a key is text, not a recorded value.
+        r#"fn f() { warn!(plugin = "rate_limiting", "rate key rejected"); }"#,
+        // Commented-out code is not compiled and is not a log statement.
+        "fn f() { /* warn!(rate_key = %key, \"x\"); */ }",
+        "fn f() { // warn!(rate_key = %key, \"x\");\n }",
+        // Compile-time constants cannot be per-identity correlators.
+        r#"fn f() { debug!(marker = %AI_REQUEST_METADATA_KEY, "x"); }"#,
+        // Field *names* alone are not values.
+        r#"fn f() { warn!(redis_key_present = %flag, "x"); }"#,
+    ];
+    for source in allowed {
+        assert!(
+            identity_bearing_log_values(source).is_empty(),
+            "guard produced a false positive: {source} -> {:?}",
+            identity_bearing_log_values(source)
+        );
     }
 }

@@ -98,6 +98,10 @@
 //! background task periodically pings Redis to detect recovery. That task is
 //! owned by this client: dropping the client aborts it so retired plugin
 //! generations do not retain connections or keep pinging obsolete endpoints.
+//! Beyond the shared availability state it holds only a `Weak` handle to the
+//! connection pool — never the client, its endpoint credentials, or unrelated
+//! state — which is exactly enough to drop every cached socket when the probe
+//! itself proves an unsupported Cluster topology.
 //!
 //! What a *consumer* does while the client is unavailable is the consumer's
 //! policy, not this client's: rate-limit plugins choose between failing closed
@@ -126,7 +130,9 @@
 //! [`redis::aio::MultiplexedConnection`] slots. Slots are established lazily on
 //! first use, selected round-robin on the hot path (lock-free atomic counter),
 //! and cleared together on failure so TLS/DNS screening and availability state
-//! stay coherent across the pool.
+//! stay coherent across the pool. A proven Cluster topology clears them too,
+//! whichever path proves it — an operation, a fresh connect screen, or the
+//! background recovery probe.
 //!
 //! The pooled type is deliberately *not* [`redis::aio::ConnectionManager`].
 //! That type reconnects transparently inside redis-rs, so a screened endpoint
@@ -1005,6 +1011,53 @@ struct ConnectionSlot {
     connect_mutex: tokio::sync::Mutex<()>,
 }
 
+/// The bounded pool of cached connections, split out of
+/// [`RedisRateLimitClient`] so a background task can be handed *only* the
+/// ability to drop cached sockets.
+///
+/// The background recovery checker can prove an unsupported Cluster topology on
+/// its own. Rejecting the topology while previously cached slots stay retained
+/// would keep sockets to a refused endpoint open until the whole client
+/// generation drops, so the checker needs to clear the pool — but it must not
+/// keep the client, its endpoint credentials, or any unrelated state alive. It
+/// therefore holds a [`std::sync::Weak`] to this holder and nothing else: no
+/// strong reference, so a retired generation is still released promptly, and
+/// the client's `Drop` still aborts the task.
+struct ConnectionPool {
+    slots: Box<[ConnectionSlot]>,
+    /// Round-robin counter for deterministic, low-overhead slot selection.
+    /// `fetch_add` + `% slots.len()` — no locks, no hashing on the hot path.
+    next_slot: AtomicUsize,
+}
+
+impl ConnectionPool {
+    fn new(size: usize) -> Self {
+        Self {
+            slots: (0..size.max(1))
+                .map(|_| ConnectionSlot {
+                    connection: ArcSwap::from_pointee(None),
+                    connect_mutex: tokio::sync::Mutex::new(()),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            next_slot: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Drop every cached connection. Lock-free stores only — the hot path's
+    /// `ArcSwap` reads are unaffected, and a slot being established concurrently
+    /// re-screens before it can publish.
+    fn clear(&self) {
+        for slot in self.slots.iter() {
+            slot.connection.store(Arc::new(None));
+        }
+    }
+}
+
 /// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
 #[derive(Debug)]
 pub enum BoundedRedisValue {
@@ -1064,10 +1117,11 @@ pub struct RedisRateLimitClient {
     /// Bounded pool of non-reconnecting multiplexed connections
     /// (`redis_pool_size`). Each slot is established lazily on first selection
     /// and only through the screened establishment path.
-    pool: Box<[ConnectionSlot]>,
-    /// Round-robin counter for deterministic, low-overhead slot selection.
-    /// `fetch_add` + `% pool.len()` — no locks, no hashing on the hot path.
-    next_slot: AtomicUsize,
+    ///
+    /// Held behind an `Arc` so the background recovery checker can be given a
+    /// `Weak` handle to it — enough to drop cached sockets when it proves an
+    /// unsupported topology, and nothing more.
+    pool: Arc<ConnectionPool>,
     /// Configuration for connecting to Redis.
     config: RedisConfig,
     /// The gateway's shared DNS cache for resolving Redis hostnames.
@@ -1154,14 +1208,7 @@ impl RedisRateLimitClient {
         };
 
         Self {
-            pool: (0..config.pool_size.max(1))
-                .map(|_| ConnectionSlot {
-                    connection: ArcSwap::from_pointee(None),
-                    connect_mutex: tokio::sync::Mutex::new(()),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            next_slot: AtomicUsize::new(0),
+            pool: Arc::new(ConnectionPool::new(config.pool_size)),
             config,
             dns_cache,
             availability: Arc::new(EnforcementAvailability::new()),
@@ -1212,6 +1259,15 @@ impl RedisRateLimitClient {
         self.mark_topology_unsupported("test-injected cluster topology proof");
     }
 
+    /// Publish "reachable" exactly the way a successful recovery probe does
+    /// (test support), so admission coverage can land a recovery at a chosen
+    /// point without a live server. Returns `false` when the topology is
+    /// terminal and nothing was written.
+    #[allow(dead_code)] // public support used by the external unit-test target
+    pub fn publish_reachable_for_test(&self) -> bool {
+        self.availability.publish_reachable()
+    }
+
     /// What a failover health observer reads from this client's shared
     /// availability signal — the same `Arc` the observer holds (test support).
     #[allow(dead_code)] // public support used by the external unit-test target
@@ -1244,6 +1300,7 @@ impl RedisRateLimitClient {
     #[allow(dead_code)] // public support used by the external unit-test target
     pub fn cached_pool_cardinality_for_test(&self) -> usize {
         self.pool
+            .slots
             .iter()
             .filter(|slot| slot.connection.load().is_some())
             .count()
@@ -1352,9 +1409,9 @@ impl RedisRateLimitClient {
     /// Deterministic round-robin index into the connection pool.
     fn select_slot_index(&self) -> usize {
         let len = self.pool.len();
-        // pool.len() is always >= 1 (constructor uses pool_size.max(1); admission
-        // rejects zero). Wrapping fetch_add keeps selection lock-free.
-        self.next_slot.fetch_add(1, Ordering::Relaxed) % len
+        // pool.len() is always >= 1 (ConnectionPool::new uses size.max(1);
+        // admission rejects zero). Wrapping fetch_add keeps selection lock-free.
+        self.pool.next_slot.fetch_add(1, Ordering::Relaxed) % len
     }
 
     /// Resolve the Redis endpoint through the gateway DNS cache.
@@ -1490,7 +1547,7 @@ impl RedisRateLimitClient {
         if self.is_topology_unsupported() {
             return None;
         }
-        let slot = &self.pool[idx];
+        let slot = &self.pool.slots[idx];
 
         // Fast path: lock-free read via ArcSwap
         let guard = slot.connection.load();
@@ -1570,6 +1627,15 @@ impl RedisRateLimitClient {
                 );
                 self.start_health_checker_if_needed();
                 slot.connection.store(Arc::new(Some(conn.clone())));
+                // Publication race, other direction: a rejection proven between
+                // the check above and this store would have cleared an empty
+                // slot. Re-read the terminal state and drop the freshly cached
+                // socket so no slot can retain a connection to a refused
+                // endpoint.
+                if self.is_topology_unsupported() {
+                    self.clear_connection();
+                    return None;
+                }
                 Some(conn)
             }
             Err(ConnectAttemptError::Redis(e)) => {
@@ -1700,9 +1766,7 @@ impl RedisRateLimitClient {
     /// This is the *only* way a pooled connection is ever replaced — the cached
     /// [`redis::aio::MultiplexedConnection`] cannot re-dial by itself.
     fn clear_connection(&self) {
-        for slot in self.pool.iter() {
-            slot.connection.store(Arc::new(None));
-        }
+        self.pool.clear();
     }
 
     /// Mark Redis as unavailable, clear the connection for re-resolution, and
@@ -1833,6 +1897,11 @@ impl RedisRateLimitClient {
         }
 
         let availability = Arc::clone(&self.availability);
+        // Weak, not strong: the checker may drop cached sockets when it proves
+        // an unsupported topology, but a retired client generation must still be
+        // released (and its pool dropped) the moment the client is dropped,
+        // without waiting for the abort to be observed by the runtime.
+        let pool = Arc::downgrade(&self.pool);
         let config = self.config.clone();
         let dns_cache = self.dns_cache.clone();
         let interval = Duration::from_secs(self.config.health_check_interval_seconds);
@@ -1933,7 +2002,17 @@ impl RedisRateLimitClient {
                     match screen {
                         TopologyScreen::Usable => Ok::<(), redis::RedisError>(()),
                         TopologyScreen::ClusterProven => {
-                            if availability.reject_topology() {
+                            let first = availability.reject_topology();
+                            // Terminal state first, cached sockets second — the
+                            // same order as the client's own rejection path, so
+                            // nothing can republish reachability and then keep a
+                            // slot to a refused endpoint. The probe's own
+                            // connection is local to this block and is dropped
+                            // with it; the endpoint is never redialed again.
+                            if let Some(pool) = pool.upgrade() {
+                                pool.clear();
+                            }
+                            if first {
                                 warn!(
                                     redis_url = %config.redacted_url(),
                                     key_prefix = %config.key_prefix,
