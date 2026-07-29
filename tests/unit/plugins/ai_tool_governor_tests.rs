@@ -9630,9 +9630,7 @@ const AMBIGUITY_REASON_VALUE: &str = "ambiguous_json";
 /// `decision=dry_run` + fixed `uninspectable_reason`, never claim deny.
 fn assert_dry_run_ambiguity_observation(ctx: &RequestContext) {
     assert_eq!(
-        ctx.metadata
-            .get(AMBIGUITY_METADATA_KEY)
-            .map(String::as_str),
+        ctx.metadata.get(AMBIGUITY_METADATA_KEY).map(String::as_str),
         Some("dry_run"),
         "dry-run ambiguity must record decision=dry_run, got {:?}",
         ctx.metadata.get(AMBIGUITY_METADATA_KEY)
@@ -10390,7 +10388,10 @@ async fn json_shaped_stream_duplicate_members_are_observed_in_dry_run() {
             .expect("stream inspector");
     let bytes = body.as_bytes();
     let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
-    assert!(!terminated, "dry-run must not cut a JSON-shaped ambiguous body");
+    assert!(
+        !terminated,
+        "dry-run must not cut a JSON-shaped ambiguous body"
+    );
     assert_eq!(out, bytes, "dry-run must forward the held JSON unchanged");
     drop(inspector);
     plugin
@@ -10482,7 +10483,10 @@ async fn streaming_reassembled_ambiguous_arguments_are_observed_in_dry_run() {
             .expect("stream inspector");
     let bytes = body.as_bytes();
     let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
-    assert!(!terminated, "dry-run must release reassembled ambiguous args");
+    assert!(
+        !terminated,
+        "dry-run must release reassembled ambiguous args"
+    );
     assert_eq!(out, bytes, "dry-run must forward held frames unchanged");
     drop(inspector);
     plugin
