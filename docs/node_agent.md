@@ -380,7 +380,8 @@ veth. Scoping is done per packet by the BPF maps, not by the attach point:
    `FERRUM_POD_INBOUND_PORTS` / `FERRUM_POD_INBOUND_PORTS6`.
 
 Those port entries are derived from the pod's declared TCP `containerPorts` at
-enrollment. Kubernetes probe ports are deliberately *not* folded in — they keep
+enrollment **and re-derived on every later pod event** (see *Lifecycle* below).
+Kubernetes probe ports are deliberately *not* folded in — they keep
 their existing direct-to-pod exemption through `FERRUM_NODE_PROBE_PORTS`, so
 kubelet health checking never depends on the relay being up. A pod that declares
 no inbound TCP port is never flagged, and traffic to an enrolled pod on an
@@ -425,6 +426,11 @@ family, and the kernel never returns an `AF_INET` socket for an IPv6 lookup. A
 path, so the node-agent publishes **IPv4 redirect scope only** in that case and
 logs which families it armed at startup; enrolled pods' IPv6 inbound traffic
 keeps its existing direct-pod behavior rather than being dropped fail-closed.
+The per-family flag and the per-family scope are derived together, so an
+IPv4-only bind also *clears* any IPv6 scope for the pod's address (a pinned map
+can outlive a previous dual-stack configuration) and never sets the IPv6
+redirect flag — a true flag paired with unreachable scope is the fail-closed
+drop case.
 Bind `FERRUM_MESH_INBOUND_LISTEN_ADDR` to `[::]:15006` — dual-stack under the
 default `bindv6only=0` — to redirect both families.
 
@@ -482,14 +488,22 @@ ip [-6] rule add priority 101 fwmark 0x735 lookup 33134
 ip [-6] route replace local <default> dev lo table 33134
 ```
 
-Priority `101` sits **below** the kernel `main` rule (32766); above it, `main`
-would resolve the marked packet first and the redirect would black-hole. Table
+The RPDB is scanned in ascending priority order, so priority `101` — numerically
+lower than the kernel `main` rule at 32766 — is evaluated **before** `main`. A
+higher-numbered rule would never be reached: `main` would resolve the marked
+packet first and the redirect would black-hole. Table
 `33134` is distinct from the UDP TPROXY table `33133`, so tearing one path down
 never reaps the other, and deletion always names the exact priority and table
 rather than flushing. Routing is installed **before** the classifier is attached
 and removed **after** it is detached, so neither ordering can strand an assigned
-packet with no local route. A failure to install routing, or to attach on any
-one interface, is fatal: the node-agent unwinds what it installed, reports
+packet with no local route. Every unsuccessful startup path unwinds the same
+way — a partially applied routing install (the `ip` batch is not atomic), a
+failed attach on any one interface, and a `validate_startup_ready` failure that
+lands after the classifier attached all remove the Ferrum-owned rule and route
+by exact priority and table, detaching the classifier first where one is live.
+An inert leftover rule still claims the fwmark, so it is never left behind. A
+failure to install routing, or to attach on any one interface, is fatal: the
+node-agent unwinds what it installed, reports
 `ferrum_mesh_node_topology_degraded{reason="node_waypoint_ingress_redirect_unavailable"}`,
 and refuses readiness rather than serving a half-installed redirect. The image
 therefore needs `iproute2` (`ip`) and `NET_ADMIN` — the same capability the
@@ -513,11 +527,24 @@ packets are never dropped by this program.
 **Lifecycle.** Scope entries are written *before* the pod-IP map carries the
 redirect flag (flagging first would open a window where in-scope traffic fails
 closed with no reachable port), and cleared *after* the pod-IP entry is removed
-on teardown (the pod-IP removal alone already disables the redirect). A
-`containerPorts` edit on a live pod converges by wholesale replacement, so a
-*narrowed* spec never leaves a removed port redirectable. Removal is keyed by
-pod address rather than an enumerated list, because a Kubernetes delete event
-carries no spec snapshot.
+on teardown (the pod-IP removal alone already disables the redirect). Removal is
+keyed by pod address rather than an enumerated list, because a Kubernetes delete
+event carries no spec snapshot.
+
+A `containerPorts` edit on a **live, already-enrolled** pod is reconciled on the
+Apply/Modified event itself — Kubernetes conflates "added" and "modified", so
+this is the update/reload path — with no re-attachment of any program. Each
+address family converges independently and in the order that never exposes a
+true flag with unusable scope: *installing or widening* writes the scope first
+and raises the flag second; *removing every declared port* lowers the flag first
+and clears the scope second; a *narrowing* between two non-empty sets is one
+wholesale replacement, so a removed port stops matching immediately. Disabling
+the redirect (or losing IPv6 support) converges the affected family to empty
+scope and a false flag. A failed map or pod-IP write is a visible, retryable
+capture failure: the node-agent records `record_attach_error`, keeps the pending
+capture-failure marker, and does **not** advance its tracked scope, so the next
+pod event recomputes the same delta and converges once the transient condition
+clears.
 
 This does **not** remove the node-global iptables fallback: that path exists for
 kernels which cannot run eBPF at all
@@ -558,7 +585,7 @@ skip-or-fail gate as the rest of the live suite, so under
 `FERRUM_LIVE_TESTS_REQUIRED=1` a runner or kernel that cannot support the
 mechanism fails the gate rather than reporting the feature ready.
 
-Residual risks: the `ip rule` priority is below `main` and the table is
+Residual risks: the `ip rule` priority is evaluated ahead of `main` and the table is
 Ferrum-owned, but a cluster running its own low-priority rules could still order
 ahead of it (verified only by the rule-shape unit tests); and the attach point is
 operator-supplied, so naming the wrong interface yields no redirect (traffic

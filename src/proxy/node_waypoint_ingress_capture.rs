@@ -199,11 +199,13 @@ async fn handle_captured_connection(
 
     let (plaintext_admitted, mode) = captured_plaintext_admitted(state, orig_dst.port());
     if !plaintext_admitted {
-        // STRICT (or DISABLE) for this app port. Direct plaintext is exactly
-        // what PeerAuthentication forbids there, so the connection is closed;
-        // the peer must arrive over authenticated mesh transport instead. This
-        // is a policy outcome, not an error, so it stays at debug with no
-        // request-derived content beyond the peer IP.
+        // STRICT for this app port — the only mode that reaches here, since
+        // `mtls_mode_accepts_plaintext` admits both PERMISSIVE and DISABLE
+        // (DISABLE means "no mesh TLS", i.e. plaintext is expected, not
+        // refused). Direct plaintext is exactly what STRICT forbids, so the
+        // connection is closed; the peer must arrive over authenticated mesh
+        // transport instead. This is a policy outcome, not an error, so it
+        // stays at debug with no request-derived content beyond the peer IP.
         debug!(
             client_ip = %remote_addr.ip(),
             app_port = orig_dst.port(),

@@ -1023,6 +1023,28 @@ pub struct MockEbpfBackend {
     /// tests can prove a pod whose redirect scope could not be written is not
     /// left flagged for redirect.
     pub fail_update_pod_inbound_port: bool,
+    /// When `true`, `validate_startup_ready` fails even though every earlier
+    /// step succeeded, so tests can drive the post-attach startup-validation
+    /// unwind (classifier detached, then Ferrum-owned routing removed).
+    pub fail_validate_startup_ready: bool,
+    /// Optional log shared with a test's own recorder, so ordering between mock
+    /// operations and side effects the mock does not own — notably the
+    /// node-agent's `ip rule`/`ip route` teardown — can be asserted from one
+    /// interleaved sequence. Mirrors [`Self::operations`] for the ingress
+    /// redirect attach/detach entries.
+    pub op_log: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+}
+
+impl MockEbpfBackend {
+    /// Record an operation on both the local log and the shared one (if any).
+    fn record_operation(&mut self, op: String) {
+        if let Some(log) = self.op_log.clone()
+            && let Ok(mut entries) = log.lock()
+        {
+            entries.push(op.clone());
+        }
+        self.operations.push(op);
+    }
 }
 
 impl EbpfBackend for MockEbpfBackend {
@@ -1133,15 +1155,14 @@ impl EbpfBackend for MockEbpfBackend {
                 "injected ingress redirect attach failure for {iface}"
             ));
         }
-        self.operations
-            .push(format!("attach_ingress_redirect:{iface}"));
+        self.record_operation(format!("attach_ingress_redirect:{iface}"));
         self.ingress_redirect_attachments.push(iface.to_string());
         Ok(())
     }
 
     fn detach_ingress_redirect(&mut self) -> Result<(), String> {
         self.ingress_redirect_detach_calls += 1;
-        self.operations.push("detach_ingress_redirect".to_string());
+        self.record_operation("detach_ingress_redirect".to_string());
         self.ingress_redirect_attachments.clear();
         Ok(())
     }
@@ -1353,6 +1374,9 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     fn validate_startup_ready(&self, require_sock_ops: bool) -> Result<(), String> {
+        if self.fail_validate_startup_ready {
+            return Err("injected startup validation failure".to_string());
+        }
         if !self.programs_loaded {
             return Err("BPF programs not loaded".to_string());
         }
