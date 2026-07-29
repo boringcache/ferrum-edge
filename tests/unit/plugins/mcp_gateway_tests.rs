@@ -9091,6 +9091,10 @@ async fn validate_tool_results_pinned_validator_ignores_public_rewrite_metadata(
         "mcp.response_rewrite.session".to_string(),
         "forged-session".to_string(),
     );
+    assert!(
+        plugin.should_buffer_response_body(&ctx),
+        "clearing public rewrite metadata must not release a privately governed tool result"
+    );
 
     let valid = serde_json::to_vec(&json!({
         "jsonrpc": "2.0",

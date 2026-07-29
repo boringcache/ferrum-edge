@@ -4441,10 +4441,11 @@ impl Plugin for McpGateway {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.requires_response_body_buffering()
-            && ctx
-                .metadata
-                .get(METADATA_RESPONSE_REWRITE_KEY)
-                .is_some_and(|value| value == "true")
+            && (ctx.mcp_validate_tool_result.is_some()
+                || ctx
+                    .metadata
+                    .get(METADATA_RESPONSE_REWRITE_KEY)
+                    .is_some_and(|value| value == "true"))
     }
 
     fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
