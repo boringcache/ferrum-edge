@@ -2154,8 +2154,7 @@ fn streaming_grpc_deadline_removes_backend_content_length_before_headers_commit(
 
     // Mixed-case must also drop: Streaming sanitization would otherwise
     // canonicalize a surviving variant onto the wire.
-    let mut mixed_case =
-        HashMap::from([("Content-Length".to_string(), "128".to_string())]);
+    let mut mixed_case = HashMap::from([("Content-Length".to_string(), "128".to_string())]);
     strip_content_length_for_streaming_grpc_deadline_for_test(&mut mixed_case, true);
     assert!(
         !mixed_case

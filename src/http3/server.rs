@@ -5366,8 +5366,7 @@ async fn handle_h3_request(
         // client — the graceful-close recovery below still needs it to tell a
         // complete body from a truncated one (an inspected response strips
         // Content-Length because the inspector transforms the body).
-        let declared_content_length: Option<u64> =
-            content_length_header_value(&response_headers);
+        let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
         if response_inspector.is_some() {
             // Omit before Streaming sanitization so a mixed-case plugin
             // spelling cannot be re-canonicalized onto the wire.
