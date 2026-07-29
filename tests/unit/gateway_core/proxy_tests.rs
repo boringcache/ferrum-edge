@@ -4041,7 +4041,10 @@ fn test_ordinary_streaming_framing_strips_every_content_length_spelling() {
 
     // Hop-by-hop stripping is unchanged and composes with the length strip.
     let mut both = HashMap::from([
-        ("connection".to_string(), "keep-alive, x-internal".to_string()),
+        (
+            "connection".to_string(),
+            "keep-alive, x-internal".to_string(),
+        ),
         ("x-internal".to_string(), "leak".to_string()),
         ("transfer-encoding".to_string(), "chunked".to_string()),
         ("content-length".to_string(), "42".to_string()),
@@ -4104,7 +4107,14 @@ fn test_head_framing_preserves_only_one_valid_representation_length() {
     );
 
     // Dropped: spellings outside `1*DIGIT`.
-    for value in ["+1024", "-1", "10 24", "1024abc", "", "18446744073709551616"] {
+    for value in [
+        "+1024",
+        "-1",
+        "10 24",
+        "1024abc",
+        "",
+        "18446744073709551616",
+    ] {
         let mut headers = HashMap::from([("content-length".to_string(), value.to_string())]);
         sanitize_client_response_headers_for_wire(
             &mut headers,

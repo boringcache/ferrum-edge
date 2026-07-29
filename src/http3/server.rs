@@ -8846,8 +8846,10 @@ async fn stream_h3_open_response_to_client(
     // representation length. Capture the declared length first — the
     // graceful-close completeness gate in the relay loop below still needs it to
     // tell a complete body from a truncated one.
-    let declared_content_length =
-        crate::proxy::headers::preserved_response_content_length(&response_headers, response_status);
+    let declared_content_length = crate::proxy::headers::preserved_response_content_length(
+        &response_headers,
+        response_status,
+    );
     sanitize_client_response_headers_for_wire(
         &mut response_headers,
         ClientResponseFraming::for_streaming_response(method, response_status),
@@ -10894,8 +10896,10 @@ async fn proxy_to_backend_h3_streaming(
     // streaming framing removes Content-Length; only HEAD keeps a valid
     // representation length. Capture the declared length first for the
     // graceful-close completeness gate in the relay loop below.
-    let declared_content_length =
-        crate::proxy::headers::preserved_response_content_length(&response_headers, response_status);
+    let declared_content_length = crate::proxy::headers::preserved_response_content_length(
+        &response_headers,
+        response_status,
+    );
     sanitize_client_response_headers_for_wire(
         &mut response_headers,
         ClientResponseFraming::for_streaming_response(method, response_status),

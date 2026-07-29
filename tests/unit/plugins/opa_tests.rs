@@ -1005,10 +1005,7 @@ fn reject_header_maps_refuse_protocol_managed_destinations() {
         // Ordinary destinations stay accepted.
         let mut headers = serde_json::Map::new();
         headers.insert("x-policy".to_string(), Value::String("opa".to_string()));
-        headers.insert(
-            "Retry-After".to_string(),
-            Value::String("30".to_string()),
-        );
+        headers.insert("Retry-After".to_string(), Value::String("30".to_string()));
         let mut config = base_config("http://127.0.0.1:8181");
         config
             .as_object_mut()

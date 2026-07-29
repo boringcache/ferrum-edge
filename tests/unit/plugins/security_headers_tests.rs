@@ -492,7 +492,10 @@ fn case_variants(name: &str) -> Vec<String> {
 
 fn set_config(name: &str, value: &str) -> serde_json::Value {
     let mut set = serde_json::Map::new();
-    set.insert(name.to_string(), serde_json::Value::String(value.to_string()));
+    set.insert(
+        name.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
     json!({ "set": serde_json::Value::Object(set) })
 }
 

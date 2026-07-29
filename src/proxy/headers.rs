@@ -2737,10 +2737,7 @@ mod tests {
         ]);
         assert_eq!(content_length_header_value(&headers), Some(999));
         remove_content_length_header(&mut headers);
-        sanitize_client_response_headers_for_wire(
-            &mut headers,
-            ClientResponseFraming::Streaming,
-        );
+        sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::Streaming);
         assert!(
             !headers
                 .keys()
