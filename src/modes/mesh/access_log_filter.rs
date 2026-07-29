@@ -707,10 +707,9 @@ mod tests {
 
     #[test]
     fn errors_or_slow_canonicalizes_to_or_tree() {
-        let filter =
-            parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
-                .expect("parses")
-                .expect("filter");
+        let filter = parse_access_log_filter_expression("response.code >= 500 || duration > 1s")
+            .expect("parses")
+            .expect("filter");
         let expr = filter.expression.expect("uses expression tree");
         assert_eq!(
             expr,
