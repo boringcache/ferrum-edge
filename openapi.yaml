@@ -16869,8 +16869,25 @@ components:
         - $ref: '#/components/schemas/CorsExactOrigin'
         - type: string
           minLength: 3
+          maxLength: 512
           pattern: '^\*\.[^*/:\s]+$'
           description: Native wildcard-subdomain matcher such as `*.example.com`.
+
+    CorsLiteralExactOrigin:
+      type: string
+      minLength: 1
+      maxLength: 512
+      # At least one non-whitespace character: a whitespace-only literal can
+      # never equal a real Origin header, so the runtime rejects it too.
+      pattern: '\S'
+      description: >-
+        Istio `StringMatch.exact` origin matcher. LITERAL semantics: compared
+        byte-for-byte and case-sensitively against the request `Origin` header
+        with NO canonicalization and NO wildcard interpretation, so a value such
+        as `*.example.com` stays the exact string upstream assigns it instead of
+        becoming the native wildcard-subdomain matcher. The single exception is
+        `*`, which Istio itself defines as allow-all. Whitespace-only values are
+        rejected; the value is bounded at 512 bytes.
 
     CorsConfig:
       type: object
@@ -16901,6 +16918,7 @@ components:
         allowed_origins:
           type: array
           minItems: 1
+          maxItems: 64
           items:
             oneOf:
               - $ref: '#/components/schemas/CorsAllowedOriginString'
@@ -16914,32 +16932,37 @@ components:
                   multi-key objects are rejected at config time.
                 properties:
                   exact:
-                    $ref: '#/components/schemas/CorsExactOrigin'
-                    description: >-
-                      Exact origin, canonicalized at config time (scheme/host
-                      case, IDNA, IP serialization, and default ports). The
-                      exact value `*` has Istio's documented allow-all meaning.
+                    $ref: '#/components/schemas/CorsLiteralExactOrigin'
                   prefix:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       Literal byte-prefix of the request Origin header
                       (case-sensitive), e.g. "https://app.".
                   regex:
                     type: string
                     minLength: 1
+                    maxLength: 512
                     description: >-
                       RE2 pattern that must FULLY match the request Origin
-                      header. Compiled (and size-bounded) at config time; an
-                      invalid pattern is rejected.
+                      header. Compiled once at config construction/reload (never
+                      per request) under explicit bounds — 512 pattern bytes, a
+                      64 KiB compiled-program limit, a 64 KiB lazy-DFA limit,
+                      and an AST nesting limit of 24. An invalid or over-budget
+                      pattern is rejected with a field-specific error.
           description: >-
-            Required permitted-origin policy. Each entry is either a string
-            (`"*"` for intentional allow-all, an exact `scheme://host[:port]`
-            origin canonicalized on the cold config path, or a
-            `*.suffix.com` wildcard-subdomain pattern)
-            or an Istio `StringMatch`-shaped object carrying exactly one of
-            `exact` / `prefix` / `regex`. Prefix and regex retain literal Istio
-            matcher semantics and are not broadened by exact canonicalization.
+            Required permitted-origin policy, bounded at 64 entries. Each entry
+            is either a string — NATIVE syntax: `"*"` for intentional allow-all,
+            an exact `scheme://host[:port]` origin canonicalized on the cold
+            config path, or a `*.suffix.com` wildcard-subdomain pattern — or an
+            Istio `StringMatch`-shaped object carrying exactly one of `exact` /
+            `prefix` / `regex`. The two families are SEPARATE matcher semantics:
+            object `exact`, `prefix`, and `regex` all retain literal Istio
+            semantics and are never broadened by the native form's
+            canonicalization or wildcard interpretation, so
+            `{"exact": "*.example.com"}` matches only that literal string while
+            the plain string `"*.example.com"` matches every subdomain.
         allowed_methods:
           type: array
           items:
