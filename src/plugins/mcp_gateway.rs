@@ -2775,6 +2775,12 @@ impl McpGateway {
         envelope: &McpEnvelope,
         downstream_session_id: &str,
     ) -> PluginResult {
+        // Defense-in-depth: aggregate batches classify `tools/call` before
+        // dispatch, but keep this private guard ahead of catalog I/O so a
+        // late path can never dial or refresh upstream discovery.
+        if self.batch_forbids_upstream(ctx) {
+            return PluginResult::Continue;
+        }
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
@@ -2909,10 +2915,6 @@ impl McpGateway {
                 None,
             );
         };
-        // Aggregate JSON-RPC batches must not dial or Continue from before_proxy.
-        if self.batch_forbids_upstream(ctx) {
-            return PluginResult::Continue;
-        }
         let response_resource_rewrite_possible =
             self.resource_response_rewrite_possible(&server.server_id);
         if response_resource_rewrite_possible {
@@ -2959,6 +2961,10 @@ impl McpGateway {
         envelope: &McpEnvelope,
         downstream_session_id: &str,
     ) -> PluginResult {
+        // Defense-in-depth: see `route_tool_call`. Keep ahead of catalog I/O.
+        if self.batch_forbids_upstream(ctx) {
+            return PluginResult::Continue;
+        }
         if let Err(error) = self.ensure_catalog(ctx, downstream_session_id).await {
             return catalog_error_response(envelope.id.clone(), "MCP catalog unavailable", error);
         }
@@ -2998,9 +3004,6 @@ impl McpGateway {
                 None,
             );
         };
-        if self.batch_forbids_upstream(ctx) {
-            return PluginResult::Continue;
-        }
         let response_resource_rewrite_possible =
             self.resource_response_rewrite_possible(&server.server_id);
         if response_resource_rewrite_possible {
@@ -3059,6 +3062,10 @@ impl McpGateway {
         envelope: &McpEnvelope,
         downstream_session_id: &str,
     ) -> PluginResult {
+        // Defense-in-depth: see `route_tool_call`. Keep ahead of catalog I/O.
+        if self.batch_forbids_upstream(ctx) {
+            return PluginResult::Continue;
+        }
         let catalog_error = match self.ensure_catalog(ctx, downstream_session_id).await {
             Ok(()) => None,
             Err(McpCatalogError::SessionNotFound) => return session_not_found_response(),
@@ -3202,9 +3209,6 @@ impl McpGateway {
                 None,
             );
         };
-        if self.batch_forbids_upstream(ctx) {
-            return PluginResult::Continue;
-        }
         if let Err(error) = self
             .ensure_upstream_initialized(downstream_session_id, &server.server_id, ctx)
             .await
@@ -3407,13 +3411,18 @@ impl McpGateway {
     }
 
     /// Aggregate batches assemble gateway-handled (synthetic) member results.
-    /// Members that would `Continue` to an upstream are fail-closed per item:
-    /// executing them inside `before_proxy` would bypass later plugin phases
-    /// (`a2a_gateway`, `mesh_route_dispatch`, `ai_semantic_cache`, request
-    /// transformers, final request-body hooks, and normal proxy response
-    /// phases). Multi-upstream or mixed synthetic+upstream shapes cannot be
-    /// represented by one HTTP exchange under full policy, so those members
-    /// must be issued as singleton requests.
+    /// Known upstream-routed methods (`tools/call`, `prompts/get`,
+    /// `resources/read`) are rejected *before* dispatch — ahead of session
+    /// touch, catalog refresh, policy/schema work, and any network I/O — so a
+    /// cold versus warm catalog cannot change the fail-closed `-32009`
+    /// outcome. Unknown/passthrough members that still resolve to upstream
+    /// routing remain covered by the private `mcp_batch_forbids_upstream`
+    /// guard: executing a `Continue` inside `before_proxy` would bypass later
+    /// plugin phases (`a2a_gateway`, `mesh_route_dispatch`, `ai_semantic_cache`,
+    /// request transformers, final request-body hooks, and normal proxy
+    /// response phases). Multi-upstream or mixed synthetic+upstream shapes
+    /// cannot be represented by one HTTP exchange under full policy, so those
+    /// members must be issued as singleton requests.
     ///
     /// Session-lifecycle members (`initialize`) are rejected *before* dispatch.
     /// Session minting and the eviction it can trigger are not transactional
@@ -3422,8 +3431,9 @@ impl McpGateway {
     /// newly minted session cannot restore one that its admission evicted. The
     /// supported contract is therefore that `initialize` is a singleton HTTP
     /// request, and no batch may mint or evict a downstream session or stamp a
-    /// session response header. Ordinary batch members may still refresh an
-    /// existing session's idle lifetime, just like equivalent singletons.
+    /// session response header. Ordinary gateway-handled batch members may
+    /// still refresh an existing session's idle lifetime, just like equivalent
+    /// singletons.
     async fn handle_aggregate_jsonrpc_batch(
         &self,
         ctx: &mut RequestContext,
@@ -3508,13 +3518,28 @@ impl McpGateway {
                 continue;
             }
 
-            // Known routed notification forms (`tools/call`, `prompts/get`,
-            // `resources/read`) take a no-op 202 path inside singleton dispatch.
-            // Inside an aggregate batch they are upstream-bound and must obey the
-            // same singleton-routing restriction as their request forms, so mark
-            // them blocked here instead of letting the no-op claim success.
-            if is_notification && aggregate_notification_requires_upstream_routing(method) {
-                blocked_upstream_notification = true;
+            // Reject known upstream-routed methods before any dispatch so a
+            // cold/stale catalog cannot dial discovery, touch the session, run
+            // policy/schema work, or return a cache-dependent error ahead of the
+            // deterministic -32009 singleton-routing boundary. Notification forms
+            // omit a response element; request forms append -32009 per item.
+            if aggregate_method_requires_upstream_routing(method) {
+                if is_notification {
+                    blocked_upstream_notification = true;
+                    continue;
+                }
+                saw_response_bearing = true;
+                if let Err(response) = self.push_bounded_batch_response(
+                    &mut responses,
+                    &mut response_bytes,
+                    json_rpc_error_value(
+                        envelope.id.clone(),
+                        MCP_BATCH_UPSTREAM_ROUTING_UNSUPPORTED,
+                        "Aggregate JSON-RPC batch member requires singleton upstream routing",
+                    ),
+                ) {
+                    return self.fail_batch_closed(ctx, headers, &inbound_headers, response);
+                }
                 continue;
             }
 
@@ -5187,11 +5212,11 @@ fn json_rpc_error_value(id: Option<Value>, code: i64, message: &str) -> Value {
     })
 }
 
-/// Methods whose aggregate handling routes to an upstream MCP server. Their
-/// notification forms are no-ops in singleton dispatch, but inside an aggregate
-/// batch they are upstream-bound and fall under the singleton-routing
-/// restriction like their request forms.
-fn aggregate_notification_requires_upstream_routing(method: &str) -> bool {
+/// Methods whose aggregate handling routes to an upstream MCP server. Inside an
+/// aggregate batch both their request and notification forms are rejected before
+/// dispatch (session touch, catalog refresh, policy/schema work, or network I/O)
+/// under the singleton-routing restriction.
+fn aggregate_method_requires_upstream_routing(method: &str) -> bool {
     matches!(method, "tools/call" | "prompts/get" | "resources/read")
 }
 

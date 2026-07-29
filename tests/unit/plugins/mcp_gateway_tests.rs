@@ -6085,7 +6085,7 @@ async fn aggregate_batch_duplicate_ids_preserve_both_responses() {
 }
 
 #[tokio::test]
-async fn aggregate_batch_policy_rejection_is_per_item() {
+async fn aggregate_batch_routed_requests_reject_before_policy_or_catalog_work() {
     let server = start_mcp_catalog_server().await;
     let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
     config["discovery"]["on_new_tool"] = json!("allow");
@@ -6117,8 +6117,9 @@ async fn aggregate_batch_policy_rejection_is_per_item() {
     ]));
     headers.insert("mcp-session-id".to_string(), session_id);
 
-    // Allowed tools/call would Continue to upstream; aggregate batches must not
-    // dial from before_proxy. Mount a trap that fails if the gateway regresses.
+    // Allowed or denied tools/call must both fail closed as singleton-only
+    // before policy/catalog work. Mount a trap that fails if the gateway
+    // regresses into upstream dialing from before_proxy.
     Mock::given(method("POST"))
         .and(path("/mcp"))
         .and(body_partial_json(json!({
@@ -6136,16 +6137,20 @@ async fn aggregate_batch_policy_rejection_is_per_item() {
 
     let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(status, 200);
-    let responses = body.as_array().expect("policy batch must return an array");
+    let responses = body.as_array().expect("routed batch must return an array");
     assert_eq!(responses.len(), 3);
     assert_eq!(responses[0]["id"], 1);
     assert_eq!(
         responses[0]["error"]["code"], -32009,
-        "allowed tools/call must fail closed as singleton-only in aggregate batches: {}",
+        "allowed tools/call must fail closed before policy/catalog work: {}",
         responses[0]
     );
     assert_eq!(responses[1]["id"], 2);
-    assert_eq!(responses[1]["error"]["code"], -32001);
+    assert_eq!(
+        responses[1]["error"]["code"], -32009,
+        "denied tools/call must also fail closed before policy evaluation: {}",
+        responses[1]
+    );
     assert_eq!(responses[2]["id"], 3);
     assert!(responses[2].get("result").is_some());
 }
@@ -6905,6 +6910,167 @@ async fn aggregate_batch_routed_notification_only_fails_closed_without_upstream_
             "{routed_method}: no upstream route may be staged"
         );
     }
+}
+
+#[tokio::test]
+async fn aggregate_batch_routed_requests_reject_before_catalog_io_when_cache_missing() {
+    // Unreachable upstream: if the gateway still called ensure_catalog before
+    // the -32009 boundary, the member would surface a catalog/transport error
+    // instead of the deterministic singleton-routing code.
+    let mut config = aggregate_config("http://127.0.0.1:1/mcp");
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["policy"] = json!({ "default_action": "allow" });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "call",
+            "method": "tools/call",
+            "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "prompt",
+            "method": "prompts/get",
+            "params": { "name": "github.code_review" }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "resource",
+            "method": "resources/read",
+            "params": { "uri": "mcp://github/file:///project/README.md" }
+        },
+        { "jsonrpc": "2.0", "id": "ping", "method": "ping", "params": {} }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().expect("mixed batch must return an array");
+    assert_eq!(responses.len(), 4);
+    for (idx, expected_id) in ["call", "prompt", "resource"].into_iter().enumerate() {
+        assert_eq!(responses[idx]["id"], expected_id);
+        assert_eq!(
+            responses[idx]["error"]["code"], -32009,
+            "{expected_id} must reject before catalog I/O on a cold cache: {}",
+            responses[idx]
+        );
+    }
+    assert_eq!(responses[3]["id"], "ping");
+    assert!(responses[3].get("result").is_some());
+    assert!(ctx.route_override_backend_host.is_none());
+}
+
+#[tokio::test]
+async fn aggregate_batch_routed_requests_reject_before_catalog_io_when_cache_warm() {
+    let server = start_mcp_catalog_server().await;
+    let mut config = aggregate_config(&format!("{}/mcp", server.uri()));
+    config["discovery"]["on_new_tool"] = json!("allow");
+    config["policy"] = json!({ "default_action": "allow" });
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
+    let session_id = initialize(&plugin).await;
+    let _ = aggregate_tool_names(&plugin, &session_id, 21).await;
+
+    // Warm catalog still must not dial discovery, templates, or the routed
+    // methods themselves — the early boundary is independent of cache state.
+    let baseline = server.received_requests().await.unwrap().len();
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({ "method": "tools/call" })))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({ "method": "prompts/get" })))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({ "method": "resources/read" })))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": "call",
+            "method": "tools/call",
+            "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "prompt",
+            "method": "prompts/get",
+            "params": { "name": "github.code_review" }
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "resource",
+            "method": "resources/read",
+            "params": { "uri": "mcp://github/file:///project/README.md" }
+        }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id.clone());
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body.as_array().unwrap();
+    assert_eq!(responses.len(), 3);
+    for response in responses {
+        assert_eq!(
+            response["error"]["code"], -32009,
+            "warm-cache routed member must still be deterministic -32009: {response}"
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        baseline,
+        "warm-cache routed batch members must not trigger any upstream I/O"
+    );
+    assert!(ctx.route_override_backend_host.is_none());
+
+    // Same members as notifications (mixed order) omit response elements while
+    // a sibling request still gets -32009 — proving the early classification
+    // covers both forms without catalog work.
+    let baseline = server.received_requests().await.unwrap().len();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "method": "prompts/get", "params": { "name": "github.code_review" } },
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "github.create_pr", "arguments": { "repo": "payments-api" } }
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "resources/read",
+            "params": { "uri": "mcp://github/file:///project/README.md" }
+        }
+    ]));
+    headers.insert("mcp-session-id".to_string(), session_id);
+    let (status, body, _) = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    let responses = body
+        .as_array()
+        .expect("mixed notification/request keeps response-bearing members");
+    assert_eq!(
+        responses.len(),
+        1,
+        "routed notifications must omit response elements: {body}"
+    );
+    assert_eq!(responses[0]["id"], 7);
+    assert_eq!(responses[0]["error"]["code"], -32009);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        baseline,
+        "mixed routed notification/request ordering must not dial upstream"
+    );
 }
 
 #[tokio::test]
