@@ -105,6 +105,36 @@ use super::{
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+/// Exact response fields invalidated when Anthropic SSE is normalized.
+///
+/// Derived from the shared representation-invalidation inventory so trailer
+/// policy cannot drift from the header rewrite. The three extra fields are
+/// owned directly by [`repair_normalized_representation_headers`].
+static AI_STREAM_ROUTER_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        let mut names = Vec::with_capacity(super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS.len() + 3);
+        names.extend(
+            super::TRANSFORM_INVALIDATED_RESPONSE_HEADERS
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+        names.extend(
+            ["content-encoding", "content-length", "vary"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        names
+    });
+
+/// Open-ended checksum families invalidated by the same normalization.
+static AI_STREAM_ROUTER_RESPONSE_POLICY_PREFIXES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| {
+        super::TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .map(|prefix| (*prefix).to_string())
+            .collect()
+    });
+
 // ---------------------------------------------------------------------------
 // Strict config key sets (fixed-shape objects; no free-form maps)
 // ---------------------------------------------------------------------------
@@ -2026,6 +2056,28 @@ impl Plugin for AiStreamRouter {
         normalize_anthropic_sse_buffered(model, &plaintext, tools_forbidden).await
     }
 
+    /// Bind every field normalized Anthropic SSE invalidates.
+    ///
+    /// When this plugin rewrites provider SSE into OpenAI-shaped identity bytes,
+    /// `repair_normalized_representation_headers` removes `content-encoding` and
+    /// `content-length`, runs
+    /// [`super::invalidate_content_bound_response_headers`] (validators, digests,
+    /// signatures, and the open-ended `x-amz-checksum-*` / `x-checksum-*`
+    /// families), and scrubs or rewrites `vary`. A trailer-only copy of any of
+    /// them is invisible to the per-request mutation witness (absent → absent),
+    /// so the exact names and checksum prefixes are derived from the same shared
+    /// invalidation inventory. Other application trailers remain intact.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        if self.enabled {
+            super::ResponseTrailerPolicy::NamesAndPrefixes {
+                names: &AI_STREAM_ROUTER_RESPONSE_POLICY_NAMES,
+                prefixes: &AI_STREAM_ROUTER_RESPONSE_POLICY_PREFIXES,
+            }
+        } else {
+            super::ResponseTrailerPolicy::None
+        }
+    }
+
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -2171,6 +2223,12 @@ fn classify_provider_content_encoding(
     }
 }
 
+/// Drop or rewrite representation metadata after Anthropic SSE is rewritten to
+/// identity OpenAI-shaped bytes. The open-ended checksum-prefix families this
+/// removes are declared through the exact-name-plus-prefix trailer policy,
+/// derived from the shared invalidation inventory. Otherwise a trailer-only
+/// copy of an invalidated field reconciles as absent→absent and lands on the
+/// wire after the header phases.
 fn repair_normalized_representation_headers(headers: &mut HashMap<String, String>) {
     remove_header_ci(headers, "content-encoding");
     remove_header_ci(headers, "content-length");

@@ -3680,6 +3680,349 @@ pub mod _test_support {
         );
     }
 
+    /// Run the buffered-path backend-trailer / response-header-policy
+    /// reconciliation over plain data.
+    ///
+    /// `pre_policy_headers` are the backend's headers as the buffered path saw
+    /// them before any response-header phase ran; `final_headers` are the
+    /// headers about to go on the wire. Returns the surviving trailer field
+    /// lines in iteration-stable `(name, value)` form.
+    pub fn reconcile_backend_trailers_with_response_policy_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+    ) -> Vec<(String, String)> {
+        reconcile_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+        )
+    }
+
+    /// Like [`reconcile_backend_trailers_with_response_policy_for_test`], but
+    /// also applies config-time policy prefixes and per-response gateway-owned
+    /// builder names.
+    pub fn reconcile_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let witness =
+            crate::proxy::headers::ResponseTrailerPolicyWitness::capture(&map, pre_policy_headers);
+        crate::proxy::headers::reconcile_backend_trailers_with_response_policy(
+            &mut map,
+            final_headers,
+            &witness,
+            policy_names,
+            policy_prefixes,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
+            unbounded_policy,
+        );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Run the STREAMING-relay backend-trailer / response-header-policy
+    /// reconciliation over plain data.
+    ///
+    /// A streaming relay commits its initial HEADERS frame before the backend's
+    /// trailers exist, so it retains the pre-policy header map instead of
+    /// per-trailer values and derives the witness at the trailer frame. This
+    /// exercises that capture decision too: `header_phases_can_mutate` is false
+    /// when no response-header phase can run for the response, and the
+    /// unbounded arm retains no evidence at all.
+    pub fn reconcile_streaming_backend_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        reconcile_streaming_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+            header_phases_can_mutate,
+        )
+    }
+
+    /// Like [`reconcile_streaming_backend_trailers_for_test`], with explicit
+    /// policy prefixes and gateway-owned builder names.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile_streaming_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            policy_prefixes,
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
+        );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Like [`reconcile_streaming_backend_trailers_for_test`], but for a NATIVE
+    /// gRPC terminal trailer section (`dispatch_grpc_native_h3` and the
+    /// H3-to-H2 cross-protocol gRPC bridge).
+    ///
+    /// Same governance, one structural difference: the three reserved terminal
+    /// fields (`grpc-status` / `grpc-message` / `grpc-status-details-bin`)
+    /// survive so generic response-header rules cannot corrupt protocol status.
+    /// Every other field stays application metadata and is fully governed.
+    pub fn reconcile_streaming_native_grpc_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            policy_prefixes: &[],
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
+        );
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Run the streaming HTTP/2 relay's OWNED trailer boundary over plain data.
+    ///
+    /// The native-H3 relays reconcile inline and can borrow the handler's
+    /// locals; a streaming HTTP/2 response instead hands its body to hyper and
+    /// returns, so the boundary travels with the body as a
+    /// `StreamingResponseTrailerGovernor`. This shim exercises exactly what the
+    /// `StripHopByHopTrailers` wrapper does on a backend TRAILERS frame:
+    /// hop-by-hop strip first, then the shared reconciliation through the owned
+    /// governor.
+    pub fn govern_streaming_h2_backend_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        govern_streaming_h2_backend_trailers_governed_for_test(
+            trailers,
+            pre_policy_headers,
+            final_headers,
+            policy_names,
+            &[],
+            &[],
+            unbounded_policy,
+            header_phases_can_mutate,
+        )
+    }
+
+    /// Like [`govern_streaming_h2_backend_trailers_for_test`], with explicit
+    /// policy prefixes and per-response gateway-owned builder names.
+    #[allow(clippy::too_many_arguments)]
+    pub fn govern_streaming_h2_backend_trailers_governed_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        policy_prefixes: &[String],
+        gateway_owned_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            crate::proxy::headers::ResponseTrailerGovernance {
+                policy_names,
+                policy_prefixes,
+                unbounded: unbounded_policy,
+            },
+            header_phases_can_mutate,
+        );
+        let governor = crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+            final_headers.clone(),
+            pre_policy,
+            std::sync::Arc::new(policy_names.to_vec()),
+            std::sync::Arc::new(policy_prefixes.to_vec()),
+            crate::proxy::headers::GatewayOwnedResponseHeaders::from_names(gateway_owned_names),
+            crate::proxy::headers::TrailerSectionKind::PlainResponse,
+            unbounded_policy,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        governor.reconcile(&mut map);
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Like [`govern_streaming_h2_backend_trailers_for_test`], but for the
+    /// NATIVE gRPC terminal trailer section carried by the direct-H2 gRPC pool
+    /// relay and the mesh-mTLS `StreamingH2` relay.
+    pub fn govern_streaming_h2_native_grpc_trailers_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+    ) -> Vec<(String, String)> {
+        let mut map = backend_trailer_map_for_test(trailers);
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            crate::proxy::headers::ResponseTrailerGovernance {
+                policy_names,
+                policy_prefixes: &[],
+                unbounded: unbounded_policy,
+            },
+            header_phases_can_mutate,
+        );
+        let governor = crate::proxy::headers::StreamingResponseTrailerGovernor::new(
+            final_headers.clone(),
+            pre_policy,
+            std::sync::Arc::new(policy_names.to_vec()),
+            std::sync::Arc::new(Vec::new()),
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
+            unbounded_policy,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        governor.reconcile(&mut map);
+        surviving_trailer_lines_for_test(&map)
+    }
+
+    /// Run a translated gRPC-Web streaming response's TERMINAL step end to end:
+    /// hop-by-hop strip, the native-gRPC-terminal reconciliation, the buffered
+    /// trailer collection, and the gRPC-Web terminal frame build.
+    ///
+    /// This is the exact sequence both translated-gRPC-Web relays perform on a
+    /// non-empty streaming response — the H3-to-H2 bridge inline in
+    /// `handle_h3_grpc_streaming_response`, and the HTTP/2 relays through the
+    /// owned governor inside `StripHopByHopTrailers`, which
+    /// `proxy::body::GrpcWebStreamingBody` wraps from the OUTSIDE so the trailer
+    /// frame is already reconciled by the time it is encoded. Governed
+    /// application metadata must therefore never reach the returned frame, while
+    /// the reserved status fields must (GHSA-r78v-rc86-6r86).
+    ///
+    /// Returns `(wire bytes, decoded trailer frame, latched grpc status)`. In
+    /// binary mode the first two are identical; in text mode the first is the
+    /// base64 of the second, so one assertion set covers both encodings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn govern_streaming_grpc_web_terminal_frame_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+        http_status: u16,
+        text_mode: bool,
+    ) -> (Vec<u8>, Vec<u8>, u32) {
+        let mut map = backend_trailer_map_for_test(trailers);
+        // Latched from the PRISTINE trailer block, before governance runs. Only
+        // a valid numeric status latches; anything else keeps deriving from the
+        // built frame, exactly as the relays do.
+        let pristine_status = map
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            policy_prefixes: &[],
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
+        );
+        let mut collected = HashMap::new();
+        crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&map, &mut collected);
+        use crate::plugins::grpc_web::build_streaming_trailer_data as build_frame;
+        let (wire, frame_status) = build_frame(&collected, http_status, text_mode);
+        let (binary, _) = build_frame(&collected, http_status, false);
+        (
+            wire.to_vec(),
+            binary.to_vec(),
+            pristine_status.unwrap_or(frame_status),
+        )
+    }
+
+    fn backend_trailer_map_for_test(trailers: &[(&str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in trailers {
+            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("trailer name");
+            let value = http::HeaderValue::from_str(value).expect("trailer value");
+            map.append(name, value);
+        }
+        map
+    }
+
+    fn surviving_trailer_lines_for_test(map: &http::HeaderMap) -> Vec<(String, String)> {
+        let mut surviving = Vec::new();
+        for (name, value) in map {
+            surviving.push((
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            ));
+        }
+        surviving
+    }
+
     pub fn record_buffered_initial_response_header_plugin_for_test(
         ctx: &mut crate::plugins::RequestContext,
         plugin: &dyn crate::plugins::Plugin,

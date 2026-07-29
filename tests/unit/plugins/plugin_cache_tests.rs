@@ -2686,6 +2686,225 @@ async fn test_request_view_precomputes_response_committed_hook_capability() {
     );
 }
 
+#[tokio::test]
+async fn test_request_view_classifies_response_trailer_policy_by_capability() {
+    // Auth/logging-only chain: nothing about it can be re-opened by a backend
+    // trailer, so it declares no names and does not fail closed (issue #2941).
+    let logging = make_plugin_config_with_json(
+        "log",
+        "stdout_logging",
+        json!({}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["log"])], vec![logging]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(view.response_trailer_policy_names().is_empty());
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `security_headers` enumerates the fields it sets or removes, so the
+    // trailer reconciliation is name-scoped rather than wholesale.
+    let security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["x-powered-by"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `response_transformer` also applies route overrides published at request
+    // time, so its governed field set is not enumerable and it fails closed.
+    let transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY)
+    );
+
+    // `ai_stream_router` invalidates open-ended checksum-prefix families when
+    // normalizing Anthropic SSE. The policy models those families directly,
+    // preserving unrelated application trailers.
+    let stream_router = make_plugin_config_with_json(
+        "asr",
+        "ai_stream_router",
+        json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["asr"])],
+        vec![stream_router],
+    );
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    assert!(
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "content-encoding")
+    );
+    assert!(
+        view.response_trailer_policy_names()
+            .iter()
+            .any(|name| name == "x-goog-hash")
+    );
+    assert_eq!(
+        view.response_trailer_policy_prefixes(),
+        &["x-amz-checksum-".to_string(), "x-checksum-".to_string(),]
+    );
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "enumerable names and prefixes must not drop unrelated trailers"
+    );
+}
+
+#[tokio::test]
+async fn test_request_view_unions_builtin_response_trailer_policy_names() {
+    // `sse` is the case the per-request mutation witness cannot see: its
+    // `strip_content_length` removal is a NO-OP on the initial header map
+    // whenever the backend sends `content-length` only as a trailer, so only
+    // this config-time declaration binds the trailer channel. The other three
+    // fields are gateway writes a trailer copy would contradict.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"force_sse_content_type": true}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let mut names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "cache-control",
+            "content-length",
+            "content-type",
+            "x-accel-buffering",
+        ],
+        "sse must declare every response field its after_proxy owns"
+    );
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "an enumerable declaration must not fail closed"
+    );
+
+    // Turning the owning knobs off narrows the declaration instead of widening
+    // it: a plugin that no longer writes the field governs no trailer for it.
+    let sse = make_plugin_config_with_json(
+        "sse",
+        "sse",
+        json!({"strip_content_length": false, "add_no_buffering_header": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sse"])], vec![sse]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["cache-control"]);
+}
+
+#[tokio::test]
+async fn test_request_view_unions_cors_response_trailer_prefix() {
+    // CORS sanitizes the open-ended `access-control-` family, not a finite write
+    // list: a trailer-only extension name must still be governed. The discrete
+    // `vary` merge sits outside that family and remains an exact-name entry.
+    let cors = make_plugin_config_with_json(
+        "cors",
+        "cors",
+        json!({"allowed_origins": ["https://app.example"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["cors"])], vec![cors]);
+    let view = PluginCache::new(&config)
+        .unwrap()
+        .request_view("ferrum", "p1", ProxyProtocol::Http);
+    let names: Vec<&str> = view
+        .response_trailer_policy_names()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let prefixes: Vec<&str> = view
+        .response_trailer_policy_prefixes()
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(names, vec!["vary"]);
+    assert_eq!(prefixes, vec!["access-control-"]);
+    assert!(
+        !view
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "CORS prefix ownership must not fail closed the whole trailer section"
+    );
+}
+
 #[test]
 fn test_request_view_precomputes_grpc_deadline_policy_plugins() {
     let mut deadline = make_plugin_config_with_json(
@@ -7108,6 +7327,64 @@ fn test_priority_override_delegates_spec_rejection_replacement_capability() {
     assert!(plugins[0].applies_after_proxy_on_reject());
     assert!(plugins[0].may_replace_rejection_response());
     assert!(!plugins[0].warn_on_rejection_response_replacement());
+}
+
+#[test]
+fn test_priority_override_delegates_response_trailer_policy() {
+    // The priority-override wrapper hand-forwards the `Plugin` trait, so a
+    // declaration it forgets to delegate silently collapses to the
+    // `ResponseTrailerPolicy::None` default — and a trailer-forwarding HTTP/3
+    // path would stop binding the very fields the plugin owns.
+    let mut security = make_plugin_config_with_json(
+        "sec",
+        "security_headers",
+        json!({"remove": ["X-Powered-By"], "frame_options": false,
+               "content_type_options": false, "referrer_policy": false}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    security.priority_override = Some(321);
+    let config = make_config(vec![make_proxy("p1", "/api", vec!["sec"])], vec![security]);
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 321);
+    let names: Vec<String> = cache
+        .request_view("ferrum", "p1", ProxyProtocol::Http)
+        .response_trailer_policy_names()
+        .to_vec();
+    assert_eq!(
+        names,
+        vec!["x-powered-by".to_string()],
+        "the priority-override wrapper must delegate the bounded trailer policy"
+    );
+
+    // The fail-closed arm has to survive the wrapper too, or an unbounded chain
+    // would silently start reconciling trailers field by field.
+    let mut transformer = make_plugin_config_with_json(
+        "rt",
+        "response_transformer",
+        json!({"rules": [{
+            "target": "header",
+            "operation": "add",
+            "key": "x-gateway-note",
+            "value": "transformed",
+        }]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    transformer.priority_override = Some(322);
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["rt"])],
+        vec![transformer],
+    );
+    let cache = PluginCache::new(&config).unwrap();
+    assert_eq!(cache.get_plugins("ferrum", "p1")[0].priority(), 322);
+    assert!(
+        cache
+            .request_view("ferrum", "p1", ProxyProtocol::Http)
+            .capabilities()
+            .has(PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+        "the priority-override wrapper must delegate the fail-closed unbounded arm"
+    );
 }
 
 #[test]
