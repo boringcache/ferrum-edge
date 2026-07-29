@@ -4633,6 +4633,18 @@ impl ResponseStreamInspector for StreamInspector {
         match self.config.enforcement {
             StreamEnforcement::Block => {
                 let mut released = Vec::new();
+                // Match `on_chunk`: an already-expired hold is resolved BEFORE
+                // finalizing or releasing any held carry / event. Otherwise a
+                // silent backend that closes after the deadline can flush a
+                // partial or role-only window through `act_on_window`'s
+                // empty-segments `release_clean()` path without consulting the
+                // budget — including when `on_hold_timeout: cut`.
+                if self.hold_expired() {
+                    match self.on_hold_expired("accumulate") {
+                        ResponseStreamAction::Forward(bytes) => released.extend_from_slice(&bytes),
+                        terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    }
+                }
                 if self.window.in_passthrough() {
                     released.extend_from_slice(&self.window.finish_passthrough());
                 }

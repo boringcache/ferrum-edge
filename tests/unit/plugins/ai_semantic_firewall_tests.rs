@@ -5550,6 +5550,110 @@ async fn fail_closed_hold_timeout_discards_partial_event_bytes() {
     assert!(post.is_empty());
 }
 
+/// A backend that holds a non-window-ready role-only SSE event past `max_hold_ms`
+/// and then closes must still honor fail-closed at `on_end`. Without consulting
+/// the budget first, `finish_step` + empty-segments `release_clean()` would
+/// forward the held bytes even when `on_hold_timeout: cut`.
+const ROLE_ONLY_EVENT: &[u8] =
+    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+
+#[tokio::test]
+async fn fail_closed_on_end_does_not_release_expired_role_only_hold() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(ROLE_ONLY_EVENT).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ResponseStreamAction::Terminate(final_bytes) = inspector.on_end().await else {
+        panic!("fail-closed expiry at end-of-stream must cut, not release held bytes");
+    };
+    let terminal = String::from_utf8(final_bytes.unwrap_or_default().to_vec()).unwrap_or_default();
+    assert!(
+        terminal.contains("ai_semantic_firewall_response_blocked"),
+        "cut emits the terminal error event, got {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("assistant"),
+        "fail-closed on_end must never release the held payload: {terminal:?}"
+    );
+    assert!(
+        !terminal.contains("choices"),
+        "fail-closed on_end must leak no held SSE payload: {terminal:?}"
+    );
+
+    let ResponseStreamAction::Forward(post) = inspector.on_end().await else {
+        panic!("post-cut end forwards nothing");
+    };
+    assert!(
+        post.is_empty(),
+        "terminated stream must not emit held bytes on a later end: {:?}",
+        String::from_utf8_lossy(&post)
+    );
+}
+
+/// Fail-open at end-of-stream must release the exact held wire bytes once and
+/// leave nothing for a subsequent end to re-emit. A partial (non-window-ready)
+/// event is required: without the pre-`finish_step` expiry check, end-of-stream
+/// absorption can treat the carry as uninspectable and cut under `on_error:
+/// reject` instead of honoring `on_hold_timeout: forward`.
+#[tokio::test]
+async fn fail_open_on_end_forwards_expired_partial_hold_exactly_once() {
+    let firewall = plugin(&hold_config(
+        "http://127.0.0.1:9/v1/embeddings",
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    ));
+    let ctx = inspect_marked_ctx();
+    let mut inspector = firewall
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector for event stream");
+
+    assert!(matches!(
+        inspector.on_chunk(PARTIAL_EVENT_PREFIX).await,
+        ResponseStreamAction::Forward(b) if b.is_empty()
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let ResponseStreamAction::Forward(released) = inspector.on_end().await else {
+        panic!("fail-open expiry at end-of-stream must forward, not cut");
+    };
+    assert_eq!(
+        released.as_ref(),
+        PARTIAL_EVENT_PREFIX,
+        "fail-open on_end must forward the held wire bytes exactly"
+    );
+
+    let ResponseStreamAction::Forward(again) = inspector.on_end().await else {
+        panic!("second end after fail-open release must not cut");
+    };
+    assert!(
+        again.is_empty(),
+        "held bytes must not be duplicated on a later end: {:?}",
+        String::from_utf8_lossy(&again)
+    );
+
+    let mut wire = released.to_vec();
+    wire.extend_from_slice(&again);
+    assert_eq!(
+        wire.windows(PARTIAL_EVENT_PREFIX.len())
+            .filter(|w| *w == PARTIAL_EVENT_PREFIX)
+            .count(),
+        1,
+        "original held payload must appear exactly once across end-of-stream actions"
+    );
+}
+
 #[tokio::test]
 async fn hold_timeout_publishes_fixed_cardinality_metadata() {
     use ferrum_edge::plugins::create_response_stream_inspector;
