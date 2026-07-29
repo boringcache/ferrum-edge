@@ -415,10 +415,25 @@ H3-capable backend — commits its initial header block before the backend's
 TRAILERS frame is read, exactly like the direct-H2 relay, and forwards that
 trailer section to the client as HTTP/1.1 chunked trailers or an H2 TRAILERS
 frame. It carries the same owned `StreamingResponseTrailerGovernor`, built from
-the same capture, and `body::H3FrameSource` applies it on the single TRAILERS
-frame immediately after the hop-by-hop trailer strip. All three body
-constructors (`direct_streaming_h3_body`, `size_limited_streaming_h3_body`,
-`coalescing_h3_body`) install it. gRPC-flavored native-H3 dispatch is owned by
+the same capture, and `body::H3FrameSource` applies it to the TRAILERS frame
+immediately after the hop-by-hop trailer strip. All three body constructors
+(`direct_streaming_h3_body`, `size_limited_streaming_h3_body`,
+`coalescing_h3_body`) install it.
+
+This relay has **two** routes out of the trailer phase and the governor binds
+both. The ordinary route is the TRAILERS frame `poll_recv_trailers` yields once
+the terminal stream FIN arrives. The second is the delayed-FIN route: h3 can
+have the TRAILERS frame fully received while still withholding it pending that
+FIN, so `H3FrameSource` peeks the buffered map (`peek_recv_trailers`, a vendored
+h3 patch) and stores it in `H3ReadProgress.pending_trailers`; if the outer
+`IdleReadTimeoutBody` trailer-phase deadline then fires, that wrapper forwards
+the stored map as the response's trailer section instead of collapsing to a bare
+EOS. The wrapper carries no governor of its own, so the peek path strips
+hop-by-hop names and reconciles **before** storing — the slot only ever holds a
+map that is safe to put on the wire. The peek runs at most once per response, so
+a long trailer wait neither re-clones the map nor double-counts the removal
+telemetry; the two routes are distinguished in the debug line by a static
+`route` field (`fin` / `timeout_peek`). gRPC-flavored native-H3 dispatch is owned by
 `dispatch_grpc_native_h3`, so this relay is a plain-response section in
 practice; the section is still chosen structurally from the dispatch, never from
 a trailer's own name.

@@ -2243,6 +2243,16 @@ fn file_mode_yaml_for_h3_with_compression(port: u16) -> String {
 /// map, so nothing but the plugin's `response_trailer_policy()` declaration can
 /// bind the trailer section (advisory GHSA-r78v-rc86-6r86).
 fn file_mode_yaml_for_h3_streaming_trailer_policy(port: u16) -> String {
+    file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(port, 5000)
+}
+
+/// Same chain with a caller-chosen `backend_read_timeout_ms`, so a test can make
+/// the trailer-phase deadline fire while h3 still withholds an already-received
+/// TRAILERS frame behind a delayed FIN.
+fn file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(
+    port: u16,
+    backend_read_timeout_ms: u64,
+) -> String {
     let config = json!({
         "version": "1",
         "proxies": [{
@@ -2253,7 +2263,7 @@ fn file_mode_yaml_for_h3_streaming_trailer_policy(port: u16) -> String {
             "backend_port": port,
             "strip_listen_path": true,
             "backend_connect_timeout_ms": 2000,
-            "backend_read_timeout_ms": 5000,
+            "backend_read_timeout_ms": backend_read_timeout_ms,
             "backend_write_timeout_ms": 5000,
             "backend_tls_verify_server_cert": false,
             "plugins": [],
@@ -3007,6 +3017,117 @@ async fn h2c_frontend_h3_backend_streaming_trailers_obey_response_header_policy(
     assert!(
         received.iter().any(|r| r.method == "GET"),
         "H3 backend must have received the GET; recorded: {received:#?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 14c — the SAME response-header policy binds the trailer section on the
+// delayed-FIN / trailer-timeout-collapse route, not just on the ordinary FIN
+// route covered by test 14b (advisory GHSA-r78v-rc86-6r86).
+//
+// `H3FrameSource` reaches the trailer phase, sees `Pending` from
+// `poll_recv_trailers`, and PEEKS the TRAILERS frame h3 has already received but
+// is withholding until the terminal stream FIN. That peeked map is handed to
+// `H3ReadProgress.pending_trailers`, and the outer `IdleReadTimeoutBody` — which
+// carries no governor of its own — forwards it verbatim when its trailer-phase
+// deadline fires. So a governed field that never reaches the `Ready` arm above
+// still lands on the wire unless the peek path applies the governor too.
+//
+// The script therefore NEVER sends FIN: the trailers can only reach the client
+// through the timeout collapse. A plain FIN-path test cannot exercise this.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2c_frontend_h3_backend_delayed_fin_trailers_obey_response_header_policy() {
+    let body_len = 512usize;
+    let body = bytes::Bytes::from(vec![b'p'; body_len]);
+
+    let (harness, h3_backend) = spawn_h3_streaming_harness_with_config(
+        "phase-h3-delayed-fin-trailer-policy",
+        vec![
+            H3Step::AcceptStream,
+            // Content-Length declared and satisfied so the DATA phase ends on a
+            // provably COMPLETE body — that is what lets the source enter the
+            // trailer phase (and the outer deadline collapse cleanly rather than
+            // erroring). `x-powered-by` is deliberately ABSENT here so the
+            // `security_headers` removal is a no-op on the initial header map and
+            // only the declared `response_trailer_policy()` name can bind it.
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", body_len.to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(body.clone()),
+            H3Step::RespondTrailersWithoutFin(vec![
+                // Governed: `security_headers` declared this name.
+                ("x-powered-by", "backend-trailer-bypass".to_string()),
+                // Ungoverned: nothing in the chain owns this field.
+                ("x-backend-checksum", "sha256-delayed-policy".to_string()),
+                // Hop-by-hop: stripped on this route before the governor runs.
+                ("transfer-encoding", "chunked".to_string()),
+            ]),
+            // Hold the stream open well past the 25 ms backend read timeout so
+            // the trailer-phase deadline is the ONLY thing that can deliver the
+            // buffered trailer map downstream.
+            H3Step::StallFor(Duration::from_millis(300)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        &|port| file_mode_yaml_for_h3_streaming_trailer_policy_with_read_timeout(port, 25),
+    )
+    .await;
+
+    let resp = raw_h2c_request(&harness.proxy_url("/api/delayed-fin-policy"), "GET", &[])
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("raw h2c request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status, 200,
+        "expected the response to STREAM; headers={:?} body_error={:?}\n--- logs ---\n{logs}",
+        resp.headers, resp.body_error
+    );
+    assert!(
+        resp.body_error.is_none(),
+        "expected the trailer-phase timeout to collapse cleanly; body_error={:?}\n--- logs ---\n{logs}",
+        resp.body_error
+    );
+    assert_eq!(resp.body.as_slice(), body.as_ref());
+    // The load-bearing pair: the collapse must have delivered a trailer section
+    // (so this really is the peek/timeout route, not a silent drop) AND that
+    // section must be governed.
+    assert_eq!(
+        resp.trailers.get("x-backend-checksum").map(String::as_str),
+        Some("sha256-delayed-policy"),
+        "the peeked trailer map must still reach the client through the timeout collapse — \
+         without this the `x-powered-by` assertion below would pass vacuously; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("x-powered-by"),
+        "a governed trailer must not bypass the response-header policy on the delayed-FIN / \
+         trailer-timeout-collapse route either (GHSA-r78v-rc86-6r86); trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert!(
+        !resp.trailers.contains_key("transfer-encoding"),
+        "hop-by-hop trailer name must still be stripped on this route; trailers={:?}",
+        resp.trailers
+    );
+    assert_eq!(
+        resp.headers.get("x-security-policy").map(String::as_str),
+        Some("gateway-enforced"),
+        "the security_headers chain must actually have run on this response; headers={:?}",
+        resp.headers
+    );
+
+    let received = h3_backend.received_requests().await;
+    assert!(
+        received.iter().any(|r| r.path == "/delayed-fin-policy"),
+        "H3 backend must have received the delayed-FIN request; recorded: {received:#?}"
     );
 }
 

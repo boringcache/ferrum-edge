@@ -2161,6 +2161,11 @@ struct H3ReadProgress {
     /// terminal stream FIN arrives. If the caller's trailer-phase timeout fires
     /// before that FIN, the outer timeout wrapper can still forward these
     /// trailers before ending the downstream body.
+    ///
+    /// Stored ALREADY hop-by-hop stripped and ALREADY governed by the source's
+    /// `trailer_governor`: the outer wrapper forwards this map verbatim as the
+    /// response's trailer section and applies no policy of its own, so this slot
+    /// only ever holds a map that is safe to put on the wire.
     pending_trailers: std::sync::Mutex<Option<http::HeaderMap>>,
 }
 
@@ -2229,6 +2234,14 @@ pub(crate) struct H3FrameSource<S = crate::http3::client::H3RequestStream> {
     /// `handle_proxy_request_inner`. `None` on every path with nothing to
     /// enforce (and in tests), which keeps this a pure hop-by-hop filter.
     trailer_governor: Option<crate::proxy::headers::StreamingResponseTrailerGovernor>,
+    /// Set once a trailer-phase `peek_recv_trailers_map()` has handed the
+    /// buffered map to [`H3ReadProgress::store_pending_trailers`]. The peek
+    /// CLONES a `HeaderMap` and the governor pass over it is not free, while
+    /// `store_pending_trailers` keeps only the first map — so without this flag
+    /// every subsequent trailer-phase `Pending` poll would re-clone, re-strip,
+    /// and re-govern a snapshot that is then thrown away, double-counting the
+    /// removal telemetry on the way.
+    peeked_pending_trailers: bool,
 }
 
 impl<S> H3FrameSource<S> {
@@ -2248,6 +2261,7 @@ impl<S> H3FrameSource<S> {
             received: 0,
             progress,
             trailer_governor: None,
+            peeked_pending_trailers: false,
         }
     }
 
@@ -2264,6 +2278,29 @@ impl<S> H3FrameSource<S> {
 
     fn is_done(&self) -> bool {
         matches!(self.state, H3FrameSourceState::Done)
+    }
+
+    /// Bind the trailer section to the response-header policy boundary.
+    ///
+    /// Both trailer-delivery routes out of this source funnel through here so
+    /// the boundary cannot be closed on one and left open on the other: the
+    /// ordinary `Ready` frame yielded after the terminal FIN, and the buffered
+    /// map peeked before that FIN which the outer [`IdleReadTimeoutBody`]
+    /// forwards when its trailer-phase deadline collapses the stream. Call it
+    /// AFTER hop-by-hop stripping.
+    ///
+    /// `route` is a two-value static label (`"fin"` / `"timeout_peek"`), not
+    /// request-derived data, so it adds no log cardinality — it only keeps the
+    /// two lines from reading as one response's trailers being governed twice.
+    /// A `None` governor (every path with nothing to enforce, and the source
+    /// tests) skips the work entirely and leaves this a pure hop-by-hop filter.
+    fn govern_trailers(&self, trailers: &mut http::HeaderMap, route: &'static str) {
+        if let Some(governor) = self.trailer_governor.as_ref() {
+            let removed = governor.reconcile(trailers);
+            if removed > 0 {
+                debug!(removed, route, "H3 backend stream: dropped governed trailer fields");
+            }
+        }
     }
 
     /// Mark the DATA body complete (a clean FIN that satisfied any declared
@@ -2404,15 +2441,7 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             // per response, on the trailer frame only, and is
                             // skipped entirely (`None`) whenever no signal could
                             // drop a field.
-                            if let Some(governor) = this.trailer_governor.as_ref() {
-                                let removed = governor.reconcile(&mut trailers);
-                                if removed > 0 {
-                                    debug!(
-                                        removed,
-                                        "H3 backend stream: dropped governed trailer fields"
-                                    );
-                                }
-                            }
+                            this.govern_trailers(&mut trailers, "fin");
                             return Poll::Ready(Some(Ok(Frame::trailers(trailers))));
                         }
                         Poll::Ready(Ok(None)) => {
@@ -2438,13 +2467,29 @@ impl<S: H3RecvStream + Unpin> FrameSource for H3FrameSource<S> {
                             return Poll::Ready(Some(Err(err)));
                         }
                         Poll::Pending => {
-                            if let Some(p) = &this.progress {
+                            // h3 can hold a fully-received TRAILERS frame back
+                            // until the terminal stream FIN arrives. If the outer
+                            // trailer-phase deadline fires during that wait, the
+                            // outer wrapper forwards THIS snapshot as the
+                            // response's trailer section — and it carries no
+                            // governor of its own — so the policy boundary has to
+                            // be applied here too, or a governed field reaches the
+                            // client on exactly the delayed-FIN/timeout-collapse
+                            // path. Peeked at most once per response; see
+                            // `peeked_pending_trailers`.
+                            if let Some(p) = &this.progress
+                                && !this.peeked_pending_trailers
+                            {
                                 match this.recv_stream.peek_recv_trailers_map() {
                                     Ok(Some(mut trailers)) => {
                                         crate::proxy::headers::strip_response_hop_by_hop_trailers(
                                             &mut trailers,
                                         );
+                                        this.govern_trailers(&mut trailers, "timeout_peek");
                                         p.store_pending_trailers(trailers);
+                                        // Set after the store so `p`'s borrow of
+                                        // `this.progress` has ended.
+                                        this.peeked_pending_trailers = true;
                                     }
                                     Ok(None) => {}
                                     Err(err) => {
