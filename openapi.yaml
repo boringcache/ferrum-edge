@@ -19389,9 +19389,11 @@ components:
         percent-encoding. `grpc_message` is authored as human-readable text
         and emitted in the canonical percent-encoded `grpc-message` wire form
         (uppercase hex for `%` and every byte outside the grammar's
-        unescaped range). Custom trailer names are case-insensitive, so two
-        `trailers` members differing only in case are rejected rather than
-        one silently overwriting the other.
+        unescaped range). Custom trailers use the gRPC Custom-Metadata name
+        alphabet and printable-ASCII value grammar; `-bin` values must be
+        standard base64 with or without padding. Names are case-insensitive,
+        so two `trailers` members differing only in case are rejected rather
+        than one silently overwriting the other.
         gRPC-Web terminate is rejected with 500. Streaming and compression
         contract shapes fail closed. Malformed or oversized function output
         fails closed without reflecting untrusted bodies. The validated

@@ -1815,6 +1815,45 @@ fn test_native_grpc_terminate_rejects_case_equivalent_trailer_names() {
     assert_eq!(headers.get("x-bar").map(String::as_str), Some("second"));
 }
 
+/// Custom trailers are gRPC metadata, not arbitrary HTTP fields. Enforce the
+/// protocol's narrower name/value grammar and binary-metadata encoding before
+/// the response is authorized to reach a native gRPC stream.
+#[test]
+fn test_native_grpc_terminate_validates_custom_grpc_metadata() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    const MAX_BODY: usize = 1024 * 1024;
+    for (trailers, expected) in [
+        (json!({"x!http-only": "value"}), "metadata name alphabet"),
+        (json!({"x-text": "café"}), "valid gRPC ASCII value"),
+        (json!({"x-custom-bin": "not base64!"}), "standard base64"),
+    ] {
+        let body = serde_json::to_vec(&json!({
+            "grpc_status": 0,
+            "trailers": trailers
+        }))
+        .unwrap();
+        let error = build(200, &body, MAX_BODY).unwrap_err();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in diagnostic, got {error:?}"
+        );
+    }
+
+    for encoded in ["AAECAw==", "AAECAw"] {
+        let body = serde_json::to_vec(&json!({
+            "grpc_status": 0,
+            "trailers": {"x-custom-bin": encoded}
+        }))
+        .unwrap();
+        let (_, _, headers) = build(200, &body, MAX_BODY).unwrap();
+        assert_eq!(
+            headers.get("x-custom-bin").map(String::as_str),
+            Some(encoded)
+        );
+    }
+}
+
 /// `grpc_message` is authored as human-readable text, but the wire field is
 /// `Percent-Encoded` per the gRPC HTTP mapping. Emitting the raw text would put
 /// a bare `%` (which clients decode as an escape introducer) and raw non-ASCII

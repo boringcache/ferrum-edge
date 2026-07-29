@@ -752,7 +752,7 @@ fn is_forbidden_grpc_web_request_trailer_name(name: &str) -> bool {
 /// The gRPC wire spec permits producers to omit padding on binary metadata, so
 /// both dialects are accepted; anything else is refused rather than forwarded
 /// as an unreadable binary field.
-fn is_base64_metadata_value(value: &str) -> bool {
+pub(crate) fn is_base64_metadata_value(value: &str) -> bool {
     !value.is_empty()
         && (BASE64.decode(value).is_ok()
             || base64::engine::general_purpose::STANDARD_NO_PAD
@@ -1976,7 +1976,7 @@ fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
 /// `_` / `-` / `.`. Stricter than the HTTP token set so hostile names that
 /// survive `HeaderName` parsing still cannot enter the trailer frame.
 #[inline]
-fn is_grpc_metadata_name(name: &str) -> bool {
+pub(crate) fn is_grpc_metadata_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -1996,7 +1996,7 @@ fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {
 /// gRPC ASCII-Value (PROTOCOL-HTTP2): space and printable ASCII only. Also
 /// rejects embedded CR/LF so a hostile trailer cannot smuggle header lines
 /// into the gRPC-Web trailer block.
-fn is_valid_trailer_value(value: &str) -> bool {
+pub(crate) fn is_valid_trailer_value(value: &str) -> bool {
     value.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 

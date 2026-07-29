@@ -2353,6 +2353,14 @@ fn build_native_grpc_terminate_response(
                 )
             })?;
             let lower = header_name.as_str();
+            if !crate::plugins::grpc_web::is_grpc_metadata_name(lower) {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!(
+                        "gRPC terminate trailer name '{name}' is outside the gRPC metadata name alphabet"
+                    ),
+                ));
+            }
             if !seen_trailer_names.insert(lower.to_string()) {
                 return Err(InvocationFailure::new(
                     "invalid_grpc_terminate_response",
@@ -2384,10 +2392,22 @@ fn build_native_grpc_terminate_response(
                     ),
                 ));
             }
-            if HeaderValue::from_str(value).is_err() {
+            if !crate::plugins::grpc_web::is_valid_trailer_value(value)
+                || HeaderValue::from_str(value).is_err()
+            {
                 return Err(InvocationFailure::new(
                     "invalid_grpc_terminate_response",
-                    format!("gRPC terminate trailer '{lower}' is not a valid HTTP field value"),
+                    format!("gRPC terminate trailer '{lower}' is not a valid gRPC ASCII value"),
+                ));
+            }
+            if lower.ends_with("-bin")
+                && !crate::plugins::grpc_web::is_base64_metadata_value(value)
+            {
+                return Err(InvocationFailure::new(
+                    "invalid_grpc_terminate_response",
+                    format!(
+                        "gRPC terminate binary trailer '{lower}' must contain standard base64, with or without padding"
+                    ),
                 ));
             }
             response_headers.insert(lower.to_string(), value.to_string());
