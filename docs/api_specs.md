@@ -38,19 +38,22 @@ The autodetection heuristic is best-effort; the full parser produces a precise e
 
 ### YAML type-coercion caution
 
-YAML's implicit type coercion can produce surprising results when the gateway serialises the document to JSON for internal processing:
+Ferrum follows the YAML scalar resolution used by `serde_yaml`: YAML 1.2-style
+booleans and explicit base prefixes, while legacy YAML 1.1 spellings remain
+strings:
 
 | YAML literal | JSON value | Why it matters |
 |---|---|---|
-| `010` | `8` | Octal integer — YAML 1.1 treats leading-zero integers as octal |
-| `1:30` | `90` | Sexagesimal integer — YAML 1.1 treats `N:M` as `N*60 + M` |
-| `yes`, `no`, `on`, `off`, `true`, `false` | boolean | YAML 1.1 boolean aliases; `yes` becomes JSON `true` |
+| `0o10` | `8` | Octal integers require the explicit `0o` prefix |
+| `010`, `1:30` | string | Legacy octal and sexagesimal YAML 1.1 forms are not coerced |
+| `yes`, `no`, `on`, `off` | string | Legacy YAML 1.1 boolean aliases are not coerced |
+| `true`, `false` | boolean | YAML 1.2 boolean spellings are coerced |
 
 **Recommendation**: quote strings that look like numbers or boolean words in YAML specs to preserve them as strings:
 
 ```yaml
 info:
-  version: "010"   # → JSON string "010", not integer 8
+  version: "010"   # Quoting remains the clearest way to state string intent
 x-ferrum-proxy:
   backend_port: 443  # numeric — no quotes needed
 ```

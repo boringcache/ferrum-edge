@@ -121,6 +121,10 @@ struct Document {
     /// Node index → first anchor name that pointed at it (for cycle diagnostics).
     anchor_names: HashMap<usize, String>,
     root: Option<usize>,
+    /// Event-processing work already charged while composing this graph.
+    /// Expansion continues from the same counter so the documented work limit
+    /// is cumulative rather than independently available to both phases.
+    composition_work: usize,
 }
 
 struct Budgets {
@@ -196,7 +200,7 @@ pub(crate) fn parse_yaml_to_json(body: &[u8], max_nodes: usize) -> Result<Value,
         max_alias_refs: MAX_YAML_ALIAS_REFERENCES,
         bytes: 0,
         max_bytes: MAX_YAML_EXPANDED_BYTES,
-        work: 0,
+        work: document.composition_work,
         max_work: MAX_YAML_EXPANSION_WORK,
     };
     let mut expanding = HashSet::new();
@@ -224,6 +228,7 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
         anchors: HashMap::new(),
         anchor_names: HashMap::new(),
         root: None,
+        composition_work: 0,
     };
     let mut stack: Vec<Frame> = Vec::new();
     let mut work = 0usize;
@@ -366,6 +371,7 @@ fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYa
     if document.root.is_none() {
         return Err(BoundedYamlError::EmptyDocument);
     }
+    document.composition_work = work;
     Ok(document)
 }
 

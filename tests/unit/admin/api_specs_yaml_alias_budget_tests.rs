@@ -420,6 +420,27 @@ fn json_and_yaml_literal_parity_without_aliases() {
 }
 
 #[test]
+fn yaml_scalar_resolution_preserves_serde_yaml_compatibility() {
+    let yaml = concat!(
+        "openapi: '3.1.0'\n",
+        "info:\n",
+        "  title: yes\n",
+        "  version: 010\n",
+        "x-ferrum-proxy:\n",
+        "  id: on\n",
+        "  backend_host: backend.internal\n",
+        "  backend_port: 0o673\n",
+        "x-ferrum-validate: false\n",
+    );
+    let (bundle, metadata) =
+        extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "on");
+    assert_eq!(bundle.proxy.backend_port, 443);
+    assert_eq!(metadata.title.as_deref(), Some("yes"));
+    assert_eq!(metadata.info_version.as_deref(), Some("010"));
+}
+
+#[test]
 fn flow_style_autodetect_expands_aliases_under_same_budgets() {
     let yaml = "{openapi: '3.1.0', info: &info {title: flow, version: '1.0'}, \
                 x-ferrum-proxy: {id: flow-proxy, backend_host: x.com, backend_port: 443}, \
