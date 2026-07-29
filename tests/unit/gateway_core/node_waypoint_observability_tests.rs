@@ -274,8 +274,7 @@ fn match_optional_gateway_namespace_sample(rest: &str) -> Option<&str> {
     } else {
         let after_key = rest.strip_prefix(",gateway_namespace=\"")?;
         let (_value, after_value) = after_key.split_once('"')?;
-        let after = after_value.strip_prefix('}')?;
-        after
+        after_value.strip_prefix('}')?
     };
     // Prometheus exposition requires whitespace between `}` and the sample.
     if after_labels.is_empty() || !after_labels.chars().next()?.is_whitespace() {
