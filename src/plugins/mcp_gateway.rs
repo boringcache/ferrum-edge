@@ -2092,22 +2092,16 @@ impl McpGateway {
         // catalog: that would misreport a total family outage as
         // healthy-and-empty for the whole cache TTL. It is marked on the
         // catalog instead, and requests for that family surface -32006 while
-        // healthy families keep serving.
+        // healthy families keep serving. When every attempted family is
+        // unavailable the refresh still commits `unavailable` and `degraded`
+        // so observability and batch request summaries can union degradation
+        // across members instead of aborting before the catalog records the
+        // outage.
         let unavailable: BTreeSet<&'static str> = families
             .iter()
             .filter(|(_, stats)| stats.fully_unavailable())
             .map(|(family, _)| *family)
             .collect();
-        // Total outage with nothing to serve in any attempted family: keep the
-        // catalog stale (the next request retries) and surface the refresh
-        // error instead of publishing a misleading empty catalog. The
-        // per-request warnings above already carry the failure detail.
-        if !families.is_empty() && unavailable.len() == families.len() {
-            let attempted_lists: usize = families.values().map(|stats| stats.attempted).sum();
-            return Err(format!(
-                "all {attempted_lists} MCP upstream catalog list requests failed"
-            ));
-        }
         for (server_id, family) in &degraded {
             warn!(
                 server_id = %server_id,
