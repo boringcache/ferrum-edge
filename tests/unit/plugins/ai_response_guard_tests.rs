@@ -4384,6 +4384,75 @@ async fn grpc_redact_transform_ignores_mislabeled_response_content_type() {
 }
 
 #[tokio::test]
+async fn grpc_web_translated_response_is_never_rewritten_as_text() {
+    // A gRPC-Web translated response is excluded from the protobuf rewrite
+    // (`grpc_web` re-frames the body first), but its bytes are still gRPC
+    // framing — and `application/grpc-web+proto` is not
+    // `is_native_grpc_content_type`, so the media-type guard inside the plain
+    // `transform_response_body` does not cover it. With `scan_fields: all` the
+    // frame bytes of an ASCII payload are valid UTF-8, so a text redaction
+    // would rewrite them and change a payload's length without its 5-byte
+    // prefix, corrupting the wire while reporting success.
+    let plugin = make_plugin(json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    }));
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    assert!(
+        std::str::from_utf8(&body).is_ok(),
+        "the regression only bites when the framed body is valid UTF-8"
+    );
+
+    let mut ctx = grpc_ctx("/test.Greeter/SayHello");
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "text".to_string());
+
+    // Detection still fires; redaction cannot reach the delivered bytes, so the
+    // enforcing action fails closed rather than claiming a redaction.
+    assert!(matches!(
+        plugin
+            .on_response_body(&mut ctx, 200, &mut grpc_headers(), &body)
+            .await,
+        PluginResult::Reject { .. }
+    ));
+    assert_eq!(
+        ctx.metadata.get("ai_response_guard_rejected").map(|s| s.as_str()),
+        Some("grpc_web_translation_blocks_redaction")
+    );
+
+    // The transform must decline these bytes for every response label a
+    // translated response can carry, including the gRPC-Web media types that
+    // the native-gRPC content-type guard does not recognize.
+    for content_type in [
+        None,
+        Some("application/grpc-web+proto"),
+        Some("application/grpc-web-text"),
+        Some("application/json"),
+        Some("text/plain"),
+    ] {
+        assert!(
+            plugin
+                .transform_response_body_with_context(
+                    &mut ctx,
+                    &body,
+                    content_type,
+                    &grpc_headers()
+                )
+                .await
+                .is_none(),
+            "gRPC framing must never be rewritten as text under content-type {content_type:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn grpc_gzip_rejects_trailing_garbage_and_concatenated_members() {
     use flate2::write::GzEncoder;
     use std::io::Write;

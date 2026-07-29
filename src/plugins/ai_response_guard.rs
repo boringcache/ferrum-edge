@@ -3218,6 +3218,21 @@ impl Plugin for AiResponseGuard {
         if self.grpc_transform_applies(ctx, content_type) {
             return self.redacted_grpc_body(ctx, response_headers, body);
         }
+        // A native-gRPC request's response body is length-prefixed protobuf
+        // framing — or the gRPC-Web re-framing of it — whatever the response
+        // `Content-Type` claims. The JSON/SSE/text rewriter below cannot
+        // address that representation, and its `scan_fields: all` branch would
+        // regex-rewrite raw frame bytes whenever they happen to be valid UTF-8,
+        // changing a payload's length without its 5-byte prefix and corrupting
+        // the wire. `application/grpc-web+proto` is not
+        // `is_native_grpc_content_type`, so the media-type guard inside
+        // `transform_response_body` does not cover the translated case. Only
+        // the descriptor contract above may rewrite these bytes; when it does
+        // not apply, `inspect_grpc_response` has already failed closed for
+        // anything it detected, so deliver them unchanged.
+        if ctx.is_native_grpc_request() {
+            return None;
+        }
         self.transform_response_body(body, content_type, response_headers)
             .await
     }
