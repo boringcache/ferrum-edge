@@ -31,6 +31,11 @@ rejects crash artifacts larger than 64 KiB before upload.
   builds, 300 s per target, bounded crash artifacts uploaded after size/count
   checks, 7-day retention, concurrency capped at two targets.
 
+Both hosted lanes install `libcurl4-openssl-dev` before compiling. The fuzz
+crate links the main Ferrum Edge crate, whose Kafka dependency builds
+`librdkafka` from source and requires the libcurl development headers; the
+hosted runner image does not guarantee that header package.
+
 ## Local workflow (optional)
 
 Local builds are not required; GitHub Actions is the gate. When investigating a

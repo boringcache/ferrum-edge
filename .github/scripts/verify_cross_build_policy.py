@@ -1685,6 +1685,11 @@ CI_FUZZ_SMOKE_JOB = r"""  fuzz-smoke:
         with:
           persist-credentials: false
 
+      - name: Install native fuzz build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends libcurl4-openssl-dev
+
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
@@ -1825,6 +1830,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           persist-credentials: false
+
+      - name: Install native fuzz build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends libcurl4-openssl-dev
 
       - name: Install pinned nightly toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
