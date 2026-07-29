@@ -155,8 +155,9 @@ async fn try_spawn_udp_gateway(
         known_namespaces: Vec::new(),
         ..Default::default()
     };
-    let plugin_cache =
-        Arc::new(PluginCache::new(&gateway_config).expect("PluginCache builds with fault_injection"));
+    let plugin_cache = Arc::new(
+        PluginCache::new(&gateway_config).expect("PluginCache builds with fault_injection"),
+    );
     let attached =
         plugin_cache.get_plugins_for_protocol(&proxy_namespace, PROXY_ID, ProxyProtocol::Udp);
     assert!(
@@ -164,9 +165,7 @@ async fn try_spawn_udp_gateway(
         "fault_injection must attach to UDP"
     );
     assert!(
-        attached
-            .iter()
-            .any(|p| p.requires_udp_datagram_hooks()),
+        attached.iter().any(|p| p.requires_udp_datagram_hooks()),
         "fault_injection must opt into on_udp_datagram"
     );
 
@@ -254,7 +253,10 @@ async fn try_spawn_udp_gateway(
     }
 }
 
-async fn spawn_udp_gateway_with_retry(backend_port: u16, fault_config: serde_json::Value) -> SpawnedUdpGateway {
+async fn spawn_udp_gateway_with_retry(
+    backend_port: u16,
+    fault_config: serde_json::Value,
+) -> SpawnedUdpGateway {
     for attempt in 1..=MAX_GATEWAY_ATTEMPTS {
         let frontend = reserve_udp_port().await.expect("reserve frontend UDP port");
         let listen_port = frontend.drop_and_take_port();

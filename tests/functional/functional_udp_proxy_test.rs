@@ -1512,17 +1512,11 @@ plugin_configs:
     let client_b = UdpSocket::bind("127.0.0.2:0").await.unwrap();
     let gateway_addr = format!("127.0.0.1:{proxy_port}");
 
-    client_a
-        .send_to(b"peer-a", &gateway_addr)
-        .await
-        .unwrap();
+    client_a.send_to(b"peer-a", &gateway_addr).await.unwrap();
     sleep(Duration::from_millis(50)).await;
 
     let b_start = Instant::now();
-    client_b
-        .send_to(b"peer-b", &gateway_addr)
-        .await
-        .unwrap();
+    client_b.send_to(b"peer-b", &gateway_addr).await.unwrap();
     let mut buf = vec![0u8; 65535];
     let (n, _) = tokio::time::timeout(Duration::from_secs(5), client_b.recv_from(&mut buf))
         .await

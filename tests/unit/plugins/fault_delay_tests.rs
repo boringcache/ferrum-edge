@@ -416,7 +416,9 @@ fn every_fault_delay_call_site_is_bounded() {
     // the bounded helper: shutdown token + process-wide budget. Peer watches
     // are owned by the stream/datagram proxy paths that race or drop the hook.
     assert_eq!(
-        plugin.matches("run_fault_delay(d.duration_ms, None)").count(),
+        plugin
+            .matches("run_fault_delay(d.duration_ms, None)")
+            .count(),
         2,
         "on_stream_connect and on_udp_datagram must each delay through the bounded helper once"
     );
