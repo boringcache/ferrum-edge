@@ -1918,7 +1918,9 @@ pub async fn handle_admin_request(
                 .map(|rt| rt.egress_scope_state().health())
                 .unwrap_or_default();
             health_status["mesh"] = json!({
-                "egress_scope": egress_health
+                "egress_scope": egress_health,
+                "node_waypoint_observability":
+                    crate::modes::mesh::node_waypoint_observability::snapshot(),
             });
         }
 

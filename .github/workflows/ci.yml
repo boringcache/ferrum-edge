@@ -954,6 +954,7 @@ jobs:
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_response_stream_test
+              functional_json_duplicate_key_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
               functional_request_mirror_grpc_transport_test
@@ -991,6 +992,7 @@ jobs:
               functional_grpc_test
               functional_h3_soap_utf16_test
               functional_key_auth_query_test
+              functional_request_mirror_admission_test
               functional_request_mirror_query_parity_test
               functional_request_transformer_query_test
               functional_load_testing_replay_test
@@ -1023,6 +1025,7 @@ jobs:
               functional_ws_origin_test
               functional_allowed_methods_test
               functional_allowed_methods_logging_test
+              functional_transaction_debugger_body_capture_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
               functional_streaming_outcome_accounting_test
