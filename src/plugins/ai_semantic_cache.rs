@@ -1653,7 +1653,7 @@ impl AiSemanticCache {
         &self,
         scope_key: &str,
         embedding: &EmbeddingPoint,
-    ) -> Option<(CachedResponse, f32, String)> {
+    ) -> Option<(CachedResponse, f32)> {
         let semantic = self.semantic.as_ref()?;
         let snapshot = self.vector_index.load_full()?;
         let mut search = HnswSearch::default();
@@ -1684,7 +1684,6 @@ impl AiSemanticCache {
                     body: entry.body.clone(),
                 },
                 similarity,
-                item.value.cache_key.clone(),
             ));
         }
 
@@ -4926,7 +4925,7 @@ impl Plugin for AiSemanticCache {
         {
             match self.compute_embedding(&input).await {
                 Ok(embedding) => {
-                    if let Some((entry, similarity, matched_key)) =
+                    if let Some((entry, similarity)) =
                         self.lookup_semantic(&scope_key, &embedding)
                     {
                         debug!(

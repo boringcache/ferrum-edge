@@ -1940,7 +1940,7 @@ impl ResponseCaching {
             if let Some(keys) = paths.get(encoded.as_ref()) {
                 doomed.extend(keys.iter().cloned());
             }
-            for (indexed_path, keys) in paths.range::<str, _>(descendant_prefix.as_str()..) {
+            for (indexed_path, keys) in paths.range(descendant_prefix.clone()..) {
                 if !indexed_path.starts_with(descendant_prefix.as_str()) {
                     break;
                 }
