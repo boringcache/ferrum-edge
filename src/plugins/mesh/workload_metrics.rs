@@ -1538,8 +1538,7 @@ fn is_sensitive_environment_variable_name(name: &str) -> bool {
             || segment.eq_ignore_ascii_case("postgres")
             || segment.eq_ignore_ascii_case("postgresql")
             || segment.eq_ignore_ascii_case("redis");
-        has_location |=
-            segment.eq_ignore_ascii_case("url") || segment.eq_ignore_ascii_case("uri");
+        has_location |= segment.eq_ignore_ascii_case("url") || segment.eq_ignore_ascii_case("uri");
         has_client |= segment.eq_ignore_ascii_case("client");
         has_id |= segment.eq_ignore_ascii_case("id");
     }
