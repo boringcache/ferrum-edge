@@ -3545,12 +3545,19 @@ paths:
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
         redacted before it is written to the audit log. Sensitive plugin
-        configuration is redacted as well; Loki endpoint paths/queries,
-        authorization, and all custom-header values are never persisted in
-        the diff, Redis envelope signing keys (`redis_integrity_key` and any
+        configuration is redacted as well, through the same schema-aware
+        sensitivity contract used for non-admin plugin reads: credential-bearing
+        endpoint URLs keep only scheme/host/port with structural
+        `[REDACTED_PATH]`/`[REDACTED_QUERY]`/`[REDACTED_FRAGMENT]` markers and
+        never userinfo, all values of arbitrary header maps and webhook body
+        templates are replaced by `[REDACTED]`, as are
+        `serverless_function.azure_function_key` and every
+        `kafka_logging.producer_config` property outside the safe-tuning
+        allow-list. Redis envelope signing keys (`redis_integrity_key` and any
         other `*_integrity_key`) are replaced by `[REDACTED]`, and `redis_url`
         userinfo/query/fragment data is stripped while its
-        scheme/host/port/database are kept.
+        scheme/host/port/database are kept. Explicit JSON `null` values on
+        sensitive fields stay `null`.
         Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
@@ -6747,12 +6754,30 @@ components:
             `[REDACTED]` marker, never values, entry fields, shape, or count.
             Unknown/custom credential types are omitted from audit payloads so
             their unmodeled values cannot be disclosed.
-            Sensitive plugin configuration is also redacted; loki_logging
-            endpoint paths/queries, authorization, and custom-header values
-            are never persisted, `redis_integrity_key` (and any other
+            Sensitive plugin configuration is also redacted through one
+            schema-aware sensitivity contract shared with non-admin plugin
+            reads. Every built-in plugin declares its credential-bearing
+            config paths; credential-bearing endpoint URLs keep only
+            `scheme://host[:port]` with `[REDACTED_PATH]` /
+            `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers and never
+            userinfo, every value of an arbitrary header or parameter map
+            (otel_tracing `headers`, loki_logging/http_logging
+            `custom_headers`, ai_transcript_audit `sink.custom_headers`, opa
+            `headers`, proxy_alerts channel `headers`,
+            api_chargeback_sink `clickhouse.insert_query_params`) is replaced
+            by `[REDACTED]`, as are `serverless_function.azure_function_key`,
+            proxy_alerts channel `body_template`, and every
+            `kafka_logging.producer_config` property outside the safe-tuning
+            allow-list. Mesh `workload_metrics` tracing-provider collector
+            URLs receive the same structural projection. `redis_integrity_key`
+            (and any other
             `*_integrity_key` signing secret) is replaced by `[REDACTED]`, and
             `redis_url` userinfo/query/fragment data is stripped while
-            scheme/host/port/database are kept.
+            scheme/host/port/database are kept. Any remaining URL-shaped
+            string carrying userinfo has that userinfo replaced. A plugin
+            config that is not an object (and not `null`) is replaced
+            wholesale. Explicit JSON `null` values on sensitive fields stay
+            `null`.
 
     AuditEventListResponse:
       type: object
@@ -12349,8 +12374,11 @@ components:
             (Sumo Logic path token, Mezmo apikey query parameter), so this value
             is never rendered in operational output: egress-denial, DNS/TLS,
             retry, slow-call, and batch-failure diagnostics show only a
-            structurally redacted scheme://host:port/redacted form, and the
-            admin audit projection redacts it the same way.
+            structurally redacted scheme://host:port/redacted form. The admin
+            audit and non-admin read projections apply the schema-aware
+            sensitivity contract instead, keeping only `scheme://host[:port]`
+            with `[REDACTED_PATH]` / `[REDACTED_QUERY]` /
+            `[REDACTED_FRAGMENT]` markers.
         custom_headers:
           type: object
           additionalProperties:
@@ -15594,7 +15622,9 @@ components:
                   a backend; takes precedence over `rewrite` and the route
                   override destination. A status-only redirect is valid and
                   preserves the original URL. A rule carrying a `redirect`
-                  does not require a `destination`.
+                  does not require a `destination`. `port` and `derive_port`
+                  are mutually exclusive (Istio oneof); scheme-default ports
+                  are omitted from Location.
                 properties:
                   uri:
                     type: [string, "null"]
@@ -15612,7 +15642,23 @@ components:
                     type: [integer, "null"]
                     format: uint16
                     minimum: 1
-                    description: Replacement authority port; request host is preserved when authority is unset.
+                    description: |
+                      Replacement authority port (Istio `redirect.port`); request
+                      host is preserved when authority is unset. Mutually
+                      exclusive with `derive_port`. Scheme-default ports
+                      (`80`/`http`, `443`/`https`) are omitted from Location.
+                  derive_port:
+                    type: [string, "null"]
+                    enum: [FROM_PROTOCOL_DEFAULT, FROM_REQUEST_PORT, null]
+                    description: |
+                      Dynamically derive the Location authority port (Istio
+                      `redirect.derivePort`). `FROM_PROTOCOL_DEFAULT` uses 80 for
+                      http and 443 for https (including when `scheme` is set on
+                      the same redirect). `FROM_REQUEST_PORT` uses the trusted
+                      request port: original-destination port when capture
+                      rewrote the accept socket, otherwise the frontend listener
+                      port — never spoofable `X-Forwarded-Port` / `Forwarded`
+                      headers. Mutually exclusive with `port`.
                   scheme:
                     type: [string, "null"]
                     enum: [http, https, null]
@@ -15814,7 +15860,8 @@ components:
       type: object
       description: |
         Plugin: __mesh_bpf_metrics - reserved internal mesh NodeWaypoint
-        plugin that exposes BPF SOCK_OPS counters on the Prometheus scrape
+        plugin that exposes BPF SOCK_OPS counters and fixed-bucket TCP
+        latency histograms (SRTT / SYN-to-ACK) on the Prometheus scrape
         surface. Mesh mode auto-injects it when BPF metrics are available;
         operator-managed plugin configs should not create names prefixed
         with `__`.
@@ -15823,17 +15870,117 @@ components:
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_]*$"
           default: ferrum_mesh_bpf
-          description: Prometheus metric name prefix for emitted BPF counters.
+          description: |
+            Prometheus metric name prefix for emitted BPF counters and
+            latency histograms (default families include
+            `{prefix}_srtt_microseconds` and
+            `{prefix}_syn_to_ack_microseconds`).
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              username_token:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  - not:
+                      properties:
+                        password_type:
+                          const: PasswordText
+                      required: [password_type]
+            required: [username_token]
+          then:
+            required: [nonce]
+            properties:
+              nonce:
+                type: object
+                required: [replay_scope]
+        - if:
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
+            required: [nonce]
+          then:
+            required: [sync_mode, redis_url]
+            properties:
+              sync_mode:
+                const: redis
+        - if:
+            properties:
+              sync_mode:
+                const: redis
+            required: [sync_mode]
+          then:
+            required: [nonce, redis_url]
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
       properties:
         reject_missing_security_header:
           type: boolean
           default: true
           description: Reject SOAP requests that lack a WS-Security header
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "PasswordDigest replay-claim storage. 'redis' is required by (and only valid with) nonce.replay_scope = 'shared'; it is what makes replay protection cross-replica. Any RESP-compatible server works."
+        redis_url:
+          type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          minLength: 1
+          description: >-
+            Key prefix for shared replay claims. Must be non-empty when
+            supplied. Defaults to
+            `{FERRUM_NAMESPACE}:soap_ws_security:{plugin-config-id}`, which
+            isolates independent PasswordDigest policies inside a namespace while
+            keeping every replica of one policy claiming against the same
+            keyspace. An explicit prefix is the opt-in for deliberately sharing a
+            keyspace across policies.
+        redis_pool_size:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 4
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
+        redis_connect_timeout_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Redis connection timeout in seconds. Must be greater than zero.
+        redis_health_check_interval_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
         timestamp:
           type: object
           description: WS-Security Timestamp validation
@@ -15842,7 +15989,7 @@ components:
             require:
               type: boolean
               default: true
-              description: Require a wsu:Timestamp element in the Security header
+              description: Require a wsu:Timestamp element in the Security header. This controls whether the element may be ABSENT; a Timestamp that IS present is always validated against max_age_seconds / clock_skew_seconds / Expires, so an out-of-policy Timestamp is never ignored and the PasswordDigest binding always compares against a validated instant.
             max_age_seconds:
               type: integer
               format: uint64
@@ -15896,6 +16043,31 @@ components:
                     type: string
                     minLength: 1
               description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with non-empty username and password; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins.
+            created_max_age_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 1
+              maximum: 86400
+              description: Freshness window (seconds) for the UsernameToken's own wsu:Created — the instant hashed into the PasswordDigest, distinct from the outer Timestamp Created. Without it a captured token stays digest-valid forever and only the replay TTL limits resubmission. Zero is rejected. The value validated is byte-for-byte the value fed to the digest.
+            created_clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for the UsernameToken Created freshness window and for the Timestamp Expires comparison. Zero is permitted (strictest).
+            created_max_timestamp_divergence_seconds:
+              type: integer
+              format: uint64
+              default: 60
+              minimum: 0
+              maximum: 3600
+              description: Maximum permitted absolute difference between the UsernameToken Created and the outer wsu:Timestamp Created. This binding is what prevents a captured UsernameToken from being paired with a freshly minted outer Timestamp — moving the outer instant no longer moves the inner one, and moving the inner one invalidates the captured digest. Zero is permitted (the two instants must be identical). The UsernameToken Created must also not fall past an outer Expires.
+            require_timestamp_binding:
+              type: boolean
+              default: true
+              description: Require an outer wsu:Timestamp carrying a valid Created for PasswordDigest requests, so the Timestamp binding cannot be dropped by omitting the element. The outer Timestamp is validated on every request in which it appears — including when timestamp.require is false — so the instant bound against is always an independently validated one.
         x509_signature:
           type: object
           description: X.509 certificate signature verification
@@ -16045,28 +16217,85 @@ components:
             per shared immutable key allocation. An exact ordered age index
             provides O(log n) expiry operations without a lookup-map scan or
             stale queue. Capacity maintenance reclaims only entries already
-            past cache_ttl_seconds and at most 64 of them per request; a nonce
-            inside its TTL is never evicted. If that bounded reclamation cannot
-            make room the request fails closed (HTTP 401) rather than accepting
-            a nonce whose replay window cannot be recorded or unprotecting one
-            that was already claimed. This is the only canonical shape; there
-            is no `nonce_replay_protection` alias.
+            past the fixed retention horizon and at most 64 of them per
+            request; a nonce inside it is never evicted. If that bounded
+            reclamation cannot make room the request fails closed (HTTP 401)
+            rather than accepting a nonce whose replay window cannot be recorded
+            or unprotecting one that was already claimed. This is the only
+            canonical shape; there is no `nonce_replay_protection` alias.
+
+            replay_scope declares where those claims live and is REQUIRED when
+            username_token is enabled with password_type PasswordDigest. It has
+            no default because a gateway cannot observe its own replica count.
+            The entry/byte caps and bounded expiry maintenance described above
+            apply to replay_scope=process; under replay_scope=shared the bounds
+            that apply are Redis's own memory policy plus the fixed expiry on
+            each claim key, and max_cache_size / max_total_cache_bytes are
+            inert. The encoded-length ceiling applies on both paths.
+
+            Claim retention is FIXED at 93601 seconds (~26 h) on both paths and
+            is not configurable: it is
+            max created_max_age_seconds (86400) + 2 × max
+            created_clock_skew_seconds (3600) + 1, the widest span over which
+            any configuration this schema admits can accept an unchanged
+            UsernameToken. Retention derived from the *configured* window is not
+            sufficient, because replay state outlives the generation that wrote
+            it: a later reload may widen created_max_age_seconds /
+            created_clock_skew_seconds after the shorter retention has already
+            elapsed, and the claim cannot then be resurrected in either scope
+            (a process entry may already have been reclaimed or refreshed, and
+            Redis SET NX cannot extend a key it finds present). Retaining every
+            claim for the schema-wide maximum makes any later admitted widening
+            safe with no rollout ordering, drain window, or operator procedure.
+            There is no cache_ttl_seconds field; it was removed rather than
+            redefined, and supplying it fails admission as an unknown key.
           additionalProperties: false
           properties:
-            cache_ttl_seconds:
-              type: integer
-              format: uint64
-              default: 300
-              minimum: 1
-              maximum: 86400
-              description: How long to remember nonces for replay detection (seconds). Zero is rejected because it would make replay detection inert.
+            replay_scope:
+              type: string
+              enum: [process, shared]
+              description: >-
+                Where PasswordDigest replay claims live. REQUIRED when
+                username_token.enabled is true and password_type is
+                PasswordDigest; there is no default. "process" registers state
+                under a stable {namespace}|{plugin-config-id} scope so a reload
+                generation inherits the previous generation's claims instead of
+                starting from an empty cache — it is explicitly NOT cross-replica
+                protection, and selecting it asserts a single-replica deployment.
+                Process-scope claims are lost on process restart, crash, or
+                reschedule; a captured PasswordDigest token still inside its
+                Created window can then be accepted again. Reload survival is
+                not restart survival.
+                "shared" claims each nonce with one atomic Redis SET NX EX so
+                exactly one request across all replicas wins a nonce inside its
+                TTL; it requires sync_mode=redis and a redis_url, and the key is
+                SHA-256(nonce) in hex so the nonce never reaches a Redis
+                keyspace, MONITOR, SLOWLOG, or client error log. A shared-backend
+                outage fails closed with HTTP 401 (failure class
+                nonce_shared_backend_unavailable); there is no degrade-to-local
+                option because a per-replica fallback would reinstate the
+                cross-replica bypass. Recovery is automatic: any error that
+                marks the shared client unavailable — connect, DNS, a hostname
+                that currently resolves to an egress-denied address, or a
+                transient command error — also arms the background recovery
+                checker, which restores enforcement within
+                redis_health_check_interval_seconds without a reload (a
+                literal-IP egress-policy denial is the exception and is a
+                configuration fix; hostname denials re-screen because DNS
+                answers can change). Claim durability is Redis's own: run the
+                replay keyspace
+                with maxmemory-policy noeviction and consistent failover, since
+                a lost claim key makes its nonce claimable again. Admission
+                enforces the pairing in both directions: shared without
+                sync_mode=redis is rejected, and sync_mode=redis without shared
+                is rejected.
             max_cache_size:
               type: integer
               format: uint64
-              default: 10000
+              default: 100000
               minimum: 1
               maximum: 1000000
-              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past cache_ttl_seconds. A nonce inside its TTL is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce.
+              description: "Maximum retained nonce entries (replay_scope=process only). Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past the fixed 93601-second retention horizon. A nonce inside that horizon is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce. Size this (and max_total_cache_bytes) for peak authenticated PasswordDigest rate × 93601 s — roughly 1 request/second sustained at the default, and about 10/second at the 1000000 ceiling. Higher sustained PasswordDigest rates need replay_scope=shared, where retention is Redis's cost rather than the gateway's."
             max_encoded_length:
               type: integer
               format: uint64
@@ -16077,10 +16306,10 @@ components:
             max_total_cache_bytes:
               type: integer
               format: uint64
-              default: 8388608
+              default: 67108864
               minimum: 4096
               maximum: 1073741824
-              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside cache_ttl_seconds."
+              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside its retention window."
 
     CorsExactOrigin:
       oneOf:
@@ -16928,10 +17157,20 @@ components:
           type: string
           enum: [add, remove, update, rename]
           description: |
-            add: insert if absent (does not overwrite).
-            update: write the query parameter value.
-            remove: delete the query parameter.
-            rename: move old → new query parameter name.
+            add: append if the decoded name is absent (does not overwrite;
+            existing duplicates are left untouched).
+            update: rewrite every matching decoded-name pair's value, or
+            append when absent.
+            remove: delete every matching decoded-name pair.
+            rename: rename every matching pair, preserving value encoding
+            and key-without-equals shape; existing destination names stay.
+            Mutations apply to an ordered, duplicate-aware representation of
+            the retained raw query after authentication-owned credential
+            pairs (`auth.strip_query_param.*`) are removed from that input,
+            and are published as the outbound query for every primary
+            backend URL builder and request_mirror. The proxy still applies
+            a final strip pass as defense in depth. A rename/update of a
+            marked credential name therefore cannot relocate the secret.
             Operation-incompatible extras are rejected: only add/update
             may set `value`; only rename may set `new_key`; remove may
             set neither.
@@ -16940,15 +17179,20 @@ components:
           const: query
         key:
           type: string
-          description: Query parameter name.
+          description: |
+            Query parameter name matched after percent-decoding. Must not
+            contain CR or LF.
         value:
           type: string
           description: |
             Required for add/update; must not be set for remove/rename.
+            Must not contain CR or LF. Authored onto the outbound query with
+            RFC 3986 percent-encoding (`%20` for spaces, never `+`).
         new_key:
           type: string
           description: |
             Required for rename; must not be set for add/update/remove.
+            Must not contain CR or LF.
 
     RequestTransformerBodyRule:
       type: object
@@ -18212,7 +18456,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. XML conversion honors OpenAPI XML Object fields
+        binary media types. Multipart Content-Disposition accepts ordinary
+        `filename` or a single bounded RFC 5987/8187 `filename*` (UTF-8 only;
+        unquoted ext-value) and rejects continuations, quoted `filename*`,
+        bare/non-token parameter segments, conflicts, and hostile extended
+        values.
+        XML conversion honors OpenAPI XML Object fields
         `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
         matching uses the URI; `prefix` is serialization metadata only;
         members that collide with a modeled name but not its XML construct or
@@ -19336,7 +19585,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -19412,7 +19661,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "Invalidate cached entries for the matched path (and descendants under the same path prefix) on unsafe methods (POST, PUT, PATCH, DELETE, and extension methods, which are conservatively treated as unsafe). Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating"
+          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
 
     GraphqlConfig:
       type: object
@@ -20059,7 +20308,7 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form, and the admin audit projection redacts it the same way."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true. Userinfo credentials (https://user:pass@host) are rejected — authenticate with custom_headers. A collector that requires a credential in the URL path or query is supported, and this value is never rendered in operational output: egress-denial, DNS/TLS, retry, slow-call, and batch-failure diagnostics show only a structurally redacted scheme://host:port/redacted form. The admin audit and non-admin read projections apply the schema-aware sensitivity contract instead, keeping only scheme://host[:port] with `[REDACTED_PATH]` / `[REDACTED_QUERY]` / `[REDACTED_FRAGMENT]` markers."
             allow_insecure_loopback:
               type: boolean
               default: false
@@ -20804,7 +21053,7 @@ components:
     AiRateLimiterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_rate_limiter — Token-aware rate limiting for LLM APIs. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
+      description: "Plugin: ai_rate_limiter — HTTP-only token-aware rate limiting for LLM APIs. Native gRPC is unsupported (not registered for the Grpc protocol view): protobuf message frames have no supported usage schema, so an attachment there would never charge the budget. Framed gRPC-Web bodies are likewise never classified as JSON AI traffic and are never charged as zero usage. Supports centralized Redis-backed mode for cross-instance token budget coordination. Counter storage supports only local memory and Redis; database-backed counters are intentionally unsupported."
       required: [token_limit]
       properties:
         token_limit:
@@ -21678,7 +21927,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Provider fallback is NOT implemented and a `fallback` config block is REJECTED at admission (issue #3328): the plugin commits one provider route, credential set, backend TLS resolution, and translated request body before dispatch and never switches providers, pre- or post-first-byte, so a stored fallback policy could only be silently inert. No ai_stream_router.fallback_attempts metadata is emitted. Configuration is strict: unknown root and provider fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -21749,23 +21998,6 @@ components:
                 type: boolean
                 default: false
                 description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
-        fallback:
-          type: object
-          additionalProperties: false
-          description: "Reserved fallback policy. Parsed and validated but not yet active: ai_stream_router cannot switch providers after the first downstream byte."
-          properties:
-            enabled:
-              type: boolean
-              default: false
-            on_connect_error:
-              type: boolean
-              default: true
-            on_5xx_before_first_byte:
-              type: boolean
-              default: true
-            max_attempts:
-              type: integer
-              default: 2
 
     A2aGatewayConfig:
       type: object
@@ -22625,6 +22857,12 @@ components:
               minimum: 1
               maximum: 1000000
               default: 50000
+              description: >
+                Bounded in-memory export channel capacity. With spool.enabled=false,
+                the 80% high-water mark is telemetry only and every slot remains
+                usable until the channel is actually full. With spool enabled,
+                high-water overflow is diverted to durable spool delivery instead
+                of consuming the remaining channel slots.
             buffer_max_bytes:
               type: integer
               minimum: 9312
@@ -23040,6 +23278,24 @@ components:
                 high_water_hits_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Enqueue attempts observed while in-memory queue depth was at
+                    or above the high-water mark. Telemetry only; does not imply
+                    diversion or loss.
+                high_water_diversions_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events whose high-water durable spool-delivery handoff was
+                    accepted. Zero when spool is disabled. Saturated or closed
+                    delivery queues are counted by spool loss metrics instead.
+                full_drops_total:
+                  type: integer
+                  minimum: 0
+                  description: >
+                    Events dropped because the bounded in-memory queue was full
+                    and no durable overflow path accepted ownership. Shutdown or
+                    unavailable admission is not counted here.
             spool:
               type: object
               properties:
@@ -23086,6 +23342,10 @@ components:
                 events_enqueued_total:
                   type: integer
                   minimum: 0
+                  description: >
+                    Events admitted to the in-memory channel or accepted by a
+                    durable overflow handoff. Failed spool-delivery admission and
+                    shutdown/unavailable outcomes are not counted.
                 events_exported_total:
                   type: integer
                   minimum: 0
@@ -23176,6 +23436,22 @@ components:
               type: integer
             high_water_hits_total:
               type: integer
+              description: >
+                Enqueue attempts observed while in-memory queue depth was at or
+                above the high-water mark. Telemetry only; does not imply
+                diversion or loss.
+            high_water_diversions_total:
+              type: integer
+              description: >
+                Events whose high-water durable spool-delivery handoff was
+                accepted. Zero when spool is disabled. Saturated or closed
+                delivery queues are counted by spool loss metrics instead.
+            full_drops_total:
+              type: integer
+              description: >
+                Events dropped because the bounded in-memory queue was full and
+                no durable overflow path accepted ownership. Shutdown or
+                unavailable admission is not counted here.
         spool:
           type: object
           properties:
@@ -23219,6 +23495,10 @@ components:
           properties:
             events_enqueued_total:
               type: integer
+              description: >
+                Events admitted to the in-memory channel or accepted by a durable
+                overflow handoff. Failed spool-delivery admission and
+                shutdown/unavailable outcomes are not counted.
             events_exported_total:
               type: integer
             failures_total:

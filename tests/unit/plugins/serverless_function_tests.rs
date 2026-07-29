@@ -3904,16 +3904,14 @@ async fn test_original_content_encoding_marker_fails_before_external_egress() {
 }
 
 #[tokio::test]
-async fn test_query_transform_marker_fails_before_external_egress() {
-    // Mirror of `QUERY_PARAMS_TRANSFORMED_METADATA_KEY` (pub(crate) in proxy).
-    const QUERY_PARAMS_TRANSFORMED_METADATA_KEY: &str = "ferrum:query_params_transformed";
-
+async fn test_query_transform_is_forwarded_in_function_payload() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
+        .expect(1)
         .mount(&server)
         .await;
     let plugin = ServerlessFunction::new(
@@ -3928,20 +3926,39 @@ async fn test_query_transform_marker_fails_before_external_egress() {
     .unwrap();
 
     let mut ctx = create_test_context();
-    // A raw query that is otherwise perfectly valid for forwarding — the reject
-    // is driven solely by the request_transformer query-transform marker.
-    ctx.set_raw_query_string("page=1&sort=asc".to_string());
+    // Simulate request_transformer publishing an ordered outbound query after
+    // removing a credential and updating a page parameter.
+    ctx.set_raw_query_string("access_token=secret&page=1&keep=1".to_string());
+    ctx.publish_transformed_query(
+        "page=2&keep=1".to_string(),
+        [
+            ("page".to_string(), "2".to_string()),
+            ("keep".to_string(), "1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
     ctx.metadata.insert(
-        QUERY_PARAMS_TRANSFORMED_METADATA_KEY.to_string(),
+        "ferrum:query_params_transformed".to_string(),
         "true".to_string(),
     );
-    match plugin.before_proxy(&mut ctx, &mut HashMap::new()).await {
-        PluginResult::Reject { body, .. } => {
-            assert!(body.contains("query_params_transformed"));
-        }
-        other => panic!("transformed-query composition must fail closed, got {other:?}"),
-    }
-    assert!(server.received_requests().await.unwrap().is_empty());
+
+    let result = plugin.before_proxy(&mut ctx, &mut HashMap::new()).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "canonical outbound query must be forwardable, got {result:?}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let params = body["query_params"].as_object().unwrap();
+    assert_eq!(params.get("page").and_then(|v| v.as_str()), Some("2"));
+    assert_eq!(params.get("keep").and_then(|v| v.as_str()), Some("1"));
+    assert!(
+        !params.contains_key("access_token"),
+        "removed credential must not appear in function payload"
+    );
 }
 
 #[tokio::test]

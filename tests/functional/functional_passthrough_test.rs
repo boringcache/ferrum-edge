@@ -107,6 +107,49 @@ fn generate_self_signed_cert() -> (String, String) {
     (cert.pem(), key_pair.serialize_pem())
 }
 
+/// Names of the captured gateway output files inside a harness `TempDir`.
+const GATEWAY_STDOUT_LOG: &str = "gateway.stdout.log";
+const GATEWAY_STDERR_LOG: &str = "gateway.stderr.log";
+
+/// Everything the gateway has written so far, both streams concatenated.
+fn gateway_logs(dir: &std::path::Path) -> String {
+    let mut combined = String::new();
+    for name in [GATEWAY_STDOUT_LOG, GATEWAY_STDERR_LOG] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+            combined.push_str(&text);
+        }
+    }
+    combined
+}
+
+/// Poll the captured gateway logs until `needle` appears, up to `within`.
+///
+/// This is the state observation that replaces "sleep and hope": a test can
+/// wait for a specific gateway-side transition (a circuit breaker opening, a
+/// connection being rejected) instead of guessing how long it takes.
+async fn wait_for_gateway_log(dir: &std::path::Path, needle: &str, within: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        if gateway_logs(dir).contains(needle) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Kills the gateway child on every exit path, including panics.
+struct GatewayProcess(std::process::Child);
+
+impl Drop for GatewayProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Wait for the gateway health endpoint to respond.
 /// Returns true if healthy, false if timed out.
 async fn wait_for_health(admin_port: u16) -> bool {
@@ -169,6 +212,14 @@ where
         let config_content = write_config(proxy_listen_port, dir.path());
         std::fs::write(&config_path, &config_content).unwrap();
 
+        // Redirect the gateway's output into files inside the temp dir rather
+        // than /dev/null. Files (not pipes — an unread pipe deadlocks, see the
+        // functional-test rules) let a test observe gateway-side state
+        // transitions instead of sleeping and hoping. Tests that don't read
+        // them are unaffected.
+        let stdout_log = std::fs::File::create(dir.path().join(GATEWAY_STDOUT_LOG)).unwrap();
+        let stderr_log = std::fs::File::create(dir.path().join(GATEWAY_STDERR_LOG)).unwrap();
+
         let mut cmd = std::process::Command::new(gateway_binary_path());
         cmd.env("FERRUM_MODE", "file")
             .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
@@ -176,8 +227,8 @@ where
             .env("FERRUM_ADMIN_HTTP_PORT", admin_port.to_string())
             .env("FERRUM_LOG_LEVEL", "debug")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::from(stdout_log))
+            .stderr(std::process::Stdio::from(stderr_log));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -254,19 +305,53 @@ upstreams: []
     gateway.wait().ok();
 }
 
-#[tokio::test]
-#[ignore]
-async fn test_tcp_passthrough_circuit_breaker_rejects_without_backend_dial() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+/// An attempt at the passthrough circuit-breaker scenario could not establish
+/// its preconditions because something outside the gateway interfered with the
+/// backend port. Distinct from a product failure, which panics on the spot.
+struct PortRaced(String);
 
-    // Reserve a backend port, then drop the listener so the first gateway
-    // connection gets ECONNREFUSED and trips the passthrough breaker.
+/// Circuit-breaker ordering on the passthrough path.
+///
+/// Production order (`src/proxy/tcp_proxy.rs`): the passthrough branch calls
+/// `circuit_breaker_cache.can_execute()` *before* DNS resolution and the
+/// backend dial, and records the connect failure via `inspect_err` on
+/// `connect_candidates` *before* the error propagates and the client socket is
+/// dropped. So a second connection that starts after the first one's client
+/// socket has closed is deterministically admitted-or-rejected against a
+/// settled breaker — there is no product-side window.
+///
+/// The old test could not see that ordering. It discarded the first client
+/// read's result (so a first attempt that had not finished — or had never even
+/// been dialed — still counted as "breaker tripped"), then rebound the backend
+/// port and slept a second before reading an accept counter. Any accept in that
+/// window failed the test, including one from an unrelated process that grabbed
+/// the port during the deliberate refusal window (issue #3431).
+///
+/// This version instead:
+///   * requires the first client connection to actually end (EOF/error) rather
+///     than ignoring a timeout,
+///   * waits for the gateway to *report* the breaker opening before the backend
+///     listener is installed, so the failed dial provably precedes the rebind,
+///   * proves the rejection positively (the gateway logs the breaker-open
+///     rejection) instead of only inferring it from an absent accept, and
+///   * attributes any backend accept by payload: only a connection carrying
+///     this attempt's unique marker proves the gateway dialed. An
+///     unattributable accept, or a port that was taken during the refusal
+///     window, retries the scenario with fresh ports instead of reporting a
+///     product failure that did not happen.
+async fn try_passthrough_circuit_breaker_scenario(attempt: u32) -> Result<(), PortRaced> {
+    // Reserve a backend port and release it: the first gateway dial must get a
+    // real ECONNREFUSED so the breaker trips on a connection error. This
+    // release/rebind window is inherent to the scenario; everything below
+    // detects interference in it rather than misreporting it.
     let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     drop(backend_listener);
 
-    let (mut gateway, proxy_listen_port, _http_port, _admin_port, _dir) =
+    let first_marker = format!("ferrum-cb-first-{attempt}-{backend_port}");
+    let second_marker = format!("ferrum-cb-second-{attempt}-{backend_port}");
+
+    let (gateway, proxy_listen_port, _http_port, _admin_port, dir) =
         start_gateway_with_retry(|stream_port, _dir_path| {
             format!(
                 r#"
@@ -294,42 +379,151 @@ upstreams: []
             )
         })
         .await;
+    let _gateway = GatewayProcess(gateway);
 
-    let mut first = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_listen_port))
+    // ── Step 1: the first attempt must fail and must be observed failing ──
+    let mut first = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
         .await
         .expect("connect to passthrough proxy");
-    first.write_all(b"trip breaker").await.ok();
-    let mut buf = [0u8; 1];
-    let _ = tokio::time::timeout(Duration::from_secs(5), first.read(&mut buf)).await;
-
-    // Bring up a backend on the same port after the breaker is open. If the
-    // passthrough path skips can_execute, the next client will be accepted here.
-    let backend_listener = TcpListener::bind(format!("127.0.0.1:{backend_port}"))
-        .await
-        .expect("bind backend after breaker trip");
-    let accepts = Arc::new(AtomicU32::new(0));
-    let accepts_for_task = accepts.clone();
-    tokio::spawn(async move {
-        while let Ok((_stream, _)) = backend_listener.accept().await {
-            accepts_for_task.fetch_add(1, Ordering::Relaxed);
+    first.write_all(first_marker.as_bytes()).await.ok();
+    let mut buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_secs(10), first.read(&mut buf)).await {
+        // EOF or a transport error: the gateway finished handling the
+        // connection, which on this path means the dial failed and the
+        // failure was recorded before the socket was dropped.
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => {
+            return Err(PortRaced(format!(
+                "backend port {backend_port} was serving during the refusal window: \
+                 the first passthrough attempt read back {n} byte(s) ({:?})",
+                String::from_utf8_lossy(&buf[..n])
+            )));
         }
-    });
+        Err(_) => {
+            return Err(PortRaced(format!(
+                "the first passthrough attempt never completed within 10s \
+                 (backend port {backend_port} was most likely taken by another \
+                 process and accepted the dial without replying)"
+            )));
+        }
+    }
 
-    let mut second = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", proxy_listen_port))
+    // ── Step 2: the breaker transition must be observable BEFORE the port is
+    // rebound, so the failed dial provably precedes the backend listener ──
+    if !wait_for_gateway_log(
+        dir.path(),
+        "Circuit breaker opening",
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        return Err(PortRaced(format!(
+            "the first connection ended but the gateway never reported the \
+             circuit breaker opening (backend port {backend_port} may have been \
+             accepted and closed by another process during the refusal window). \
+             Gateway log:\n{}",
+            gateway_logs(dir.path())
+        )));
+    }
+
+    // ── Step 3: install the backend listener now that the breaker is open ──
+    let backend_listener = match TcpListener::bind(format!("127.0.0.1:{backend_port}")).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            return Err(PortRaced(format!(
+                "backend port {backend_port} was taken by another process during \
+                 the refusal window: {e}"
+            )));
+        }
+    };
+    // ── Step 4: the second connection must be rejected before any dial ──
+    let mut second = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_listen_port}"))
         .await
         .expect("connect to passthrough proxy while breaker is open");
-    second.write_all(b"must not reach backend").await.ok();
-    let _ = tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await;
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        accepts.load(Ordering::Relaxed),
-        0,
-        "open passthrough circuit breaker must reject before backend dial"
+    second.write_all(second_marker.as_bytes()).await.ok();
+    let second_outcome = tokio::time::timeout(Duration::from_secs(10), second.read(&mut buf)).await;
+    assert!(
+        matches!(&second_outcome, Ok(Ok(0)) | Ok(Err(_))),
+        "with the breaker open the gateway must close the client connection \
+         immediately; instead the connection stayed open (outcome={second_outcome:?}), \
+         which means it was relayed to the backend. Gateway log:\n{}",
+        gateway_logs(dir.path())
     );
 
-    gateway.kill().ok();
-    gateway.wait().ok();
+    // Positive proof of the rejection. Without this, a gateway that dropped the
+    // connection for some unrelated reason (or never handled it at all) would
+    // leave the accept assertion below passing vacuously.
+    assert!(
+        wait_for_gateway_log(
+            dir.path(),
+            "TCP passthrough connection rejected: circuit breaker open",
+            Duration::from_secs(10),
+        )
+        .await,
+        "the gateway closed the second connection but never reported a \
+         circuit-breaker rejection, so the accept count below would prove \
+         nothing. Gateway log:\n{}",
+        gateway_logs(dir.path())
+    );
+
+    // ── Step 5: no backend dial happened ──
+    // A successful TCP connect is queued in this listener's kernel backlog
+    // even if this task has not yet been scheduled to call `accept()`. Awaiting
+    // the listener directly therefore closes the old false-green window where
+    // an atomically sampled counter could still be zero while the accept task
+    // had not run. The bounded quiet window is the negative assertion itself,
+    // not a scheduling sleep.
+    match tokio::time::timeout(Duration::from_secs(2), backend_listener.accept()).await {
+        Err(_) => {}
+        Ok(Err(e)) => panic!(
+            "backend listener on port {backend_port} failed while checking for \
+             a forbidden gateway dial: {e}"
+        ),
+        Ok(Ok((mut stream, peer))) => {
+            let mut probe = vec![0u8; 512];
+            let observed =
+                match tokio::time::timeout(Duration::from_secs(2), stream.read(&mut probe)).await {
+                    Ok(Ok(n)) => probe[..n].to_vec(),
+                    _ => Vec::new(),
+                };
+            let relayed = observed
+                .windows(second_marker.len())
+                .any(|window| window == second_marker.as_bytes());
+            assert!(
+                !relayed,
+                "open passthrough circuit breaker must reject before backend dial, but \
+                 the backend received this client's payload from {peer}. Gateway log:\n{}",
+                gateway_logs(dir.path())
+            );
+            return Err(PortRaced(format!(
+                "backend port {backend_port} received an unattributable connection \
+                 from {peer} that did not carry this attempt's marker: {:?}",
+                String::from_utf8_lossy(&observed)
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_tcp_passthrough_circuit_breaker_rejects_without_backend_dial() {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut races = Vec::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        match try_passthrough_circuit_breaker_scenario(attempt).await {
+            Ok(()) => return,
+            Err(PortRaced(reason)) => {
+                eprintln!("attempt {attempt}/{MAX_ATTEMPTS}: {reason}");
+                races.push(reason);
+            }
+        }
+    }
+    panic!(
+        "could not establish the passthrough circuit-breaker preconditions in \
+         {MAX_ATTEMPTS} attempts (the backend port was interfered with every \
+         time): {races:?}"
+    );
 }
 
 #[tokio::test]
