@@ -23017,10 +23017,11 @@ components:
               type: boolean
               default: false
               description: >
-                When true, compile each discovered tool outputSchema at catalog
-                construction and validate bounded tools/call results against that
-                schema before releasing the caller-visible response or publishing
-                audit metadata. structuredContent is preferred; a single JSON text
+                Aggregate-router only. When true, compile each discovered tool
+                outputSchema at catalog construction and validate bounded
+                tools/call results against that schema before releasing the
+                caller-visible response or publishing audit metadata.
+                structuredContent is preferred; a single JSON text
                 content block is accepted when structuredContent is absent; mixed
                 disagreeing variants fail closed. Tool execution errors (result.isError)
                 and upstream JSON-RPC errors are preserved. Event-stream and

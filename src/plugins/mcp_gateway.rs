@@ -658,6 +658,12 @@ impl McpGateway {
         let policy = parse_policy(object)?;
         let validation = parse_validation(object)?;
         let observability = parse_observability(object)?;
+        if mode == McpGatewayMode::TransparentProxy && validation.validate_tool_results {
+            return Err(
+                "mcp_gateway: 'validation.validate_tool_results' requires mode 'aggregate_router' because transparent_proxy has no mediated tool catalog"
+                    .to_string(),
+            );
+        }
         let servers = parse_servers(object, sessions.initialize_upstreams)?;
         if servers.is_empty() {
             return Err("mcp_gateway: 'servers' must not be empty".to_string());

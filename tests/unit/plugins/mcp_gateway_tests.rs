@@ -923,11 +923,24 @@ fn invalid_config_shapes_are_rejected() {
 
 #[test]
 fn validate_tool_results_config_is_accepted() {
-    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    let mut config = aggregate_config("http://127.0.0.1:9/mcp");
     config["validation"] = json!({ "validate_tool_results": true });
     assert!(
         create_plugin("mcp_gateway", &config).is_ok(),
-        "validation.validate_tool_results=true must be constructible"
+        "validation.validate_tool_results=true must be constructible in aggregate_router mode"
+    );
+}
+
+#[test]
+fn validate_tool_results_rejects_transparent_mode() {
+    let mut config = transparent_config("http://127.0.0.1:9/mcp");
+    config["validation"] = json!({ "validate_tool_results": true });
+    let error = create_plugin("mcp_gateway", &config)
+        .err()
+        .expect("transparent mode must reject inert tool-result validation");
+    assert!(
+        error.contains("validate_tool_results") && error.contains("aggregate_router"),
+        "error must identify the field and required mode: {error}"
     );
 }
 
