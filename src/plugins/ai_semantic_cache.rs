@@ -4925,8 +4925,7 @@ impl Plugin for AiSemanticCache {
         {
             match self.compute_embedding(&input).await {
                 Ok(embedding) => {
-                    if let Some((entry, similarity)) =
-                        self.lookup_semantic(&scope_key, &embedding)
+                    if let Some((entry, similarity)) = self.lookup_semantic(&scope_key, &embedding)
                     {
                         debug!(
                             similarity = similarity,

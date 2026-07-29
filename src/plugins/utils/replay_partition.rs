@@ -647,7 +647,10 @@ pub fn append_request_context_partition(
     // spellings the origin can distinguish stay distinguishable.
     let transformed_query = ctx.outbound_query_string();
     hasher.bool_value("req.query_transformed", transformed_query.is_some());
-    hasher.optional_text("req.query", transformed_query.or_else(|| ctx.raw_query_string()));
+    hasher.optional_text(
+        "req.query",
+        transformed_query.or_else(|| ctx.raw_query_string()),
+    );
 
     let mut names: Vec<&str> = request_headers
         .keys()

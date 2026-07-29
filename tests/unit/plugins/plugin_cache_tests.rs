@@ -3580,12 +3580,11 @@ fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body()
         vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
         vec![dedup(), late_headers],
     );
-    let late_headers_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(
-            &late_headers_config,
-            None,
-        )
-        .expect_err("deduplication must observe request-transformer header/query output");
+    let late_headers_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_headers_config,
+        None,
+    )
+    .expect_err("deduplication must observe request-transformer header/query output");
     assert!(
         late_headers_error.contains("fingerprint headers/query"),
         "{late_headers_error}"
@@ -3610,12 +3609,11 @@ fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body()
         vec![make_proxy("p1", "/api", vec!["dedup", "transform"])],
         vec![dedup(), late_query],
     );
-    let late_query_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(
-            &late_query_config,
-            None,
-        )
-        .expect_err("query-only mutation after deduplication must be rejected");
+    let late_query_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_query_config,
+        None,
+    )
+    .expect_err("query-only mutation after deduplication must be rejected");
     assert!(
         late_query_error.contains("fingerprint headers/query"),
         "{late_query_error}"
@@ -3659,12 +3657,11 @@ fn request_deduplication_rejects_unwitnessable_request_mutation_order_and_body()
             ),
         ],
     );
-    let late_headers_error =
-        validate_plugin_composition_candidate_with_real_ip_header_for_test(
-            &late_headers_config,
-            None,
-        )
-        .expect_err("a later built-in header mutation must be rejected");
+    let late_headers_error = validate_plugin_composition_candidate_with_real_ip_header_for_test(
+        &late_headers_config,
+        None,
+    )
+    .expect_err("a later built-in header mutation must be rejected");
     assert!(
         late_headers_error.contains("compression")
             && late_headers_error.contains("fingerprint headers/query"),
@@ -9903,11 +9900,7 @@ fn h3_grpc_web_view_retains_http_guardrails_and_adds_only_compatible_grpc_polici
     let cache = PluginCache::new(&config).expect("plugin cache");
     let view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
 
-    assert!(
-        view.plugins
-            .iter()
-            .any(|name| name == "response_caching")
-    );
+    assert!(view.plugins.iter().any(|name| name == "response_caching"));
     assert!(view.plugins.iter().any(|name| name == "grpc_web"));
     assert_eq!(
         view.plugins

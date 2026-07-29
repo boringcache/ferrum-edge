@@ -1502,8 +1502,7 @@ async fn exact_cache_key_differs_for_base64_audio_and_file_parts() {
         )
         .await;
 
-        let (_, result) =
-            run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+        let (_, result) = run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
         assert!(
             matches!(result, PluginResult::Continue),
             "{name} content must exact-miss instead of replaying cached response A"
@@ -1602,8 +1601,7 @@ async fn exact_cache_key_treats_text_type_without_string_text_as_non_text() {
     )
     .await;
 
-    let (ctx_b, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+    let (ctx_b, result) = run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "a \"text\"-typed part without a string `text` must be fingerprinted, so a differing non-string value is an exact MISS"
@@ -1634,8 +1632,7 @@ async fn semantic_cache_scope_differs_for_different_image_url() {
     )
     .await;
 
-    let (ctx_b, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+    let (ctx_b, result) = run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "semantic scope must include image fingerprint and miss different image_url"
@@ -1653,8 +1650,7 @@ async fn cache_does_not_store_raw_multimodal_url_in_metadata() {
 
     let url = "https://example.com/private-image.png?token=secret";
     let body = multimodal_image_url_body(url);
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
 
     for key in [
@@ -1701,8 +1697,7 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
     )
     .await;
 
-    let (ctx_b, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
+    let (ctx_b, result) = run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "multimodal fingerprint must prevent cross-replay even when consumer scoping is disabled"
@@ -1764,8 +1759,7 @@ async fn exact_only_multimodal_skips_semantic_embedding_call() {
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let body = multimodal_image_url_body("https://example.com/a.png");
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
@@ -1863,8 +1857,7 @@ async fn test_semantic_similarity_miss_below_threshold() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "orthogonal embeddings should miss when below semantic_similarity_threshold"
@@ -1932,8 +1925,7 @@ async fn test_semantic_similarity_respects_response_shaping_scope() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "semantic hit must not cross response-shaping parameters"
@@ -1969,8 +1961,7 @@ async fn test_semantic_similarity_respects_system_message_scope() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "semantic cache must not cross system/developer instruction scopes"
@@ -2006,8 +1997,7 @@ async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         hit,
         "Gemini embedding.values responses should support semantic hits"
@@ -2724,8 +2714,7 @@ async fn test_different_system_prompt_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `system` prompts must NOT collapse to the same cache key"
@@ -2757,8 +2746,7 @@ async fn test_different_system_array_form_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different array-form `system` prompts must NOT collapse to the same cache key"
@@ -2792,8 +2780,7 @@ async fn test_different_temperature_no_cache_hit_with_default_config() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `temperature` must NOT collapse with `include_params_in_key=true` default"
@@ -2897,9 +2884,7 @@ async fn test_numerically_equivalent_sampling_params_collapse() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None)
-            .await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None).await;
     assert!(
         hit,
         "numerically equivalent sampling params (1 vs 1.0, 0.5 vs 0.50) must hit the same entry"
@@ -3006,9 +2991,7 @@ async fn test_stream_true_vs_false_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None)
-            .await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None).await;
     assert!(
         !hit,
         "`stream:true` request MUST NOT receive the `stream:false` cached entry"
@@ -3041,8 +3024,7 @@ async fn test_different_tools_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `tools` definitions must NOT collapse to the same cache key"
@@ -3074,8 +3056,7 @@ async fn test_different_response_format_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `response_format` must NOT collapse to the same cache key"
@@ -3107,8 +3088,7 @@ async fn test_different_seed_no_cache_hit() {
     )
     .await;
 
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(!hit, "different `seed` must NOT collapse cache keys");
 }
 
@@ -3613,8 +3593,7 @@ async fn assert_exact_miss_for_variant(
         response_body,
     )
     .await;
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(!hit, "variant must miss the exact cache");
 }
 
@@ -4083,9 +4062,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         br#"{"city":"Paris"}"#,
     )
     .await;
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None)
-            .await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None).await;
     assert!(
         hit,
         "Responses family should semantic-hit within one instruction scope"
@@ -4171,8 +4148,7 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 
     for variant in variants {
         assert!(
-            !run_lookup_get_status(&plugin, &serde_json::to_string(&variant).unwrap(), None)
-                .await,
+            !run_lookup_get_status(&plugin, &serde_json::to_string(&variant).unwrap(), None).await,
             "semantic lookup must not cross message tool state or provider-native controls"
         );
     }
@@ -4203,9 +4179,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         br#""Paris""#,
     )
     .await;
-    assert!(
-        run_lookup_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None).await
-    );
+    assert!(run_lookup_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None).await);
     let cohere_isolated = json!({
         "model": "command-r",
         "preamble": "Be poetic.",
@@ -4262,9 +4236,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         br#""Paris""#,
     )
     .await;
-    assert!(
-        run_lookup_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await
-    );
+    assert!(run_lookup_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await);
     let tgi_isolated = json!({
         "inputs": "What city is France's capital?",
         "parameters": {"temperature": 1.0}
@@ -4293,9 +4265,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         br#""Paris""#,
     )
     .await;
-    assert!(
-        run_lookup_get_status(&plugin, &serde_json::to_string(&titan2).unwrap(), None).await
-    );
+    assert!(run_lookup_get_status(&plugin, &serde_json::to_string(&titan2).unwrap(), None).await);
     let titan_isolated = json!({
         "inputText": "What city is France's capital?",
         "textGenerationConfig": {"temperature": 1.0}
@@ -4386,8 +4356,7 @@ async fn complex_provider_native_inputs_build_semantic_keys_without_collisions()
         )
         .await;
         assert!(
-            run_lookup_get_status(&plugin, &serde_json::to_string(&lookup).unwrap(), None,)
-                .await,
+            run_lookup_get_status(&plugin, &serde_json::to_string(&lookup).unwrap(), None,).await,
             "same-family structured prompt variants should semantic-hit"
         );
     }
@@ -4492,8 +4461,7 @@ async fn distinct_families_do_not_exact_or_semantic_collide() {
     )
     .await;
 
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "Gemini body must not exact-hit a Messages-family entry"
@@ -4854,8 +4822,7 @@ async fn test_embedding_response_rejects_oversize_body() {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "oversize embedding body"}]
     });
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     assert!(
@@ -4888,8 +4855,7 @@ async fn test_embedding_response_rejects_oversize_dimension() {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "oversize embedding dimension"}]
     });
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     assert!(
@@ -4924,8 +4890,7 @@ async fn large_finite_embedding_components_normalize_without_zero_collapse() {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "large finite embedding components"}]
     });
-    let (ctx, result) =
-        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    let (ctx, result) = run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     let embedding = ai_semantic_cache_embedding(&ctx, instance_id(&plugin))
@@ -5076,9 +5041,7 @@ async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
         "temperature": 1.0,
         "messages": [{"role": "user", "content": "canonical params"}]
     });
-    let hit =
-        run_lookup_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None)
-            .await;
+    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None).await;
     assert!(
         hit,
         "canonical numeric sampling-parameter forms remain exact-key equivalent"
@@ -6221,8 +6184,7 @@ async fn exact_key_framing_defeats_role_content_delimiter_collisions() {
     )
     .await;
     assert!(
-        !run_lookup_get_status(&plugin, &serde_json::to_string(&genuine).unwrap(), None)
-            .await,
+        !run_lookup_get_status(&plugin, &serde_json::to_string(&genuine).unwrap(), None).await,
         "delimiter-bearing message content must not collide with a different conversation"
     );
 }
@@ -6270,7 +6232,6 @@ async fn semantic_cache_config_admits_anonymous_caller_scope_key() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Destination + request-context partition (GHSA-37gg-v9m4-8445)
 //
@@ -6307,7 +6268,8 @@ fn partition_ctx(
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
     for (name, value) in extra_headers {
-        ctx.headers.insert((*name).to_string(), (*value).to_string());
+        ctx.headers
+            .insert((*name).to_string(), (*value).to_string());
     }
     if let Some(query) = raw_query {
         ctx.set_raw_query_string(query.to_string());
@@ -6616,8 +6578,7 @@ async fn semantic_scope_key_isolates_namespace_query_and_header_dimensions() {
     config["scope_by_consumer"] = json!(false);
     let plugin = make_plugin(config);
 
-    let mut baseline =
-        partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    let mut baseline = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
     let baseline_scope = staged_scope_key(&plugin, &mut baseline)
         .await
         .expect("a semantic miss stages its scope key");

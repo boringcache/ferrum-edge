@@ -5590,10 +5590,8 @@ fn ctx_with_rewritten_credential(
     // The live, backend-visible view an earlier router already rewrote. Both
     // callers present the *same* bytes here — only the retained wire view can
     // still tell them apart.
-    ctx.headers.insert(
-        "authorization".to_string(),
-        provider_key.to_string(),
-    );
+    ctx.headers
+        .insert("authorization".to_string(), provider_key.to_string());
     ctx
 }
 

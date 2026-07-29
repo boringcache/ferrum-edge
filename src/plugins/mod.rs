@@ -3544,9 +3544,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
-            query_credential_partition_digests: self
-                .query_credential_partition_digests
-                .clone(),
+            query_credential_partition_digests: self.query_credential_partition_digests.clone(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
@@ -3747,11 +3745,7 @@ impl RequestContext {
     }
 
     /// Retain one credential-query digest outside public metadata.
-    pub(crate) fn mark_query_credential_partition_digest(
-        &mut self,
-        name: &str,
-        digest: [u8; 32],
-    ) {
+    pub(crate) fn mark_query_credential_partition_digest(&mut self, name: &str, digest: [u8; 32]) {
         if let Some((_, known_digest)) = self
             .query_credential_partition_digests
             .iter_mut()
