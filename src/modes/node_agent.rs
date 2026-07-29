@@ -6673,9 +6673,9 @@ fn initialize_backend_after_load(
     // first means an aborted startup leaves only inert routing behind.
     let ingress_redirect_enabled = config.capture_contract.ingress_redirect_enabled();
     if ingress_redirect_enabled {
-        if let Err(e) = install_ingress_redirect_routing(
-            config.capture_contract.ingress_capture_supports_ipv6,
-        ) {
+        if let Err(e) =
+            install_ingress_redirect_routing(config.capture_contract.ingress_capture_supports_ipv6)
+        {
             // The `ip` batch is not atomic: the v4 rule can be installed when
             // the v6 route fails. Remove exactly the Ferrum-owned rule/route on
             // this path too — an inert leftover priority/table entry still
@@ -7960,7 +7960,13 @@ mod tests {
             };
             handle_pod_added(backend, &pod_states, &config, &metrics, &event);
         };
-        let tracked = || pod_states.get("pod-uid-1").unwrap().inbound_redirect_ports.clone();
+        let tracked = || {
+            pod_states
+                .get("pod-uid-1")
+                .unwrap()
+                .inbound_redirect_ports
+                .clone()
+        };
 
         drive(&mut backend, vec![8080, 9090]);
         assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([8080, 9090]));
@@ -7970,7 +7976,10 @@ mod tests {
 
         // Expand.
         drive(&mut backend, vec![7000, 8080, 9090]);
-        assert_eq!(redirect_scope_v4(&backend, pod_ip), scope([7000, 8080, 9090]));
+        assert_eq!(
+            redirect_scope_v4(&backend, pod_ip),
+            scope([7000, 8080, 9090])
+        );
         assert!(backend.pod_ips[&pod_ip].inbound_redirect_enabled());
         assert_eq!(tracked(), vec![7000, 8080, 9090]);
 
@@ -8086,7 +8095,13 @@ mod tests {
             };
             handle_pod_added(backend, &pod_states, &config, &metrics, &event);
         };
-        let tracked = || pod_states.get("pod-uid-1").unwrap().inbound_redirect_ports.clone();
+        let tracked = || {
+            pod_states
+                .get("pod-uid-1")
+                .unwrap()
+                .inbound_redirect_ports
+                .clone()
+        };
         // Scope the pending-failure assertions to this pod's redirect operation
         // rather than the whole map: the failure registry is process-global.
         let retry_pending = || {
@@ -8158,8 +8173,7 @@ mod tests {
             "an IPv4-only capture listener must not install fatal IPv6 routing commands"
         );
         assert_eq!(
-            calls.removals,
-            1,
+            calls.removals, 1,
             "the partially installed Ferrum-owned rule/route must be removed"
         );
         assert!(
@@ -8194,7 +8208,10 @@ mod tests {
         let calls = ingress_redirect_routing_seam::take_calls();
         let entries = op_log.lock().unwrap().clone();
 
-        assert!(err.to_string().contains("startup validation failed"), "{err}");
+        assert!(
+            err.to_string().contains("startup validation failed"),
+            "{err}"
+        );
         assert_eq!(calls.installs, 1);
         assert_eq!(
             calls.install_supports_ipv6,
@@ -8202,8 +8219,7 @@ mod tests {
             "an IPv4-only capture listener must not install fatal IPv6 routing commands"
         );
         assert_eq!(
-            calls.removals,
-            1,
+            calls.removals, 1,
             "an unsuccessful startup must remove the routing it installed"
         );
         let install = entries
@@ -8222,7 +8238,10 @@ mod tests {
             .iter()
             .position(|op| op == "remove_ingress_redirect_routing")
             .expect("routing removed on the failure path");
-        assert!(install < attach, "routing installs before attach: {entries:?}");
+        assert!(
+            install < attach,
+            "routing installs before attach: {entries:?}"
+        );
         assert!(
             detach < remove,
             "classifier must detach before its routing is removed: {entries:?}"
