@@ -537,6 +537,8 @@ fn test_saml_malformed_pem_error_withholds_configured_source() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["urn:test:idp"],
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": [MALFORMED_INLINE_PEM],
             "allowed_signature_algorithms": ["rsa-sha256"]
         }
@@ -1264,7 +1266,7 @@ async fn test_username_token_credential_failures_are_indistinguishable() {
         let body = wrap_soap(&token);
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
-        let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
+        let result = run_soap_request_policy(plugin, &mut ctx, &mut headers).await;
         assert_username_token_invalid_credentials(&result, &["eve-candidate", "alice"]);
         outcomes.push((
             reject_status(&result),
@@ -1483,6 +1485,11 @@ fn test_saml_enabled_without_trusted_signing_certs_is_error() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["https://idp.example.com"],
+            // Both bindings are mandatory when SAML is enabled and are checked
+            // ahead of the trust material, so they must be present for this
+            // test to reach the arm it is about.
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": []
         }
     });
@@ -1509,6 +1516,8 @@ fn test_saml_unreadable_signing_cert_is_error() {
         "saml": {
             "enabled": true,
             "trusted_issuers": ["https://idp.example.com"],
+            "audience": "https://service.example.com",
+            "recipient": "https://service.example.com/ws",
             "trusted_signing_certs": ["/nonexistent/path/to/cert.pem"]
         }
     });
@@ -1730,6 +1739,13 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Subject with no / blank / duplicate NameID still carries a fully
         /// valid IdP signature. `""` removes the NameID entirely.
         pub name_id_fragment: Option<String>,
+        /// `SignedInfo/Reference/@URI`, applied **before** the SignedInfo is
+        /// canonicalized and signed. Rewriting it after signing would only ever
+        /// reach the signature arm: trust and `SignatureValue`-over-`SignedInfo`
+        /// are settled before the first Reference is resolved
+        /// (GHSA-9g4v-h9hm-846r), so a Reference-scoping test has to sign the
+        /// URI it wants judged. `None` targets the enclosing assertion.
+        pub reference_uri_override: Option<String>,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1755,6 +1771,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 corrupt_subject_after_signing: false,
                 corrupt_signature_value: false,
                 name_id_fragment: None,
+                reference_uri_override: None,
             }
         }
 
@@ -1867,6 +1884,10 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 
             // SignedInfo bytes — exactly these bytes are what
             // `<SignatureValue>` covers.
+            let reference_uri = self
+                .reference_uri_override
+                .as_deref()
+                .unwrap_or(self.assertion_id);
             let signed_info = format!(
                 "<ds:SignedInfo xmlns:ds=\"{}\">\
 <ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
@@ -1880,7 +1901,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 <ds:DigestValue>{}</ds:DigestValue>\
 </ds:Reference>\
 </ds:SignedInfo>",
-                DSIG_NS, self.assertion_id, digest_method_uri, digest_b64
+                DSIG_NS, reference_uri, digest_method_uri, digest_b64
             );
             let canonical_signed_info =
                 super::soap_exclusive_canonicalize_element_for_test(&signed_info, "SignedInfo", "")
@@ -2060,10 +2081,15 @@ async fn test_saml_missing_signature_rejects() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    // Assertion with no Signature element — i.e. exactly the spoofable XML
-    // the previous behaviour silently accepted.
-    let unsigned = r#"<Assertion ID="_a"><Issuer>https://idp.example.com/metadata</Issuer><Subject><NameID>alice</NameID></Subject></Assertion>"#;
-    let body = wrap_saml_assertion(unsigned);
+    // Assertion with no Signature element — i.e. exactly the spoofable XML the
+    // previous behaviour silently accepted. It must be namespace-qualified:
+    // assertion selection is namespace-correct, so a bare `<Assertion>` is not
+    // a SAML assertion at all and would be reported as an absent one.
+    let unsigned = format!(
+        r#"<saml:Assertion xmlns:saml="{ns}" ID="_a"><saml:Issuer>https://idp.example.com/metadata</saml:Issuer><saml:Subject><saml:NameID>alice</saml:NameID></saml:Subject></saml:Assertion>"#,
+        ns = saml_fixtures::SAML_NS,
+    );
+    let body = wrap_saml_assertion(&unsigned);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
@@ -2183,15 +2209,22 @@ async fn test_saml_expired_assertion_rejects() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    let nb = "2020-01-01T00:00:00Z";
-    let noa = "2020-01-02T00:00:00Z";
+    // The window must stay inside `saml.max_assertion_lifetime_seconds` (300 by
+    // default) or the lifetime cap — which is checked first, because it is what
+    // makes the fixed replay horizon sufficient — answers instead of the expiry
+    // arm this test is about. One hour in the past clears the 300s clock skew.
+    let expired_at = chrono::Utc::now() - chrono::Duration::seconds(3_600);
+    let nb = (expired_at - chrono::Duration::seconds(60))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let noa = expired_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-expired",
         "https://idp.example.com/metadata",
         "alice@example.com",
     );
-    builder.not_before = Some(nb.to_string());
-    builder.not_on_or_after = Some(noa.to_string());
+    builder.not_before = Some(nb);
+    builder.not_on_or_after = Some(noa);
     let assertion = builder.build();
 
     let body = wrap_saml_assertion(&assertion);
@@ -2200,7 +2233,7 @@ async fn test_saml_expired_assertion_rejects() {
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(
-        reject_body(&result).contains("expired"),
+        reject_body(&result).contains("has expired"),
         "expected SAML expired rejection, got: {}",
         reject_body(&result)
     );
@@ -2370,16 +2403,20 @@ async fn test_saml_signature_must_cover_enclosing_assertion() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
 
-    // Build a valid assertion, then surgically rewrite its Reference URI.
-    let assertion = saml_fixtures::AssertionBuilder::new(
+    // The mis-targeted URI is *signed in*, not patched over afterwards: the IdP
+    // signature and the assertion digest are both authentic, so the only thing
+    // left to refuse the message is the Reference-scoping rule itself. Patching
+    // the URI after signing would invalidate SignedInfo and be caught one arm
+    // earlier, proving nothing about scoping.
+    let mut builder = saml_fixtures::AssertionBuilder::new(
         "_assertion-real-id",
         "https://idp.example.com/metadata",
         "alice@example.com",
-    )
-    .build();
-    let tampered = assertion.replace("URI=\"#_assertion-real-id\"", "URI=\"#somewhere-else\"");
+    );
+    builder.reference_uri_override = Some("somewhere-else".to_string());
+    let assertion = builder.build();
 
-    let body = wrap_saml_assertion(&tampered);
+    let body = wrap_saml_assertion(&assertion);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
@@ -2481,11 +2518,17 @@ async fn test_saml_assertion_in_body_is_rejected() {
     )
     .build();
 
-    let body = wrap_saml_assertion(&valid).replace(
-        "<soap:Body>",
-        "<soap:Body><Assertion ID=\"body-assertion\"><Issuer>https://evil.example.com</Issuer>\
-         <Subject><NameID>mallory@example.com</NameID></Subject></Assertion>",
+    // The decoy must be a namespace-correct SAML Assertion: that is what a
+    // downstream consumer walking the Body would pick up, and it is what the
+    // envelope-wide single-assertion scan is defined over.
+    let decoy = format!(
+        "<saml:Assertion xmlns:saml=\"{ns}\" ID=\"body-assertion\">\
+         <saml:Issuer>https://evil.example.com</saml:Issuer>\
+         <saml:Subject><saml:NameID>mallory@example.com</saml:NameID></saml:Subject>\
+         </saml:Assertion>",
+        ns = saml_fixtures::SAML_NS,
     );
+    let body = wrap_saml_assertion(&valid).replace("<soap:Body>", &format!("<soap:Body>{decoy}"));
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
@@ -3292,6 +3335,46 @@ mod x509_roundtrip {
         cert: &TestRsaCert,
         timestamp_prefix: &str,
     ) -> String {
+        build_signed_soap_envelope_full(cert, timestamp_prefix, SIGNED_BODY_XML, |signed_info| {
+            signed_info
+        })
+    }
+
+    /// Same fixture, but the `SignedInfo` is rewritten **before** it is
+    /// canonicalized and signed, so the emitted envelope carries an authentic
+    /// `SignatureValue` over exactly the `SignedInfo` on the wire.
+    ///
+    /// Trust and `SignatureValue`-over-`SignedInfo` are now settled before the
+    /// first attacker-selected `<Reference>` is resolved
+    /// (GHSA-9g4v-h9hm-846r). A fixture that edits `SignedInfo` after signing
+    /// can therefore only ever reach the signature arm; anything that must be
+    /// judged by a per-`Reference` rule has to be signed in.
+    fn build_signed_soap_envelope_with_signed_info(
+        cert: &TestRsaCert,
+        rewrite_signed_info: impl FnOnce(String) -> String,
+    ) -> String {
+        build_signed_soap_envelope_full(cert, "wsu", SIGNED_BODY_XML, rewrite_signed_info)
+    }
+
+    /// Same fixture with a caller-supplied signed Body.
+    ///
+    /// X.509 success now requires a Reference resolving uniquely to the
+    /// backend-visible Body (GHSA-3mwq-c8j6-9xhp), so a fixture that edits the
+    /// Body after signing is a digest mismatch by construction. A Body variant
+    /// that is meant to be *accepted* must be digested in.
+    fn build_signed_soap_envelope_with_signed_body(
+        cert: &TestRsaCert,
+        signed_body_xml: &str,
+    ) -> String {
+        build_signed_soap_envelope_full(cert, "wsu", signed_body_xml, |signed_info| signed_info)
+    }
+
+    fn build_signed_soap_envelope_full(
+        cert: &TestRsaCert,
+        timestamp_prefix: &str,
+        signed_body_xml: &str,
+        rewrite_signed_info: impl FnOnce(String) -> String,
+    ) -> String {
         let now = chrono::Utc::now();
         let created = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let expires = (now + chrono::Duration::minutes(5))
@@ -3326,7 +3409,7 @@ mod x509_roundtrip {
         let body_context = format!(
             r#"<root xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:wsu="{wsu}">{body}</root>"#,
             wsu = WSU_NAMESPACE_URI_FOR_TESTS,
-            body = SIGNED_BODY_XML,
+            body = signed_body_xml,
         );
         let canonical_body =
             soap_exclusive_canonicalize_element_for_test(&body_context, "Body", "soap")
@@ -3338,6 +3421,7 @@ mod x509_roundtrip {
             r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference><Reference URI="#Body-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
             ts_digest_b64, body_digest_b64
         );
+        let signed_info = rewrite_signed_info(signed_info);
         let signed_info_context = format!(
             r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">{signed_info}</Signature>"#,
         );
@@ -3380,7 +3464,7 @@ mod x509_roundtrip {
   </soap:Header>
   {signed_body}
 </soap:Envelope>"#,
-            signed_body = SIGNED_BODY_XML,
+            signed_body = signed_body_xml,
             timestamp = timestamp_xml,
             timestamp_prefix = timestamp_prefix,
             cert_b64 = cert.cert_der_b64,
@@ -3597,10 +3681,16 @@ mod x509_roundtrip {
         let cert = mint_rsa_cert();
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
-        let body = build_signed_soap_envelope(&cert).replace(
-            "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
-            "<Transform Algorithm=\"urn:unsupported:transform\">",
-        );
+        // The Transform is inside SignedInfo, and SignedInfo is authenticated
+        // before any Reference is resolved, so the unsupported algorithm has to
+        // be signed in — otherwise this only ever proves the signature check
+        // works.
+        let body = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            signed_info.replace(
+                "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
+                "<Transform Algorithm=\"urn:unsupported:transform\">",
+            )
+        });
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
@@ -3807,6 +3897,14 @@ mod x509_roundtrip {
         config["x509_signature"]["require_signed_timestamp"] = json!(false);
         let plugin = SoapWsSecurity::new(&config).unwrap();
 
+        // Two `wsse:Security` header blocks: the signed one is addressed to
+        // another intermediary (`soap:actor`), so it is not this receiver's to
+        // enforce and must not satisfy verification. The one this gateway
+        // selects — the unaddressed block — carries no Signature.
+        //
+        // The signed block stays a direct child of `soap:Header`. Parking it
+        // outside the Header (as a sibling of it, say) is refused structurally
+        // before selection ever runs, which would prove nothing about scoping.
         let valid = build_signed_soap_envelope(&cert);
         let security_start = valid.find("<wsse:Security").expect("Security start");
         let security_end = valid[security_start..]
@@ -3824,10 +3922,17 @@ mod x509_roundtrip {
         let mut unsigned_security = signed_security.to_string();
         unsigned_security.replace_range(signature_start..signature_end, "");
         unsigned_security = unsigned_security.replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS-actual\"");
+
+        // SOAP 1.1 addresses a header block with `soap:actor`.
+        let other_actor_security = signed_security.replacen(
+            "<wsse:Security",
+            "<wsse:Security soap:actor=\"urn:example:other-intermediary\"",
+            1,
+        );
         let header_unsigned = valid.replacen(signed_security, &unsigned_security, 1);
         let body = header_unsigned.replacen(
             "<soap:Header>",
-            &format!("{}<soap:Header>", signed_security),
+            &format!("<soap:Header>{other_actor_security}"),
             1,
         );
         let mut ctx = make_ctx_with_soap_body(&body);
@@ -3838,7 +3943,7 @@ mod x509_roundtrip {
         assert!(is_reject(&result));
         assert!(
             reject_body(&result).contains("missing Signature"),
-            "pre-header signed Security must not satisfy header verification: {}",
+            "a Security block addressed elsewhere must not satisfy header verification: {}",
             reject_body(&result)
         );
     }
@@ -3891,14 +3996,22 @@ mod x509_roundtrip {
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
 
-        let valid = build_signed_soap_envelope(&cert);
-        let with_business_attr = valid.replace(
+        // The attribute lives in the signed, backend-visible Body, so it has to
+        // be digested in: X.509 success now requires a Reference resolving to
+        // that Body, and adding the attribute afterwards would simply be a
+        // digest mismatch rather than a test of the uniqueness count.
+        let signed_body = SIGNED_BODY_XML.replace(
             "<GetPrice xmlns=\"http://example.com/prices\">",
             "<GetPrice xmlns=\"http://example.com/prices\" CorrelationId=\"TS-1\">",
         );
         assert_ne!(
-            valid, with_business_attr,
-            "business attribute injection must modify the envelope"
+            SIGNED_BODY_XML, signed_body,
+            "business attribute injection must modify the signed Body"
+        );
+        let with_business_attr = build_signed_soap_envelope_with_signed_body(&cert, &signed_body);
+        assert!(
+            with_business_attr.contains("CorrelationId=\"TS-1\""),
+            "the emitted envelope must carry the business attribute"
         );
 
         let mut ctx = make_ctx_with_soap_body(&with_business_attr);
@@ -3963,17 +4076,24 @@ mod x509_roundtrip {
         // must reject. We can't tamper with the Timestamp text itself here
         // because `validate_timestamp` runs first in the pipeline and would
         // fail on the parse before signature checks even run.
-        let original = build_signed_soap_envelope(&cert);
-        let dv_open = original
-            .find("<DigestValue>")
-            .expect("envelope must have <DigestValue>")
-            + "<DigestValue>".len();
-        let first_char = original.as_bytes()[dv_open];
-        let replacement = if first_char == b'A' { 'B' } else { 'A' };
-        let mut body = String::with_capacity(original.len());
-        body.push_str(&original[..dv_open]);
-        body.push(replacement);
-        body.push_str(&original[dv_open + 1..]);
+        //
+        // The flip is applied before signing. DigestValue lives inside
+        // SignedInfo, which is authenticated before any Reference is resolved,
+        // so flipping it on the wire would be caught as a signature failure and
+        // the digest arm would never run.
+        let body = build_signed_soap_envelope_with_signed_info(&cert, |signed_info| {
+            let dv_open = signed_info
+                .find("<DigestValue>")
+                .expect("SignedInfo must have <DigestValue>")
+                + "<DigestValue>".len();
+            let first_char = signed_info.as_bytes()[dv_open];
+            let replacement = if first_char == b'A' { 'B' } else { 'A' };
+            let mut tampered = String::with_capacity(signed_info.len());
+            tampered.push_str(&signed_info[..dv_open]);
+            tampered.push(replacement);
+            tampered.push_str(&signed_info[dv_open + 1..]);
+            tampered
+        });
 
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
@@ -5523,7 +5643,7 @@ fn offset_created(offset: chrono::Duration) -> String {
 async fn digest_outcome(plugin: &SoapWsSecurity, security_block: &str) -> PluginResult {
     let mut ctx = make_ctx_with_soap_body(&wrap_soap(security_block));
     let mut headers = soap_headers();
-    run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+    run_soap_request_policy(plugin, &mut ctx, &mut headers).await
 }
 
 #[tokio::test]
@@ -7137,7 +7257,6 @@ mod advisory_regressions {
 // describes — so every one of them fails closed here.
 
 mod mtom_strict_framing {
-    use super::*;
     use ferrum_edge::_test_support::soap_extract_mtom_root_part_for_test as extract;
 
     const BOUNDARY: &str = "MIME_boundary";

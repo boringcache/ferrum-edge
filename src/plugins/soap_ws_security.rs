@@ -512,18 +512,44 @@ const SAML_REPLAY_DETECTED_MESSAGE: &str = "WS-Security: SAML assertion has alre
 /// nonces are attacker-chosen strings and SAML claim keys are SHA-256 hex, so
 /// namespacing them keeps a chosen nonce from ever burning an assertion claim
 /// (or the reverse).
+const NONCE_PROCESS_CLAIM_PREFIX: &str = "n|";
+const SAML_PROCESS_CLAIM_PREFIX: &str = "s|";
+
+/// Byte width of a process claim-kind prefix. Both prefixes are the same width,
+/// asserted at compile time, so retained-byte accounting can charge exactly the
+/// claim payload without carrying the prefix kind alongside every key.
+const PROCESS_CLAIM_PREFIX_BYTES: usize = NONCE_PROCESS_CLAIM_PREFIX.len();
+const _: () = assert!(SAML_PROCESS_CLAIM_PREFIX.len() == PROCESS_CLAIM_PREFIX_BYTES);
+
 fn nonce_process_claim_key(nonce: &str) -> String {
-    let mut key = String::with_capacity(nonce.len() + 2);
-    key.push_str("n|");
+    let mut key = String::with_capacity(nonce.len() + PROCESS_CLAIM_PREFIX_BYTES);
+    key.push_str(NONCE_PROCESS_CLAIM_PREFIX);
     key.push_str(nonce);
     key
 }
 
 fn saml_process_claim_key(claim_digest: &str) -> String {
-    let mut key = String::with_capacity(claim_digest.len() + 2);
-    key.push_str("s|");
+    let mut key = String::with_capacity(claim_digest.len() + PROCESS_CLAIM_PREFIX_BYTES);
+    key.push_str(SAML_PROCESS_CLAIM_PREFIX);
     key.push_str(claim_digest);
     key
+}
+
+/// Bytes one retained claim key charges against `nonce.max_total_cache_bytes`.
+///
+/// The claim-kind prefix is gateway-internal namespacing and is deliberately
+/// **not** charged. `max_total_cache_bytes` is documented as the retained nonce
+/// payload; `max_encoded_length` may legitimately equal it (both admit 4096),
+/// and charging the prefix would make a maximum-length nonce permanently
+/// unadmissible even against a completely empty cache — a saturation answer to
+/// a request that carries no replay at all, and a violation of the
+/// `max_encoded_length <= max_total_cache_bytes` invariant
+/// [`SoapWsSecurity::reclaim_expired_nonce_room_locked`] relies on to tell
+/// genuine saturation from impossible index drift. Map/tree node and `Arc`
+/// control-block overhead is likewise uncharged, so this stays consistent with
+/// what the cap has always measured.
+fn charged_claim_key_bytes(claim_key: &str) -> usize {
+    claim_key.len().saturating_sub(PROCESS_CLAIM_PREFIX_BYTES)
 }
 
 /// WS-Security UsernameToken Profile nonces are short random values (16–32 raw
@@ -955,8 +981,10 @@ struct NonceEntry {
 /// `cache` provides expected O(1) same-nonce decisions. `age_index` provides
 /// O(log n) expiration and exact-oldest selection without a full-cache scan.
 /// Both containers hold `Arc` handles to the same immutable nonce allocation;
-/// `retained_key_bytes` counts that allocation's UTF-8 payload exactly once
-/// per logical entry (not map/tree node or `Arc` control-block overhead).
+/// `retained_key_bytes` counts that allocation's UTF-8 payload exactly once per
+/// logical entry via [`charged_claim_key_bytes`] — the claim payload only, never
+/// the internal claim-kind prefix, and never map/tree node or `Arc`
+/// control-block overhead.
 ///
 /// Entry count, age order, and retained key bytes are updated under one mutex
 /// so concurrent admissions cannot overshoot either documented hard cap.
@@ -1018,7 +1046,7 @@ impl NonceReplayState {
             if !self.age_entry_matches(age_key, nonce) {
                 return false;
             }
-            let Some(total) = retained_key_bytes.checked_add(nonce.len()) else {
+            let Some(total) = retained_key_bytes.checked_add(charged_claim_key_bytes(nonce)) else {
                 return false;
             };
             retained_key_bytes = total;
@@ -1045,7 +1073,10 @@ impl NonceReplayState {
         if !self.age_entry_matches(age_key, nonce) {
             return Err(());
         }
-        let Some(retained_key_bytes) = self.retained_key_bytes.checked_sub(nonce.len()) else {
+        let Some(retained_key_bytes) = self
+            .retained_key_bytes
+            .checked_sub(charged_claim_key_bytes(nonce))
+        else {
             return Err(());
         };
 
@@ -2828,7 +2859,7 @@ impl SoapWsSecurity {
             return Ok(());
         }
 
-        let incoming_bytes = nonce.len();
+        let incoming_bytes = charged_claim_key_bytes(nonce);
         if !state.has_capacity(
             incoming_bytes,
             self.max_nonce_cache_size,
@@ -2956,7 +2987,7 @@ impl SoapWsSecurity {
         let recomputed_key_bytes = state
             .cache
             .keys()
-            .try_fold(0usize, |total, nonce| total.checked_add(nonce.len()));
+            .try_fold(0usize, |total, nonce| total.checked_add(charged_claim_key_bytes(nonce)));
         let Some(recomputed_key_bytes) = recomputed_key_bytes else {
             return Err(
                 "soap_ws_security: nonce replay observation accounting overflow".to_string(),
@@ -3333,11 +3364,22 @@ impl SoapWsSecurity {
                 .decode(expected_b64.replace(char::is_whitespace, "").as_bytes())
                 .map_err(|e| format!("WS-Security: invalid DigestValue base64: {}", e))?;
 
-            // XML Signature Wrapping defense: a signed reference must resolve
-            // to exactly ONE element in the whole envelope, under both the
-            // entity-decoded DOM view and a raw start-tag scan that recognizes
-            // the broader id spellings a tolerant backend might resolve.
-            if raw_occurrences[index] != 1 {
+            // XML Signature Wrapping defense: a signed reference must resolve to
+            // exactly ONE element in the whole envelope. `resolve_unique` below
+            // is what enforces "exactly one" — it reads the entity-decoded DOM,
+            // so it sees the same value a backend's parser sees. The raw
+            // start-tag scan is the defence-in-depth *over-count* on top of it:
+            // it recognizes broader id spellings a tolerant backend might
+            // resolve but the DOM index does not index.
+            //
+            // It must stay an over-count check. A raw byte scan cannot see
+            // through character references, so `wsu:Id="TS&#x2D;1"` — one
+            // legitimate element whose decoded id is exactly `TS-1` — scans as
+            // zero raw occurrences. Requiring exactly one here would reject that
+            // message while adding nothing: any decoded duplicate is already
+            // caught by `resolve_unique`, and any raw duplicate under a spelling
+            // the DOM misses is caught by `> 1`.
+            if raw_occurrences[index] > 1 {
                 return Err(format!(
                     "WS-Security: referenced id is not unique in the envelope ({} raw \
                      occurrences) — possible XML signature wrapping",
@@ -5939,6 +5981,11 @@ where
 /// skipped as non-element spans. Unlike the narrower extraction helpers, this
 /// full-envelope scan treats malformed start tags as errors rather than
 /// returning a partial count.
+///
+/// Single-id convenience wrapper over [`count_raw_id_occurrences`], reached only
+/// through `lib::_test_support`; the request path scans the whole `SignedInfo` in
+/// one pass. The binary target compiles this module without that facade.
+#[allow(dead_code)]
 pub(crate) fn count_wsu_id_occurrences(xml: &str, id: &str) -> Result<usize, String> {
     Ok(count_raw_id_occurrences(xml, &[id])?[0])
 }
