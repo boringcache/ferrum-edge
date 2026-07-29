@@ -14,6 +14,7 @@ use ferrum_edge::_test_support::{
     response_caching_size_accounting_snapshot_for_test,
     response_caching_staging_metadata_key_for_test, response_caching_vary_index_snapshot_for_test,
     run_after_proxy_hooks_for_test, run_after_proxy_hooks_reject_for_test,
+    set_replay_credential_headers_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -5634,6 +5635,86 @@ async fn replay_partition_survives_an_earlier_credential_rewrite() {
         lookup_is_hit(&plugin, &mut same).await,
         "the same original caller must still hit"
     );
+}
+
+fn ctx_with_stripped_custom_credential(token: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/custom-auth".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx.authenticated_identity = Some("alice@example.com".to_string());
+    set_replay_credential_headers_for_test(&mut ctx, vec!["x-tenant-jwt".to_string()]);
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        "x-tenant-jwt",
+        http::HeaderValue::from_str(token).expect("custom credential"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx
+}
+
+/// A configured credential header is part of the authorization context even
+/// when it is not one of the conservative built-in names and auth stripped it
+/// from the live backend view.
+#[tokio::test]
+async fn replay_partition_binds_stripped_custom_credential_headers() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut narrow = ctx_with_stripped_custom_credential("scope-read-only");
+    seed_public_entry(&plugin, &mut narrow, b"read-only-view").await;
+
+    let mut broad = ctx_with_stripped_custom_credential("scope-read-write-admin");
+    assert!(
+        !lookup_is_hit(&plugin, &mut broad).await,
+        "custom credential locations must not collapse onto one resolved subject"
+    );
+
+    let mut same = ctx_with_stripped_custom_credential("scope-read-only");
+    assert!(lookup_is_hit(&plugin, &mut same).await);
+}
+
+fn ctx_with_query_credential(token: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/query-auth".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    ctx.authenticated_identity = Some("alice@example.com".to_string());
+    ctx.set_raw_query_string(format!("access_token={token}"));
+    ctx.materialize_query_params();
+    let auth = ferrum_edge::plugins::jwt_auth::JwtAuth::new(
+        &json!({ "token_lookup": "query:access_token" }),
+    )
+    .expect("query JWT config");
+    auth.mark_query_credentials_for_redaction(&mut ctx);
+    ctx
+}
+
+/// Query exclusion is an origin-cache policy, not permission to erase an
+/// authentication credential from the mandatory caller partition.
+#[tokio::test]
+async fn replay_partition_binds_query_credentials_when_cache_key_excludes_query() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cache_key_include_query": false
+    }));
+
+    let mut narrow = ctx_with_query_credential("scope-read-only");
+    seed_public_entry(&plugin, &mut narrow, b"read-only-view").await;
+
+    let mut broad = ctx_with_query_credential("scope-read-write-admin");
+    assert!(
+        !lookup_is_hit(&plugin, &mut broad).await,
+        "excluding ordinary query state must not exclude a query credential"
+    );
+
+    let mut same = ctx_with_query_credential("scope-read-only");
+    assert!(lookup_is_hit(&plugin, &mut same).await);
 }
 
 /// The backend receives Ferrum's regenerated forwarding identity for

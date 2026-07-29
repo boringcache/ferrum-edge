@@ -9,14 +9,16 @@
 //! * **Caller authorization** — not a display subject. Two credentials can carry
 //!   the same `sub` with different scopes, audiences, or tenancy claims, so the
 //!   partition binds a digest of the actual credential material presented on
-//!   this request together with the mechanism that accepted it. *Both* credential
-//!   views are bound, under distinct provenance labels: the pristine inbound wire
-//!   view (`RequestContext`'s retained raw `HeaderMap`) and the live,
-//!   backend-visible view the calling plugin was handed. An earlier plugin that
-//!   rewrites credentials — `ai_stream_router` strips the client credential and
-//!   injects the provider's — therefore cannot erase the original caller
-//!   distinction, and cannot demote an authenticated caller to *anonymous* by
-//!   consuming the only credential header it presented.
+//!   this request together with the mechanism that accepted it. *Both* header
+//!   views are bound, under distinct provenance labels: the pristine inbound
+//!   wire view (`RequestContext`'s retained raw `HeaderMap`) and the live,
+//!   backend-visible view the calling plugin was handed. Configured custom auth
+//!   headers join the conservative built-in set, and credential-bearing query
+//!   parameters are privately digested before authentication stripping. An
+//!   earlier plugin that rewrites credentials — `ai_stream_router` strips the
+//!   client credential and injects the provider's — therefore cannot erase the
+//!   original caller distinction, and cannot demote an authenticated caller to
+//!   *anonymous* by consuming the only credential it presented.
 //! * **Canonical caller context** — every caller is bound to the
 //!   gateway-resolved peer address, because Ferrum regenerates
 //!   `X-Forwarded-For` on every outbound HTTP request and the origin therefore
@@ -72,6 +74,16 @@ pub fn is_credential_context_header(name: &str) -> bool {
     CREDENTIAL_CONTEXT_HEADERS
         .iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Whether `name` is a conservative built-in credential header or a custom
+/// credential location precomputed for this request's plugin chain.
+pub fn is_request_credential_context_header(ctx: &RequestContext, name: &str) -> bool {
+    is_credential_context_header(name)
+        || ctx
+            .request_headers_requiring_redaction()
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 /// Headers that are never visible to the backend as sent by the client, and so
@@ -329,21 +341,56 @@ fn append_canonical_address(
 fn append_original_credential_context(hasher: &mut PartitionHasher, ctx: &RequestContext) -> bool {
     let available = ctx.has_raw_headers();
     hasher.bool_value("caller.origin_view", available);
-    if !available {
-        return false;
-    }
     let mut present = false;
-    hasher.count("caller.origin_names", CREDENTIAL_CONTEXT_HEADERS.len());
-    for candidate in CREDENTIAL_CONTEXT_HEADERS {
-        hasher.text("caller.origin_credential_name", candidate);
+    if available {
+        let custom_count = ctx
+            .request_headers_requiring_redaction()
+            .iter()
+            .filter(|candidate| !is_credential_context_header(candidate))
+            .count();
         hasher.count(
-            "caller.origin_credential_lines",
-            ctx.raw_header_value_bytes(candidate).count(),
+            "caller.origin_names",
+            CREDENTIAL_CONTEXT_HEADERS.len() + custom_count,
         );
-        for line in ctx.raw_header_value_bytes(candidate) {
-            present = true;
-            hasher.nested("caller.origin_credential_digest", &bytes_digest(line));
+        for candidate in CREDENTIAL_CONTEXT_HEADERS {
+            hasher.text("caller.origin_credential_name", candidate);
+            hasher.count(
+                "caller.origin_credential_lines",
+                ctx.raw_header_value_bytes(candidate).count(),
+            );
+            for line in ctx.raw_header_value_bytes(candidate) {
+                present = true;
+                hasher.nested("caller.origin_credential_digest", &bytes_digest(line));
+            }
         }
+        for candidate in ctx
+            .request_headers_requiring_redaction()
+            .iter()
+            .filter(|candidate| !is_credential_context_header(candidate))
+        {
+            hasher.text("caller.origin_credential_name", candidate);
+            hasher.count(
+                "caller.origin_credential_lines",
+                ctx.raw_header_value_bytes(candidate).count(),
+            );
+            for line in ctx.raw_header_value_bytes(candidate) {
+                present = true;
+                hasher.nested("caller.origin_credential_digest", &bytes_digest(line));
+            }
+        }
+    }
+
+    // Query credentials are captured before authentication and transformer
+    // stripping in a private RequestContext field. Their raw values never enter
+    // public metadata or the key preimage; only these one-way digests do.
+    hasher.count(
+        "caller.origin_query_credentials",
+        ctx.query_credential_partition_digests().len(),
+    );
+    for (name, digest) in ctx.query_credential_partition_digests() {
+        hasher.text("caller.origin_query_credential_name", name);
+        hasher.nested("caller.origin_query_credential_digest", digest);
+        present = true;
     }
     present
 }
@@ -352,7 +399,7 @@ fn append_original_credential_context(hasher: &mut PartitionHasher, ctx: &Reques
 ///
 /// Authenticated callers are bound to a *context* fingerprint — mechanism,
 /// resolved identity, consumer, peer SPIFFE identity, and a digest of every
-/// credential header actually presented — rather than to a display subject, so
+/// credential actually presented — rather than to a display subject, so
 /// two tokens with the same `sub` and different scopes never share a retained
 /// result.
 ///
@@ -368,10 +415,10 @@ fn append_original_credential_context(hasher: &mut PartitionHasher, ctx: &Reques
 /// plugins run — collapse two distinct client tokens onto one partition.
 ///
 /// A caller counts as **authenticated** when it resolved a gateway identity or
-/// peer SPIFFE identity, *or* when a candidate credential header is present in
-/// either view — live or pristine. Reading only the live view would misclassify
-/// a caller whose credential an earlier plugin consumed as anonymous, and an
-/// anonymous classification is what unlocks the
+/// peer SPIFFE identity, *or* when a candidate credential header/query value is
+/// present in either retained view. Reading only the live header view would
+/// misclassify a caller whose credential an earlier plugin consumed as
+/// anonymous, and an anonymous classification is what unlocks the
 /// [`AnonymousCallerScope::Shared`] opt-out.
 ///
 /// Every caller, authenticated or not, additionally binds its canonical peer
@@ -391,42 +438,45 @@ pub fn append_caller_partition(
     anonymous_scope: AnonymousCallerScope,
 ) -> Result<(), PartitionRefusal> {
     // Credential material present on this request, canonicalized to a lowercase
-    // name and reduced to a digest. `Vec` with a small capacity rather than a
-    // map: the candidate set is a fixed 11 names and most requests carry none.
+    // name and reduced to a digest. The candidates combine the conservative
+    // built-in set with custom locations precomputed by the plugin cache.
     //
     // Hot path: one hash lookup per candidate. Protocol header maps are already
     // lowercase, so the case-insensitive sweep below is gated on a name
     // actually carrying an uppercase byte (only plugin-synthesised keys do) and
     // never scans the map for an ordinary request.
-    let mut credentials: Vec<(&'static str, [u8; 32])> = Vec::new();
+    let has_uppercase_name = request_headers
+        .keys()
+        .any(|name| name.bytes().any(|byte| byte.is_ascii_uppercase()));
+    let lookup = |candidate: &str| {
+        request_headers.get(candidate).or_else(|| {
+            has_uppercase_name
+                .then(|| {
+                    request_headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(candidate))
+                        .map(|(_, value)| value)
+                })
+                .flatten()
+        })
+    };
+
+    let mut credentials: Vec<(&str, [u8; 32])> = Vec::new();
     for candidate in CREDENTIAL_CONTEXT_HEADERS {
-        if let Some(value) = request_headers.get(*candidate) {
+        if let Some(value) = lookup(candidate) {
             credentials.push((*candidate, value_digest(value)));
         }
     }
-    if request_headers
-        .keys()
-        .any(|name| name.bytes().any(|byte| byte.is_ascii_uppercase()))
+    for candidate in ctx
+        .request_headers_requiring_redaction()
+        .iter()
+        .filter(|candidate| !is_credential_context_header(candidate))
     {
-        for (name, value) in request_headers {
-            if !name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-                continue;
-            }
-            let Some(canonical) = CREDENTIAL_CONTEXT_HEADERS
-                .iter()
-                .copied()
-                .find(|candidate| name.eq_ignore_ascii_case(candidate))
-            else {
-                continue;
-            };
-            if !credentials.iter().any(|(known, _)| *known == canonical) {
-                credentials.push((canonical, value_digest(value)));
-            }
+        if let Some(value) = lookup(candidate) {
+            credentials.push((candidate.as_str(), value_digest(value)));
         }
-        // `CREDENTIAL_CONTEXT_HEADERS` is sorted, so the loop above is the only
-        // thing that can disturb order. Restore it so the digest is stable.
-        credentials.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
     }
+    credentials.sort_by(|left, right| left.0.cmp(right.0).then(left.1.cmp(&right.1)));
 
     // Bind the pristine inbound view first, because whether it carried a
     // credential is an input to the authenticated/anonymous classification
@@ -561,7 +611,7 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
 ///
 /// * headers are sorted by name so map iteration order cannot change the digest,
 ///   and the pair count is bound ahead of the pairs;
-/// * a header classified by [`is_credential_context_header`] contributes a
+/// * a header classified by [`is_request_credential_context_header`] contributes a
 ///   SHA-256 digest of its value, never the value — no secret enters the digest
 ///   preimage in cleartext, a key, metadata, a log line, or a diagnostic;
 /// * only [`is_non_backend_visible_request_header`] names are excluded — the
@@ -610,7 +660,7 @@ pub fn append_request_context_partition(
         hasher.text("req.header_name", name);
         // `names` came from this map's keys, so the lookup always resolves.
         let value = request_headers.get(name).map(String::as_str).unwrap_or("");
-        if is_credential_context_header(name) {
+        if is_request_credential_context_header(ctx, name) {
             hasher.bool_value("req.header_is_credential", true);
             hasher.nested("req.header_digest", &value_digest(value));
         } else {

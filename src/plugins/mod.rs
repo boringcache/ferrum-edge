@@ -2021,6 +2021,13 @@ pub struct RequestContext {
     /// diagnostics and policy calls. Kept outside public metadata so plugin
     /// configuration details do not enter transaction logs.
     request_headers_to_redact: Option<Arc<Vec<String>>>,
+    /// Digests of credential-bearing query parameters that were present before
+    /// authentication and request transformation. Kept outside public metadata
+    /// so neither reusable credentials nor correlatable digests enter logs.
+    /// The shared replay partition carries this private snapshot because an
+    /// authentication strip may remove the parameter before a retained-result
+    /// plugin builds its key.
+    query_credential_partition_digests: Vec<(String, [u8; 32])>,
     /// Buffered response policy provenance, present only while the ordered
     /// `after_proxy` chain is processing a merged gRPC header+trailer view.
     /// Shared through `Arc` so the rare hook-preflight context clone remains
@@ -2655,6 +2662,7 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: None,
+            query_credential_partition_digests: Vec::new(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: HttpFlavor::Plain,
@@ -3488,6 +3496,9 @@ impl RequestContext {
             pending_claim_headers: HashMap::new(),
             sanitized_claim_header_destinations: HashSet::new(),
             request_headers_to_redact: self.request_headers_to_redact.clone(),
+            query_credential_partition_digests: self
+                .query_credential_partition_digests
+                .clone(),
             buffered_initial_response_header_policy_state: None,
             buffered_deadline_response_header_provenance: None,
             request_http_flavor: self.request_http_flavor,
@@ -3670,6 +3681,43 @@ impl RequestContext {
         if !headers.is_empty() {
             self.request_headers_to_redact = Some(headers);
         }
+    }
+
+    /// Header names configured as reusable credential locations for this route.
+    ///
+    /// The list is built once with the plugin cache and is already
+    /// case-insensitively deduplicated. Replay partitioning uses it in addition
+    /// to the conservative built-in credential-name set so custom JWT/JWKS,
+    /// OAuth, and API-key headers cannot disappear from the authorization
+    /// context after an authentication plugin strips them.
+    pub(crate) fn request_headers_requiring_redaction(&self) -> &[String] {
+        self.request_headers_to_redact
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Retain one credential-query digest outside public metadata.
+    pub(crate) fn mark_query_credential_partition_digest(
+        &mut self,
+        name: &str,
+        digest: [u8; 32],
+    ) {
+        if let Some((_, known_digest)) = self
+            .query_credential_partition_digests
+            .iter_mut()
+            .find(|(known_name, _)| known_name == name)
+        {
+            *known_digest = digest;
+            return;
+        }
+        self.query_credential_partition_digests
+            .push((name.to_string(), digest));
+    }
+
+    /// Credential-query digests captured before authentication stripping.
+    pub(crate) fn query_credential_partition_digests(&self) -> &[(String, [u8; 32])] {
+        &self.query_credential_partition_digests
     }
 
     pub(crate) fn set_websocket_response_boundary(&mut self, enabled: bool) {

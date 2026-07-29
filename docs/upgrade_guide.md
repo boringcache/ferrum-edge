@@ -334,10 +334,15 @@ one fail-closed replay-partition contract
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
   disable caller isolation.** Every key now binds an authorization-context
   fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests
-  of the credential headers presented), so two credentials that render as one
-  display subject with different scopes never share a retained result. Routes
-  that intentionally shared entries across distinct credentials will see a lower
-  hit rate; there is no opt-out, because that sharing was the vulnerability.
+  of the credentials presented), so two credentials that render as one display
+  subject with different scopes never share a retained result. The credential
+  registry includes configured custom header locations for `key_auth`,
+  `jwt_auth`, `jwks_auth`, and `oauth2_introspection`; credential-bearing query
+  parameters are privately digested before authentication or transformer
+  stripping, even when `response_caching.cache_key_include_query` is `false`.
+  Routes that intentionally shared entries across distinct credentials will see
+  a lower hit rate; there is no opt-out, because that sharing was the
+  vulnerability.
 
 ### Response Cache Shared-Storage Hardening
 

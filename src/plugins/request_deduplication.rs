@@ -1400,7 +1400,7 @@ impl RequestDeduplication {
         hasher.count("headers", fields.len());
         for (header_name, value) in fields.drain(..) {
             hasher.text("header_name", &header_name);
-            if replay_partition::is_credential_context_header(&header_name) {
+            if replay_partition::is_request_credential_context_header(ctx, &header_name) {
                 hasher.nested(
                     "header_value_digest",
                     &replay_partition::value_digest(value),

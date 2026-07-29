@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module, `plugins::utils::replay_partition`, defines it.
   - **Caller authorization, not a display subject.** Every key binds the
     authentication mechanism, resolved identity and consumer, peer SPIFFE
-    identity, and SHA-256 digests of every credential header presented, so two
+    identity, and SHA-256 digests of every credential presented, so two
     tokens that resolve to the same `sub` with different scopes, audiences, or
     tenancy claims can no longer share a retained result. `scope_by_consumer`
     and `cache_key_include_consumer` no longer gate caller isolation; they now
@@ -27,7 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     backend-visible headers — because the post-routing caches run after
     `ai_stream_router`, which strips the client credential and injects the
     provider's; binding only the live view would collapse two distinct client
-    tokens onto one partition.
+    tokens onto one partition. The route's precomputed credential registry now
+    includes custom header locations configured by `key_auth`, `jwt_auth`,
+    `jwks_auth`, and `oauth2_introspection`. Present credential-bearing query
+    parameters are privately digested before authentication/transformer
+    stripping and remain mandatory caller dimensions even when ordinary query
+    fields are excluded from a response-cache key.
   - **Every caller binds canonical caller context.** A new
     `anonymous_caller_scope` option (`caller_address` default, `shared` opt-out)
     binds the gateway-resolved canonical peer address, which the origin observes

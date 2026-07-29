@@ -217,6 +217,15 @@ pub mod _test_support {
         ctx.clone_for_final_request_body_hooks()
     }
 
+    /// Install the route's precomputed credential-header registry so external
+    /// replay-partition tests can exercise stripped custom auth locations.
+    pub fn set_replay_credential_headers_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        headers: Vec<String>,
+    ) {
+        ctx.set_request_headers_to_redact(Arc::new(headers));
+    }
+
     pub fn gateway_response_compression_algorithm_for_test(
         ctx: &crate::plugins::RequestContext,
     ) -> Option<&'static str> {

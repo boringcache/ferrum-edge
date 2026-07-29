@@ -105,6 +105,7 @@ async fn test_jwt_auth_creation_with_config() {
     }))
     .unwrap();
     assert_eq!(plugin.name(), "jwt_auth");
+    assert_eq!(plugin.request_headers_to_redact(), &["x-token"]);
 }
 
 #[test]
