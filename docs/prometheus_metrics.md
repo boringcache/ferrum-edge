@@ -9,7 +9,7 @@ Hosted CI and unit tests fail closed when exposition name/type/label drift is un
 | Field | Meaning |
 |-------|---------|
 | `name` | Exact Prometheus metric family name. Histogram/summary samples use `_bucket`/`_sum`/`_count`; those suffixes are normalized to the base family only when the exact name is not itself an inventoried family and the stripped candidate is an inventoried histogram/summary. |
-| `type` | Prometheus type: `counter`, `gauge`, or `histogram` |
+| `type` | Prometheus type: `counter`, `gauge`, `histogram`, or `summary` |
 | `help` | HELP text emitted on scrape |
 | `labels` | Stable label keys the family may emit (optional `namespace` / `gateway_namespace` appear when the gateway namespace is configured) |
 | `subsystem` | Owning emitter / operational area |

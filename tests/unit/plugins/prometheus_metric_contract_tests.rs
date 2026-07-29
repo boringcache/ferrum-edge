@@ -14,14 +14,18 @@ use ferrum_edge::plugins::api_chargeback::{
 };
 use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
-use ferrum_edge::plugins::prometheus_metric_contract::{
-    BUNDLED_EXTERNAL_METRIC_ALLOWLIST, BUNDLED_PROMETHEUS_RULE_TEMPLATE,
-    PROMETHEUS_METRIC_CONTRACT_JSON, PROMETHEUS_METRICS_REFERENCE_MD,
-};
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
 use serde_json::Value;
 
+const PROMETHEUS_METRIC_CONTRACT_JSON: &str =
+    include_str!("../../../docs/prometheus_metric_contract.json");
+const PROMETHEUS_METRICS_REFERENCE_MD: &str =
+    include_str!("../../../docs/prometheus_metrics.md");
+const BUNDLED_PROMETHEUS_RULE_TEMPLATE: &str =
+    include_str!("../../../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml");
+const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] =
+    &["apiserver_admission_webhook_rejection_count"];
 const SAMPLE_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count"];
 
 const API_CHARGEBACK_FAMILIES: &[&str] = &[
@@ -45,9 +49,18 @@ struct FamilyContract {
     name: String,
     metric_type: String,
     help: String,
+    label_order: Vec<String>,
     labels: BTreeSet<String>,
+    subsystem: String,
     bundled: String,
     emission: String,
+}
+
+#[derive(Debug)]
+struct ExpositionFamily {
+    help: String,
+    metric_type: String,
+    labels: BTreeSet<String>,
 }
 
 fn load_contract() -> BTreeMap<String, FamilyContract> {
@@ -62,7 +75,7 @@ fn load_contract() -> BTreeMap<String, FamilyContract> {
             .expect("labels")
             .iter()
             .map(|v| v.as_str().expect("label").to_string())
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
         assert!(
             out.insert(
                 name.clone(),
@@ -70,7 +83,9 @@ fn load_contract() -> BTreeMap<String, FamilyContract> {
                     name: name.clone(),
                     metric_type: item["type"].as_str().expect("type").to_string(),
                     help: item["help"].as_str().expect("help").to_string(),
-                    labels,
+                    label_order: labels.clone(),
+                    labels: labels.into_iter().collect(),
+                    subsystem: item["subsystem"].as_str().expect("subsystem").to_string(),
                     bundled: item["bundled"].as_str().expect("bundled").to_string(),
                     emission: item["emission"].as_str().expect("emission").to_string(),
                 },
@@ -120,17 +135,29 @@ fn family_for_sample_name(name: &str, types: &BTreeMap<String, String>) -> Optio
     None
 }
 
-fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<String>)> {
+fn parse_exposition_families(text: &str) -> BTreeMap<String, ExpositionFamily> {
+    let mut helps: BTreeMap<String, String> = BTreeMap::new();
     let mut types: BTreeMap<String, String> = BTreeMap::new();
     let mut labels: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# HELP ") {
+            let Some((name, help)) = rest.split_once(' ') else {
+                continue;
+            };
+            if let Some(previous) = helps.insert(name.to_string(), help.to_string()) {
+                assert_eq!(previous, help, "conflicting HELP declarations for {name}");
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("# TYPE ") {
             let mut parts = rest.split_whitespace();
             let name = parts.next().unwrap_or_default();
             let ty = parts.next().unwrap_or_default();
             if !name.is_empty() {
-                types.insert(name.to_string(), ty.to_string());
+                if let Some(previous) = types.insert(name.to_string(), ty.to_string()) {
+                    assert_eq!(previous, ty, "conflicting TYPE declarations for {name}");
+                }
                 labels.entry(name.to_string()).or_default();
             }
             continue;
@@ -165,7 +192,14 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<S
 
     let mut out = BTreeMap::new();
     for (name, ty) in types {
-        out.insert(name.clone(), (ty, labels.remove(&name).unwrap_or_default()));
+        out.insert(
+            name.clone(),
+            ExpositionFamily {
+                help: helps.remove(&name).unwrap_or_default(),
+                metric_type: ty,
+                labels: labels.remove(&name).unwrap_or_default(),
+            },
+        );
     }
     out
 }
@@ -586,14 +620,43 @@ fn prometheus_metrics_reference_documents_every_contract_family() {
         doc.contains("# Prometheus Metrics Contract (DOC-10)"),
         "operator reference missing DOC-10 title"
     );
-    for fam in contract.values() {
-        let needle = format!("| `{}` |", fam.name);
-        assert!(
-            doc.contains(&needle),
-            "docs/prometheus_metrics.md missing inventory row for {}",
-            fam.name
-        );
-    }
+    let inventory_section = doc
+        .split_once("## Complete family inventory")
+        .and_then(|(_, rest)| rest.split_once("## Bundled observability surfaces"))
+        .map(|(inventory, _)| inventory)
+        .expect("operator reference has a bounded complete-inventory section");
+    let actual_rows = inventory_section
+        .lines()
+        .filter(|line| line.starts_with("| `"))
+        .collect::<Vec<_>>();
+    let expected_rows = contract
+        .values()
+        .map(|fam| {
+            let labels = if fam.label_order.is_empty() {
+                "—".to_string()
+            } else {
+                fam.label_order
+                    .iter()
+                    .map(|label| format!("`{label}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "| `{}` | {} | {} | `{}` | `{}` | `{}` | {} |",
+                fam.name,
+                fam.metric_type,
+                labels,
+                fam.subsystem,
+                fam.bundled,
+                fam.emission,
+                fam.help
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_rows, expected_rows,
+        "docs/prometheus_metrics.md complete inventory must be generated exactly from the contract"
+    );
     for section in [
         "Database rejected-delta polling",
         "Mesh remote-cluster endpoint discovery",
@@ -620,23 +683,19 @@ fn representative_metrics_exposition_matches_contract() {
     );
 
     let mut undocumented = Vec::new();
-    for (name, (ty, label_keys)) in &emitted {
+    for (name, observed) in &emitted {
         let Some(fam) = contract.get(name) else {
             undocumented.push(name.clone());
             continue;
         };
         assert_eq!(
-            fam.metric_type, *ty,
-            "type drift for {name}: contract={} exposition={ty}",
-            fam.metric_type
+            fam.metric_type, observed.metric_type,
+            "type drift for {name}: contract={} exposition={}",
+            fam.metric_type,
+            observed.metric_type
         );
-        for key in label_keys {
-            assert!(
-                fam.labels.contains(key),
-                "undocumented label `{key}` on family `{name}` (contract labels: {:?})",
-                fam.labels
-            );
-        }
+        assert_eq!(fam.help, observed.help, "HELP drift for family {name}");
+        assert_eq!(fam.labels, observed.labels, "label-key drift for family {name}");
     }
     assert!(
         undocumented.is_empty(),
@@ -673,11 +732,11 @@ fn representative_metrics_exposition_matches_contract() {
         );
     }
     let backoff = &emitted["ferrum_database_delta_backoff_bucket"];
-    assert_eq!(backoff.0, "gauge");
+    assert_eq!(backoff.metric_type, "gauge");
     assert!(
-        backoff.1.contains("bucket"),
+        backoff.labels.contains("bucket"),
         "backoff bucket gauge labels must include the bucket key: {:?}",
-        backoff.1
+        backoff.labels
     );
 }
 
@@ -789,12 +848,12 @@ ferrum_request_duration_ms_sum{proxy_id=\"p\"} 1\n\
 ferrum_request_duration_ms_count{proxy_id=\"p\"} 1\n\
 ";
     let parsed = parse_exposition_families(exposition);
-    assert_eq!(parsed["ferrum_database_delta_backoff_bucket"].0, "gauge");
+    assert_eq!(parsed["ferrum_database_delta_backoff_bucket"].metric_type, "gauge");
     assert!(parsed["ferrum_database_delta_backoff_bucket"]
-        .1
+        .labels
         .contains("bucket"));
-    assert_eq!(parsed["ferrum_request_duration_ms"].0, "histogram");
-    assert!(parsed["ferrum_request_duration_ms"].1.contains("le"));
+    assert_eq!(parsed["ferrum_request_duration_ms"].metric_type, "histogram");
+    assert!(parsed["ferrum_request_duration_ms"].labels.contains("le"));
     assert!(!parsed.contains_key("ferrum_database_delta_backoff"));
 }
 
@@ -814,7 +873,7 @@ fn production_type_literals_are_inventoried_with_matching_types() {
             missing.push(name.clone());
             continue;
         };
-        if !types.contains(&fam.metric_type) {
+        if types != &BTreeSet::from([fam.metric_type.clone()]) {
             mismatched.push(format!(
                 "{name}: contract={} source={types:?}",
                 fam.metric_type

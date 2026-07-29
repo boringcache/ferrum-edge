@@ -31,6 +31,17 @@ VALID_EMISSION = {
     "when_plugin_enabled",
     "when_process_initialized",
 }
+BASE_CONTRACT_FIELDS = {
+    "name",
+    "type",
+    "help",
+    "labels",
+    "subsystem",
+    "export_surface",
+    "bundled",
+    "emission",
+}
+DYNAMIC_CONTRACT_FIELDS = {"name_template", "default_prefix"}
 EXTERNAL_ALLOWLIST = {"apiserver_admission_webhook_rejection_count"}
 REQUIRED_FAMILIES = {
     "ferrum_database_delta_consecutive_identical_rejections",
@@ -50,6 +61,9 @@ TYPE_LITERAL_RE = re.compile(
     r"(counter|gauge|histogram|summary)\b"
 )
 METRIC_TOKEN_RE = re.compile(r"\b(?:ferrum_[a-z0-9_]+|chargeback_sink_[a-z0-9_]+)\b")
+METRIC_NAME_RE = re.compile(r"^(?:ferrum_|chargeback_sink_)[a-z0-9_]+$")
+LABEL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+SUBSYSTEM_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 SAMPLE_SUFFIXES = ("_bucket", "_sum", "_count")
 
 
@@ -176,33 +190,89 @@ def load_contract(root: Path) -> list[dict]:
     items = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(items, list) or not items:
         fail("Empty metric contract", str(path))
-    names = [item.get("name") for item in items]
+    names: list[str] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            fail("Invalid metric contract row", f"row {index} must be an object")
+        dynamic_fields = DYNAMIC_CONTRACT_FIELDS.intersection(item)
+        expected_fields = set(BASE_CONTRACT_FIELDS)
+        if dynamic_fields:
+            expected_fields.update(DYNAMIC_CONTRACT_FIELDS)
+        if set(item) != expected_fields:
+            fail(
+                "Invalid metric contract schema",
+                f"row {index}: expected fields {sorted(expected_fields)}, "
+                f"got {sorted(item)}",
+            )
+        name = item["name"]
+        if not isinstance(name, str) or METRIC_NAME_RE.fullmatch(name) is None:
+            fail("Invalid metric family name", f"row {index}: {name!r}")
+        names.append(name)
     if names != sorted(names):
         fail("Metric contract unsorted", "family names must be strictly sorted")
     if len(names) != len(set(names)):
         fail("Metric contract duplicates", "family names must be unique")
     for item in items:
-        name = item.get("name")
-        if not isinstance(name, str) or not name:
-            fail("Invalid metric contract row", "missing name")
-        if item.get("type") not in VALID_TYPES:
-            fail("Invalid metric type", f"{name}: {item.get('type')}")
-        if not item.get("help"):
+        name = item["name"]
+        if item["type"] not in VALID_TYPES:
+            fail("Invalid metric type", f"{name}: {item['type']}")
+        help_text = item["help"]
+        if (
+            not isinstance(help_text, str)
+            or not help_text
+            or help_text != help_text.strip()
+            or "\n" in help_text
+            or "|" in help_text
+        ):
             fail("Missing metric help", name)
-        if not isinstance(item.get("labels"), list):
+        labels = item["labels"]
+        if not isinstance(labels, list) or any(
+            not isinstance(label, str) or LABEL_NAME_RE.fullmatch(label) is None
+            for label in labels
+        ):
             fail("Missing metric labels", name)
-        if item.get("bundled") not in VALID_BUNDLED:
-            fail("Invalid bundled classification", f"{name}: {item.get('bundled')}")
-        if item.get("emission") not in VALID_EMISSION:
-            fail("Invalid emission classification", f"{name}: {item.get('emission')}")
-        if not item.get("subsystem"):
+        if len(labels) != len(set(labels)):
+            fail("Duplicate metric labels", name)
+        subsystem = item["subsystem"]
+        if not isinstance(subsystem, str) or SUBSYSTEM_RE.fullmatch(subsystem) is None:
             fail("Missing subsystem", name)
-        if item.get("export_surface") != "/metrics":
-            fail("Unexpected export surface", f"{name}: {item.get('export_surface')}")
+        if item["bundled"] not in VALID_BUNDLED:
+            fail("Invalid bundled classification", f"{name}: {item['bundled']}")
+        if item["emission"] not in VALID_EMISSION:
+            fail("Invalid emission classification", f"{name}: {item['emission']}")
+        if item["export_surface"] != "/metrics":
+            fail("Unexpected export surface", f"{name}: {item['export_surface']}")
+        if "name_template" in item:
+            template = item["name_template"]
+            prefix = item["default_prefix"]
+            if (
+                not isinstance(template, str)
+                or template.count("{prefix}") != 1
+                or not isinstance(prefix, str)
+                or METRIC_NAME_RE.fullmatch(prefix + "_sentinel") is None
+                or template.replace("{prefix}", prefix) != name
+            ):
+                fail(
+                    "Invalid dynamic metric family",
+                    f"{name}: name_template/default_prefix do not reproduce the family",
+                )
     missing = REQUIRED_FAMILIES.difference(names)
     if missing:
         fail("DOC-10 required families missing", ", ".join(sorted(missing)))
     return items
+
+
+def reference_row(item: dict) -> str:
+    labels = (
+        ", ".join(f"`{label}`" for label in item["labels"])
+        if item["labels"]
+        else "—"
+    )
+    return (
+        f"| `{item['name']}` | {item['type']} | {labels} | "
+        f"`{item['subsystem']}` | `{item['bundled']}` | `{item['emission']}` | "
+        f"{item['help']} |"
+    )
 
 
 def validate_reference(root: Path, items: list[dict]) -> None:
@@ -218,10 +288,31 @@ def validate_reference(root: Path, items: list[dict]) -> None:
     ):
         if section not in doc:
             fail("Missing runbook section", section)
-    for item in items:
-        needle = f"| `{item['name']}` |"
-        if needle not in doc:
-            fail("Reference missing inventory row", item["name"])
+    section_marker = "## Complete family inventory"
+    next_marker = "## Bundled observability surfaces"
+    if section_marker not in doc or next_marker not in doc:
+        fail("Missing complete inventory section", "docs/prometheus_metrics.md")
+    inventory_section = doc.split(section_marker, 1)[1].split(next_marker, 1)[0]
+    actual_rows = [
+        line for line in inventory_section.splitlines() if line.startswith("| `")
+    ]
+    expected_rows = [reference_row(item) for item in items]
+    if actual_rows != expected_rows:
+        mismatch = next(
+            (
+                index
+                for index, (actual, expected) in enumerate(
+                    zip(actual_rows, expected_rows, strict=False)
+                )
+                if actual != expected
+            ),
+            min(len(actual_rows), len(expected_rows)),
+        )
+        fail(
+            "Prometheus reference diverges from inventory",
+            f"first mismatch at generated row {mismatch + 1}; "
+            f"expected {len(expected_rows)} rows, found {len(actual_rows)}",
+        )
     print("prometheus metrics reference ok")
 
 
@@ -289,7 +380,7 @@ def validate_source_type_literals(root: Path, items: list[dict]) -> None:
     mismatches: list[str] = []
     for name, types in sorted(found.items()):
         contract_type = by_name[name]["type"]
-        if contract_type not in types:
+        if types != {contract_type}:
             mismatches.append(f"{name}: contract={contract_type} source={sorted(types)}")
     if mismatches:
         fail("Production # TYPE type mismatch", "; ".join(mismatches))

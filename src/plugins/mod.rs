@@ -76,8 +76,6 @@ pub mod oidc_relying_party;
 pub mod opa;
 pub mod openapi_validator;
 pub mod otel_tracing;
-#[allow(dead_code)] // DOC-10 inventory is consumed by external tests / CI, not the binary crate.
-pub mod prometheus_metric_contract;
 pub mod prometheus_metrics;
 pub mod proxy_alerts;
 pub mod rate_limiting;

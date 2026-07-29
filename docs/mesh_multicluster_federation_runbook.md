@@ -73,10 +73,10 @@ Cross-cluster endpoint discovery exports four Prometheus families (see
 
 | Family | Use |
 |---|---|
-| `ferrum_mesh_remote_discovery_poll_failures_total{cluster,trust_domain,control_plane}` | Rising failures: check peer CP reachability, JWT/audience, and TLS trust. The `control_plane` label is a redacted token, never a raw URL. |
-| `ferrum_mesh_remote_discovery_poll_successes_total{cluster,trust_domain}` | Successful polls; should advance while the peer remains configured. |
-| `ferrum_mesh_remote_discovery_last_success_timestamp_seconds{cluster,trust_domain}` | Last successful poll time. |
-| `ferrum_mesh_remote_discovery_endpoint_age_seconds{cluster,trust_domain}` | Age of cached remote endpoints. Alert when age exceeds your freshness window while the cluster is still configured; last-good endpoints are preserved on transient poll failure. |
+| `ferrum_mesh_remote_discovery_poll_failures_total{cluster,trust_domain,control_plane,gateway_namespace}` | Rising failures: check peer CP reachability, JWT/audience, and TLS trust. The `control_plane` label is a redacted token, never a raw URL. |
+| `ferrum_mesh_remote_discovery_poll_successes_total{cluster,trust_domain,gateway_namespace}` | Successful polls; should advance while the peer remains configured. |
+| `ferrum_mesh_remote_discovery_last_success_timestamp_seconds{cluster,trust_domain,gateway_namespace}` | Last successful poll time. |
+| `ferrum_mesh_remote_discovery_endpoint_age_seconds{cluster,trust_domain,gateway_namespace}` | Age of cached remote endpoints. Alert when age exceeds your freshness window while the cluster is still configured; last-good endpoints are preserved on transient poll failure. |
 
 **Poll-failure response:** confirm `GET /mesh/remote-clusters` for the peer, verify
 control-plane URL/JWT, and restore connectivity. Do not wipe last-good endpoints
