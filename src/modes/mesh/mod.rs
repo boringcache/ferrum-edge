@@ -22911,32 +22911,34 @@ mod tests {
 
     #[test]
     fn inject_mesh_global_plugins_keeps_operator_authz_override_when_capture_redirect_is_off() {
-        let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
-        assert!(
-            !runtime.transparent_inbound_capture_requested(),
-            "default NodeWaypoint fixture must leave the ingress redirect off"
-        );
-        let mut config = GatewayConfig {
-            plugin_configs: vec![global_mesh_authz_plugin(
-                "operator-mesh-authz",
-                serde_json::json!({ "trusted_hbone_assertors": [] }),
-            )],
-            ..GatewayConfig::default()
-        };
-        inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
-        assert!(
-            config
-                .plugin_configs
-                .iter()
-                .any(|plugin| plugin.id == "operator-mesh-authz")
-        );
-        assert!(
-            config
-                .plugin_configs
-                .iter()
-                .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
-            "redirect-off NodeWaypoint must preserve operator mesh_authz override suppression"
-        );
+        with_mesh_env(&[], || {
+            let runtime = runtime_with_topology(MeshTopology::NodeWaypoint);
+            assert!(
+                !runtime.transparent_inbound_capture_requested(),
+                "default NodeWaypoint fixture must leave the ingress redirect off"
+            );
+            let mut config = GatewayConfig {
+                plugin_configs: vec![global_mesh_authz_plugin(
+                    "operator-mesh-authz",
+                    serde_json::json!({ "trusted_hbone_assertors": [] }),
+                )],
+                ..GatewayConfig::default()
+            };
+            inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
+            assert!(
+                config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.id == "operator-mesh-authz")
+            );
+            assert!(
+                config
+                    .plugin_configs
+                    .iter()
+                    .all(|plugin| plugin.id != MESH_AUTHZ_PLUGIN_ID),
+                "redirect-off NodeWaypoint must preserve operator mesh_authz override suppression"
+            );
+        });
     }
 
     #[test]
