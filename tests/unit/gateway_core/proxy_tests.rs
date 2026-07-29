@@ -4034,8 +4034,14 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
             .any(|name| name.eq_ignore_ascii_case("content-length")),
         "normalization must strip every plugin-authored Content-Length case variant"
     );
-    assert_eq!(normalized.headers.get("grpc-status").map(String::as_str), Some("7"));
-    assert_eq!(normalized.headers.get("x-plugin").map(String::as_str), Some("1"));
+    assert_eq!(
+        normalized.headers.get("grpc-status").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(
+        normalized.headers.get("x-plugin").map(String::as_str),
+        Some("1")
+    );
 
     let framing = ClientResponseFraming::for_buffered_grpc(
         normalized.http_status.as_u16(),
@@ -4060,7 +4066,10 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
             .any(|name| name.eq_ignore_ascii_case("content-length")),
         "no Content-Length may reach a trailers-only gRPC response"
     );
-    assert_eq!(raw_length_variants.get("x-plugin").map(String::as_str), Some("1"));
+    assert_eq!(
+        raw_length_variants.get("x-plugin").map(String::as_str),
+        Some("1")
+    );
 
     // Streaming framing is a separate contract: it preserves one valid plugin length.
     let mut streaming_headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
