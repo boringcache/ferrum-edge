@@ -383,10 +383,14 @@ Shared rules for all three:
   pre-existing path, with no projection machinery and no added allocation.
 - **Named schemas are portable, so they are limited here.** A
   `transaction_log_schema` definition is authored and registered against the
-  transaction-summary registry, so it can only name fields these families share
-  with it (`namespace`, `proxy_id`, `proxy_name`, `protocol`, `bytes_sent`,
-  `bytes_received`, …). Recompiling it under a different family fails closed on
-  any other name — use an inline `schema:` for family-specific fields.
+  transaction-summary registry, so under another family it can only name the
+  fields that family happens to share with the summary registry. Only
+  `namespace`, `proxy_id`, and `proxy_name` are shared by all three families.
+  `protocol`, `bytes_sent`, and `bytes_received` reach the charge event and the
+  debugger diagnostics but **not** the chargeback billing row, which carries
+  `protocol_family` and a nested `bandwidth` object instead. Recompiling a
+  definition under a family that lacks one of its names fails closed on that
+  name — use an inline `schema:` for family-specific fields.
 
 Family-specific notes:
 
@@ -399,6 +403,15 @@ Family-specific notes:
   not control.
 - **`api_chargeback_sink`** projects the ClickHouse INSERT row, so renaming a
   field renames the column the row inserts into — the target table must agree.
+  Mind the sort key in particular: the reference `ferrum.charges_raw` is a
+  `ReplacingMergeTree` ordered by
+  `(namespace, consumer_id, received_at, event_id)`, and that ordering is what
+  makes at-least-once spool replay idempotent. Renaming or omitting one of
+  those four without matching the destination table leaves its column at the
+  default for every row, so distinct charges collapse onto one sort key and the
+  `FINAL` reads behind the hourly/daily/monthly rollup views keep only one of
+  them. Ferrum cannot inspect the remote table, so preserving the destination
+  sort key is the operator's responsibility.
   `received_at` stays an epoch-nanosecond integer: its representation is fixed
   by the column it inserts into, so `timestamp_format` is rejected rather than
   silently changing a column's type. The durable spool artifact is a copy of the delivery body and is replayed

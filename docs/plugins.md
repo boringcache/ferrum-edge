@@ -1835,7 +1835,9 @@ ownership/claim protocol, and reconciliation guidance.
 `schema` / `schema_ref` project the exported charge-event record — the
 JSONEachRow row delivered to ClickHouse and the durable spool artifact that
 replays it. Renaming a field renames the column the row inserts into, so the
-target table must agree. `summary_type`, `timestamp_format`, the `metadata`
+target table must agree — including its sort key, which is what makes replay
+idempotent (see [docs/log_schema.md](log_schema.md)). `summary_type`,
+`timestamp_format`, the `metadata`
 policy, and the `backend_host` derived kind are rejected for this surface.
 Pricing, accumulator identities, and snapshot keys are unaffected. See [docs/log_schema.md](log_schema.md).
 
