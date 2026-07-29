@@ -264,4 +264,4 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 
 External (non-Ferrum) metrics referenced by bundled alerts — for example `apiserver_admission_webhook_rejection_count` — are allowlisted in the contract validator and are outside this inventory.
 
-Hosted CI validates chart metric references with `.github/scripts/validate_prometheus_metric_contract.py` (static inventory checks; no local `promtool` pin is required by repository policy). Operators may additionally run `promtool check rules` against a rendered PrometheusRule if their cluster tooling provides it.
+Hosted CI validates chart metric references with `.github/scripts/validate_prometheus_metric_contract.py`, renders the enabled Helm `PrometheusRule`, extracts its rule groups, and runs `promtool check rules` against the exact rendered expressions. Operators may run the same check against a rendered PrometheusRule in their own cluster tooling.

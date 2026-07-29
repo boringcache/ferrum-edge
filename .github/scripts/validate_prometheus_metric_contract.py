@@ -2,9 +2,9 @@
 """Hosted CI checks for the DOC-10 Prometheus metric contract.
 
 Validates the checked-in inventory JSON, the operator reference markdown, and
-bundled PrometheusRule / Grafana metric references. Intentionally static: no
-promtool binary is required by repository policy (operators may still run
-promtool against a rendered rule file in their own clusters).
+bundled PrometheusRule / Grafana metric references. This script is intentionally
+static; the hosted Helm job separately renders the PrometheusRule and runs
+``promtool check rules`` against its extracted rule groups.
 
 Also scans production Rust string-literal ``# TYPE`` declarations and rejects
 any literal exported family absent from the inventory (or any type mismatch).

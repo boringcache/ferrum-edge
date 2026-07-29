@@ -1834,6 +1834,11 @@ jobs:
       - name: Install Kubernetes tools
         uses: ./.github/actions/setup-kubernetes-tools
 
+      - name: Install Prometheus rule validator
+        run: |
+          sudo apt-get update
+          sudo apt-get install --assume-yes --no-install-recommends prometheus
+
       - name: Helm static validation
         run: |
           set -euo pipefail
@@ -1847,9 +1852,38 @@ jobs:
             -r ./scripts/check_helm_values_schema_parity.requirements.txt
           python3 ./scripts/check_helm_values_schema_parity.py
           # DOC-10: executable Prometheus metric contract (inventory ↔ docs ↔ charts).
-          # Static only — no promtool pin; Rust unit tests cover representative /metrics.
           python3 -I .github/scripts/validate_prometheus_metric_contract.py
           helm lint ./charts/ferrum-mesh
+          helm template ferrum ./charts/ferrum-mesh \
+            --namespace ferrum \
+            --set observability.enabled=true \
+            --set observability.alerts.enabled=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml"
+          python3 - \
+            "$RUNNER_TEMP/ferrum-helm-results/prometheus-rule-rendered.yaml" \
+            "$RUNNER_TEMP/ferrum-helm-results/prometheus-rules.yaml" <<'PY'
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          rendered_path = Path(sys.argv[1])
+          rules_path = Path(sys.argv[2])
+          groups = []
+          for document in yaml.safe_load_all(rendered_path.read_text(encoding="utf-8")):
+              if isinstance(document, dict) and document.get("kind") == "PrometheusRule":
+                  spec = document.get("spec")
+                  if not isinstance(spec, dict) or not isinstance(spec.get("groups"), list):
+                      raise SystemExit("rendered PrometheusRule is missing spec.groups")
+                  groups.extend(spec["groups"])
+          if not groups:
+              raise SystemExit("Helm render produced no PrometheusRule groups")
+          rules_path.write_text(
+              yaml.safe_dump({"groups": groups}, sort_keys=False),
+              encoding="utf-8",
+          )
+          PY
+          promtool check rules "$RUNNER_TEMP/ferrum-helm-results/prometheus-rules.yaml"
           # Unknown / misspelled keys must fail schema validation (additionalProperties: false).
           if helm lint ./charts/ferrum-mesh --set ambient.enabld=true \
             > "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.out" \
