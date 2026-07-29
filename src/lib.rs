@@ -1319,6 +1319,11 @@ pub mod _test_support {
         pub shared_key_entries: usize,
         pub last_expired_removals: usize,
         pub max_maintenance_entries: usize,
+        /// The fixed claim-retention horizon in seconds that entries are
+        /// expired against. Not configurable and not per-generation: it is the
+        /// widest acceptance window the schema admits, so no later reload can
+        /// outlive a claim.
+        pub retention_seconds: u64,
     }
 
     /// Controllable-time harness for the PasswordDigest nonce replay state.
@@ -1336,6 +1341,23 @@ pub mod _test_support {
                 plugin: crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?,
                 epoch: std::time::Instant::now(),
             })
+        }
+
+        /// A harness bound to a registered process replay scope, sharing an
+        /// explicit epoch so two generations of the same scope can be driven
+        /// against one deterministic timeline.
+        pub fn with_scope(
+            config: &serde_json::Value,
+            plugin_config_id: &str,
+            epoch: std::time::Instant,
+        ) -> Result<Self, String> {
+            use crate::plugins::soap_ws_security::SoapWsSecurity;
+            let plugin = SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+            Ok(Self { plugin, epoch })
         }
 
         pub fn claim(&self, nonce: &str) -> Result<(), String> {
@@ -1360,8 +1382,30 @@ pub mod _test_support {
                 shared_key_entries: snapshot.shared_key_entries,
                 last_expired_removals: snapshot.last_expired_removals,
                 max_maintenance_entries: snapshot.max_maintenance_entries,
+                retention_seconds: snapshot.retention_seconds,
             })
         }
+    }
+
+    /// The UsernameToken `Created` admission decision at an explicit instant.
+    /// The outer `Result` is construction, the inner one is the decision.
+    pub fn soap_username_token_created_outcome_for_test(
+        config: &serde_json::Value,
+        security_block: &str,
+        created: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Result<(), String>, String> {
+        let plugin = crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?;
+        Ok(plugin.username_token_created_outcome_for_tests(security_block, created, now))
+    }
+
+    /// The TTL a `replay_scope: shared` claim writes with its atomic
+    /// `SET NX EX`, observed without a live Redis server.
+    pub fn soap_shared_claim_retention_seconds_for_test(
+        config: &serde_json::Value,
+    ) -> Result<u64, String> {
+        crate::plugins::soap_ws_security::SoapWsSecurity::new(config)?
+            .shared_claim_retention_seconds_for_tests()
     }
 
     /// One-shot proof that map/index drift cannot be recovered as a fresh
@@ -1376,6 +1420,82 @@ pub mod _test_support {
             Ok(()) => Err("soap nonce inconsistent state admitted a probe".to_string()),
             Err(error) => Ok(error),
         }
+    }
+
+    pub const MAX_NONCE_REPLAY_SCOPES_FOR_TESTS: usize =
+        crate::plugins::soap_ws_security::MAX_NONCE_REPLAY_SCOPES_FOR_TESTS;
+    pub const NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS: u64 =
+        crate::plugins::soap_ws_security::NONCE_CLAIM_RETENTION_SECONDS_FOR_TESTS;
+
+    pub fn soap_nonce_replay_registry_len_for_test() -> Result<usize, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_len_for_tests()
+    }
+
+    pub fn soap_nonce_replay_registry_contains_for_test(scope_key: &str) -> Result<bool, String> {
+        crate::plugins::soap_ws_security::nonce_replay_registry_contains_for_tests(scope_key)
+    }
+
+    /// Process-global registry key for `plugin_config_id` under the default
+    /// namespace used by `PluginHttpClient::default()`.
+    pub fn soap_nonce_replay_scope_key_for_test(plugin_config_id: &str) -> String {
+        format!(
+            "{}|{plugin_config_id}",
+            crate::config::types::DEFAULT_NAMESPACE
+        )
+    }
+
+    /// Build a scoped process-replay plugin and poison its registry mutex.
+    pub fn soap_poison_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.poison_nonce_replay_state_for_tests()?;
+        // Drop the plugin so the registry is the sole strong owner; prune must
+        // still refuse to replace poisoned state.
+        drop(plugin);
+        Ok(())
+    }
+
+    /// Build a scoped process-replay plugin, seed one claim, then corrupt the
+    /// age index and drop the holder so the registry is the sole owner.
+    pub fn soap_retire_inconsistent_process_replay_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.check_nonce_replay("inconsistent-retired-seed")?;
+        plugin.corrupt_nonce_age_index_for_tests()?;
+        drop(plugin);
+        Ok(())
+    }
+
+    /// Retire a replay scope whose cache and age index retain equal cardinality
+    /// but no longer describe the same claim.
+    pub fn soap_retire_same_cardinality_drift_scope_for_test(
+        config: &serde_json::Value,
+        plugin_config_id: &str,
+    ) -> Result<(), String> {
+        let plugin =
+            crate::plugins::soap_ws_security::SoapWsSecurity::new_with_http_client_and_config_id(
+                config,
+                crate::plugins::PluginHttpClient::default(),
+                Some(plugin_config_id),
+            )?;
+        plugin.check_nonce_replay("same-cardinality-retired-seed")?;
+        plugin.corrupt_nonce_age_index_value_for_tests()?;
+        drop(plugin);
+        Ok(())
     }
 
     /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,

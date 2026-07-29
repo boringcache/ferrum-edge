@@ -1178,6 +1178,7 @@ fn try_create_plugin(
             | "udp_rate_limiting"
             | "ws_rate_limiting"
             | "ai_rate_limiter"
+            | "soap_ws_security"
     ) {
         // Pass the stable plugin-config resource id through the production
         // factory so identity-aware plugins partition or attribute sibling
@@ -1189,6 +1190,10 @@ fn try_create_plugin(
         // one another's counters. It must be the configured resource id, not a
         // process-local id: replicas of the same policy on separate data planes
         // must keep sharing one distributed budget.
+        //
+        // `soap_ws_security` uses the same stable identity for its process
+        // replay registry and shared Redis keyspace. Passing `None` here would
+        // leave every production reload generation with private replay state.
         create_plugin_with_http_client_and_config_id(
             &pc.plugin_name,
             &pc.config,

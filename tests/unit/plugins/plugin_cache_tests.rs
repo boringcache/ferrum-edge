@@ -420,6 +420,41 @@ fn make_config(proxies: Vec<Proxy>, plugin_configs: Vec<PluginConfig>) -> Gatewa
     }
 }
 
+#[test]
+fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
+    // The soap constructor rejects a blank stable identity because collapsing
+    // policies onto one replay registry/keyspace is unsafe. Reaching that
+    // constructor error through PluginCache proves the production routing path
+    // passes `pc.id`; the identityless factory would incorrectly admit this
+    // generation with private replay state.
+    let mut plugin = make_plugin_config(
+        "   ",
+        "soap_ws_security",
+        PluginScope::Proxy,
+        Some("soap"),
+        true,
+    );
+    plugin.config = json!({
+        "timestamp": {"require": false},
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret"}]
+        },
+        "nonce": {"replay_scope": "process"}
+    });
+    let config = make_config(vec![make_proxy("soap", "/soap", vec!["   "])], vec![plugin]);
+
+    let error = match PluginCache::new(&config) {
+        Ok(_) => panic!("blank SOAP replay identity must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("plugin config id must not be blank"),
+        "{error}"
+    );
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
