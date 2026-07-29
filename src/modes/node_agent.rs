@@ -1339,10 +1339,8 @@ async fn run_with_backend(
     // (normal shutdown, Kubernetes client construction failure, and Drop on
     // any other exit). Do not call `cleanup_all` on a second path.
     initialize_backend(backend.as_mut(), config, metrics.as_ref())?;
-    let mut owner = InitializedBackendOwner::new(
-        backend,
-        config.capture_contract.ingress_redirect_enabled(),
-    );
+    let mut owner =
+        InitializedBackendOwner::new(backend, config.capture_contract.ingress_redirect_enabled());
 
     let client = match build_node_agent_kube_client().await {
         Ok(client) => client,
@@ -6847,9 +6845,7 @@ fn initialize_backend_after_load(
         // classifier is provably gone — so no window exists where packets are
         // assigned but no longer locally delivered. The routing removal itself
         // is the rollback sweep's, after `cleanup_all` retries this detach.
-        if ingress_redirect_enabled
-            && let Err(detach_err) = backend.detach_ingress_redirect()
-        {
+        if ingress_redirect_enabled && let Err(detach_err) = backend.detach_ingress_redirect() {
             warn!(
                 error = %detach_err,
                 "Failed to detach the NodeWaypoint inbound tc ingress redirect while unwinding \
@@ -7174,9 +7170,7 @@ fn shutdown_backend_state(
     // the backend, so a failure keeps its attachment recorded), and the routing
     // removal is deferred until after that retry — and skipped entirely if the
     // classifier still cannot be proven gone.
-    if ingress_redirect_enabled
-        && let Err(e) = backend.detach_ingress_redirect()
-    {
+    if ingress_redirect_enabled && let Err(e) = backend.detach_ingress_redirect() {
         warn!(
             error = %e,
             context = "shutdown",

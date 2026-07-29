@@ -120,6 +120,7 @@ fn client_config() -> NativeMeshClientConfig {
         waypoint_name: None,
         labels: HashMap::new(),
         ambient_udp_source_scoping: false,
+        node_waypoint_capture_scoping: false,
         primary_retry_secs: 0,
     }
 }

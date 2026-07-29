@@ -33,6 +33,11 @@ pub struct NativeMeshClientConfig {
     pub waypoint_name: Option<String>,
     pub labels: HashMap<String, String>,
     pub ambient_udp_source_scoping: bool,
+    /// This DP is a NodeWaypoint whose transparent inbound capture listener
+    /// terminates direct plaintext for enrolled pods on its node (issue #3287),
+    /// so it needs the dedicated cross-namespace capture destination/policy
+    /// inventory. See `MeshSliceRequest::node_waypoint_capture_scoping`.
+    pub node_waypoint_capture_scoping: bool,
     /// Shared CP-failover primary-retry interval
     /// (`FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS`). When > 0 and connected to a
     /// fallback CP after a first slice is installed, the client proactively
@@ -51,6 +56,7 @@ impl NativeMeshClientConfig {
             labels: self.labels.clone(),
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
+            node_waypoint_capture_scoping: self.node_waypoint_capture_scoping,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
             // own control plane and presents the distinct, fixed local-mesh
             // JWT audience. The CP rejects both missing audiences (legacy
@@ -406,6 +412,7 @@ mod tests {
             waypoint_name: None,
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             primary_retry_secs: 0,
         }
     }
@@ -539,6 +546,7 @@ mod tests {
             waypoint_name: None,
             labels: HashMap::new(),
             ambient_udp_source_scoping: false,
+            node_waypoint_capture_scoping: false,
             primary_retry_secs: 300,
         };
         assert_eq!(config.primary_retry_secs, 300);

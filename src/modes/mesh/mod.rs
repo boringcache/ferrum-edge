@@ -284,6 +284,23 @@ impl MeshTopology {
     fn uses_ambient_udp_source_scoping(self) -> bool {
         matches!(self, Self::Ambient | Self::ServiceWaypoint)
     }
+
+    /// Whether this topology runs the transparent inbound CAPTURE listener that
+    /// terminates direct plaintext for enrolled pods (issue #3287), and so needs
+    /// the dedicated cross-namespace capture destination/PeerAuthentication
+    /// inventory.
+    ///
+    /// NodeWaypoint only. Deliberately NOT folded into
+    /// [`Self::uses_ambient_udp_source_scoping`]: NodeWaypoint UDP is
+    /// mesh-wide-only by architecture (a shared UDP frontend socket carries one
+    /// cookie for every client), so reusing that flag would either grant
+    /// NodeWaypoint a UDP source superset it must not act on or leave Ambient /
+    /// ServiceWaypoint carrying a capture inventory they have no capture
+    /// listener for.
+    #[inline]
+    fn uses_node_waypoint_capture_scoping(self) -> bool {
+        matches!(self, Self::NodeWaypoint)
+    }
 }
 
 /// Control-protocol source for mesh runtime config.
@@ -753,6 +770,7 @@ impl MeshRuntimeConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             labels: self.workload_labels.clone(),
             // Same `FERRUM_DP_CP_FAILOVER_PRIMARY_RETRY_SECS` interval the xDS
             // client uses — the knob is protocol-agnostic failover/failback.
@@ -769,6 +787,7 @@ impl MeshRuntimeConfig {
             workload_spiffe_id: self.workload_spiffe_id.clone(),
             waypoint_name: self.service_waypoint_name(),
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
             stream_channel_capacity: self.xds_stream_channel_capacity,
             primary_retry_secs: self.xds_primary_retry_secs,
             connect_timeout_seconds: self.xds_connect_timeout_seconds,
@@ -1067,6 +1086,7 @@ impl MeshRuntimeConfig {
             sidecar_egress_dry_run: self.sidecar_enforced_dry_run,
             enforce_sidecar_identity_narrowing: self.sidecar_identity_narrowing,
             ambient_udp_source_scoping: self.topology.uses_ambient_udp_source_scoping(),
+            node_waypoint_capture_scoping: self.topology.uses_node_waypoint_capture_scoping(),
         }
     }
 
@@ -1171,6 +1191,24 @@ fn prepare_normalized_gateway_config_for_mesh(
     // consume the filtered slice directly. Closes Gap #2.
     if let Some(mesh) = config.mesh.as_deref_mut() {
         mesh.service_entries = mesh_slice.service_entries.clone();
+        // Back-project the NodeWaypoint transparent-inbound-capture inventory
+        // (issue #3287) so `resolve_node_waypoint_capture_destination` reads the
+        // CURRENT epoch's destinations and their PeerAuthentication candidates
+        // from the same `RequestEpoch` snapshot everything else on the capture
+        // path uses. Assigned UNCONDITIONALLY (not merged) so a slice that no
+        // longer carries a destination — the pod moved off this node, left the
+        // mesh, or its namespace stopped being authorized — cannot leave a stale
+        // record behind that would keep admitting captured plaintext.
+        //
+        // Deliberately NOT folded into `mesh.workloads` / `mesh.peer_authentications`:
+        // those are the subscription-namespace routing and own-posture views, and
+        // widening them with cross-namespace records would leak destination
+        // visibility into known-destinations, the outbound registry, and this
+        // proxy's own inbound mTLS resolution.
+        mesh.node_waypoint_capture_destinations =
+            mesh_slice.node_waypoint_capture_destinations.clone();
+        mesh.node_waypoint_capture_peer_authentications =
+            mesh_slice.node_waypoint_capture_peer_authentications.clone();
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port
@@ -19665,6 +19703,18 @@ mod tests {
         assert!(!runtime.xds_client_config().ambient_udp_source_scoping);
         assert!(!runtime.mesh_slice_request().ambient_udp_source_scoping);
 
+        // Issue #3287: NodeWaypoint — and only NodeWaypoint — asks the CP for
+        // the cross-namespace capture destination / PeerAuthentication
+        // inventory, and it must not also pick up Ambient UDP source scoping
+        // (NodeWaypoint UDP is mesh-wide-only by architecture).
+        runtime.topology = MeshTopology::NodeWaypoint;
+        assert!(runtime.native_client_config().node_waypoint_capture_scoping);
+        assert!(runtime.xds_client_config().node_waypoint_capture_scoping);
+        assert!(runtime.mesh_slice_request().node_waypoint_capture_scoping);
+        assert!(!runtime.native_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.xds_client_config().ambient_udp_source_scoping);
+        assert!(!runtime.mesh_slice_request().ambient_udp_source_scoping);
+
         runtime.topology = MeshTopology::ServiceWaypoint;
 
         assert_eq!(
@@ -19682,6 +19732,12 @@ mod tests {
         assert!(runtime.native_client_config().ambient_udp_source_scoping);
         assert!(runtime.xds_client_config().ambient_udp_source_scoping);
         assert!(runtime.mesh_slice_request().ambient_udp_source_scoping);
+        // Issue #3287: the capture-destination inventory is NodeWaypoint-only
+        // and must NOT ride the Ambient-UDP source flag — a ServiceWaypoint has
+        // no transparent inbound capture listener to resolve destinations for.
+        assert!(!runtime.native_client_config().node_waypoint_capture_scoping);
+        assert!(!runtime.xds_client_config().node_waypoint_capture_scoping);
+        assert!(!runtime.mesh_slice_request().node_waypoint_capture_scoping);
 
         let mut config = GatewayConfig::default();
         inject_mesh_global_plugins(&mut config, &runtime, &MeshSlice::default());
@@ -21672,6 +21728,8 @@ mod tests {
             workloads: Vec::new(),
             ambient_udp_source_workloads: Vec::new(),
             node_waypoint_assertors: Vec::new(),
+            node_waypoint_capture_destinations: Vec::new(),
+            node_waypoint_capture_peer_authentications: Vec::new(),
             services: Vec::new(),
             local_inbound_services: Vec::new(),
             local_inbound_workloads: None,
@@ -23210,7 +23268,10 @@ mod tests {
     /// `prepare_mesh_runtime_before_owner` applies with `?`.
     #[test]
     fn an_unbindable_capture_address_fails_the_serving_path_instead_of_warn_skipping() {
-        for (addr, expected) in [("0.0.0.0:0", "non-zero port"), ("10.0.0.5:15006", "wildcard")] {
+        for (addr, expected) in [
+            ("0.0.0.0:0", "non-zero port"),
+            ("10.0.0.5:15006", "wildcard"),
+        ] {
             with_mesh_env(
                 &[
                     ("FERRUM_MODE", "mesh"),
@@ -23231,8 +23292,11 @@ mod tests {
                     // The plan silently omits it — that is exactly why the
                     // serving path cannot rely on planning alone.
                     assert!(
-                        !runtime.listener_plan().iter().any(|listener| listener.kind
-                            == MeshListenerKind::TransparentInboundCapture),
+                        !runtime
+                            .listener_plan()
+                            .iter()
+                            .any(|listener| listener.kind
+                                == MeshListenerKind::TransparentInboundCapture),
                         "an invalid capture address warn-skips in the infallible plan"
                     );
 
@@ -23272,11 +23336,9 @@ mod tests {
                         .is_ok()
                 );
                 assert!(
-                    !runtime
-                        .listener_plan()
-                        .iter()
-                        .any(|listener| listener.kind
-                            == MeshListenerKind::TransparentInboundCapture)
+                    !runtime.listener_plan().iter().any(
+                        |listener| listener.kind == MeshListenerKind::TransparentInboundCapture
+                    )
                 );
             },
         );

@@ -294,12 +294,23 @@ mod tests {
 
         use crate::identity::spiffe::{SpiffeId, TrustDomain};
         use crate::modes::mesh::config::{
-            AppProtocol, MeshConfig, MtlsMode, PeerAuthentication, Workload, WorkloadPort,
-            WorkloadSelector,
+            AppProtocol, MeshConfig, MtlsMode, NodeWaypointEndpoint, PeerAuthentication,
+            PolicyScope, Workload, WorkloadPort, WorkloadSelector,
+        };
+        use crate::modes::mesh::slice::{
+            node_waypoint_capture_destinations_from_workloads,
+            node_waypoint_capture_peer_authentications_for_destinations,
         };
         use crate::proxy::resolve_node_waypoint_capture_destination;
 
         const APP_PORT: u16 = 8080;
+        /// The NodeWaypoint serving this node. Enrolled pods name it in
+        /// `Workload.node_waypoint.spiffe_id`; it lives in `ferrum`, while the
+        /// pods it captures for live in application namespaces.
+        const NODE_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint";
+        /// A DIFFERENT node's NodeWaypoint. Pods pointing at it are NOT this
+        /// proxy's to capture for.
+        const OTHER_NODE_WAYPOINT: &str = "spiffe://cluster.local/ns/ferrum/sa/node-waypoint-b";
 
         fn trust_domain() -> TrustDomain {
             TrustDomain::new("cluster.local").expect("trust domain")
@@ -331,8 +342,41 @@ mod tests {
                 locality: None,
                 service_account: None,
                 pod_uid: None,
-                node_waypoint: None,
+                node_waypoint: Some(NodeWaypointEndpoint {
+                    address: "10.0.0.1".to_string(),
+                    hbone_port: 15008,
+                    spiffe_id: SpiffeId::new(NODE_WAYPOINT).expect("node waypoint spiffe id"),
+                    node_name: None,
+                    node_uid: None,
+                    network: None,
+                    cluster: None,
+                }),
                 remote_provenance: false,
+            }
+        }
+
+        /// Build the mesh view a NodeWaypoint DP actually holds: the CP-resolved
+        /// capture inventory, derived through the SAME helpers the slice builder
+        /// uses, with `workloads` left EMPTY. That emptiness is the point — it is
+        /// the subscription-namespace routing view, and the capture resolver must
+        /// not depend on it.
+        fn capture_mesh(
+            workloads: Vec<Workload>,
+            peer_authentications: Vec<PeerAuthentication>,
+        ) -> MeshConfig {
+            let destinations = node_waypoint_capture_destinations_from_workloads(
+                workloads.iter(),
+                Some(NODE_WAYPOINT),
+            );
+            let capture_peer_authentications =
+                node_waypoint_capture_peer_authentications_for_destinations(
+                    peer_authentications.iter(),
+                    &destinations,
+                );
+            MeshConfig {
+                node_waypoint_capture_destinations: destinations,
+                node_waypoint_capture_peer_authentications: capture_peer_authentications,
+                ..MeshConfig::default()
             }
         }
 
@@ -367,12 +411,12 @@ mod tests {
         /// can never admit direct plaintext to the strict one.
         #[test]
         fn two_workloads_sharing_an_app_port_do_not_cross_apply_peer_authentication() {
-            let mesh = MeshConfig {
-                workloads: vec![
+            let mesh = capture_mesh(
+                vec![
                     workload("payments", "ledger", "10.244.1.7", "ledger"),
                     workload("payments", "reports", "10.244.1.8", "reports"),
                 ],
-                peer_authentications: vec![
+                vec![
                     selector_peer_auth("ledger-strict", "payments", "ledger", MtlsMode::Strict),
                     selector_peer_auth(
                         "reports-permissive",
@@ -381,8 +425,7 @@ mod tests {
                         MtlsMode::Permissive,
                     ),
                 ],
-                ..MeshConfig::default()
-            };
+            );
 
             let strict = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
@@ -418,10 +461,10 @@ mod tests {
         /// as soon as one namespace/selector-scoped policy exists.
         #[test]
         fn the_capture_relay_entry_stamps_the_destination_workload_scope() {
-            let mesh = MeshConfig {
-                workloads: vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
-                ..MeshConfig::default()
-            };
+            let mesh = capture_mesh(
+                vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                Vec::new(),
+            );
             let destination = resolve_node_waypoint_capture_destination(
                 format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
                 &mesh,
@@ -450,10 +493,7 @@ mod tests {
         #[test]
         fn an_unresolvable_or_ambiguous_destination_is_refused() {
             let known = workload("payments", "ledger", "10.244.1.7", "ledger");
-            let mesh = MeshConfig {
-                workloads: vec![known.clone()],
-                ..MeshConfig::default()
-            };
+            let mesh = capture_mesh(vec![known.clone()], Vec::new());
             assert!(
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.9.9:{APP_PORT}").parse().unwrap(),
@@ -465,10 +505,7 @@ mod tests {
 
             // Duplicate records for ONE pod are normal (several services backed
             // by the same workload) and must still resolve.
-            let duplicate = MeshConfig {
-                workloads: vec![known.clone(), known.clone()],
-                ..MeshConfig::default()
-            };
+            let duplicate = capture_mesh(vec![known.clone(), known.clone()], Vec::new());
             assert!(
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
@@ -479,10 +516,7 @@ mod tests {
             );
 
             let impostor = workload("attacker", "spoof", "10.244.1.7", "spoof");
-            let ambiguous = MeshConfig {
-                workloads: vec![known, impostor],
-                ..MeshConfig::default()
-            };
+            let ambiguous = capture_mesh(vec![known, impostor], Vec::new());
             assert!(
                 resolve_node_waypoint_capture_destination(
                     format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
@@ -491,6 +525,138 @@ mod tests {
                 .is_none(),
                 "two divergent workload identities on one address are ambiguous and must fail \
                  closed rather than pick whose policy applies"
+            );
+        }
+
+        /// The root finding: a NodeWaypoint in `ferrum` captures for a pod in
+        /// `payments`. `payments`'s STRICT PeerAuthentication is namespace-scoped
+        /// and would never survive the CP's subscription-namespace narrowing, so
+        /// resolving against the ordinary `peer_authentications` view saw no
+        /// policy and defaulted PERMISSIVE — admitting direct plaintext to a
+        /// STRICT workload. The dedicated capture inventory carries it.
+        #[test]
+        fn a_cross_namespace_destination_enforces_its_own_strict_peer_authentication() {
+            let ledger = workload("payments", "ledger", "10.244.1.7", "ledger");
+            let payments_strict = PeerAuthentication {
+                name: "payments-default".to_string(),
+                namespace: "payments".to_string(),
+                scope: Some(PolicyScope::Namespace {
+                    namespace: "payments".to_string(),
+                }),
+                selector: None,
+                mtls_mode: MtlsMode::Strict,
+                port_overrides: HashMap::new(),
+            };
+
+            // The NodeWaypoint's OWN namespace view: `workloads` and
+            // `peer_authentications` are narrowed to `ferrum`, so neither names
+            // the `payments` pod nor its policy. Only the capture inventory does.
+            let mut mesh = capture_mesh(vec![ledger], vec![payments_strict.clone()]);
+            assert!(
+                mesh.workloads.is_empty() && mesh.peer_authentications.is_empty(),
+                "the fixture must prove the ordinary namespace views cannot answer this"
+            );
+            assert_eq!(
+                mesh.node_waypoint_capture_peer_authentications,
+                vec![payments_strict],
+                "the captured pod's own-namespace STRICT policy must ride the capture inventory"
+            );
+
+            let destination = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                &mesh,
+            )
+            .expect("the cross-namespace destination resolves");
+            assert_eq!(destination.mtls_mode, MtlsMode::Strict);
+            assert!(
+                !super::super::captured_plaintext_admitted(destination.mtls_mode),
+                "direct plaintext to a STRICT cross-namespace destination must be refused"
+            );
+
+            // The proxy's OWN `peer_authentications` view must not be able to
+            // relax the capture posture. A PERMISSIVE policy that (wrongly)
+            // matched the destination's namespace in that view is ignored:
+            // resolution reads the capture inventory only.
+            mesh.peer_authentications = vec![PeerAuthentication {
+                name: "own-view-permissive".to_string(),
+                namespace: "payments".to_string(),
+                scope: Some(PolicyScope::Namespace {
+                    namespace: "payments".to_string(),
+                }),
+                selector: None,
+                mtls_mode: MtlsMode::Permissive,
+                port_overrides: HashMap::new(),
+            }];
+            let still_strict = resolve_node_waypoint_capture_destination(
+                format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                &mesh,
+            )
+            .expect("the cross-namespace destination still resolves");
+            assert_eq!(
+                still_strict.mtls_mode,
+                MtlsMode::Strict,
+                "the proxy's own subscription-namespace PeerAuthentication view must never \
+                 participate in — let alone relax — the captured destination's posture"
+            );
+        }
+
+        /// A pod enrolled on a DIFFERENT node's NodeWaypoint is not this
+        /// proxy's to terminate, and an EMPTY inventory (legacy CP, unauthorized
+        /// namespace, or a node with no enrolled pods) resolves nothing.
+        #[test]
+        fn a_foreign_or_missing_capture_inventory_fails_closed() {
+            let mut foreign = workload("payments", "ledger", "10.244.1.7", "ledger");
+            foreign.node_waypoint = foreign.node_waypoint.map(|mut endpoint| {
+                endpoint.spiffe_id =
+                    SpiffeId::new(OTHER_NODE_WAYPOINT).expect("other node waypoint spiffe id");
+                endpoint
+            });
+            let mesh = capture_mesh(vec![foreign.clone()], Vec::new());
+            assert!(
+                mesh.node_waypoint_capture_destinations.is_empty(),
+                "a pod enrolled on another node's NodeWaypoint must not enter this inventory"
+            );
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                    &mesh,
+                )
+                .is_none(),
+                "a foreign-node destination must be refused"
+            );
+
+            // A legacy CP that emits no inventory leaves it empty even though the
+            // workload is present in the ordinary view. Resolution must refuse
+            // rather than fall back to `workloads` (which carries no proof this
+            // NodeWaypoint owns the pod, and whose policy view is the wrong one).
+            let legacy = MeshConfig {
+                workloads: vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                ..MeshConfig::default()
+            };
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    format!("10.244.1.7:{APP_PORT}").parse().unwrap(),
+                    &legacy,
+                )
+                .is_none(),
+                "an absent capture inventory must fail closed, never fall back to `workloads`"
+            );
+        }
+
+        /// The captured port must be one the destination workload declares.
+        #[test]
+        fn an_undeclared_destination_port_is_refused() {
+            let mesh = capture_mesh(
+                vec![workload("payments", "ledger", "10.244.1.7", "ledger")],
+                Vec::new(),
+            );
+            assert!(
+                resolve_node_waypoint_capture_destination(
+                    "10.244.1.7:9999".parse().unwrap(),
+                    &mesh,
+                )
+                .is_none(),
+                "a port the destination workload does not declare must be refused"
             );
         }
     }

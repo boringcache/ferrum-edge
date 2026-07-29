@@ -441,23 +441,32 @@ The capture listener terminates nothing. It:
 1. recovers the original destination from `getsockname()` (there is no NAT to
    consult) and refuses anything that carries no captured destination — it is
    not a general-purpose relay anyone on the node may address;
-2. resolves that destination to **exactly one slice-declared in-mesh workload**
-   — the same open-relay guard the inbound HBONE relay applies, tightened to a
-   single unambiguous workload. No matching workload, or two records claiming
-   the address with divergent identity, closes the connection. This gate runs
-   first because both gates below are properties of that workload, not of the
+2. resolves that destination to **exactly one workload in this NodeWaypoint's
+   capture destination inventory** — the workloads whose trusted
+   `Workload.node_waypoint.spiffe_id` names this exact NodeWaypoint, on a port
+   that workload declares. This is strictly stronger than the inbound HBONE
+   relay's open-relay guard (which admits any slice-declared workload address,
+   and loopback): the address must belong to a pod this NodeWaypoint is enrolled
+   for. No matching workload, an empty inventory, or two records claiming the
+   address with divergent identity closes the connection. This gate runs first
+   because both gates below are properties of that workload, not of the
    listener;
 3. consults the **live PeerAuthentication posture of that exact destination
    workload** on the captured app port, resolved from the workload's own
    namespace/labels with the canonical resolver (`WorkloadSelector` >
-   `Namespace` > mesh-wide, port override inside the winner). It is deliberately
-   *not* the listener-wide `modes_by_port` table: one NodeWaypoint listener
-   serves every enrolled pod on the node, so a port-keyed posture would let a
-   `PERMISSIVE` pod admit direct plaintext to a `STRICT` pod that happens to
-   share the app port. Direct captured plaintext is admitted only where the
-   destination's own posture permits it; under `STRICT` it is refused and the
-   peer must arrive over authenticated mesh transport instead. Enabling the
-   redirect therefore does not weaken STRICT;
+   `Namespace` > mesh-wide, port override inside the winner) over the
+   PeerAuthentication candidates carried alongside the capture inventory. It is
+   deliberately *not* the listener-wide `modes_by_port` table: one NodeWaypoint
+   listener serves every enrolled pod on the node, so a port-keyed posture would
+   let a `PERMISSIVE` pod admit direct plaintext to a `STRICT` pod that happens
+   to share the app port. It is equally deliberately *not* the proxy's own
+   `peer_authentications` view: that is narrowed to the NodeWaypoint's
+   subscription namespace, so a captured pod in **another** namespace would
+   resolve against no policy at all and fall back to Istio's `PERMISSIVE`
+   default. Direct captured plaintext is admitted only where the destination's
+   own posture permits it; under `STRICT` it is refused and the peer must arrive
+   over authenticated mesh transport instead. Enabling the redirect therefore
+   does not weaken STRICT, including across namespaces;
 4. runs the L4 `on_stream_connect` chain, including the mesh-injected
    `__mesh_authz`, with the captured **app** port as the authorization
    destination and the destination workload's policy scope stamped on the
@@ -465,6 +474,21 @@ The capture listener terminates nothing. It:
    evaluated against the captured destination rather than denied `scope_missing`
    — then relays byte-for-byte. Application TLS is carried opaquely and is never
    mistaken for mesh TLS.
+
+**Cross-namespace destinations.** A NodeWaypoint usually runs in an
+infrastructure namespace while the pods it captures for do not. The control
+plane therefore resolves a dedicated, least-privilege inventory for this
+subscription — the enrolled destination workloads plus the PeerAuthentication
+candidates applicable to them — and carries it on its own slice fields
+(`node_waypoint_capture_destinations`, `node_waypoint_capture_peer_authentications`)
+over native MeshSubscribe, xDS ECDS carriers, and the file source alike. It is
+authorized before it leaves the control plane (CP namespace scope plus the
+bearer `ns` claim, with a `Single`-scope control plane a hard boundary), and it
+never widens the ordinary `workloads` / `services` / `peer_authentications`
+views. A control plane that emits no inventory, an unauthorized namespace, an
+unknown NodeWaypoint identity, and a pod enrolled on a *different* node's
+NodeWaypoint all resolve to nothing and the connection is refused. See
+[`docs/mesh.md`](mesh.md) for the full contract.
 
 Every one of those gates is fail-closed: an unresolvable or ambiguous
 destination, or a posture that cannot be established, closes the connection

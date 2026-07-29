@@ -52,9 +52,15 @@ mesh-mode topology see [`docs/mesh.md`](mesh.md).
     excluded), so it cannot capture unenrolled traffic; an in-scope packet with
     no resolvable capture-listener socket is dropped rather than delivered.
     Captured plaintext is then admitted only where the live PeerAuthentication
-    posture for the recovered app port allows it — `STRICT` still requires
-    verified mesh transport — and only to a slice-declared in-mesh workload
-    address and port, after the L4 `mesh_authz` chain.
+    posture **of the exact destination workload** allows it — `STRICT` still
+    requires verified mesh transport — and only to a workload in this
+    NodeWaypoint's authorized capture destination inventory, on a port that
+    workload declares, after the L4 `mesh_authz` chain. That inventory (and the
+    PeerAuthentication candidates applicable to it) is resolved control-plane
+    side under the CP namespace scope and the bearer `ns` claim, so a
+    cross-namespace enrolled pod's own `STRICT` policy is enforced while an
+    unauthorized namespace contributes nothing; a missing inventory refuses the
+    connection rather than defaulting `PERMISSIVE`.
   - The **cgroup root** for global socket-ops telemetry
     (`ferrum_sock_ops` — `sock_ops`, attached once at startup).
 - Pins SOCK_OPS event and stats maps into `/sys/fs/bpf/ferrum/` so the

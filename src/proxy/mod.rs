@@ -2145,27 +2145,35 @@ pub(crate) struct NodeWaypointCaptureDestination {
 /// NodeWaypoint materializes no inbound routes (its inbound surface is the
 /// HBONE relay), so the relay target is synthesized per connection from the
 /// recovered original destination — the direct-plaintext counterpart of
-/// [`build_inbound_hbone_relay_proxy`], and gated by the **same** open-relay
-/// guard: the destination must be a slice-declared in-mesh workload address and
-/// port.
+/// [`build_inbound_hbone_relay_proxy`].
 ///
-/// Beyond that guard this resolution is **destination-exact and fail-closed**,
-/// which the HBONE relay does not have to be: HBONE authenticates its peer and
-/// authorizes with the destination-scope machinery on the request path, whereas
-/// this listener admits unauthenticated direct plaintext and is therefore the
-/// only thing standing between a node-local peer and the workload. So:
+/// This resolution is **destination-exact and fail-closed**, which the HBONE
+/// relay does not have to be: HBONE authenticates its peer and authorizes with
+/// the destination-scope machinery on the request path, whereas this listener
+/// admits unauthenticated direct plaintext and is therefore the only thing
+/// standing between a node-local peer and the workload. So:
 ///
-/// * The destination address must match **exactly one** slice workload identity.
-///   No match (including the loopback case the open-relay guard tolerates for
-///   HBONE) and divergent matches both return `None`: without the exact
-///   workload there is no PeerAuthentication posture and no policy scope to
-///   enforce, and evaluating another workload's policy would be worse than
-///   refusing.
+/// * Resolution runs against the dedicated
+///   [`crate::modes::mesh::config::MeshConfig::node_waypoint_capture_destinations`]
+///   inventory — the CP-authorized set of workloads enrolled on THIS
+///   NodeWaypoint — not the subscription-namespace `workloads` view. Enrolled
+///   pods are routinely in other namespaces, so `workloads` cannot name them;
+///   and the inventory is narrower everywhere else, so it subsumes the HBONE
+///   open-relay guard rather than relaxing it.
+/// * The destination address must match **exactly one** inventory workload, and
+///   that workload must declare the captured port (a port-less workload does not
+///   constrain its address). No match (including the loopback case the HBONE
+///   open-relay guard tolerates), an EMPTY inventory, and divergent matches all
+///   return `None`: without the exact workload there is no PeerAuthentication
+///   posture and no policy scope to enforce, and evaluating another workload's
+///   policy — or defaulting PERMISSIVE because the required policy was filtered
+///   out at the CP — would be worse than refusing.
 /// * The returned [`NodeWaypointCaptureDestination::mtls_mode`] is resolved from
 ///   that workload's own namespace/labels via the canonical PeerAuthentication
-///   resolver, never from the listener-wide per-port table — two pods can share
-///   an app port with opposite postures, and a `Permissive` neighbour must not
-///   admit plaintext to a `Strict` workload.
+///   resolver over the matching capture-policy inventory, never from the
+///   listener-wide per-port table — two pods can share an app port with opposite
+///   postures, and a `Permissive` neighbour must not admit plaintext to a
+///   `Strict` workload, including across namespaces.
 /// * The entry carries that workload's [`crate::modes::mesh::runtime::PolicyScopeCache`]
 ///   so stream `mesh_authz` evaluates namespace/selector-scoped policies against
 ///   the captured destination instead of failing every connection closed as
@@ -2190,9 +2198,34 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
     mesh: &crate::modes::mesh::config::MeshConfig,
 ) -> Option<NodeWaypointCaptureDestination> {
     let host = orig_dst.ip().to_string();
-    if !inbound_hbone_relay_destination_allowed(&host, orig_dst.port(), Some(mesh)) {
-        return None;
-    }
+    // Resolution runs ONLY against the dedicated NodeWaypoint capture
+    // destination inventory (issue #3287), never `mesh.workloads`. A
+    // NodeWaypoint captures for every ENROLLED pod on its node, and those pods
+    // routinely live in namespaces other than the NodeWaypoint's own, so
+    // `mesh.workloads` — narrowed to the subscription namespace — cannot even
+    // name the destination. The inventory is CP-authorized (scope + bearer `ns`
+    // claim) and keyed on the trusted `Workload.node_waypoint.spiffe_id`, so it
+    // is both wider where it must be and strictly narrower everywhere else.
+    //
+    // This also subsumes the `inbound_hbone_relay_destination_allowed` open-relay
+    // guard the HBONE relay uses, and is strictly stronger: that guard admits any
+    // slice-declared workload address (and loopback), whereas here the address
+    // must belong to a workload THIS NodeWaypoint is enrolled for, and the port
+    // must be one that workload declares. An EMPTY inventory therefore matches
+    // nothing and fails closed — the caller refuses the connection — rather than
+    // resolving a workload with no policy and defaulting PERMISSIVE.
+    //
+    // A workload that declares ports admits only those ports; one that declares
+    // none does not constrain its address (the same rule the HBONE open-relay
+    // guard applies).
+    let owns_destination = |workload: &crate::modes::mesh::config::Workload| {
+        workload.addresses.iter().any(|addr| addr == &host)
+            && (workload.ports.is_empty()
+                || workload
+                    .ports
+                    .iter()
+                    .any(|workload_port| workload_port.port == orig_dst.port()))
+    };
     // Exactly one workload identity may own the captured address. Duplicate
     // records for one pod (several services backed by the same workload) are
     // normal and agree on namespace/labels/SPIFFE, so they collapse to one
@@ -2203,9 +2236,9 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
         crate::modes::mesh::runtime::PolicyScopeCache,
     )> = None;
     for workload in mesh
-        .workloads
+        .node_waypoint_capture_destinations
         .iter()
-        .filter(|workload| workload.addresses.iter().any(|addr| addr == &host))
+        .filter(|workload| owns_destination(workload))
     {
         let candidate = crate::modes::mesh::runtime::PolicyScopeCache::from_workload(workload);
         if let Some((_, existing)) = destination.as_ref() {
@@ -2223,8 +2256,18 @@ pub(crate) fn resolve_node_waypoint_capture_destination(
     // as the slice declares them. The slice-level `labels_ambiguous` escalation
     // does not apply here: that guards the DP's inference of its OWN identity,
     // while these labels come straight off the workload record.
+    //
+    // The candidate set is the dedicated capture inventory, NOT
+    // `mesh.peer_authentications`: the latter is narrowed to this NodeWaypoint's
+    // OWN subscription namespace, so a STRICT PeerAuthentication declared in a
+    // CAPTURED pod's namespace would be absent and this resolver would fall back
+    // to Istio's PERMISSIVE default — admitting direct plaintext exactly where
+    // STRICT forbids it. The capture inventory carries the mesh-wide /
+    // root-namespace, namespace-scoped, and selector-scoped candidates
+    // applicable to the destinations, so precedence and port overrides resolve
+    // identically to how the destination's own sidecar would resolve them.
     let mtls_mode = crate::modes::mesh::slice::resolve_effective_mtls_mode(
-        &mesh.peer_authentications,
+        &mesh.node_waypoint_capture_peer_authentications,
         &policy_scope.namespace,
         &policy_scope.labels,
         orig_dst.port(),
