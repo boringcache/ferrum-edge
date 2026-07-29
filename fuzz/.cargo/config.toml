@@ -1,2 +1,0 @@
-# Pin cargo-fuzz for reproducible hosted runs.
-cargo-fuzz = "=0.13.1"

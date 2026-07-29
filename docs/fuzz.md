@@ -25,11 +25,11 @@ rejects crash artifacts larger than 64 KiB before upload.
 
 ## Hosted CI
 
-- **PR / `main` smoke** (`ci.yml` → `Fuzz Smoke`): `proptest` smoke tests plus
-  ~8 s libFuzzer budget per target (`-runs=512`, `-max_len=4096`).
+- **PR / `main` smoke** (`ci.yml` → `Fuzz Smoke`): locked `proptest` smoke tests
+  plus ~8 s libFuzzer budget per target (`-runs=512`, `-max_len=4096`).
 - **Scheduled sanitizer lane** (`.github/workflows/fuzz.yml`): AddressSanitizer
-  builds, 300 s per target (configurable via `workflow_dispatch`), retained crash
-  artifacts for 14 days, concurrency capped at three targets.
+  builds, 300 s per target, bounded crash artifacts uploaded after size/count
+  checks, 7-day retention, concurrency capped at two targets.
 
 ## Local workflow (optional)
 
@@ -61,7 +61,7 @@ traffic into `corpus/`.
 | Component | Pin |
 |-----------|-----|
 | Rust (fuzz) | `nightly-2025-07-01` (`fuzz/rust-toolchain.toml`) |
-| `cargo-fuzz` | `0.13.1` (`fuzz/.cargo/config.toml`) |
+| `cargo-fuzz` | `0.13.1` (pinned in admitted CI workflows) |
 | `libfuzzer-sys` | `0.4.9` (`fuzz/Cargo.toml`) |
 | `proptest` (smoke only) | `1.6.0` (`fuzz/Cargo.toml` dev-dep) |
 
