@@ -2368,10 +2368,17 @@ impl McpGateway {
             .cloned()
             .unwrap_or_else(|| json!({"type": "object"}));
         let output_schema = item.get("outputSchema").cloned();
-        let schema_hash = hash_value(&json!({
-            "inputSchema": input_schema,
-            "outputSchema": output_schema,
-        }));
+        let schema_hash = if self.validation.validate_tool_results {
+            hash_value(&json!({
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+            }))
+        } else {
+            // Preserve the pre-enforcement catalog contract when result
+            // validation is disabled: an upstream outputSchema is descriptive
+            // only, so it cannot hide or remove an otherwise valid tool.
+            hash_value(&input_schema)
+        };
         let input_validator = match jsonschema::validator_for(&input_schema) {
             Ok(validator) => Arc::new(validator),
             Err(error) => {
@@ -2384,20 +2391,24 @@ impl McpGateway {
                 return None;
             }
         };
-        let output_validator = match output_schema.as_ref() {
-            Some(schema) => match compile_tool_output_schema(schema) {
-                Ok(validator) => Some(validator),
-                Err(error) => {
-                    warn!(
-                        server_id = %server.server_id,
-                        tool = %name,
-                        error = %error,
-                        "Skipping MCP tool with invalid outputSchema"
-                    );
-                    return None;
-                }
-            },
-            None => None,
+        let output_validator = if self.validation.validate_tool_results {
+            match output_schema.as_ref() {
+                Some(schema) => match compile_tool_output_schema(schema) {
+                    Ok(validator) => Some(validator),
+                    Err(error) => {
+                        warn!(
+                            server_id = %server.server_id,
+                            tool = %name,
+                            error = %error,
+                            "Skipping MCP tool with invalid outputSchema"
+                        );
+                        return None;
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
         };
         let description = item
             .get("description")

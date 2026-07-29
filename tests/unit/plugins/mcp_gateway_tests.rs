@@ -7983,6 +7983,26 @@ async fn validate_tool_results_skips_tools_with_invalid_output_schema() {
 }
 
 #[tokio::test]
+async fn disabled_tool_result_validation_keeps_tools_with_unusable_output_schema() {
+    let server = start_mcp_output_schema_tool_server(json!({
+        "$ref": "https://example.invalid/schemas/weather.json"
+    }))
+    .await;
+    let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
+    config["validation"]["validate_tool_results"] = json!(false);
+    let plugin = create_plugin("mcp_gateway", &config)
+        .unwrap()
+        .unwrap();
+    let session_id = initialize(&plugin).await;
+    let tools = aggregate_tool_names(&plugin, &session_id, 185).await;
+    assert_eq!(
+        tools,
+        vec!["github.create_pr"],
+        "default-off result validation must preserve the legacy catalog even when an upstream advertises an unusable outputSchema"
+    );
+}
+
+#[tokio::test]
 async fn validate_tool_results_reload_update_and_delete_change_enforcement() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let upstream = format!("{}/mcp", server.uri());
