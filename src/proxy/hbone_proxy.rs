@@ -478,6 +478,10 @@ pub(super) async fn handle_hbone_request(
         is_tls,
         ctx.tls_client_cert_der.is_some(),
     ) {
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
         return super::reject_mesh_inbound_peer_auth_transport_mismatch(
             state,
             plugins,

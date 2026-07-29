@@ -6151,6 +6151,21 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         }),
         true,
     );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": {
+                    "sidecar_admitted_services": 1,
+                    "sidecar_denied_services": 0
+                }
+            }
+        }),
+        false,
+    );
 
     let mut overload = serde_json::to_value(OverloadSnapshot {
         level: OverloadLevel::Normal,

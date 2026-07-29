@@ -28,9 +28,10 @@ templated against the live metrics.
 | egress-scope | `ferrum_mesh_outbound_registry_decisions_total{decision="admit"\|"deny"}` |
 | policy-deny | `ferrum_mesh_requests_total{response_code="403"}`, `ferrum_mesh_outbound_registry_decisions_total{decision="deny"}` |
 
-All names are emitted in `src/plugins/prometheus_metrics.rs` and
-`src/plugins/mesh/prometheus_helpers.rs`; alert rules built on the same
-names live in `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`.
+Names are emitted in `src/plugins/prometheus_metrics.rs`,
+`src/plugins/mesh/prometheus_helpers.rs`, and
+`src/modes/mesh/node_waypoint_observability.rs`; alert rules built on the
+same names live in `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`.
 
 ## Installing via the Helm chart
 
@@ -71,9 +72,9 @@ either:
 ## Notes on what is and isn't covered
 
 - **Active-connections / pool-utilization gauges** are not exposed in
-  Prometheus format. The gateway surfaces them only via the unauthenticated
-  `GET /overload` and JWT-authenticated `GET /metrics/runtime` JSON
-  endpoints, so they are intentionally absent from `gateway-overview.json`.
+  Prometheus format. The gateway surfaces them only in authenticated detail
+  from `GET /overload` and the JWT-authenticated `GET /metrics/runtime` JSON
+  endpoint, so they are intentionally absent from `gateway-overview.json`.
 - **Per-rule mesh authz denies** are surfaced in transaction logs only
   (`mesh_authz.deny_policy` metadata), not as Prometheus labels. The
   `policy-deny.json` dashboard groups denies by source / destination

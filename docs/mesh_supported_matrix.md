@@ -96,9 +96,9 @@ CI today."
   counter-movement assertion IDs
   (`node_waypoint.observability.hbone_handshake_inbound_tls_failure`,
   `node_waypoint.observability.asserted_identity_rejected`,
-  `node_waypoint.observability.hbone_handshake_outbound_success`) are
-  specified as a required Beta gate but are not yet wired into the live
-  harness — see `docs/plans/node_waypoint_transport_adr.md`;
+  `node_waypoint.observability.hbone_handshake_outbound_success`) are wired
+  into the live harness and remain required Beta gates — see
+  `docs/plans/node_waypoint_transport_adr.md`;
   Helm must mount the shared node-agent ↔ ambient pod registry plus host
   cgroup/bpffs views and `SYS_ADMIN`/`SYS_PTRACE` netns capabilities for
   `node_waypoint`), eBPF ambient capture (Dev-only; enabled chart topologies

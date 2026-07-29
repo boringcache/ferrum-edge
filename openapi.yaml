@@ -10463,7 +10463,7 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope]
+      required: [egress_scope, node_waypoint_observability]
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"

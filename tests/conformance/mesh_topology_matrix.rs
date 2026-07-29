@@ -118,7 +118,7 @@ fn topology_node_waypoint() {
         feature = "NodeWaypoint topology",
         status = Status::Supported,
         maturity = Maturity::Experimental,
-        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4/IPv6 capture, secured HBONE transport, and SPIRE identity are live-gated; ADR observability counters are unit-gated with live counter-movement IDs reserved; Experimental→Beta/Beta→GA gates live in docs/plans/node_waypoint_transport_adr.md.",
+        notes = "One HBONE listener serves multiple node-local pods; per-pod policy scoping. Experimental: IPv4/IPv6 capture, secured HBONE transport, SPIRE identity, and representative ADR observability counter movement are live-gated; Experimental→Beta/Beta→GA gates live in docs/plans/node_waypoint_transport_adr.md.",
     );
     assert_topology_apply_succeeds(MeshTopology::NodeWaypoint);
 }

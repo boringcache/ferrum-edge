@@ -1851,6 +1851,8 @@ impl Plugin for MeshAuthz {
         let source_for_log = source_principal.as_ref().map(|id| id.as_str().to_string());
         let trust_domain_mismatch = baggage_outcome == BaggageOutcome::TrustDomainMismatch;
         let untrusted_assertor = baggage_outcome == BaggageOutcome::UntrustedAssertor;
+        let asserted_identity_rejected =
+            unauthenticated_hbone_baggage || untrusted_assertor || trust_domain_mismatch;
         if trust_domain_mismatch {
             record_ignored_baggage_reason(&mut ctx.metadata, "trust_domain_mismatch");
             ctx.metadata.insert(
@@ -2018,7 +2020,7 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    if self.per_pod_policy_scoping {
+                    if self.per_pod_policy_scoping && !asserted_identity_rejected {
                         crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
                             crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
                         );
@@ -2126,9 +2128,11 @@ impl Plugin for MeshAuthz {
                         "scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
-                    );
+                    if !asserted_identity_rejected {
+                        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
+                        );
+                    }
                     return PluginResult::Reject {
                         status_code: 403,
                         body:
@@ -2152,9 +2156,11 @@ impl Plugin for MeshAuthz {
                         "destination_scope_missing".to_string(),
                     );
                     self.record_policy_deny(&ctx.metadata, source_for_log.as_deref());
-                    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
-                        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
-                    );
+                    if !asserted_identity_rejected {
+                        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::DestinationScopeMissing,
+                        );
+                    }
                     return PluginResult::Reject {
                         status_code: 403,
                         body:
@@ -2315,6 +2321,9 @@ impl Plugin for MeshAuthz {
                         "mesh_authz.deny_policy".to_string(),
                         "scope_missing".to_string(),
                     );
+                    crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                        crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::ScopeMissing,
+                    );
                     self.record_policy_deny(&metadata, source_for_log.as_deref());
                     ctx.metadata = (!metadata.is_empty()).then_some(metadata);
                     return PluginResult::Reject {
@@ -2338,6 +2347,11 @@ impl Plugin for MeshAuthz {
             result,
             PluginResult::Reject { .. } | PluginResult::RejectBinary { .. }
         ) {
+            if self.per_pod_policy_scoping {
+                crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::AuthzDeny,
+                );
+            }
             self.record_policy_deny(&metadata, source_for_log.as_deref());
         }
         ctx.metadata = (!metadata.is_empty()).then_some(metadata);

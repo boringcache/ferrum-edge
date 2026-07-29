@@ -647,7 +647,16 @@ impl HboneConnectionPool {
         sni_override: Option<&str>,
         asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
-        let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
+        let (source_identity, fingerprint) = match self.current_svid_identity_cached() {
+            Ok(identity) => identity,
+            Err(error) => {
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::OutboundDial,
+                    false,
+                );
+                return Err(error);
+            }
+        };
         let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
         let effective_connect_timeout_ms =
