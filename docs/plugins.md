@@ -1332,7 +1332,47 @@ The channel slot is reserved before serialization. Serialization is capped by `m
 
 Emits verbose request/response and terminal diagnostics via `tracing::debug!` on the `transaction_debug` target. All output flows through the non-blocking writer, avoiding synchronous stdout mutex contention. Sensitive headers are automatically redacted. Enable per-proxy only for debugging — not recommended for production due to information disclosure risk. Requires `FERRUM_LOG_LEVEL=debug` (or `RUST_LOG=transaction_debug=debug`) to see output.
 
-The plugin does not capture request or response payloads. The former `log_request_body` and `log_response_body` options are rejected instead of silently accepting no-op body settings. Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+Terminal HTTP/gRPC diagnostics use the final transaction outcome, including dispatch/body errors, client disconnects, completion and byte counts, rejection phase, and non-zero gRPC status. TCP/UDP/DTLS diagnostics include typed disconnect direction, cause, and error classification.
+
+#### Bounded body capture
+
+`log_request_body` and `log_response_body` are opt-in, default-off switches that emit a **bounded, redacted sample** of the body. They are intended for incident debugging only; a capture is an information-disclosure surface even after redaction.
+
+**Capture never forces an ineligible message to buffer.** A message is admitted to the buffered path only when *all* of the following hold; otherwise it keeps streaming exactly as it does with capture disabled, and the debugger emits an omission record with a stable `reason`:
+
+| Requirement | Omission `reason` when unmet |
+|---|---|
+| A `Content-Type` header is present | `no_content_type` |
+| Not gRPC (`application/grpc*`) or SSE (`text/event-stream`), and not a WebSocket upgrade | `protocol_excluded` |
+| A capturable textual media type | `content_type_excluded` |
+| Identity (or absent) `Content-Encoding` | `content_encoding` |
+| A parseable `Content-Length` (so chunked/unknown-length keeps streaming) | `unknown_length` |
+| `Content-Length` greater than zero | `empty_body` |
+| `Content-Length` at most the configured cap | `over_capture_limit` |
+
+Capture being disabled for a direction is not in that table: a disabled direction is evaluated as `disabled` internally but emits no record at all, because the switch is checked before the debugger touches the body path.
+
+**The declared length is only an admission screen.** `Content-Length` can be stale, wrong, or overtaken by a transform that grows the body. Both final body hooks therefore re-check the actual post-transform `body.len()` against the configured cap *before* any UTF-8 scan, parse, redaction, or allocation, and emit a content-free `over_capture_limit` omission instead of a sample when it does not fit. The header can also *overstate* the message — a `HEAD` or `304` response declares the length of a body it never sends — so an actually empty slice is reported with the same fixed `empty_body` reason rather than reaching the renderer, where a structured family would report an absent body as a *malformed* one the peer never sent. The header-time screen is unchanged, so oversized and unknown-length traffic still never leaves the streaming path.
+
+**No-output short circuit.** Capture records exist only on the `transaction_debug` DEBUG target. When that target is not enabled, the per-request buffering predicates release eligible bodies back to streaming rather than buffering bytes that could never be reported. The configuration-level buffering capability is unchanged — it still describes what the configuration asks for — and the runtime log level is re-read per request, so an admin log-level change simply takes effect on subsequent requests.
+
+Capturable media types are `application/json`, `text/json`, any `+json` structured suffix, `application/x-www-form-urlencoded`, and `text/plain`. Everything else — including `application/xml`, `text/xml`, `+xml` suffixes, `application/graphql`, `text/html`, `multipart/*`, and all binary media types — is excluded. XML and GraphQL are excluded deliberately: their secrets live in structural positions (element text, GraphQL variable values) that line-level redaction cannot reach, and Ferrum implements no bounded structure-aware redactor for either, so the plugin does not claim a control it cannot enforce.
+
+**Capture point.** The request sample is taken in `on_final_request_body`, after every request transform, so it is the backend-visible representation. The response sample is taken in `on_final_response_body`, after every response transform, so it is the client-visible representation. Capture is observational: it never rejects, mutates, or reorders a request, and it never changes trailers, content lengths, or body limits.
+
+**Redaction runs before rendering, over the complete body.** JSON documents are parsed and every value under a credential-bearing key is replaced; form bodies are redacted per pair. Credential-shaped string values (`Bearer …`, `Basic …`, JWT-shaped) are replaced wherever they appear, regardless of field name. A body that declares JSON but does not parse is **not** partially rendered and does **not** fall back to line-level redaction — a key and its value can sit on different lines, so line-level handling would redact the marker line and log the secret line. It renders as the fixed, content-free `<malformed-structured-body-omitted>` marker instead. `text/plain` is the single deliberately coarse family: it has no field grammar, so it receives operator-opt-in line-level redaction where any line carrying a sensitive marker is replaced wholesale. Sensitive names come from the built-in credential markers (`password`, `passwd`, `passphrase`, `secret`, `token`, `apikey`/`api_key`/`api-key`, `credential`, `private_key`, `access_key`, `secret_key`, `authorization`, `session`, `signature`, `assertion`, and exact `auth`/`code`/`cookie`/`jwt`/`key`/`otp`/`pin`/`pwd`/`sig`), the built-in sensitive header list, `redacted_headers`, `redacted_body_fields`, and the central metadata classifier (which honors `FERRUM_LOG_REDACT_METADATA_KEYS`).
+
+**Bounds.** A body past the effective cap is refused outright before any scan (`<over-capture-limit-body-omitted>` for direct callers, an `over_capture_limit` omission record on both final body hooks). Within the cap, redaction walks at most 64 levels of JSON nesting, retains at most 256 text lines, truncates the redacted rendering to the configured cap on a character boundary, escapes control, line-separator, and bidi/invisible-spoofing characters, and caps the rendered field at 64 KiB. That ceiling is dimensioned to the worst case exactly — the maximum expansion per source byte is 8 output bytes and the capture cap is 8192 bytes — and the cap check admits a segment only when the whole encoded segment fits, so escaping can reach the ceiling but never overshoot it. Bodies that are not valid UTF-8 are never dumped — not even base64-encoded — and render as `<non-utf8-body-omitted>`. That includes a valid prefix followed by an incomplete multibyte sequence: at a final body hook the slice is complete, so an incomplete tail is malformed, not truncated, and no prefix is logged.
+
+**Protocol exclusion uses typed request provenance.** Native gRPC and WebSocket responses are excluded from the buffered path using the request's typed protocol flavor recorded on the protocol entry path, not only its headers. That covers H2/H3 Extended CONNECT WebSockets, which carry no `Upgrade` header at all, and cannot be defeated by an earlier plugin rewriting `Content-Type`. The conservative header checks (`Upgrade`, `application/grpc*`, `Accept: text/event-stream`) are retained on top for gRPC-Web and H1 upgrade shapes.
+
+**Provenance.** For each direction whose enabled body-capture lifecycle reaches the debugger while the `transaction_debug` DEBUG target is active, the eligibility or final-body hook emits exactly one capture record whose `capture` field is `captured`, `truncated`, `binary`, or `omitted`; disabled directions emit none. A record that never reached the renderer — the eligibility screen declined it, or the actual body was oversized or absent — carries the fixed `reason` and no body fields at all. Every other record carries `body_kind`, `body_bytes`, and `truncated` alongside a `body` that is either the bounded redacted sample (`captured` / `truncated`) or one of the fixed content-free markers described above (`binary`, and `omitted` for a malformed structured body). An absent sample is therefore always distinguishable from an empty one. Captured bytes are never written into `ctx.metadata` or `TransactionSummary`, so no log-shipping sink can observe them, and nothing is retained across hooks.
+
+**Retry-enabled proxies.** When retry is configured, the gateway keeps every response buffered unless each active buffering plugin explicitly opts a concrete response out after headers arrive. The debugger participates in that opt-in with the same capture screen, so a response it will not sample — SSE, chunked/unknown-length, encoded, oversized, or non-textual — is released to stream rather than pinned for the retry window. Only the small textual responses it actually captures stay buffered (and therefore mid-body retryable).
+
+**Known limitation — HTTP/3 response trailers.** On the buffered HTTP/3 path the gateway drops backend-controlled response trailers for any response handled by a body-processing plugin chain, because response-body plugins cannot inspect or transform trailers (issue #2941). Enabling `log_response_body` puts the debugger into that chain, so buffered H3 responses on that proxy lose backend trailers while capture is on. This is inherent to the shared two-tier buffering gate rather than to capture eligibility, and is one more reason to treat capture as a troubleshooting opt-in.
+
+When both switches are false — the default — the plugin reports no body buffering requirement, allocates nothing on the body path, and emits no capture records.
 
 WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic and exactly one additional terminal session diagnostic when the upgraded session ends. When `correlation_id` or `otel_tracing` supplied `request_id` or `trace_id` metadata, the terminal records include the same selected value; all selected metadata passes through the central sensitivity classifier. The plugin never dumps the complete metadata map.
 
@@ -1341,10 +1381,15 @@ WebSocket upgrades produce the ordinary HTTP handshake transaction diagnostic an
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `redacted_headers` | String[] | `[]` | Additional header names to redact beyond the built-in sensitive list |
+| `log_request_body` | bool | `false` | Enable bounded, redacted capture of the backend-visible request body |
+| `log_response_body` | bool | `false` | Enable bounded, redacted capture of the client-visible response body |
+| `max_request_body_bytes` | Integer | `1024` | Request capture budget in bytes (1–8192). Requires `log_request_body: true` |
+| `max_response_body_bytes` | Integer | `1024` | Response capture budget in bytes (1–8192). Requires `log_response_body: true` |
+| `redacted_body_fields` | String[] | `[]` | Additional body field names (case-insensitive, ≤128 chars) to redact. Requires one of the capture switches |
 
 **Built-in redacted headers**: `authorization`, `proxy-authorization`, `cookie`, `set-cookie`, `api-key`, `x-api-key`, `x-goog-api-key`, `x-auth-token`, `x-csrf-token`, `x-xsrf-token`, `www-authenticate`, `x-forwarded-authorization`
 
-The configuration object is closed: any key other than `redacted_headers` is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error.
+The configuration object is closed: any key outside the table above is rejected. `schema` and `schema_ref` retain their specialized unsupported-schema error. Capture budgets outside `1..=8192` are rejected rather than clamped, `null` is rejected for every field, and a budget or `redacted_body_fields` without its capture switch is rejected as inert configuration.
 
 ### `correlation_id`
 

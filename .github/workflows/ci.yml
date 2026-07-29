@@ -1023,6 +1023,7 @@ jobs:
               functional_ws_origin_test
               functional_allowed_methods_test
               functional_allowed_methods_logging_test
+              functional_transaction_debugger_body_capture_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
               functional_streaming_outcome_accounting_test

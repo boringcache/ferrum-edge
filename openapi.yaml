@@ -13337,14 +13337,82 @@ components:
       description: >-
         Plugin: transaction_debugger — Emits verbose request/response and
         terminal diagnostics via tracing::debug on the transaction_debug
-        target. Request and response payloads are never captured. Requires
-        FERRUM_LOG_LEVEL=debug to see output. Unsupported keys are rejected.
+        target. Requires FERRUM_LOG_LEVEL=debug to see output. Unsupported keys
+        are rejected. Body capture is opt-in and default off. It never forces an
+        ineligible message to buffer: a body is sampled only when the message
+        declares an identity Content-Encoding, a Content-Length that fits inside
+        the configured cap, and a capturable textual Content-Type
+        (application/json, +json, text/json,
+        application/x-www-form-urlencoded, text/plain). gRPC
+        (application/grpc*), SSE (text/event-stream), WebSocket upgrades
+        (including H2/H3 Extended CONNECT, excluded by typed request
+        provenance rather than headers), XML, GraphQL, multipart, text/html,
+        binary media types, chunked/unknown-length, and encoded messages keep
+        streaming and are reported as omitted with a stable reason. XML and
+        GraphQL are excluded because Ferrum has no bounded structure-aware
+        redactor for them. Request samples are taken after all request
+        transforms (backend-visible bytes) and response samples after all
+        response transforms (client-visible bytes). Content-Length is only an
+        admission screen: both final body hooks re-check the actual body length
+        against the configured cap before any scan and fail closed with a
+        content-free over_capture_limit omission, and an actually empty body
+        (a HEAD or 304 response declares a length it never sends) is reported
+        with the fixed empty_body reason rather than as a malformed structured
+        body. Samples are redacted before rendering
+        (JSON/form per field, text/plain per line as a coarse
+        operator opt-in, plus credential-shaped values anywhere), a malformed
+        JSON body renders as a fixed content-free marker instead of a partial
+        rendering, control and bidi characters are escaped, non-UTF-8 bodies
+        (including an incomplete multibyte tail) render as a fixed marker, and
+        every capture reports whether it was captured, truncated, binary, or
+        omitted. When the transaction_debug DEBUG target is disabled no body is
+        buffered for capture. Captured bytes go only to the transaction_debug
+        tracing target and are never written into transaction-log metadata.
       properties:
         redacted_headers:
           type: array
           items:
             type: string
           description: Additional header names to redact beyond the built-in sensitive list
+        log_request_body:
+          type: boolean
+          default: false
+          description: >-
+            Enable bounded, redacted capture of the backend-visible request
+            body. Null is rejected.
+        log_response_body:
+          type: boolean
+          default: false
+          description: >-
+            Enable bounded, redacted capture of the client-visible response
+            body. Null is rejected.
+        max_request_body_bytes:
+          type: integer
+          default: 1024
+          minimum: 1
+          maximum: 8192
+          description: >-
+            Per-request capture budget in bytes. Requires log_request_body
+            true; out-of-range values are rejected, never clamped.
+        max_response_body_bytes:
+          type: integer
+          default: 1024
+          minimum: 1
+          maximum: 8192
+          description: >-
+            Per-response capture budget in bytes. Requires log_response_body
+            true; out-of-range values are rejected, never clamped.
+        redacted_body_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '\S'
+          description: >-
+            Additional body field names (compared case-insensitively) to redact
+            beyond the built-in credential markers. Requires log_request_body or
+            log_response_body true.
 
     CorrelationIdConfig:
       type: object

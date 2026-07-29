@@ -697,7 +697,7 @@ Given all built-in plugins enabled, the execution order is:
 | 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
 | 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
 | 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect, on_ws_disconnect |
+| 75 | `transaction_debugger` | 9200 | on_request_received, before_proxy, on_final_request_body, after_proxy, on_final_response_body, log, on_stream_disconnect, on_ws_disconnect |
 | 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
 | 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect, on_ws_disconnect |
 | 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |

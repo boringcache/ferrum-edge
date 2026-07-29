@@ -108,6 +108,7 @@ mod functional_tcp_proxy_test;
 mod functional_tcp_splice_backend_timeout_test;
 mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
+mod functional_transaction_debugger_body_capture_test;
 mod functional_udp_proxy_test;
 mod functional_url_query_limits_test;
 mod functional_websocket_connection_limit_test;
