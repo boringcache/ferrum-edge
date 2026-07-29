@@ -430,10 +430,11 @@ h3 patch) and stores it in `H3ReadProgress.pending_trailers`; if the outer
 the stored map as the response's trailer section instead of collapsing to a bare
 EOS. The wrapper carries no governor of its own, so the peek path strips
 hop-by-hop names and reconciles **before** storing — the slot only ever holds a
-map that is safe to put on the wire. The peek runs at most once per response, so
-a long trailer wait neither re-clones the map nor double-counts the removal
-telemetry; the two routes are distinguished in the debug line by a static
-`route` field (`fin` / `timeout_peek`). gRPC-flavored native-H3 dispatch is owned by
+map that is safe to put on the wire. Once a peek returns a trailer map, that map
+is stored and governed at most once per response, so a long trailer wait neither
+re-clones it nor double-counts the removal telemetry; the two routes are
+distinguished in the debug line by a static `route` field (`fin` /
+`timeout_peek`). gRPC-flavored native-H3 dispatch is owned by
 `dispatch_grpc_native_h3`, so this relay is a plain-response section in
 practice; the section is still chosen structurally from the dispatch, never from
 a trailer's own name.
