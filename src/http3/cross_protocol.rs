@@ -6853,12 +6853,8 @@ pub(crate) fn normalize_reject_for_client(
     // Cross-protocol rejects run only after backend dispatch; `serverless_function`
     // terminate short-circuits in `before_proxy`, so framed unary provenance
     // never reaches this normalizer.
-    let normalized = crate::proxy::normalize_reject_response(
-        status,
-        body,
-        headers,
-        native_grpc || grpc_web,
-    );
+    let normalized =
+        crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
     }

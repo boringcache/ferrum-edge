@@ -170,8 +170,8 @@ fn h3_cross_protocol_grpc_reject_writer_is_trailers_only() {
 #[test]
 fn h3_cross_protocol_grpc_reject_headers_emit_each_cookie() {
     use ferrum_edge::proxy::headers::apply_response_headers;
-    use http::header::SET_COOKIE;
     use http::StatusCode;
+    use http::header::SET_COOKIE;
     use std::collections::HashMap;
 
     let headers = HashMap::from([
@@ -183,8 +183,7 @@ fn h3_cross_protocol_grpc_reject_headers_emit_each_cookie() {
         ),
         ("x-custom".to_string(), "keep".to_string()),
     ]);
-    let response = http::Response::builder()
-        .status(StatusCode::OK);
+    let response = http::Response::builder().status(StatusCode::OK);
     let response = apply_response_headers(response, &headers)
         .body(())
         .expect("cross-protocol gRPC reject header block");
@@ -196,7 +195,10 @@ fn h3_cross_protocol_grpc_reject_headers_emit_each_cookie() {
         .collect::<Vec<_>>();
     assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
     assert_eq!(
-        response.headers().get("x-custom").and_then(|v| v.to_str().ok()),
+        response
+            .headers()
+            .get("x-custom")
+            .and_then(|v| v.to_str().ok()),
         Some("keep")
     );
 }
