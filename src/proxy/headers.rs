@@ -850,6 +850,11 @@ impl GatewayOwnedResponseHeaders {
         self.0 & bit != 0
     }
 
+    /// Build the bitset from field names. Production callers use
+    /// [`Self::insert`] at the point of each builder write; this name-driven
+    /// form exists so external tests can reach the real name-to-variant mapping
+    /// through [`crate::_test_support`] rather than restating it.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; external tests call via that seam.
     pub(crate) fn from_names(names: &[String]) -> Self {
         let mut owned = Self::default();
         for name in names {

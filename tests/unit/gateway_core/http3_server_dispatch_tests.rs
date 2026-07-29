@@ -1834,9 +1834,32 @@ fn the_trailer_reconciliation_exempts_no_field_name() {
         !body.contains("continue;"),
         "the reconciliation must reach the governance decision for every trailer name"
     );
+    // Governance stays the union of every independent signal. Asserted term by
+    // term rather than as one formatted line so `cargo fmt` rewrapping the
+    // expression cannot silently retire the contract.
+    let union = body
+        .split("let governed = ")
+        .nth(1)
+        .expect("governance union")
+        .split(';')
+        .next()
+        .expect("bounded governance union");
+    for term in [
+        "explicitly_named",
+        "prefix_owned",
+        "gateway_owned",
+        "unbounded_policy",
+        "witness.was_mutated(",
+    ] {
+        assert!(
+            union.contains(term),
+            "governance must keep the {term} signal in its union: {union}"
+        );
+    }
     assert!(
-        body.contains("explicitly_named || unbounded_policy || witness.was_mutated("),
-        "governance stays the union of declaration, fail-closed arm, and observed mutation"
+        !union.contains("&&"),
+        "the governance signals must be OR-ed; ANDing any pair would let one \
+         signal veto another: {union}"
     );
 }
 
