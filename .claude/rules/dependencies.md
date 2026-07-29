@@ -40,8 +40,14 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
   `CI_FUZZ_SMOKE_JOB` (the whole `fuzz-smoke` job in `ci.yml`) and
   `FUZZ_WORKFLOW` (the whole of `.github/workflows/fuzz.yml`). Either may be
   absent before initial adoption; once present on the trusted base, pull
-  requests may neither remove nor alter it. A committed
-  `.cargo/config[.toml]` below the repository root is rejected outright.
+  requests may neither remove nor alter it. Adoption additionally admits exactly
+  three byte-exact, anchored lines wiring `fuzz-smoke` into the required `test`
+  aggregate (`CI_FUZZ_SMOKE_AGGREGATE_INSERTIONS`: the `needs` entry, the
+  `add_row "Fuzz Smoke"` row, and the `require_success "Fuzz Smoke"` assertion,
+  each immediately after its `lint` counterpart); the rest of the aggregate is
+  still compared byte for byte, and the wiring cannot be removed once adopted. A
+  committed `.cargo/config[.toml]` below the repository root is rejected
+  outright.
 
 ## Drift Guard
 
