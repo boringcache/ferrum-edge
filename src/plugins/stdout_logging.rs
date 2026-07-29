@@ -147,10 +147,7 @@ impl StdoutLogging {
         Self::flat_filter_matches_stream(&filter.flat, summary)
     }
 
-    fn flat_filter_matches_transaction(
-        filter: &FlatFilter,
-        summary: &TransactionSummary,
-    ) -> bool {
+    fn flat_filter_matches_transaction(filter: &FlatFilter, summary: &TransactionSummary) -> bool {
         if let Some(min) = filter.status_code_min
             && summary.response_status_code < min
         {
@@ -172,10 +169,7 @@ impl StdoutLogging {
         true
     }
 
-    fn flat_filter_matches_stream(
-        filter: &FlatFilter,
-        summary: &StreamTransactionSummary,
-    ) -> bool {
+    fn flat_filter_matches_stream(filter: &FlatFilter, summary: &StreamTransactionSummary) -> bool {
         if filter.status_code_min.is_some() || filter.status_code_max.is_some() {
             return false;
         }

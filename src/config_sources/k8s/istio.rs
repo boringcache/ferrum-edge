@@ -8,15 +8,15 @@ use crate::modes::mesh::config::{
     AppProtocol, ConditionMatch, JwtHeader, MeshAccessLoggingConfig, MeshConsistentHash,
     MeshCorsOriginMatch, MeshCorsPolicy, MeshDestinationRule, MeshEndpoint, MeshJwtRule,
     MeshLoadBalancer, MeshLocalityDistribute, MeshLocalityFailover, MeshLocalityLbSetting,
-    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig, MeshRequestAuthentication,
-    MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress, MeshSimpleLb, MeshSubset,
-    MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig, MeshTrafficPolicy,
-    MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride, MtlsMode,
-    PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch, Resolution,
-    ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch, TagOverrideOperation,
-    TelemetryTracingMode, TracingProvider, Workload, WorkloadPort, WorkloadSelector,
-    is_mesh_condition_ip_key, is_supported_mesh_condition_key, mesh_condition_has_values,
-    validate_mesh_condition_ip_block,
+    MeshMetricsConfig, MeshOutlierDetection, MeshPolicy, MeshProxyConfig,
+    MeshRequestAuthentication, MeshRule, MeshSidecar, MeshSidecarEgress, MeshSidecarIngress,
+    MeshSimpleLb, MeshSubset, MeshTelemetryConfig, MeshTelemetryResource, MeshTracingConfig,
+    MeshTrafficPolicy, MeshTrafficPolicyTls, MeshVirtualServiceCorsPolicy, MetricTagOverride,
+    MtlsMode, PeerAuthentication, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
+    Resolution, ServiceEntry, ServiceEntryLocation, ServicePort, SourceNegationMatch,
+    TagOverrideOperation, TelemetryTracingMode, TracingProvider, Workload, WorkloadPort,
+    WorkloadSelector, is_mesh_condition_ip_key, is_supported_mesh_condition_key,
+    mesh_condition_has_values, validate_mesh_condition_ip_block,
 };
 
 use super::{
@@ -7626,9 +7626,10 @@ mod tests {
             .expect_err("unsupported duration identifier should fail closed");
         assert!(filter.contains("unsupported identifier"));
 
-        let filter = parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
-            .expect("parses")
-            .expect("filter");
+        let filter =
+            parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
+                .expect("parses")
+                .expect("filter");
         assert!(filter.expression.is_some());
     }
 
@@ -7698,12 +7699,7 @@ mod tests {
         )
         .expect("removed translate");
 
-        let initial_filter = initial
-            .config
-            .mesh
-            .as_ref()
-            .unwrap()
-            .telemetry_resources[0]
+        let initial_filter = initial.config.mesh.as_ref().unwrap().telemetry_resources[0]
             .config
             .access_logging
             .as_ref()
@@ -7713,12 +7709,7 @@ mod tests {
             .unwrap();
         assert!(initial_filter.expression.is_some());
 
-        let updated_filter = updated
-            .config
-            .mesh
-            .as_ref()
-            .unwrap()
-            .telemetry_resources[0]
+        let updated_filter = updated.config.mesh.as_ref().unwrap().telemetry_resources[0]
             .config
             .access_logging
             .as_ref()
@@ -7731,12 +7722,7 @@ mod tests {
         assert_eq!(updated_filter.status_code_max, Some(499));
 
         assert!(
-            removed
-                .config
-                .mesh
-                .as_ref()
-                .unwrap()
-                .telemetry_resources[0]
+            removed.config.mesh.as_ref().unwrap().telemetry_resources[0]
                 .config
                 .access_logging
                 .as_ref()

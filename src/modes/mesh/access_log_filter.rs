@@ -30,17 +30,11 @@ pub enum AccessLogFilterExpr {
         right: Box<AccessLogFilterExpr>,
     },
     #[serde(rename = "status_code_min")]
-    StatusCodeMin {
-        value: u16,
-    },
+    StatusCodeMin { value: u16 },
     #[serde(rename = "status_code_max")]
-    StatusCodeMax {
-        value: u16,
-    },
+    StatusCodeMax { value: u16 },
     #[serde(rename = "min_latency_ms")]
-    MinLatencyMs {
-        value: u64,
-    },
+    MinLatencyMs { value: u64 },
     #[serde(rename = "errors_only")]
     ErrorsOnly,
 }
@@ -95,9 +89,7 @@ pub fn evaluate_access_log_filter_expr(
         }
         AccessLogFilterExpr::StatusCodeMin { value } => ctx.response_status_code >= *value,
         AccessLogFilterExpr::StatusCodeMax { value } => ctx.response_status_code <= *value,
-        AccessLogFilterExpr::MinLatencyMs { value } => {
-            ctx.latency_total_ms >= (*value as f64)
-        }
+        AccessLogFilterExpr::MinLatencyMs { value } => ctx.latency_total_ms >= (*value as f64),
         AccessLogFilterExpr::ErrorsOnly => ctx.is_terminal_failure,
     }
 }
@@ -211,9 +203,7 @@ impl<'a> ExpressionParser<'a> {
             let expr = self.parse_expression()?;
             self.skip_whitespace();
             if !self.consume_token(")")? {
-                return Err(
-                    "Telemetry access log filter expression has unclosed '('".to_string(),
-                );
+                return Err("Telemetry access log filter expression has unclosed '('".to_string());
             }
             self.paren_depth -= 1;
             return Ok(expr);
@@ -227,7 +217,8 @@ impl<'a> ExpressionParser<'a> {
     fn parse_atom(&mut self) -> Result<ComparisonAtom, String> {
         self.skip_whitespace();
         let start = self.pos;
-        if self.starts_with_identifier("response.code") || self.starts_with_identifier("response.status")
+        if self.starts_with_identifier("response.code")
+            || self.starts_with_identifier("response.status")
         {
             self.pos += if self.starts_with_identifier("response.code") {
                 "response.code".len()
@@ -235,15 +226,15 @@ impl<'a> ExpressionParser<'a> {
                 "response.status".len()
             };
             self.skip_whitespace();
-            let comparison = self
-                .parse_numeric_comparison("Telemetry access log response.code filter")?;
+            let comparison =
+                self.parse_numeric_comparison("Telemetry access log response.code filter")?;
             return Ok(ComparisonAtom::StatusCode(comparison));
         }
         if self.starts_with_identifier("response.duration") {
             self.pos += "response.duration".len();
             self.skip_whitespace();
-            let comparison = self
-                .parse_duration_comparison("Telemetry access log response.duration filter")?;
+            let comparison =
+                self.parse_duration_comparison("Telemetry access log response.duration filter")?;
             return Ok(ComparisonAtom::Duration(comparison));
         }
 
@@ -310,7 +301,9 @@ impl<'a> ExpressionParser<'a> {
         }
         if !self.peek_is_ascii_digit() {
             let fragment = self.input.get(start..self.pos).unwrap_or("");
-            return Err(format!("{field} comparison value '{fragment}' is not a number"));
+            return Err(format!(
+                "{field} comparison value '{fragment}' is not a number"
+            ));
         }
         while self.peek_is_ascii_digit() {
             self.pos += 1;
@@ -359,9 +352,7 @@ impl<'a> ExpressionParser<'a> {
             return Ok(());
         }
         if self.input[self.pos..].starts_with(")") {
-            return Err(
-                "Telemetry access log filter expression has unmatched ')'".to_string(),
-            );
+            return Err("Telemetry access log filter expression has unmatched ')'".to_string());
         }
         let fragment = self.remaining_identifier_prefix(self.pos);
         Err(format!(
@@ -473,10 +464,7 @@ fn flatten_expr(expr: AccessLogFilterExpr) -> AccessLogFilterExpr {
                 (AccessLogFilterExpr::Or { left: l, right: r }, other)
                 | (other, AccessLogFilterExpr::Or { left: l, right: r }) => {
                     flatten_expr(AccessLogFilterExpr::Or {
-                        left: Box::new(flatten_expr(AccessLogFilterExpr::Or {
-                            left: l,
-                            right: r,
-                        })),
+                        left: Box::new(flatten_expr(AccessLogFilterExpr::Or { left: l, right: r })),
                         right: Box::new(other),
                     })
                 }
@@ -536,9 +524,12 @@ fn apply_atom_to_filter(
             merge_status_code_max(&mut filter.status_code_max, i64::from(*value))?;
         }
         AccessLogFilterExpr::MinLatencyMs { value } => {
-            merge_min_latency_ms(&mut filter.min_latency_ms, i64::try_from(*value).map_err(
-                |_| "Telemetry access log duration filter value must be non-negative".to_string(),
-            )?)?;
+            merge_min_latency_ms(
+                &mut filter.min_latency_ms,
+                i64::try_from(*value).map_err(|_| {
+                    "Telemetry access log duration filter value must be non-negative".to_string()
+                })?,
+            )?;
         }
         AccessLogFilterExpr::ErrorsOnly => filter.errors_only = true,
         AccessLogFilterExpr::And { .. } | AccessLogFilterExpr::Or { .. } => {
@@ -582,7 +573,9 @@ fn status_comparison_to_expr(comparison: Comparison) -> Result<AccessLogFilterEx
     }
 }
 
-fn duration_comparison_to_expr(comparison: DurationComparison) -> Result<AccessLogFilterExpr, String> {
+fn duration_comparison_to_expr(
+    comparison: DurationComparison,
+) -> Result<AccessLogFilterExpr, String> {
     match comparison {
         DurationComparison::Gte(n) => Ok(AccessLogFilterExpr::MinLatencyMs {
             value: duration_value(n)?,
@@ -663,9 +656,10 @@ mod tests {
 
     #[test]
     fn errors_or_slow_canonicalizes_to_or_tree() {
-        let filter = parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
-            .expect("parses")
-            .expect("filter");
+        let filter =
+            parse_access_log_filter_expression("response.code >= 500 || response.duration > 1000")
+                .expect("parses")
+                .expect("filter");
         let expr = filter.expression.expect("uses expression tree");
         assert_eq!(
             expr,
@@ -678,9 +672,10 @@ mod tests {
 
     #[test]
     fn pure_and_stays_flat() {
-        let filter = parse_access_log_filter_expression("response.code >= 500 && response.duration >= 1000")
-            .expect("parses")
-            .expect("filter");
+        let filter =
+            parse_access_log_filter_expression("response.code >= 500 && response.duration >= 1000")
+                .expect("parses")
+                .expect("filter");
         assert!(filter.expression.is_none());
         assert_eq!(filter.status_code_min, Some(500));
         assert_eq!(filter.min_latency_ms, Some(1000));
