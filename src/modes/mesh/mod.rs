@@ -14696,6 +14696,12 @@ mod tests {
             "FERRUM_MESH_ALLOW_NO_CA",
             "FERRUM_MESH_CAPTURE_UDP_ENABLED",
             "FERRUM_MESH_CAPTURE_UDP_PORT",
+            "FERRUM_MESH_WAYPOINT_NAME",
+            // Shared with the node-agent: when set, NodeWaypoint plans a second
+            // transparent capture listener. Leaving it set after a redirect-on
+            // test would make the redirect-off plan assertion observe two
+            // listeners, and would fail-closed LocalPod node-agent parses.
+            "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES",
         ];
 
         for key in keys {
@@ -14715,10 +14721,14 @@ mod tests {
             unsafe { std::env::set_var("FERRUM_MESH_ALLOW_NO_CA", "true") };
         }
 
-        f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
         for key in keys {
             unsafe { std::env::remove_var(key) };
+        }
+
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
         }
     }
 
@@ -23100,6 +23110,7 @@ mod tests {
                     "secret-padding-for-32-char-min!!",
                 ),
                 ("FERRUM_MESH_TOPOLOGY", "service_waypoint"),
+                ("FERRUM_MESH_WAYPOINT_NAME", "test-waypoint"),
                 ("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", "eth0"),
             ],
             || {

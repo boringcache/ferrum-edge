@@ -30,9 +30,8 @@ use arc_swap::ArcSwap;
 use ferrum_ebpf_common::{BpfCaptureConfig, INBOUND_HBONE_PORT, OUTBOUND_CAPTURE_PORT};
 pub use ferrum_ebpf_common::{
     INCLUDE_PORTS_MAX, IncludePortsPolicy, NODE_WAYPOINT_INBOUND_AUTH_MARK,
-    NODE_WAYPOINT_INGRESS_CAPTURE_PORT, NODE_WAYPOINT_INGRESS_REDIRECT_MARK,
-    NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY, NODE_WAYPOINT_INGRESS_REDIRECT_TABLE,
-    POD_CAPTURE_FLAG_INBOUND_REDIRECT, WorkloadIdentity,
+    NODE_WAYPOINT_INGRESS_REDIRECT_MARK, NODE_WAYPOINT_INGRESS_REDIRECT_RULE_PRIORITY,
+    NODE_WAYPOINT_INGRESS_REDIRECT_TABLE, POD_CAPTURE_FLAG_INBOUND_REDIRECT, WorkloadIdentity,
 };
 
 pub const NODE_AGENT_CAPTURE_STATE_STARTING: &str = "starting";
@@ -1393,6 +1392,7 @@ impl EbpfBackend for MockEbpfBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
 
     #[test]
     fn fallback_mode_parse_valid() {

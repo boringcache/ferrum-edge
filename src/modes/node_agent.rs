@@ -7240,17 +7240,32 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let previous: Vec<(&str, Option<std::ffi::OsString>)> = vars
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // Always isolate vars that other modules' tests may leave set. Restoring
+        // only the caller's list is not enough: a leaked
+        // `FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES` from a mesh test would
+        // fail-closed every LocalPod `from_env_config` parse and poison the
+        // env lock for the rest of this module.
+        let isolated_keys = ["FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES"];
+        let mut previous: Vec<(&str, Option<std::ffi::OsString>)> = isolated_keys
             .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .map(|key| (*key, std::env::var_os(key)))
             .collect();
+        for (key, _) in vars {
+            if !isolated_keys.iter().any(|isolated| *isolated == *key) {
+                previous.push((*key, std::env::var_os(key)));
+            }
+        }
+        for key in isolated_keys {
+            // SAFETY: this test helper serializes all env mutation in this module.
+            unsafe { std::env::remove_var(key) };
+        }
         for (key, value) in vars {
             // SAFETY: this test helper serializes all env mutation in this module.
             unsafe { std::env::set_var(key, value) };
         }
 
-        let result = f();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
         for (key, value) in previous {
             // SAFETY: this test helper serializes all env mutation in this module.
@@ -7262,7 +7277,10 @@ mod tests {
             }
         }
 
-        result
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn test_failed_enrollment_signature(
@@ -7729,30 +7747,36 @@ mod tests {
     #[test]
     fn ingress_redirect_ifaces_parse_dedupes_and_defaults_to_disabled() {
         // Unset is the default and must disable the redirect entirely.
-        unsafe { std::env::remove_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES") };
-        assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
-        assert!(!node_waypoint_ingress_redirect_configured());
+        with_env_vars(&[], || {
+            assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            assert!(!node_waypoint_ingress_redirect_configured());
+        });
 
-        unsafe {
-            std::env::set_var(
+        with_env_vars(
+            &[(
                 "FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES",
                 " eth0 , eth1 ,, eth0 ",
-            )
-        };
-        // Trimmed, empty entries dropped, and DEDUPED — attaching the same
-        // classifier twice to one interface would install two filters both
-        // trying to assign the same packet.
-        assert_eq!(
-            node_agent_ingress_redirect_ifaces_from_env(),
-            vec!["eth0".to_string(), "eth1".to_string()]
+            )],
+            || {
+                // Trimmed, empty entries dropped, and DEDUPED — attaching the same
+                // classifier twice to one interface would install two filters both
+                // trying to assign the same packet.
+                assert_eq!(
+                    node_agent_ingress_redirect_ifaces_from_env(),
+                    vec!["eth0".to_string(), "eth1".to_string()]
+                );
+                assert!(node_waypoint_ingress_redirect_configured());
+            },
         );
-        assert!(node_waypoint_ingress_redirect_configured());
 
         // An all-whitespace value is equivalent to unset, not to an interface
         // literally named "".
-        unsafe { std::env::set_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", " , ") };
-        assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
-        unsafe { std::env::remove_var("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES") };
+        with_env_vars(
+            &[("FERRUM_NODE_AGENT_INGRESS_REDIRECT_IFACES", " , ")],
+            || {
+                assert!(node_agent_ingress_redirect_ifaces_from_env().is_empty());
+            },
+        );
     }
 
     #[test]
@@ -7779,7 +7803,7 @@ mod tests {
         // listener, and without its port there is no socket to assign.
         assert!(!contract.ingress_redirect_enabled());
 
-        contract.ingress_capture_port = crate::ebpf::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
+        contract.ingress_capture_port = ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT;
         assert!(contract.ingress_redirect_enabled());
         let published = contract.bpf_capture_config();
         assert_eq!(
@@ -7788,7 +7812,7 @@ mod tests {
         );
         assert_eq!(
             published.node_waypoint_ingress_capture_port,
-            crate::ebpf::NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
+            ferrum_ebpf_common::NODE_WAYPOINT_INGRESS_CAPTURE_PORT as u32
         );
         assert_ne!(
             published.node_waypoint_ingress_capture_port, published.hbone_redirect_port,

@@ -740,6 +740,8 @@ mod live_kernel_tests {
     use crate::ebpf::kernel_probe::probe_kernel;
     use crate::ebpf::{BPF_ORIG_DST4_PIN_PATH, EbpfBackend};
     use aya::maps::{HashMap as BpfHashMap, Map, MapData};
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    use aya::programs::{SchedClassifier, TcAttachType};
     use ferrum_ebpf_common::{OrigDst4, OrigDstKey, WorkloadIdentity};
     use std::fs;
     use std::net::Ipv4Addr;
@@ -994,11 +996,11 @@ mod live_kernel_tests {
         backend
             .attach_ingress_redirect(&veth.name)
             .expect("attach ferrum_tc_ingress_redirect to the scratch veth ingress hook");
-        let attached_filters = tc_ingress_filters(&veth.name);
+        let attached = ingress_redirect_classifier_visible(&veth.name);
         backend
             .detach_ingress_redirect()
             .expect("detach ferrum_tc_ingress_redirect");
-        let detached_filters = tc_ingress_filters(&veth.name);
+        let detached_gone = !ingress_redirect_classifier_visible(&veth.name);
 
         // Clearing must succeed for a pod that was scoped and for one that was
         // never scoped (teardown runs on both).
@@ -1021,15 +1023,14 @@ mod live_kernel_tests {
         backend.cleanup_all().expect("cleanup BPF state");
 
         assert!(
-            attached_filters.contains("ferrum_tc_ingress_redirect")
-                || attached_filters.contains("bpf"),
+            attached,
             "the classifier must be visible on the interface's tc ingress hook after attach \
-             (filters={attached_filters:?})"
+             (classic `tc filter show` and/or TCX query)"
         );
         assert!(
-            !detached_filters.contains("ferrum_tc_ingress_redirect"),
+            detached_gone,
             "detach must remove the classifier; a leftover filter would steer inbound traffic \
-             at a listener that is going away (filters={detached_filters:?})"
+             at a listener that is going away"
         );
     }
 
@@ -1043,6 +1044,31 @@ mod live_kernel_tests {
             .output()
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
             .unwrap_or_default()
+    }
+
+    /// Whether the ingress-redirect classifier is attached on `iface`.
+    ///
+    /// On kernels >= 6.6, aya's `SchedClassifier::attach` uses TCX (BPF links)
+    /// rather than classic clsact filters. TCX programs do **not** appear in
+    /// `tc filter show`, so an empty classic listing after a successful attach
+    /// is expected — query the TCX multi-prog list instead. Older kernels keep
+    /// the netlink/clsact path and remain visible via `tc filter show`.
+    ///
+    /// The scratch interfaces created by these live phases have no other TCX
+    /// programs, so a non-empty TCX query is sufficient evidence of our attach
+    /// (BPF object names are also truncated to 16 bytes, so an exact
+    /// `ferrum_tc_ingress_redirect` match against `ProgramInfo::name` is not
+    /// reliable).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    fn ingress_redirect_classifier_visible(iface: &str) -> bool {
+        let filters = tc_ingress_filters(iface);
+        if filters.contains("ferrum_tc_ingress_redirect") || filters.contains("bpf") {
+            return true;
+        }
+        match SchedClassifier::query_tcx(iface, TcAttachType::Ingress) {
+            Ok((_revision, programs)) => !programs.is_empty(),
+            Err(_) => false,
+        }
     }
 
     /// A scratch network namespace plus the veth pair that reaches it, removed
@@ -1372,7 +1398,7 @@ mod live_kernel_tests {
         let detached = backend.detach_ingress_redirect();
         let scope_cleared = backend.clear_pod_inbound_ports(pod_ip);
         let _ = backend.remove_pod_ip(pod_ip);
-        let post_detach_filters = tc_ingress_filters(&env.host_iface);
+        let post_detach_gone = !ingress_redirect_classifier_visible(&env.host_iface);
         for args in crate::modes::node_agent::ingress_redirect_routing_teardown_commands(false) {
             let argv: Vec<&str> = args.iter().map(String::as_str).collect();
             let _ = ip(&argv);
@@ -1411,8 +1437,8 @@ mod live_kernel_tests {
         detached.expect("detaching the classifier must succeed");
         scope_cleared.expect("clearing the redirect scope must succeed");
         assert!(
-            !post_detach_filters.contains("ferrum_tc_ingress_redirect"),
-            "detach must remove the classifier (filters={post_detach_filters:?})"
+            post_detach_gone,
+            "detach must remove the classifier (classic tc filter and/or TCX query)"
         );
         assert!(
             post_detach_stdout.is_empty(),
