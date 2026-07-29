@@ -4908,30 +4908,24 @@ impl Plugin for McpGateway {
                 return self.reject_invalid_tool_result(ctx, None, "tool result is not valid JSON");
             }
         };
+        let response_id = valid_json_rpc_response_id(&value);
         // Preserve only well-formed, error-only JSON-RPC responses. Merely
         // adding an `error` key must not let an upstream bypass validation of
         // a simultaneously supplied tool result.
-        if value.get("result").is_none()
-            && value.get("error").is_some_and(|error| {
-                error.as_object().is_some_and(|object| {
-                    object.get("code").and_then(Value::as_i64).is_some()
-                        && object.get("message").and_then(Value::as_str).is_some()
-                })
-            })
-        {
+        if is_well_formed_json_rpc_error_response(&value) {
             return PluginResult::Continue;
         }
         if value.get("result").is_some() && value.get("error").is_some() {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "tools/call response contains both result and error",
             );
         }
         let Some(result) = value.get("result") else {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "tools/call response missing result",
             );
         };
@@ -4947,7 +4941,7 @@ impl Plugin for McpGateway {
         let Some((public_name, _)) = ctx.mcp_trusted_tool_name_rewrite.clone() else {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "missing trusted tool identity for result validation",
             );
         };
@@ -4956,7 +4950,7 @@ impl Plugin for McpGateway {
             None => {
                 return self.reject_invalid_tool_result(
                     ctx,
-                    value.get("id").cloned(),
+                    response_id,
                     "missing session binding for result validation",
                 );
             }
@@ -4970,7 +4964,7 @@ impl Plugin for McpGateway {
             None => {
                 return self.reject_invalid_tool_result(
                     ctx,
-                    value.get("id").cloned(),
+                    response_id,
                     "missing catalog version for result validation",
                 );
             }
@@ -4982,7 +4976,7 @@ impl Plugin for McpGateway {
         else {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "catalog unavailable for result validation",
             );
         };
@@ -4990,14 +4984,14 @@ impl Plugin for McpGateway {
         if catalog.version != expected_catalog_version {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "catalog changed before tool result validation",
             );
         }
         let Some(entry) = catalog.tools.get(&public_name) else {
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "tool missing from catalog during result validation",
             );
         };
@@ -5005,7 +4999,7 @@ impl Plugin for McpGateway {
             // Staged flag requires a compiled schema; absence is fail-closed.
             return self.reject_invalid_tool_result(
                 ctx,
-                value.get("id").cloned(),
+                response_id,
                 "tool output schema unavailable during result validation",
             );
         };
@@ -5016,7 +5010,7 @@ impl Plugin for McpGateway {
         ) {
             Ok(payload) => payload,
             Err(reason) => {
-                return self.reject_invalid_tool_result(ctx, value.get("id").cloned(), reason);
+                return self.reject_invalid_tool_result(ctx, response_id, reason);
             }
         };
         match validate_json_schema(validator, &payload) {
@@ -5034,7 +5028,7 @@ impl Plugin for McpGateway {
                 // embed credentials; only a coarse failure marker is emitted.
                 self.reject_invalid_tool_result(
                     ctx,
-                    value.get("id").cloned(),
+                    response_id,
                     "tool result failed outputSchema validation",
                 )
             }
@@ -5355,6 +5349,32 @@ fn parse_mcp_envelope_value(value: &Value) -> Result<McpEnvelope, String> {
         result,
         error,
         message_kind,
+    })
+}
+
+fn valid_json_rpc_response_id(value: &Value) -> Option<Value> {
+    value
+        .as_object()?
+        .get("id")
+        .filter(|id| id.is_null() || id.is_string() || id.is_number())
+        .cloned()
+}
+
+fn is_well_formed_json_rpc_error_response(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || object.contains_key("result")
+        || valid_json_rpc_response_id(value).is_none()
+    {
+        return false;
+    }
+    object.get("error").is_some_and(|error| {
+        error.as_object().is_some_and(|error| {
+            error.get("code").and_then(Value::as_i64).is_some()
+                && error.get("message").and_then(Value::as_str).is_some()
+        })
     })
 }
 

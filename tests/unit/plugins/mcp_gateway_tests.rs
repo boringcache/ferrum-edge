@@ -7912,19 +7912,106 @@ async fn validate_tool_results_preserves_json_rpc_protocol_errors() {
     .unwrap()
     .unwrap();
     let session_id = initialize(&plugin).await;
-    let mut ctx = route_validated_tool_call(&plugin, &session_id, 150).await;
 
-    let upstream_response = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": 151,
-        "error": { "code": -32603, "message": "Internal error" }
-    }))
+    for (offset, response_id) in [Value::Null, json!("upstream"), json!(151)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 150 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": response_id,
+            "error": {
+                "code": -32603,
+                "message": "Internal error",
+                "data": {"retryable": false}
+            }
+        }))
+        .unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "null, string, and numeric JSON-RPC ids must be preserved"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validate_tool_results_rejects_malformed_json_rpc_protocol_errors() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
     .unwrap();
-    let headers = known_json_response_headers(&upstream_response);
-    let result = plugin
-        .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
-        .await;
-    assert!(matches!(result, PluginResult::Continue));
+    let session_id = initialize(&plugin).await;
+    let malformed = [
+        (
+            "non-object envelope",
+            json!(["not", "a", "response"]),
+            Value::Null,
+        ),
+        (
+            "missing jsonrpc",
+            json!({"id": 1, "error": {"code": -32603, "message": "bad"}}),
+            json!(1),
+        ),
+        (
+            "wrong jsonrpc",
+            json!({"jsonrpc": "1.0", "id": 2, "error": {"code": -32603, "message": "bad"}}),
+            json!(2),
+        ),
+        (
+            "missing id",
+            json!({"jsonrpc": "2.0", "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "object id",
+            json!({"jsonrpc": "2.0", "id": {}, "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "array id",
+            json!({"jsonrpc": "2.0", "id": [], "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "boolean id",
+            json!({"jsonrpc": "2.0", "id": true, "error": {"code": -32603, "message": "bad"}}),
+            Value::Null,
+        ),
+        (
+            "non-integer error code",
+            json!({"jsonrpc": "2.0", "id": 3, "error": {"code": 1.5, "message": "bad"}}),
+            json!(3),
+        ),
+        (
+            "non-string error message",
+            json!({"jsonrpc": "2.0", "id": 4, "error": {"code": -32603, "message": 4}}),
+            json!(4),
+        ),
+    ];
+
+    for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 160 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(body["id"], expected_id, "{case}");
+    }
 }
 
 #[tokio::test]
