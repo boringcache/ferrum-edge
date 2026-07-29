@@ -4086,7 +4086,7 @@ mod tests {
                 Duration::from_secs(600),
                 "mixed retention is max(native, longest explicit)"
             );
-            let expected_refresh = if note_order.iter().any(|t| *t == Some(5)) {
+            let expected_refresh = if note_order.contains(&Some(5)) {
                 Duration::from_secs(5)
             } else {
                 // default native 60s is shorter than explicit 600s
