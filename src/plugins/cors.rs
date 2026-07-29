@@ -24,11 +24,30 @@ use http::header::HeaderName;
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tracing::{debug, warn};
 use url::Url;
 
 use super::{Plugin, PluginResult, RequestContext};
+
+/// Discrete response fields `finalize_cors_response` can write that sit
+/// outside the open-ended `access-control-` family. Built once per process and
+/// shared by both the per-instance plugin and the cache-internal finalizer.
+///
+/// `vary` is the only such field today: `cors_headers` merges a token list into
+/// it, and a backend trailer could otherwise overwrite that merge. Every
+/// `access-control-*` name — including trailer-only extensions the finite write
+/// list never enumerates — is covered by [`CORS_RESPONSE_POLICY_PREFIXES`].
+static CORS_RESPONSE_POLICY_NAMES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["vary".to_string()]);
+
+/// Open-ended CORS response-header family. Mirrors the case-insensitive
+/// `access-control-` prefix `remove_access_control_headers` strips on every
+/// CORS-owned response, so a trailer-only extension name
+/// (`access-control-allow-private-network`, …) cannot bypass sanitization
+/// merely by being absent from the finite write list and the initial map.
+static CORS_RESPONSE_POLICY_PREFIXES: LazyLock<Vec<String>> =
+    LazyLock::new(|| vec!["access-control-".to_string()]);
 
 const DEFAULT_ALLOWED_METHODS: &[&str] =
     &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -754,6 +773,20 @@ impl Plugin for CorsPlugin {
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
     }
+
+    /// The CORS response headers are the browser's entire cross-origin
+    /// authorization decision. A backend trailer repeating one of them lands
+    /// after `after_proxy` and could hand the client a second, contradictory
+    /// `Access-Control-Allow-Origin` — and a backend that echoes the identical
+    /// value is invisible to observed-mutation reconciliation. Ownership is the
+    /// open-ended `access-control-` prefix `remove_access_control_headers`
+    /// already strips, plus `vary` for the merge outside that family.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
+    }
 }
 
 /// Cache-internal boundary after a contiguous set of CORS instances.
@@ -805,6 +838,16 @@ impl Plugin for CorsFinalizer {
             && name
                 .get(.."access-control-".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("access-control-"))
+    }
+
+    /// Same ownership contract as the per-instance plugin: this finalizer is
+    /// the phase that actually writes the deferred CORS response headers, so it
+    /// declares the same prefix family plus `vary`.
+    fn response_trailer_policy(&self) -> super::ResponseTrailerPolicy<'_> {
+        super::ResponseTrailerPolicy::NamesAndPrefixes {
+            names: &CORS_RESPONSE_POLICY_NAMES,
+            prefixes: &CORS_RESPONSE_POLICY_PREFIXES,
+        }
     }
 }
 
