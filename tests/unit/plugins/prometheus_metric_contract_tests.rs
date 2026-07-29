@@ -900,7 +900,7 @@ fn production_type_literals_are_inventoried_with_matching_types() {
 #[test]
 fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
     let contract = load_contract();
-    let synthetic = r#"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"#;
+    let synthetic = r##"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"##;
     let detected = type_literals_in_rust_source(synthetic);
     assert!(
         detected.contains_key("ferrum_contract_mutation_missing_total"),
