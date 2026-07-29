@@ -1662,26 +1662,51 @@ impl MetricsRegistry {
     /// Render metrics in Prometheus exposition format.
     /// Returns a cached result if the cache is still fresh (within render_cache_ttl_secs).
     /// Also runs lazy stale-entry eviction on each cache miss to bound memory growth.
+    ///
+    /// NodeWaypoint ADR process-static counters are appended **after** the
+    /// cache lookup so a scrape always observes the latest handshake / identity
+    /// / policy samples. Those producers live outside this registry and do not
+    /// invalidate `render_cache`; folding them into the cached body made live
+    /// before/after probes within `render_cache_ttl_secs` miss counter movement
+    /// (issue #3334 / PR #3388 live gate).
     pub fn render(&self) -> String {
         // Check cache
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
         let cached = self.render_cache.load();
-        if let Some((generated_at, ref output)) = **cached
+        let mut output = if let Some((generated_at, ref output)) = **cached
             && generated_at.elapsed().as_secs() < ttl_secs
         {
-            return output.clone();
-        }
+            output.clone()
+        } else {
+            // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
+            let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+            self.evict_stale(stale_ttl);
 
-        // Lazy eviction: piggyback on cache-miss (at most once per render_cache_ttl_secs)
-        let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-        self.evict_stale(stale_ttl);
+            let output = self.render_uncached();
 
-        let output = self.render_uncached();
+            self.render_cache
+                .store(Arc::new(Some((Instant::now(), output.clone()))));
 
-        self.render_cache
-            .store(Arc::new(Some((Instant::now(), output.clone()))));
-
+            output
+        };
+        self.append_node_waypoint_observability_prometheus(&mut output);
         output
+    }
+
+    /// Append NodeWaypoint ADR series from the live process-static atomics.
+    ///
+    /// Kept off the render cache so `/metrics` scrapes see increments immediately.
+    fn append_node_waypoint_observability_prometheus(&self, output: &mut String) {
+        let ns_label = self
+            .namespace_label
+            .read()
+            .map(|l| l.clone())
+            .unwrap_or_default();
+        let gateway_ns_label = gateway_namespace_label(&ns_label);
+        crate::modes::mesh::node_waypoint_observability::render_prometheus(
+            output,
+            &gateway_ns_label,
+        );
     }
 
     /// Render metrics without caching. Used internally and for testing.
@@ -2450,6 +2475,8 @@ impl MetricsRegistry {
             &mut output,
             &gateway_ns_label,
         );
+        // NodeWaypoint ADR counters are appended in `render()` outside the
+        // cache — do not fold them into this cached body.
 
         if let Some(snapshot) = self.database_delta_poll_metrics_snapshot() {
             output.push_str(

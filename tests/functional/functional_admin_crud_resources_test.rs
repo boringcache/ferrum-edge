@@ -483,6 +483,181 @@ async fn test_admin_restore_persists_normalized_canonical_fields_mongodb() {
 
 #[tokio::test]
 #[ignore]
+async fn test_admin_backup_restore_api_specs_roundtrip_mongodb() {
+    // Hosted-CI coverage for issue #2424 on the MongoDB path.
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    let mongo_host_port = host_port_from_db_url(&mongo_url);
+    if !continue_if_backend_available(
+        "mongodb",
+        mongodb_is_available(&mongo_url).await,
+        &format!("not available at {mongo_host_port}"),
+    ) {
+        return;
+    }
+
+    let mongo_database = format!("ferrum_restore_specs_{}", Uuid::new_v4().simple());
+    let _mongo_cleanup = MongoDatabaseCleanup::new(mongo_url.clone(), mongo_database.clone());
+
+    let gateway = TestGateway::builder()
+        .mode_database(DbType::Mongo(mongo_url))
+        .env("FERRUM_MONGO_DATABASE", mongo_database)
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .expect("spawn mongodb gateway");
+
+    let client = Client::new();
+    let auth = gateway.auth_header();
+    let openapi = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Mongo Backup API", "version": "1.0.0"},
+        "paths": {
+            "/pets": {
+                "get": {
+                    "responses": {"200": {"description": "ok"}}
+                }
+            }
+        },
+        "x-ferrum-proxy": {
+            "id": "mongo-spec-proxy",
+            "hosts": ["api.example.com"],
+            "listen_path": "/mongo-spec",
+            "backend_scheme": "http",
+            "backend_host": "backend.example.com",
+            "backend_port": 8080
+        }
+    });
+
+    let created = admin_post_json(&client, &gateway, "/api-specs", &auth, openapi.clone()).await;
+    assert!(
+        created.get("id").is_some(),
+        "mongodb api-spec create must succeed: {created}"
+    );
+    let spec_id = created["id"].as_str().expect("spec id").to_string();
+
+    let yaml = r#"
+openapi: 3.1.0
+info:
+  title: Mongo YAML Backup API
+  version: 1.0.0
+paths: {}
+x-ferrum-proxy:
+  id: mongo-yaml-spec-proxy
+  hosts:
+    - yaml-api.example.com
+  listen_path: /mongo-yaml-spec
+  backend_scheme: http
+  backend_host: backend.example.com
+  backend_port: 8080
+"#;
+    let yaml_response = client
+        .post(gateway.admin_url("/api-specs"))
+        .header("Authorization", &auth)
+        .header("Content-Type", "application/yaml")
+        .body(yaml)
+        .send()
+        .await
+        .expect("create MongoDB YAML API spec");
+    let yaml_created = expect_json_success(yaml_response, "POST /api-specs (MongoDB YAML)").await;
+    let yaml_spec_id = yaml_created["id"]
+        .as_str()
+        .expect("YAML spec id")
+        .to_string();
+
+    let mut tenant_openapi = openapi;
+    tenant_openapi["info"]["title"] = json!("Mongo Tenant Backup API");
+    tenant_openapi["x-ferrum-proxy"]["id"] = json!("mongo-tenant-spec-proxy");
+    tenant_openapi["x-ferrum-proxy"]["listen_path"] = json!("/mongo-tenant-spec");
+    let tenant_response = client
+        .post(gateway.admin_url("/api-specs"))
+        .header("Authorization", &auth)
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .json(&tenant_openapi)
+        .send()
+        .await
+        .expect("create other-namespace MongoDB API spec");
+    let tenant_created =
+        expect_json_success(tenant_response, "POST /api-specs (MongoDB tenant-b)").await;
+    let tenant_spec_id = tenant_created["id"]
+        .as_str()
+        .expect("tenant spec id")
+        .to_string();
+
+    let backup = admin_get_json(&client, &gateway, "/backup", &auth).await;
+    assert_eq!(backup["counts"]["api_specs"], 2);
+    assert_eq!(backup["api_specs"]["section_version"], "1");
+    let backup_items = backup["api_specs"]["items"]
+        .as_array()
+        .expect("MongoDB backup API spec items");
+    let backed_ids: Vec<&str> = backup_items
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    assert!(backed_ids.contains(&spec_id.as_str()));
+    assert!(backed_ids.contains(&yaml_spec_id.as_str()));
+    assert!(
+        !backed_ids.contains(&tenant_spec_id.as_str()),
+        "MongoDB backup must remain namespace-scoped: {backup}"
+    );
+    assert!(
+        backup_items
+            .iter()
+            .any(|item| item["spec_format"] == "json"),
+        "MongoDB backup must include the JSON format: {backup}"
+    );
+    assert!(
+        backup_items
+            .iter()
+            .any(|item| item["spec_format"] == "yaml"),
+        "MongoDB backup must include the YAML format: {backup}"
+    );
+
+    let restore = admin_post_json(&client, &gateway, "/restore?confirm=true", &auth, backup).await;
+    assert_eq!(
+        restore["restored"]["api_specs"], 2,
+        "mongodb restore must recreate api_specs: {restore}"
+    );
+
+    let listed = admin_get_json(&client, &gateway, "/api-specs", &auth).await;
+    assert_eq!(
+        listed["items"].as_array().map(|a| a.len()),
+        Some(2),
+        "mongodb api_specs must survive backup/restore: {listed}"
+    );
+    let proxy = admin_get_json(&client, &gateway, "/proxies/mongo-spec-proxy", &auth).await;
+    assert_eq!(
+        proxy["api_spec_id"].as_str(),
+        Some(spec_id.as_str()),
+        "mongodb ownership tag must survive restore: {proxy}"
+    );
+    let yaml_proxy =
+        admin_get_json(&client, &gateway, "/proxies/mongo-yaml-spec-proxy", &auth).await;
+    assert_eq!(
+        yaml_proxy["api_spec_id"].as_str(),
+        Some(yaml_spec_id.as_str()),
+        "MongoDB YAML ownership tag must survive restore: {yaml_proxy}"
+    );
+    let tenant_list_response = client
+        .get(gateway.admin_url("/api-specs"))
+        .header("Authorization", &auth)
+        .header("X-Ferrum-Namespace", "tenant-b")
+        .send()
+        .await
+        .expect("list other-namespace MongoDB API specs");
+    let tenant_list =
+        expect_json_success(tenant_list_response, "GET /api-specs (MongoDB tenant-b)").await;
+    assert!(
+        tenant_list["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["id"] == tenant_spec_id)),
+        "restoring the default namespace must leave tenant-b API specs intact: {tenant_list}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     let backend_a = spawn_http_identifying("file-crud-a")
         .await

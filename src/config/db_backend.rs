@@ -1644,10 +1644,13 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// unreachable.
     ///
     /// Reads MUST come from the authoritative primary — a rollback snapshot must
-    /// never be built from a possibly-stale read replica. `api_spec_id` ownership
-    /// tags are cleared (mirroring `load_full_config`): a rollback re-applies the
-    /// config resources as hand-managed, and the `api_specs` rows themselves are
-    /// captured separately by the caller.
+    /// never be built from a possibly-stale read replica. Unlike runtime/CP
+    /// `load_full_config` loads, this snapshot PRESERVES `api_spec_id` ownership
+    /// tags: the caller captures the `api_specs` documents separately (see
+    /// [`Self::list_api_specs_with_content`]) and a rollback recreates the
+    /// managed relationship rather than downgrading it to hand-managed. Do not
+    /// re-add a strip here — it would silently convert every spec-owned resource
+    /// to hand-managed on rollback.
     async fn load_namespace_snapshot(
         &self,
         namespace: &str,
@@ -2171,6 +2174,40 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     ///
     /// This count-only operation must not fetch or deserialize item metadata.
     async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error>;
+
+    /// Load every ApiSpec in a namespace **including** gzip `spec_content`.
+    ///
+    /// Authoritative primary-only path used by backup export and restore
+    /// recovery snapshots. Must never be called from polling loops, gRPC
+    /// distribution, or `GatewayConfig` loading.
+    async fn list_api_specs_with_content(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<ApiSpec>, anyhow::Error>;
+
+    /// Insert API-spec rows after config resources have already been restored.
+    ///
+    /// Does not create proxies/upstreams/plugins (those come from the restore
+    /// payload). Callers must import specs after proxies exist so the SQL FK /
+    /// ownership relationship holds, then call
+    /// [`Self::apply_api_spec_ownership_from_resources`] to stamp `api_spec_id`
+    /// tags that ordinary batch inserts intentionally omit.
+    async fn batch_insert_api_specs(
+        &self,
+        specs: &[ApiSpec],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error>;
+
+    /// Stamp `api_spec_id` ownership tags onto already-inserted restore
+    /// resources. Ordinary batch inserts omit the column so direct admin/batch
+    /// writes cannot forge ownership; restore reapplies tags from the backup.
+    async fn apply_api_spec_ownership_from_resources(
+        &self,
+        proxies: &[Proxy],
+        upstreams: &[Upstream],
+        plugin_configs: &[PluginConfig],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error>;
 
     /// Delete an ApiSpec and all resources it owns.
     ///

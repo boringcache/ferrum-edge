@@ -88,7 +88,11 @@ Unauthenticated callers receive only `status` and `ready` (enough for a readines
 
 In mesh mode, authenticated health detail includes
 `mesh.egress_scope.sidecar_admitted_services` and
-`mesh.egress_scope.sidecar_denied_services`. The authenticated `/overload`
+`mesh.egress_scope.sidecar_denied_services`, plus
+`mesh.node_waypoint_observability` (ADR counters for HBONE handshake phases,
+asserted-identity decisions, destination-policy rejections, missing destination
+metadata, and blocked plaintext fallback attempts; `enabled` is true only for
+`node_waypoint` topology). The authenticated `/overload`
 snapshot also includes `node_waypoint_drops`, with monotonic counters for
 missing/unknown socket-cookie metadata, missing pod/workload identity data,
 unknown pods, and workload-hash mismatches. These fields are omitted from the

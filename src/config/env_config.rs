@@ -1525,8 +1525,9 @@ pub struct EnvConfig {
     /// `node_waypoint` reserves the Phase 2 node-waypoint contract surface.
     pub node_agent_proxy_mode: NodeAgentProxyMode,
     /// Opt in to the node-agent read-only admin listener. Default false so
-    /// node-agent upgrades do not expose unauthenticated admin endpoints on
-    /// the global admin bind address by accident.
+    /// node-agent upgrades do not expose the admin surface on the global bind
+    /// address by accident. Endpoint authentication and observability-detail
+    /// tiers still apply when enabled.
     pub node_agent_admin_enabled: bool,
     /// HBONE redirect/listener port included in the node-agent capture
     /// contract and BPF config map. Default: 15008.

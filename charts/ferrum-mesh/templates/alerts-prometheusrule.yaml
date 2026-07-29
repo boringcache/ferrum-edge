@@ -82,6 +82,14 @@ spec:
           annotations:
             summary: Ferrum mesh mTLS handshake failures increased
             description: "mTLS handshake failures are above the configured threshold."
+        - alert: FerrumMeshNodeWaypointHboneHandshakeFailureSpike
+          expr: sum(rate(ferrum_mesh_node_waypoint_hbone_handshakes_total{result="failure"}[5m])) > {{ .Values.observability.alerts.mtlsHandshakeFailureRatePerSecond }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Ferrum NodeWaypoint HBONE handshake failures increased
+            description: "NodeWaypoint HBONE handshake failures (inbound_tls, inbound_connect, or outbound_dial) are above the configured threshold."
         - alert: FerrumMeshPolicyDenySpike
           expr: sum(rate(ferrum_mesh_requests_total{response_code="403"}[5m])) > {{ .Values.observability.alerts.policyDenyRatePerSecond }}
           for: 5m
