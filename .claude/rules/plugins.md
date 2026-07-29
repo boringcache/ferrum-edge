@@ -162,9 +162,17 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
   TTL/retention math uses the saturating helpers in
   `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
   `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
-  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
-  rate-limit plugin roots are closed key sets; AI and WebSocket rate-limit
-  roots remain intentionally open and must stay in parity with OpenAPI.
+  timestamp per request. All six Redis-backed rate-limit plugin roots
+  (`rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, `udp_rate_limiting`) are closed key sets enforced by
+  `reject_unknown_keys` against the plugin's `*_CONFIG_KEYS` allowlist, and each
+  must stay in exact parity with an `additionalProperties: false` OpenAPI
+  schema. A new root key therefore lands in the runtime allowlist,
+  `openapi.yaml`, and `docs/plugins.md` together — none of these roots accepts
+  an undeclared property. Parity is enforced by
+  `rate_limiter_configs_are_closed_and_bounded_in_openapi` and
+  `graphql_config_schema_matches_runtime_validation` in
+  `tests/unit/openapi_yaml_tests.rs`.
 - Redis outage behavior is `redis_failure_policy` (`fail_closed` default,
   `local_fallback` opt-in); only the opt-in falls back to in-memory. The client
   reconnects in the background either way. `request_deduplication` expresses the
