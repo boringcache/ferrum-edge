@@ -172,7 +172,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config fields:** `max_entries`, `max_entry_size_bytes`, and `max_total_size_bytes` (in plugin config JSON).
 
-**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. Stores hold a narrow admission/accounting lock so `max_total_size_bytes` is an exact upper bound across concurrent stores and replacements. When a store would exceed `max_total_size_bytes`, expired entries are reclaimed first and the store is skipped only if it still does not fit. When the cache exceeds `max_entries`, expired entries are evicted first, then oldest entries are removed to bring the count below the limit.
+**Cleanup mechanism:** Freshness-based expiration (`ttl_seconds` fallback plus backend `Cache-Control`, `Age`, and `Date`). Cache hits emit a current `Age` header. Stores hold a narrow admission/accounting lock so `max_total_size_bytes` is an exact upper bound on the plugin's accounted approximate entry footprints across concurrent stores and replacements. When a store would exceed `max_total_size_bytes`, expired entries are reclaimed through an expiration-ordered live index and the store is skipped only if it still does not fit; fresh entries are never displaced for byte admission. When the cache exceeds `max_entries`, oldest entries are removed from the insertion-ordered eviction queue to bring the count below the limit.
 
 ### AI Semantic Cache
 
@@ -277,7 +277,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 |--------|-------------|---------|-------------|
 | `response_caching` | `max_entries` | `10000` | Maximum cached responses |
 | `response_caching` | `max_entry_size_bytes` | `1048576` | Maximum single cached response body |
-| `response_caching` | `max_total_size_bytes` | `104857600` | Exact maximum retained response-entry bytes |
+| `response_caching` | `max_total_size_bytes` | `104857600` | Maximum accounted approximate retained response-entry footprint |
 | `ai_semantic_cache` | `max_entries` | `10000` | Maximum cached LLM responses |
 | `request_deduplication` | `max_entries` | `10000` | Maximum tracked idempotency keys |
 | `request_deduplication` | `max_entry_size_bytes` | `1048576` | Maximum retained completed response entry |
