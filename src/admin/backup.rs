@@ -1435,9 +1435,14 @@ mod tests {
         let plugin: PluginConfig =
             serde_json::from_value(owned_proxy_scoped_plugin("plug-1", "proxy-1", "spec-1"))
                 .expect("plugin");
-        let err =
-            validate_restore_api_specs_section(&section(), &proxies, &[], &[plugin.clone()], 25)
-                .expect_err("unassociated spec-owned plugin");
+        let err = validate_restore_api_specs_section(
+            &section(),
+            &proxies,
+            &[],
+            std::slice::from_ref(&plugin),
+            25,
+        )
+        .expect_err("unassociated spec-owned plugin");
         assert!(
             err.iter()
                 .any(|e| e.contains("is not associated with owning proxy 'proxy-1'")),

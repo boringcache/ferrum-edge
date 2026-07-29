@@ -207,6 +207,7 @@ pub(crate) fn api_spec_tag_forbidden_char(tag: &str) -> Option<char> {
 /// whitelist invariants) so a crafted backup cannot persist metadata that
 /// ordinary POST/PUT ingestion forbids. Error strings intentionally omit the
 /// hostile field values themselves.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_stored_api_spec_metadata(
     title: Option<&str>,
     info_version: Option<&str>,
