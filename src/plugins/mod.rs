@@ -265,7 +265,7 @@ pub fn apply_initial_response_header_policies(
 
 /// Representation metadata that becomes invalid whenever a buffered response
 /// transform replaces the client-visible bytes.
-const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "accept-ranges",
     "content-range",
     "content-md5",
@@ -282,7 +282,16 @@ const TRANSFORM_INVALIDATED_RESPONSE_HEADERS: &[&str] = &[
     "content-signature",
     "content-signature-input",
     "content-checksum",
+    "x-goog-hash",
+    "x-ms-content-crc64",
 ];
+
+/// Open-ended response-header families invalidated by a representation rewrite.
+///
+/// Kept beside [`TRANSFORM_INVALIDATED_RESPONSE_HEADERS`] so response
+/// transformers and trailer-policy declarations consume the same inventory.
+pub(crate) const TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES: &[&str] =
+    &["x-amz-checksum-", "x-checksum-"];
 
 fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
     value
@@ -295,10 +304,9 @@ fn is_transform_invalidated_response_header(name: &str) -> bool {
     TRANSFORM_INVALIDATED_RESPONSE_HEADERS
         .iter()
         .any(|header| name.eq_ignore_ascii_case(header))
-        || starts_with_ascii_case_insensitive(name, "x-amz-checksum-")
-        || starts_with_ascii_case_insensitive(name, "x-checksum-")
-        || name.eq_ignore_ascii_case("x-goog-hash")
-        || name.eq_ignore_ascii_case("x-ms-content-crc64")
+        || TRANSFORM_INVALIDATED_RESPONSE_HEADER_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ascii_case_insensitive(name, prefix))
 }
 
 /// Whether buffered response bytes may be rewritten while preserving the
@@ -1146,6 +1154,54 @@ impl BufferedInitialResponseHeaderPolicyState {
         }
     }
 }
+
+/// How far a plugin's response-header policy binds the response TRAILER
+/// section.
+///
+/// `after_proxy` and every buffered response-header phase see only the INITIAL
+/// header map. On protocol paths that forward backend trailers after those
+/// phases (buffered and streaming native HTTP/3), a backend trailer carrying a
+/// governed field name re-opens the policy those phases applied — the classic
+/// case is a `security_headers` removal that was a no-op on the initial map
+/// because the backend only ever sent the field as a trailer, so no
+/// observed-mutation diff can see it.
+///
+/// This is a config-time declaration: the plugin cache unions it once per
+/// reload so the request path reads a precomputed name list instead of scanning
+/// the chain.
+#[derive(Debug, Clone, Copy)]
+pub enum ResponseTrailerPolicy<'a> {
+    /// This plugin applies no response-header policy a backend trailer could
+    /// re-open. Correct for observers (logging), authentication, and
+    /// authorization plugins — and the default, because realized response-header
+    /// mutations are reconciled per request regardless of this declaration.
+    None,
+    /// Policy is limited to these canonical lowercase field names. Backend
+    /// trailers carrying one of them are dropped; every other trailer field is
+    /// forwarded unchanged.
+    Names(&'a [String]),
+    /// Exact names plus case-insensitive ASCII prefixes. Use when the sanitizer
+    /// owns an open-ended family together with discrete fields outside it —
+    /// CORS removes every `access-control-*` response header and also rewrites
+    /// `vary`. A trailer whose name equals any `names` entry or starts with any
+    /// `prefixes` entry is dropped; every other trailer field is forwarded.
+    NamesAndPrefixes {
+        names: &'a [String],
+        prefixes: &'a [String],
+    },
+    /// The governed field set is not enumerable at config time. The built-in
+    /// example is `response_transformer`, whose route-override rules are
+    /// published at request time. Trailer-forwarding paths fail closed and drop
+    /// the whole backend trailer section.
+    Unbounded,
+}
+
+/// Shared one-element declaration for the plugins whose `after_proxy` echoes
+/// the gateway-authored `traceparent` (`otel_tracing`, and `workload_metrics`
+/// when it is the mesh tracing plugin). Built once per process so both can hand
+/// out a bounded slice with no per-request allocation.
+pub(crate) static TRACEPARENT_RESPONSE_POLICY_NAMES: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec!["traceparent".to_string()]);
 
 /// How plugin construction or validation failures affect cache publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6931,6 +6987,43 @@ pub trait Plugin: Send + Sync {
         &[]
     }
 
+    /// Declare how far this plugin's response-header policy binds the response
+    /// TRAILER section.
+    ///
+    /// Protocol paths that forward backend trailers after the response-header
+    /// phases (buffered and streaming native HTTP/3) reconcile the trailer
+    /// section against the union of these declarations.
+    ///
+    /// Override this whenever the plugin OWNS a response field — that is,
+    /// whenever a backend trailer carrying the same name would contradict or
+    /// undo the decision — AND the per-request mutation witness could fail to
+    /// see it. The witness only proves "this field changed on the initial header
+    /// map", so it misses exactly two shapes, and both are common:
+    ///
+    /// * A **no-op removal**: the policy removes a field the backend sent only
+    ///   as a trailer, so nothing changes on the initial map (`sse` with
+    ///   `strip_content_length`, `security_headers` with a configured `remove`,
+    ///   `grpc_web` stripping its internal bridge headers).
+    /// * An **idempotent write**: the gateway writes a value the backend already
+    ///   sent verbatim, so the diff is empty (`response_caching`'s guessable
+    ///   `x-cache-status: MISS`, an echoed `traceparent`, a `vary` token merge
+    ///   that was already nominated).
+    ///
+    /// Mutations that do land visibly on the initial headers are reconciled per
+    /// request without any declaration, so plugins that only observe, log,
+    /// authenticate, or authorize correctly keep the
+    /// [`ResponseTrailerPolicy::None`] default and preserve backend trailers
+    /// (issue #2941). Declare the enumerable name set wherever it is
+    /// enumerable; use [`ResponseTrailerPolicy::NamesAndPrefixes`] when an
+    /// open-ended prefix family is owned together with discrete names outside
+    /// it (CORS `access-control-*` plus `vary`); reserve
+    /// [`ResponseTrailerPolicy::Unbounded`] when the governed set cannot be
+    /// listed even that way — currently request-time route overrides from
+    /// `response_transformer`.
+    fn response_trailer_policy(&self) -> ResponseTrailerPolicy<'_> {
+        ResponseTrailerPolicy::None
+    }
+
     /// Returns `true` when this plugin may change the response `Content-Type`
     /// in `after_proxy` for the current request.
     ///
@@ -8452,7 +8545,12 @@ pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
 /// protobuf request/response *targets* come from the config shape, not from the
 /// descriptor file), so `Plugin::requires_request_body_buffering()` on the
 /// shape-only instance is the authoritative runtime answer.
-pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] = &["body_validator"];
+///
+/// `ai_response_guard` is here for the same reason: its runtime constructor
+/// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
+/// answer is the trait default and never depends on that file.
+pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
+    &["ai_response_guard", "body_validator"];
 
 /// Why the request-body-buffering screen could not evaluate a plugin config.
 ///
@@ -8591,6 +8689,8 @@ impl RequestBodyBufferingScreener {
     /// through its shape-only constructor.
     fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
         let answer = match plugin_name {
+            "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
+                .map(|plugin| plugin.requires_request_body_buffering()),
             "body_validator" => body_validator::BodyValidator::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
             // Unreachable today. A name added to the shape-only list without a
@@ -8653,6 +8753,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // installed on data-plane nodes. Mode-aware dependency validation and
         // runtime construction handle the local FileDescriptorSet.
         return body_validator::BodyValidator::validate_config(config);
+    }
+    if name == "ai_response_guard" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_response_guard::AiResponseGuard::validate_config(config);
     }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
