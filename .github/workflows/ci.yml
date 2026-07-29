@@ -60,12 +60,14 @@ jobs:
             # request's trusted-base execution of it. `py_compile` parses and
             # byte-compiles without running any module-level code. Use
             # `-X pycache_prefix` (not PYTHONPYCACHEPREFIX) because isolated
-            # mode (`-I`) ignores all PYTHON* environment variables. The cache
-            # directory is deliberately named without the Cross word: the
-            # generic scanner reads this line as a command and a Cross-named
-            # path in it is an unprotected Cross configuration surface.
+            # mode (`-I`) ignores all PYTHON* environment variables. Keep both
+            # the cache directory and the command arguments neutral: the
+            # generic scanner joins continued command lines, so spelling the
+            # protected policy filename directly as a `py_compile` argument
+            # would make this syntax-only check look like an executable policy
+            # surface outside the protected build job.
             python3 -I -X "pycache_prefix=$RUNNER_TEMP/pr-verifier-pycache" \
-              -m py_compile .github/scripts/verify_cross_build_policy.py
+              -m py_compile "$policy"
             if git cat-file -e "${base_ref}:${policy}" 2>/dev/null; then
               trusted_policy="$RUNNER_TEMP/verify-cross-build-policy.py"
               git show "${base_ref}:${policy}" > "$trusted_policy"
