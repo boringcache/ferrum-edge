@@ -1419,8 +1419,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
         let failed_body = wrap_soap(&failed_token);
         let mut failed_ctx = make_ctx_with_soap_body(&failed_body);
         let mut failed_headers = soap_headers();
-        let failed = run_soap_request_policy(&plugin, &mut failed_ctx, &mut failed_headers)
-            .await;
+        let failed = run_soap_request_policy(&plugin, &mut failed_ctx, &mut failed_headers).await;
         assert_username_token_invalid_credentials(
             &failed,
             &[attempt_username, "alice", "eve-candidate"],
@@ -1431,8 +1430,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
         let valid_body = wrap_soap(&valid_token);
         let mut valid_ctx = make_ctx_with_soap_body(&valid_body);
         let mut valid_headers = soap_headers();
-        let valid = run_soap_request_policy(&plugin, &mut valid_ctx, &mut valid_headers)
-            .await;
+        let valid = run_soap_request_policy(&plugin, &mut valid_ctx, &mut valid_headers).await;
         assert!(
             matches!(valid, PluginResult::Continue),
             "failed attempt for {attempt_username} poisoned the legitimate nonce: {valid:?}"
@@ -1440,8 +1438,7 @@ async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
 
         let mut replay_ctx = make_ctx_with_soap_body(&valid_body);
         let mut replay_headers = soap_headers();
-        let replay = run_soap_request_policy(&plugin, &mut replay_ctx, &mut replay_headers)
-            .await;
+        let replay = run_soap_request_policy(&plugin, &mut replay_ctx, &mut replay_headers).await;
         assert!(is_reject(&replay));
         assert!(reject_body(&replay).contains("nonce replay"));
     }
@@ -1728,6 +1725,11 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
         /// Mutate the SignatureValue bytes after signing to simulate a
         /// forged or randomly damaged signature.
         pub corrupt_signature_value: bool,
+        /// Replace the whole `<saml:NameID>…</saml:NameID>` fragment inside
+        /// `<saml:Subject>`, in both the emitted and the signed view, so a
+        /// Subject with no / blank / duplicate NameID still carries a fully
+        /// valid IdP signature. `""` removes the NameID entirely.
+        pub name_id_fragment: Option<String>,
     }
 
     impl<'a> AssertionBuilder<'a> {
@@ -1752,6 +1754,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 use_sha1_digest: false,
                 corrupt_subject_after_signing: false,
                 corrupt_signature_value: false,
+                name_id_fragment: None,
             }
         }
 
@@ -1812,15 +1815,23 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 self.subject_name_id.to_string()
             };
 
+            let name_id = |value: &str| match self.name_id_fragment.as_deref() {
+                Some(fragment) => fragment.to_string(),
+                None => format!("<saml:NameID>{}</saml:NameID>", value),
+            };
             let body_after_issuer = format!(
-                "<saml:Subject><saml:NameID>{}</saml:NameID>{}</saml:Subject>{}",
-                subject_inner, confirmation, conditions
+                "<saml:Subject>{}{}</saml:Subject>{}",
+                name_id(&subject_inner),
+                confirmation,
+                conditions
             );
 
             // The bytes we actually sign use the ORIGINAL (untampered) subject.
             let signed_body_after_issuer = format!(
-                "<saml:Subject><saml:NameID>{}</saml:NameID>{}</saml:Subject>{}",
-                self.subject_name_id, confirmation, conditions
+                "<saml:Subject>{}{}</saml:Subject>{}",
+                name_id(self.subject_name_id),
+                confirmation,
+                conditions
             );
 
             // The assertion as it looks after enveloped-signature transform —
@@ -2975,7 +2986,8 @@ async fn test_non_envelope_soap_body_rejects() {
     let mut headers = soap_headers();
     let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
     assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("not a SOAP envelope"));
+    let body = reject_body(&result);
+    assert!(body.contains("not a namespace-qualified SOAP Envelope"), "{body}");
 }
 
 #[tokio::test]
@@ -3403,6 +3415,118 @@ mod x509_roundtrip {
         })
     }
 
+    // ── X.509 integrity vs MTOM/XOP attachments ─────────────────────────
+    //
+    // An X.509 policy claims integrity over the message the backend executes.
+    // Ferrum implements no WS-Security attachment-signature transform, so for
+    // a XOP representation the digest it verifies covers the `xop:Include`
+    // element, not the attachment octets that element stands for: an
+    // attacker-selected attachment present during validation is never
+    // detected. Refusing the representation is the honest outcome.
+
+    /// MTOM/XOP `multipart/related` is refused before dispatch, and its body is
+    /// not even buffered.
+    #[tokio::test]
+    async fn mtom_is_refused_when_x509_claims_integrity() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let content_type = "multipart/related; type=\"application/xop+xml\"; \
+                            boundary=MIME_boundary; start=\"<root@example.com>\"";
+        let package = "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             <soap:Envelope/>\r\n\
+             --MIME_boundary--\r\n";
+
+        let mut ctx = make_ctx_with_soap_bytes(package.as_bytes().to_vec(), content_type);
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "a refused representation must not be buffered"
+        );
+        let mut headers = soap_headers_with_content_type(content_type);
+        match run_soap_request_policy(&plugin, &mut ctx, &mut headers).await {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 415);
+                assert!(body.contains("attachment octets"), "got: {body}");
+            }
+            other => panic!("MTOM under an X.509 policy must be refused, got {other:?}"),
+        }
+    }
+
+    /// A bare `application/xop+xml` infoset is the same claim without the
+    /// package, and is refused for the same reason.
+    #[tokio::test]
+    async fn bare_xop_infoset_is_refused_when_x509_claims_integrity() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let content_type = "application/xop+xml; charset=utf-8; type=\"text/xml\"";
+        let body = build_signed_soap_envelope(&cert);
+        let mut ctx = make_ctx_with_soap_bytes(body.into_bytes(), content_type);
+        let mut headers = soap_headers_with_content_type(content_type);
+        match run_soap_request_policy(&plugin, &mut ctx, &mut headers).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 415),
+            other => panic!("bare XOP under an X.509 policy must be refused, got {other:?}"),
+        }
+    }
+
+    /// The refusal is narrow: plain XML representations are unaffected, and a
+    /// policy that authenticates identity rather than asserting message
+    /// integrity keeps accepting XOP.
+    #[tokio::test]
+    async fn the_xop_refusal_is_narrow() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        assert!(
+            matches!(
+                run_soap_request_policy(&plugin, &mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "text/xml under an X.509 policy is still governed and still accepted"
+        );
+
+        // UsernameToken authenticates the caller; it never claimed coverage of
+        // attachment octets, so MTOM/XOP stays available to it.
+        let ut = SoapWsSecurity::new(&username_token_config()).unwrap();
+        let xop_ctx = make_ctx_with_soap_bytes(b"x".to_vec(), "application/xop+xml");
+        assert!(ut.should_buffer_request_body(&xop_ctx));
+
+        let package = "multipart/related; type=\"application/xop+xml\"; boundary=b";
+        let mtom_ctx = make_ctx_with_soap_bytes(b"x".to_vec(), package);
+        assert!(ut.should_buffer_request_body(&mtom_ctx));
+    }
+
+    /// Asking for both in one configuration is asking for integrity Ferrum
+    /// cannot establish, so the explicit pairing is refused at admission.
+    #[test]
+    fn explicit_allow_mtom_with_x509_is_refused_at_admission() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+
+        let mut config = x509_plugin_config(cert_file.path());
+        config["content_type"] = json!({ "allow_mtom": true });
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .expect("allow_mtom alongside x509_signature must be refused");
+        assert!(err.contains("allow_mtom"), "got: {err}");
+
+        // The honest pairing constructs.
+        let mut config = x509_plugin_config(cert_file.path());
+        config["content_type"] = json!({ "allow_mtom": false });
+        assert!(SoapWsSecurity::new(&config).is_ok());
+    }
+
     #[tokio::test]
     async fn valid_rsa_signature_is_accepted() {
         let cert = mint_rsa_cert();
@@ -3520,8 +3644,10 @@ mod x509_roundtrip {
         let cert_file = write_pem_to_tempfile(&cert.cert_pem);
         let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
         let many_nodes = "<N/>".repeat(66_000);
-        let body = build_signed_soap_envelope(&cert)
-            .replace(SIGNED_BODY_OPEN_TAG, &format!("{SIGNED_BODY_OPEN_TAG}{many_nodes}"));
+        let body = build_signed_soap_envelope(&cert).replace(
+            SIGNED_BODY_OPEN_TAG,
+            &format!("{SIGNED_BODY_OPEN_TAG}{many_nodes}"),
+        );
         let mut ctx = make_ctx_with_soap_body(&body);
         let mut headers = soap_headers();
 
@@ -6656,7 +6782,9 @@ mod advisory_regressions {
         let mut headers = HashMap::new();
         let result = run_soap_request_policy(&plugin, &mut ctx, &mut headers).await;
         match result {
-            PluginResult::Reject { status_code, body, .. } => {
+            PluginResult::Reject {
+                status_code, body, ..
+            } => {
                 assert_eq!(status_code, 415);
                 assert!(body.contains("missing a Content-Type"), "got: {body}");
             }
@@ -6699,6 +6827,30 @@ mod advisory_regressions {
             Some("multipart/form-data; boundary=application/soap+xml")
         )));
         assert!(!plugin.should_buffer_request_body(&ctx_with("", Some("application/xmlish"))));
+    }
+
+    /// Classification names the representation. A bare `application/xop+xml`
+    /// infoset is distinguishable from plain XML even though both carry the
+    /// whole envelope in the body, because only the XOP forms may reference
+    /// octets that live outside the bytes Ferrum validates.
+    #[test]
+    fn governed_representations_are_named_by_class() {
+        use ferrum_edge::_test_support::soap_classify_request_for_test as classify;
+        let config = strict_username_token_config();
+
+        let xml = classify(&config, Some("text/xml"));
+        assert_eq!(xml, Ok("xml".to_string()));
+
+        let xop = classify(&config, Some("application/xop+xml"));
+        assert_eq!(xop, Ok("xop".to_string()));
+
+        let package = "multipart/related; type=\"application/xop+xml\"; boundary=b";
+        let mtom = classify(&config, Some(package));
+        assert_eq!(mtom, Ok("mtom".to_string()));
+
+        let other = classify(&config, Some("application/json"));
+        let refused = "reject:415:unsupported_media_type".to_string();
+        assert_eq!(other, Ok(refused));
     }
 
     /// MTOM/XOP: the envelope lives in the multipart root part and is
@@ -6863,12 +7015,17 @@ mod advisory_regressions {
     /// runtime policy.
     #[test]
     fn saml_requires_binding_and_replay_configuration() {
+        // A real trust anchor on disk: `trusted_signing_certs` is loaded during
+        // construction, so a nonexistent path would fail admission before any
+        // of the bindings under test could be reached.
+        let bundle = super::saml_fixtures::IdpBundle::new();
+        let signing_cert = bundle.trusted_cert_path.to_str().unwrap();
         let base = json!({
             "timestamp": { "require": false },
             "saml": {
                 "enabled": true,
                 "trusted_issuers": ["https://idp.example.com"],
-                "trusted_signing_certs": ["/nonexistent.pem"],
+                "trusted_signing_certs": [signing_cert],
                 "audience": "https://service.example.com",
                 "recipient": "https://service.example.com/ws"
             },
@@ -6917,20 +7074,20 @@ mod advisory_regressions {
     /// vacuously-satisfiable pairing the advisory describes.
     #[test]
     fn contradictory_signed_timestamp_configuration_is_refused() {
+        // `trusted_certs` is loaded during construction, so the pairing under
+        // test is only reachable behind a trust anchor that actually exists.
+        let bundle = super::saml_fixtures::IdpBundle::new();
         let err = SoapWsSecurity::new(&json!({
             "timestamp": { "require": false },
             "x509_signature": {
                 "enabled": true,
-                "trusted_certs": ["/nonexistent.pem"],
+                "trusted_certs": [bundle.trusted_cert_path.to_str().unwrap()],
                 "require_signed_timestamp": true
             }
         }))
         .err()
         .expect("contradictory timestamp policy must be refused");
-        assert!(
-            err.contains("require_signed_timestamp"),
-            "got: {err}"
-        );
+        assert!(err.contains("require_signed_timestamp"), "got: {err}");
     }
 
     // ── Requirement 6: the authenticated representation is what dispatches ──
@@ -6966,5 +7123,482 @@ mod advisory_regressions {
             PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 500),
             other => panic!("a mutated authenticated body must not dispatch, got {other:?}"),
         }
+    }
+}
+
+// ── Strict MTOM/XOP MIME framing (GHSA-435h-f785-wmm4 residual) ─────────────
+//
+// The package parser decides *which bytes are the SOAP envelope*. Any shape
+// where a conforming backend parser would frame the package differently is a
+// gateway/backend representation split — the exact bypass class the advisory
+// describes — so every one of them fails closed here.
+
+mod mtom_strict_framing {
+    use super::*;
+    use ferrum_edge::_test_support::soap_extract_mtom_root_part_for_test as extract;
+
+    const BOUNDARY: &str = "MIME_boundary";
+    const ROOT_ID: &str = "root@example.com";
+
+    /// A conforming two-part package: an XOP root selectable by `start`, plus
+    /// one opaque attachment.
+    fn package(root_body: &str, attachment_body: &str) -> String {
+        format!(
+            "--MIME_boundary\r\n\
+             Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n\
+             Content-Transfer-Encoding: binary\r\n\
+             Content-ID: <root@example.com>\r\n\
+             \r\n\
+             {root_body}\r\n\
+             --MIME_boundary\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-ID: <attachment@example.com>\r\n\
+             \r\n\
+             {attachment_body}\r\n\
+             --MIME_boundary--\r\n"
+        )
+    }
+
+    /// The resolved root part's body, as text.
+    fn root_of(package: &str, start: Option<&str>) -> String {
+        let resolved = extract(package.as_bytes(), BOUNDARY, start);
+        let (body, _) = resolved.expect("package must resolve");
+        String::from_utf8(body).expect("root part is UTF-8 here")
+    }
+
+    /// The package must fail closed with exactly `class`.
+    fn assert_closed(package: &str, start: Option<&str>, class: &str) {
+        let outcome = extract(package.as_bytes(), BOUNDARY, start);
+        let actual = outcome.err().unwrap_or("<accepted>");
+        assert_eq!(actual, class);
+    }
+
+    /// The conforming shapes still work: `start`-selected and first-part
+    /// selection both resolve the envelope, the root's own Content-Type (which
+    /// carries its charset) comes back with it, and an RFC 2046 preamble is
+    /// ignored rather than inspected.
+    #[test]
+    fn valid_packages_resolve_the_root_envelope() {
+        let package = package("<soap:Envelope/>", "opaque-bytes");
+        assert_eq!(root_of(&package, Some(ROOT_ID)), "<soap:Envelope/>");
+        assert_eq!(root_of(&package, None), "<soap:Envelope/>");
+
+        let resolved = extract(package.as_bytes(), BOUNDARY, Some(ROOT_ID));
+        let (_, content_type) = resolved.expect("package must resolve");
+        assert_eq!(
+            content_type,
+            "application/xop+xml; charset=utf-8; type=\"text/xml\""
+        );
+
+        let with_preamble = format!("this is a MIME preamble\r\n{package}");
+        assert_eq!(root_of(&with_preamble, Some(ROOT_ID)), "<soap:Envelope/>");
+    }
+
+    /// A `--boundary` that is not at the start of a line is payload, not
+    /// framing. The unanchored byte-substring search this replaced truncated
+    /// the envelope at the first such occurrence, so Ferrum validated a prefix
+    /// of the message the backend executed in full.
+    #[test]
+    fn an_embedded_boundary_substring_does_not_reframe_the_root() {
+        let root = "<soap:Envelope><!--MIME_boundary--></soap:Envelope>";
+        let package = package(root, "opaque-bytes");
+        assert_eq!(
+            root_of(&package, Some(ROOT_ID)),
+            root,
+            "a boundary substring inside the envelope is payload"
+        );
+    }
+
+    /// A fake part planted in the preamble must not become the root. With
+    /// first-part selection an unanchored search finds the planted delimiter
+    /// first and returns the attacker's envelope; anchored framing skips it and
+    /// selects the real first part.
+    #[test]
+    fn a_payload_fake_delimiter_cannot_become_the_root() {
+        let real = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        // The planted delimiter is mid-line, so it is not a delimiter line for
+        // any conforming parser.
+        let planted = format!(
+            "preamble --MIME_boundary\r\n\
+             Content-Type: text/xml\r\n\
+             \r\n\
+             <soap:Envelope>forged</soap:Envelope>\r\n\
+             {real}"
+        );
+        assert_eq!(
+            root_of(&planted, None),
+            "<soap:Envelope>real</soap:Envelope>",
+            "an unanchored delimiter must not select a root"
+        );
+        assert_eq!(
+            root_of(&planted, Some(ROOT_ID)),
+            "<soap:Envelope>real</soap:Envelope>"
+        );
+    }
+
+    /// LF-only framing is not MIME framing. A parser that tolerates it and one
+    /// that does not disagree about every part boundary in the package.
+    #[test]
+    fn lf_only_framing_fails_closed() {
+        let raw = package("<soap:Envelope/>", "opaque");
+        let package = raw.replace("\r\n", "\n");
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+        assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// The close-delimiter is mandatory, and nothing boundary-shaped may
+    /// follow it.
+    #[test]
+    fn missing_or_ambiguous_closure_fails_closed() {
+        let complete = package("<soap:Envelope/>", "opaque");
+
+        let unterminated = complete.replace("--MIME_boundary--\r\n", "");
+        assert_closed(&unterminated, Some(ROOT_ID), "malformed_encoding");
+
+        // `--boundary-` is neither a part delimiter nor a close-delimiter.
+        let malformed = complete.replace("boundary--\r\n", "boundary-\r\n");
+        assert_closed(&malformed, Some(ROOT_ID), "malformed_encoding");
+
+        // A second package framed inside the epilogue: a parser that keeps
+        // reading past the close-delimiter frames a different root.
+        let with_epilogue = format!(
+            "{complete}--MIME_boundary\r\n\
+             Content-Type: text/xml\r\n\
+             Content-ID: <late@example.com>\r\n\
+             \r\n\
+             <soap:Envelope>late</soap:Envelope>\r\n\
+             --MIME_boundary--\r\n"
+        );
+        assert_closed(&with_epilogue, Some(ROOT_ID), "malformed_encoding");
+
+        // No parts at all.
+        assert_closed("--MIME_boundary--\r\n", None, "malformed_encoding");
+    }
+
+    /// Duplicated security-relevant part headers are ambiguous. A first-wins
+    /// rule here is a rule the backend need not share.
+    #[test]
+    fn duplicate_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let duplicate_type = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Type: text/xml\r\nContent-Transfer-Encoding: binary\r\n",
+        );
+        assert_closed(&duplicate_type, Some(ROOT_ID), "malformed_encoding");
+
+        let duplicate_id = base.replace(
+            "Content-ID: <root@example.com>\r\n",
+            "Content-ID: <root@example.com>\r\nContent-ID: <b@example.com>\r\n",
+        );
+        assert_closed(&duplicate_id, Some(ROOT_ID), "malformed_encoding");
+
+        let duplicate_cte = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Transfer-Encoding: binary\r\nContent-Transfer-Encoding: 8bit\r\n",
+        );
+        assert_closed(&duplicate_cte, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// Two parts claiming one `Content-ID` let `start` resolve to either
+    /// envelope; RFC 2387 requires package-unique ids.
+    #[test]
+    fn duplicate_root_content_ids_fail_closed() {
+        let base = package("<soap:Envelope>real</soap:Envelope>", "opaque");
+        let package = base.replace("<attachment@example.com>", "<root@example.com>");
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+        // Even first-part selection must not silently prefer one of them.
+        assert_closed(&package, None, "malformed_encoding");
+    }
+
+    /// Obsolete folded continuation lines unfold differently across parsers.
+    #[test]
+    fn folded_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+        let package = base.replace(
+            "application/xop+xml; charset=utf-8;",
+            "application/xop+xml;\r\n charset=utf-8;",
+        );
+        assert_closed(&package, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// A header line with no colon, a non-ASCII header block, and a blank
+    /// `Content-ID` are all ambiguous syntax rather than readable metadata.
+    #[test]
+    fn malformed_part_headers_fail_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let no_colon = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            "Content-Transfer-Encoding: binary\r\nnot-a-header-line\r\n",
+        );
+        assert_closed(&no_colon, Some(ROOT_ID), "malformed_encoding");
+
+        let non_ascii = base.replace("<root@example.com>", "<r\u{00f6}ot>");
+        assert_closed(&non_ascii, Some(ROOT_ID), "malformed_encoding");
+
+        let blank_id = base.replace("<root@example.com>", "<>");
+        assert_closed(&blank_id, Some(ROOT_ID), "malformed_encoding");
+    }
+
+    /// `start` naming a part the package does not contain has no envelope to
+    /// validate.
+    #[test]
+    fn unknown_start_id_fails_closed() {
+        let package = package("<soap:Envelope/>", "opaque");
+        let absent = Some("absent@example.com");
+        assert_closed(&package, absent, "malformed_encoding");
+    }
+
+    /// The root part must itself be a SOAP/XOP infoset and must not declare a
+    /// re-encoding transfer encoding, or the bytes Ferrum validates are not the
+    /// bytes the backend decodes.
+    #[test]
+    fn a_mislabelled_or_re_encoded_root_fails_closed() {
+        let base = package("<soap:Envelope/>", "opaque");
+
+        let mislabelled = base.replace("application/xop+xml", "application/pdf");
+        assert_closed(&mislabelled, Some(ROOT_ID), "unsupported_charset");
+
+        let re_encoded = base.replace("binary\r\n", "base64\r\n");
+        assert_closed(&re_encoded, Some(ROOT_ID), "unsupported_charset");
+    }
+
+    /// Part-count and header-size ceilings stay fail-closed.
+    #[test]
+    fn part_and_header_bounds_fail_closed() {
+        // 65 parts: one over MAX_MULTIPART_PARTS.
+        let mut over_capacity = String::new();
+        for index in 0..65 {
+            over_capacity.push_str(&format!(
+                "--MIME_boundary\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-ID: <part-{index}@example.com>\r\n\
+                 \r\n\
+                 payload\r\n"
+            ));
+        }
+        over_capacity.push_str("--MIME_boundary--\r\n");
+        assert_closed(&over_capacity, None, "malformed_encoding");
+
+        // A header block past MAX_MULTIPART_PART_HEADER_BYTES.
+        let padding = "X".repeat(9_000);
+        let base = package("<soap:Envelope/>", "opaque");
+        let oversized = base.replace(
+            "Content-Transfer-Encoding: binary\r\n",
+            &format!("Content-Transfer-Encoding: binary\r\nX-Pad: {padding}\r\n"),
+        );
+        assert_closed(&oversized, Some(ROOT_ID), "malformed_encoding");
+    }
+}
+
+// ── Governed representations always parse or reject ─────────────────────────
+//
+// `reject_missing_security_header: false` is the documented opt-out for a
+// governed message that genuinely carries no `wsse:Security` header. It is not
+// an opt-out from *parsing*: turning a gateway/backend parser disagreement into
+// pass-through skips authentication, integrity, freshness, and replay for a
+// message the backend still executes.
+
+mod governed_parse_failures_reject {
+    use super::*;
+
+    fn permissive_config() -> serde_json::Value {
+        json!({
+            "timestamp": { "require": false },
+            "username_token": {
+                "enabled": true,
+                "password_type": "PasswordText",
+                "credentials": [{"username": "alice", "password": "secret123"}]
+            },
+            "reject_missing_security_header": false
+        })
+    }
+
+    async fn run(body: &str) -> PluginResult {
+        let plugin = SoapWsSecurity::new(&permissive_config()).unwrap();
+        let mut ctx = make_ctx_with_soap_body(body);
+        let mut headers = soap_headers();
+        run_soap_request_policy(&plugin, &mut ctx, &mut headers).await
+    }
+
+    /// A SOAP 1.1 envelope wrapping exactly `inner`, so structural fixtures can
+    /// state only the shape they are about.
+    fn envelope(inner: &str) -> String {
+        let ns = "http://schemas.xmlsoap.org/soap/envelope/";
+        format!("<soap:Envelope xmlns:soap=\"{ns}\">{inner}</soap:Envelope>")
+    }
+
+    /// XML the gateway cannot parse is not proof that the backend cannot.
+    #[tokio::test]
+    async fn malformed_xml_rejects_even_with_the_missing_header_opt_out() {
+        let unclosed = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">"#;
+        let result = run(unclosed).await;
+        assert_eq!(reject_status(&result), 400);
+        assert!(
+            reject_body(&result).contains("malformed"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// A non-envelope root is unsupported structure, not an absent header.
+    #[tokio::test]
+    async fn unsupported_structure_rejects_even_with_the_opt_out() {
+        let result = run("<notasoap>hello</notasoap>").await;
+        assert_eq!(reject_status(&result), 400);
+        let body = reject_body(&result);
+        assert!(body.contains("not a namespace-qualified SOAP Envelope"), "{body}");
+    }
+
+    /// Two namespace-correct `soap:Body` elements are exactly the ambiguity
+    /// that lets a gateway and a backend read different messages.
+    #[tokio::test]
+    async fn duplicate_envelope_structure_rejects_even_with_the_opt_out() {
+        let two_bodies = "<soap:Header/><soap:Body><A/></soap:Body><soap:Body><B/></soap:Body>";
+        assert_eq!(reject_status(&run(&envelope(two_bodies)).await), 400);
+
+        let two_headers = "<soap:Header/><soap:Header/><soap:Body><A/></soap:Body>";
+        assert_eq!(reject_status(&run(&envelope(two_headers)).await), 400);
+    }
+
+    /// A parsing-budget failure is a refusal to read the message, so it cannot
+    /// become a decision to forward it unvalidated.
+    #[tokio::test]
+    async fn a_parsing_budget_failure_rejects_even_with_the_opt_out() {
+        let nodes = "<N/>".repeat(66_000);
+        let inner = format!("<soap:Header/><soap:Body>{nodes}</soap:Body>");
+        assert_eq!(reject_status(&run(&envelope(&inner)).await), 400);
+    }
+
+    /// The documented opt-out itself is preserved: a well-formed envelope whose
+    /// Header genuinely carries no `wsse:Security` still passes through.
+    #[tokio::test]
+    async fn a_genuinely_absent_security_header_still_passes_through() {
+        let inner = "<soap:Header/><soap:Body><GetPrice/></soap:Body>";
+        assert!(matches!(run(&envelope(inner)).await, PluginResult::Continue));
+    }
+}
+
+// ── SAML assertions must name a principal (GHSA-f44p-hfqr-cvcc residual) ────
+//
+// An enabled SAML policy makes this instance an authentication plugin whose
+// documented principal is the Subject `NameID`. An assertion that satisfies
+// every binding but names nobody authenticated nothing, so accepting it —
+// while burning its single-use replay id — silently degraded the request to
+// unauthenticated and let an attacker spend a legitimate assertion id.
+
+mod saml_name_id_is_required {
+    use super::*;
+
+    fn plugin_and_bundle() -> (SoapWsSecurity, saml_fixtures::IdpBundle) {
+        let bundle = saml_fixtures::IdpBundle::new();
+        let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+        (plugin, bundle)
+    }
+
+    fn assertion_with(assertion_id: &str, name_id_fragment: Option<&str>) -> String {
+        let mut builder = saml_fixtures::AssertionBuilder::new(
+            assertion_id,
+            "https://idp.example.com/metadata",
+            "alice@example.com",
+        );
+        builder.name_id_fragment = name_id_fragment.map(str::to_string);
+        builder.build()
+    }
+
+    async fn run(plugin: &SoapWsSecurity, assertion: &str) -> PluginResult {
+        let mut ctx = make_ctx_with_soap_body(&wrap_saml_assertion(assertion));
+        let mut headers = soap_headers();
+        run_soap_request_policy(plugin, &mut ctx, &mut headers).await
+    }
+
+    /// A fully signed, fully bound assertion whose Subject has no `NameID`
+    /// authenticates nobody.
+    #[tokio::test]
+    async fn an_absent_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let result = run(&plugin, &assertion_with("_no-name-id", Some(""))).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("NameID"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// Two `NameID` elements are two candidate principals; a downstream
+    /// consumer need not pick the one the gateway did.
+    #[tokio::test]
+    async fn a_duplicate_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let two_name_ids = concat!(
+            "<saml:NameID>alice@example.com</saml:NameID>",
+            "<saml:NameID>mallory@example.com</saml:NameID>"
+        );
+        let assertion = assertion_with("_duplicate-name-id", Some(two_name_ids));
+        let result = run(&plugin, &assertion).await;
+        assert_eq!(reject_status(&result), 401);
+    }
+
+    /// A whitespace-only `NameID` is not an identity.
+    #[tokio::test]
+    async fn a_blank_name_id_rejects() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let assertion = assertion_with("_blank-name-id", Some("<saml:NameID>   </saml:NameID>"));
+        let result = run(&plugin, &assertion).await;
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            reject_body(&result).contains("NameID"),
+            "got: {}",
+            reject_body(&result)
+        );
+    }
+
+    /// The positive case: one nonblank `NameID` becomes the request principal.
+    #[tokio::test]
+    async fn a_valid_name_id_becomes_the_principal() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let assertion = assertion_with("_valid-name-id", None);
+        let mut ctx = make_ctx_with_soap_body(&wrap_saml_assertion(&assertion));
+        let consumer_index = ConsumerIndex::new(&[]);
+        assert!(matches!(
+            plugin.authenticate(&mut ctx, &consumer_index).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            ctx.authenticated_identity.as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+            Some("alice@example.com")
+        );
+    }
+
+    /// The semantic failure must consume no replay state: the very same
+    /// assertion id must still be spendable by a well-formed assertion.
+    #[tokio::test]
+    async fn a_principal_less_assertion_does_not_burn_the_replay_id() {
+        let (plugin, _bundle) = plugin_and_bundle();
+        let shared_id = "_shared-assertion-id";
+
+        let rejected = run(&plugin, &assertion_with(shared_id, Some(""))).await;
+        assert_eq!(reject_status(&rejected), 401);
+
+        let accepted = run(&plugin, &assertion_with(shared_id, None)).await;
+        assert!(
+            matches!(accepted, PluginResult::Continue),
+            "a rejected principal-less assertion must not claim the id: {accepted:?}"
+        );
+
+        // And the id is claimed exactly once by the assertion that was accepted.
+        let replayed = run(&plugin, &assertion_with(shared_id, None)).await;
+        assert_eq!(reject_status(&replayed), 401);
+        assert!(
+            reject_body(&replayed).contains("already been used"),
+            "got: {}",
+            reject_body(&replayed)
+        );
     }
 }

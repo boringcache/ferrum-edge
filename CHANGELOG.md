@@ -22,7 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   MTOM validates the root part's envelope (selected by `start`, else the first
   part) and refuses a root part that is mislabelled, re-encoded, or absent.
   A `multipart/form-data; boundary=application/xml` request is no longer
-  raw-scanned as an envelope.
+  raw-scanned as an envelope. MTOM package framing is now a strict MIME
+  contract, because the parser decides which bytes are the envelope: delimiter
+  *lines* are recognized only at the body start or immediately after a CRLF with
+  exact CRLF framing and no transport padding (so a `--boundary` sequence inside
+  a preamble, a header value, an attachment payload, or the envelope itself is
+  inert payload rather than framing); exactly one close-delimiter is required
+  and the epilogue after it must not contain the boundary token; part headers
+  must be US-ASCII, unfolded, well-formed `token: value` pairs carrying at most
+  one `Content-Type` / `Content-ID` / `Content-Transfer-Encoding` each;
+  `Content-ID` values must be package-unique and nonblank, and with `start`
+  supplied exactly one part may match; and the whole package is framed and every
+  part parsed before a root is selected, so no later ambiguity is missed by an
+  early return. Part, header, and boundary-candidate ceilings stay fail-closed.
+  Previously an unanchored byte-substring search let an attacker plant a
+  boundary-shaped sequence in a payload or preamble and have Ferrum validate a
+  fabricated envelope — or a truncated one — while the backend executed the real
+  root part.
 - `soap_ws_security` now authenticates the signer before performing
   attacker-selected XML work (GHSA-9g4v-h9hm-846r). Both the X.509 and SAML
   paths settle certificate trust and `SignatureValue`-over-`SignedInfo`
@@ -60,7 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timestamp.require: false` is refused at admission. Previously a trusted
   signature over only the Timestamp authorized an arbitrary rewritten operation,
   and a signed lookalike `<Body>` under another namespace could be selected in
-  place of the real one.
+  place of the real one. **Breaking:** because Ferrum implements no WS-Security
+  attachment-signature transform, an X.509 signature cannot cover the octets an
+  `xop:Include` stands for; an enabled `x509_signature` therefore now refuses
+  both MTOM/XOP `multipart/related` and bare `application/xop+xml` with `415`
+  before dispatch, and an explicit `content_type.allow_mtom: true` alongside it
+  is refused at config admission. `username_token` and `saml` keep accepting
+  MTOM/XOP — they authenticate who sent the message and never claimed integrity
+  over attachment octets. Separately, `reject_missing_security_header: false`
+  now governs an *absent header only*: on a governed representation, malformed
+  XML, unsupported or ambiguous envelope structure, and XML parsing-budget
+  failures reject with `400` regardless of that setting, so a gateway/backend
+  parser disagreement can no longer become a pass-through that skips
+  authentication, integrity, freshness, and replay for a message the backend
+  still executes.
 - `soap_ws_security` SAML assertions are now bound and single-use
   (GHSA-f44p-hfqr-cvcc). **Breaking:** `saml.audience`, the new
   `saml.recipient`, and `nonce.replay_scope` are required when SAML is enabled.
@@ -78,7 +107,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SAML deployments must use `shared`. Previously a captured signed assertion
   could be replayed indefinitely beside a freshly minted outer Timestamp, and in
   the default configuration an assertion issued for another service by the same
-  trusted IdP was accepted.
+  trusted IdP was accepted. An accepted assertion must also resolve exactly one
+  namespace-correct, nonblank Subject `NameID` — the documented SAML principal —
+  and that resolution now happens *before* the single-use claim, so an assertion
+  that satisfies every binding but authenticates nobody fails closed with `401`
+  without consuming replay state. Previously such an assertion was accepted,
+  burned its replay id, and returned no principal, silently degrading the
+  request to unauthenticated while letting an attacker spend a legitimate
+  assertion id.
 
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via

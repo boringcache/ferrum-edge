@@ -2333,7 +2333,18 @@ Media types are parsed **structurally** — `type/subtype` plus RFC 9110 paramet
 | `strict` *(default)* | Every request on this proxy is a governed SOAP request. A missing Content-Type returns `415`, an unsupported media type returns `415`, and a malformed one returns `400` — all before backend dispatch. |
 | `mixed_route` | Only requests whose media type is a recognized SOAP representation are governed; everything else passes through. This is the explicit opt-out for proxies that intentionally serve mixed traffic. A malformed media-type label still fails closed in this mode, because an unparsable label cannot be proven non-SOAP. |
 
-Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. A root part that is mislabelled, that declares a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`), or that cannot be located fails closed. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+
+**MTOM package framing is strict, because the parser decides which bytes are the envelope.** Any package shape a conforming backend parser would frame differently is a gateway/backend representation split, so it fails closed rather than being resolved by a rule the backend need not share. The whole package is framed and every part parsed *before* a root is selected, so no ambiguity later in the package is missed by an early return. Specifically:
+
+- Boundary delimiter *lines* are recognized only at the start of the body or immediately after a CRLF, with exact CRLF framing and no RFC 2046 transport padding. A `--boundary` sequence anywhere else — in the preamble, in a header value, inside an attachment payload, inside the envelope itself — is payload, exactly as it is for a conforming parser.
+- Exactly one close-delimiter (`--boundary--`) must be present, and the epilogue after it must not contain the boundary token at all.
+- Part headers must be US-ASCII with exact CRLF line endings, must not use obsolete folded continuation lines, must be well-formed `token: value` pairs, and may carry at most one `Content-Type`, one `Content-ID`, and one `Content-Transfer-Encoding` each.
+- `Content-ID` values must be unique across the package (RFC 2387) and must not be blank. When `start` is supplied, exactly one part may match it.
+- The root part must itself declare a SOAP/XOP essence and must not declare a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`).
+- Bounds are fail-closed: at most 64 parts, at most 8 KiB and 32 lines of headers per part, and a ceiling on boundary-shaped candidates examined per package.
+
+**X.509 signatures and MTOM/XOP are mutually exclusive.** Ferrum implements no WS-Security attachment-signature transform, so for a XOP representation the digest it verifies covers the `xop:Include` element rather than the attachment octets that element stands for — an attacker-selected attachment present during validation would never be detected. When `x509_signature.enabled` is `true`, MTOM/XOP `multipart/related` **and** bare `application/xop+xml` are therefore refused with `415` before dispatch, and an explicit `content_type.allow_mtom: true` alongside an enabled `x509_signature` is refused at config admission. `username_token` and `saml` keep accepting MTOM/XOP: those mechanisms authenticate *who sent the message*, and neither claims integrity over attachment octets.
 
 #### Phase, identity, and composition
 
@@ -2354,9 +2365,9 @@ As a runtime backstop for every other transform (including custom plugins), the 
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
+| `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header. This governs an *absent header only*: on a governed representation, malformed XML, unsupported or ambiguous envelope structure, and XML parsing-budget failures always reject with `400` regardless of this setting |
 | `content_type.mode` | String | `strict` | `strict` (every request on this proxy is governed) or `mixed_route` (only recognized SOAP media types are governed) |
-| `content_type.allow_mtom` | bool | `true` | Accept MTOM/XOP `multipart/related` packaging and validate its SOAP root part. `false` rejects SOAP-bearing multipart with `415` |
+| `content_type.allow_mtom` | bool | `true` | Accept MTOM/XOP `multipart/related` packaging and validate its SOAP root part. `false` rejects SOAP-bearing multipart with `415`. Must not be explicitly `true` when `x509_signature.enabled` is `true` (refused at admission); XOP representations are refused with `415` under an enabled `x509_signature` regardless |
 | `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header. Controls whether the element may be *absent*; a Timestamp that **is** present is always validated |
 | `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection (`1`–`86400`) |
 | `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
@@ -2617,8 +2628,9 @@ The plugin cryptographically verifies the SAML assertion's `<Signature>` element
 4. Verify `<SignatureValue>` over the canonicalized `<SignedInfo>` bytes using the matched cert's RSA public key.
 5. **Only then** verify the single `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`, and the Reference must target the enclosing Assertion ID.
 6. Validate `Issuer` (must match one of `trusted_issuers`), the mandatory bounded `Conditions` window, the service `Audience`, and the `SubjectConfirmation` / `Recipient` binding — see [SAML assertions are bearer values](#saml-assertions-are-bearer-values).
-7. Claim the assertion id for single use in the declared `nonce.replay_scope`.
-8. Publish the Subject `NameID` as the request principal (`authenticated_identity`, plus a namespace-correct `identified_consumer`) and mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
+7. Resolve exactly one namespace-correct, nonblank Subject `NameID`. An enabled SAML policy is an authentication plugin whose principal *is* the `NameID`, so an assertion that satisfies every binding but names nobody is rejected with `401` — **before** step 8, so a principal-less assertion consumes no replay state and cannot spend a legitimate assertion's id. An absent, blank, or duplicated `NameID` all fail closed.
+8. Claim the assertion id for single use in the declared `nonce.replay_scope`.
+9. Publish that Subject `NameID` as the request principal (`authenticated_identity`, plus a namespace-correct `identified_consumer`) and mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
 
 ```yaml
 plugin_name: soap_ws_security

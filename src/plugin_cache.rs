@@ -4422,7 +4422,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
-    validate_soap_ws_security_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         validate_tcp_connection_throttle_attachments(config).map_err(|errors| errors.join("; "))?;
         let (
             proxy_map,
@@ -4829,7 +4829,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
-    validate_soap_ws_security_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         let restrict_country_mmdb_refresh_to_rebuild_scope =
             matches!(country_mmdb_load_mode, CountryMmdbLoadMode::PreloadedOnly);
@@ -4872,7 +4872,7 @@ impl PluginCache {
         validate_mesh_bpf_metrics_ownership(config)?;
         validate_api_chargeback_ownership(config)?;
         validate_replay_provenance_composition(config)?;
-    validate_soap_ws_security_composition(config)?;
+        validate_soap_ws_security_composition(config)?;
         let paths = config.country_mmdb_file_dependency_paths();
         if paths.is_empty() {
             return Ok(None);

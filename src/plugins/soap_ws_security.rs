@@ -41,7 +41,26 @@
 //! traffic. SOAP 1.1 (`text/xml`), SOAP 1.2 (`application/soap+xml`),
 //! `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related`
 //! are supported; MTOM validates the root part's envelope and refuses a root
-//! part that is mislabelled or re-encoded.
+//! part that is mislabelled or re-encoded. Package framing is a strict MIME
+//! contract — see [`extract_mtom_root_part`] — because the parser is what
+//! decides which bytes are the envelope.
+//!
+//! An `x509_signature` policy claims *integrity* over the message the backend
+//! executes. Ferrum implements no WS-Security attachment-signature transform,
+//! so for a XOP representation the digest it verifies covers the `xop:Include`
+//! element and not the attachment octets that element stands for. An enabled
+//! `x509_signature` therefore refuses both MTOM `multipart/related` and bare
+//! `application/xop+xml` with `415`. `username_token` and `saml` keep accepting
+//! them: those mechanisms authenticate *who sent the message* and never claimed
+//! coverage of attachment octets.
+//!
+//! `reject_missing_security_header: false` is the opt-out for a governed
+//! message that genuinely carries no `wsse:Security` header. It is not an
+//! opt-out from *parsing*: once a representation is governed, malformed XML,
+//! unsupported or ambiguous envelope structure, and parsing-budget failures
+//! reject unconditionally, because a gateway/backend parser disagreement that
+//! became a pass-through would skip every check for a message the backend still
+//! executes.
 //!
 //! ## Configuration admission (strict, fail-closed)
 //!
@@ -351,6 +370,15 @@ const CANONICALIZATION_BUDGET_MULTIPLIER: usize = 2;
 const MAX_MULTIPART_PARTS: usize = 64;
 const MAX_MULTIPART_PART_HEADER_BYTES: usize = 8_192;
 const MAX_MULTIPART_BOUNDARY_BYTES: usize = 70;
+/// Header lines admitted per MIME part. A part header block is bounded by both
+/// this count and [`MAX_MULTIPART_PART_HEADER_BYTES`] so neither a few enormous
+/// lines nor very many tiny ones can drive unbounded work.
+const MAX_MULTIPART_PART_HEADERS: usize = 32;
+/// Delimiter-line candidates examined across one package. Every candidate that
+/// is rejected as payload advances the scan by at least `2 + boundary.len()`
+/// bytes, so this is a belt-and-braces ceiling on an adversarial package that
+/// embeds boundary-shaped bytes throughout its attachments.
+const MAX_MULTIPART_DELIMITER_CANDIDATES: usize = 4_096;
 
 // ── Configuration admission bounds ──────────────────────────────────────────
 
@@ -1429,7 +1457,11 @@ impl SoapWsSecurity {
         // protection, so pass-through is now an explicit, named opt-out rather
         // than the consequence of a client-chosen header value.
         let content_type_cfg = soap_object(root, "config", "content_type")?;
-        reject_unknown(content_type_cfg, "config.content_type", CONTENT_TYPE_CONFIG_KEYS)?;
+        reject_unknown(
+            content_type_cfg,
+            "config.content_type",
+            CONTENT_TYPE_CONFIG_KEYS,
+        )?;
         let configured_mode = soap_string(content_type_cfg, "config.content_type", "mode")?;
         let content_type_mode = match configured_mode.as_deref().unwrap_or("strict") {
             "strict" => ContentTypeMode::Strict,
@@ -1442,6 +1474,12 @@ impl SoapWsSecurity {
                 );
             }
         };
+        // Whether the operator *named* `allow_mtom`, as distinct from taking its
+        // default. An explicit `true` alongside an X.509 policy is a
+        // contradiction worth refusing at admission rather than silently
+        // rejecting every MTOM request at runtime.
+        let allow_mtom_explicit =
+            present(content_type_cfg, "config.content_type", "allow_mtom")?.is_some();
         let allow_mtom = soap_bool(content_type_cfg, "config.content_type", "allow_mtom", true)?;
 
         // ── Timestamp config ────────────────────────────────────────────
@@ -1711,6 +1749,22 @@ impl SoapWsSecurity {
                 "soap_ws_security: 'config.x509_signature.require_signed_timestamp' requires \
                  'config.timestamp.require' to be true — a signed Timestamp cannot be required \
                  while the Timestamp itself is optional"
+                    .to_string(),
+            );
+        }
+
+        // Ferrum implements no WS-Security attachment-signature transform, so
+        // an X.509 policy cannot cover the octets an `xop:Include` stands for.
+        // Asking for both is asking for integrity Ferrum cannot establish;
+        // XOP/MTOM representations are refused at request time either way, and
+        // an explicit `allow_mtom: true` is refused here so the contradiction
+        // surfaces at admission instead of as a runtime 415.
+        if x509_enabled && allow_mtom_explicit && allow_mtom {
+            return Err(
+                "soap_ws_security: 'config.content_type.allow_mtom' cannot be true while \
+                 'config.x509_signature.enabled' is true — Ferrum implements no WS-Security \
+                 attachment-signature transform, so an X.509 signature cannot cover MTOM/XOP \
+                 attachment octets"
                     .to_string(),
             );
         }
@@ -2320,10 +2374,9 @@ impl SoapWsSecurity {
             .map_err(UsernameTokenError::Structural)?
             .ok_or_else(|| structural("WS-Security: missing UsernameToken element"))?;
 
-        let username_node =
-            unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Username", "WS-Security")
-                .map_err(UsernameTokenError::Structural)?
-                .ok_or_else(|| structural("WS-Security: UsernameToken missing Username element"))?;
+        let username_node = unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Username", "WS-Security")
+            .map_err(UsernameTokenError::Structural)?
+            .ok_or_else(|| structural("WS-Security: UsernameToken missing Username element"))?;
         let username = element_text(username_node)
             .ok_or_else(|| structural("WS-Security: UsernameToken Username element is empty"))?;
 
@@ -2398,14 +2451,12 @@ impl SoapWsSecurity {
                 // known/unknown credential branch so missing digest inputs cannot
                 // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
-                let nonce_node = unique_ns_child(
-                    ut_node,
-                    WSSE_NAMESPACE_URI,
-                    "Nonce",
-                    "WS-Security",
-                )
-                .map_err(UsernameTokenError::Structural)?
-                .ok_or_else(|| structural("WS-Security: PasswordDigest requires Nonce element"))?;
+                let nonce_node =
+                    unique_ns_child(ut_node, WSSE_NAMESPACE_URI, "Nonce", "WS-Security")
+                        .map_err(UsernameTokenError::Structural)?
+                        .ok_or_else(|| {
+                            structural("WS-Security: PasswordDigest requires Nonce element")
+                        })?;
                 let nonce_b64_raw = element_text(nonce_node)
                     .ok_or_else(|| structural("WS-Security: Nonce element is empty"))?;
 
@@ -2957,21 +3008,19 @@ impl SoapWsSecurity {
         self.validate_username_token_created(document.root_element(), created_raw, now)
     }
 
-    /// Media-type classification outcome for external tests: `Ok(None)` is
-    /// pass-through, `Ok(Some(true))` is a governed MTOM package,
-    /// `Ok(Some(false))` a governed direct XML representation, `Err` the
-    /// `(status, class)` of a fail-closed rejection.
+    /// Media-type classification outcome for external tests as a stable string:
+    /// `"xml"` / `"xop"` / `"mtom"` for a governed representation,
+    /// `"pass_through"`, or `"reject:<status>:<class>"`.
     #[allow(dead_code)]
-    pub(crate) fn classify_request_for_tests(
-        &self,
-        content_type: Option<&str>,
-    ) -> Result<Option<bool>, (u16, &'static str)> {
+    pub(crate) fn classify_request_for_tests(&self, content_type: Option<&str>) -> String {
         match self.classify_request(content_type) {
-            SoapRequestDisposition::Governed(SoapMediaClass::Mtom { .. }) => Ok(Some(true)),
-            SoapRequestDisposition::Governed(SoapMediaClass::Xml) => Ok(Some(false)),
-            SoapRequestDisposition::PassThrough => Ok(None),
+            SoapRequestDisposition::Governed(SoapMediaClass::Mtom { .. }) => "mtom".to_string(),
+            SoapRequestDisposition::Governed(SoapMediaClass::Xop) => "xop".to_string(),
+            SoapRequestDisposition::Governed(SoapMediaClass::Xml) => "xml".to_string(),
+            SoapRequestDisposition::PassThrough => "pass_through".to_string(),
             SoapRequestDisposition::Reject(rejection) => {
-                Err((rejection.status_code(), rejection.class()))
+                let status = rejection.status_code();
+                format!("reject:{status}:{}", rejection.class())
             }
         }
     }
@@ -3082,8 +3131,9 @@ impl SoapWsSecurity {
         envelope: &str,
         budget: &mut WorkBudget,
     ) -> Result<&str, String> {
-        let sig_node = unique_ns_child(security, XMLDSIG_NAMESPACE_URI, "Signature", "WS-Security")?
-            .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
+        let sig_node =
+            unique_ns_child(security, XMLDSIG_NAMESPACE_URI, "Signature", "WS-Security")?
+                .ok_or_else(|| "WS-Security: missing Signature element".to_string())?;
         let signed_info_node =
             unique_ns_child(sig_node, XMLDSIG_NAMESPACE_URI, "SignedInfo", "WS-Security")?
                 .ok_or_else(|| "WS-Security: Signature missing SignedInfo element".to_string())?;
@@ -3437,8 +3487,11 @@ impl SoapWsSecurity {
 
     /// Validate the SAML assertion inside a WS-Security header.
     ///
-    /// Returns the assertion's Subject NameID on success (the "who" of the
-    /// assertion) so callers can publish it as the request principal.
+    /// Returns the assertion's Subject `NameID` on success — the "who" of the
+    /// assertion — which the caller publishes as the request principal. Exactly
+    /// one namespace-correct, nonblank `NameID` is required, and it is resolved
+    /// before the single-use claim, so an assertion that authenticates nobody
+    /// fails closed without consuming replay state.
     ///
     /// Verification order is signature-first: an attacker who can post a SOAP
     /// body controls every text node in the assertion, so issuer / conditions
@@ -3454,17 +3507,18 @@ impl SoapWsSecurity {
     /// mandatory, span capped by `max_assertion_lifetime_seconds`), the
     /// configured service `Audience`, a supported `SubjectConfirmation` whose
     /// `SubjectConfirmationData` names the configured `Recipient` and carries
-    /// its own bounded `NotOnOrAfter`, and finally an atomic single-use claim
-    /// on the assertion id in the declared replay scope. `OneTimeUse` needs no
-    /// special case because every accepted assertion is claimed exactly once;
-    /// a replay backend outage fails closed like every other replay decision.
+    /// its own bounded `NotOnOrAfter`, a resolvable Subject `NameID`, and
+    /// finally an atomic single-use claim on the assertion id in the declared
+    /// replay scope. `OneTimeUse` needs no special case because every accepted
+    /// assertion is claimed exactly once; a replay backend outage fails closed
+    /// like every other replay decision.
     async fn validate_saml_assertion<'a, 'i>(
         &self,
         security: Node<'a, 'i>,
         envelope: &str,
         now: DateTime<Utc>,
         budget: &mut WorkBudget,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<String, String> {
         let document = security.document();
         let mut assertion_node = None;
         for node in document.descendants().filter(Node::is_element) {
@@ -3486,12 +3540,10 @@ impl SoapWsSecurity {
                 );
             }
         }
+        // Only reached from an enabled SAML policy, so an absent assertion is
+        // always terminal.
         let Some(assertion_node) = assertion_node else {
-            return if self.saml_enabled {
-                Err("WS-Security: missing SAML Assertion element".to_string())
-            } else {
-                Ok(None)
-            };
+            return Err("WS-Security: missing SAML Assertion element".to_string());
         };
 
         // ── 1. Signature verification ─────────────────────────────────
@@ -3500,9 +3552,13 @@ impl SoapWsSecurity {
         self.validate_saml_signature(assertion_node, envelope, budget)?;
 
         // ── 2. Issuer trust ───────────────────────────────────────────
-        let issuer_node =
-            unique_ns_child(assertion_node, SAML2_ASSERTION_NS, "Issuer", "WS-Security: SAML")?
-                .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
+        let issuer_node = unique_ns_child(
+            assertion_node,
+            SAML2_ASSERTION_NS,
+            "Issuer",
+            "WS-Security: SAML",
+        )?
+        .ok_or_else(|| "WS-Security: SAML Assertion missing Issuer element".to_string())?;
         let issuer = element_text(issuer_node)
             .ok_or_else(|| "WS-Security: SAML Issuer is empty".to_string())?;
 
@@ -3561,9 +3617,10 @@ impl SoapWsSecurity {
             return Err("WS-Security: SAML Assertion has expired".to_string());
         }
 
-        let expected_audience = self.saml_audience.as_deref().ok_or_else(|| {
-            "WS-Security: SAML audience binding is not configured".to_string()
-        })?;
+        let expected_audience = self
+            .saml_audience
+            .as_deref()
+            .ok_or_else(|| "WS-Security: SAML audience binding is not configured".to_string())?;
         let mut audience_matched = false;
         let mut audience_restrictions = 0usize;
         for restriction in conditions
@@ -3608,7 +3665,25 @@ impl SoapWsSecurity {
         .ok_or_else(|| "WS-Security: SAML Assertion missing Subject element".to_string())?;
         self.validate_saml_subject_confirmation(subject, now)?;
 
-        // ── 5. Single use ─────────────────────────────────────────────
+        // ── 5. Subject NameID: the assertion's authoritative identity ─
+        //
+        // This runs *before* the single-use claim, not after it. An enabled
+        // SAML policy makes this instance an authentication plugin, and the
+        // documented principal it publishes is the Subject `NameID`. An
+        // assertion that satisfies every other check but names nobody cannot
+        // authenticate anything, so accepting it and returning no principal
+        // silently degraded the request to unauthenticated while still burning
+        // the assertion's replay id — which also let an attacker who observed a
+        // legitimate assertion id spend it on a principal-less lookalike.
+        // Requiring exactly one namespace-correct, nonblank `NameID` here makes
+        // that a semantic failure that consumes no replay state.
+        let name_id_node =
+            unique_ns_child(subject, SAML2_ASSERTION_NS, "NameID", "WS-Security: SAML")?;
+        let Some(name_id) = name_id_node.and_then(element_text) else {
+            return Err("WS-Security: SAML Subject has no nonblank NameID".to_string());
+        };
+
+        // ── 6. Single use ─────────────────────────────────────────────
         // Claimed after every semantic check so a rejected assertion cannot
         // burn a legitimate one's id, and before the identity is returned so no
         // caller can act on an assertion whose claim was refused.
@@ -3617,10 +3692,6 @@ impl SoapWsSecurity {
             .or_else(|| assertion_node.attribute("AssertionID"))
             .ok_or_else(|| "WS-Security: SAML Assertion missing ID attribute".to_string())?;
         self.claim_saml_assertion(&issuer, assertion_id).await?;
-
-        // ── 6. Extract Subject NameID for downstream identity use ─────
-        let name_id = unique_ns_child(subject, SAML2_ASSERTION_NS, "NameID", "WS-Security: SAML")?
-            .and_then(element_text);
 
         debug!("soap_ws_security: SAML assertion validated successfully");
         Ok(name_id)
@@ -3640,9 +3711,10 @@ impl SoapWsSecurity {
         subject: Node<'_, '_>,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        let expected_recipient = self.saml_recipient.as_deref().ok_or_else(|| {
-            "WS-Security: SAML recipient binding is not configured".to_string()
-        })?;
+        let expected_recipient = self
+            .saml_recipient
+            .as_deref()
+            .ok_or_else(|| "WS-Security: SAML recipient binding is not configured".to_string())?;
         let skew = self.saml_clock_skew;
         let mut accepted = false;
 
@@ -3703,9 +3775,7 @@ impl SoapWsSecurity {
                     .to_string()
             })?;
             if now > expiry_with_skew {
-                return Err(
-                    "WS-Security: SAML SubjectConfirmationData has expired".to_string(),
-                );
+                return Err("WS-Security: SAML SubjectConfirmationData has expired".to_string());
             }
             if let Some(raw) = data.attribute("NotBefore") {
                 let not_before = parse_ws_datetime(raw).ok_or_else(|| {
@@ -3713,7 +3783,7 @@ impl SoapWsSecurity {
                 })?;
                 if now + skew < not_before {
                     return Err(
-                        "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string(),
+                        "WS-Security: SAML SubjectConfirmationData is not yet valid".to_string()
                     );
                 }
             }
@@ -4027,7 +4097,22 @@ impl SoapWsSecurity {
                 ContentTypeMode::MixedRoute => SoapRequestDisposition::PassThrough,
             };
         };
-        match classify_soap_media_type(content_type, self.allow_mtom) {
+        let classified = classify_soap_media_type(content_type, self.allow_mtom);
+
+        // An X.509 policy claims *integrity* over the message the backend
+        // executes. Ferrum implements no WS-Security attachment transform, so
+        // for a XOP representation the digest it verifies covers the
+        // `xop:Include` element and not the attachment octets that element
+        // stands for — an attacker-selected attachment substituted before
+        // validation is never detected. Refusing the representation is the
+        // honest outcome; claiming coverage Ferrum cannot establish is not.
+        let xop = matches!(&classified, Ok(Some(class)) if class.is_xop());
+        if self.x509_enabled && xop {
+            let refusal = MediaTypeRejection::XopUnsupportedUnderX509;
+            return SoapRequestDisposition::Reject(refusal);
+        }
+
+        match classified {
             Ok(Some(class)) => SoapRequestDisposition::Governed(class),
             Ok(None) => match self.content_type_mode {
                 ContentTypeMode::Strict => SoapRequestDisposition::Reject(
@@ -4080,9 +4165,13 @@ enum ContentTypeMode {
 /// How a governed SOAP message is packaged on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SoapMediaClass {
-    /// `text/xml`, `application/soap+xml`, `application/xml`, or a bare
-    /// `application/xop+xml`: the whole body is the SOAP envelope.
+    /// `text/xml`, `application/soap+xml`, or `application/xml`: the whole body
+    /// is the SOAP envelope and nothing it references lives outside it.
     Xml,
+    /// A bare `application/xop+xml` infoset: the whole body is the envelope,
+    /// but it declares the XOP optimization, so `xop:Include` elements in it
+    /// stand for octets Ferrum has no packaged source for.
+    Xop,
     /// MTOM/XOP `multipart/related`: the envelope is the root part and the
     /// remaining parts are binary attachments the gateway never decodes.
     Mtom {
@@ -4091,19 +4180,32 @@ enum SoapMediaClass {
     },
 }
 
+impl SoapMediaClass {
+    /// Whether this representation declares the XOP optimization, i.e. whether
+    /// the envelope may reference octets that live outside the bytes Ferrum
+    /// validates. Only relevant to policies that claim message integrity.
+    fn is_xop(&self) -> bool {
+        matches!(self, Self::Xop | Self::Mtom { .. })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaTypeRejection {
     MissingContentTypeOnProtectedRoute,
     UnsupportedMediaTypeOnProtectedRoute,
     MalformedMediaType,
     MalformedMultipartPackaging,
+    /// A XOP/MTOM representation on a route whose `x509_signature` policy
+    /// claims message integrity Ferrum cannot establish over attachment octets.
+    XopUnsupportedUnderX509,
 }
 
 impl MediaTypeRejection {
     fn status_code(self) -> u16 {
         match self {
             Self::MissingContentTypeOnProtectedRoute
-            | Self::UnsupportedMediaTypeOnProtectedRoute => 415,
+            | Self::UnsupportedMediaTypeOnProtectedRoute
+            | Self::XopUnsupportedUnderX509 => 415,
             Self::MalformedMediaType | Self::MalformedMultipartPackaging => 400,
         }
     }
@@ -4120,6 +4222,9 @@ impl MediaTypeRejection {
             Self::MalformedMultipartPackaging => {
                 "SOAP request MTOM/XOP packaging is malformed or unsupported"
             }
+            Self::XopUnsupportedUnderX509 => {
+                "SOAP request uses MTOM/XOP; attachment octets are outside X.509 coverage"
+            }
         }
     }
 
@@ -4131,6 +4236,7 @@ impl MediaTypeRejection {
             Self::UnsupportedMediaTypeOnProtectedRoute => "unsupported_media_type",
             Self::MalformedMediaType => "malformed_media_type",
             Self::MalformedMultipartPackaging => "malformed_multipart",
+            Self::XopUnsupportedUnderX509 => "xop_unsupported_under_x509",
         }
     }
 }
@@ -4149,9 +4255,12 @@ const SOAP_XML_ESSENCES: &[&str] = &[
     "application/soap+xml",
     // Generic XML, accepted by many SOAP stacks
     "application/xml",
-    // A bare XOP infoset (MTOM without the multipart wrapper)
-    "application/xop+xml",
 ];
+
+/// A bare XOP infoset (MTOM without the multipart wrapper). Classified apart
+/// from [`SOAP_XML_ESSENCES`] because it declares the XOP optimization, which
+/// matters to any policy claiming coverage of the whole message.
+const XOP_INFOSET_ESSENCE: &str = "application/xop+xml";
 
 /// Essences accepted as an MTOM root part's own type.
 const MTOM_ROOT_ESSENCES: &[&str] = &["application/xop+xml", "text/xml", "application/soap+xml"];
@@ -4169,6 +4278,9 @@ fn classify_soap_media_type(
     let essence = media_type_essence(content_type)?;
     if SOAP_XML_ESSENCES.contains(&essence.as_str()) {
         return Ok(Some(SoapMediaClass::Xml));
+    }
+    if essence == XOP_INFOSET_ESSENCE {
+        return Ok(Some(SoapMediaClass::Xop));
     }
     if essence != "multipart/related" {
         return Ok(None);
@@ -4338,6 +4450,10 @@ impl SoapWsSecurity {
         let body = match resolve_soap_request_body(ctx, content_type, media_class) {
             Ok(Some(body)) => body,
             Ok(None) => {
+                // An empty body carries no `wsse:Security` header because it
+                // carries nothing at all. This is the one shape
+                // `reject_missing_security_header: false` may still forward —
+                // it is a genuinely absent header, not a parse disagreement.
                 if self.reject_missing_security_header {
                     return Err(SoapRejection::new(
                         400,
@@ -4373,23 +4489,24 @@ impl SoapWsSecurity {
         // gateway and the backend cannot be steered to different elements
         // (GHSA-3mwq-c8j6-9xhp), and the previous three independent parses of
         // the same envelope are gone.
+        //
+        // Neither failure below is gated on `reject_missing_security_header`.
+        // That option exists to allow a governed message that genuinely carries
+        // no `wsse:Security` header; it is not a licence to forward a
+        // representation the gateway could not parse. Treating a parse
+        // disagreement as pass-through is the bypass itself: Ferrum declines to
+        // read the envelope, the backend reads it fine, and every check below
+        // — timestamp, credentials, signature, replay — is skipped for a
+        // message the backend still executes. Once a representation is
+        // governed, malformed XML, a node/DTD budget failure, and unsupported
+        // or ambiguous envelope structure are terminal.
         let document = match parse_bounded_xml(envelope, "SOAP") {
             Ok(document) => document,
-            Err(error) => {
-                if !self.reject_missing_security_header {
-                    return Ok(None);
-                }
-                return Err(SoapRejection::new(400, &error, "malformed_xml"));
-            }
+            Err(error) => return Err(SoapRejection::new(400, &error, "malformed_xml")),
         };
         let structure = match resolve_soap_envelope(&document) {
             Ok(structure) => structure,
-            Err(error) => {
-                if !self.reject_missing_security_header {
-                    return Ok(None);
-                }
-                return Err(SoapRejection::new(400, &error, "malformed_envelope"));
-            }
+            Err(error) => return Err(SoapRejection::new(400, &error, "malformed_envelope")),
         };
 
         let security = resolve_security_node(&document, &structure)
@@ -4497,10 +4614,8 @@ impl SoapWsSecurity {
             {
                 Ok(name_id) => {
                     debug!("soap_ws_security: SAML assertion accepted");
-                    if let Some(name_id) = name_id {
-                        principal.principal.get_or_insert_with(|| name_id.clone());
-                        principal.saml_subject = Some(name_id);
-                    }
+                    principal.principal.get_or_insert_with(|| name_id.clone());
+                    principal.saml_subject = Some(name_id);
                 }
                 Err(error) => {
                     warn!(
@@ -4544,7 +4659,10 @@ impl SoapWsSecurity {
         // `classify_request` only returns `Governed` for a present header.
         let content_type = content_type_header.unwrap_or_default();
 
-        let principal = match self.validate_message(ctx, &content_type, &media_class).await {
+        let principal = match self
+            .validate_message(ctx, &content_type, &media_class)
+            .await
+        {
             Ok(Some(principal)) => principal,
             Ok(None) => return PluginResult::Continue,
             Err(rejection) => return rejection.into_plugin_result(),
@@ -4725,9 +4843,7 @@ pub fn validate_composition(
             .plugin_configs
             .iter()
             .filter(|plugin| {
-                plugin.enabled
-                    && plugin.scope == PluginScope::Global
-                    && plugin.plugin_name == name
+                plugin.enabled && plugin.scope == PluginScope::Global && plugin.plugin_name == name
             })
             .collect()
     };
@@ -4783,7 +4899,11 @@ pub fn validate_composition(
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 // ── Plugin trait implementation ─────────────────────────────────────────────
@@ -4993,7 +5113,9 @@ fn resolve_soap_envelope<'a, 'input>(
 ) -> Result<SoapEnvelopeStructure<'a, 'input>, String> {
     let envelope = document.root_element();
     let envelope_tag = envelope.tag_name();
-    let Some(envelope_ns) = envelope_tag.namespace().filter(|ns| is_soap_envelope_namespace(ns))
+    let Some(envelope_ns) = envelope_tag
+        .namespace()
+        .filter(|ns| is_soap_envelope_namespace(ns))
     else {
         return Err(
             "WS-Security: request root element is not a namespace-qualified SOAP Envelope"
@@ -5239,12 +5361,8 @@ fn xmldsig_key_info_certificate(
     else {
         return Ok(None);
     };
-    let Some(certificate) = unique_ns_child(
-        x509_data,
-        XMLDSIG_NAMESPACE_URI,
-        "X509Certificate",
-        context,
-    )?
+    let Some(certificate) =
+        unique_ns_child(x509_data, XMLDSIG_NAMESPACE_URI, "X509Certificate", context)?
     else {
         return Ok(None);
     };
@@ -5290,7 +5408,7 @@ fn parse_signed_info_canonicalization(
         "CanonicalizationMethod",
         context,
     )?
-        .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
+    .ok_or_else(|| format!("{}: SignedInfo missing CanonicalizationMethod", context))?;
     let algorithm = method.attribute("Algorithm").ok_or_else(|| {
         format!(
             "{}: CanonicalizationMethod missing Algorithm attribute",
@@ -6237,7 +6355,10 @@ fn resolve_soap_request_body<'a>(
             return Ok(None);
         }
         let (envelope_bytes, envelope_content_type) = match media_class {
-            SoapMediaClass::Xml => (&bytes[..], Cow::Borrowed(content_type)),
+            // A bare XOP infoset has no package around it, so like plain XML the
+            // whole body is the envelope. It is only classified apart so an
+            // integrity-claiming policy can refuse it.
+            SoapMediaClass::Xml | SoapMediaClass::Xop => (&bytes[..], Cow::Borrowed(content_type)),
             SoapMediaClass::Mtom { boundary, start } => {
                 let part = extract_mtom_root_part(bytes, boundary, start.as_deref())?;
                 (part.body, Cow::Owned(part.content_type))
@@ -6274,106 +6395,375 @@ struct MtomRootPart<'a> {
     content_type: String,
 }
 
+/// One framed MIME part of an MTOM/XOP package.
+///
+/// Only the three headers that decide *which* envelope is validated are kept;
+/// every other header is syntax-checked and discarded. Attachment payloads are
+/// never read, decoded, or validated.
+struct MtomPart<'a> {
+    content_type: Option<&'a str>,
+    content_id: Option<String>,
+    transfer_encoding: Option<&'a str>,
+    body: &'a [u8],
+}
+
+/// A recognized boundary delimiter *line*.
+struct MtomDelimiter {
+    /// Offset of the first `-` of `--boundary`.
+    line_start: usize,
+    /// Offset just past the delimiter line, i.e. past its terminating CRLF (or
+    /// at end of input for a closing delimiter that ends the body).
+    next: usize,
+    closing: bool,
+}
+
+/// Classify what follows `--boundary` on a candidate delimiter line.
+///
+/// Returns how many bytes the line occupies after the boundary token plus
+/// whether this is the closing delimiter, or `None` when the candidate is not a
+/// delimiter line at all — in which case those bytes are payload and the scan
+/// continues past them.
+///
+/// Framing is exact CRLF and nothing else. RFC 2046 transport padding is
+/// deliberately *not* accepted: a padded delimiter is precisely the construct
+/// one parser treats as framing and another as payload, and rejecting it fails
+/// closed instead of choosing a reading the backend may not share.
+fn mtom_delimiter_tail(rest: &[u8]) -> Option<(usize, bool)> {
+    let Some(after_dashes) = rest.strip_prefix(b"--") else {
+        // A part delimiter line ends in exactly CRLF and nothing else.
+        return rest.starts_with(b"\r\n").then_some((2, false));
+    };
+    // Close-delimiter. RFC 2046 allows an epilogue after its CRLF, and allows
+    // the body to simply end here.
+    if after_dashes.starts_with(b"\r\n") {
+        return Some((4, true));
+    }
+    if after_dashes.is_empty() {
+        return Some((2, true));
+    }
+    None
+}
+
+/// A bounded, line-anchored scanner over one package's delimiter lines.
+///
+/// A delimiter line exists only at the very start of the body or immediately
+/// after a CRLF. That anchoring is what makes an embedded `--boundary`
+/// substring inside a preamble, a header value, or an attachment payload inert
+/// here — exactly as it is inert for a conforming backend parser. An unanchored
+/// byte-substring search would instead let an attacker plant a fake part inside
+/// a payload and have Ferrum validate it while the backend consumed the real
+/// root part (GHSA-435h-f785-wmm4).
+struct MtomScanner<'a> {
+    bytes: &'a [u8],
+    dash_boundary: Vec<u8>,
+    crlf_dash_boundary: Vec<u8>,
+    /// Delimiter-line candidates examined so far, across the whole package.
+    candidates: usize,
+}
+
+impl<'a> MtomScanner<'a> {
+    fn new(bytes: &'a [u8], boundary: &str) -> Self {
+        let dash_boundary = format!("--{boundary}").into_bytes();
+        let mut crlf_dash_boundary = Vec::with_capacity(dash_boundary.len() + 2);
+        crlf_dash_boundary.extend_from_slice(b"\r\n");
+        crlf_dash_boundary.extend_from_slice(&dash_boundary);
+        Self {
+            bytes,
+            dash_boundary,
+            crlf_dash_boundary,
+            candidates: 0,
+        }
+    }
+
+    /// The next delimiter line at or after `from`, or `Ok(None)` when the
+    /// package has none left.
+    fn next_from(&mut self, from: usize) -> Result<Option<MtomDelimiter>, SoapBodyDecodeError> {
+        let mut search = from;
+        loop {
+            let line_start = if search == 0 && self.bytes.starts_with(&self.dash_boundary) {
+                0
+            } else {
+                let Some(tail) = self.bytes.get(search..) else {
+                    return Ok(None);
+                };
+                match find_subslice(tail, &self.crlf_dash_boundary) {
+                    // The line starts *after* the CRLF that introduces it.
+                    Some(offset) => search + offset + 2,
+                    None => return Ok(None),
+                }
+            };
+            self.candidates += 1;
+            if self.candidates > MAX_MULTIPART_DELIMITER_CANDIDATES {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            let after_boundary = line_start + self.dash_boundary.len();
+            let rest = self
+                .bytes
+                .get(after_boundary..)
+                .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+            if let Some((tail_len, closing)) = mtom_delimiter_tail(rest) {
+                return Ok(Some(MtomDelimiter {
+                    line_start,
+                    next: after_boundary + tail_len,
+                    closing,
+                }));
+            }
+            // Boundary-shaped bytes that are not a delimiter line. Skip past
+            // them and keep scanning; they belong to whatever part is being
+            // framed. `dash_boundary` is at least three bytes, so the scan
+            // always advances.
+            search = after_boundary;
+        }
+    }
+
+    /// Whether the boundary token occurs anywhere in `bytes[from..]`, anchored
+    /// or not. Used for the epilogue, where any boundary-shaped bytes are
+    /// ambiguous rather than ignorable.
+    fn boundary_occurs_after(&self, from: usize) -> bool {
+        self.bytes
+            .get(from..)
+            .is_some_and(|tail| find_subslice(tail, &self.dash_boundary).is_some())
+    }
+}
+
+/// Parse one MIME part from its exact framed content.
+///
+/// Strict by construction: the header block ends at the first `CRLF CRLF`,
+/// obsolete folded continuation lines are refused rather than unfolded, every
+/// line must be a well-formed `token ":" value`, header bytes must be US-ASCII
+/// with no bare CR or LF, and each of the three headers that decide which
+/// envelope is validated may appear at most once. A first-wins rule over
+/// duplicated or foldable headers is exactly the kind of ambiguity a backend
+/// can resolve differently, so it fails closed here instead.
+fn parse_mtom_part(content: &[u8]) -> Result<MtomPart<'_>, SoapBodyDecodeError> {
+    let header_len =
+        find_subslice(content, b"\r\n\r\n").ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    if header_len > MAX_MULTIPART_PART_HEADER_BYTES {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    let header_bytes = &content[..header_len];
+    if !header_bytes
+        .iter()
+        .all(|&byte| matches!(byte, b'\t' | b'\r' | b'\n' | 0x20..=0x7e))
+    {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    let Ok(headers) = std::str::from_utf8(header_bytes) else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+
+    let mut content_type: Option<&str> = None;
+    let mut content_id_raw: Option<&str> = None;
+    let mut transfer_encoding: Option<&str> = None;
+    let mut lines = 0usize;
+    for line in headers.split("\r\n") {
+        // A part with no headers at all, or an empty line inside the block,
+        // re-frames the part for a lenient parser.
+        if line.is_empty() {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        // A bare CR or LF would end this line for some parsers and not others.
+        if line.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        // Obsolete folding (RFC 5322 obs-fold): refused, not joined.
+        if line.starts_with([' ', '\t']) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        lines += 1;
+        if lines > MAX_MULTIPART_PART_HEADERS {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let (name, value) = line
+            .split_once(':')
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if name.is_empty() || !name.bytes().all(is_media_type_token_byte) {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let value = value.trim_matches([' ', '\t']);
+        let slot = if name.eq_ignore_ascii_case("content-type") {
+            &mut content_type
+        } else if name.eq_ignore_ascii_case("content-id") {
+            &mut content_id_raw
+        } else if name.eq_ignore_ascii_case("content-transfer-encoding") {
+            &mut transfer_encoding
+        } else {
+            continue;
+        };
+        if slot.replace(value).is_some() {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
+
+    let content_id = match content_id_raw {
+        Some(raw) => {
+            let normalized = normalize_content_id(raw);
+            if normalized.is_empty() {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+
+    let body = content
+        .get(header_len + 4..)
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    Ok(MtomPart {
+        content_type,
+        content_id,
+        transfer_encoding,
+        body,
+    })
+}
+
 /// Locate and return the SOAP root part of an MTOM/XOP package.
 ///
 /// Only part *headers* are parsed; attachment payloads are skipped without
-/// being read, decoded, or validated. The root part is the one whose
-/// `Content-ID` matches the `start` parameter, or the first part when `start`
-/// is absent (RFC 2387). Every failure mode — no parts, no matching root, a
-/// root part that is not a SOAP/XOP infoset, or a transfer encoding that would
-/// make the validated bytes differ from the packaged bytes — fails closed.
+/// being read, decoded, or validated. The whole package is framed and every
+/// part parsed *before* a root is selected, so no ambiguity later in the
+/// package can be missed by an early return.
+///
+/// The contract this enforces, so that Ferrum and the backend cannot disagree
+/// about which bytes are the envelope (GHSA-435h-f785-wmm4):
+///
+/// * Delimiter lines are recognized only at the body start or immediately after
+///   a CRLF, with exact CRLF framing and no transport padding.
+/// * Exactly one close-delimiter must be present, and the epilogue after it
+///   must not contain the boundary token at all.
+/// * Part headers are strict: US-ASCII, no obsolete folding, well-formed field
+///   names, and at most one `Content-Type` / `Content-ID` /
+///   `Content-Transfer-Encoding` per part.
+/// * `Content-ID` values are unique across the package (RFC 2387).
+/// * The root is the part whose `Content-ID` matches `start`, or the first part
+///   when `start` is absent — and with `start` supplied exactly one part may
+///   match.
+/// * The root part must itself declare a SOAP/XOP infoset and must not declare
+///   a re-encoding `Content-Transfer-Encoding`.
+///
+/// Every other shape — no parts, no matching root, LF-only framing, a missing
+/// or malformed closure, a part header block over its byte/line ceiling, more
+/// than [`MAX_MULTIPART_PARTS`] parts, or more than
+/// [`MAX_MULTIPART_DELIMITER_CANDIDATES`] boundary-shaped candidates — fails
+/// closed.
 fn extract_mtom_root_part<'a>(
     bytes: &'a [u8],
     boundary: &str,
     start: Option<&str>,
 ) -> Result<MtomRootPart<'a>, SoapBodyDecodeError> {
-    let delimiter = format!("--{boundary}");
-    let delimiter = delimiter.as_bytes();
-    let mut cursor = find_subslice(bytes, delimiter).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-    let mut parts_seen = 0usize;
+    let mut scanner = MtomScanner::new(bytes, boundary);
 
-    while cursor < bytes.len() {
-        let after_delimiter = cursor + delimiter.len();
-        let remainder = bytes
-            .get(after_delimiter..)
-            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-        // The closing delimiter is `--boundary--`; nothing follows it.
-        if remainder.starts_with(b"--") {
-            break;
-        }
-        let header_start = after_delimiter + leading_crlf_len(remainder);
-        if header_start == after_delimiter && !remainder.is_empty() {
-            // A delimiter must be followed by CRLF (or the closing `--`).
-            // Anything else means this occurrence was payload, not framing.
-            return Err(SoapBodyDecodeError::MalformedEncoding);
-        }
-        parts_seen += 1;
-        if parts_seen > MAX_MULTIPART_PARTS {
-            return Err(SoapBodyDecodeError::MalformedEncoding);
-        }
-
-        let part_bytes = bytes
-            .get(header_start..)
-            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-        let header_len =
-            find_subslice(part_bytes, b"\r\n\r\n").ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-        if header_len > MAX_MULTIPART_PART_HEADER_BYTES {
-            return Err(SoapBodyDecodeError::MalformedEncoding);
-        }
-        let headers = std::str::from_utf8(&part_bytes[..header_len])
-            .map_err(|_| SoapBodyDecodeError::MalformedEncoding)?;
-        let body_start = header_start + header_len + 4;
-
-        let next_delimiter = bytes
-            .get(body_start..)
-            .and_then(|tail| find_subslice(tail, delimiter))
-            .map(|offset| body_start + offset)
-            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
-        // The CRLF immediately before a delimiter belongs to the framing.
-        let body_end = next_delimiter.saturating_sub(trailing_crlf_len(&bytes[body_start..next_delimiter]));
-        let body = &bytes[body_start..body_end];
-
-        let part_content_type = mime_header_value(headers, "content-type").unwrap_or("");
-        let part_content_id = mime_header_value(headers, "content-id").map(normalize_content_id);
-        let transfer_encoding = mime_header_value(headers, "content-transfer-encoding");
-
-        // RFC 2387: the root is the part whose Content-ID matches `start`, or
-        // the first part when `start` is absent.
-        let is_root = match start {
-            Some(start) => part_content_id.as_deref() == Some(start),
-            None => parts_seen == 1,
-        };
-        if is_root {
-            // The root part must itself declare a SOAP/XOP infoset. A root part
-            // labelled `application/octet-stream` is the same client-selected
-            // mislabelling GHSA-435h-f785-wmm4 describes, one layer down.
-            let essence = media_type_essence(part_content_type)
-                .map_err(|_| SoapBodyDecodeError::MalformedEncoding)?;
-            if !MTOM_ROOT_ESSENCES.contains(&essence.as_str()) {
-                return Err(SoapBodyDecodeError::UnsupportedCharset);
-            }
-            // MTOM mandates a binary-safe transfer encoding. Anything that
-            // re-encodes the payload would make the bytes Ferrum validates
-            // differ from the bytes the backend decodes.
-            if let Some(encoding) = transfer_encoding
-                && !matches!(
-                    encoding.trim().to_ascii_lowercase().as_str(),
-                    "7bit" | "8bit" | "binary"
-                )
-            {
-                return Err(SoapBodyDecodeError::UnsupportedCharset);
-            }
-            return Ok(MtomRootPart {
-                body,
-                content_type: part_content_type.to_string(),
-            });
-        }
-        cursor = next_delimiter;
+    // Anything before the first delimiter line is the RFC 2046 preamble, which
+    // every conforming parser ignores; it is skipped rather than inspected.
+    let first = scanner
+        .next_from(0)?
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+    if first.closing {
+        // `--boundary--` with no parts: there is no envelope to validate.
+        return Err(SoapBodyDecodeError::MalformedEncoding);
     }
 
-    // `start` named a part this package does not contain, or there were no
-    // parts at all. Either way there is no envelope to validate.
-    Err(SoapBodyDecodeError::MalformedEncoding)
+    let mut parts: Vec<MtomPart<'a>> = Vec::new();
+    let mut cursor = first.next;
+    let epilogue_start = loop {
+        if parts.len() >= MAX_MULTIPART_PARTS {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let next = scanner
+            .next_from(cursor)?
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        // The CRLF immediately before a delimiter line is framing, not content.
+        let content_end = next
+            .line_start
+            .checked_sub(2)
+            .filter(|end| *end >= cursor)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        if &bytes[content_end..next.line_start] != b"\r\n" {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        parts.push(parse_mtom_part(&bytes[cursor..content_end])?);
+        cursor = next.next;
+        if next.closing {
+            break cursor;
+        }
+    };
+    // A parser that keeps reading past the close-delimiter would frame more
+    // parts than this one did, so any boundary token in the epilogue is
+    // ambiguous rather than ignorable.
+    if scanner.boundary_occurs_after(epilogue_start) {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+
+    // RFC 2387 requires package-unique Content-IDs. Two parts claiming one id
+    // let the gateway and the backend resolve `start` to different envelopes.
+    for (index, part) in parts.iter().enumerate() {
+        let Some(id) = part.content_id.as_deref() else {
+            continue;
+        };
+        if parts[..index]
+            .iter()
+            .any(|earlier| earlier.content_id.as_deref() == Some(id))
+        {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+    }
+
+    let root = match start {
+        Some(start) => {
+            let mut matching = parts
+                .iter()
+                .filter(|part| part.content_id.as_deref() == Some(start));
+            let Some(selected) = matching.next() else {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            };
+            if matching.next().is_some() {
+                return Err(SoapBodyDecodeError::MalformedEncoding);
+            }
+            selected
+        }
+        None => parts.first().ok_or(SoapBodyDecodeError::MalformedEncoding)?,
+    };
+
+    // The root part must itself declare a SOAP/XOP infoset. A root part
+    // labelled `application/octet-stream` is the same client-selected
+    // mislabelling GHSA-435h-f785-wmm4 describes, one layer down.
+    let root_content_type = root.content_type.unwrap_or("");
+    let Ok(essence) = media_type_essence(root_content_type) else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    if !MTOM_ROOT_ESSENCES.contains(&essence.as_str()) {
+        return Err(SoapBodyDecodeError::UnsupportedCharset);
+    }
+    // MTOM mandates a binary-safe transfer encoding. Anything that re-encodes
+    // the payload would make the bytes Ferrum validates differ from the bytes
+    // the backend decodes.
+    if let Some(encoding) = root.transfer_encoding
+        && !matches!(
+            encoding.trim().to_ascii_lowercase().as_str(),
+            "7bit" | "8bit" | "binary"
+        )
+    {
+        return Err(SoapBodyDecodeError::UnsupportedCharset);
+    }
+
+    Ok(MtomRootPart {
+        body: root.body,
+        content_type: root_content_type.to_string(),
+    })
+}
+
+/// The strict MTOM package parser, reached through the lib target's
+/// `_test_support` shim so hostile-package regressions live in the external
+/// unit suite rather than inline in this module.
+#[allow(dead_code)]
+pub(crate) fn extract_mtom_root_part_for_test(
+    bytes: &[u8],
+    boundary: &str,
+    start: Option<&str>,
+) -> Result<(Vec<u8>, String), &'static str> {
+    extract_mtom_root_part(bytes, boundary, start)
+        .map(|part| (part.body.to_vec(), part.content_type))
+        .map_err(SoapBodyDecodeError::class)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -6383,40 +6773,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
-}
-
-fn leading_crlf_len(bytes: &[u8]) -> usize {
-    if bytes.starts_with(b"\r\n") {
-        2
-    } else if bytes.starts_with(b"\n") {
-        1
-    } else {
-        0
-    }
-}
-
-fn trailing_crlf_len(bytes: &[u8]) -> usize {
-    if bytes.ends_with(b"\r\n") {
-        2
-    } else if bytes.ends_with(b"\n") {
-        1
-    } else {
-        0
-    }
-}
-
-/// Case-insensitive MIME part header lookup over a CRLF-separated header block.
-/// Folded (continuation) lines are not supported and simply do not match; a
-/// header Ferrum cannot read is treated as absent, which fails closed for the
-/// checks above.
-fn mime_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
-    headers.lines().find_map(|line| {
-        let (field, value) = line.split_once(':')?;
-        field
-            .trim()
-            .eq_ignore_ascii_case(name)
-            .then(|| value.trim())
-    })
 }
 
 /// Decode a buffered SOAP body into UTF-8 text for XML validation.
@@ -6996,7 +7352,10 @@ mod tests {
         let references = std::iter::repeat_n(timestamp_reference(), MAX_SIGNED_REFERENCES + 1)
             .collect::<String>();
         let error = reference_digest_error(&signed_envelope(&references));
-        assert!(error.contains("too many Signature References"), "got: {error}");
+        assert!(
+            error.contains("too many Signature References"),
+            "got: {error}"
+        );
     }
 
     /// GHSA-9g4v-h9hm-846r: two References to one id multiply canonicalization
@@ -7056,7 +7415,10 @@ mod tests {
         );
         let document = parse_bounded_xml(&envelope, "test envelope").expect("fixture parses");
         let error = resolve_soap_envelope(&document).expect_err("duplicate Body must reject");
-        assert!(error.contains("duplicate namespace-qualified"), "got: {error}");
+        assert!(
+            error.contains("duplicate namespace-qualified"),
+            "got: {error}"
+        );
     }
 
     /// GHSA-3mwq-c8j6-9xhp: a `wsse:Security` element outside the SOAP Header
@@ -7083,7 +7445,10 @@ mod tests {
         let mut budget = WorkBudget { remaining: 4 };
         assert!(budget.charge(4).is_ok());
         let error = budget.charge(1).expect_err("budget must be finite");
-        assert!(error.contains("canonicalization work budget"), "got: {error}");
+        assert!(
+            error.contains("canonicalization work budget"),
+            "got: {error}"
+        );
     }
 
     /// GHSA-435h-f785-wmm4: classification is structural, so a parameter value
@@ -7099,7 +7464,10 @@ mod tests {
             classify_soap_media_type("multipart/form-data; boundary=application/xml", true),
             Ok(None)
         );
-        assert_eq!(classify_soap_media_type("application/octet-stream", true), Ok(None));
+        assert_eq!(
+            classify_soap_media_type("application/octet-stream", true),
+            Ok(None)
+        );
         assert_eq!(
             classify_soap_media_type("text/xml\u{7f}", true),
             Err(MediaTypeRejection::MalformedMediaType)
@@ -7124,45 +7492,6 @@ mod tests {
         assert_eq!(
             classify_soap_media_type("multipart/related; type=\"application/xop+xml\"", true),
             Err(MediaTypeRejection::MalformedMultipartPackaging)
-        );
-    }
-
-    /// GHSA-435h-f785-wmm4: MTOM validation targets the root part's envelope,
-    /// and a root part that is not a SOAP/XOP infoset fails closed.
-    #[test]
-    fn mtom_root_part_extraction_selects_the_envelope() {
-        let package = concat!(
-            "--MIME_boundary\r\n",
-            "Content-Type: application/xop+xml; charset=utf-8; type=\"text/xml\"\r\n",
-            "Content-Transfer-Encoding: binary\r\n",
-            "Content-ID: <root@example.com>\r\n",
-            "\r\n",
-            "<soap:Envelope/>\r\n",
-            "--MIME_boundary\r\n",
-            "Content-Type: application/octet-stream\r\n",
-            "Content-ID: <attachment@example.com>\r\n",
-            "\r\n",
-            "\x00\x01\x02\r\n",
-            "--MIME_boundary--\r\n",
-        );
-        let part = extract_mtom_root_part(
-            package.as_bytes(),
-            "MIME_boundary",
-            Some("root@example.com"),
-        )
-        .expect("root part should resolve");
-        assert_eq!(part.body, b"<soap:Envelope/>");
-
-        let mislabelled = package.replace("application/xop+xml", "application/octet-stream");
-        assert_eq!(
-            extract_mtom_root_part(mislabelled.as_bytes(), "MIME_boundary", Some("root@example.com")),
-            Err(SoapBodyDecodeError::UnsupportedCharset)
-        );
-
-        let reencoded = package.replace("Content-Transfer-Encoding: binary", "Content-Transfer-Encoding: base64");
-        assert_eq!(
-            extract_mtom_root_part(reencoded.as_bytes(), "MIME_boundary", Some("root@example.com")),
-            Err(SoapBodyDecodeError::UnsupportedCharset)
         );
     }
 
