@@ -5706,11 +5706,7 @@ fn finish_pod_ip_removal_scope_clear(
             "{scope_label}"
         );
         metrics.record_attach_error();
-        remember_pending_capture_failure(
-            state_key,
-            CAPTURE_FAILURE_POD_IP_REMOVE,
-            &ip.to_string(),
-        );
+        remember_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());
         return false;
     }
     forget_pending_capture_failure(state_key, CAPTURE_FAILURE_POD_IP_REMOVE, &ip.to_string());

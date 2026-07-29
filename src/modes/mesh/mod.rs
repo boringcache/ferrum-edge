@@ -22863,17 +22863,14 @@ mod tests {
                             serde_json::json!({ "trusted_hbone_assertors": [] }),
                         ),
                     ),
-                    (
-                        "disabled override",
-                        {
-                            let mut plugin = global_mesh_authz_plugin(
-                                "operator-mesh-authz-disabled",
-                                serde_json::json!({}),
-                            );
-                            plugin.enabled = false;
-                            plugin
-                        },
-                    ),
+                    ("disabled override", {
+                        let mut plugin = global_mesh_authz_plugin(
+                            "operator-mesh-authz-disabled",
+                            serde_json::json!({}),
+                        );
+                        plugin.enabled = false;
+                        plugin
+                    }),
                 ] {
                     let mut config = GatewayConfig {
                         plugin_configs: vec![operator.clone()],

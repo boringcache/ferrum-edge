@@ -3158,12 +3158,10 @@ fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
 /// back to the config row that produced it. Counting closes that gap exactly:
 /// the global chain is built from enabled global rows at **most one instance
 /// per row** (plus the CORS / mesh-route-dispatch finalizers, neither of which
-/// is a `mesh_authz`), so `built <= configured` structurally. Requiring
-/// `built >= configured` therefore forces equality, and equality plus a managed
-/// row present means the managed instance itself constructed AND survived the
-/// TCP protocol filter. Any construction failure or protocol-filter drop —
-/// including one that removes exactly the managed instance while leaving an
-/// operator instance behind — lands `built < configured` and fails closed.
+/// is a `mesh_authz`). Requiring exact equality plus a managed row means the
+/// managed instance itself constructed AND survived the TCP protocol filter.
+/// Any construction failure, protocol-filter drop, or unexpected extra runtime
+/// instance fails closed rather than weakening this proof.
 fn node_waypoint_destination_authz_ready_from_counts(
     managed_config_present: bool,
     enabled_global_mesh_authz_configs: usize,
@@ -3171,7 +3169,7 @@ fn node_waypoint_destination_authz_ready_from_counts(
 ) -> bool {
     managed_config_present
         && enabled_global_mesh_authz_configs > 0
-        && built_global_tcp_mesh_authz_plugins >= enabled_global_mesh_authz_configs
+        && built_global_tcp_mesh_authz_plugins == enabled_global_mesh_authz_configs
 }
 
 /// Test seam for [`node_waypoint_destination_authz_ready_from_counts`] so the
@@ -3203,7 +3201,11 @@ fn compute_node_waypoint_destination_authz_ready(
 ) -> bool {
     let (managed, enabled_global) = mesh_authz_global_config_state(config);
     let built = match global.get(&ProxyProtocol::Tcp) {
-        Some(entry) => entry.plugins.iter().filter(|p| p.name() == "mesh_authz").count(),
+        Some(entry) => entry
+            .plugins
+            .iter()
+            .filter(|p| p.name() == "mesh_authz")
+            .count(),
         None => 0,
     };
     node_waypoint_destination_authz_ready_from_counts(managed, enabled_global, built)

@@ -10316,9 +10316,7 @@ fn node_waypoint_authz_ready(plugin_configs: Vec<PluginConfig>) -> bool {
 
 fn ready_from_counts(managed: bool, configured: usize, built: usize) -> bool {
     ferrum_edge::_test_support::node_waypoint_destination_authz_ready_from_counts_for_test(
-        managed,
-        configured,
-        built,
+        managed, configured, built,
     )
 }
 
@@ -10410,6 +10408,9 @@ fn managed_config_without_its_runtime_policy_in_the_tcp_chain_is_not_ready() {
     // instance is necessarily among them.
     assert!(ready_from_counts(true, 1, 1));
     assert!(ready_from_counts(true, 2, 2));
+    // An unexpected extra runtime instance also invalidates the exact
+    // config-to-chain proof and must fail closed.
+    assert!(!ready_from_counts(true, 1, 2));
     // No managed row: an operator instance in the chain never satisfies it.
     assert!(!ready_from_counts(false, 1, 1));
     assert!(!ready_from_counts(true, 0, 0));
