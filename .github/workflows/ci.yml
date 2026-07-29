@@ -3354,6 +3354,7 @@ jobs:
       - mesh-e2e-sidecar
       - helm-chart
       - lint
+      - fuzz-smoke
       - build-ebpf
       - build-ebpf-userspace
       - ebpf-live
@@ -3504,6 +3505,31 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  fuzz-smoke:
+    name: Fuzz Smoke
+    needs: ci-plan
+    if: needs.ci-plan.outputs.mode == 'full' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-smoke
+
+      - name: Run deterministic fuzz smoke lane
+        working-directory: fuzz
+        run: bash scripts/fuzz_smoke.sh
 
   build-ebpf:
     name: Build eBPF Programs

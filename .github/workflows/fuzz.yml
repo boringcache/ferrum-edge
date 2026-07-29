@@ -1,0 +1,96 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: Per-target libFuzzer wall time in seconds
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  FUZZ_MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
+
+jobs:
+  fuzz-sanitized:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target:
+          - traceparent
+          - config_decode
+          - proxy_protocol
+          - mesh_udp_frame
+          - k8s_crd
+          - plugin_config
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz-sanitized-${{ matrix.target }}
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.1
+
+      - name: Run sanitizer-backed fuzz target
+        working-directory: fuzz
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:allocator_may_return_null=1"
+        run: |
+          set -euo pipefail
+          cargo fuzz run -s address "${{ matrix.target }}" -- \
+            -max_total_time="${FUZZ_MAX_TOTAL_TIME}" \
+            -max_len=65536 \
+            -timeout=5 \
+            -rss_limit_mb=2048 \
+            -artifact_prefix=artifacts/${{ matrix.target }}/
+
+      - name: Upload crash artifacts (bounded)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Reject oversized crash artifacts
+        if: failure()
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          if [ ! -d "artifacts/${{ matrix.target }}" ]; then
+            exit 0
+          fi
+          while IFS= read -r file; do
+            size="$(wc -c < "$file" | tr -d ' ')"
+            if [ "$size" -gt 65536 ]; then
+              echo "::error::crash artifact $file exceeds 64 KiB ($size bytes); redact before promotion"
+              exit 1
+            fi
+          done < <(find "artifacts/${{ matrix.target }}" -type f -print)

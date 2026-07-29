@@ -88,6 +88,13 @@ paths:
 - Set `FERRUM_POOL_WARMUP_ENABLED=false` in tests that count backend hits.
 - Keep warmup true when tests require the capability registry to have a `Supported` entry before traffic, such as native H3 or direct H2 routing.
 
+## Fuzz / property lane
+
+- Hostile-parser fuzzing lives in the isolated `fuzz/` cargo-fuzz workspace; see
+  `docs/fuzz.md` for budgets, corpora policy, and crash promotion.
+- Ordinary PR CI runs the deterministic `Fuzz Smoke` job (`fuzz/scripts/fuzz_smoke.sh`).
+- Longer sanitizer-backed runs are scheduled in `.github/workflows/fuzz.yml` only.
+
 ## CI Expectations
 
 - Full-mode PR CI runs formatting and integration-shard coverage inside `ci-plan`, then runs consolidated test jobs (unit + inline lib, all secret backends, Consul + LDAP), two integration shards, three functional shards, lint, perf regression, and five build targets: Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64. The planner also emits trusted, fail-closed Helm/mesh/eBPF path gates so irrelevant jobs skip before runner allocation. Ordinary non-vendored documentation, license, and agent-instruction-only PRs stay on a lightweight diff-hygiene + `Tests` aggregate path; vendored Markdown and live-suite contract/runbook docs still select full mode. On full-mode PRs, the perf-regression job always runs lightweight protocol-perf static contracts (workflow/evaluator self-tests + scenario `py_compile`) after checkout; the expensive HTTP overhead benchmark runs only for shared runtime infrastructure (top-level `src/*.rs`), proxy/connection hot paths, file-mode startup and config, performance fixtures, or dependency/build-graph changes; plugin-internal, admin, secrets, and unrelated-mode changes skip the benchmark. It always runs on pushes to `main` and manual `workflow_dispatch`, and runs fail-closed when the PR diff cannot be computed.

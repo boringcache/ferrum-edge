@@ -86,6 +86,22 @@ pub fn encode_datagram(out: &mut BytesMut, payload: &[u8]) -> std::io::Result<()
 /// caller that received whole back-to-back frames in one underlying read drains
 /// them one call at a time without another syscall (the inner reads short-circuit
 /// on the buffered bytes).
+/// Try to decode one complete length-prefixed datagram from `buf` without I/O.
+///
+/// Returns `Some(payload)` when a full frame is present (payload may be empty),
+/// or `None` when fewer than `LEN_PREFIX + payload_len` bytes are buffered.
+pub fn pop_framed_datagram(buf: &mut BytesMut) -> Option<Bytes> {
+    if buf.len() < LEN_PREFIX {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.len() < LEN_PREFIX + payload_len {
+        return None;
+    }
+    buf.advance(LEN_PREFIX);
+    Some(buf.split_to(payload_len).freeze())
+}
+
 pub async fn read_datagram<R: AsyncRead + Unpin>(
     reader: &mut R,
     buf: &mut BytesMut,
@@ -94,15 +110,8 @@ pub async fn read_datagram<R: AsyncRead + Unpin>(
         // 1. Do we already have a full frame buffered? Parse and return it
         //    WITHOUT touching the transport — back-to-back frames from one read
         //    drain one call at a time.
-        if buf.len() >= LEN_PREFIX {
-            // Peek the length without consuming, so a short payload leaves the
-            // prefix intact for the next attempt.
-            let payload_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-            if buf.len() >= LEN_PREFIX + payload_len {
-                buf.advance(LEN_PREFIX);
-                let payload = buf.split_to(payload_len).freeze();
-                return Ok(Some(payload));
-            }
+        if let Some(payload) = pop_framed_datagram(buf) {
+            return Ok(Some(payload));
         }
 
         // 2. Need more bytes. Read another chunk from the transport.

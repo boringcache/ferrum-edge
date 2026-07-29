@@ -1,0 +1,29 @@
+[package]
+name = "ferrum-edge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.9"
+ferrum-edge = { path = ".." }
+
+[dev-dependencies]
+proptest = "=1.6.0"
+
+[profile.release]
+debug = 1
+
+[profile.dev]
+debug = 1
+
+[profile.fuzz]
+inherits = "release"
+debug = 1
+
+[profile.fuzz-with-sanitizer]
+inherits = "release"
+debug = 1
