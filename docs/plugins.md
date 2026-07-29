@@ -3164,7 +3164,7 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_origins` | (String \| Object)[] | required, max 64 | Permitted origins. Use `["*"]` only for intentional allow-all. Plain strings are NATIVE syntax: exact origins are canonicalized at config load and matched case-insensitively, and `*.suffix.com` is the wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex` and keep LITERAL source semantics — object `exact` is a byte-for-byte case-sensitive match with no canonicalization or wildcard interpretation, so `{exact: "*.example.com"}` matches only that literal string; `{exact: "*"}` is Istio allow-all. Matcher values are bounded at 512 bytes and regexes compile once at config construction/reload under explicit complexity limits. |
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
