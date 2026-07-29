@@ -24,7 +24,11 @@
 //!   full-body UTF-8 scan, parse, redaction, or allocation, and fail closed with
 //!   a content-free `over_capture_limit` omission when it does not fit. A stale
 //!   or lying header, or a transform that grows the body, therefore cannot make
-//!   the debugger walk an oversized payload.
+//!   the debugger walk an oversized payload. The header can overstate the
+//!   message as well — a `HEAD` or `304` response declares a length it never
+//!   sends — so an actually empty slice reports the same fixed `empty_body`
+//!   reason the header screen uses rather than being handed to the renderer,
+//!   where a structured family would call an absent body malformed.
 //! * **Never forces a stream to buffer.** Both buffering predicates return
 //!   `false` unless the message declares a `Content-Length` that fits inside the
 //!   configured cap, declares an identity `Content-Encoding`, and declares a
@@ -507,6 +511,12 @@ impl TransactionDebugger {
     /// scanned, parsed, redacted, or allocated from — it returns a content-free
     /// omission. The final hooks apply the same rule and emit the ordinary
     /// `over_capture_limit` omission record instead of calling this at all.
+    ///
+    /// The hooks also screen out an actually empty body first, so `body` here
+    /// is non-empty on every production path. A direct caller that passes an
+    /// empty slice still gets a content-free answer, but a structured family
+    /// reports it through [`BODY_MALFORMED_MARKER`] — an empty document is not
+    /// parseable as the structure it declared.
     pub fn render_captured_body(
         &self,
         body: &[u8],
@@ -736,6 +746,21 @@ impl TransactionDebugger {
                     method,
                     path,
                     BodyCaptureDecision::Skip("over_capture_limit"),
+                    None,
+                );
+                return PluginResult::Continue;
+            }
+            // The declared length can overstate the message too, and there is
+            // nothing to sample when it does. Report the same fixed
+            // `empty_body` reason the header screen uses rather than handing an
+            // empty slice to the renderer, where a structured family would
+            // report it as a *malformed* body the peer never sent.
+            if body.is_empty() {
+                self.emit_body_capture(
+                    "request",
+                    method,
+                    path,
+                    BodyCaptureDecision::Skip("empty_body"),
                     None,
                 );
                 return PluginResult::Continue;
@@ -975,6 +1000,21 @@ impl Plugin for TransactionDebugger {
                     &ctx.method,
                     &ctx.path,
                     BodyCaptureDecision::Skip("over_capture_limit"),
+                    None,
+                );
+                return PluginResult::Continue;
+            }
+            // A `HEAD` or `304` response legitimately declares the length of a
+            // body it does not send, so the actual client-visible slice is
+            // empty even though the header screen admitted it. Report the fixed
+            // `empty_body` reason instead of letting the structured renderer
+            // call an absent body malformed.
+            if body.is_empty() {
+                self.emit_body_capture(
+                    "response",
+                    &ctx.method,
+                    &ctx.path,
+                    BodyCaptureDecision::Skip("empty_body"),
                     None,
                 );
                 return PluginResult::Continue;

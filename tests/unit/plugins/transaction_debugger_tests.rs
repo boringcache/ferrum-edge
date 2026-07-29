@@ -1559,6 +1559,64 @@ async fn test_final_response_hook_fails_closed_on_transformation_length_drift() 
     assert!(logs.contains("ok"), "got: {logs}");
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn test_final_hooks_report_a_declared_but_absent_body_as_empty_not_malformed() {
+    // `Content-Length` can overstate the message as easily as it can understate
+    // it: a `HEAD` or `304` response declares the length of a body it never
+    // sends, so the header screen admits it and the final hook receives an
+    // empty slice. Handing that to the structured renderer would report
+    // `<malformed-structured-body-omitted>` — telling the operator the backend
+    // emitted broken JSON when it correctly emitted nothing at all.
+    let plugin = capture_plugin();
+    let mut ctx = make_ctx();
+    let headers = body_headers("application/json", 50);
+    let empty: &[u8] = b"";
+    assert!(plugin.response_body_capture_decision(&headers).is_capture());
+
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 304, &headers, empty)
+            .await;
+    })
+    .await;
+    assert!(logs.contains("capture=omitted"), "got: {logs}");
+    assert!(logs.contains("reason=empty_body"), "got: {logs}");
+    assert!(logs.contains("direction=response"), "got: {logs}");
+    assert!(
+        !logs.contains(BODY_MALFORMED_MARKER),
+        "an absent body must not be reported as a malformed one: {logs}"
+    );
+
+    // Same rule on the request side, where a `before_proxy` transform can empty
+    // a body the header screen already admitted.
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.on_final_request_body(&headers, empty).await;
+    })
+    .await;
+    assert!(logs.contains("capture=omitted"), "got: {logs}");
+    assert!(logs.contains("reason=empty_body"), "got: {logs}");
+    assert!(logs.contains("direction=request"), "got: {logs}");
+    assert!(!logs.contains(BODY_MALFORMED_MARKER), "got: {logs}");
+
+    // Exactly one record either way: the omission replaces the sample, it does
+    // not accompany one.
+    assert_eq!(
+        logs.matches("Bounded body capture").count(),
+        1,
+        "an empty body must emit exactly one record: {logs}"
+    );
+
+    // The unstructured families take the same path rather than reporting an
+    // empty `captured` sample that reads like a real one.
+    let text = body_headers("text/plain", 50);
+    let logs = capture_debug_logs(|| async {
+        let _ = plugin.on_final_request_body(&text, empty).await;
+    })
+    .await;
+    assert!(logs.contains("reason=empty_body"), "got: {logs}");
+    assert!(!logs.contains("capture=captured"), "got: {logs}");
+}
+
 #[test]
 fn test_reload_style_reconfiguration_changes_capture_behavior() {
     // A rebuilt plugin cache constructs a fresh instance; the new configuration

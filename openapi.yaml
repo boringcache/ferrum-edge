@@ -13331,8 +13331,11 @@ components:
         response transforms (client-visible bytes). Content-Length is only an
         admission screen: both final body hooks re-check the actual body length
         against the configured cap before any scan and fail closed with a
-        content-free over_capture_limit omission. Samples are redacted before
-        rendering (JSON/form per field, text/plain per line as a coarse
+        content-free over_capture_limit omission, and an actually empty body
+        (a HEAD or 304 response declares a length it never sends) is reported
+        with the fixed empty_body reason rather than as a malformed structured
+        body. Samples are redacted before rendering
+        (JSON/form per field, text/plain per line as a coarse
         operator opt-in, plus credential-shaped values anywhere), a malformed
         JSON body renders as a fixed content-free marker instead of a partial
         rendering, control and bidi characters are escaped, non-UTF-8 bodies
