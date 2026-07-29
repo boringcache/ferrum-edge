@@ -5997,3 +5997,205 @@ fn redis_quarantine_delete_outcome_handler_is_shared() {
         "test seam must not duplicate success/failure mapping"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Replay-partition contract (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc)
+// ---------------------------------------------------------------------------
+
+fn semantic_ctx(client_ip: &str, body_str: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        client_ip.to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.to_string());
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx
+}
+
+async fn semantic_store(plugin: &AiSemanticCache, ctx: &mut RequestContext, response_body: &[u8]) {
+    let mut headers = ctx.headers.clone();
+    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(ctx, 200, &response_headers, response_body)
+        .await;
+}
+
+async fn semantic_is_hit(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> bool {
+    let mut headers = ctx.headers.clone();
+    matches!(
+        plugin.before_proxy(ctx, &mut headers).await,
+        PluginResult::RejectBinary { .. }
+    )
+}
+
+const REPLAY_BODY: &str = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
+
+#[tokio::test]
+async fn semantic_cache_isolates_same_subject_different_credential_scope() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+
+    let mut narrow = semantic_ctx("127.0.0.1", REPLAY_BODY);
+    narrow.authenticated_identity = Some("alice@example.com".to_string());
+    narrow.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    semantic_store(&plugin, &mut narrow, br#""narrow""#).await;
+
+    let mut broad = semantic_ctx("127.0.0.1", REPLAY_BODY);
+    broad.authenticated_identity = Some("alice@example.com".to_string());
+    broad.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-write-admin".to_string(),
+    );
+    assert!(
+        !semantic_is_hit(&plugin, &mut broad).await,
+        "a different credential scope for one subject must not replay"
+    );
+}
+
+#[tokio::test]
+async fn semantic_cache_isolates_anonymous_callers_by_canonical_address() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+
+    let mut first = semantic_ctx("203.0.113.7", REPLAY_BODY);
+    semantic_store(&plugin, &mut first, br#""first""#).await;
+
+    let mut second = semantic_ctx("198.51.100.9", REPLAY_BODY);
+    assert!(
+        !semantic_is_hit(&plugin, &mut second).await,
+        "anonymous callers at different canonical addresses must not share a completion"
+    );
+
+    let mut same = semantic_ctx("203.0.113.7", REPLAY_BODY);
+    assert!(
+        semantic_is_hit(&plugin, &mut same).await,
+        "the same canonical address must still hit"
+    );
+}
+
+#[tokio::test]
+async fn semantic_cache_anonymous_caller_scope_shared_is_an_explicit_opt_out() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut first = semantic_ctx("203.0.113.7", REPLAY_BODY);
+    semantic_store(&plugin, &mut first, br#""shared""#).await;
+
+    let mut second = semantic_ctx("198.51.100.9", REPLAY_BODY);
+    assert!(
+        semantic_is_hit(&plugin, &mut second).await,
+        "the explicit shared attestation must let anonymous callers share"
+    );
+
+    assert!(
+        AiSemanticCache::new(
+            &json!({ "anonymous_caller_scope": "everyone" }),
+            PluginHttpClient::default()
+        )
+        .is_err(),
+        "an unknown anonymous_caller_scope must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn semantic_cache_scope_by_consumer_false_still_isolates_callers() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut alice = semantic_ctx("127.0.0.1", REPLAY_BODY);
+    alice.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    semantic_store(&plugin, &mut alice, br#""alice""#).await;
+
+    let mut bob = semantic_ctx("127.0.0.1", REPLAY_BODY);
+    bob.headers
+        .insert("authorization".to_string(), "Bearer bob-token".to_string());
+    assert!(
+        !semantic_is_hit(&plugin, &mut bob).await,
+        "scope_by_consumer=false must no longer let distinct credentials share a completion"
+    );
+}
+
+#[tokio::test]
+async fn exact_key_framing_defeats_role_content_delimiter_collisions() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    // The advisory's collision pair: one message whose content embeds the
+    // delimiters versus the two messages that used to serialize identically.
+    let collided = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "a|assistant:b"}]
+    });
+    let genuine = json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"}
+        ]
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&collided).unwrap(),
+        None,
+        br#""collided""#,
+    )
+    .await;
+    assert!(
+        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&genuine).unwrap(), None)
+            .await,
+        "delimiter-bearing message content must not collide with a different conversation"
+    );
+}
+
+#[tokio::test]
+async fn exact_key_framing_defeats_newline_field_boundary_forgery() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    // `start_key_part` used to separate broader key fields with a raw newline,
+    // which a model name can contain.
+    let forged = json!({
+        "model": "gpt-4o\nsys:0:",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let plain = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": ""
+    });
+
+    store_response(
+        &plugin,
+        &serde_json::to_string(&forged).unwrap(),
+        None,
+        br#""forged""#,
+    )
+    .await;
+    assert!(
+        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&plain).unwrap(), None).await,
+        "a newline inside a model name must not forge a key-part boundary"
+    );
+}
+
+#[tokio::test]
+async fn semantic_cache_config_admits_anonymous_caller_scope_key() {
+    for value in ["caller_address", "caller-address", "shared", " SHARED "] {
+        assert!(
+            AiSemanticCache::new(
+                &json!({ "anonymous_caller_scope": value }),
+                PluginHttpClient::default()
+            )
+            .is_ok(),
+            "anonymous_caller_scope must accept {value:?}"
+        );
+    }
+}

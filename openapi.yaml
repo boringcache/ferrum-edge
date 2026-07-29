@@ -20182,7 +20182,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching. Cache keys are opaque SHA-256 digests over typed, length-framed fields: the effective post-routing destination (proxy, listen path, upstream or direct host/port/scheme, authority, rewritten path), the request authority/method/path/raw query, a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and digests of every credential header presented; anonymous callers bind their canonical peer address per anonymous_caller_scope), and a digest of the complete Vary tuple including every name, presence flag, and value. No raw delimiter concatenation is used anywhere in key construction, so an attacker-supplied header or query value cannot forge a field boundary and collide two distinct requests onto one key. Keys are never logged. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes a bounded FIFO cacheability predictor (amortized O(1) admission, no full-map sort at capacity) that suppresses repeat cache lookups for variants known to be uncacheable. Unsafe-method invalidation is deferred until a non-error origin response (private provenance recorded before after_proxy hooks), is classified independently of cacheable_methods storage eligibility, skips served cache HITs that never contacted the origin, and is confined to the same normalized/transformed Host/authority partition as lookup. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -20195,7 +20195,7 @@ components:
           format: uint64
           minimum: 1
           default: 10000
-          description: Maximum number of cached entries before eviction of expired/oldest entries. Must be greater than zero.
+          description: Maximum number of cached entries. Overflow is evicted oldest-first from an insertion-ordered queue in amortized O(1) per admitted entry — no full-map clone or sort is performed while the accounting mutex is held. Must be greater than zero.
         max_entry_size_bytes:
           type: [integer, "null"]
           format: uint64
@@ -20207,7 +20207,7 @@ components:
           format: uint64
           minimum: 1
           default: 104857600
-          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; expired entries are reclaimed before a store is rejected for byte pressure; oversized entries are not cached. Must be greater than zero.
+          description: Exact maximum retained in-memory response-entry size across all entries (100 MiB by default). Concurrent stores and replacements are admitted atomically; when the byte cap is the limiting dimension, oldest entries are evicted until an eligible representation fits (bounded by the number of entries actually evicted, not by cache size); an entry larger than the cap alone is never cached. Must be greater than zero.
         cacheable_methods:
           type: array
           minItems: 1
@@ -20215,7 +20215,7 @@ components:
             type: string
             pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           default: ["GET", "HEAD"]
-          description: HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token.
+          description: "HTTP methods eligible for caching (uppercased). Must contain at least one entry, and every entry must be a valid RFC 9110 HTTP method token that is also a bodyless retrieval method — only GET and HEAD are accepted. A body-bearing method is rejected at admission because cache lookup runs in before_proxy, ahead of on_final_request_body, so the exact backend-visible request body does not exist yet and could not be bound into the key. At runtime any request that declares a body (Transfer-Encoding, or a non-zero/unparsable Content-Length) bypasses lookup and storage for the same reason."
         cacheable_status_codes:
           type: array
           minItems: 1
@@ -20246,11 +20246,16 @@ components:
         cache_key_include_query:
           type: [boolean, "null"]
           default: true
-          description: Include the exact raw query string in the cache key as a SHA-256 hash. The query string is not parsed, sorted, percent-decoded, or normalized.
+          description: Include the exact raw query string in the cache key. The query string is not parsed, sorted, percent-decoded, or normalized; it is bound as a length-framed field of the cache-key digest.
         cache_key_include_consumer:
           type: [boolean, "null"]
           default: false
-          description: "Add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag. This key-partition option does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
+          description: "Legacy key-partition toggle. Caller isolation no longer depends on it: every cache key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials that resolve to one display subject with different scopes can never share an entry. The flag is still bound into the key digest so flipping it yields a disjoint keyspace rather than reusing entries minted under the other setting. It does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
+        anonymous_caller_scope:
+          type: [string, "null"]
+          enum: ["caller_address", "shared", null]
+          default: "caller_address"
+          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed bypasses the cache entirely rather than being keyed incompletely. shared is an explicit operator attestation that the origin does not vary its response by caller address on this route and lets anonymous callers share one retained representation — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins."
         add_cache_status_header:
           type: [boolean, "null"]
           default: true
@@ -20258,7 +20263,7 @@ components:
         invalidate_on_unsafe_methods:
           type: [boolean, "null"]
           default: true
-          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
+          description: "After a non-error origin response (status < 400) to an unsafe method (POST, PUT, PATCH, DELETE, and extension/custom methods, which fail closed as unsafe), invalidate cached entries for the matched path (and descendants under the same path prefix) within the same matched-proxy and normalized/transformed Host/authority partition used by cache lookup. Invalidation is an indexed exact lookup plus one ordered range over the mutated path's descendants, so its cost is bounded by the entries it removes rather than by cache size. Method safety is independent of cacheable_methods: an unsafe method listed there still invalidates after an origin MISS and non-error response; a served cache HIT that never contacted the origin does not. Safe methods outside cacheable_methods (OPTIONS, or HEAD under a GET-only set) bypass without invalidating. Error responses, transport failures, and gateway-only synthetics do not invalidate. Invalidation uses private origin-status provenance recorded before after_proxy hooks, so an earlier response hook that replaces the client-visible response cannot suppress eviction after a successful mutation."
 
     GraphqlConfig:
       type: object
@@ -21403,7 +21408,12 @@ components:
         scope_by_consumer:
           type: boolean
           default: true
-          description: Scope cache entries per consumer (authenticated consumer ID is included in the cache key). Default `true` — different consumers must not see each other's cached responses. Set `false` only on a public LLM proxy with no per-tenant data.
+          description: Additionally include the authenticated consumer's display identity in the cache key. Caller isolation no longer depends on this flag — every exact and semantic key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented), so two credentials resolving to one display subject with different scopes can never share a retained completion. Setting `false` no longer lets distinct callers share entries.
+        anonymous_caller_scope:
+          type: [string, "null"]
+          enum: ["caller_address", "shared", null]
+          default: "caller_address"
+          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins."
         cache_multimodal:
           type: string
           enum: [reject, exact_only, exact-only, include_fingerprints, include-fingerprints]
@@ -24252,7 +24262,12 @@ components:
         scope_by_consumer:
           type: boolean
           default: true
-          description: Scope deduplication keys per consumer identity
+          description: Additionally include the authenticated consumer's display identity in the deduplication key. Caller isolation no longer depends on this flag — every logical key binds a mandatory caller-authorization partition (authentication mechanism, resolved identity/consumer, peer SPIFFE identity, and SHA-256 digests of every credential header presented) plus the effective destination, so two credentials resolving to one display subject with different scopes can never claim or replay one another's operation.
+        anonymous_caller_scope:
+          type: [string, "null"]
+          enum: ["caller_address", "shared", null]
+          default: "caller_address"
+          description: "How anonymous callers (no gateway identity, no credential header, no peer SPIFFE identity) are partitioned. caller_address (default) binds the gateway-resolved canonical peer address, which the origin observes through Ferrum's regenerated X-Forwarded-For; a request whose canonical address cannot be parsed is refused rather than keyed incompletely. shared is an explicit operator attestation that the origin does not vary its result by caller address on this route — only set it when that is known-safe, because it re-opens cross-caller replay for address-sensitive origins."
         enforce_required:
           type: boolean
           default: false

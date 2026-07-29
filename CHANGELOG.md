@@ -9,6 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Retained-response replay now follows one fail-closed partition contract across
+  `response_caching`, `request_deduplication`, and `ai_semantic_cache`
+  (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc, GHSA-37gg-v9m4-8445). A new shared
+  module, `plugins::utils::replay_partition`, defines it.
+  - **Caller authorization, not a display subject.** Every key binds the
+    authentication mechanism, resolved identity and consumer, peer SPIFFE
+    identity, and SHA-256 digests of every credential header presented, so two
+    tokens that resolve to the same `sub` with different scopes, audiences, or
+    tenancy claims can no longer share a retained result. `scope_by_consumer`
+    and `cache_key_include_consumer` no longer gate caller isolation; they now
+    only add the display identity to the digest. `request_deduplication` also
+    stops excluding credential headers from the request fingerprint and binds
+    their digests instead, so a same-subject/different-scope credential is a
+    conflict rather than a replay.
+  - **Anonymous callers bind canonical caller context.** A new
+    `anonymous_caller_scope` option (`caller_address` default, `shared` opt-out)
+    binds the gateway-resolved canonical peer address, which the origin observes
+    through Ferrum's regenerated `X-Forwarded-For`. A caller whose canonical
+    address cannot be derived is refused rather than keyed incompletely.
+  - **Effective destination is part of the key.** `response_caching` and
+    `ai_semantic_cache` run after every route-dispatch plugin and now bind the
+    post-routing upstream / host / port / scheme / authority and rewritten path,
+    so a header-selected tenant backend cannot replay another backend's result.
+    `request_deduplication` binds it too and documents why its earlier lookup is
+    still sound: every routing input is already bound into its fingerprint.
+  - **Body-bearing response caching is refused.** `cacheable_methods` now
+    accepts only the bodyless retrieval methods `GET` and `HEAD`; a
+    body-bearing method is rejected at admission, and at runtime any request
+    declaring a body bypasses lookup and storage. Cache lookup happens before
+    the exact backend-visible request body exists, so a pre-transform digest
+    could not describe what is actually sent.
+  - **Canonical length-framed key serialization replaces raw delimiters.**
+    `ai_semantic_cache` no longer joins roles, content, and broader fields with
+    literal `:`, `|`, and newline bytes, and `response_caching` no longer
+    appends `name=value|name=value` Vary suffixes. Keys are digests over typed,
+    length-framed fields with explicit sequence counts and presence flags, so a
+    legal value containing a delimiter cannot reproduce another request's
+    preimage. `response_caching` hashes the *complete* Vary tuple — every name,
+    presence flag, and value — rather than only the subset classified as
+    sensitive.
+  - **Bounded cache maintenance.** `response_caching` overflow eviction now pops
+    an insertion-ordered queue in amortized O(1) instead of cloning and sorting
+    the entire cache under the accounting mutex for every admitted entry;
+    unsafe-method invalidation is an indexed exact lookup plus one ordered range
+    over the mutated path's descendants instead of a full-cache scan;
+    `vary_index` mappings are reclaimed exactly when their last variant leaves
+    instead of by a heuristic sweep; and the uncacheable predictor enforces its
+    bound with a FIFO queue instead of a full clone + sort at capacity. Byte-cap
+    pressure now evicts oldest-first rather than scanning for expiry.
+  - Replay keys, credentials, caller identities, and authorization fingerprints
+    are never logged; the remaining diagnostics carry only counts and static
+    reasons.
+  - **Breaking:** key derivation changed in all three plugins, so entries stored
+    by a previous build are unreachable — the intended fail-closed outcome for
+    anything keyed under the weaker partition. `response_caching` configs that
+    listed a body-bearing `cacheable_methods` entry now fail admission.
+
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via
   `BackendTlsConfigBuilder::build_reqwest`), active health-check clients

@@ -250,6 +250,40 @@ Runtime behavior also tightens:
   relied on sending an uninitialized proto2 message must be fixed before
   upgrade.
 
+### Retained-Response Replay Partition (breaking)
+
+`response_caching`, `request_deduplication`, and `ai_semantic_cache` now share
+one fail-closed replay-partition contract
+(`plugins::utils::replay_partition`). Plan for four operational changes:
+
+- **All three caches start cold after upgrade.** Key derivation changed in every
+  plugin, so entries and idempotency records written by an earlier build are
+  unreachable. That is deliberate: anything keyed under the weaker partition
+  must not be replayable. Expect a transient origin-load spike proportional to
+  your cache hit rate, and expect idempotency keys that were mid-flight across
+  the upgrade to be re-executable exactly once.
+- **`response_caching` accepts only bodyless retrieval methods.** A
+  `cacheable_methods` list containing `POST`, `PUT`, `PATCH`, `DELETE`, or any
+  other body-bearing method now fails admission in database, control-plane,
+  data-plane, and file modes. Audit every enabled `response_caching` plugin row
+  before cutover and reduce the list to `GET` / `HEAD`. At runtime, any request
+  that declares a body (`Transfer-Encoding`, or a non-zero/unparsable
+  `Content-Length`) bypasses lookup and storage.
+- **Anonymous callers are partitioned by canonical peer address by default.**
+  The new `anonymous_caller_scope` option defaults to `caller_address` in all
+  three plugins, which the origin observes through Ferrum's regenerated
+  `X-Forwarded-For`. On a high-fanout public route whose origin provably does
+  not vary by caller address, set `anonymous_caller_scope: "shared"` to restore
+  the previous sharing — this is an explicit attestation and re-opens
+  cross-caller replay for address-sensitive origins.
+- **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
+  disable caller isolation.** Every key now binds an authorization-context
+  fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests
+  of the credential headers presented), so two credentials that render as one
+  display subject with different scopes never share a retained result. Routes
+  that intentionally shared entries across distinct credentials will see a lower
+  hit rate; there is no opt-out, because that sharing was the vulnerability.
+
 ### Response Cache Shared-Storage Hardening
 
 `response_caching` now applies RFC 9111 shared-cache rules that earlier

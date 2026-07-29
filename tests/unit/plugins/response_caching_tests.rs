@@ -339,6 +339,7 @@ fn test_unknown_root_keys_are_rejected_with_path_qualified_suggestions() {
 
     let typos = [
         ("vary_by_headers", "vary_by_header"),
+        ("anonymous_caller_scope", "anonymous_caller_scop"),
         ("cache_key_include_consumer", "cache_key_include_consumr"),
         ("cache_key_include_query", "cache_key_include_quer"),
         ("respect_cache_control", "respect_cache_contro"),
@@ -3504,7 +3505,7 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         "cache_key_include_query": false,
         "cache_key_include_consumer": true,
         "vary_by_headers": ["x-tenant"],
-        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "cacheable_methods": ["GET", "HEAD"],
         "cacheable_status_codes": [200, 404],
         "add_cache_status_header": true
     }));
@@ -3786,7 +3787,7 @@ async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
     // SSE bypass after a staged miss must not wipe the sibling's staging.
     let sse_peer = plugin_with_config(json!({
         "ttl_seconds": 60,
-        "cacheable_methods": ["GET", "POST"]
+        "cacheable_methods": ["GET", "HEAD"]
     }));
     let mut ctx = make_ctx("GET", "/mixed-sse");
     let mut headers = HashMap::new();
@@ -4995,13 +4996,89 @@ async fn test_concurrent_authority_scoped_invalidation() {
     assert_cache_hit_for_host(&plugin, "/api/items", "c.example.com", b"tenant-c").await;
 }
 
-/// Unsafe methods listed in `cacheable_methods` must still invalidate after an
-/// origin MISS and non-error response. Storage eligibility is not method safety.
+/// A body-bearing method can no longer be made cacheable: a shared cache
+/// selects a representation by method + target + Vary, and lookup runs before
+/// the exact backend-visible request body exists (GHSA-w27g-65rf-h7xm).
 #[tokio::test]
-async fn test_unsafe_cacheable_method_miss_invalidates_after_success() {
+async fn test_body_bearing_cacheable_method_is_refused_at_admission() {
+    for method in ["POST", "PUT", "PATCH", "DELETE", "QUERY"] {
+        let error = ResponseCaching::new(&json!({ "cacheable_methods": ["GET", method] }))
+            .expect_err("body-bearing cacheable method must be refused");
+        assert!(
+            error.contains("bodyless retrieval method"),
+            "unexpected admission error for {method}: {error}"
+        );
+    }
+    assert!(
+        ResponseCaching::new(&json!({ "cacheable_methods": ["GET", "HEAD"] })).is_ok(),
+        "bodyless retrieval methods must remain admissible"
+    );
+}
+
+/// Even for an admissible method, a request that declares a body bypasses both
+/// lookup and storage: the pre-transform bytes are not the ones sent upstream.
+#[tokio::test]
+async fn test_request_declaring_a_body_bypasses_cache() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = default_plugin();
+
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("a.example.com"),
+        200,
+        &HashMap::new(),
+        b"cached-get",
+    )
+    .await;
+
+    for (name, value) in [("content-length", "7"), ("transfer-encoding", "chunked")] {
+        let mut ctx = make_ctx("GET", "/api/items");
+        ctx.headers
+            .insert("host".to_string(), "a.example.com".to_string());
+        let mut headers = HashMap::new();
+        headers.insert("host".to_string(), "a.example.com".to_string());
+        headers.insert(name.to_string(), value.to_string());
+        assert!(
+            matches!(
+                plugin.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "a declared body must never replay a stored representation ({name})"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(&staging_key(&plugin, "cache_status"))
+                .map(String::as_str),
+            Some("BYPASS"),
+            "a declared body must bypass ({name})"
+        );
+        assert!(
+            !ctx.metadata
+                .contains_key(&staging_key(&plugin, "cache_base_key")),
+            "a bypassed request must not stage a storage key ({name})"
+        );
+    }
+
+    // A zero-length declaration is not a body and still uses the cache.
+    let mut ctx = make_ctx("GET", "/api/items");
+    ctx.headers
+        .insert("host".to_string(), "a.example.com".to_string());
+    let mut headers = HashMap::new();
+    headers.insert("host".to_string(), "a.example.com".to_string());
+    headers.insert("content-length".to_string(), "0".to_string());
+    let (_, body, _) = expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(body, b"cached-get");
+}
+
+/// An unsafe method is never cacheable now, but it must still stage and apply
+/// RFC 9111 §4.4 invalidation after a non-error origin response.
+#[tokio::test]
+async fn test_unsafe_method_bypass_invalidates_after_success() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "cacheable_methods": ["GET", "HEAD"],
         "invalidate_on_unsafe_methods": true
     }));
 
@@ -5016,9 +5093,6 @@ async fn test_unsafe_cacheable_method_miss_invalidates_after_success() {
     )
     .await;
 
-    // POST is cacheable, so before_proxy takes the lookup path (MISS) rather
-    // than the historical non-cacheable bypass — and must still stage
-    // invalidation for the origin-success boundary.
     let mut post_ctx = make_ctx("POST", "/api/items");
     post_ctx
         .headers
@@ -5034,14 +5108,14 @@ async fn test_unsafe_cacheable_method_miss_invalidates_after_success() {
             .metadata
             .get(&staging_key(&plugin, "cache_status"))
             .map(String::as_str),
-        Some("MISS"),
-        "cacheable POST must take the MISS lookup path"
+        Some("BYPASS"),
+        "a body-bearing method must bypass storage"
     );
     assert!(
         post_ctx
             .metadata
             .contains_key(&staging_key(&plugin, "cache_pending_invalidate_host")),
-        "unsafe cacheable MISS must stage pending invalidation"
+        "an unsafe method must still stage pending invalidation"
     );
 
     // before_proxy alone must not evict.
@@ -5054,13 +5128,13 @@ async fn test_unsafe_cacheable_method_miss_invalidates_after_success() {
     assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
 }
 
-/// An unsafe cacheable MISS that receives an error origin status must not
-/// invalidate peer GET/HEAD variants.
+/// An unsafe bypass that receives an error origin status must not invalidate
+/// peer GET/HEAD variants.
 #[tokio::test]
-async fn test_unsafe_cacheable_method_miss_error_does_not_invalidate() {
+async fn test_unsafe_method_error_does_not_invalidate() {
     let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
-        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "cacheable_methods": ["GET", "HEAD"],
         "invalidate_on_unsafe_methods": true
     }));
 
@@ -5092,57 +5166,6 @@ async fn test_unsafe_cacheable_method_miss_error_does_not_invalidate() {
             .await;
         assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"still-fresh").await;
     }
-}
-
-/// A served cache HIT for an unsafe-but-cacheable method never contacted the
-/// origin and must not flush other path variants.
-#[tokio::test]
-async fn test_unsafe_cacheable_method_hit_does_not_invalidate() {
-    let _policy_guard = response_cache_replay_policy_guard();
-    let plugin = plugin_with_config(json!({
-        "cacheable_methods": ["GET", "HEAD", "POST"],
-        "cacheable_status_codes": [200],
-        "invalidate_on_unsafe_methods": true
-    }));
-
-    // Seed POST first so its successful store cannot invalidate a later GET.
-    cache_response_with_host(
-        &plugin,
-        "POST",
-        "/api/items",
-        Some("a.example.com"),
-        200,
-        &HashMap::new(),
-        b"post-body",
-    )
-    .await;
-    cache_response_with_host(
-        &plugin,
-        "GET",
-        "/api/items",
-        Some("a.example.com"),
-        200,
-        &HashMap::new(),
-        b"get-body",
-    )
-    .await;
-
-    let mut hit_ctx = make_ctx("POST", "/api/items");
-    hit_ctx
-        .headers
-        .insert("host".to_string(), "a.example.com".to_string());
-    let mut hit_headers = HashMap::new();
-    hit_headers.insert("host".to_string(), "a.example.com".to_string());
-    let (_, body, _) = expect_reject(plugin.before_proxy(&mut hit_ctx, &mut hit_headers).await);
-    assert_eq!(body, b"post-body");
-    assert!(
-        !hit_ctx
-            .metadata
-            .contains_key(&staging_key(&plugin, "cache_pending_invalidate_host")),
-        "HIT must clear pending invalidation without contacting the origin"
-    );
-
-    assert_cache_hit_for_host(&plugin, "/api/items", "a.example.com", b"get-body").await;
 }
 
 /// An earlier `after_proxy` rejection of a genuine non-error origin response
@@ -5408,4 +5431,368 @@ async fn test_observe_then_after_proxy_does_not_double_invalidate() {
     let mut hit_headers = HashMap::new();
     let (_, body, _) = expect_reject(cache.before_proxy(&mut hit_ctx, &mut hit_headers).await);
     assert_eq!(body, b"again");
+}
+
+// ---------------------------------------------------------------------------
+// Replay-partition contract (GHSA-w27g-65rf-h7xm, GHSA-v4g3-2r4f-f6pc,
+// GHSA-37gg-v9m4-8445)
+//
+// Each test proves a HIT cannot cross one omitted boundary: it seeds an entry
+// under one partition and asserts the peer request MISSes.
+// ---------------------------------------------------------------------------
+
+/// Seed one cacheable GET through the full lifecycle using an explicitly built
+/// context, then return that context's staged base key.
+async fn seed_public_entry(plugin: &ResponseCaching, ctx: &mut RequestContext, body: &[u8]) {
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    plugin
+        .on_final_response_body(ctx, 200, &response_headers, body)
+        .await;
+}
+
+async fn lookup_is_hit(plugin: &ResponseCaching, ctx: &mut RequestContext) -> bool {
+    let mut headers = ctx.headers.clone();
+    is_reject(&plugin.before_proxy(ctx, &mut headers).await)
+}
+
+#[tokio::test]
+async fn replay_partition_isolates_same_subject_different_credential_scope() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    // One display subject, two credentials. The old partition keyed only the
+    // subject, so the second caller replayed the first caller's response.
+    let mut narrow = make_ctx("GET", "/api/reports");
+    narrow.authenticated_identity = Some("alice@example.com".to_string());
+    narrow.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    seed_public_entry(&plugin, &mut narrow, b"read-only-view").await;
+
+    let mut broad = make_ctx("GET", "/api/reports");
+    broad.authenticated_identity = Some("alice@example.com".to_string());
+    broad.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-write-admin".to_string(),
+    );
+    assert!(
+        !lookup_is_hit(&plugin, &mut broad).await,
+        "a different credential for the same subject must not replay"
+    );
+}
+
+#[tokio::test]
+async fn replay_partition_isolates_anonymous_callers_by_canonical_address() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut first = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/public".to_string(),
+    );
+    first.matched_proxy = Some(Arc::new(create_test_proxy()));
+    seed_public_entry(&plugin, &mut first, b"geo-a").await;
+
+    let mut second = RequestContext::new(
+        "198.51.100.9".to_string(),
+        "GET".to_string(),
+        "/public".to_string(),
+    );
+    second.matched_proxy = Some(Arc::new(create_test_proxy()));
+    assert!(
+        !lookup_is_hit(&plugin, &mut second).await,
+        "anonymous callers at different canonical addresses must not share an entry"
+    );
+
+    // The same address still hits.
+    let mut same = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/public".to_string(),
+    );
+    same.matched_proxy = Some(Arc::new(create_test_proxy()));
+    assert!(
+        lookup_is_hit(&plugin, &mut same).await,
+        "the same canonical address must still hit"
+    );
+}
+
+#[tokio::test]
+async fn anonymous_caller_scope_shared_is_an_explicit_operator_opt_out() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut first = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/public".to_string(),
+    );
+    first.matched_proxy = Some(Arc::new(create_test_proxy()));
+    seed_public_entry(&plugin, &mut first, b"shared-body").await;
+
+    let mut second = RequestContext::new(
+        "198.51.100.9".to_string(),
+        "GET".to_string(),
+        "/public".to_string(),
+    );
+    second.matched_proxy = Some(Arc::new(create_test_proxy()));
+    assert!(
+        lookup_is_hit(&plugin, &mut second).await,
+        "the explicit shared attestation must let anonymous callers share"
+    );
+
+    assert!(
+        ResponseCaching::new(&json!({ "anonymous_caller_scope": "everyone" })).is_err(),
+        "an unknown anonymous_caller_scope must fail closed"
+    );
+}
+
+#[tokio::test]
+async fn replay_partition_isolates_effective_route_destination() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut tenant_a = make_ctx("GET", "/api/data");
+    tenant_a.route_override_upstream_id = Some("tenant-a".to_string());
+    seed_public_entry(&plugin, &mut tenant_a, b"tenant-a-body").await;
+
+    let mut tenant_b = make_ctx("GET", "/api/data");
+    tenant_b.route_override_upstream_id = Some("tenant-b".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut tenant_b).await,
+        "a header-selected upstream must not replay another backend's response"
+    );
+
+    let mut rewritten = make_ctx("GET", "/api/data");
+    rewritten.route_override_upstream_id = Some("tenant-a".to_string());
+    rewritten.route_override_path = Some("/internal/data".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut rewritten).await,
+        "a post-routing path rewrite must not replay the unrewritten destination"
+    );
+}
+
+#[tokio::test]
+async fn vary_tuple_framing_defeats_delimiter_collisions() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "vary_by_headers": ["x-a", "x-b"]
+    }));
+
+    // The advisory's exact collision pair. Under `name=value|name=value` both
+    // serialized to `x-a=foo|x-b=bar|x-b=baz`.
+    let mut first = make_ctx("GET", "/vary");
+    first.headers.insert("x-a".to_string(), "foo".to_string());
+    first
+        .headers
+        .insert("x-b".to_string(), "bar|x-b=baz".to_string());
+    seed_public_entry(&plugin, &mut first, b"first-tuple").await;
+
+    let mut second = make_ctx("GET", "/vary");
+    second
+        .headers
+        .insert("x-a".to_string(), "foo|x-b=bar".to_string());
+    second.headers.insert("x-b".to_string(), "baz".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut second).await,
+        "delimiter-bearing Vary values must not collide onto one cache key"
+    );
+}
+
+#[tokio::test]
+async fn vary_framing_distinguishes_absent_empty_and_newline_values() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "vary_by_headers": ["x-a", "x-b"]
+    }));
+
+    let mut absent = make_ctx("GET", "/vary2");
+    absent.headers.insert("x-a".to_string(), "v".to_string());
+    seed_public_entry(&plugin, &mut absent, b"absent-b").await;
+
+    let mut empty = make_ctx("GET", "/vary2");
+    empty.headers.insert("x-a".to_string(), "v".to_string());
+    empty.headers.insert("x-b".to_string(), String::new());
+    assert!(
+        !lookup_is_hit(&plugin, &mut empty).await,
+        "an absent Vary header must not share a key with an empty one"
+    );
+
+    let mut newline = make_ctx("GET", "/vary2");
+    newline.headers.insert("x-a".to_string(), "v".to_string());
+    newline
+        .headers
+        .insert("x-b".to_string(), "\nx-a=v".to_string());
+    assert!(
+        !lookup_is_hit(&plugin, &mut newline).await,
+        "a newline-bearing Vary value must not forge a field boundary"
+    );
+}
+
+#[tokio::test]
+async fn replay_partition_isolates_query_and_path_delimiters() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut colon = make_ctx_with_raw_query("GET", "/items:1", "a=b");
+    seed_public_entry(&plugin, &mut colon, b"colon-body").await;
+
+    // The same bytes redistributed across the path/query boundary must be a
+    // different partition.
+    let mut shifted = make_ctx_with_raw_query("GET", "/items", ":1:a=b");
+    assert!(
+        !lookup_is_hit(&plugin, &mut shifted).await,
+        "path/query boundary must be unambiguous"
+    );
+}
+
+#[tokio::test]
+async fn saturated_cache_evicts_in_bounded_batches_with_exact_accounting() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let max_entries = 32;
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 300,
+        "max_entries": max_entries,
+    }));
+
+    // Far more unique targets than the cap: the FIFO must hold the cache at the
+    // cap with exact byte accounting and no stranded vary_index mappings.
+    for i in 0..(max_entries * 8) {
+        let mut ctx = make_ctx("GET", &format!("/unique/{i}"));
+        seed_public_entry(&plugin, &mut ctx, b"body").await;
+    }
+
+    assert_eq!(
+        response_caching_cache_keys_for_test(&plugin).len(),
+        max_entries,
+        "cache must stay pinned at max_entries"
+    );
+    assert_size_accounting_exact(&plugin);
+    assert!(
+        response_caching_vary_index_snapshot_for_test(&plugin).len()
+            <= response_caching_cache_keys_for_test(&plugin).len(),
+        "vary_index must never exceed the live base-key count"
+    );
+    assert!(response_caching_current_total_size_for_test(&plugin) > 0);
+}
+
+#[tokio::test]
+async fn invalidation_index_removes_only_the_mutated_subtree() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 300 }));
+
+    for path in ["/api/items", "/api/items/1", "/api/itemsX", "/api/other"] {
+        cache_response_with_host(
+            &plugin,
+            "GET",
+            path,
+            Some("a.example.com"),
+            200,
+            &HashMap::new(),
+            b"seed",
+        )
+        .await;
+    }
+    // Another authority must be untouched by the sweep.
+    cache_response_with_host(
+        &plugin,
+        "GET",
+        "/api/items",
+        Some("b.example.com"),
+        200,
+        &HashMap::new(),
+        b"other-authority",
+    )
+    .await;
+
+    unsafe_method_cycle(&plugin, "DELETE", "/api/items", Some("a.example.com"), 204).await;
+
+    assert_cache_miss_for_host(&plugin, "/api/items", "a.example.com").await;
+    assert_cache_miss_for_host(&plugin, "/api/items/1", "a.example.com").await;
+    assert_cache_hit_for_host(&plugin, "/api/itemsX", "a.example.com", b"seed").await;
+    assert_cache_hit_for_host(&plugin, "/api/other", "a.example.com", b"seed").await;
+    assert_cache_hit_for_host(&plugin, "/api/items", "b.example.com", b"other-authority").await;
+    assert_size_accounting_exact(&plugin);
+}
+
+#[tokio::test]
+async fn predictor_stays_bounded_without_sorting_at_capacity() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    // `max_entries / 10`, floored at 100, sizes the predictor.
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 300, "max_entries": 200 }));
+
+    // A stream of unique uncacheable targets: every response carries Set-Cookie,
+    // which marks the exact variant uncacheable.
+    let mut response_headers = HashMap::new();
+    response_headers.insert("set-cookie".to_string(), "s=1".to_string());
+    for i in 0..2000 {
+        let mut ctx = make_ctx("GET", &format!("/uncacheable/{i}"));
+        let mut headers = ctx.headers.clone();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response_headers, b"body")
+            .await;
+    }
+
+    // Nothing was stored, accounting stayed exact, and the run completed
+    // without a per-admission full sort.
+    assert!(response_caching_cache_keys_for_test(&plugin).is_empty());
+    assert_size_accounting_exact(&plugin);
+}
+
+#[tokio::test]
+async fn concurrent_writers_keep_exact_entry_and_byte_accounting() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let max_entries = 64;
+    let plugin = Arc::new(plugin_with_config(json!({
+        "ttl_seconds": 300,
+        "max_entries": max_entries,
+    })));
+
+    let mut tasks = Vec::new();
+    for worker in 0..8 {
+        let plugin = Arc::clone(&plugin);
+        tasks.push(tokio::spawn(async move {
+            for i in 0..64 {
+                let mut ctx = make_ctx("GET", &format!("/w{worker}/{i}"));
+                let mut headers = ctx.headers.clone();
+                plugin.before_proxy(&mut ctx, &mut headers).await;
+                let mut response_headers = HashMap::new();
+                response_headers.insert(
+                    "cache-control".to_string(),
+                    "public, max-age=300".to_string(),
+                );
+                plugin
+                    .on_final_response_body(&mut ctx, 200, &response_headers, b"concurrent")
+                    .await;
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("writer task");
+    }
+
+    let keys = response_caching_cache_keys_for_test(&plugin);
+    assert!(
+        keys.len() <= max_entries,
+        "concurrent writers must respect max_entries; got {}",
+        keys.len()
+    );
+    assert_size_accounting_exact(&plugin);
 }
