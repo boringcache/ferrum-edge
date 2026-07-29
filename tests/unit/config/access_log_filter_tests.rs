@@ -107,15 +107,43 @@ fn equality_expansion_cannot_exceed_final_ast_cap() {
 }
 
 #[test]
-fn equality_expansion_at_final_ast_cap_is_accepted() {
+fn equality_expansion_within_final_ast_cap_is_accepted() {
     // Eight equality atoms + 7 Or => 8*3 + 7 = 31 final nodes (<= 32).
     let terms: Vec<String> = (500..508)
         .map(|code| format!("response.code == {code}"))
         .collect();
     let expr = terms.join(" || ");
     let filter = parse_access_log_filter_expression(&expr)
-        .expect("parses at final cap")
+        .expect("parses within final cap")
         .expect("filter");
     let tree = filter.expression.expect("uses expression tree");
     validate_access_log_filter_expr(&tree).expect("final tree within cap");
+}
+
+#[test]
+fn pure_and_equality_chain_flattens_before_recursive_ast_cap() {
+    // The canonical intermediate tree expands above 32 nodes, but this pure
+    // conjunction becomes legacy flat fields and never reaches the recursive
+    // evaluator, so the AST-only hot-path bound must not reject it.
+    let terms = std::iter::repeat_n("response.code == 500", 9).collect::<Vec<_>>();
+    let filter = parse_access_log_filter_expression(&terms.join(" && "))
+        .expect("pure conjunction flattens")
+        .expect("filter");
+    assert!(filter.expression.is_none());
+    assert_eq!(filter.status_code_min, Some(500));
+    assert_eq!(filter.status_code_max, Some(500));
+}
+
+#[test]
+fn invalid_identifier_diagnostics_do_not_reflect_hostile_input() {
+    let hostile = "secret\u{1b}[31m-token";
+    let err = parse_access_log_filter_expression(&format!("{hostile} >= 1"))
+        .expect_err("unsupported identifier");
+    assert!(err.contains("unsupported identifier"));
+    assert!(!err.contains(hostile));
+
+    let err = parse_access_log_filter_expression(&format!("response.code >= 500 {hostile}"))
+        .expect_err("unexpected trailing input");
+    assert!(err.contains("unexpected trailing input"));
+    assert!(!err.contains(hostile));
 }

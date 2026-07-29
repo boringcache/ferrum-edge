@@ -64,7 +64,7 @@ pub fn parse_access_log_filter_expression(expr: &str) -> Result<Option<AccessLog
     if trimmed.len() > MAX_ACCESS_LOG_FILTER_EXPR_LEN {
         return Err(format!(
             "Telemetry access log filter expression exceeds maximum length of \
-             {MAX_ACCESS_LOG_FILTER_EXPR_LEN} characters"
+             {MAX_ACCESS_LOG_FILTER_EXPR_LEN} bytes"
         ));
     }
 
@@ -265,15 +265,15 @@ impl<'a> ExpressionParser<'a> {
             return Ok(ComparisonAtom::Duration(comparison));
         }
 
-        let unexpected = self.remaining_identifier_prefix(start);
-        if unexpected.is_empty() {
+        if self.remaining_identifier_prefix(start).is_empty() {
             return Err(
                 "Telemetry access log filter expression is missing a comparison atom".to_string(),
             );
         }
-        Err(format!(
-            "Telemetry access log filter expression has unsupported identifier '{unexpected}'"
-        ))
+        // Do not reflect an operator-controlled identifier into diagnostics:
+        // this error can cross logging/admin boundaries and the fragment may
+        // contain terminal controls or credential-like text.
+        Err("Telemetry access log filter expression has unsupported identifier".to_string())
     }
 
     fn parse_numeric_comparison(&mut self, field: &str) -> Result<Comparison, String> {
@@ -397,10 +397,9 @@ impl<'a> ExpressionParser<'a> {
         if self.input[self.pos..].starts_with(")") {
             return Err("Telemetry access log filter expression has unmatched ')'".to_string());
         }
-        let fragment = self.remaining_identifier_prefix(self.pos);
-        Err(format!(
-            "Telemetry access log filter expression has unexpected trailing input '{fragment}'"
-        ))
+        // As above, keep diagnostics field-oriented without echoing the
+        // operator-controlled trailing fragment.
+        Err("Telemetry access log filter expression has unexpected trailing input".to_string())
     }
 
     fn starts_with_identifier(&self, ident: &str) -> bool {
@@ -444,14 +443,14 @@ impl<'a> ExpressionParser<'a> {
 
 fn canonicalize_access_log_filter(parsed: ParsedExpr) -> Result<Option<AccessLogFilter>, String> {
     let canonical = canonicalize_parsed_expr(parsed)?;
-    // Parser node accounting charges one node per equality atom, but
-    // `response.code == N` expands into And(min, max) (three final nodes).
-    // Re-validate the post-canonical tree so the documented 32-node hot-path
-    // bound is enforced fail-closed before the filter is returned.
-    validate_access_log_filter_expr(&canonical)?;
     if let Some(flat) = flatten_and_only(&canonical)? {
         return Ok(Some(flat));
     }
+    // Parser node accounting charges one node per equality atom, but
+    // `response.code == N` expands into And(min, max) (three final nodes).
+    // Re-validate any tree that will reach the recursive hot-path evaluator.
+    // Pure conjunctions above were reduced to non-recursive legacy fields.
+    validate_access_log_filter_expr(&canonical)?;
     Ok(Some(AccessLogFilter {
         status_code_min: None,
         status_code_max: None,
