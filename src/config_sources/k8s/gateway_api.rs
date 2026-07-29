@@ -9196,8 +9196,7 @@ mod tests {
             );
             let proxy = grpc_catch_all_proxy(&result);
             assert_eq!(
-                proxy.backend_port,
-                8080,
+                proxy.backend_port, 8080,
                 "the HTTPRoute keeps the default backend for non-gRPC traffic"
             );
 
@@ -9208,7 +9207,9 @@ mod tests {
                 "the HTTPRoute contributes an unconditional match, so unmatched traffic must \
                  fall through to its backend rather than 404"
             );
-            let rules = plugin.config["rules"].as_array().expect("rules are an array");
+            let rules = plugin.config["rules"]
+                .as_array()
+                .expect("rules are an array");
             assert_eq!(rules.len(), 1, "only the GRPCRoute carries a predicate");
             assert_eq!(
                 rules[0]["destination"]["backend_port"].as_u64(),
