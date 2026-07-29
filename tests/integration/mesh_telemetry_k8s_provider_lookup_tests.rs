@@ -628,6 +628,170 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
     );
 }
 
+#[tokio::test]
+async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
+    const ENV_VAR: &str = "FERRUM_TEST_TELEMETRY_DP_ENV_TAG";
+
+    let translation = translate_k8s_objects(
+        &[telemetry(json!({
+            "tracing": [{
+                "customTags": {
+                    "cluster": {
+                        "environment": {
+                            "name": ENV_VAR,
+                            "defaultValue": "fallback-cluster"
+                        }
+                    },
+                    "region": {
+                        "environment": {
+                            "name": "FERRUM_TEST_TELEMETRY_DP_ENV_TAG_MISSING"
+                        }
+                    }
+                }
+            }]
+        }))],
+        options(),
+    )
+    .expect("environment custom tags translate");
+    let tracing = translation
+        .config
+        .mesh
+        .expect("mesh config")
+        .telemetry_resources[0]
+        .config
+        .tracing
+        .clone()
+        .expect("tracing config");
+
+    assert_eq!(
+        tracing.custom_tags.get("cluster").map(String::as_str),
+        Some("fallback-cluster")
+    );
+    assert!(!tracing.custom_tags.contains_key("region"));
+    assert_eq!(
+        tracing.custom_env_tags.get("cluster").map(String::as_str),
+        Some(ENV_VAR)
+    );
+    assert_eq!(
+        tracing.custom_env_tags.get("region").map(String::as_str),
+        Some("FERRUM_TEST_TELEMETRY_DP_ENV_TAG_MISSING")
+    );
+
+    // Translator must not resolve controller-host environment: only typed
+    // lookups + optional defaults are carried for DP construction/reload.
+    let missing_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": tracing.custom_tags,
+            "custom_env_tags": tracing.custom_env_tags,
+        }),
+        |_| Err(std::env::VarError::NotPresent),
+    )
+    .expect("missing DP env keeps default / omits tag");
+
+    let mut missing_ctx =
+        RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        missing_plugin
+            .before_proxy(&mut missing_ctx, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        missing_ctx.metadata.get("cluster").map(String::as_str),
+        Some("fallback-cluster")
+    );
+    assert!(!missing_ctx.metadata.contains_key("region"));
+
+    let present_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": {
+                "cluster": "fallback-cluster"
+            },
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok("live-cluster".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        },
+    )
+    .expect("present DP env overrides default at construction/reload");
+
+    let mut present_ctx =
+        RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        present_plugin
+            .before_proxy(&mut present_ctx, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        present_ctx.metadata.get("cluster").map(String::as_str),
+        Some("live-cluster")
+    );
+
+    let empty_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": {
+                "cluster": "fallback-cluster"
+            },
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok(String::new())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        },
+    )
+    .expect("empty but present env value is a resolved value");
+    let mut empty_ctx =
+        RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
+    assert!(matches!(
+        empty_plugin
+            .before_proxy(&mut empty_ctx, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        empty_ctx.metadata.get("cluster").map(String::as_str),
+        Some("")
+    );
+
+    let oversized = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok("x".repeat(1025))
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        },
+    );
+    let oversized_err = oversized
+        .err()
+        .expect("oversized resolved env value fails closed");
+    assert!(
+        oversized_err.contains("exceeds 1024 bytes"),
+        "got {oversized_err}"
+    );
+    // Do not assert the resolved secret/value appears in the error.
+    assert!(!oversized_err.contains(&"x".repeat(32)));
+    assert!(!oversized_err.contains(ENV_VAR));
+}
+
 #[test]
 fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
     let too_many_custom_tags = (0..33)
@@ -688,6 +852,28 @@ fn k8s_telemetry_rejects_workload_metrics_constructor_blackout_vectors() {
                 }]
             }),
             "cannot copy sensitive header 'Authorization'",
+        ),
+        (
+            "environment tag missing name",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "cluster": {"environment": {"defaultValue": "x"}}
+                    }
+                }]
+            }),
+            "environment.name is required",
+        ),
+        (
+            "environment tag invalid name",
+            json!({
+                "tracing": [{
+                    "customTags": {
+                        "cluster": {"environment": {"name": "BAD-NAME"}}
+                    }
+                }]
+            }),
+            "invalid environment variable name",
         ),
         (
             "invalid custom header name",

@@ -11664,6 +11664,70 @@ components:
             attempt, including empty-success, rejection, and handled-error
             outcomes. Panic/abort/cancellation do not advance it. Absent until the
             first poll tick finishes.
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
+
+    ConfigChangeWatcherStatus:
+      type: object
+      description: |
+        Backend-native config-change watcher state (database mode, MongoDB
+        replica sets, `FERRUM_MONGO_CHANGE_STREAM_ENABLED=true`). Absent unless
+        a watcher was started for this process.
+
+        The watcher is a **coalesced wake-up signal only**: it carries no
+        config, never advances the accepted durable sequence cursor, and never
+        publishes a runtime config generation. Every notification runs the same
+        authoritative cursor-based incremental/full reload a periodic poll tick
+        would have run, so duplicate, out-of-order, and missed notifications are
+        harmless. `connected: false` is therefore a reload-latency signal, not a
+        config-outage signal, and never forces `status: degraded` — periodic
+        polling continues to apply committed changes.
+
+        Every field is a counter, flag, or fixed enum label. Resource IDs,
+        namespaces, connection strings, resume tokens, and backend error bodies
+        are never exposed here.
+      required:
+        - enabled
+        - connected
+        - degraded_reason
+        - events_total
+        - reconnects_total
+        - invalidations_total
+        - history_losses_total
+        - resume_token_retained
+      properties:
+        enabled:
+          type: boolean
+          description: A watcher task was started for this process.
+        connected:
+          type: boolean
+          description: A watch is currently open and delivering wake-ups.
+        degraded_reason:
+          type: string
+          enum: [none, connect_failed, stream_error, history_lost, invalidated, unauthorized, unsupported_topology, stopped]
+        events_total:
+          type: integer
+          format: int64
+        reconnects_total:
+          type: integer
+          format: int64
+        invalidations_total:
+          type: integer
+          format: int64
+        history_losses_total:
+          type: integer
+          format: int64
+        resume_token_retained:
+          type: boolean
+          description: |
+            Whether a resume point is currently retained in memory. Resume
+            tokens are never persisted and never logged.
+        last_event_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recent observed change notification.
+            Absent until the first one arrives.
 
     DatabaseDeltaPollingMetrics:
       type: object
@@ -11722,6 +11786,8 @@ components:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
             - type: "null"
+        change_stream:
+          $ref: "#/components/schemas/ConfigChangeWatcherStatus"
 
     # ── Admin metrics ───────────────────────────────────────────────
     AdminMetrics:
@@ -16144,9 +16210,9 @@ components:
         non-mesh gateways that want Istio-style workload labels in logs.
 
         Runtime admission permits at most 32 distinct custom tag names across
-        `custom_tags` and `custom_header_tags` combined. The individual
-        `maxProperties: 32` bounds remain for generated clients, but the
-        cross-property combined total cannot be expressed mechanically.
+        `custom_tags`, `custom_header_tags`, and `custom_env_tags` combined. The
+        individual `maxProperties: 32` bounds remain for generated clients, but
+        the cross-property combined total cannot be expressed mechanically.
       properties:
         node_id:
           type: string
@@ -16207,8 +16273,10 @@ components:
             Custom tags injected into transaction metadata and exported spans.
             Names are limited to 128 ASCII letters, digits, `.`, `_`, or `-`
             and cannot collide with reserved, sensitive, `mesh.*`, trace, or
-            authorization keys. This map and `custom_header_tags` may contain
-            at most 32 distinct tag names combined.
+            authorization keys. This map, `custom_header_tags`, and
+            `custom_env_tags` may contain at most 32 distinct tag names combined.
+            For Istio environment tags, values here are `defaultValue`
+            fallbacks only — live data-plane resolution uses `custom_env_tags`.
         custom_header_tags:
           type: object
           maxProperties: 32
@@ -16218,8 +16286,32 @@ components:
             Custom tags populated from request headers (`tag_name ->
             header_name`). Credential-bearing source headers and reserved or
             sensitive destination names are rejected; runtime values over 1024
-            bytes are omitted. This map and `custom_tags` may contain at most
-            32 distinct tag names combined.
+            bytes are omitted. This map, `custom_tags`, and `custom_env_tags`
+            may contain at most 32 distinct tag names combined.
+        custom_env_tags:
+          type: object
+          maxProperties: 32
+          additionalProperties:
+            type: string
+            maxLength: 256
+            pattern: '^[A-Za-z_][A-Za-z0-9_]*$'
+          description: |
+            Istio `customTags.<tag>.environment` lookups (`tag_name ->
+            env_var_name`) resolved from the local data-plane process
+            environment at plugin construction and reload. Controllers must
+            not resolve these against the controller-host environment. A
+            present UTF-8 value overrides any matching `custom_tags` default;
+            a missing variable keeps that default when present and otherwise
+            omits the tag. Credential-bearing environment variable names
+            (including secret/password/token/key/credential names, database
+            connection locations, client credential identifiers, and
+            operator-configured sensitive metadata names) are rejected.
+            Non-UTF-8 or >1024-byte values fail construction closed. Selected
+            values are deliberately emitted as custom transaction and trace
+            metadata; diagnostics never include resolved values or rejected
+            credential-bearing variable names. This map, `custom_tags`, and
+            `custom_header_tags` may contain at most 32 distinct tag names
+            combined.
         metrics:
           type: object
           description: |
@@ -21038,6 +21130,17 @@ components:
               enum: [cut_with_error_event, cut_silent]
               default: cut_with_error_event
               description: Whether a cut emits an OpenAI-compatible terminal SSE error event or ends the stream silently. Applies to enforcement=block only (detect never cuts).
+            max_hold_ms:
+              type: integer
+              format: uint
+              minimum: 1
+              maximum: 300000
+              description: "Absolute deadline, in milliseconds, on how long response content may be held awaiting a semantic verdict. Independent of max_window_bytes, provider.request_timeout_ms, and any transport timeout: the budget covers the time the bytes have already been held plus the semantic round-trip (including queueing for a detect-mode admission permit). The clock is anchored when un-released content first enters the hold and is never refreshed by further chunks or by a partial release that leaves older bytes held, so a drip-feeding backend cannot extend it. It clears only when the current hold is fully released, so the next hold receives a fresh budget. On expiry the in-flight evaluation is cancelled and streaming.on_hold_timeout decides. Omit the field to leave the hold unbounded (the historic behavior); 0 and values above 300000 are rejected."
+            on_hold_timeout:
+              type: string
+              enum: [on_error, cut, forward]
+              default: on_error
+              description: "Policy when streaming.max_hold_ms expires before a verdict. on_error inherits the plugin's on_error policy (reject fails closed by cutting, warn/allow fail open by forwarding every byte that caused the hold uninspected — complete events and any un-terminated partial SSE event — then passing the remainder of that partial event through until the next event boundary), matching how a provider error or an exhausted inspection budget is handled. cut always fails closed (discards all held/partial bytes); forward always fails open. Requires streaming.max_hold_ms to be set. cut is rejected with enforcement=detect, whose bytes were already forwarded before the evaluation began — an expired detect hold can only abandon the evaluation and release its admission permit. A cut is client-indistinguishable from a policy cut (same terminal error event), and every expiry folds into the fixed-cardinality ai_semantic_firewall.stream_hold_timeouts count (saturating-summed across active instances) and ai_semantic_firewall.stream_hold_timeout_action (most restrictive of cut > forward > detect_abandoned) transaction metadata; a zero-expiry instance neither synthesizes nor erases those keys."
             enforcement:
               type: string
               enum: [block, detect]
@@ -22698,7 +22801,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, bounded JSON-RPC batch admission with per-item validation and ordered synthetic response assembly. Aggregate upstream-routed members such as tools/call must be singleton requests so later plugin phases are preserved; batch request members return JSON-RPC -32009, while notification-only batches report the restriction once at batch level. MCP initialize must also be a singleton HTTP request: initialize batch members return JSON-RPC -32010 before any session mint or eviction, so no batch mints or evicts a session or returns a session header. A notification-only batch whose gateway dispatch otherwise fails reports JSON-RPC -32011. A batch member whose session is no longer live contributes a per-item JSON-RPC -32004 element because the singleton bare HTTP 404 cannot be expressed per item. Aggregate batches always answer HTTP 200 with a response array, so an unsupported MCP-Protocol-Version surfaces per item rather than as the singleton HTTP 400; transparent_proxy batches cannot be partially forwarded and are rejected whole with HTTP 400. The plugin also supports tool argument JSON Schema validation and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins. Cannot be composed with request_deduplication on the same proxy; admission rejects the pair with 400 because a deduplicated replay is served before this plugin runs and cannot be proven to match the live catalog mapping."
       required: [mode, endpoint, servers]
       properties:
         enabled:
@@ -22720,7 +22823,7 @@ components:
               items:
                 type: string
               default: ["2025-11-25"]
-              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version.
+              description: Supported MCP protocol versions, in preference order. The first entry is the gateway's preferred version, returned by aggregate-mode initialize when the client requests an unsupported version. Includes 2025-03-26 when JSON-RPC batches are desired; batches are admitted under validation.max_batch_* limits.
         discovery:
           type: object
           properties:
@@ -22887,6 +22990,30 @@ components:
               minimum: 1
               default: 8388608
               description: "Maximum total serialized bytes accumulated across paginated catalog list pages before the aggregation is rejected. Must be greater than 0."
+            max_batch_items:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 32
+              description: "Maximum JSON-RPC batch array members admitted before session, catalog, or upstream work. Empty batches are rejected separately as Invalid Request. Must be greater than 0."
+            max_batch_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum aggregate request-body bytes admitted for a JSON-RPC batch. Enforced on the raw request body before any JSON parsing, using the first non-whitespace byte to detect array-shaped input. Must be greater than 0 and at least max_batch_item_bytes."
+            max_batch_item_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 262144
+              description: "Maximum raw wire bytes admitted for one JSON-RPC batch member. Measured on the member's exact raw JSON slice as received (internal whitespace and escape sequences included, array separators and surrounding inter-member whitespace excluded), before the member is deserialized, so a member cannot shrink under the cap by normalizing. Oversized members yield a bounded per-item Invalid Request with id null (their id is never materialized or reflected) while siblings continue. Must be greater than 0 and must not exceed max_batch_bytes."
+            max_batch_response_bytes:
+              type: integer
+              format: int64
+              minimum: 1
+              default: 1048576
+              description: "Maximum serialized bytes admitted for an assembled JSON-RPC batch response array (including array framing). Oversized aggregates fail closed without returning a partial body. Must be greater than 0."
         observability:
           type: object
           properties:

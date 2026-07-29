@@ -1104,6 +1104,15 @@ pub fn render_prometheus() -> String {
     let admitted_tasks = lifecycle.admitted_tasks.load(Ordering::Acquire);
     let max_tasks = lifecycle.max_tasks;
     let capacity_rejections = lifecycle.capacity_rejection_count();
+    let retained_bytes = crate::plugins::utils::byte_budget::process_retained_bytes();
+    let max_retained_bytes = crate::plugins::utils::byte_budget::process_max_retained_bytes();
+    let retained_high_water =
+        crate::plugins::utils::byte_budget::process_retained_bytes_high_water();
+    let ceiling_rejections = crate::plugins::utils::byte_budget::process_ceiling_rejections();
+    let batch_lost_records =
+        crate::plugins::utils::byte_budget::batch_materialization_lost_records();
+    let batch_loss_events = crate::plugins::utils::byte_budget::batch_materialization_loss_events();
+    let batch_fallbacks = crate::plugins::utils::byte_budget::batch_materialization_fallbacks();
     let active_workers = match lifecycle.workers.lock() {
         Ok(workers) => workers
             .values()
@@ -1145,7 +1154,28 @@ pub fn render_prometheus() -> String {
          ferrum_observability_delivery_lost_worker_records_total {}\n\
          # HELP ferrum_observability_delivery_drain_timeouts_total Observability shutdown drains that exhausted their shared deadline.\n\
          # TYPE ferrum_observability_delivery_drain_timeouts_total counter\n\
-         ferrum_observability_delivery_drain_timeouts_total {}\n",
+         ferrum_observability_delivery_drain_timeouts_total {}\n\
+         # HELP ferrum_observability_retained_bytes Bytes currently retained across every observability sink instance in this process.\n\
+         # TYPE ferrum_observability_retained_bytes gauge\n\
+         ferrum_observability_retained_bytes {retained_bytes}\n\
+         # HELP ferrum_observability_max_retained_bytes Configured process-wide retained-byte ceiling shared by all observability sink instances.\n\
+         # TYPE ferrum_observability_max_retained_bytes gauge\n\
+         ferrum_observability_max_retained_bytes {max_retained_bytes}\n\
+         # HELP ferrum_observability_retained_bytes_high_water Peak process-wide observability retention observed since startup.\n\
+         # TYPE ferrum_observability_retained_bytes_high_water gauge\n\
+         ferrum_observability_retained_bytes_high_water {retained_high_water}\n\
+         # HELP ferrum_observability_process_ceiling_rejections_total Sink admissions refused specifically by the process-wide retained-byte ceiling rather than a per-instance budget.\n\
+         # TYPE ferrum_observability_process_ceiling_rejections_total counter\n\
+         ferrum_observability_process_ceiling_rejections_total {ceiling_rejections}\n\
+         # HELP ferrum_observability_batch_materialization_lost_records_total Log entries, spans, and rows discarded because their batch representation could not be materialized under the retained-byte ceiling. Counts records, not reservations.\n\
+         # TYPE ferrum_observability_batch_materialization_lost_records_total counter\n\
+         ferrum_observability_batch_materialization_lost_records_total {batch_lost_records}\n\
+         # HELP ferrum_observability_batch_materialization_losses_total Discard events, each of which lost one or more records.\n\
+         # TYPE ferrum_observability_batch_materialization_losses_total counter\n\
+         ferrum_observability_batch_materialization_losses_total {batch_loss_events}\n\
+         # HELP ferrum_observability_batch_materialization_fallbacks_total Batches delivered complete but in a degraded representation, such as uncompressed because the compressed copy could not be reserved. No record loss.\n\
+         # TYPE ferrum_observability_batch_materialization_fallbacks_total counter\n\
+         ferrum_observability_batch_materialization_fallbacks_total {batch_fallbacks}\n",
         report.rejected_tasks,
         report.cancelled_tasks,
         report.lost_worker_records,
