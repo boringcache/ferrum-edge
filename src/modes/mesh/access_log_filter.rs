@@ -19,7 +19,7 @@ pub const MAX_ACCESS_LOG_FILTER_AST_NODES: usize = 32;
 
 /// Canonical, serde-stable access-log filter expression tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccessLogFilterExpr {
     And {
         left: Box<AccessLogFilterExpr>,

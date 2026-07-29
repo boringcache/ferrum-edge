@@ -93,7 +93,7 @@ impl StdoutLogging {
                 let errors_only =
                     parse_optional_bool(filter_config, "errors_only")?.unwrap_or(false);
                 let expression = match filter_config.get("expression") {
-                    None | Some(Value::Null) => None,
+                    None => None,
                     Some(value) => {
                         let expression = serde_json::from_value(value.clone()).map_err(|err| {
                             format!("stdout_logging: filter.expression is invalid: {err}")
@@ -441,6 +441,26 @@ mod tests {
             (
                 json!({ "filter": { "status_code_min": 500, "status_code_max": 499 } }),
                 "filter.status_code_min must be less than or equal to filter.status_code_max",
+            ),
+            (
+                json!({ "filter": { "expression": null } }),
+                "filter.expression is invalid",
+            ),
+            (
+                json!({
+                    "filter": {
+                        "expression": {
+                            "op": "or",
+                            "left": {
+                                "op": "status_code_min",
+                                "value": 500,
+                                "ignored": true
+                            },
+                            "right": { "op": "errors_only" }
+                        }
+                    }
+                }),
+                "unknown field",
             ),
         ] {
             let err = match StdoutLogging::new(&config) {
