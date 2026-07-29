@@ -747,6 +747,28 @@ fn fleet_secret_backed_credentials_are_refused() {
         .expect_err("secret_env naming the fleet variable must be refused");
     assert!(error.contains("GHSA-3f2j-wwqw-grmg"), "got: {error}");
 
+    // File-backed material is compared after the loader trims the customary
+    // trailing newline. A copied or symlinked fleet secret must not evade the
+    // same by-value refusal merely because it came from `secret_path`.
+    let dir = tempfile::tempdir().expect("temporary trust-bundle material");
+    let secret_path = dir.path().join("fleet-secret");
+    std::fs::write(&secret_path, format!("{FLEET}\n")).expect("write fleet-secret fixture");
+    let document = json!({
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256",
+              "secret_path": secret_path.display().to_string(),
+              "namespaces": [TENANT_A] },
+        ]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "fleet-path-bundle", Some(FLEET))
+        .expect_err("secret_path carrying the fleet secret must be refused");
+    assert!(error.contains("GHSA-3f2j-wwqw-grmg"), "got: {error}");
+    assert!(
+        !error.contains(FLEET),
+        "the file-backed refusal must not echo the secret, got: {error}"
+    );
+
     // A distinct per-tenant secret still loads with the fleet secret present.
     let document = json!({
         "keys": [
