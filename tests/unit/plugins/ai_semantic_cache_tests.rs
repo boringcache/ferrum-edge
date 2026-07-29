@@ -1697,7 +1697,8 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
     )
     .await;
 
-    let (ctx_b, result) = run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
+    let (ctx_b, result) =
+        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "multimodal fingerprint must prevent cross-replay even when consumer scoping is disabled"
@@ -2884,7 +2885,8 @@ async fn test_numerically_equivalent_sampling_params_collapse() {
     )
     .await;
 
-    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None).await;
+    let hit =
+        run_lookup_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None).await;
     assert!(
         hit,
         "numerically equivalent sampling params (1 vs 1.0, 0.5 vs 0.50) must hit the same entry"
@@ -2991,7 +2993,8 @@ async fn test_stream_true_vs_false_no_cache_hit() {
     )
     .await;
 
-    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None).await;
+    let hit =
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None).await;
     assert!(
         !hit,
         "`stream:true` request MUST NOT receive the `stream:false` cached entry"
@@ -4062,7 +4065,8 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         br#"{"city":"Paris"}"#,
     )
     .await;
-    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None).await;
+    let hit =
+        run_lookup_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None).await;
     assert!(
         hit,
         "Responses family should semantic-hit within one instruction scope"
@@ -5041,7 +5045,8 @@ async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
         "temperature": 1.0,
         "messages": [{"role": "user", "content": "canonical params"}]
     });
-    let hit = run_lookup_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None).await;
+    let hit =
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None).await;
     assert!(
         hit,
         "canonical numeric sampling-parameter forms remain exact-key equivalent"

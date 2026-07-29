@@ -1931,17 +1931,20 @@ impl ResponseCaching {
         let mut guard = self.accounting_guard();
         let maintenance = &mut *guard;
 
-        let mut descendant_prefix = String::with_capacity(encoded.len() + 1);
-        descendant_prefix.push_str(encoded.as_ref());
-        descendant_prefix.push('/');
+        let descendant_prefix: Arc<str> = {
+            let mut prefix = String::with_capacity(encoded.len() + 1);
+            prefix.push_str(encoded.as_ref());
+            prefix.push('/');
+            prefix.into()
+        };
 
         let mut doomed: Vec<String> = Vec::new();
         if let Some(paths) = maintenance.path_index.get(scope) {
             if let Some(keys) = paths.get(encoded.as_ref()) {
                 doomed.extend(keys.iter().cloned());
             }
-            for (indexed_path, keys) in paths.range(descendant_prefix.clone()..) {
-                if !indexed_path.starts_with(descendant_prefix.as_str()) {
+            for (indexed_path, keys) in paths.range(Arc::clone(&descendant_prefix)..) {
+                if !indexed_path.starts_with(descendant_prefix.as_ref()) {
                     break;
                 }
                 doomed.extend(keys.iter().cloned());
