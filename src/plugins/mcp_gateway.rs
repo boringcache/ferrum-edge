@@ -3346,6 +3346,7 @@ impl McpGateway {
                             // Drop any staged per-item state, then restate the
                             // deny decision so the rejection stays observable.
                             self.clear_batch_item_routing_state(ctx);
+                            self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
                             ctx.metadata
                                 .insert("mcp.route_decision".to_string(), "deny".to_string());
                             return response;
@@ -3384,6 +3385,7 @@ impl McpGateway {
                 })
                 .collect();
             self.clear_batch_item_routing_state(ctx);
+            self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
                 "synthetic_response".to_string(),
@@ -3407,6 +3409,13 @@ impl McpGateway {
                 error: None,
                 message_kind: McpMessageKind::Notification,
             });
+        // The forwarded body is the whole batch, not `route_envelope`, so no
+        // single member may describe the request: drop every member-scoped key
+        // the loop stamped (otherwise `mcp.method` and friends would report the
+        // *last* member while the route was chosen from the *first*) and keep
+        // only the request-level summary before Continuing.
+        self.clear_batch_item_routing_state(ctx);
+        self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
         self.handle_transparent_post(ctx, headers, &route_envelope)
     }
 
@@ -3450,6 +3459,12 @@ impl McpGateway {
         let mut blocked_upstream_notification = false;
         let mut blocked_lifecycle_notification = false;
         let mut failed_notification = false;
+        // Bounded union of every member's catalog-degradation state. The key is
+        // request-level observability, but it is *produced* per member and the
+        // per-item reset clears it, so it is accumulated here instead of being
+        // left at whichever member happened to run last. Cardinality is fixed:
+        // at most (configured servers x catalog families) `server:family` pairs.
+        let mut catalog_degraded: BTreeSet<String> = BTreeSet::new();
         let inbound_headers = headers.clone();
 
         for item in batch {
@@ -3545,6 +3560,14 @@ impl McpGateway {
 
             self.emit_envelope_metadata(ctx, &envelope);
             let result = self.dispatch_post_envelope(ctx, headers, &envelope).await;
+            // Take this member's degraded set before the next iteration's reset
+            // drops it, so the request-level summary is the union across members
+            // rather than the last member's view.
+            if let Some(item_degraded) = ctx.metadata.remove("mcp.catalog_degraded") {
+                for pair in item_degraded.split(',').filter(|pair| !pair.is_empty()) {
+                    catalog_degraded.insert(pair.to_string());
+                }
+            }
             match classify_batch_item_result(
                 result,
                 envelope.id.clone(),
@@ -3619,6 +3642,7 @@ impl McpGateway {
 
         self.clear_batch_item_routing_state(ctx);
         *headers = inbound_headers;
+        self.restore_batch_request_metadata(ctx, headers, &catalog_degraded);
         ctx.metadata.insert(
             "mcp.route_decision".to_string(),
             "synthetic_response".to_string(),
@@ -3682,12 +3706,43 @@ impl McpGateway {
         response: PluginResult,
     ) -> PluginResult {
         self.clear_batch_item_routing_state(ctx);
+        // A fail-closed batch publishes no catalog-degradation summary: the
+        // members that would have contributed one never completed.
+        self.restore_batch_request_metadata(ctx, inbound_headers, &BTreeSet::new());
         ctx.metadata.insert(
             "mcp.route_decision".to_string(),
             "synthetic_response".to_string(),
         );
         *headers = inbound_headers.clone();
         response
+    }
+
+    /// Re-establish the request-level MCP metadata the per-item reset clears.
+    ///
+    /// `mcp.protocol_version` is a property of the *request* — the inbound
+    /// `MCP-Protocol-Version` header — not of any member. `mark_protocol_version`
+    /// also falls back to a member's `params.protocolVersion` when the header is
+    /// absent, which is right for the per-member version gate but would
+    /// otherwise leave the last member that declared one describing the whole
+    /// request. Passing `None` here re-derives it from the inbound headers only,
+    /// so a member's params can gate that member without ever labelling the
+    /// batch. `mcp.catalog_degraded` is likewise republished as the bounded
+    /// union accumulated across members, never one member's view.
+    fn restore_batch_request_metadata(
+        &self,
+        ctx: &mut RequestContext,
+        inbound_headers: &HashMap<String, String>,
+        catalog_degraded: &BTreeSet<String>,
+    ) {
+        // Stamps `mcp.protocol_version` from the header when present; the
+        // returned value is only needed by the per-member gate, not here.
+        let _ = self.mark_protocol_version(ctx, inbound_headers, None);
+        if !self.observability.emit_metadata || catalog_degraded.is_empty() {
+            return;
+        }
+        let pairs: Vec<&str> = catalog_degraded.iter().map(String::as_str).collect();
+        ctx.metadata
+            .insert("mcp.catalog_degraded".to_string(), pairs.join(","));
     }
 
     /// Raw admission for an array-shaped request body.
@@ -3849,11 +3904,18 @@ impl McpGateway {
     /// sibling's routing decision, private rewrite trust, response binding, or
     /// item-scoped observability can never authorize or reroute another member.
     /// Only request-level metadata survives a batch: `mcp.enabled`, `mcp.mode`,
-    /// `mcp.batch`, `mcp.batch_size`, `mcp.protocol_version` (a shared request
-    /// header), and the terminal `mcp.route_decision`. The request-start
-    /// baselines for `mcp.policy_decision` / `mcp.schema_validation` are
-    /// re-established afterwards so log schemas keep seeing those fields with
-    /// their neutral values rather than a sibling member's verdict.
+    /// `mcp.batch`, `mcp.batch_size`, and the terminal `mcp.route_decision`. The
+    /// request-start baselines for `mcp.policy_decision` /
+    /// `mcp.schema_validation` are re-established afterwards so log schemas keep
+    /// seeing those fields with their neutral values rather than a sibling
+    /// member's verdict.
+    ///
+    /// `mcp.protocol_version` and `mcp.catalog_degraded` are cleared here too
+    /// even though their final values are request-level: both can be *written*
+    /// by a single member (`params.protocolVersion`, one member's catalog
+    /// refresh), so every batch terminal point republishes them from
+    /// request-level inputs via [`Self::restore_batch_request_metadata`] rather
+    /// than letting whichever member ran last describe the request.
     fn clear_batch_item_routing_state(&self, ctx: &mut RequestContext) {
         ctx.route_override_backend_scheme = None;
         ctx.route_override_backend_host = None;
@@ -3882,6 +3944,8 @@ impl McpGateway {
         ctx.metadata.remove("mcp.policy_decision");
         ctx.metadata.remove("mcp.catalog_hit");
         ctx.metadata.remove("mcp.catalog_version");
+        ctx.metadata.remove("mcp.catalog_degraded");
+        ctx.metadata.remove("mcp.protocol_version");
         ctx.metadata.remove("mcp.session.downstream");
         ctx.metadata.remove("mcp.protocol_version_negotiated");
         ctx.metadata.remove("mcp.message.kind");

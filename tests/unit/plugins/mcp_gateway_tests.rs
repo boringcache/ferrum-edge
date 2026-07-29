@@ -6640,6 +6640,10 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
     ctx.route_override_backend_host = Some("leak.example".to_string());
     ctx.metadata
         .insert("mcp.server_id".to_string(), "forged".to_string());
+    ctx.metadata
+        .insert("mcp.protocol_version".to_string(), "forged".to_string());
+    ctx.metadata
+        .insert("mcp.catalog_degraded".to_string(), "forged:tools".to_string());
     let _ = reject_json(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
         ctx.route_override_backend_host.is_none(),
@@ -6667,6 +6671,12 @@ async fn aggregate_batch_clears_per_item_routing_state_between_members() {
         "mcp.catalog_version",
         "mcp.item_name",
         "mcp.arguments_hash",
+        // Both of these end up describing the *request*, but either can be
+        // written by a single member (`params.protocolVersion`, one member's
+        // catalog refresh). They must be republished from request-level inputs,
+        // never carried over from a member or from pre-seeded scratch space.
+        "mcp.protocol_version",
+        "mcp.catalog_degraded",
     ] {
         assert!(
             !ctx.metadata.contains_key(stale_key),
@@ -7317,4 +7327,95 @@ async fn aggregate_batch_upstream_routed_member_does_not_bypass_later_plugins() 
     let after = transformer.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(after, PluginResult::Continue));
     let _ = std::any::type_name::<RequestTransformer>();
+}
+
+/// A batch is not describable by any one of its members. `mcp.protocol_version`
+/// must come from the request's `MCP-Protocol-Version` header rather than from
+/// whichever member last declared a `params.protocolVersion`, and a transparent
+/// batch — whose forwarded body is the whole array — must not be labelled with
+/// the last member's envelope fields while it was routed from the first.
+#[tokio::test]
+async fn batch_request_metadata_is_not_described_by_a_single_member() {
+    let aggregate = create_plugin(
+        "mcp_gateway",
+        &aggregate_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+
+    // No request header, but a member declares a (supported, so non-gating)
+    // protocolVersion in params. That is a member property, not the request's.
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": { "protocolVersion": "2025-11-25" }
+        },
+        { "jsonrpc": "2.0", "id": 2, "method": "ping", "params": {} }
+    ]));
+    let (status, body, _) = reject_json(aggregate.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(body.as_array().map(Vec::len), Some(2));
+    assert!(
+        !ctx.metadata.contains_key("mcp.protocol_version"),
+        "a member's params.protocolVersion must not label the whole batch: {:?}",
+        ctx.metadata.get("mcp.protocol_version")
+    );
+
+    // With the shared request header present it is republished verbatim.
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {} }
+    ]));
+    headers.insert("mcp-protocol-version".to_string(), "2025-11-25".to_string());
+    let (status, _, _) = reject_json(aggregate.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(status, 200);
+    assert_eq!(
+        ctx.metadata.get("mcp.protocol_version").map(String::as_str),
+        Some("2025-11-25"),
+        "the shared request header is the batch's protocol version"
+    );
+
+    let transparent = create_plugin(
+        "mcp_gateway",
+        &transparent_config("http://github-mcp.example:8080/mcp"),
+    )
+    .unwrap()
+    .unwrap();
+    let (mut ctx, mut headers) = mcp_ctx(json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} },
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": { "protocolVersion": "2025-11-25" }
+        }
+    ]));
+    assert!(matches!(
+        transparent.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        ctx.route_override_backend_host.as_deref(),
+        Some("github-mcp.example")
+    );
+    assert!(
+        !ctx.metadata.contains_key("mcp.protocol_version"),
+        "a transparent batch member's params must not label the request"
+    );
+    for member_scoped in ["mcp.method", "mcp.message.kind", "mcp.jsonrpc"] {
+        assert!(
+            !ctx.metadata.contains_key(member_scoped),
+            "{member_scoped} describes one member, but the forwarded body is the whole batch"
+        );
+    }
+    assert_eq!(
+        ctx.metadata.get("mcp.batch").map(String::as_str),
+        Some("true"),
+        "the request-level batch summary is what describes a forwarded batch"
+    );
+    assert_eq!(
+        ctx.metadata.get("mcp.batch_size").map(String::as_str),
+        Some("2")
+    );
 }
