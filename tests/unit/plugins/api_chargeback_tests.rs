@@ -565,6 +565,8 @@ fn test_unknown_keys_rejected_by_schema_and_runtime() {
         API_CHARGEBACK_CONFIG_KEYS,
         &[
             "currency",
+            "schema",
+            "schema_ref",
             "pricing_tiers",
             "bandwidth_pricing",
             "stream_connection_pricing",

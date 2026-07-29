@@ -7433,7 +7433,7 @@ fn charge_event_projection_renames_omits_and_adds_fields() {
     let event = sample_event("evt-projected");
     let value = projected_row(
         json!({
-            "rename": { "proxy_id": "route_id", "charge_total": "amount" },
+            "rename": { "proxy_id": "route_key", "charge_total": "amount" },
             "omit": ["node_id", "pricing_version"],
             "static_fields": { "ledger": "prod", "shard": 3 },
             "derived_fields": [
@@ -7444,7 +7444,7 @@ fn charge_event_projection_renames_omits_and_adds_fields() {
         }),
         &event,
     );
-    assert_eq!(value["route_id"], json!("proxy-a"));
+    assert_eq!(value["route_key"], json!("proxy-a"));
     assert!(value.get("proxy_id").is_none());
     assert_eq!(value["amount"], json!(event.charge_total));
     assert!(value.get("node_id").is_none());
@@ -7602,7 +7602,7 @@ fn charge_event_dangling_schema_ref_fails_closed() {
 #[test]
 fn sink_constructor_accepts_and_rejects_schemas_at_construction() {
     ApiChargebackSink::new(
-        &sink_config_with(json!({ "schema": { "rename": { "proxy_id": "route_id" } } })),
+        &sink_config_with(json!({ "schema": { "rename": { "proxy_id": "route_key" } } })),
         PluginHttpClient::default(),
         "ferrum",
     )
