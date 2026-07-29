@@ -178,8 +178,11 @@ A resume point is retained **in memory only** — never persisted, never logged.
 On primary election, connection loss, or any stream error the watcher marks
 itself degraded, raises one wake-up so the authoritative poll closes whatever
 gap may exist, and reconnects with exponential backoff from 1s to
-`FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS` with ±25% jitter. If the resume
-point falls out of the oplog (`ChangeStreamHistoryLost`) or the collection is
+`FERRUM_MONGO_CHANGE_STREAM_MAX_BACKOFF_SECONDS` with ±25% jitter. Backoff
+escalates across open-then-immediate-error/end cycles; it resets to the initial
+delay only after a watch session has delivered at least one usable event, not
+merely because `watch()` opened successfully. If the resume point falls out of
+the oplog (`ChangeStreamHistoryLost`) or the collection is
 dropped/renamed (invalidation), the token is dropped and the watch reopens from
 now; the sequence cursor is what actually repairs the gap. Shutdown joins the
 watcher task with the other background tasks.

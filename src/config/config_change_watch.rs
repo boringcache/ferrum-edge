@@ -356,6 +356,27 @@ pub fn next_config_change_watch_backoff_secs(
     current_secs.saturating_mul(2).clamp(initial_secs, max_secs)
 }
 
+/// Next reconnect delay after one watch-session outcome.
+///
+/// `delivered_usable_event` is true only when the session observed at least one
+/// non-lifecycle change-stream event (healthy progress). A successful `watch()`
+/// open alone must pass `false`: servers that accept the watch and then
+/// immediately end/error would otherwise forever restart at the initial delay
+/// instead of escalating toward `max_secs`.
+pub fn config_change_watch_backoff_after_session(
+    previous_backoff_secs: u64,
+    initial_secs: u64,
+    max_secs: u64,
+    delivered_usable_event: bool,
+) -> u64 {
+    let base = if delivered_usable_event {
+        0
+    } else {
+        previous_backoff_secs
+    };
+    next_config_change_watch_backoff_secs(base, initial_secs, max_secs)
+}
+
 /// MongoDB `Unauthorized`. The database user may not open the watch.
 pub const MONGO_ERR_UNAUTHORIZED: i32 = 13;
 /// MongoDB `ChangeStreamFatalError` — the stream cannot resume from its token.

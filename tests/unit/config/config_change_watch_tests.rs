@@ -14,7 +14,8 @@ use ferrum_edge::config::config_change_watch::{
     ConfigChangeWatchDegradedReason, ConfigChangeWatchSettings, ConfigChangeWatcherHealth,
     ConfigPollWake, MONGO_ERR_CHANGE_STREAM_FATAL, MONGO_ERR_CHANGE_STREAM_HISTORY_LOST,
     MONGO_ERR_UNAUTHORIZED, WATCH_ERROR_LOG_CHARS, classify_mongo_change_stream_failure,
-    next_config_change_watch_backoff_secs, truncate_watch_error, wait_for_config_poll_wake,
+    config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
+    truncate_watch_error, wait_for_config_poll_wake,
 };
 
 fn armed_interval(period: Duration) -> tokio::time::Interval {
@@ -194,6 +195,35 @@ fn watch_backoff_never_exceeds_the_configured_ceiling() {
 fn watch_backoff_clamps_an_initial_above_the_ceiling() {
     assert_eq!(next_config_change_watch_backoff_secs(0, 600, 5), 5);
     assert_eq!(next_config_change_watch_backoff_secs(1, 600, 5), 5);
+}
+
+#[test]
+fn open_then_immediate_failure_keeps_escalating_backoff() {
+    // Prior failures left the delay at 4s; a successful open that never
+    // delivered a usable event must not clear the failure sequence.
+    assert_eq!(
+        config_change_watch_backoff_after_session(4, 1, 30, false),
+        8
+    );
+    let mut backoff = 0;
+    for expected in [1_u64, 2, 4, 8, 16, 30, 30] {
+        backoff = config_change_watch_backoff_after_session(backoff, 1, 30, false);
+        assert_eq!(
+            backoff, expected,
+            "open-then-fail cycles must escalate toward the ceiling"
+        );
+    }
+}
+
+#[test]
+fn usable_delivery_resets_failure_sequence_for_next_reconnect() {
+    // An escalated delay clears only after healthy delivery; the next reconnect
+    // after that session ends restarts at the initial delay.
+    assert_eq!(
+        config_change_watch_backoff_after_session(16, 1, 30, true),
+        1
+    );
+    assert_eq!(config_change_watch_backoff_after_session(0, 1, 30, true), 1);
 }
 
 // ── Bounded failure classification ───────────────────────────────────────────

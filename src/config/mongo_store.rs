@@ -48,7 +48,8 @@ mod inner {
     use crate::config::config_change_watch::{
         ConfigChangeWakeWatcherParams, ConfigChangeWatchDegradedReason,
         ConfigChangeWatcherStopGuard, classify_mongo_change_stream_failure,
-        next_config_change_watch_backoff_secs, truncate_watch_error,
+        config_change_watch_backoff_after_session, next_config_change_watch_backoff_secs,
+        truncate_watch_error,
     };
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
@@ -2924,7 +2925,10 @@ mod inner {
 
                 health.mark_connected();
                 failed_opens_with_token = 0;
-                backoff_secs = 0;
+                // Do not clear reconnect backoff here: a server that accepts the
+                // watch and then immediately ends/errors must keep escalating.
+                // Only a usable (non-lifecycle) delivered event resets the
+                // failure sequence — see `config_change_watch_backoff_after_session`.
                 debug!(
                     "MongoDB config-change watcher connected; wake-ups are advisory and the \
                      durable sequence cursor stays authoritative"
@@ -2933,6 +2937,7 @@ mod inner {
                 // down. One wake-up makes the authoritative poll close the gap.
                 signal.signal();
 
+                let mut delivered_usable_event = false;
                 let degraded_reason = loop {
                     let next_event = tokio::select! {
                         _ = shutdown.changed() => return,
@@ -2960,6 +2965,7 @@ mod inner {
                                 _ => {
                                     health.record_event();
                                     signal.signal();
+                                    delivered_usable_event = true;
                                 }
                             }
                         }
@@ -2985,10 +2991,11 @@ mod inner {
                 // Same gap argument as above: reconnecting is best-effort, the
                 // authoritative poll is not.
                 signal.signal();
-                backoff_secs = next_config_change_watch_backoff_secs(
+                backoff_secs = config_change_watch_backoff_after_session(
                     backoff_secs,
                     initial_backoff_secs,
                     max_backoff_secs,
+                    delivered_usable_event,
                 );
             }
 
