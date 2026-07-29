@@ -6713,7 +6713,17 @@ async fn aggregate_batch_preserves_degraded_catalog_summary_across_clean_sibling
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "prompts",
+            "result": {"prompts": []}
+        })))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, false);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
 
@@ -6749,7 +6759,17 @@ async fn aggregate_batch_preserves_degraded_catalog_summary_when_degraded_member
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, false, false);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "prompts/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "prompts",
+            "result": {"prompts": []}
+        })))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, false);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
 
@@ -6787,7 +6807,17 @@ async fn aggregate_batch_unions_degraded_catalog_summary_across_multiple_members
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
-    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, false);
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .and(body_partial_json(json!({"method": "resources/list"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jsonrpc": "2.0",
+            "id": "resources",
+            "result": {"resources": []}
+        })))
+        .mount(&server)
+        .await;
+    let config = single_server_family_config(&format!("{}/mcp", server.uri()), true, true, true);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
 
