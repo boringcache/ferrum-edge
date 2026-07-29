@@ -1884,7 +1884,10 @@ fn status_only_full_terminate_trailers() -> HashMap<String, String> {
     let mut trailers = HashMap::new();
     trailers.insert("grpc-status".to_string(), "0".to_string());
     trailers.insert("grpc-message".to_string(), "all%20good".to_string());
-    trailers.insert("grpc-status-details-bin".to_string(), "AAECAw==".to_string());
+    trailers.insert(
+        "grpc-status-details-bin".to_string(),
+        "AAECAw==".to_string(),
+    );
     trailers.insert("x-tenant".to_string(), "acme".to_string());
     trailers
 }
@@ -2021,7 +2024,10 @@ fn test_status_only_terminate_restores_complete_authored_metadata() {
     assert_eq!(
         shared.2,
         vec![
-            ("grpc-status-details-bin".to_string(), "AAECAw==".to_string()),
+            (
+                "grpc-status-details-bin".to_string(),
+                "AAECAw==".to_string()
+            ),
             ("x-tenant".to_string(), "acme".to_string()),
         ],
         "sorted, and limited to authored terminal metadata beyond status/message"
@@ -2106,7 +2112,10 @@ fn test_invalidated_framed_terminate_drops_all_authored_metadata() {
 
     let framed = frame_terminate_message(b"hello");
     let mut authored = framed_grpc_terminate_trailers();
-    authored.insert("grpc-status-details-bin".to_string(), "AAECAw==".to_string());
+    authored.insert(
+        "grpc-status-details-bin".to_string(),
+        "AAECAw==".to_string(),
+    );
 
     let mut ctx = create_test_context();
     set_serverless_grpc_terminate_frame_for_test(&mut ctx, &framed, authored.clone());

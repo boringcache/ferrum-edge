@@ -12331,8 +12331,7 @@ fn h3_non_framed_grpc_reject_signal_with_provenance(
     headers: &HashMap<String, String>,
     framed_unary_provenance: crate::proxy::FramedGrpcUnaryProvenance<'_>,
 ) -> (u32, Option<std::borrow::Cow<'static, str>>) {
-    let (derived_status, derived_message) =
-        h3_grpc_reject_signal(http_status, http_body, headers);
+    let (derived_status, derived_message) = h3_grpc_reject_signal(http_status, http_body, headers);
     if let Some(authored) =
         crate::proxy::status_only_grpc_signal(framed_unary_provenance, http_status, http_body)
     {
@@ -12342,8 +12341,7 @@ fn h3_non_framed_grpc_reject_signal_with_provenance(
         );
     }
 
-    let mapped_status =
-        crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
+    let mapped_status = crate::proxy::grpc_proxy::h3_http_reject_status_to_grpc_status(http_status);
     match crate::proxy::invalidated_grpc_terminate_fail_closed_signal(
         framed_unary_provenance,
         derived_status,
