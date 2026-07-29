@@ -197,7 +197,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .find("send_h3_plugin_reject_flavor_aware(")
         .expect("Content-Length rejection send");
     assert!(content_length_finalize < content_length_send);
-    assert!(content_length_fast_path.contains("&rejection.body"));
+    assert!(content_length_fast_path.contains("rejection.body.clone()"));
     assert!(content_length_fast_path.contains("&rejection.headers"));
 
     let terminal_dispatch = src
@@ -590,7 +590,7 @@ fn h3_cross_protocol_buffered_grpc_writes_and_fin_are_deadline_bounded() {
         .expect("bounded buffered gRPC response arm");
     assert!(buffered.contains("await_response_write_before_deadline("));
     assert!(buffered.contains("await_terminal_response_write_before_deadline("));
-    assert!(buffered.contains("stream.send_data(Bytes::from(response_body))"));
+    assert!(buffered.contains("stream.send_data(response_body)"));
     assert!(buffered.contains("stream.send_trailers(trailer_map)"));
     assert!(
         buffered.matches("stream.finish()").count() >= 2,
