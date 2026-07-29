@@ -253,9 +253,10 @@ enum OriginPattern {
     Prefix(String),
     /// Istio `StringMatch.regex` on the request `Origin` header: the compiled
     /// RE2 pattern must FULLY match the entire origin. Compiled once at config
-    /// time with the regex crate's default size limit (no catastrophic
-    /// backtracking — the engine is finite-automaton based); an invalid pattern
-    /// is rejected at config validation, never panicked on.
+    /// time under the explicit program, DFA, and nesting limits below (no
+    /// catastrophic backtracking — the engine is finite-automaton based); an
+    /// invalid or over-budget pattern is rejected at config validation, never
+    /// panicked on.
     Regex(Regex),
 }
 
