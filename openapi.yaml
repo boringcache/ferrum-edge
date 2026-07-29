@@ -15904,13 +15904,109 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
+      allOf:
+        - if:
+            properties:
+              username_token:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  - not:
+                      properties:
+                        password_type:
+                          const: PasswordText
+                      required: [password_type]
+            required: [username_token]
+          then:
+            required: [nonce]
+            properties:
+              nonce:
+                type: object
+                required: [replay_scope]
+        - if:
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
+            required: [nonce]
+          then:
+            required: [sync_mode, redis_url]
+            properties:
+              sync_mode:
+                const: redis
+        - if:
+            properties:
+              sync_mode:
+                const: redis
+            required: [sync_mode]
+          then:
+            required: [nonce, redis_url]
+            properties:
+              nonce:
+                type: object
+                properties:
+                  replay_scope:
+                    const: shared
+                required: [replay_scope]
       properties:
         reject_missing_security_header:
           type: boolean
           default: true
           description: Reject SOAP requests that lack a WS-Security header
+        sync_mode:
+          type: string
+          enum: [local, redis]
+          default: local
+          description: "PasswordDigest replay-claim storage. 'redis' is required by (and only valid with) nonce.replay_scope = 'shared'; it is what makes replay protection cross-replica. Any RESP-compatible server works."
+        redis_url:
+          type: string
+          minLength: 1
+          pattern: '^rediss?://[^/?#\s]+(?:[/?#][^\s]*)?$'
+          description: "Redis connection URL with a redis:// or rediss:// scheme and a non-empty authority/hostname. Required when sync_mode is 'redis'."
+        redis_tls:
+          type: boolean
+          default: false
+          description: "Enable TLS for the Redis connection. CA verification uses gateway-level FERRUM_TLS_CA_BUNDLE_PATH; skip-verify uses FERRUM_TLS_NO_VERIFY."
+        redis_key_prefix:
+          type: string
+          minLength: 1
+          description: >-
+            Key prefix for shared replay claims. Must be non-empty when
+            supplied. Defaults to
+            `{FERRUM_NAMESPACE}:soap_ws_security:{plugin-config-id}`, which
+            isolates independent PasswordDigest policies inside a namespace while
+            keeping every replica of one policy claiming against the same
+            keyspace. An explicit prefix is the opt-in for deliberately sharing a
+            keyspace across policies.
+        redis_pool_size:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 4
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
+        redis_connect_timeout_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Redis connection timeout in seconds. Must be greater than zero.
+        redis_health_check_interval_seconds:
+          type: integer
+          minimum: 1
+          default: 5
+          description: Health check ping interval when Redis is unavailable. Must be greater than zero.
+        redis_username:
+          type: string
+          description: Redis username for ACL authentication
+        redis_password:
+          type: string
+          description: Redis password
         timestamp:
           type: object
           description: WS-Security Timestamp validation
@@ -15919,7 +16015,7 @@ components:
             require:
               type: boolean
               default: true
-              description: Require a wsu:Timestamp element in the Security header
+              description: Require a wsu:Timestamp element in the Security header. This controls whether the element may be ABSENT; a Timestamp that IS present is always validated against max_age_seconds / clock_skew_seconds / Expires, so an out-of-policy Timestamp is never ignored and the PasswordDigest binding always compares against a validated instant.
             max_age_seconds:
               type: integer
               format: uint64
@@ -15973,6 +16069,31 @@ components:
                     type: string
                     minLength: 1
               description: Allowed username/password pairs for UsernameToken authentication. Every entry must be an object with non-empty username and password; a malformed entry is rejected rather than dropped, and duplicate usernames are rejected because credential selection is first-wins.
+            created_max_age_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 1
+              maximum: 86400
+              description: Freshness window (seconds) for the UsernameToken's own wsu:Created — the instant hashed into the PasswordDigest, distinct from the outer Timestamp Created. Without it a captured token stays digest-valid forever and only the replay TTL limits resubmission. Zero is rejected. The value validated is byte-for-byte the value fed to the digest.
+            created_clock_skew_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 0
+              maximum: 3600
+              description: Clock skew tolerance (seconds) for the UsernameToken Created freshness window and for the Timestamp Expires comparison. Zero is permitted (strictest).
+            created_max_timestamp_divergence_seconds:
+              type: integer
+              format: uint64
+              default: 60
+              minimum: 0
+              maximum: 3600
+              description: Maximum permitted absolute difference between the UsernameToken Created and the outer wsu:Timestamp Created. This binding is what prevents a captured UsernameToken from being paired with a freshly minted outer Timestamp — moving the outer instant no longer moves the inner one, and moving the inner one invalidates the captured digest. Zero is permitted (the two instants must be identical). The UsernameToken Created must also not fall past an outer Expires.
+            require_timestamp_binding:
+              type: boolean
+              default: true
+              description: Require an outer wsu:Timestamp carrying a valid Created for PasswordDigest requests, so the Timestamp binding cannot be dropped by omitting the element. The outer Timestamp is validated on every request in which it appears — including when timestamp.require is false — so the instant bound against is always an independently validated one.
         x509_signature:
           type: object
           description: X.509 certificate signature verification
@@ -16122,28 +16243,85 @@ components:
             per shared immutable key allocation. An exact ordered age index
             provides O(log n) expiry operations without a lookup-map scan or
             stale queue. Capacity maintenance reclaims only entries already
-            past cache_ttl_seconds and at most 64 of them per request; a nonce
-            inside its TTL is never evicted. If that bounded reclamation cannot
-            make room the request fails closed (HTTP 401) rather than accepting
-            a nonce whose replay window cannot be recorded or unprotecting one
-            that was already claimed. This is the only canonical shape; there
-            is no `nonce_replay_protection` alias.
+            past the fixed retention horizon and at most 64 of them per
+            request; a nonce inside it is never evicted. If that bounded
+            reclamation cannot make room the request fails closed (HTTP 401)
+            rather than accepting a nonce whose replay window cannot be recorded
+            or unprotecting one that was already claimed. This is the only
+            canonical shape; there is no `nonce_replay_protection` alias.
+
+            replay_scope declares where those claims live and is REQUIRED when
+            username_token is enabled with password_type PasswordDigest. It has
+            no default because a gateway cannot observe its own replica count.
+            The entry/byte caps and bounded expiry maintenance described above
+            apply to replay_scope=process; under replay_scope=shared the bounds
+            that apply are Redis's own memory policy plus the fixed expiry on
+            each claim key, and max_cache_size / max_total_cache_bytes are
+            inert. The encoded-length ceiling applies on both paths.
+
+            Claim retention is FIXED at 93601 seconds (~26 h) on both paths and
+            is not configurable: it is
+            max created_max_age_seconds (86400) + 2 × max
+            created_clock_skew_seconds (3600) + 1, the widest span over which
+            any configuration this schema admits can accept an unchanged
+            UsernameToken. Retention derived from the *configured* window is not
+            sufficient, because replay state outlives the generation that wrote
+            it: a later reload may widen created_max_age_seconds /
+            created_clock_skew_seconds after the shorter retention has already
+            elapsed, and the claim cannot then be resurrected in either scope
+            (a process entry may already have been reclaimed or refreshed, and
+            Redis SET NX cannot extend a key it finds present). Retaining every
+            claim for the schema-wide maximum makes any later admitted widening
+            safe with no rollout ordering, drain window, or operator procedure.
+            There is no cache_ttl_seconds field; it was removed rather than
+            redefined, and supplying it fails admission as an unknown key.
           additionalProperties: false
           properties:
-            cache_ttl_seconds:
-              type: integer
-              format: uint64
-              default: 300
-              minimum: 1
-              maximum: 86400
-              description: How long to remember nonces for replay detection (seconds). Zero is rejected because it would make replay detection inert.
+            replay_scope:
+              type: string
+              enum: [process, shared]
+              description: >-
+                Where PasswordDigest replay claims live. REQUIRED when
+                username_token.enabled is true and password_type is
+                PasswordDigest; there is no default. "process" registers state
+                under a stable {namespace}|{plugin-config-id} scope so a reload
+                generation inherits the previous generation's claims instead of
+                starting from an empty cache — it is explicitly NOT cross-replica
+                protection, and selecting it asserts a single-replica deployment.
+                Process-scope claims are lost on process restart, crash, or
+                reschedule; a captured PasswordDigest token still inside its
+                Created window can then be accepted again. Reload survival is
+                not restart survival.
+                "shared" claims each nonce with one atomic Redis SET NX EX so
+                exactly one request across all replicas wins a nonce inside its
+                TTL; it requires sync_mode=redis and a redis_url, and the key is
+                SHA-256(nonce) in hex so the nonce never reaches a Redis
+                keyspace, MONITOR, SLOWLOG, or client error log. A shared-backend
+                outage fails closed with HTTP 401 (failure class
+                nonce_shared_backend_unavailable); there is no degrade-to-local
+                option because a per-replica fallback would reinstate the
+                cross-replica bypass. Recovery is automatic: any error that
+                marks the shared client unavailable — connect, DNS, a hostname
+                that currently resolves to an egress-denied address, or a
+                transient command error — also arms the background recovery
+                checker, which restores enforcement within
+                redis_health_check_interval_seconds without a reload (a
+                literal-IP egress-policy denial is the exception and is a
+                configuration fix; hostname denials re-screen because DNS
+                answers can change). Claim durability is Redis's own: run the
+                replay keyspace
+                with maxmemory-policy noeviction and consistent failover, since
+                a lost claim key makes its nonce claimable again. Admission
+                enforces the pairing in both directions: shared without
+                sync_mode=redis is rejected, and sync_mode=redis without shared
+                is rejected.
             max_cache_size:
               type: integer
               format: uint64
-              default: 10000
+              default: 100000
               minimum: 1
               maximum: 1000000
-              description: Maximum retained nonce entries. Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past cache_ttl_seconds. A nonce inside its TTL is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce.
+              description: "Maximum retained nonce entries (replay_scope=process only). Zero is rejected because it would make replay detection inert. Capacity maintenance uses an ordered age index and reclaims at most 64 entries per request, and only entries already past the fixed 93601-second retention horizon. A nonce inside that horizon is never evicted, so a claim that cannot be recorded is rejected with 401 instead of admitting an unprotected nonce. Size this (and max_total_cache_bytes) for peak authenticated PasswordDigest rate × 93601 s — roughly 1 request/second sustained at the default, and about 10/second at the 1000000 ceiling. Higher sustained PasswordDigest rates need replay_scope=shared, where retention is Redis's cost rather than the gateway's."
             max_encoded_length:
               type: integer
               format: uint64
@@ -16154,10 +16332,10 @@ components:
             max_total_cache_bytes:
               type: integer
               format: uint64
-              default: 8388608
+              default: 67108864
               minimum: 4096
               maximum: 1073741824
-              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside cache_ttl_seconds."
+              description: "Maximum total retained nonce-key UTF-8 payload bytes, counted once per logical nonce's immutable allocation shared by the lookup map and age index. Hash/tree node and reference-count control-block overhead is excluded and remains bounded by max_cache_size. Must be at least max_encoded_length. Like max_cache_size this is a fail-closed cap: exhausting it rejects the claim with 401 rather than evicting a nonce that is still inside its retention window."
 
     CorsExactOrigin:
       oneOf:
