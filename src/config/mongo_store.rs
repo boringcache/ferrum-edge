@@ -5766,6 +5766,12 @@ mod inner {
                         .await?;
             }
 
+            // Hot-path isolation: strip ownership tags from runtime/CP loads.
+            // Backup export keeps them so restore can recreate managed state.
+            if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
+                crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
+            }
+
             Ok(config)
         }
 
@@ -5779,8 +5785,9 @@ mod inner {
             // namespace, so such a config must still snapshot; only a genuine
             // MongoDB error surfaces as `Err`, letting the caller abort the
             // destructive clear instead of wiping an unrecoverable-but-intact
-            // config. The `_opt_session` helpers already clear `api_spec_id`
-            // (parity with `load_full_config`). A replica-set deployment reads
+            // config. Snapshot loads preserve `api_spec_id` so restore rollback
+            // can recreate managed relationships together with api_specs docs.
+            // A replica-set deployment reads
             // the snapshot inside a majority/snapshot transaction; standalone
             // reads directly from the primary.
             let start = std::time::Instant::now();
@@ -11451,6 +11458,237 @@ mod inner {
             Ok(count)
         }
 
+        async fn list_api_specs_with_content(
+            &self,
+            namespace: &str,
+        ) -> Result<Vec<ApiSpec>, anyhow::Error> {
+            let start = std::time::Instant::now();
+            let options = FindOptions::builder().sort(doc! { "_id": 1 }).build();
+            let mut cursor = self
+                .api_specs()
+                .find(doc! { "namespace": namespace })
+                .with_options(options)
+                .await?;
+            let mut specs = Vec::new();
+            while cursor.advance().await? {
+                let doc = cursor.deserialize_current()?;
+                specs.push(doc_to_api_spec(doc)?);
+            }
+            self.check_slow_query("list_api_specs_with_content", start);
+            Ok(specs)
+        }
+
+        async fn batch_insert_api_specs(
+            &self,
+            specs: &[ApiSpec],
+            mode: &BatchConfigWriteMode,
+        ) -> Result<usize, anyhow::Error> {
+            if specs.is_empty() {
+                return Ok(0);
+            }
+
+            // Pre-flight BSON size checks before any durable write.
+            let mut docs = Vec::with_capacity(specs.len());
+            for spec in specs {
+                let spec_doc = api_spec_to_doc(spec)?;
+                let bson_bytes = mongodb::bson::to_vec(&spec_doc)?;
+                if bson_bytes.len() > 15 * 1024 * 1024 {
+                    anyhow::bail!(
+                        "MongoDB document limit exceeded restoring api_spec '{}': \
+                         serialized size is {} bytes (limit ~15 MiB)",
+                        spec.id,
+                        bson_bytes.len()
+                    );
+                }
+                docs.push(spec_doc);
+            }
+
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases_for_mode(
+                    specs.iter().map(|spec| spec.namespace.as_str()),
+                    mode,
+                )
+                .await?;
+            let count = Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                // Ownership checks against already-restored proxies.
+                for spec in specs {
+                    let proxy_doc = self
+                        .proxies()
+                        .find_one(doc! { "_id": &spec.proxy_id, "namespace": &spec.namespace })
+                        .await?;
+                    if proxy_doc.is_none() {
+                        anyhow::bail!(
+                            "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                            spec.id,
+                            spec.proxy_id
+                        );
+                    }
+                }
+
+                let count = if self.replica_set_configured() {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    session
+                        .start_transaction()
+                        .and_run((self, docs), |s, (this, docs)| {
+                            Box::pin(async move {
+                                let result = this
+                                    .api_specs()
+                                    .insert_many(docs)
+                                    .ordered(true)
+                                    .session(&mut *s)
+                                    .await?;
+                                Ok(result.inserted_ids.len())
+                            })
+                        })
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("batch_insert_api_specs transaction failed")?
+                } else {
+                    let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
+                    // MUST stay unordered, exactly like every sibling standalone
+                    // batch insert. `rollback_ids_for_unordered_insert_error`
+                    // derives "documents this call created" as *all ids minus
+                    // the reported write-error indices*, which is only true for
+                    // an unordered insert. An ordered insert stops at the first
+                    // write error, so every id after it would be reported as
+                    // created and then deleted by the compensating
+                    // `delete_many({_id: {$in: ...}})` — and `api_specs._id` is
+                    // the bare spec id with no namespace qualifier, so that
+                    // delete would destroy another namespace's spec documents.
+                    match self.api_specs().insert_many(docs).ordered(false).await {
+                        Ok(result) => result.inserted_ids.len(),
+                        Err(err) => {
+                            let rollback_ids =
+                                Self::rollback_ids_for_unordered_insert_error(&ids, &err);
+                            let err = anyhow::Error::new(err);
+                            self.rollback_standalone_created_documents(
+                                "api_specs",
+                                "api_spec",
+                                &rollback_ids,
+                                &err,
+                            )
+                            .await;
+                            return Err(err);
+                        }
+                    }
+                };
+                Ok(count)
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
+            Ok(count)
+        }
+
+        async fn apply_api_spec_ownership_from_resources(
+            &self,
+            proxies: &[Proxy],
+            upstreams: &[Upstream],
+            plugin_configs: &[PluginConfig],
+            mode: &BatchConfigWriteMode,
+        ) -> Result<(), anyhow::Error> {
+            let namespaces: Vec<&str> = proxies
+                .iter()
+                .map(|p| p.namespace.as_str())
+                .chain(upstreams.iter().map(|u| u.namespace.as_str()))
+                .chain(plugin_configs.iter().map(|p| p.namespace.as_str()))
+                .collect();
+            if namespaces.is_empty() {
+                return Ok(());
+            }
+            let mut mtls_leases = self
+                .acquire_mtls_dns_admission_leases_for_mode(namespaces.iter().copied(), mode)
+                .await?;
+            Self::run_mtls_dns_mutations(&mut mtls_leases, async {
+                let stamp = async {
+                    for proxy in proxies {
+                        if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+                            self.proxies()
+                                .update_one(
+                                    doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                                    doc! { "$set": { "api_spec_id": spec_id } },
+                                )
+                                .await?;
+                        }
+                    }
+                    for upstream in upstreams {
+                        if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+                            self.upstreams()
+                                .update_one(
+                                    doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                                    doc! { "$set": { "api_spec_id": spec_id } },
+                                )
+                                .await?;
+                        }
+                    }
+                    for plugin in plugin_configs {
+                        if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+                            self.plugin_configs()
+                                .update_one(
+                                    doc! { "_id": &plugin.id, "namespace": &plugin.namespace },
+                                    doc! { "$set": { "api_spec_id": spec_id } },
+                                )
+                                .await?;
+                        }
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+                if self.replica_set_configured() {
+                    let connection = self.connection();
+                    let mut session = connection.client.start_session().await?;
+                    session
+                        .start_transaction()
+                        .and_run((self, proxies, upstreams, plugin_configs), |s, (this, proxies, upstreams, plugin_configs)| {
+                            Box::pin(async move {
+                                for proxy in proxies.iter() {
+                                    if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+                                        this.proxies()
+                                            .update_one(
+                                                doc! { "_id": &proxy.id, "namespace": &proxy.namespace },
+                                                doc! { "$set": { "api_spec_id": spec_id } },
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                }
+                                for upstream in upstreams.iter() {
+                                    if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+                                        this.upstreams()
+                                            .update_one(
+                                                doc! { "_id": &upstream.id, "namespace": &upstream.namespace },
+                                                doc! { "$set": { "api_spec_id": spec_id } },
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                }
+                                for plugin in plugin_configs.iter() {
+                                    if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+                                        this.plugin_configs()
+                                            .update_one(
+                                                doc! { "_id": &plugin.id, "namespace": &plugin.namespace },
+                                                doc! { "$set": { "api_spec_id": spec_id } },
+                                            )
+                                            .session(&mut *s)
+                                            .await?;
+                                    }
+                                }
+                                Ok(())
+                            })
+                        })
+                        .await
+                        .map_err(anyhow::Error::new)
+                        .context("apply_api_spec_ownership_from_resources transaction failed")?;
+                } else {
+                    stamp.await?;
+                }
+                Ok(())
+            })
+            .await?;
+            Self::release_mtls_dns_admission_leases_after_commit(&mut mtls_leases).await;
+            Ok(())
+        }
+
         async fn list_spec_owned_plugin_configs(
             &self,
             namespace: &str,
@@ -12163,8 +12401,7 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "proxy", None, error)
                     })?;
-                    let mut proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
-                    proxy.api_spec_id = None;
+                    let proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
                     proxies.push(proxy);
                 }
             } else {
@@ -12174,8 +12411,7 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "proxy", None, error)
                     })?;
-                    let mut proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
-                    proxy.api_spec_id = None;
+                    let proxy = decode_loaded_document(doc, snapshot, "proxy", doc_to_proxy)?;
                     proxies.push(proxy);
                 }
             }
@@ -12253,13 +12489,12 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "plugin_config", None, error)
                     })?;
-                    let mut plugin_config = decode_loaded_document(
+                    let plugin_config = decode_loaded_document(
                         doc,
                         snapshot,
                         "plugin_config",
                         doc_to_plugin_config,
                     )?;
-                    plugin_config.api_spec_id = None;
                     plugin_configs.push(plugin_config);
                 }
             } else {
@@ -12269,13 +12504,12 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "plugin_config", None, error)
                     })?;
-                    let mut plugin_config = decode_loaded_document(
+                    let plugin_config = decode_loaded_document(
                         doc,
                         snapshot,
                         "plugin_config",
                         doc_to_plugin_config,
                     )?;
-                    plugin_config.api_spec_id = None;
                     plugin_configs.push(plugin_config);
                 }
             }
@@ -12300,9 +12534,8 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "upstream", None, error)
                     })?;
-                    let mut upstream =
+                    let upstream =
                         decode_loaded_document(doc, snapshot, "upstream", doc_to_upstream)?;
-                    upstream.api_spec_id = None;
                     upstreams.push(upstream);
                 }
             } else {
@@ -12312,9 +12545,8 @@ mod inner {
                     let doc = cursor.deserialize_current().map_err(|error| {
                         map_snapshot_document_error(snapshot, "upstream", None, error)
                     })?;
-                    let mut upstream =
+                    let upstream =
                         decode_loaded_document(doc, snapshot, "upstream", doc_to_upstream)?;
-                    upstream.api_spec_id = None;
                     upstreams.push(upstream);
                 }
             }
