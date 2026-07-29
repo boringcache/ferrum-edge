@@ -10487,10 +10487,125 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope]
+      required: [egress_scope, node_waypoint_observability]
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
+        node_waypoint_observability:
+          $ref: "#/components/schemas/NodeWaypointObservabilitySnapshot"
+          description: |
+            NodeWaypoint ADR observability counters (issue #3334). Present on
+            authenticated `/health`/`/status` mesh detail for every mesh process;
+            `enabled` is true only when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
+            Counters are process-static and monotonic across config reload and
+            SVID rotation; they reset on NodeWaypoint process restart.
+
+    NodeWaypointObservabilitySnapshot:
+      type: object
+      required:
+        - enabled
+        - hbone_handshakes
+        - asserted_identity
+        - destination_policy_rejections
+        - missing_destination_metadata
+        - plaintext_fallback_attempts
+      properties:
+        enabled:
+          type: boolean
+          description: True when NodeWaypoint ADR counter producers are active.
+        hbone_handshakes:
+          $ref: "#/components/schemas/NodeWaypointHboneHandshakeSnapshot"
+        asserted_identity:
+          $ref: "#/components/schemas/NodeWaypointAssertedIdentitySnapshot"
+        destination_policy_rejections:
+          $ref: "#/components/schemas/NodeWaypointDestinationPolicySnapshot"
+        missing_destination_metadata:
+          type: integer
+          format: uint64
+          description: Secured targets skipped for absent Workload.node_waypoint metadata.
+        plaintext_fallback_attempts:
+          type: integer
+          format: uint64
+          description: Prohibited plaintext fallback attempts blocked fail-closed.
+
+    NodeWaypointHboneHandshakeSnapshot:
+      type: object
+      required:
+        - inbound_tls_success
+        - inbound_tls_failure
+        - inbound_connect_success
+        - inbound_connect_failure
+        - outbound_dial_success
+        - outbound_dial_failure
+      properties:
+        inbound_tls_success:
+          type: integer
+          format: uint64
+        inbound_tls_failure:
+          type: integer
+          format: uint64
+        inbound_connect_success:
+          type: integer
+          format: uint64
+        inbound_connect_failure:
+          type: integer
+          format: uint64
+        outbound_dial_success:
+          type: integer
+          format: uint64
+        outbound_dial_failure:
+          type: integer
+          format: uint64
+
+    NodeWaypointAssertedIdentitySnapshot:
+      type: object
+      required:
+        - accepted
+        - rejected_untrusted_assertor
+        - rejected_trust_domain_mismatch
+        - rejected_unauthenticated_hbone
+        - rejected_malformed
+        - rejected_stale_or_unknown
+      properties:
+        accepted:
+          type: integer
+          format: uint64
+        rejected_untrusted_assertor:
+          type: integer
+          format: uint64
+        rejected_trust_domain_mismatch:
+          type: integer
+          format: uint64
+        rejected_unauthenticated_hbone:
+          type: integer
+          format: uint64
+        rejected_malformed:
+          type: integer
+          format: uint64
+        rejected_stale_or_unknown:
+          type: integer
+          format: uint64
+
+    NodeWaypointDestinationPolicySnapshot:
+      type: object
+      required:
+        - authz_deny
+        - scope_missing
+        - destination_scope_missing
+        - relay_destination_denied
+      properties:
+        authz_deny:
+          type: integer
+          format: uint64
+        scope_missing:
+          type: integer
+          format: uint64
+        destination_scope_missing:
+          type: integer
+          format: uint64
+        relay_destination_denied:
+          type: integer
+          format: uint64
 
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:

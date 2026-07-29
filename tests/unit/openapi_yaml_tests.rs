@@ -6074,6 +6074,10 @@ fn service_discovery_schema_matches_provider_validation_and_serialization() {
 
 #[test]
 fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
+    use ferrum_edge::modes::mesh::node_waypoint_observability::{
+        NodeWaypointAssertedIdentitySnapshot, NodeWaypointDestinationPolicySnapshot,
+        NodeWaypointHboneHandshakeSnapshot, NodeWaypointObservabilitySnapshot,
+    };
     use ferrum_edge::modes::mesh::runtime::MeshEgressScopeHealth;
     use ferrum_edge::modes::mesh::slice::{MeshEgressScopeResource, MeshEgressScopeSnapshot};
     use ferrum_edge::overload::{
@@ -6112,15 +6116,63 @@ fn mesh_and_overload_runtime_snapshots_are_covered_by_openapi() {
         "health": health
     });
     assert_component_validity(&spec, "MeshEgressScopeResponse", &egress_response, true);
+    // Build from the REAL snapshot type, not a hand-written literal: a serde
+    // field rename in `node_waypoint_observability` must fail this parity gate
+    // instead of silently diverging from the published OpenAPI schema.
+    let node_waypoint_observability = NodeWaypointObservabilitySnapshot {
+        enabled: true,
+        hbone_handshakes: NodeWaypointHboneHandshakeSnapshot {
+            inbound_tls_success: 1,
+            inbound_tls_failure: 2,
+            inbound_connect_success: 3,
+            inbound_connect_failure: 4,
+            outbound_dial_success: 5,
+            outbound_dial_failure: 6,
+        },
+        asserted_identity: NodeWaypointAssertedIdentitySnapshot {
+            accepted: 1,
+            rejected_untrusted_assertor: 2,
+            rejected_trust_domain_mismatch: 0,
+            rejected_unauthenticated_hbone: 0,
+            rejected_malformed: 0,
+            rejected_stale_or_unknown: 0,
+        },
+        destination_policy_rejections: NodeWaypointDestinationPolicySnapshot {
+            authz_deny: 1,
+            scope_missing: 0,
+            destination_scope_missing: 0,
+            relay_destination_denied: 0,
+        },
+        missing_destination_metadata: 1,
+        plaintext_fallback_attempts: 1,
+    };
     assert_component_validity(
         &spec,
         "HealthResponse",
         &json!({
             "status": "ok",
             "ready": true,
-            "mesh": {"egress_scope": health}
+            "mesh": {
+                "egress_scope": health,
+                "node_waypoint_observability": node_waypoint_observability
+            }
         }),
         true,
+    );
+    assert_component_validity(
+        &spec,
+        "HealthResponse",
+        &json!({
+            "status": "ok",
+            "ready": true,
+            "mesh": {
+                "egress_scope": {
+                    "sidecar_admitted_services": 1,
+                    "sidecar_denied_services": 0
+                }
+            }
+        }),
+        false,
     );
 
     let mut overload = serde_json::to_value(OverloadSnapshot {

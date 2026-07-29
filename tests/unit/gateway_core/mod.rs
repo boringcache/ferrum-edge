@@ -45,6 +45,7 @@ mod mesh_udp_capture_outcome_tests;
 mod metrics_tests;
 mod node_agent_startup_cleanup_tests;
 mod node_agent_watcher_exit_tests;
+mod node_waypoint_observability_tests;
 mod observability_delivery_tests;
 mod overload_tests;
 mod per_port_load_balancer_tests;
