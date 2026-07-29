@@ -12,7 +12,7 @@ use ferrum_edge::plugins::mesh::bpf_metrics::MeshBpfMetrics;
 use ferrum_edge::plugins::mesh::prometheus_helpers;
 use ferrum_edge::plugins::prometheus_metric_contract::{
     BUNDLED_EXTERNAL_METRIC_ALLOWLIST, BUNDLED_PROMETHEUS_RULE_TEMPLATE,
-    PROMETHEUS_METRICS_REFERENCE_MD, PROMETHEUS_METRIC_CONTRACT_JSON,
+    PROMETHEUS_METRIC_CONTRACT_JSON, PROMETHEUS_METRICS_REFERENCE_MD,
 };
 use ferrum_edge::plugins::prometheus_metrics::MetricsRegistry;
 use ferrum_edge::plugins::{StreamTransactionSummary, TransactionSummary};
@@ -80,7 +80,9 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, (String, BTreeSet<S
         }
         let name_and_maybe_labels = line.split_once(' ').map(|(a, _)| a).unwrap_or(line);
         let (name, label_body) = if let Some(idx) = name_and_maybe_labels.find('{') {
-            let end = name_and_maybe_labels.rfind('}').unwrap_or(name_and_maybe_labels.len());
+            let end = name_and_maybe_labels
+                .rfind('}')
+                .unwrap_or(name_and_maybe_labels.len());
             (
                 &name_and_maybe_labels[..idx],
                 Some(&name_and_maybe_labels[idx + 1..end]),
@@ -246,8 +248,8 @@ fn representative_exposition() -> String {
     let mut output = registry.render_uncached();
     output.push_str(&ferrum_edge::observability_delivery::render_prometheus());
 
-    let bpf = MeshBpfMetrics::new(&serde_json::json!({}))
-        .expect("default bpf metrics plugin config");
+    let bpf =
+        MeshBpfMetrics::new(&serde_json::json!({})).expect("default bpf metrics plugin config");
     output.push_str(&bpf.exporter().render_prometheus());
     output
 }
@@ -471,8 +473,7 @@ fn bundled_classification_matches_chart_references() {
             "alert" | "dashboard" | "alert_and_dashboard" => assert!(
                 is_ref,
                 "{} is classified as {} but is not referenced by bundled charts/alerts",
-                fam.name,
-                fam.bundled
+                fam.name, fam.bundled
             ),
             other => panic!("unexpected bundled value {other}"),
         }

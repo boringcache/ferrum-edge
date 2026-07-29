@@ -19,14 +19,12 @@ pub const PROMETHEUS_METRIC_CONTRACT_JSON: &str =
     include_str!("../../docs/prometheus_metric_contract.json");
 
 /// Checked-in operator reference validated against the inventory.
-pub const PROMETHEUS_METRICS_REFERENCE_MD: &str =
-    include_str!("../../docs/prometheus_metrics.md");
+pub const PROMETHEUS_METRICS_REFERENCE_MD: &str = include_str!("../../docs/prometheus_metrics.md");
 
 /// Bundled PrometheusRule template validated against the inventory.
 pub const BUNDLED_PROMETHEUS_RULE_TEMPLATE: &str =
     include_str!("../../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml");
 
 /// Non-Ferrum metric names that bundled alerts may legally reference.
-pub const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] = &[
-    "apiserver_admission_webhook_rejection_count",
-];
+pub const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] =
+    &["apiserver_admission_webhook_rejection_count"];
