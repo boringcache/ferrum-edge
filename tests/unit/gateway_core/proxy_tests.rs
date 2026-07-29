@@ -3997,15 +3997,12 @@ fn test_buffered_grpc_framing_is_trailers_only_on_empty_body() {
 /// Regression: a plugin reject on the buffered gRPC path must not publish a
 /// plugin-authored `Content-Length` on a response that sends zero DATA frames.
 ///
-/// `normalize_reject_response(.., is_grpc_request = true)` copies every
-/// plugin-supplied header except content-type / grpc-status / grpc-message and
-/// returns an empty body, so a `Content-Length` in the reject map survives
-/// normalization. The buffered writers previously selected trailers-only
-/// framing from an `after_proxy_rejected` flag, which the `on_response_body`
-/// and `on_final_response_body` reject arms do not set — those arms therefore
-/// fell through to streaming framing, which canonicalizes and publishes the
-/// plugin value. Framing is now derived from the final body instead, so every
-/// reject arm is covered whether or not it shares a flag.
+/// `normalize_reject_response(.., is_grpc_request = true)` strips every case
+/// variant of protocol-managed `content-length`, empties the body for
+/// trailers-only framing, and leaves only the authoritative gRPC terminal
+/// metadata. Framing is derived from the final body, so every reject arm
+/// selects trailers-only for an empty body rather than streaming framing that
+/// would publish a surviving plugin length.
 #[test]
 fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
     use ferrum_edge::_test_support::normalize_reject_response;
@@ -4026,18 +4023,19 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
         true,
     );
 
-    // Precondition: normalization keeps the plugin's length and empties the body.
     assert!(
         normalized.body.is_empty(),
         "a native gRPC reject normalizes to trailers-only with no DATA frames"
     );
     assert!(
-        normalized
+        !normalized
             .headers
             .keys()
             .any(|name| name.eq_ignore_ascii_case("content-length")),
-        "precondition: the plugin-authored length survives reject normalization"
+        "normalization must strip every plugin-authored Content-Length case variant"
     );
+    assert_eq!(normalized.headers.get("grpc-status").map(String::as_str), Some("7"));
+    assert_eq!(normalized.headers.get("x-plugin").map(String::as_str), Some("1"));
 
     let framing = ClientResponseFraming::for_buffered_grpc(
         normalized.http_status.as_u16(),
@@ -4048,35 +4046,33 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
         "an empty buffered gRPC body must select trailers-only framing"
     );
 
-    let mut headers = normalized.headers;
-    sanitize_client_response_headers_for_wire(&mut headers, framing);
+    // Feed explicit case variants directly so the wire sanitizer is exercised
+    // independently of reject normalization.
+    let mut raw_length_variants = HashMap::from([
+        ("content-length".to_string(), "999".to_string()),
+        ("Content-Length".to_string(), "31337".to_string()),
+        ("x-plugin".to_string(), "1".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(&mut raw_length_variants, framing);
     assert!(
-        !headers
+        !raw_length_variants
             .keys()
             .any(|name| name.eq_ignore_ascii_case("content-length")),
         "no Content-Length may reach a trailers-only gRPC response"
     );
-    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("7"));
-    assert_eq!(headers.get("x-plugin").map(String::as_str), Some("1"));
+    assert_eq!(raw_length_variants.get("x-plugin").map(String::as_str), Some("1"));
 
-    // The superseded selector: streaming framing would have canonicalized one
-    // of the plugin values straight onto the wire.
-    let mut streamed = normalize_reject_response(
-        StatusCode::FORBIDDEN,
-        br#"{"error":"denied"}"#,
-        &HashMap::from([("content-length".to_string(), "999".to_string())]),
-        true,
-    )
-    .headers;
+    // Streaming framing is a separate contract: it preserves one valid plugin length.
+    let mut streaming_headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
     sanitize_client_response_headers_for_wire(
-        &mut streamed,
+        &mut streaming_headers,
         ClientResponseFraming::Streaming { status: 200 },
     );
     assert_eq!(
-        streamed.get("content-length").map(String::as_str),
+        streaming_headers.get("content-length").map(String::as_str),
         Some("999"),
-        "guard the premise: streaming framing preserves the plugin length, which \
-         is why the buffered gRPC writers must not select it for an empty body"
+        "streaming framing preserves the plugin length, which buffered gRPC rejects \
+         must not select for an empty body"
     );
 }
 
