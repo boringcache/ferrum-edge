@@ -326,21 +326,25 @@ impl TransactionDebugger {
     }
 
     /// Whether bounded request-body capture is enabled.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn log_request_body(&self) -> bool {
         self.log_request_body
     }
 
     /// Whether bounded response-body capture is enabled.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn log_response_body(&self) -> bool {
         self.log_response_body
     }
 
     /// Effective request-body capture budget in bytes.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn max_request_body_bytes(&self) -> usize {
         self.max_request_body_bytes
     }
 
     /// Effective response-body capture budget in bytes.
+    #[allow(dead_code)] // used only by external unit tests; dead in the production binary
     pub const fn max_response_body_bytes(&self) -> usize {
         self.max_response_body_bytes
     }
