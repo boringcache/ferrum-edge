@@ -207,8 +207,14 @@ forwarded ungoverned:
 
 In `mode: dry_run` these bodies are forwarded uninspected (and a stream past
 the hold cap is released uninspected) — dry-run never disrupts traffic. That
-includes ambiguous JSON: dry-run records the observation and forwards, and
-never claims enforcement.
+includes ambiguous JSON: dry-run forwards the original bytes unchanged and
+records a sanitized fixed-cardinality observation —
+`ai_tool_governor.decision=dry_run` plus
+`ai_tool_governor.uninspectable_reason=ambiguous_json` — and never claims
+enforcement with `decision=deny`. The reason label is sticky and bounded, so
+repeated ambiguous frames do not grow metadata cardinality. Generic
+uninspectable causes (encoding, size, non-UTF-8) keep their prior forward-only
+dry-run posture and are not relabeled as ambiguity.
 
 ## Actions
 
@@ -364,7 +370,9 @@ When `observability.emit_metadata` is on (default), the plugin writes
 (`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
 `approval_denied`),
 `tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
-(SHA-256, when `hash_arguments` is on), and `redacted_tools`.
+(SHA-256, when `hash_arguments` is on), `redacted_tools`, and — when global
+`mode: dry_run` observes duplicate-key ambiguity without blocking —
+`uninspectable_reason` (`ambiguous_json` only; never raw body bytes).
 
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked

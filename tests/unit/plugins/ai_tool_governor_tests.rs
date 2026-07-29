@@ -9577,6 +9577,33 @@ async fn redact_transform_leaves_non_redactable_shapes_unchanged() {
 // ---------------------------------------------------------------------------
 
 const AMBIGUITY_METADATA_KEY: &str = "ai_tool_governor.decision";
+const AMBIGUITY_REASON_KEY: &str = "ai_tool_governor.uninspectable_reason";
+const AMBIGUITY_REASON_VALUE: &str = "ambiguous_json";
+
+/// Positive dry-run ambiguity contract: forward unchanged, record
+/// `decision=dry_run` + fixed `uninspectable_reason`, never claim deny.
+fn assert_dry_run_ambiguity_observation(ctx: &RequestContext) {
+    assert_eq!(
+        ctx.metadata
+            .get(AMBIGUITY_METADATA_KEY)
+            .map(String::as_str),
+        Some("dry_run"),
+        "dry-run ambiguity must record decision=dry_run, got {:?}",
+        ctx.metadata.get(AMBIGUITY_METADATA_KEY)
+    );
+    assert_eq!(
+        ctx.metadata.get(AMBIGUITY_REASON_KEY).map(String::as_str),
+        Some(AMBIGUITY_REASON_VALUE),
+        "dry-run ambiguity must record the fixed reason, got {:?}",
+        ctx.metadata.get(AMBIGUITY_REASON_KEY)
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.mode")
+            .map(String::as_str),
+        Some("dry_run")
+    );
+}
 
 /// A raw JSON-RPC `tools/call` body whose `params` carries an earlier `danger`
 /// name and a later `safe` one. Built as raw text because `serde_json::json!`
@@ -9625,11 +9652,9 @@ async fn mcp_duplicate_tool_name_is_observed_in_dry_run() {
     );
     let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert_ne!(
-        ctx.metadata.get(AMBIGUITY_METADATA_KEY).map(String::as_str),
-        Some("deny"),
-        "dry-run must not record an enforcement decision"
-    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+    assert_no_metadata_contains(&ctx, "safe");
 }
 
 /// The rejection detail is a fixed reason that never echoes the governed body.
@@ -9828,6 +9853,9 @@ async fn duplicate_members_in_buffered_response_are_forwarded_in_dry_run() {
             .on_response_body(&mut ctx, 200, &mut json_headers(), body.as_bytes())
             .await,
     );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+    assert_no_metadata_contains(&ctx, "safe");
 }
 
 /// A response tool call whose `arguments` STRING is ambiguous joins the
@@ -9904,15 +9932,23 @@ async fn live_sse_duplicate_member_frame_is_released_in_dry_run() {
         "deny",
     );
     config["mode"] = json!("dry_run");
-    let plugin = make(config);
-    let ctx = create_test_context();
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-        .expect("inspector");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
     let bytes = SSE_DUPLICATE_MEMBER_FRAMES.as_bytes();
     let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
     assert!(!terminated, "dry-run must not disrupt the stream");
     assert_eq!(out, bytes, "dry-run must forward the body unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+    assert_no_metadata_contains(&ctx, "get_weather");
 }
 
 /// The BUFFERED SSE path mirrors the live inspector: the same body delivered
@@ -10011,6 +10047,7 @@ async fn encoded_sse_labeled_json_with_duplicate_members_forwards_in_dry_run() {
             )
             .await,
     );
+    assert_dry_run_ambiguity_observation(&ctx);
 }
 
 /// Chat Completions JSON carrying a duplicated `function.name`, mislabeled
@@ -10185,4 +10222,291 @@ async fn pathologically_deep_governed_body_is_refused_without_stack_overflow() {
     ctx.metadata.insert("request_body".to_string(), body);
     let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+/// Final backend-visible request ambiguity: dry-run forwards and records the
+/// fixed observation; enforce still rejects.
+#[tokio::test]
+async fn final_request_duplicate_members_are_observed_in_dry_run() {
+    let enforce = mcp_governor("enforce");
+    let mut enforce_ctx = json_post_ctx();
+    assert_reject(
+        enforce
+            .on_final_request_body_with_context(
+                &mut enforce_ctx,
+                &json_headers(),
+                MCP_DUPLICATE_TOOL_NAME.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+
+    let plugin = mcp_governor("dry_run");
+    let mut ctx = json_post_ctx();
+    let body = MCP_DUPLICATE_TOOL_NAME.as_bytes();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body)
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// Trailing-event Ambiguous arm: an incomplete final `data:` event with
+/// duplicate members is classified only at `on_end`. Dry-run forwards it and
+/// records the observation; enforce cuts.
+#[tokio::test]
+async fn trailing_sse_duplicate_member_frame_is_observed_in_dry_run() {
+    // Complete stop event, then an ambiguous payload left in the carry (no
+    // trailing blank line) so classification happens in `on_end`.
+    let trailing = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"danger\",\"name\":\"safe\",\"arguments\":\"{}\"}}]}}]}"
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "safe": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[trailing.as_bytes()]).await;
+    assert!(
+        enforce_terminated,
+        "trailing ambiguous event must cut the stream in enforce"
+    );
+    assert!(
+        !String::from_utf8_lossy(&enforce_out).contains("danger"),
+        "enforce must not release the ambiguous trailing frame"
+    );
+
+    let mut config = streaming_config(
+        json!({ "safe": { "action": "allow" }, "danger": { "action": "deny" } }),
+        "deny",
+    );
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = trailing.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not cut on trailing ambiguity");
+    assert_eq!(out, bytes, "dry-run must forward trailing bytes unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// Fully-held JSON-shaped stream with duplicate members: dry-run forwards
+/// byte-for-byte and records the fixed observation; enforce cuts.
+#[tokio::test]
+async fn json_shaped_stream_duplicate_members_are_observed_in_dry_run() {
+    let body = concat!(
+        r#"{"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","#,
+        r#""tool_calls":[{"id":"c1","type":"function","function":"#,
+        r#"{"name":"danger","name":"get_weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "danger": { "action": "deny" }, "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[body.as_bytes()]).await;
+    assert!(enforce_terminated);
+    assert!(!String::from_utf8_lossy(&enforce_out).contains("danger"));
+
+    let mut config = streaming_config(
+        json!({ "danger": { "action": "deny" }, "get_weather": { "action": "allow" } }),
+        "deny",
+    );
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not cut a JSON-shaped ambiguous body");
+    assert_eq!(out, bytes, "dry-run must forward the held JSON unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
+}
+
+/// String-form tool argument ambiguity on the request path: dry-run forwards
+/// and records the observation; enforce rejects.
+#[tokio::test]
+async fn ambiguous_tool_argument_string_is_observed_in_dry_run() {
+    let config = json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "run": { "action": "allow", "required_args": ["cmd"] } },
+        "inspect": { "a2a_methods": true, "mcp_tool_calls": false, "response_tool_calls": false }
+    });
+    let plugin = make(config);
+    let mut ctx = json_post_ctx();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "run",
+        "params": r#"{"cmd":"rm -rf /","cmd":"ls"}"#
+    })
+    .to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "rm -rf");
+    assert_no_metadata_contains(&ctx, "SHIBBOLETH");
+
+    let enforce = make(json!({
+        "mode": "enforce",
+        "default_action": "allow",
+        "tools": { "run": { "action": "allow", "required_args": ["cmd"] } },
+        "inspect": { "a2a_methods": true, "mcp_tool_calls": false, "response_tool_calls": false }
+    }));
+    let mut enforce_ctx = json_post_ctx();
+    enforce_ctx
+        .metadata
+        .insert("request_body".to_string(), body);
+    let mut enforce_headers = json_headers();
+    assert_reject(
+        enforce
+            .before_proxy(&mut enforce_ctx, &mut enforce_headers)
+            .await,
+        Some(502),
+    );
+}
+
+/// Streaming reassembled argument string with duplicate members: dry-run
+/// releases held frames and records the observation; enforce cuts.
+#[tokio::test]
+async fn streaming_reassembled_ambiguous_arguments_are_observed_in_dry_run() {
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{\\\"cmd\\\":\\\"rm\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"\\\",\\\"cmd\\\":\\\"ls\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    let enforce = make(streaming_config(
+        json!({ "run": { "action": "allow" } }),
+        "deny",
+    ));
+    let enforce_ctx = create_test_context();
+    let mut enforce_inspector = enforce
+        .response_stream_inspector(&enforce_ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (enforce_out, enforce_terminated) =
+        drive_stream(&mut enforce_inspector, &[body.as_bytes()]).await;
+    assert!(enforce_terminated);
+    assert!(!String::from_utf8_lossy(&enforce_out).contains("rm"));
+
+    let mut config = streaming_config(json!({ "run": { "action": "allow" } }), "deny");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must release reassembled ambiguous args");
+    assert_eq!(out, bytes, "dry-run must forward held frames unchanged");
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "rm");
+    assert_no_metadata_contains(&ctx, "ls");
+}
+
+/// Multiple mid-stream ambiguous frames must not grow metadata cardinality.
+#[tokio::test]
+async fn multiple_sse_ambiguous_frames_keep_fixed_observation_cardinality() {
+    let frames = concat!(
+        "data: {\"a\":1,\"a\":2}\n\n",
+        "data: {\"b\":1,\"b\":2}\n\n",
+        "data: {\"c\":1,\"c\":2}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut config = streaming_config(json!({}), "allow");
+    config["mode"] = json!("dry_run");
+    let plugin = Arc::new(make(config));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![plugin.clone()];
+    let mut ctx = create_test_context();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("stream inspector");
+    let bytes = frames.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated);
+    assert_eq!(out, bytes);
+    drop(inspector);
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(out.len() as u64))
+        .await;
+    assert_dry_run_ambiguity_observation(&ctx);
+    let reason = ctx
+        .metadata
+        .get(AMBIGUITY_REASON_KEY)
+        .expect("reason present");
+    assert_eq!(reason, AMBIGUITY_REASON_VALUE);
+    assert!(
+        !reason.contains(','),
+        "repeated ambiguous frames must not grow reason cardinality: {reason}"
+    );
+}
+
+/// Buffered SSE duplicate-member frame: dry-run forwards and records the
+/// fixed observation (parity with the live inspector).
+#[tokio::test]
+async fn buffered_sse_duplicate_member_frame_is_observed_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "get_weather": { "action": "allow" }, "danger": { "action": "deny" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &mut headers,
+                SSE_DUPLICATE_MEMBER_FRAMES.as_bytes(),
+            )
+            .await,
+    );
+    assert_dry_run_ambiguity_observation(&ctx);
+    assert_no_metadata_contains(&ctx, "danger");
 }
