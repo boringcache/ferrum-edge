@@ -23,11 +23,11 @@ The DNS cache stores **one shared answer row per hostname** (addresses, native T
 1. A caller is **fresh** until its own effective TTL elapses from the shared `resolved_at`.
 2. After that, the caller is **stale** until `caller_effective_ttl + FERRUM_DNS_STALE_TTL`; the shared addresses are served and **one** background refresh is scheduled for the hostname.
 3. Past the caller's stale window, that caller performs a synchronous lookup. Longer-TTL peers may still treat the same row as fresh.
-4. Proactive background refresh schedules against the **shortest observed** per-proxy TTL for the hostname (tracked atomically on hits) so short-TTL service-discovery peers stay warm without a DNS-query storm per consumer.
+4. Proactive background refresh schedules against the **shortest effective TTL among policies actually observed** for the hostname (tracked atomically on hits) so short-TTL service-discovery peers stay warm without a DNS-query storm per consumer. Default / global / native policy participates in that minimum only when a caller with no per-proxy override was observed; explicit-only hostnames refresh from the shortest explicit override alone.
 
 **Intentional sharing tradeoff:** a short-TTL peer can trigger an earlier shared refresh than a long-TTL peer alone would need. Addresses stay coherent across consumers; only freshness windows differ. Warmup still coalesces to one lookup per hostname (preferring the shortest advertised per-proxy TTL for initial refresh scheduling) but no longer first-writer-wins for freshness.
 
-**Shared-row age eviction:** the hostname row is retained until the longest plausible consumer window elapses (`max(global/native effective TTL, longest observed per-proxy TTL) + FERRUM_DNS_STALE_TTL`), capped at one day. A short-TTL peer therefore cannot age-evict data a longer-TTL peer still needs, while short global/native policies remain reclaimable by `evict_expired` instead of pinning every success row to the one-day ceiling.
+**Shared-row age eviction:** the hostname row is retained until the longest effective TTL among **policies actually observed** for that hostname elapses, plus `FERRUM_DNS_STALE_TTL`, capped at one day. Explicit-only consumers retain for their longest override even when native TTL is longer; a default (`None`) consumer includes global/native effective policy in that maximum so a shorter explicit peer cannot age-evict data still fresh for the default consumer. Short global/native policies therefore remain reclaimable by `evict_expired` when they were actually observed, instead of pinning every success row to the one-day ceiling.
 
 If a caller past its own stale window attempts a synchronous refresh and DNS fails, Ferrum keeps the shared success row for peers whose longer TTL is still fresh. The expired caller observes a bounded cached refresh error before retrying DNS; the failure never replaces a still-usable hostname-wide answer with an error row.
 
@@ -148,7 +148,7 @@ On successful retry, the entry is promoted from error to a healthy cached entry 
 
 A background task proactively refreshes cache entries before they expire. By default, entries are refreshed when 90% of their TTL has elapsed (configurable via `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT`). This keeps the cache warm and prevents any request from hitting DNS directly.
 
-Since each record has its own native TTL, the background refresh task uses each entry's refresh TTL — `effective_ttl(native_ttl, shortest_observed_per_proxy_ttl)` — for threshold computation, not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
+Since each record has its own native TTL, the background refresh task uses each entry's refresh TTL — the shortest effective TTL among policies actually observed for that hostname (default/global/native only when a `None` consumer was observed) — for threshold computation, not a single global value. The scan runs every 5 seconds to handle short-TTL records promptly.
 
 ## DNS Warmup
 
