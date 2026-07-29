@@ -1290,9 +1290,8 @@ fn test_h3_framed_unary_reject_emits_each_cookie_as_a_separate_header() {
         "a=1; Path=/\nb=2; Path=/".to_string(),
     );
 
-    let emitted =
-        ferrum_edge::_test_support::h3_framed_unary_response_headers_for_test(&headers)
-            .expect("H3 framed unary response headers");
+    let emitted = ferrum_edge::_test_support::h3_framed_unary_response_headers_for_test(&headers)
+        .expect("H3 framed unary response headers");
     let cookies = emitted
         .get_all(http::header::SET_COOKIE)
         .iter()
