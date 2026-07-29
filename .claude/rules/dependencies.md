@@ -6,7 +6,8 @@ Full policy: `docs/dependency-policy.md`. These are the load-bearing rules.
 
 - Ferrum carries vendored upstream crates under `vendor/**`, wired via
   `[patch.crates-io]` in `Cargo.toml`: `reqwest 0.13.3`, `h3 0.0.8` (three
-  patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`.
+  patches), `tungstenite 0.29.0`, `tokio-tungstenite 0.29.0`, and
+  `dimpl 0.6.1`.
 - Each patch has a retirement plan under `docs/upstream-*-patches/` and a row in
   the inventory table in `docs/dependency-policy.md` plus a matching entry in
   `docs/vendored-patch-lifecycle.json`. Keep them, the

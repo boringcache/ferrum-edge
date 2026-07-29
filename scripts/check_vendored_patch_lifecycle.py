@@ -407,6 +407,11 @@ def parity_errors(data: Any) -> list[str]:
     shape_errors = validate_lifecycle_shape(data)
     errors.extend(shape_errors)
 
+    # Synthetic malformed-input self-tests must fail closed before touching live
+    # repository files. Normal parity continues below only for a valid contract.
+    if shape_errors:
+        return errors
+
     if PATCH_STATUS_SCRIPT.is_file():
         errors.extend(
             wrapper_delegation_errors(
@@ -416,17 +421,7 @@ def parity_errors(data: Any) -> list[str]:
     else:
         errors.append("missing scripts/check_vendored_patch_status.sh wrapper")
 
-    # Hostile top-level JSON (list/scalar) must fail closed without AttributeError.
-    if not isinstance(data, dict):
-        return errors
-
-    patches_raw = data.get("patches")
-    usable_patches = isinstance(patches_raw, list) and all(
-        isinstance(patch, dict) for patch in patches_raw
-    )
-    if not usable_patches:
-        return errors
-
+    patches_raw = data["patches"]
     patches: list[dict[str, Any]] = patches_raw
     patch_ids = [
         patch["id"]
@@ -451,11 +446,6 @@ def parity_errors(data: Any) -> list[str]:
                 )
     else:
         errors.append("missing docs/dependency-policy.md")
-
-    # Remaining parity assumes a well-formed contract; stop early on shape failures
-    # so malformed inventories surface as parity errors instead of exceptions.
-    if shape_errors:
-        return errors
 
     for patch in patches:
         pid = patch["id"]
