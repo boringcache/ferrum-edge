@@ -10,6 +10,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "=0.4.9"
 ferrum-edge = { path = "..", features = ["fuzzing"] }
+# The root crate disables librdkafka's OAuthBearer OIDC support, but
+# librdkafka 2.12.1 still includes <curl/curl.h> under an #ifdef for the
+# disabled macro. Activate the real vendored curl headers only in this isolated
+# fuzz dependency graph so the frozen hosted lanes remain hermetic.
+rdkafka = { version = "0.39", features = ["curl-static"] }
 
 [dev-dependencies]
 proptest = "=1.6.0"

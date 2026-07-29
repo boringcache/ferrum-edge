@@ -35,10 +35,10 @@ The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
 `librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
 nevertheless includes `curl/curl.h` because one preprocessor guard tests whether
 the disabled macro is defined instead of whether it is enabled. The isolated
-fuzz workspace exposes an intentionally empty header from
-`fuzz/native_include/curl/curl.h`; all real curl code remains excluded by the
-upstream `#if WITH_OAUTHBEARER_OIDC` guards. This keeps the byte-frozen hosted
-workflows hermetic without installing an unused native dependency.
+fuzz dependency graph therefore activates `rdkafka`'s `curl-static` feature and
+uses its real vendored curl headers. Production builds retain their existing
+feature set, while the byte-frozen hosted workflows stay hermetic without
+installing runner packages or trusting a nested Cargo configuration.
 
 ## Local workflow (optional)
 
