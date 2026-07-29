@@ -813,11 +813,9 @@ async fn run_status_patchers(
     route_conflicts: Option<&[crate::config_sources::k8s::GatewayApiRouteConflict]>,
     gateway_api_status_context: GatewayApiStatusContext,
 ) {
-    let Some(snapshot) = shared_status_objects_snapshot(
-        objects,
-        gateway_writer.is_some(),
-        istio_writer.is_some(),
-    ) else {
+    let Some(snapshot) =
+        shared_status_objects_snapshot(objects, gateway_writer.is_some(), istio_writer.is_some())
+    else {
         return;
     };
 
@@ -1285,10 +1283,7 @@ mod tests {
     #[test]
     fn shared_status_snapshot_is_one_arc_generation_for_both_writers() {
         let mut large_spec = serde_json::Map::new();
-        large_spec.insert(
-            "payload".to_string(),
-            Value::String("x".repeat(64 * 1024)),
-        );
+        large_spec.insert("payload".to_string(), Value::String("x".repeat(64 * 1024)));
         let objects = vec![K8sObject {
             api_version: "gateway.networking.k8s.io/v1".to_string(),
             kind: "HTTPRoute".to_string(),
@@ -1332,8 +1327,8 @@ mod tests {
             status_snapshot_object("HTTPRoute", "keep"),
             status_snapshot_object("VirtualService", "gone"),
         ];
-        let first = shared_status_objects_snapshot(&first_objects, true, true)
-            .expect("initial generation");
+        let first =
+            shared_status_objects_snapshot(&first_objects, true, true).expect("initial generation");
 
         let reloaded_objects = vec![status_snapshot_object("HTTPRoute", "keep")];
         let reloaded = shared_status_objects_snapshot(&reloaded_objects, true, true)
@@ -1344,17 +1339,11 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].metadata.name, "keep");
         assert!(
-            !reloaded
-                .iter()
-                .any(|object| object.metadata.name == "gone"),
+            !reloaded.iter().any(|object| object.metadata.name == "gone"),
             "deleted objects must not appear in the reload generation"
         );
         // Prior generation remains independently readable after reload.
-        assert!(
-            first
-                .iter()
-                .any(|object| object.metadata.name == "gone")
-        );
+        assert!(first.iter().any(|object| object.metadata.name == "gone"));
     }
 
     #[test]
@@ -1364,20 +1353,19 @@ mod tests {
             status_snapshot_object("VirtualService", "vs"),
             status_snapshot_object("ConfigMap", "noise"),
         ];
-        let snapshot = shared_status_objects_snapshot(&objects, true, true)
-            .expect("both writers present");
+        let snapshot =
+            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),
         );
 
-        let gateway_from_slice =
-            plan_gateway_api_status_updates_with_context(
-                &objects,
-                options.clone(),
-                &[],
-                Default::default(),
-            );
+        let gateway_from_slice = plan_gateway_api_status_updates_with_context(
+            &objects,
+            options.clone(),
+            &[],
+            Default::default(),
+        );
         let gateway_from_arc = plan_gateway_api_status_updates_with_context(
             &snapshot,
             options.clone(),
@@ -1403,8 +1391,8 @@ mod tests {
             status_snapshot_object("HTTPRoute", "api"),
             status_snapshot_object("VirtualService", "vs"),
         ];
-        let snapshot = shared_status_objects_snapshot(&objects, true, true)
-            .expect("both writers present");
+        let snapshot =
+            shared_status_objects_snapshot(&objects, true, true).expect("both writers present");
         let options = K8sTranslationOptions::new(
             "default".to_string(),
             TrustDomain::new("cluster.local").expect("test trust domain"),

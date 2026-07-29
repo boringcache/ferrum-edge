@@ -1,7 +1,7 @@
 //! Structural + allocation regression for shared status-writer snapshots (#3281).
 
-use ferrum_edge::config_sources::k8s::{K8sMetadata, K8sObject};
 use ferrum_edge::_test_support::shared_status_objects_snapshot;
+use ferrum_edge::config_sources::k8s::{K8sMetadata, K8sObject};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;

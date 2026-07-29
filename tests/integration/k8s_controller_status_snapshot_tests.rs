@@ -195,10 +195,7 @@ fn mock_kube_client(state: Arc<Mutex<MockKubeState>>) -> Client {
 fn both_writers_plan_from_one_arc_generation_with_parity() {
     let objects = mixed_generation();
     let snapshot = shared_status_objects_snapshot(&objects, true, true).expect("both writers");
-    assert!(Arc::ptr_eq(
-        &snapshot,
-        &Arc::clone(&snapshot)
-    ));
+    assert!(Arc::ptr_eq(&snapshot, &Arc::clone(&snapshot)));
 
     let gateway_slice = plan_gateway_api_status_updates(&objects, options(), &[]);
     let gateway_arc = plan_gateway_api_status_updates(&snapshot, options(), &[]);
@@ -273,10 +270,7 @@ async fn istio_writer_failure_does_not_block_gateway_plan_from_shared_snapshot()
 
     let gateway_state = Arc::new(Mutex::new(MockKubeState::default()));
     let istio_state = Arc::new(Mutex::new(MockKubeState {
-        fail_kinds: vec![
-            "VirtualService".to_string(),
-            "DestinationRule".to_string(),
-        ],
+        fail_kinds: vec!["VirtualService".to_string(), "DestinationRule".to_string()],
         ..MockKubeState::default()
     }));
 
