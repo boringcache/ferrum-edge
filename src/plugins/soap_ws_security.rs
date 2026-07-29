@@ -2984,10 +2984,9 @@ impl SoapWsSecurity {
         let state = replay_state
             .lock()
             .map_err(|_| "soap_ws_security: nonce replay observation unavailable".to_string())?;
-        let recomputed_key_bytes = state
-            .cache
-            .keys()
-            .try_fold(0usize, |total, nonce| total.checked_add(charged_claim_key_bytes(nonce)));
+        let recomputed_key_bytes = state.cache.keys().try_fold(0usize, |total, nonce| {
+            total.checked_add(charged_claim_key_bytes(nonce))
+        });
         let Some(recomputed_key_bytes) = recomputed_key_bytes else {
             return Err(
                 "soap_ws_security: nonce replay observation accounting overflow".to_string(),
