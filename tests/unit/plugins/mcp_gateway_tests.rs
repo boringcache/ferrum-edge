@@ -8190,9 +8190,7 @@ async fn disabled_tool_result_validation_keeps_tools_with_unusable_output_schema
     .await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
     config["validation"]["validate_tool_results"] = json!(false);
-    let plugin = create_plugin("mcp_gateway", &config)
-        .unwrap()
-        .unwrap();
+    let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let tools = aggregate_tool_names(&plugin, &session_id, 185).await;
     assert_eq!(
