@@ -320,30 +320,39 @@ one fail-closed replay-partition contract
   were previously sharing one completion will now miss. Only transport/hop-by-hop
   framing fields Ferrum provably regenerates for the backend hop are excluded;
   `Host`/authority is bound as its own field.
-- **`response_caching` now binds the complete request context too.** The
-  backend-effective query and every non-hop-by-hop request header are mandatory
-  key dimensions. `cache_key_include_query: false` remains accepted only to
-  rotate/partition legacy keyspaces; it no longer allows responses to be shared
-  across origin-visible query values. Header/query priority overrides that run
-  at or after `response_caching` and deferred request-body transformers now fail
+- **`response_caching` now binds the complete request target too.** The
+  backend-effective query is a mandatory key dimension.
+  `cache_key_include_query: false` remains accepted only to rotate/partition
+  legacy keyspaces; it no longer allows responses to be shared across
+  origin-visible query values. Its request-header dimension is unchanged — the
+  complete `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and
+  the mandatory credential/session auto-Vary) — because RFC 9111 §4.1 selection
+  is target + `Vary` and a conditional revalidation, a client `no-cache`
+  refresh, and `Content-Length: 0` are addressed to a stored entry rather than
+  selecting a different one. Header/query priority overrides that run at or
+  after `response_caching` and deferred request-body transformers now fail
   configuration admission.
 - **GET/HEAD cache lookup now requires an observed empty upload.** Ferrum drains
   the complete H1/H2/H3 request body before cache lookup and bypasses when it is
   non-empty or cannot be proven empty. This closes H2/H3 GET-with-DATA replay
   even when no `Content-Length` is present. Expect those requests to reach the
   origin instead of receiving or populating a cached response.
-- **Tracing and correlation request headers are now key dimensions.** An earlier
-  revision excluded `traceparent`, `tracestate`, `b3`, `X-B3-*`, `X-Request-Id`,
-  `X-Correlation-Id` and friends by reusing the *response*-cache sanitation
-  classifier and arguing they are fresh "by construction". That proof does not
-  hold on the request side: `correlation_id` preserves a valid client-supplied
-  ID, the plugin may not be configured at all, and the value reaches the origin
-  either way. They are bound like any other backend-visible header, so a client
-  that varies its trace header per request will now miss per request. Deployments
-  that want cross-trace sharing must strip or normalize those headers before the
-  cache — for example with `correlation_id` or `otel_tracing` in
-  `trace_context_trust: untrusted` mode. Response-header replay sanitation still
-  strips trace identifiers from a retained response; that contract is unchanged.
+- **Tracing and correlation request headers are now `ai_semantic_cache` key
+  dimensions.** An earlier revision excluded `traceparent`, `tracestate`, `b3`,
+  `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and friends from the shared
+  request-header partition by reusing the *response*-cache sanitation classifier
+  and arguing they are fresh "by construction". That proof does not hold on the
+  request side: `correlation_id` preserves a valid client-supplied ID, the plugin
+  may not be configured at all, and the value reaches the origin either way.
+  Wherever that partition is used they are bound like any other backend-visible
+  header, so a client that varies its trace header per request will now miss per
+  request. Deployments that want cross-trace sharing must strip or normalize
+  those headers before the cache — for example with `correlation_id` or
+  `otel_tracing` in `trace_context_trust: untrusted` mode. `response_caching` is
+  unaffected: it keys request headers through `Vary`, so a trace header is a
+  dimension there only when the origin nominates it or an operator lists it in
+  `vary_by_headers`. Response-header replay sanitation still strips trace
+  identifiers from a retained response; that contract is unchanged.
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
   disable caller isolation.** Every key now binds an authorization-context
   fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests

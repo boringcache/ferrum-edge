@@ -5423,11 +5423,15 @@ async fn test_reused_key_different_client_trace_headers_replays() {
 /// This previously replayed: credential headers were excluded from the
 /// fingerprint whenever `scope_by_consumer` had resolved an identity, so two
 /// tokens that render as one `sub` — with different scopes, audiences, or
-/// tenancy claims — produced an identical fingerprint. They are now bound as
-/// digests, so the difference is observable while the raw secret still never
-/// enters a key.
+/// tenancy claims — produced an identical fingerprint. Credential material is
+/// now bound as digests in *both* the mandatory caller partition of the logical
+/// key and the request fingerprint, while the raw secret still never enters a
+/// key. The caller partition is the outer boundary, so the rotated credential
+/// claims its own operation rather than conflicting with the stored one — which
+/// is the stronger outcome: it neither replays nor reports another caller's key
+/// as taken.
 #[tokio::test]
-async fn test_scoped_credential_rotation_is_a_fingerprint_conflict() {
+async fn test_scoped_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5454,7 +5458,10 @@ async fn test_scoped_credential_rotation_is_a_fingerprint_conflict() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
 
     // The unchanged credential context still replays.
     let mut same_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5469,8 +5476,10 @@ async fn test_scoped_credential_rotation_is_a_fingerprint_conflict() {
     ));
 }
 
+/// Same boundary with `scope_by_consumer` disabled: the display identity leaves
+/// the key, but the credential digests in the caller partition remain.
 #[tokio::test]
-async fn test_unscoped_credentials_remain_in_fingerprint() {
+async fn test_unscoped_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({
         "scope_by_consumer": false
     }));
@@ -5495,11 +5504,16 @@ async fn test_unscoped_credentials_remain_in_fingerprint() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
 }
 
+/// Same boundary for a caller Ferrum never authenticated: the presented
+/// credential headers are still the caller's authorization context.
 #[tokio::test]
-async fn test_anonymous_credentials_remain_in_fingerprint() {
+async fn test_anonymous_credential_rotation_cannot_replay() {
     let plugin = make_plugin(json!({}));
 
     let mut first_ctx = body_ctx("POST", "/api/orders", b"{\"order\":1}");
@@ -5522,7 +5536,10 @@ async fn test_anonymous_credentials_remain_in_fingerprint() {
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
-    assert_fingerprint_conflict(result);
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a rotated credential must not replay the stored response"
+    );
 }
 
 #[tokio::test]

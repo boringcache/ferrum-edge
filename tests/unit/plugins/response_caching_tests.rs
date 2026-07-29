@@ -2730,15 +2730,19 @@ async fn test_invalidation_disabled() {
 #[tokio::test]
 async fn test_max_total_size_exceeded() {
     let plugin = plugin_with_config(json!({
-        "max_total_size_bytes": 300,
+        "max_total_size_bytes": 500,
         "max_entry_size_bytes": 1048576
     }));
 
-    // Cache a response that takes up most of the total size
-    // Each entry is ~200 bytes body + ~64 bytes overhead = ~264 bytes
+    // Cache a response that takes up most of the total size. Each entry is
+    // ~200 bytes body + ~64 bytes struct overhead + the retained
+    // invalidation-index scope digest and path, so one fits inside 500 bytes
+    // and two do not.
     cache_response(&plugin, "GET", "/api/a", 200, &HashMap::new(), &[b'x'; 200]).await;
 
-    // This should fail to cache (would exceed 300-byte total size)
+    // This should fail to cache (would exceed the 500-byte total size). The cap
+    // is a hard cap on retained bytes, not an LRU trigger, so the fresh first
+    // entry is never evicted to make room.
     cache_response(&plugin, "GET", "/api/b", 200, &HashMap::new(), &[b'y'; 200]).await;
 
     // First should be cached
@@ -2752,13 +2756,13 @@ async fn test_max_total_size_exceeded() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(assert_size_accounting_exact(&plugin) <= 300);
+    assert!(assert_size_accounting_exact(&plugin) <= 500);
 }
 
 #[tokio::test]
 async fn test_replacement_admission_uses_size_delta() {
     let plugin = plugin_with_config(json!({
-        "max_total_size_bytes": 450,
+        "max_total_size_bytes": 600,
         "max_entry_size_bytes": 1048576
     }));
 
@@ -2771,7 +2775,7 @@ async fn test_replacement_admission_uses_size_delta() {
         &[b'a'; 200],
     )
     .await;
-    assert!(assert_size_accounting_exact(&plugin) <= 450);
+    assert!(assert_size_accounting_exact(&plugin) <= 600);
 
     replace_cached_response(
         &plugin,
@@ -2791,13 +2795,13 @@ async fn test_replacement_admission_uses_size_delta() {
         vec![b'b'; 300],
         "replacement should be admitted when only the positive size delta fits"
     );
-    assert!(assert_size_accounting_exact(&plugin) <= 450);
+    assert!(assert_size_accounting_exact(&plugin) <= 600);
 }
 
 #[tokio::test]
 async fn test_large_to_small_replacement_releases_capacity() {
     let plugin = plugin_with_config(json!({
-        "max_total_size_bytes": 430,
+        "max_total_size_bytes": 550,
         "max_entry_size_bytes": 1048576
     }));
 
@@ -2810,7 +2814,7 @@ async fn test_large_to_small_replacement_releases_capacity() {
         &[b'a'; 300],
     )
     .await;
-    assert!(assert_size_accounting_exact(&plugin) <= 430);
+    assert!(assert_size_accounting_exact(&plugin) <= 550);
 
     replace_cached_response(
         &plugin,
@@ -2830,7 +2834,7 @@ async fn test_large_to_small_replacement_releases_capacity() {
         vec![b'b'; 20],
         "smaller replacement should be admitted even when old+new would exceed the cap"
     );
-    assert!(assert_size_accounting_exact(&plugin) <= 430);
+    assert!(assert_size_accounting_exact(&plugin) <= 550);
 }
 
 #[tokio::test]
@@ -5929,10 +5933,22 @@ async fn replay_partition_isolates_query_and_path_delimiters() {
     );
 }
 
+/// An origin-visible request header the backend never nominates in `Vary` is
+/// keyed through `vary_by_headers`, which is the operator-facing control for
+/// exactly this case.
+///
+/// The raw header view is deliberately not a base-key dimension: RFC 9111 §4.1
+/// selection is target + `Vary`, and keying every header would make the `Vary`
+/// index unreachable and put a conditional revalidation or a client `no-cache`
+/// refresh in a different partition from the entry it names. Cross-caller
+/// isolation is the mandatory caller partition, which is unconditional.
 #[tokio::test]
-async fn replay_partition_binds_unconfigured_backend_visible_headers() {
+async fn replay_partition_binds_vary_by_headers_the_backend_never_nominates() {
     let _policy_guard = response_cache_replay_policy_guard();
-    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "vary_by_headers": ["x-tenant-policy"]
+    }));
 
     let mut tenant_a = make_ctx("GET", "/reports");
     tenant_a
@@ -5946,7 +5962,13 @@ async fn replay_partition_binds_unconfigured_backend_visible_headers() {
         .insert("x-tenant-policy".to_string(), "admin".to_string());
     assert!(
         !lookup_is_hit(&plugin, &mut tenant_b).await,
-        "an origin-visible header must partition replay without relying on Vary"
+        "a configured Vary dimension must partition replay without backend Vary"
+    );
+
+    let mut absent = make_ctx("GET", "/reports");
+    assert!(
+        !lookup_is_hit(&plugin, &mut absent).await,
+        "an absent dimension is distinct from a present one"
     );
 
     let mut same = make_ctx("GET", "/reports");

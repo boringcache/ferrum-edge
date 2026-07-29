@@ -1384,10 +1384,30 @@ impl ResponseCaching {
     ///   rewritten path. `response_caching` runs at
     ///   [`super::priority::RESPONSE_CACHING`], after every route-dispatch
     ///   plugin, so this is the destination that will actually serve a miss;
-    /// * **request context** — original authority, method, path, effective
-    ///   outbound query, and every backend-visible request header. Query and
-    ///   header transforms that ran before this plugin are therefore part of
-    ///   the partition; only hop-by-hop fields Ferrum regenerates are omitted;
+    /// * **request target** — original authority, `Host`, method, path, and the
+    ///   *effective outbound* query, so a `request_transformer` query rewrite
+    ///   that ran before this plugin is part of the partition. The request
+    ///   header dimension is deliberately **not** the raw header view: it is the
+    ///   complete `Vary` tuple appended by [`Self::extend_base_key_with_vary`]
+    ///   (backend-nominated dimensions, `vary_by_headers`, and the mandatory
+    ///   credential/session auto-Vary), plus the caller partition below.
+    ///
+    ///   Binding the whole live header map here instead would be
+    ///   self-defeating rather than stricter. A shared cache selects a stored
+    ///   representation by target + `Vary` (RFC 9111 §4.1), and three of this
+    ///   plugin's own contracts are addressed *to the entry* rather than
+    ///   selecting it: an `If-None-Match` / `If-Modified-Since` revalidation
+    ///   (RFC 9110 §13), a client `Cache-Control: no-cache` refresh whose
+    ///   zero-freshness response must invalidate the entry (RFC 9111 §5.2),
+    ///   and `Content-Length: 0` framing. Each of those requests carries a
+    ///   header the stored request did not, so a raw-header partition would put
+    ///   it in a different partition from the entry it names — and the `Vary`
+    ///   index, variant union, and predictor would become unreachable because
+    ///   no two requests could ever share a base key. Origin-visible headers
+    ///   the backend does not nominate are covered by `vary_by_headers`, and
+    ///   cross-caller isolation by the mandatory caller partition;
+    /// * **complete `Vary` tuple** — appended to this base key by
+    ///   [`Self::extend_base_key_with_vary`];
     /// * **caller authorization context** — see
     ///   [`replay_partition::append_caller_partition`]. Authenticated callers
     ///   bind a fingerprint of the credential material and mechanism, not a
@@ -1423,15 +1443,15 @@ impl ResponseCaching {
 
         // This legacy option no longer permits an origin-visible query to be
         // omitted from a replay key. Keep the setting in the digest so changing
-        // it still rotates the keyspace, then bind the complete effective
-        // request context unconditionally below.
+        // it still rotates the keyspace, then bind the effective request target
+        // unconditionally below.
         hasher.bool_value("include_query", self.config.cache_key_include_query);
         // `cache_key_include_consumer` no longer decides whether callers are
         // isolated — the caller partition below is unconditional. It is kept in
         // the digest so flipping it still produces a disjoint keyspace rather
         // than silently reusing entries minted under the other setting.
         hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
-        replay_partition::append_request_context_partition(&mut hasher, ctx, request_headers);
+        replay_partition::append_request_target_partition(&mut hasher, ctx, request_headers);
         replay_partition::append_caller_partition(
             &mut hasher,
             ctx,
@@ -1873,19 +1893,38 @@ impl ResponseCaching {
         self.compact_eviction_queue_locked(maintenance);
     }
 
-    /// Evict oldest-first until the retained bytes fit `budget`, so a fresh
-    /// eligible representation is not refused because stale ones still hold the
-    /// byte budget. Bounded by the number of entries actually evicted.
-    fn evict_to_byte_budget_locked(&self, maintenance: &mut CacheMaintenance, budget: usize) {
-        while self.total_size.load(Ordering::Relaxed) > budget {
-            let Some((oldest_key, oldest_seq)) = maintenance.eviction_queue.pop_front() else {
+    /// Reclaim *expired* retained bytes oldest-first so a stale working set
+    /// cannot trap the byte budget (#2400).
+    ///
+    /// `max_total_size_bytes` is a hard cap on retained bytes, not an LRU
+    /// trigger: a store that still does not fit once every reclaimable expired
+    /// entry is gone is refused, and a *fresh* representation is never dropped
+    /// to make room for a new one. Insertion order and `stored_at` order
+    /// coincide, so the FIFO front is the oldest candidate; the walk stops at
+    /// the first live entry that is still fresh and is bounded by the slots it
+    /// actually retires rather than by cache size.
+    fn reclaim_expired_for_byte_budget_locked(
+        &self,
+        maintenance: &mut CacheMaintenance,
+        now: Duration,
+    ) {
+        loop {
+            let Some((oldest_key, oldest_seq)) = maintenance.eviction_queue.front().cloned() else {
                 break;
             };
-            let is_current = self
-                .cache
-                .get(&oldest_key)
-                .is_some_and(|entry| entry.insert_seq == oldest_seq);
-            if is_current {
+            // A slot is authoritative only while it still names the live entry;
+            // a replaced entry's superseded slot is retired here for free.
+            let expired = match self.cache.get(&oldest_key) {
+                Some(entry) if entry.insert_seq == oldest_seq => {
+                    if entry.is_fresh_at(now) {
+                        break;
+                    }
+                    true
+                }
+                _ => false,
+            };
+            maintenance.eviction_queue.pop_front();
+            if expired {
                 self.remove_entry_locked(maintenance, &oldest_key);
             }
         }
@@ -2910,33 +2949,50 @@ impl Plugin for ResponseCaching {
                 response_policy_stamp: policy_stamp,
             };
             let entry_size = entry.approx_size();
-            let old_size = self
+            let mut old_size = self
                 .cache
                 .get(&cache_key)
                 .map(|old_entry| old_entry.approx_size())
                 .unwrap_or(0);
-            let current_total = self.total_size.load(Ordering::Relaxed);
-            let next_total = current_total
+            let mut current_total = self.total_size.load(Ordering::Relaxed);
+            let mut next_total = current_total
                 .saturating_sub(old_size)
                 .saturating_add(entry_size);
 
-            if entry_size > self.config.max_total_size_bytes {
-                debug!(
-                    entry_size = entry_size,
-                    max_total = self.config.max_total_size_bytes,
-                    "response_caching: entry alone exceeds the total size limit, skipping cache"
-                );
-                return PluginResult::Continue;
+            if next_total > self.config.max_total_size_bytes
+                && entry_size <= self.config.max_total_size_bytes
+            {
+                // The byte cap is the limiting dimension: reclaim *expired*
+                // entries before refusing an otherwise eligible store. Stale
+                // entries must not trap the byte budget when the entry count
+                // never exceeded `max_entries` — the count-gated sweep in
+                // `evict_if_needed_locked` never runs for them. The reclaim may
+                // also collect the entry being replaced, so recompute both
+                // accounting inputs under the same lock.
+                self.reclaim_expired_for_byte_budget_locked(maintenance, response_time_monotonic);
+                old_size = self
+                    .cache
+                    .get(&cache_key)
+                    .map(|old_entry| old_entry.approx_size())
+                    .unwrap_or(0);
+                current_total = self.total_size.load(Ordering::Relaxed);
+                next_total = current_total
+                    .saturating_sub(old_size)
+                    .saturating_add(entry_size);
             }
 
-            if next_total > self.config.max_total_size_bytes {
-                // The byte cap is the limiting dimension. Evict oldest-first
-                // until this eligible representation fits, rather than
-                // refusing it because older entries still hold the budget.
-                // Bounded by the number of entries actually evicted; the
-                // previous implementation scanned the whole cache for expiry.
-                let headroom = self.config.max_total_size_bytes.saturating_sub(entry_size);
-                self.evict_to_byte_budget_locked(maintenance, headroom);
+            if entry_size > self.config.max_total_size_bytes
+                || next_total > self.config.max_total_size_bytes
+            {
+                debug!(
+                    current_total = current_total,
+                    old_size = old_size,
+                    entry_size = entry_size,
+                    next_total = next_total,
+                    max_total = self.config.max_total_size_bytes,
+                    "response_caching: total cache size would exceed limit, skipping cache"
+                );
+                return PluginResult::Continue;
             }
 
             self.insert_entry_locked(maintenance, &base_key, cache_key.clone(), entry);

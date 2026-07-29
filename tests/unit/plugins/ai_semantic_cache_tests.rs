@@ -2592,7 +2592,11 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
     // (cookies, auth tokens) or per-request rate-limit/trace headers to a
     // different consumer. Without this, a cache hit would leak the original
     // user's session cookie to the next user that asks the same question.
-    let config = json!({"ttl_seconds": 300});
+    // Two anonymous callers from different addresses only share one retained
+    // response under the explicit `shared` attestation; the default
+    // `caller_address` scope would partition them and make the replay this test
+    // is about unreachable.
+    let config = json!({"ttl_seconds": 300, "anonymous_caller_scope": "shared"});
     let plugin = make_plugin(config);
 
     let body_json = json!({
@@ -6737,10 +6741,15 @@ async fn request_body_transform_changes_exact_and_semantic_identity() {
 
     let pre_transform =
         r#"{"model":"gpt-4o","messages":[{"role":"user","content":"the original prompt"}]}"#;
+    // The semantic scope key binds the non-prompt dimensions (model, role
+    // shape, instruction/generation state) while the prompt text itself is the
+    // embedding input, so the transformed bodies differ in `model` too. That is
+    // what makes the scope observably follow the final body rather than the
+    // pre-transform snapshot, which names `gpt-4o` in both cases.
     let transformed_a =
         r#"{"model":"gpt-4o","messages":[{"role":"user","content":"compressed prompt A"}]}"#;
     let transformed_b =
-        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"compressed prompt B"}]}"#;
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"compressed prompt B"}]}"#;
 
     // Same staged pre-transform body in every case; only the final backend
     // body differs.
@@ -6895,7 +6904,7 @@ async fn lookup_precedes_federation_dispatch_and_misses_still_stage_a_store_key(
             &json!({
                 "providers": [{
                     "name": "unreachable",
-                    "provider_type": "openai_compatible",
+                    "provider_type": "openai",
                     "api_key": "sk-test-key",
                     "model_patterns": ["gpt-*"],
                     "base_url": "https://provider.example.invalid/v1/chat/completions"

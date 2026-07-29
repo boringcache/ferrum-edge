@@ -3,7 +3,7 @@
 use ferrum_edge::_test_support::{
     apply_synthetic_response_body_hooks_for_test,
     discard_grpc_application_trailers_after_body_rewrite_for_test,
-    stamp_original_response_metadata_for_test,
+    set_replay_request_body_empty_proven_for_test, stamp_original_response_metadata_for_test,
     transform_buffered_response_body_with_deadline_full_for_test,
 };
 use ferrum_edge::plugins::response_caching::ResponseCaching;
@@ -1921,6 +1921,9 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     let mut store_ctx = make_ctx();
     store_ctx.path = path.to_string();
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    // Stand in for the proxy's transport-owned empty-request-body proof, which
+    // `response_caching` requires before it may look up or store.
+    set_replay_request_body_empty_proven_for_test(&mut store_ctx, true);
     let mut request_headers = HashMap::new();
     assert!(matches!(
         caching
@@ -1946,6 +1949,7 @@ async fn response_caching_does_not_revalidate_stripped_origin_etag() {
     let mut hit_ctx = make_ctx();
     hit_ctx.path = path.to_string();
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    set_replay_request_body_empty_proven_for_test(&mut hit_ctx, true);
     let mut conditional =
         HashMap::from([("if-none-match".to_string(), "\"origin-v1\"".to_string())]);
     match caching.before_proxy(&mut hit_ctx, &mut conditional).await {

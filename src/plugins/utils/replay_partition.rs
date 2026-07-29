@@ -27,12 +27,16 @@
 //!   *anonymous* callers only, with [`AnonymousCallerScope::Shared`].
 //! * **Effective destination** — the post-routing upstream / host / port /
 //!   scheme / authority and rewritten path, not the originally matched proxy.
-//! * **Request context** — the finalized backend-visible header view, the
-//!   original client authority, and the effective outbound query, for plugins
-//!   whose own key does not already bind them
+//! * **Request target** — the original client authority, `Host`, method, path,
+//!   and effective outbound query
+//!   ([`append_request_target_partition`]).
+//! * **Request headers** — the finalized backend-visible header view, for
+//!   plugins whose own key does not already bind an equivalent dimension
 //!   ([`append_request_context_partition`]). Only hop-by-hop/framing fields
 //!   Ferrum provably regenerates are excluded; tracing and correlation headers
-//!   reach the origin and are bound.
+//!   reach the origin and are bound. A shared HTTP cache uses the narrower
+//!   target-only form instead, because its request-header dimension is the
+//!   complete `Vary` tuple (RFC 9111 §4.1).
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -557,6 +561,12 @@ pub fn append_caller_partition(
 pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
     let Some(proxy) = ctx.matched_proxy.as_ref() else {
         hasher.bool_value("dst.matched_proxy", false);
+        // A route-dispatch override is the only destination signal an unmatched
+        // context carries, and it is attacker-reachable through the
+        // header/host selectors those plugins read. Binding it here too keeps
+        // the "different destination, different partition" rule from silently
+        // degrading to "no partition at all" whenever proxy matching is absent.
+        append_route_override_partition(hasher, ctx);
         return;
     };
     hasher.bool_value("dst.matched_proxy", true);
@@ -585,38 +595,57 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
         }
     }
 
+    append_route_override_partition(hasher, ctx);
+}
+
+/// Append the route-dispatch override dimension.
+///
+/// Shared by both arms of [`append_destination_partition`] so an override is
+/// never bound on one path and dropped on the other. The backend host/port/
+/// scheme/upstream overrides are framed here as well as through
+/// `effective_*`, because the matched-proxy arm resolves them against the proxy
+/// while the unmatched arm has nothing to resolve against.
+fn append_route_override_partition(hasher: &mut PartitionHasher, ctx: &RequestContext) {
     hasher.optional_text("dst.authority", ctx.route_override_authority.as_deref());
     hasher.optional_text("dst.rewrite_path", ctx.route_override_path.as_deref());
     hasher.bool_value(
         "dst.rewrite_path_is_absolute",
         ctx.route_override_path_is_absolute,
     );
+    hasher.optional_text(
+        "dst.override_upstream_id",
+        ctx.route_override_upstream_id.as_deref(),
+    );
+    hasher.optional_text(
+        "dst.override_backend_host",
+        ctx.route_override_backend_host.as_deref(),
+    );
+    hasher.bool_value(
+        "dst.override_backend_port_set",
+        ctx.route_override_backend_port.is_some(),
+    );
+    hasher.u64_value(
+        "dst.override_backend_port",
+        u64::from(ctx.route_override_backend_port.unwrap_or(0)),
+    );
+    let override_scheme = ctx
+        .route_override_backend_scheme
+        .map(|scheme| scheme.to_scheme_str());
+    hasher.optional_text("dst.override_backend_scheme", override_scheme);
 }
 
-/// Append the backend-visible request-context dimension: original client
-/// authority, method, effective outbound query, and the live header view.
+/// Append the backend-visible request *target* dimension: original client
+/// authority, `Host`, method, path, and the effective outbound query.
 ///
-/// This exists for plugins whose own key is derived from a request *body* and
-/// therefore does not already bind the request line and headers the way
-/// `response_caching` does. Without it, two requests differing only in a tenancy
-/// header or a query parameter share one retained representation even though the
-/// origin sees both differences.
-///
-/// Framing rules:
-///
-/// * headers are sorted by name so map iteration order cannot change the digest,
-///   and the pair count is bound ahead of the pairs;
-/// * a header classified by [`is_request_credential_context_header`] contributes a
-///   SHA-256 digest of its value, never the value — no secret enters the digest
-///   preimage in cleartext, a key, metadata, a log line, or a diagnostic;
-/// * only [`is_non_backend_visible_request_header`] names are excluded — the
-///   hop-by-hop/framing fields Ferrum provably regenerates for the backend hop,
-///   with `host`/authority bound as their own fields above. Tracing and
-///   correlation headers are *not* excluded; they reach the origin.
+/// This is the half of [`append_request_context_partition`] that every replay
+/// plugin needs. It is also the whole request-side target contract for a shared
+/// HTTP cache, whose request-header dimension is the complete `Vary` tuple
+/// rather than the raw header view — see
+/// [`crate::plugins::response_caching`].
 ///
 /// `request_headers` must be the finalized backend-visible header view — the
 /// map the proxy will send — not `ctx.headers`.
-pub fn append_request_context_partition(
+pub fn append_request_target_partition(
     hasher: &mut PartitionHasher,
     ctx: &RequestContext,
     request_headers: &HashMap<String, String>,
@@ -646,6 +675,37 @@ pub fn append_request_context_partition(
         "req.query",
         transformed_query.or_else(|| ctx.raw_query_string()),
     );
+}
+
+/// Append the backend-visible request-context dimension: the request target
+/// ([`append_request_target_partition`]) plus the live header view.
+///
+/// This exists for plugins whose own key is derived from a request *body* and
+/// therefore does not already bind the request line and headers the way
+/// `response_caching` does. Without it, two requests differing only in a tenancy
+/// header or a query parameter share one retained representation even though the
+/// origin sees both differences.
+///
+/// Framing rules:
+///
+/// * headers are sorted by name so map iteration order cannot change the digest,
+///   and the pair count is bound ahead of the pairs;
+/// * a header classified by [`is_request_credential_context_header`] contributes a
+///   SHA-256 digest of its value, never the value — no secret enters the digest
+///   preimage in cleartext, a key, metadata, a log line, or a diagnostic;
+/// * only [`is_non_backend_visible_request_header`] names are excluded — the
+///   hop-by-hop/framing fields Ferrum provably regenerates for the backend hop,
+///   with `host`/authority bound as their own fields above. Tracing and
+///   correlation headers are *not* excluded; they reach the origin.
+///
+/// `request_headers` must be the finalized backend-visible header view — the
+/// map the proxy will send — not `ctx.headers`.
+pub fn append_request_context_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+) {
+    append_request_target_partition(hasher, ctx, request_headers);
 
     let mut names: Vec<&str> = request_headers
         .keys()

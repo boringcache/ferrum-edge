@@ -65,6 +65,13 @@ fn make_plugin(config: serde_json::Value) -> CompressionPlugin {
     CompressionPlugin::new(&config).unwrap()
 }
 
+/// Stand in for the proxy's transport-owned empty-request-body proof, which
+/// `response_caching` requires before it may look up or store. These chains are
+/// driven directly rather than through a proxy body-drain path.
+fn prove_empty_request_body(ctx: &mut RequestContext) {
+    ferrum_edge::_test_support::set_replay_request_body_empty_proven_for_test(ctx, true);
+}
+
 fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {
     let mut ctx = RequestContext::new(
         "127.0.0.1".to_string(),
@@ -1020,6 +1027,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         "/cache-vary-order".to_string(),
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut store_ctx);
     let mut store_req = HashMap::new();
     assert!(matches!(
         cache.before_proxy(&mut store_ctx, &mut store_req).await,
@@ -1065,6 +1073,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         "/cache-vary-order".to_string(),
     );
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut hit_ctx);
     let mut hit_headers = HashMap::new();
     let (status, body, headers) = match cache.before_proxy(&mut hit_ctx, &mut hit_headers).await {
         PluginResult::Reject {
@@ -1100,6 +1109,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        prove_empty_request_body(&mut miss_ctx);
         miss_ctx
             .headers
             .insert("accept-encoding".to_string(), accept_encoding.to_string());
@@ -1120,6 +1130,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     );
     gzip_store_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     gzip_store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut gzip_store_ctx);
     gzip_store_ctx
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
@@ -1171,6 +1182,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         "/cache-vary-order".to_string(),
     );
     gzip_hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut gzip_hit_ctx);
     gzip_hit_ctx
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
@@ -1209,6 +1221,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             "/cache-vary-order".to_string(),
         );
         miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        prove_empty_request_body(&mut miss_ctx);
         if let Some(ae) = accept_encoding {
             miss_ctx
                 .headers
@@ -1254,6 +1267,7 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
         "/cache-406".to_string(),
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut store_ctx);
     let mut store_headers = HashMap::new();
     assert!(matches!(
         plugins[0]
@@ -1287,6 +1301,7 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
         "/cache-406".to_string(),
     );
     hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut hit_ctx);
     hit_ctx
         .headers
         .insert("accept-encoding".to_string(), "*;q=0".to_string());
@@ -1351,6 +1366,7 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
         "/cache-identity-ok".to_string(),
     );
     store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    prove_empty_request_body(&mut store_ctx);
     let mut store_headers = HashMap::new();
     assert!(matches!(
         plugins[0]
@@ -1380,6 +1396,7 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             "/cache-identity-ok".to_string(),
         );
         hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        prove_empty_request_body(&mut hit_ctx);
         if let Some(ae) = accept_encoding {
             hit_ctx
                 .headers

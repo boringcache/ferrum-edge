@@ -20,6 +20,10 @@ fn create_response_context(path: &str) -> RequestContext {
     let mut ctx = create_test_context();
     ctx.path = path.to_string();
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    // Stand in for the proxy's transport-owned empty-request-body proof, which
+    // `response_caching` requires before it may look up or store. These hook
+    // chains are driven directly rather than through a proxy body-drain path.
+    ferrum_edge::_test_support::set_replay_request_body_empty_proven_for_test(&mut ctx, true);
     ctx
 }
 

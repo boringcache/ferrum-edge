@@ -60,10 +60,17 @@ paths:
   exactly the body produced by the pre-`before_proxy` normalization phase.
 - `response_caching` likewise requires the proxy's private proof that the
   complete GET/HEAD upload is empty before lookup, binds the complete
-  backend-visible headers/query, rejects later header/query mutation, and
-  rejects deferred body transforms that could synthesize bytes after lookup.
-  Configured request decompression remains compatible because its exact final
-  body is published during pre-`before_proxy` normalization.
+  backend-visible request target (including the effective outbound query),
+  rejects later header/query mutation, and rejects deferred body transforms that
+  could synthesize bytes after lookup. Configured request decompression remains
+  compatible because its exact final body is published during pre-`before_proxy`
+  normalization. Its request-header dimension is the complete `Vary` tuple, not
+  the raw header view: RFC 9111 §4.1 selection is target + `Vary`, and a
+  conditional revalidation, a client `no-cache` refresh, and `Content-Length: 0`
+  are addressed to an entry rather than selecting a different one — keying the
+  raw view would put each of them in a partition the entry cannot be reached
+  from and make the `Vary` index unreachable. Cross-caller isolation is the
+  mandatory caller partition.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

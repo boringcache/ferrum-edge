@@ -53,9 +53,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cross-namespace and header/query-only tenant collisions are closed for both
     exact and semantic lookup scopes.
     `response_caching` now binds the same complete backend-visible request
-    context unconditionally: effective outbound query and every non-hop-by-hop
-    request header are key dimensions even when `cache_key_include_query` is
-    `false`. That option is retained only as a legacy keyspace toggle.
+    *target* unconditionally: the effective outbound query is a key dimension
+    even when `cache_key_include_query` is `false`, which is retained only as a
+    legacy keyspace toggle. Its request-header dimension stays the complete
+    `Vary` tuple (backend-nominated dimensions, `vary_by_headers`, and the
+    mandatory credential/session auto-Vary) rather than the raw header view,
+    because RFC 9111 §4.1 selection is target + `Vary` and a conditional
+    revalidation, a client `no-cache` refresh, and `Content-Length: 0` are
+    addressed to a stored entry rather than selecting a different one.
   - **`ai_semantic_cache` lookup moved to the final-request-body stage**
     (priority `2996` → `4057`). It previously looked up in `before_proxy`,
     ahead of `request_transformer` (3000) and every `transform_request_body`
