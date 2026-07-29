@@ -1685,8 +1685,7 @@ fn contains_known_credential_compound(segment: &str) -> bool {
         segment.match_indices(*compound).any(|(offset, _)| {
             // `clientidentity` is a common non-credential dimension. Do not
             // reinterpret its leading bytes as the `clientid` compound.
-            *compound != "clientid"
-                || !segment[offset + compound.len()..].starts_with("entity")
+            *compound != "clientid" || !segment[offset + compound.len()..].starts_with("entity")
         })
     })
 }
