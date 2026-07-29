@@ -10200,6 +10200,153 @@ fn priority_override_preserves_dynamic_replay_provenance() {
 }
 
 #[test]
+fn ai_response_guard_descriptor_preload_scopes_and_lifecycle() {
+    use ferrum_edge::_test_support::ai_response_guard_descriptor_preload_required_for_test;
+
+    let descriptor = format!(
+        "{}/tests/fixtures/test_validator.bin",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let guard_config = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": descriptor,
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        }
+    });
+
+    let ns = ferrum_edge::config::types::default_namespace();
+    let p1 = NamespacedResourceId::new(&ns, "p1");
+    let p2 = NamespacedResourceId::new(&ns, "p2");
+
+    // Global scope: only when globals rebuild.
+    let global = make_config(
+        vec![make_proxy("p1", "/api", vec![])],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            guard_config.clone(),
+            PluginScope::Global,
+            None,
+        )],
+    );
+    let cache = PluginCache::new(&global).expect("global guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &global,
+        &HashSet::new(),
+        true
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &global,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+
+    // Proxy scope: only when that proxy rebuilds and is attached.
+    let proxy_scoped = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["g1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            guard_config.clone(),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&proxy_scoped).expect("proxy guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &proxy_scoped,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &proxy_scoped,
+        &HashSet::from([p2.clone()]),
+        false
+    ));
+
+    // Proxy-group scope: active when any attached proxy in the group rebuilds.
+    let mut group_plugin = make_plugin_config_with_json(
+        "g1",
+        "ai_response_guard",
+        guard_config.clone(),
+        PluginScope::ProxyGroup,
+        None,
+    );
+    let group = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["g1"]),
+            make_proxy("p2", "/other", vec![]),
+        ],
+        vec![group_plugin.clone()],
+    );
+    let cache = PluginCache::new(&group).expect("group guard cache");
+    assert!(ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &group,
+        &HashSet::from([p1.clone()]),
+        false
+    ));
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &group,
+        &HashSet::from([p2.clone()]),
+        false
+    ));
+
+    // Disabled / inactive configs do not require preload.
+    group_plugin.enabled = false;
+    let disabled = make_config(
+        vec![make_proxy("p1", "/api", vec!["g1"])],
+        vec![group_plugin],
+    );
+    let cache = PluginCache::new(&disabled).expect("disabled guard is ignored");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &disabled,
+        &HashSet::from([p1.clone()]),
+        true
+    ));
+
+    let no_grpc = make_config(
+        vec![make_proxy("p1", "/api", vec!["g1"])],
+        vec![make_plugin_config_with_json(
+            "g1",
+            "ai_response_guard",
+            json!({"pii_patterns": ["email"]}),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&no_grpc).expect("http-only guard");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &no_grpc,
+        &HashSet::from([p1.clone()]),
+        true
+    ));
+
+    // Deletion / empty rebuild scope: no preload.
+    let empty = make_config(vec![make_proxy("p1", "/api", vec![])], vec![]);
+    let cache = PluginCache::new(&empty).expect("empty cache");
+    assert!(!ai_response_guard_descriptor_preload_required_for_test(
+        &cache,
+        &empty,
+        &HashSet::from([p1]),
+        true
+    ));
+}
+
+#[test]
 fn test_transaction_debugger_body_capture_reload_flips_buffering_requirements() {
     // Issue #3316: bounded body capture is an opt-in that must take effect on
     // reload — including when it is turned back off — and must never claim
