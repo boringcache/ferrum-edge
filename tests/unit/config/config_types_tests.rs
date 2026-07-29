@@ -5469,6 +5469,35 @@ fn mesh_tracing_config_deserializes_legacy_singular_provider_alias() {
 }
 
 #[test]
+fn mesh_tracing_config_round_trips_custom_env_tags() {
+    let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
+        "custom_tags": {
+            "cluster": "fallback"
+        },
+        "custom_env_tags": {
+            "cluster": "ISTIO_META_CLUSTER_ID"
+        },
+        "disableSpanReporting": false
+    }))
+    .expect("custom_env_tags deserialize");
+
+    assert_eq!(
+        config.custom_env_tags.get("cluster").map(String::as_str),
+        Some("ISTIO_META_CLUSTER_ID")
+    );
+    assert_eq!(
+        config.custom_tags.get("cluster").map(String::as_str),
+        Some("fallback")
+    );
+
+    let encoded = serde_json::to_value(&config).expect("serialize");
+    assert_eq!(
+        encoded["custom_env_tags"]["cluster"].as_str(),
+        Some("ISTIO_META_CLUSTER_ID")
+    );
+}
+
+#[test]
 fn mesh_tracing_config_deserializes_provider_array() {
     let config: MeshTracingConfig = serde_json::from_value(serde_json::json!({
         "providers": [

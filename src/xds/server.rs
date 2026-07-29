@@ -26,6 +26,7 @@ use crate::config::incremental_apply::apply_incremental_to_config_snapshot;
 use crate::config::types::GatewayConfig;
 use crate::grpc::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
 use crate::grpc::cp_server::{CpGrpcServer, CpScope, NamespaceBroadcasts};
+use crate::grpc::cp_trust::{CpDpVerifier, CpGrpcConnectInfo};
 use crate::grpc::proto::ConfigUpdate;
 use crate::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 use crate::xds::carrier::XdsNodeScoping;
@@ -77,7 +78,10 @@ pub struct XdsAdsServer {
     config: Arc<ArcSwap<GatewayConfig>>,
     update_tx: broadcast::Sender<ConfigUpdate>,
     namespace_broadcasts: Option<Arc<NamespaceBroadcasts>>,
-    jwt_secret: String,
+    /// Shared with the ConfigSync and mesh servers so ADS enforces the same
+    /// namespace-bound verification credentials, not a second authorization
+    /// source (advisory GHSA-3f2j-wwqw-grmg).
+    verifier: Arc<CpDpVerifier>,
     expected_issuer: String,
     namespace: String,
     scope: CpScope,
@@ -273,7 +277,7 @@ impl XdsAdsServer {
             config,
             update_tx,
             namespace_broadcasts: None,
-            jwt_secret,
+            verifier: Arc::new(CpDpVerifier::SharedSecret(jwt_secret)),
             expected_issuer,
             namespace: namespace.clone(),
             scope: CpScope::Single(namespace),
@@ -300,6 +304,13 @@ impl XdsAdsServer {
 
     pub fn with_scope(mut self, scope: CpScope) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// Replace the seeded shared-secret verifier with the CP's configured
+    /// namespace-bound trust bundle.
+    pub fn with_verifier(mut self, verifier: Arc<CpDpVerifier>) -> Self {
+        self.verifier = verifier;
         self
     }
 
@@ -347,8 +358,14 @@ impl XdsAdsServer {
     fn verify_jwt_metadata(
         &self,
         metadata: &tonic::metadata::MetadataMap,
+        extensions: &tonic::Extensions,
     ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
+        verify_grpc_jwt_metadata_with_claims(
+            metadata,
+            &self.verifier,
+            &self.expected_issuer,
+            extensions.get::<CpGrpcConnectInfo>(),
+        )
     }
 
     #[allow(clippy::result_large_err)]
@@ -1596,7 +1613,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DiscoveryRequest>>,
     ) -> Result<Response<Self::StreamAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(allowed) => allowed,
             Err(status) => {
                 warn!(
@@ -1644,7 +1661,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
@@ -1882,7 +1899,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
         &self,
         request: Request<tonic::Streaming<DeltaDiscoveryRequest>>,
     ) -> Result<Response<Self::DeltaAggregatedResourcesStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+        let allowed = match self.verify_jwt_metadata(request.metadata(), request.extensions()) {
             Ok(allowed) => allowed,
             Err(status) => {
                 warn!(
@@ -1930,7 +1947,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
 
         let mut requests = request.into_inner();
         let mut server = self.clone();
-        server.ambient_udp_source_bearer_namespaces = allowed.0.clone();
+        server.ambient_udp_source_bearer_namespaces = allowed.effective_namespaces().cloned();
         let mut updates = server.updates_for_namespace(&stream_namespace);
         let (tx, rx) = mpsc::channel(server.stream_channel_capacity);
 
