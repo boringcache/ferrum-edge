@@ -1058,7 +1058,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
 | `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
 | `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses |
-| `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
+| `ai_response_guard` | ✓ | ✓ | | | | HTTP JSON/SSE/text response inspection; native gRPC only for methods enrolled in the descriptor-based `grpc` block |
 | `security_headers` | ✓ | ✓ | ✓ | | | HTTP-family response security headers and fingerprint stripping |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | | | | | HTTP JSON/SSE token accounting only; native gRPC protobuf frames have no supported usage schema, so gRPC attachment would never charge |
