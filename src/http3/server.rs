@@ -47,8 +47,11 @@ use crate::proxy::grpc_proxy::{
 };
 use crate::proxy::headers::{
     ClientResponseFraming, RejectBodyDisposition, apply_response_headers,
+    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
+    ResponseTrailerPolicyWitness, TrailerSectionKind,
     content_length_header_value, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
     parse_connection_listed_from_str_map, remove_content_length_header,
+    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
     sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
@@ -483,6 +486,34 @@ fn build_h3_quinn_server_config(
     Ok(server_config)
 }
 
+/// Everything the trailer-finish phase needs to re-apply the response-header
+/// policy boundary to a STREAMING relay's trailer section.
+///
+/// A streaming relay sends its initial HEADERS frame before the backend's
+/// trailers exist, so `after_proxy`, sticky-cookie injection, and the final
+/// hop-by-hop strip have all already run and gone on the wire by the time the
+/// trailers are read. Without this, a backend trailer repeating a governed
+/// field name lands AFTER the policy boundary and undoes it — the same gap the
+/// buffered native-H3 send path closes inline. See `docs/http3.md`
+/// ("Backend trailers and response header policy").
+struct H3StreamingTrailerPolicy<'a> {
+    /// The response headers exactly as they went on the wire, after every
+    /// response-header phase for this path.
+    ///
+    /// This map is the WIRE header set, not a subset of it: each relay writes
+    /// its synthesized default `content-type` into the map before building the
+    /// response, so reconciliation can never report absent->absent for a field
+    /// the gateway actually sent.
+    final_headers: &'a std::collections::HashMap<String, String>,
+    /// Evidence captured before the first response-header phase ran.
+    pre_policy: &'a PrePolicyResponseHeaders,
+    /// Config-time declarations plus the fail-closed unbounded arm.
+    governance: ResponseTrailerGovernance<'a>,
+    /// Plain response trailers, or a native gRPC terminal section. Selected by
+    /// the relay from the dispatch it committed to, never from a trailer name.
+    section: TrailerSectionKind,
+}
+
 /// Failure side for [`finish_h3_response_with_backend_trailers`].
 ///
 /// The trailer-finish phase touches both ends of the relay: reading
@@ -508,6 +539,7 @@ async fn finish_h3_response_with_backend_trailers<S>(
     h3_stream: &mut RequestStream<S, Bytes>,
     recv_stream: &mut crate::http3::client::H3RequestStream,
     backend_read_timeout_ms: u64,
+    trailer_policy: H3StreamingTrailerPolicy<'_>,
 ) -> Result<(), H3TrailerFinishError>
 where
     S: SendStream<Bytes>,
@@ -543,6 +575,27 @@ where
     match trailers {
         Some(mut trailers) => {
             strip_response_hop_by_hop_trailers(&mut trailers);
+            // Last point on a streaming relay where the response-header policy
+            // boundary can still bind the trailer section: the initial HEADERS
+            // frame, sticky-cookie injection, and the final hop-by-hop strip all
+            // happened before the first body frame. Runs once per response, on
+            // the trailer frame only — never per body frame — and an
+            // auth/logging-only chain contributes no governance, so its trailers
+            // pass through untouched (issue #2941).
+            let removed = reconcile_streaming_backend_trailers(
+                &mut trailers,
+                trailer_policy.final_headers,
+                trailer_policy.pre_policy,
+                trailer_policy.governance,
+                GatewayOwnedResponseHeaders::default(),
+                trailer_policy.section,
+            );
+            if removed > 0 {
+                debug!(
+                    removed,
+                    "streaming H3: dropped backend trailer fields governed by response header policy"
+                );
+            }
             if !trailers.is_empty() {
                 h3_stream
                     .send_trailers(trailers)
@@ -2082,6 +2135,17 @@ async fn handle_h3_request(
     let stream_hooks_enabled = plugin_cache_view.requires_response_stream_hooks();
     let maybe_requires_response_body_buffering =
         plugin_cache_view.requires_response_body_buffering();
+    // Config-time response-trailer governance, read once and threaded into
+    // every plain native/refined H3 STREAMING relay below. Those relays send
+    // initial HEADERS before the backend's trailers exist, so the trailer frame
+    // is a second crossing of the same response-header policy boundary the
+    // buffered send path reconciles inline.
+    let response_trailer_governance = ResponseTrailerGovernance {
+        policy_names: plugin_cache_view.response_trailer_policy_names(),
+        policy_prefixes: plugin_cache_view.response_trailer_policy_prefixes(),
+        unbounded: capabilities
+            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY),
+    };
 
     let mut plugin_execution_ns: u64 = 0;
 
@@ -4555,6 +4619,7 @@ async fn handle_h3_request(
             backend_admission_plugins.as_ref(),
             &mut plugin_execution_ns,
             initial_response_header_policy_plugins.as_ref(),
+            response_trailer_governance,
         )
         .await;
     }
@@ -4592,6 +4657,7 @@ async fn handle_h3_request(
                 initial_response_header_policy_plugins.as_ref(),
                 backend_admission_plugins.as_ref(),
                 sticky_cookie_needed,
+                response_trailer_governance,
             )
             .await?
         } else {
@@ -4788,6 +4854,7 @@ async fn handle_h3_request(
                 response_committed_plugins: plugin_cache_view.response_committed_plugins(),
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
+                response_trailer_governance,
             })
             .await?
         };
@@ -5238,6 +5305,27 @@ async fn handle_h3_request(
             return Ok(());
         }
 
+        // Retain the backend's pre-policy response headers before the first
+        // response-header phase can rewrite them, so the trailer frame at the
+        // end of this relay can still tell a policy mutation from an untouched
+        // backend field. One clone per streaming RESPONSE, skipped entirely
+        // when no response-header phase can run or when the chain already fails
+        // closed; never touched per body frame.
+        //
+        // The default `content-type` this relay synthesizes below is a
+        // gateway-authored wire mutation just like a plugin write, so it counts
+        // as a header phase for the capture decision. Without it an
+        // auth/logging-only chain would keep the no-clone #2941 pass-through
+        // AND forward a backend `content-type` TRAILER that contradicts the
+        // media type the gateway itself put on the wire. Costs one map lookup
+        // and retains evidence only when the backend actually omitted the field.
+        let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
+        let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+            &response_headers,
+            response_trailer_governance,
+            !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+        );
+
         // after_proxy hooks run before streaming begins so headers can be
         // modified or the response rejected before any downstream bytes are
         // committed. A reject here (e.g. a WAF response-header-inspection
@@ -5398,13 +5486,23 @@ async fn handle_h3_request(
             },
         );
 
-        // Send response headers on the H3 stream
+        // Send response headers on the H3 stream.
+        //
+        // The default `content-type` is a real gateway mutation of the response
+        // header set, so it is written into `response_headers` BEFORE the
+        // builder rather than onto the builder alone. That keeps the map the
+        // trailer boundary later treats as "the final headers" identical to the
+        // field set the client actually received; otherwise a backend
+        // `content-type` TRAILER would reconcile absent->absent and land on the
+        // wire contradicting a header the gateway itself synthesized. The
+        // lookup stays case-sensitive on the already-lowercased H3 header map,
+        // exactly as the previous builder-side check was.
+        response_headers
+            .entry("content-type".to_string())
+            .or_insert_with(|| "application/json".to_string());
         let status_code = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut resp_builder =
+        let resp_builder =
             apply_response_headers(Response::builder().status(status_code), &response_headers);
-        if !response_headers.contains_key("content-type") {
-            resp_builder = resp_builder.header("content-type", "application/json");
-        }
         let resp = resp_builder
             .body(())
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
@@ -5693,6 +5791,14 @@ async fn handle_h3_request(
                         &mut stream,
                         &mut h3_resp.recv_stream,
                         backend_read_timeout_ms,
+                        H3StreamingTrailerPolicy {
+                            final_headers: &response_headers,
+                            pre_policy: &pre_policy_response_headers,
+                            governance: response_trailer_governance,
+                            // Plain-flavor relay: `use_native_h3_pool` requires
+                            // `HttpFlavor::Plain`, so no field name is exempt here.
+                            section: TrailerSectionKind::PlainResponse,
+                        },
                     )
                     .await
                 };
@@ -6220,6 +6326,7 @@ async fn handle_h3_request(
             } else {
                 None
             },
+            response_trailer_governance,
         )
         .await?
         {
@@ -6265,6 +6372,7 @@ async fn handle_h3_request(
                 &mut ctx,
                 &mut plugin_execution_ns,
                 backend_admission_start,
+                response_trailer_governance,
             )
             .await;
 
@@ -6855,6 +6963,18 @@ async fn handle_h3_request(
         // rewrite a representation it must preserve.
         stamp_h3_original_response_metadata(&mut ctx, response_status, &response_headers);
 
+        // Witness the backend's pre-policy value for exactly the field names it
+        // also sent as trailers, before the first response-header phase can
+        // rewrite them. Allocated only when the backend actually sent trailers,
+        // and sized by the trailer count — never by the header count. A response
+        // with no trailers gets the unproven witness and never reaches the
+        // reconciliation below; that value proves nothing, so any future caller
+        // that does reach it fails closed.
+        let trailer_policy_witness = match response_trailers.as_ref() {
+            Some(trailers) => ResponseTrailerPolicyWitness::capture(trailers, &response_headers),
+            None => ResponseTrailerPolicyWitness::Unproven,
+        };
+
         // after_proxy hooks
         let mut after_proxy_rejected = false;
         {
@@ -6905,7 +7025,9 @@ async fn handle_h3_request(
         // two-tier response-body-buffering predicate that chose this path — NOT
         // chain-emptiness: an auth/logging-only proxy never reads the body and
         // keeps the backend's trailers (issue #2941). Body-mutating phases
-        // below additionally clear the trailers when they replace the bytes.
+        // below additionally clear the trailers when they replace the bytes,
+        // and surviving trailers are still reconciled field-by-field against
+        // the response-header policy before they reach the wire.
         if crate::proxy::response_body_plugins_process_body(&plugins, &ctx) {
             response_trailers = None;
         }
@@ -7121,6 +7243,44 @@ async fn handle_h3_request(
         );
         sanitize_client_response_headers_for_wire(&mut response_headers, framing);
 
+        // Reconcile surviving backend trailers with the response-header policy
+        // this path already applied. Every response-header phase — `after_proxy`,
+        // sticky-cookie injection, committed hooks — sees only the INITIAL header
+        // map, so a backend trailer repeating a governed field name would land on
+        // the wire after the policy boundary and undo it. Runs once, after the
+        // last header phase, against the precomputed per-proxy policy-name union;
+        // an auth/logging-only chain contributes no names and mutates no headers,
+        // so its trailers pass through untouched.
+        let unbounded_trailer_policy = capabilities
+            .has(crate::plugin_cache::PluginCapabilities::UNBOUNDED_RESPONSE_TRAILER_POLICY);
+        if let Some(trailers) = response_trailers.as_mut() {
+            // Strip hop-by-hop trailer names BEFORE reconciling, matching the
+            // streaming helper's order (`finish_h3_response_with_backend_trailers`).
+            // A hop-by-hop field is dropped either way, so the wire outcome is
+            // identical, but reconciling first would count it as a
+            // policy-governed removal and inflate the telemetry below.
+            strip_response_hop_by_hop_trailers(trailers);
+            let removed = reconcile_backend_trailers_with_response_policy(
+                trailers,
+                &response_headers,
+                &trailer_policy_witness,
+                plugin_cache_view.response_trailer_policy_names(),
+                plugin_cache_view.response_trailer_policy_prefixes(),
+                GatewayOwnedResponseHeaders::default(),
+                // Buffered native-H3 send path: plain flavor only (a native gRPC
+                // dispatch goes to `dispatch_grpc_native_h3`), so no exemption.
+                TrailerSectionKind::PlainResponse,
+                unbounded_trailer_policy,
+            );
+            if removed > 0 {
+                debug!(
+                    proxy_id = %proxy.id,
+                    removed,
+                    "buffered H3: dropped backend trailer fields governed by response header policy"
+                );
+            }
+        }
+
         // Build and send buffered response
         let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
         let resp_builder =
@@ -7183,20 +7343,21 @@ async fn handle_h3_request(
         }
 
         // Backend trailers survive to here only when no response-body plugin
-        // phase processed this response (gate above) and no mutation / reject /
-        // normalize arm replaced the bytes. Auth/logging-only plugins must not
-        // wipe trailers merely because the plugin chain is nonempty (#2941).
+        // phase processed this response (gate above), no mutation / reject /
+        // normalize arm replaced the bytes, and the response-policy
+        // reconciliation above kept the remaining fields.
+        // Auth/logging-only plugins must not wipe trailers merely because the
+        // plugin chain is nonempty (#2941).
 
-        // Forward backend response trailers, if any (issue #1630). Strip
-        // response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) with
-        // the same helper the streaming path's
-        // `finish_h3_response_with_backend_trailers` uses, then send them
-        // before FIN. An empty map after stripping is skipped — emit a bare
-        // `finish()` exactly as before.
+        // Forward backend response trailers, if any (issue #1630).
+        // Response-direction hop-by-hop trailer names (RFC 9110 §7.6.1) were
+        // already stripped above, with the same helper the streaming path's
+        // `finish_h3_response_with_backend_trailers` uses, immediately before
+        // the policy reconciliation. Send what survived before FIN. An empty
+        // map is skipped — emit a bare `finish()` exactly as before.
         if body_completed {
             match response_trailers {
-                Some(mut trailers) => {
-                    strip_response_hop_by_hop_trailers(&mut trailers);
+                Some(trailers) => {
                     if !trailers.is_empty() {
                         let trailer_write = if terminal_gateway_deadline {
                             crate::http3::stream_util::await_terminal_response_write_before_deadline(
@@ -8167,6 +8328,7 @@ async fn proxy_to_backend_h3_refined_response(
     is_early_data: bool,
     backend_admission_start: std::time::Instant,
     retry_config: Option<&crate::config::types::RetryConfig>,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -8305,6 +8467,7 @@ async fn proxy_to_backend_h3_refined_response(
                 ctx,
                 plugin_execution_ns,
                 backend_admission_elapsed,
+                trailer_governance,
             )
             .await?;
             return Ok(H3RefinedResponse::Streamed(result));
@@ -8584,6 +8747,7 @@ async fn stream_h3_open_response_to_client(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     backend_admission_elapsed: std::time::Duration,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
     if state.max_response_body_size_bytes > 0
         && let Some(len) = response_headers
@@ -8610,6 +8774,18 @@ async fn stream_h3_open_response_to_client(
             backend_admission_elapsed,
         });
     }
+
+    // Same pre-policy capture as the inline native-H3 streaming relay: this
+    // path also commits its initial HEADERS before the backend's trailers
+    // exist, so the trailer frame needs evidence of what the response-header
+    // phases actually changed — including the default `content-type` this relay
+    // synthesizes below, which is a gateway-authored wire mutation.
+    let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
+    let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        trailer_governance,
+        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+    );
 
     if let Some(reject) = run_h3_streaming_after_proxy_hooks(
         plugins,
@@ -8670,12 +8846,15 @@ async fn stream_h3_open_response_to_client(
         },
     );
 
+    // Default `content-type` goes into the header MAP, not just the builder, so
+    // the map handed to the trailer boundary below is the field set the client
+    // actually received. See the matching note in the inline native-H3 relay.
+    response_headers
+        .entry("content-type".to_string())
+        .or_insert_with(|| "application/json".to_string());
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder =
+    let resp_builder =
         apply_response_headers(Response::builder().status(status), &response_headers);
-    if !response_headers.contains_key("content-type") {
-        resp_builder = resp_builder.header("content-type", "application/json");
-    }
     let resp = resp_builder
         .body(())
         .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 streaming response: {}", e))?;
@@ -8853,6 +9032,13 @@ async fn stream_h3_open_response_to_client(
                 h3_stream,
                 &mut recv_stream,
                 backend_read_timeout_ms,
+                H3StreamingTrailerPolicy {
+                    final_headers: &response_headers,
+                    pre_policy: &pre_policy_response_headers,
+                    governance: trailer_governance,
+                    // Plain-flavor relay: no field name is exempt here.
+                    section: TrailerSectionKind::PlainResponse,
+                },
             )
             .await
             {
@@ -8960,6 +9146,13 @@ async fn dispatch_grpc_native_h3(
     backend_admission_plugins: &[Arc<dyn Plugin>],
     plugin_execution_ns: &mut u64,
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    // Config-time response-trailer governance, precomputed per reload. Native
+    // gRPC terminal metadata crosses the response-header policy boundary exactly
+    // like a plain streaming relay's trailer section (GHSA-r78v-rc86-6r86): the
+    // initial HEADERS frame commits before the trailers exist, so `after_proxy`
+    // and sticky-cookie injection have already gone on the wire. Only the three
+    // RESERVED terminal fields are exempt — see `TrailerSectionKind`.
+    response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<(), anyhow::Error> {
     // Backend admission (gRPC rejects are emitted as trailers-only errors).
     let mut backend_admission_permits = match run_h3_backend_admission_or_send_reject(
@@ -9371,6 +9564,30 @@ async fn dispatch_grpc_native_h3(
     let backend_header_grpc_status = pristine_initial_terminal_metadata
         .grpc_status()
         .map(str::to_owned);
+
+    // Response-trailer policy boundary for the NATIVE H3 gRPC relay
+    // (GHSA-r78v-rc86-6r86). Captured HERE, on the pristine backend header map,
+    // because every response-header phase below — `after_proxy`, sticky-cookie
+    // injection, the `content-length` strip, the reserved-terminal-metadata
+    // strip, and the final hop-by-hop strip — runs afterwards and is on the wire
+    // long before the backend's TRAILERS frame arrives.
+    //
+    // The gate mirrors the plain relays: with no plugin able to touch response
+    // headers, no sticky cookie, and no `content-length` for the gateway to
+    // strip, nothing on this path can mutate a header, so the snapshot would be
+    // compared against itself and the #2941 pass-through stands. `content-length`
+    // is in the gate because the gateway removes it unconditionally below, which
+    // is exactly the present->absent shape a backend `content-length` TRAILER
+    // would undo. Hop-by-hop names need no gate entry: they are stripped from
+    // the trailer section before reconciliation, so they can never reach it.
+    // Reserved terminal metadata needs none either — it is exempt by section.
+    let grpc_pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        response_trailer_governance,
+        !plugins.is_empty()
+            || sticky_cookie_needed
+            || response_headers.contains_key("content-length"),
+    );
 
     // Response body size ceiling (Content-Length fast path). Backend RESPONSE
     // bytes are bounded by `max_response_body_size_bytes` — the same limit the
@@ -10093,6 +10310,28 @@ async fn dispatch_grpc_native_h3(
                         })
                     });
                     strip_response_hop_by_hop_trailers(&mut trailers);
+                    // Last point where the response-header policy boundary can
+                    // still bind this RPC's terminal metadata. `grpc_trailer_status`
+                    // above is already latched from the pristine trailer block, so
+                    // backend-health classification is unaffected either way — and
+                    // the reserved status/message/details fields are exempt by
+                    // section, so a governed drop can never truncate the RPC
+                    // outcome. Runs once, on the trailer frame only.
+                    let removed = reconcile_streaming_backend_trailers(
+                        &mut trailers,
+                        &response_headers,
+                        &grpc_pre_policy_response_headers,
+                        response_trailer_governance,
+                        GatewayOwnedResponseHeaders::default(),
+                        TrailerSectionKind::NativeGrpcTerminal,
+                    );
+                    if removed > 0 {
+                        debug!(
+                            removed,
+                            "native H3 gRPC: dropped trailer application metadata \
+                             governed by response header policy"
+                        );
+                    }
                     let finish_outcome = if !trailers.is_empty() {
                         // `send_trailers` only writes the trailer HEADERS frame;
                         // `finish()` is required to FIN the QUIC send side so the
@@ -10426,6 +10665,7 @@ async fn proxy_to_backend_h3_streaming(
     ctx: &mut RequestContext,
     plugin_execution_ns: &mut u64,
     backend_admission_start: std::time::Instant,
+    trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<H3StreamResult, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -10565,6 +10805,18 @@ async fn proxy_to_backend_h3_streaming(
         });
     }
 
+    // Same pre-policy capture as the inline native-H3 streaming relay: the
+    // initial HEADERS frame is committed before the backend's trailers exist,
+    // so the trailer frame needs evidence of what the response-header phases
+    // actually changed — including the default `content-type` this relay
+    // synthesizes below, which is a gateway-authored wire mutation.
+    let gateway_synthesizes_content_type = !response_headers.contains_key("content-type");
+    let pre_policy_response_headers = PrePolicyResponseHeaders::capture_for_streaming(
+        &response_headers,
+        trailer_governance,
+        !plugins.is_empty() || sticky_cookie_needed || gateway_synthesizes_content_type,
+    );
+
     // after_proxy hooks run before streaming begins so headers can be modified
     // or the response can be rejected before any downstream bytes are committed.
     if let Some(reject) = run_h3_streaming_after_proxy_hooks(
@@ -10637,13 +10889,16 @@ async fn proxy_to_backend_h3_streaming(
         },
     );
 
-    // Send response headers on the H3 stream
+    // Send response headers on the H3 stream. Default `content-type` goes into
+    // the header MAP, not just the builder, so the map handed to the trailer
+    // boundary below is the field set the client actually received. See the
+    // matching note in the inline native-H3 relay.
+    response_headers
+        .entry("content-type".to_string())
+        .or_insert_with(|| "application/json".to_string());
     let status = StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut resp_builder =
+    let resp_builder =
         apply_response_headers(Response::builder().status(status), &response_headers);
-    if !response_headers.contains_key("content-type") {
-        resp_builder = resp_builder.header("content-type", "application/json");
-    }
 
     let resp = resp_builder
         .body(())
@@ -10843,6 +11098,13 @@ async fn proxy_to_backend_h3_streaming(
                 h3_stream,
                 &mut h3_resp.recv_stream,
                 backend_read_timeout_ms,
+                H3StreamingTrailerPolicy {
+                    final_headers: &response_headers,
+                    pre_policy: &pre_policy_response_headers,
+                    governance: trailer_governance,
+                    // Plain-flavor relay: no field name is exempt here.
+                    section: TrailerSectionKind::PlainResponse,
+                },
             )
             .await
             {
@@ -10931,8 +11193,11 @@ struct H3BufferedDispatchResult {
     /// native-H3 send path forwards them only when no response-body plugin
     /// phase processed the response and no phase replaced the bytes
     /// (auth/logging-only plugins keep trailers; body-inspecting, mutating,
-    /// rejecting, and normalizing phases drop them). Surviving trailers get
-    /// response-direction hop-by-hop names stripped before forwarding. `None` on every
+    /// rejecting, and normalizing phases drop them). Surviving trailers are
+    /// reconciled field-by-field against the response-header policy in force
+    /// (`reconcile_backend_trailers_with_response_policy`) so a trailer cannot
+    /// reintroduce a field that policy removed, then get response-direction
+    /// hop-by-hop names stripped before forwarding. `None` on every
     /// gateway-synthesized error/reject below (no backend trailers to forward),
     /// and `None` for a successful response that carried no trailers.
     trailers: Option<http::HeaderMap>,
