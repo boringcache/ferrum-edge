@@ -2553,7 +2553,7 @@ impl KeyParts {
 
 /// Open a new key part. Boundaries are recorded as offsets, never written into
 /// the buffer, so no attacker-controlled byte can forge one.
-fn start_key_part(buffer: &mut String, has_part: &mut KeyParts) {
+fn start_key_part(buffer: &str, has_part: &mut KeyParts) {
     has_part.offsets.push(buffer.len());
 }
 

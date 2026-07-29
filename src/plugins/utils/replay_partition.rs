@@ -141,12 +141,13 @@ pub fn is_non_backend_visible_request_header(name: &str) -> bool {
 
 /// How an *anonymous* caller (no gateway identity, no credential header, no
 /// peer SPIFFE identity) is partitioned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AnonymousCallerScope {
     /// Default. Bind the retained result to the gateway-resolved canonical peer
     /// address, which the origin observes through Ferrum's regenerated
     /// `X-Forwarded-For`. A request whose canonical address cannot be derived
     /// is refused rather than partitioned incompletely.
+    #[default]
     CallerAddress,
     /// Operator attestation that the origin does not vary its response by
     /// caller address for this route, so anonymous callers may share one
@@ -178,12 +179,6 @@ impl AnonymousCallerScope {
             Self::CallerAddress => "caller_address",
             Self::Shared => "shared",
         }
-    }
-}
-
-impl Default for AnonymousCallerScope {
-    fn default() -> Self {
-        Self::CallerAddress
     }
 }
 
