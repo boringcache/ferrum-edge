@@ -116,6 +116,12 @@ body fails closed identically AND discards every terminal key the contract autho
 replacement error never ships beside the original contract's `grpc-status-details-bin` or
 custom trailers. `grpc_message` is authored as text and emitted percent-encoded per the
 gRPC HTTP mapping, with the 8 KiB wire ceiling measured on the encoded value.
+That per-field ceiling bounds one value; the COMPLETE terminal block
+(`grpc-status`, `grpc-message`, `grpc-status-details-bin`, every custom trailer,
+and `content-type`) carries a separate 16 KiB aggregate budget charged as
+name + value + 32 bytes per field — the HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` /
+HTTP/3 `SETTINGS_MAX_FIELD_SECTION_SIZE` accounting — so 32 individually valid
+8 KiB trailers cannot authorize ~256 KiB of terminal metadata.
 The raw function output is screened with the shared bounded
 `crate::util::json_dup_keys` scanner BEFORE `serde_json::from_slice`: a duplicate
 object member name (byte-identical, escaped-equivalent, or nested inside

@@ -2103,6 +2103,217 @@ fn test_native_grpc_terminate_bounds_encoded_grpc_message() {
     assert!(err.contains("percent-encoded"), "names the encoding: {err}");
 }
 
+/// Per-field charge an H2 peer applies to a header list (RFC 9113 §6.5.2) and
+/// an H3 peer applies to a field section (RFC 9114 §4.2.2): name + value + 32.
+const TERMINATE_FIELD_OVERHEAD: usize = 32;
+/// Aggregate budget for the complete terminal metadata block.
+const TERMINATE_BLOCK_BUDGET: usize = 16 * 1024;
+
+/// Charge a built terminal metadata map exactly the way the peer does.
+fn terminate_block_charge(fields: &HashMap<String, String>) -> usize {
+    fields
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + TERMINATE_FIELD_OVERHEAD)
+        .sum()
+}
+
+/// The two fields every terminate contract emits regardless of what it authored.
+fn terminate_block_base_charge() -> usize {
+    let content_type = "content-type".len() + "application/grpc".len() + TERMINATE_FIELD_OVERHEAD;
+    let grpc_status = "grpc-status".len() + "0".len() + TERMINATE_FIELD_OVERHEAD;
+    content_type + grpc_status
+}
+
+/// Build `count` distinct, individually valid custom trailers whose combined
+/// header-list charge is exactly `charge`. Every value stays far below the 8 KiB
+/// per-value ceiling, so only the aggregate bound can refuse them.
+fn aggregate_terminate_trailers(count: usize, charge: usize) -> HashMap<String, String> {
+    assert!(count > 0);
+    let names: Vec<String> = (0..count).map(|i| format!("x-t{i:02}")).collect();
+    let fixed: usize = names
+        .iter()
+        .map(|name| name.len() + TERMINATE_FIELD_OVERHEAD)
+        .sum();
+    let value_bytes = charge
+        .checked_sub(fixed)
+        .expect("requested charge must cover names and per-field overhead");
+    let each = value_bytes / count;
+    let mut trailers = HashMap::new();
+    for (index, name) in names.iter().enumerate() {
+        let len = if index + 1 == count {
+            value_bytes - each * (count - 1)
+        } else {
+            each
+        };
+        assert!(
+            len <= 8 * 1024,
+            "each generated trailer must stay under the per-value ceiling"
+        );
+        trailers.insert(name.clone(), "a".repeat(len));
+    }
+    assert_eq!(terminate_block_charge(&trailers), charge);
+    trailers
+}
+
+/// The per-value 8 KiB ceiling and the 32-entry count cap each bound ONE
+/// dimension. Neither bounds the block a peer must actually accept: 32
+/// individually valid 8 KiB trailers are ~256 KiB of terminal metadata, past any
+/// header-list size an H2/H3 client is obliged to accept and held in memory
+/// until emission. The complete block is therefore charged the way the peer
+/// charges it — names + values + 32 bytes per field.
+#[test]
+fn test_native_grpc_terminate_bounds_aggregate_terminal_block() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_error_code_test as build_code;
+
+    const MAX_BODY: usize = 1024 * 1024;
+    const COUNT: usize = 32;
+
+    // Exactly on the budget: accepted, with the count cap fully used and every
+    // value roughly a twentieth of the per-value ceiling.
+    let custom_charge = TERMINATE_BLOCK_BUDGET - terminate_block_base_charge();
+    let trailers = aggregate_terminate_trailers(COUNT, custom_charge);
+    let body = serde_json::to_vec(&json!({ "grpc_status": 0, "trailers": trailers })).unwrap();
+    let (_, _, headers) = build(200, &body, MAX_BODY).unwrap();
+    assert_eq!(headers.len(), COUNT + 2);
+    assert_eq!(
+        terminate_block_charge(&headers),
+        TERMINATE_BLOCK_BUDGET,
+        "the accepted block sits exactly on the aggregate budget"
+    );
+
+    // One byte more. Still 32 entries, still every value far under 8 KiB — the
+    // per-entry and count limits cannot see this, only the aggregate one can.
+    let mut over = trailers.clone();
+    let (name, value) = over
+        .iter()
+        .next()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .unwrap();
+    over.insert(name, format!("{value}a"));
+    let body = serde_json::to_vec(&json!({ "grpc_status": 0, "trailers": over })).unwrap();
+    let err = build(200, &body, MAX_BODY).unwrap_err();
+    assert!(err.contains("aggregate"), "names the aggregate budget: {err}");
+    assert!(
+        !err.contains("aaaa") && !err.contains("x-t"),
+        "the diagnostic never echoes trailer names or values: {err}"
+    );
+    assert_eq!(
+        build_code(200, &body, MAX_BODY).unwrap_err(),
+        "invalid_grpc_terminate_response",
+        "an over-budget block fails closed under the existing fixed class"
+    );
+}
+
+/// Protocol-owned terminal metadata shares the one block with custom trailers,
+/// so it is charged there too. A custom set that fits on its own must stop
+/// fitting once the contract also authors `grpc-message` and
+/// `grpc-status-details-bin`.
+#[test]
+fn test_native_grpc_terminate_aggregate_budget_counts_protocol_owned_metadata() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    const MAX_BODY: usize = 1024 * 1024;
+    const COUNT: usize = 32;
+
+    let message_charge = "grpc-message".len() + "ok".len() + TERMINATE_FIELD_OVERHEAD;
+    let custom_charge = TERMINATE_BLOCK_BUDGET - terminate_block_base_charge() - message_charge;
+    let trailers = aggregate_terminate_trailers(COUNT, custom_charge);
+
+    // The custom trailers alone leave exactly one `grpc-message` of headroom.
+    let alone = serde_json::to_vec(&json!({ "grpc_status": 0, "trailers": trailers })).unwrap();
+    let (_, _, headers) = build(200, &alone, MAX_BODY).unwrap();
+    assert_eq!(
+        terminate_block_charge(&headers),
+        TERMINATE_BLOCK_BUDGET - message_charge
+    );
+
+    // Spending that headroom on the protocol-owned message lands exactly on the
+    // budget.
+    let contract = json!({ "grpc_status": 0, "grpc_message": "ok", "trailers": trailers });
+    let with_message = serde_json::to_vec(&contract).unwrap();
+    let (_, _, headers) = build(200, &with_message, MAX_BODY).unwrap();
+    assert_eq!(headers.get("grpc-message").map(String::as_str), Some("ok"));
+    assert_eq!(terminate_block_charge(&headers), TERMINATE_BLOCK_BUDGET);
+
+    // Adding `grpc-status-details-bin` on top crosses it, even though that value
+    // is a handful of bytes and every per-entry check still passes.
+    let contract = json!({
+        "grpc_status": 0,
+        "grpc_message": "ok",
+        "status_details_base64": "AAECAw==",
+        "trailers": trailers
+    });
+    let with_details = serde_json::to_vec(&contract).unwrap();
+    let err = build(200, &with_details, MAX_BODY).unwrap_err();
+    assert!(err.contains("aggregate"), "names the aggregate budget: {err}");
+}
+
+/// An over-budget contract must fail closed all the way out: no framed provenance
+/// is stamped, so nothing authorizes DATA + plugin-authored trailers on the gRPC
+/// stream, and the client sees the fixed rejection class instead.
+#[tokio::test]
+async fn test_terminate_mode_over_budget_trailers_never_receive_framed_provenance() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // Twice the aggregate budget, assembled entirely from individually valid
+    // 1 KiB trailers within the 32-entry count cap.
+    let trailers = aggregate_terminate_trailers(32, 2 * TERMINATE_BLOCK_BUDGET);
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "grpc_status": 0,
+            "message_base64": "",
+            "trailers": trailers
+        })))
+        .mount(&server)
+        .await;
+
+    // `on_error: continue` is the permissive policy; a refused terminate contract
+    // must still not fall through to the backend.
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "mode": "terminate",
+            "timeout_ms": 5000,
+            "max_response_body_bytes": 1048576,
+            "on_error": "continue"
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ferrum_edge::_test_support::set_request_http_flavor_for_test(
+        &mut ctx,
+        ferrum_edge::config::types::HttpFlavor::Grpc,
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 502);
+            assert!(body.contains("invalid_grpc_terminate_response"));
+            assert!(
+                !body.contains("aaaa") && !body.contains("x-t"),
+                "the client-visible reject never reflects the function's trailers"
+            );
+        }
+        other => panic!("Expected fail-closed Reject, got {:?}", other),
+    }
+
+    assert!(
+        ferrum_edge::_test_support::serverless_grpc_terminate_frame_for_test(&ctx).is_none(),
+        "a refused contract must not stamp provenance authorizing framed output"
+    );
+}
+
 /// The authored terminal metadata of a status-only contract that used every
 /// optional field.
 fn status_only_full_terminate_trailers() -> HashMap<String, String> {

@@ -106,8 +106,9 @@ const DEFAULT_INSTANCE_ID: &str = "standalone";
 /// response. Protocol-owned `grpc-status` / `grpc-message` /
 /// `grpc-status-details-bin` are counted separately via dedicated fields.
 const MAX_GRPC_TERMINATE_CUSTOM_TRAILERS: usize = 32;
-/// Per-trailer **wire** value byte cap. Prevents a function from forcing
-/// oversized HEADER/TRAILER blocks onto the client stream.
+/// Per-trailer **wire** value byte cap. Bounds one field only; the size of the
+/// block a peer must accept is bounded separately by
+/// [`MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES`].
 ///
 /// This bound is applied to the bytes that actually reach the trailer block,
 /// after sanitization and after any re-encoding — not to some pre-image of
@@ -122,6 +123,30 @@ const MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES: usize = 8 * 1024;
 /// three quarters of the wire ceiling.
 const MAX_GRPC_TERMINATE_STATUS_DETAILS_DECODED_BYTES: usize =
     MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES / 4 * 3;
+/// Per-field accounting overhead an HTTP/2 peer adds when charging a header
+/// list against `SETTINGS_MAX_HEADER_LIST_SIZE` (RFC 9113 §6.5.2: name length +
+/// value length + 32). HTTP/3 charges the same shape for a field section
+/// against `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2), so one constant
+/// covers both wire protocols this contract can terminate on.
+const GRPC_TERMINATE_HEADER_FIELD_OVERHEAD_BYTES: usize = 32;
+/// Aggregate ceiling for the COMPLETE terminal metadata block the contract
+/// authors — every emitted field, not one value at a time.
+///
+/// [`MAX_GRPC_TERMINATE_TRAILER_VALUE_BYTES`] alone bounds only a single field.
+/// With [`MAX_GRPC_TERMINATE_CUSTOM_TRAILERS`] custom entries plus the
+/// protocol-owned `grpc-message` / `grpc-status-details-bin`, a contract could
+/// authorize ~256 KiB of trailer values and still pass every per-entry check —
+/// far beyond any header-list size a peer is obliged to accept, and retained in
+/// memory until emission. The block is therefore charged as a whole.
+///
+/// 16 KiB is the established repository floor for this resource: proxy H2
+/// listeners never advertise a `SETTINGS_MAX_HEADER_LIST_SIZE` below
+/// `MIN_H2_HEADER_LIST_SIZE` (16 KiB, `src/proxy/mod.rs`), while the configured
+/// header budget defaults to 32 KiB (`FERRUM_MAX_HEADER_SIZE_BYTES`) and the
+/// admin listener advertises 64 KiB. Staying at the smallest of those keeps an
+/// accepted terminal block deliverable on every H2/H3 client Ferrum expects,
+/// rather than accepted here and reset by the peer.
+const MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES: usize = 16 * 1024;
 /// Allowed top-level keys in the terminate-mode native-gRPC JSON contract.
 const GRPC_TERMINATE_RESPONSE_FIELDS: &[&str] = &[
     "grpc_status",
@@ -2085,6 +2110,22 @@ fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("grpc-accept-encoding")
 }
 
+/// Charge a built terminate field map the way an H2/H3 peer charges a header
+/// list: name bytes + value bytes + per-field overhead, over every field.
+///
+/// Returns `None` on arithmetic overflow so the caller fails closed rather than
+/// wrapping into an apparently small total.
+fn grpc_terminate_terminal_block_bytes(fields: &HashMap<String, String>) -> Option<usize> {
+    let mut total: usize = 0;
+    for (name, value) in fields {
+        total = total
+            .checked_add(name.len())?
+            .checked_add(value.len())?
+            .checked_add(GRPC_TERMINATE_HEADER_FIELD_OVERHEAD_BYTES)?;
+    }
+    Some(total)
+}
+
 /// Parse the terminate-mode native-gRPC JSON contract and build the client
 /// RejectBinary parts (HTTP 200 + `application/grpc` + framed unary body /
 /// trailers-only signalling).
@@ -2441,6 +2482,33 @@ fn build_native_grpc_terminate_response(
             }
             response_headers.insert(lower.to_string(), value.to_string());
         }
+    }
+
+    // Aggregate bound on the COMPLETE terminal metadata block. Per-entry and
+    // per-count limits above bound one field and the field count; neither bounds
+    // the block a peer actually has to accept. `response_headers` is exactly what
+    // both authored shapes emit — the framed shape sends it as trailers, the
+    // status-only shape as a Trailers-Only HEADERS block — so charging the map
+    // here covers both. The gateway's own `content-type` is charged too: it
+    // shares that single block in the trailers-only shape, and counting it is
+    // the conservative direction.
+    //
+    // The diagnostic is fixed text: it names no trailer, echoes no value, and so
+    // cannot leak attacker- or function-supplied material into operator logs.
+    let block_bytes = grpc_terminate_terminal_block_bytes(&response_headers).ok_or_else(|| {
+        InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            "gRPC terminate terminal metadata block size is not representable",
+        )
+    })?;
+    if block_bytes > MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            format!(
+                "gRPC terminate terminal metadata exceeds the {MAX_GRPC_TERMINATE_TERMINAL_BLOCK_BYTES}-byte \
+                 aggregate header-list budget (names + values + 32 bytes per field)"
+            ),
+        ));
     }
 
     let framed_body = match message_bytes {

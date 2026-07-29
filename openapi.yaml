@@ -19922,7 +19922,13 @@ components:
         frontend stamps at intake, not by a mutable effective content-type.
         Every terminal trailer value is bounded by an 8 KiB wire-value
         ceiling, measured after sanitization and after base64 or
-        percent-encoding. `grpc_message` is authored as human-readable text
+        percent-encoding, and the complete terminal metadata block —
+        `grpc-status`, `grpc-message`, `grpc-status-details-bin`, every
+        custom trailer, and `content-type` — is bounded by a separate 16 KiB
+        aggregate budget charged as name + value + 32 bytes per field, the
+        way HTTP/2 charges `SETTINGS_MAX_HEADER_LIST_SIZE` and HTTP/3 charges
+        `SETTINGS_MAX_FIELD_SECTION_SIZE`. Custom trailers are additionally
+        capped at 32 entries. `grpc_message` is authored as human-readable text
         and emitted in the canonical percent-encoded `grpc-message` wire form
         (uppercase hex for `%` and every byte outside the grammar's
         unescaped range). Custom trailers use the gRPC Custom-Metadata name
