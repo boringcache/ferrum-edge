@@ -404,9 +404,9 @@ handler returns, so the boundary travels with the body as an owned
 That owned form also carries an allocation-free per-response
 `gateway_owned_headers` bitset for the end-to-end builder writes (`via`,
 `alt-svc`, `X-Gateway-*`) so an exact-value pre-seed cannot bypass them. Native
-gRPC (the mesh-mTLS relay) on that arm is governed as a gRPC terminal section;
-translated gRPC-Web is excluded, because its terminal metadata is adapted into a
-final DATA frame that the pristine Trailers-Only snapshot already governs.
+gRPC (the mesh-mTLS relay) on that arm is governed as a gRPC terminal section,
+and so is translated gRPC-Web — see
+[Translated gRPC-Web terminal frames](#translated-grpc-web-terminal-frames).
 
 ### Native gRPC terminal metadata
 
@@ -445,9 +445,40 @@ request-scoped boundary to the trailer frame instead.
 An auth/logging-only chain still forwards gRPC application trailers untouched,
 exactly as before (issue #2941).
 
-Translated gRPC-Web remains outside this boundary on every path: its terminal
-metadata is adapted into a final DATA frame, and the pristine Trailers-Only
-snapshot already governs what may appear there.
+### Translated gRPC-Web terminal frames
+
+A translated gRPC-Web response adapts the backend's terminal metadata into a
+final DATA frame instead of a TRAILERS frame. That changes the **encoding**, not
+the boundary, and the two cases must not be conflated:
+
+- **Genuine Trailers-Only.** The backend put its terminal metadata in the
+  initial END_STREAM HEADERS block. `after_proxy` and the pristine Trailers-Only
+  snapshot already governed exactly that block, so the adapted frame inherits
+  their result and needs nothing further.
+- **A non-empty streaming response.** The terminal metadata arrives in a later
+  TRAILERS frame, long after the header boundary closed — the same crossing
+  GHSA-r78v-rc86-6r86 reports. Reconciliation therefore runs on that trailer
+  block **before** any of it is collected and encoded, on the same
+  request-scoped boundary the native trailer-forwarding branch uses, as a
+  `NativeGrpcTerminal` section (so `grpc-status`, `grpc-message`, and
+  `grpc-status-details-bin` survive and still drive the frame's status).
+
+| Relay | Where it reconciles |
+| --- | --- |
+| Direct HTTP/2 gRPC pool + gRPC-Web | owned governor inside `StripHopByHopTrailers`, which `proxy::body::GrpcWebStreamingBody` wraps from the outside — the trailer frame is already reconciled when the adapter encodes it |
+| Mesh-mTLS `StreamingH2` + gRPC-Web | the same owned governor on the plain streaming-H2 arm, likewise inside the gRPC-Web adapter |
+| H3 client → H2 gRPC backend, translated | inline in `handle_h3_grpc_streaming_response`, before `collect_buffered_grpc_trailers` / `build_streaming_trailer_data` |
+
+`dispatch_grpc_native_h3` performs no gRPC-Web conversion and cannot receive a
+translated request: translation forces request-body buffering, which clears
+`can_stream_request_body` and so clears the `use_native_h3_grpc` gate. Its
+forwarded trailer section is governed by the native rules above regardless.
+
+Each relay latches the pristine backend `grpc-status` before reconciling, so
+backend health, admission, deadline, and observability classification are
+decided by what the backend sent. Binary and text modes share one governed
+frame — text mode base64-encodes the same reconciled bytes — and clean EOF,
+Trailers-Only, disconnect, and deadline terminal frames are unchanged.
 
 ## WebSocket over HTTP/3 (RFC 9220 Extended CONNECT)
 

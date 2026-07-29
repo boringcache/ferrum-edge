@@ -3465,7 +3465,9 @@ async fn handle_h3_grpc_streaming_response<S>(
     // Config-time response-trailer governance. Native gRPC terminal metadata on
     // this bridge crosses the response-header policy boundary exactly like a
     // plain streaming relay's trailer section (GHSA-r78v-rc86-6r86); only the
-    // three RESERVED terminal fields are exempt.
+    // three RESERVED terminal fields are exempt. Applied to BOTH terminal
+    // shapes this bridge can emit: the forwarded TRAILERS frame and the
+    // translated gRPC-Web terminal DATA frame.
     response_trailer_governance: ResponseTrailerGovernance<'_>,
 ) -> Result<CrossProtocolOutcome, anyhow::Error>
 where
@@ -3545,7 +3547,9 @@ where
             });
 
     // Response-trailer policy boundary for the H3-to-H2 native gRPC STREAMING
-    // bridge (GHSA-r78v-rc86-6r86). Captured on the PRISTINE backend header map,
+    // bridge (GHSA-r78v-rc86-6r86), used by the forwarded-trailers branch and by
+    // the translated gRPC-Web terminal-frame branch alike. Captured on the
+    // PRISTINE backend header map,
     // before `after_proxy`, sticky-cookie injection, the gRPC-Web initial
     // metadata take, and the `content-length` strips below — all of which are on
     // the wire before the backend's TRAILERS frame is read.
@@ -3793,11 +3797,55 @@ where
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
     } else if body_completed && let Some(text_mode) = grpc_web_translation_mode {
+        // Translated gRPC-Web. The terminal metadata is adapted into a final
+        // DATA frame instead of a TRAILERS frame, but WHERE it came from decides
+        // whether the response-header policy already saw it:
+        //
+        //   * A genuine Trailers-Only response carries it in the initial
+        //     END_STREAM HEADERS block, which `after_proxy` and the pristine
+        //     snapshot above already governed — `grpc_web_initial_terminal_metadata`
+        //     is that governed view, so it needs nothing more here.
+        //   * A NON-EMPTY streaming response instead delivers it in a later
+        //     TRAILERS frame, long after the header boundary closed. That block
+        //     crosses exactly the boundary GHSA-r78v-rc86-6r86 reports, and the
+        //     gRPC-Web encoding below makes it client-visible just as
+        //     `send_trailers` would — so it gets the SAME reconciliation the
+        //     native trailer-forwarding branch applies, on the same
+        //     request-scoped boundary, before any of it can be encoded.
         let mut collected = grpc_web_initial_terminal_metadata
             .take()
             .unwrap_or_default();
+        let mut pristine_trailer_status = None;
         if let Some(mut trailers) = trailers {
+            // Latch the PRISTINE backend terminal status first, like the native
+            // branch below, so backend health, admission, deadline, and
+            // observability classification are decided by what the backend sent
+            // rather than by anything governance did. Only a VALID numeric
+            // status latches: a malformed or absent one keeps deriving from the
+            // built frame (`build_streaming_trailer_data` maps it from the HTTP
+            // status), so this latch cannot change any existing classification —
+            // the reserved fields are exempt by section, so the two always
+            // agree, and the latch simply makes that independent of governance.
+            pristine_trailer_status = trailers
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u32>().ok());
             strip_response_hop_by_hop_trailers(&mut trailers);
+            let removed = reconcile_streaming_backend_trailers(
+                &mut trailers,
+                &streaming.headers,
+                &grpc_pre_policy_response_headers,
+                response_trailer_governance,
+                GatewayOwnedResponseHeaders::default(),
+                TrailerSectionKind::NativeGrpcTerminal,
+            );
+            if removed > 0 {
+                debug!(
+                    removed,
+                    "cross-protocol H3 gRPC-Web streaming: dropped backend trailer application \
+                     metadata governed by response header policy"
+                );
+            }
             collected.clear();
             crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
         }
@@ -3807,7 +3855,7 @@ where
                 streaming.status,
                 text_mode,
             );
-        grpc_trailer_status = Some(terminal_status);
+        grpc_trailer_status = Some(pristine_trailer_status.unwrap_or(terminal_status));
         let terminal_len = terminal_data.len() as u64;
         let terminal_write = if client_deadline_expired {
             crate::http3::stream_util::await_terminal_response_write_before_deadline(

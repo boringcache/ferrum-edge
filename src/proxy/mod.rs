@@ -25893,18 +25893,26 @@ async fn handle_proxy_request_inner(
     // application metadata crossing the same policy boundary — the case
     // GHSA-r78v-rc86-6r86 reports.
     //
-    // ONE dispatch stays excluded: translated gRPC-Web
-    // (`grpc_request_is_web_translated`). Its terminal metadata is adapted into a
-    // final DATA frame rather than a TRAILERS frame, and the pristine
-    // Trailers-Only snapshot already governs what may appear there, so this
-    // wrapper stays a pure hop-by-hop filter and passes `None`.
+    // Translated gRPC-Web (`grpc_request_is_web_translated`) is governed too. Its
+    // TERMINAL metadata is adapted into a final DATA frame rather than a TRAILERS
+    // frame, but that only changes the ENCODING, not the boundary: the backend
+    // still speaks native gRPC (the `grpc_web` plugin rewrote the request), and on
+    // a NON-EMPTY streaming response its terminal metadata arrives in a later
+    // TRAILERS frame, long after the header policy ran. Only a genuine
+    // Trailers-Only response carries that metadata in the initial END_STREAM
+    // HEADERS block, where the pristine snapshot and `after_proxy` already
+    // governed it. `GrpcWebStreamingBody` wraps this body from the OUTSIDE
+    // (`into_grpc_web_streaming` below), so the governor installed here
+    // reconciles the trailer frame before the adapter can encode any of it.
     //
     // Capture is here, on the PRISTINE backend header map: the gRPC-Web bridge
     // promotion and every response-header phase below run after this point.
-    let h2_streaming_trailer_policy = if matches!(&response_body, ResponseBody::StreamingH2(_))
-        && !grpc_request_is_web_translated
-    {
-        let section = if streaming_h2_native_grpc {
+    let h2_streaming_trailer_policy = if matches!(&response_body, ResponseBody::StreamingH2(_)) {
+        // A translated gRPC-Web response's trailer block IS a native gRPC
+        // terminal section — chosen structurally from the dispatch the gateway
+        // committed to, never from a trailer's own name — so its three reserved
+        // status fields survive and still drive `build_streaming_trailer_data`.
+        let section = if streaming_h2_native_grpc || grpc_request_is_web_translated {
             headers_mod::TrailerSectionKind::NativeGrpcTerminal
         } else {
             headers_mod::TrailerSectionKind::PlainResponse
@@ -25939,7 +25947,13 @@ async fn handle_proxy_request_inner(
                 // deliberately dropped. Only reachable with a client gRPC
                 // deadline, i.e. only on the native-gRPC section.
                 || (grpc_request_deadline.is_some()
-                    && response_headers.contains_key("content-length")),
+                    && response_headers.contains_key("content-length"))
+                // The gRPC-Web translation below rewrites the wire header map
+                // after this capture (terminal-metadata take + `content-length`
+                // removal). A request can only be translated when the `grpc_web`
+                // plugin ran, so `!plugins.is_empty()` already covers it; state
+                // it explicitly so the gate cannot silently lose that coupling.
+                || grpc_request_is_web_translated,
         );
         Some((pre_policy, section, unbounded))
     } else {

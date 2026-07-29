@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 
+use ferrum_edge::_test_support::govern_streaming_grpc_web_terminal_frame_for_test as grpc_web_frame;
 use ferrum_edge::_test_support::govern_streaming_h2_backend_trailers_for_test as govern_h2;
 use ferrum_edge::_test_support::govern_streaming_h2_native_grpc_trailers_for_test as govern_h2_grpc;
 use ferrum_edge::_test_support::reconcile_backend_trailers_with_response_policy_for_test as reconcile;
@@ -941,7 +942,7 @@ fn every_streaming_h2_body_constructor_carries_the_trailer_governor() {
 }
 
 #[test]
-fn native_grpc_h2_is_governed_while_grpc_web_stays_excluded() {
+fn native_grpc_and_translated_grpc_web_are_both_governed_on_the_h2_arm() {
     let src = include_str!("../../../src/proxy/mod.rs");
     let gate = src
         .split("let h2_streaming_trailer_policy = ")
@@ -963,11 +964,18 @@ fn native_grpc_h2_is_governed_while_grpc_web_stays_excluded() {
         "the streaming H2 arm must pick its trailer section structurally from \
          `streaming_h2_native_grpc`"
     );
-    // Translated gRPC-Web still carries its terminal metadata in a final DATA
-    // frame governed by the pristine Trailers-Only snapshot, so it stays out.
+    // Translated gRPC-Web is governed too. Adapting the terminal metadata into a
+    // final DATA frame changes the encoding, not the boundary: a NON-EMPTY
+    // streaming response still delivers that metadata in a later TRAILERS frame,
+    // which the pristine Trailers-Only snapshot never saw. Its trailer block is a
+    // native gRPC terminal section, so the reserved status fields still survive.
     assert!(
-        gate.contains("!grpc_request_is_web_translated"),
-        "gRPC-Web adaptation must stay outside the response-header trailer boundary"
+        !gate.contains("!grpc_request_is_web_translated"),
+        "translated gRPC-Web must not be excluded from the trailer boundary"
+    );
+    assert!(
+        gate.contains("streaming_h2_native_grpc || grpc_request_is_web_translated"),
+        "a translated gRPC-Web trailer block must be governed as a native gRPC terminal section"
     );
     assert!(
         gate.contains("PrePolicyResponseHeaders::capture_for_streaming("),
@@ -1354,4 +1362,252 @@ fn duplicate_case_variants_on_a_grpc_trailer_still_fail_closed() {
     );
     assert!(!has(&surviving, "x-internal-debug"), "{surviving:?}");
     assert!(has(&surviving, "grpc-status"), "{surviving:?}");
+}
+
+// ── Translated gRPC-Web terminal frames (GHSA-r78v-rc86-6r86) ───────────────
+//
+// A translated gRPC-Web response adapts the backend's terminal metadata into a
+// final DATA frame instead of a TRAILERS frame. That changes the ENCODING, not
+// the policy boundary: on a NON-EMPTY streaming response the metadata still
+// arrives in a later trailer frame, long after `after_proxy` saw the initial
+// header map. Only a genuine Trailers-Only response carries it in the initial
+// END_STREAM HEADERS block, which the pristine snapshot already governs.
+//
+// The helper below runs the exact terminal sequence both relays perform —
+// hop-by-hop strip, native-gRPC-terminal reconciliation, buffered collection,
+// frame build — so a governed name must never appear in the client-visible
+// frame in either binary or text mode.
+
+fn frame_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn trailer_only_governed_metadata_never_reaches_a_binary_grpc_web_frame() {
+    // `response_transformer` declares `Unbounded`: its governed names do not
+    // exist until the request runs, so every non-reserved terminal field is
+    // dropped before the frame is built.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let (wire, decoded, status) = grpc_web_frame(
+        &[
+            ("grpc-status", "0"),
+            ("grpc-message", "OK"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+        200,
+        false,
+    );
+    let frame = frame_text(&decoded);
+    assert!(
+        !frame.contains("x-internal-debug") && !frame.contains("backend-trace-9f2a"),
+        "governed trailer-only metadata reached the gRPC-Web frame: {frame:?}"
+    );
+    assert!(frame.contains("grpc-status"), "{frame:?}");
+    assert_eq!(status, 0, "the pristine backend status must be latched");
+    assert_eq!(
+        wire, decoded,
+        "binary mode must emit the frame bytes verbatim"
+    );
+}
+
+#[test]
+fn trailer_only_governed_metadata_never_reaches_a_text_grpc_web_frame() {
+    // Text mode base64-encodes the SAME governed frame. Reconciliation must run
+    // before that encoding, otherwise the metadata would merely be obscured.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let (wire, decoded, status) = grpc_web_frame(
+        &[
+            ("grpc-status", "0"),
+            ("x-internal-debug", "backend-trace-9f2a"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+        200,
+        true,
+    );
+    let frame = frame_text(&decoded);
+    assert!(
+        !frame.contains("x-internal-debug"),
+        "governed metadata reached the text-mode frame: {frame:?}"
+    );
+    assert!(frame.contains("grpc-status"), "{frame:?}");
+    assert_eq!(status, 0);
+    assert_ne!(
+        wire, decoded,
+        "text mode must base64-encode the terminal frame"
+    );
+    assert!(
+        !frame_text(&wire).contains("x-internal-debug"),
+        "the encoded wire bytes must not carry the governed name either"
+    );
+}
+
+#[test]
+fn reserved_terminal_status_survives_grpc_web_conversion() {
+    // All three reserved fields are exempt by SECTION, not by a `grpc-` prefix:
+    // `grpc-encoding` in the same block is ordinary application metadata and is
+    // governed like any other name.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let (_, decoded, status) = grpc_web_frame(
+        &[
+            ("grpc-status", "5"),
+            ("grpc-message", "NOT_FOUND"),
+            ("grpc-status-details-bin", "AAECAw"),
+            ("grpc-encoding", "gzip"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        true,
+        true,
+        200,
+        false,
+    );
+    let frame = frame_text(&decoded);
+    assert!(frame.contains("grpc-status:"), "{frame:?}");
+    assert!(frame.contains("grpc-message:"), "{frame:?}");
+    assert!(frame.contains("grpc-status-details-bin:"), "{frame:?}");
+    assert!(
+        !frame.contains("grpc-encoding"),
+        "`grpc-` is not a prefix exemption: {frame:?}"
+    );
+    assert_eq!(status, 5, "the pristine backend status must be latched");
+}
+
+#[test]
+fn an_auth_only_chain_preserves_ungoverned_grpc_web_application_metadata() {
+    // Issue #2941 parity: nothing declared, nothing mutated, no fail-closed arm
+    // — the terminal application metadata is forwarded into the frame untouched.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let (_, decoded, status) = grpc_web_frame(
+        &[
+            ("grpc-status", "0"),
+            ("x-trace-id", "abc123"),
+            // Hop-by-hop names are stripped before governance regardless.
+            ("proxy-authenticate", "Basic"),
+        ],
+        &backend,
+        &backend,
+        &[],
+        false,
+        false,
+        200,
+        false,
+    );
+    let frame = frame_text(&decoded);
+    assert!(
+        frame.contains("x-trace-id") && frame.contains("abc123"),
+        "an auth/logging-only chain must not drop ungoverned metadata: {frame:?}"
+    );
+    assert!(frame.contains("grpc-status"), "{frame:?}");
+    assert!(
+        !frame.contains("proxy-authenticate"),
+        "hop-by-hop names must never reach the frame: {frame:?}"
+    );
+    assert_eq!(status, 0);
+}
+
+#[test]
+fn a_declared_removal_is_applied_to_the_grpc_web_frame() {
+    // The declared-name signal is the only one that catches a policy REMOVAL
+    // which was a no-op on the initial header map because the backend sent the
+    // field only as a trailer.
+    let backend = headers(&[("content-type", "application/grpc")]);
+    let (_, decoded, _) = grpc_web_frame(
+        &[("grpc-status", "0"), ("x-powered-by", "backend/1.2")],
+        &backend,
+        &backend,
+        &["x-powered-by".to_string()],
+        false,
+        true,
+        200,
+        false,
+    );
+    let frame = frame_text(&decoded);
+    assert!(
+        !frame.contains("x-powered-by"),
+        "a declared removal must bind the gRPC-Web frame too: {frame:?}"
+    );
+    assert!(frame.contains("grpc-status"), "{frame:?}");
+}
+
+// ── Source contracts ────────────────────────────────────────────────────────
+//
+// The two relays that build a client-visible gRPC-Web terminal frame have no
+// local live runtime here (they need a QUIC client / a mesh-mTLS backend), so
+// pin the ordering that makes the behavioral coverage above load-bearing.
+
+#[test]
+fn the_h3_grpc_web_branch_reconciles_before_collecting_terminal_metadata() {
+    let src = include_str!("../../../src/http3/cross_protocol.rs");
+    let start = src
+        .find("async fn handle_h3_grpc_streaming_response")
+        .expect("handle_h3_grpc_streaming_response not found");
+    let tail = &src[start..];
+    let branch_start = tail
+        .find("} else if body_completed && let Some(text_mode) = grpc_web_translation_mode {")
+        .expect("translated gRPC-Web branch not found");
+    let branch = &tail[branch_start..];
+    let branch_end = branch
+        .find("} else if body_completed && let Some(mut trailers) = trailers {")
+        .expect("end of translated gRPC-Web branch not found");
+    let branch = &branch[..branch_end];
+
+    let reconcile = branch
+        .find("reconcile_streaming_backend_trailers(")
+        .expect("the translated gRPC-Web branch must reconcile backend trailers");
+    let collect = branch
+        .find("collect_buffered_grpc_trailers(")
+        .expect("collect_buffered_grpc_trailers not found in the gRPC-Web branch");
+    assert!(
+        reconcile < collect,
+        "reconciliation must run BEFORE the terminal metadata is collected for encoding"
+    );
+    assert!(
+        branch.contains("TrailerSectionKind::NativeGrpcTerminal"),
+        "the gRPC-Web terminal block is a native gRPC terminal section"
+    );
+    let latch = branch
+        .find("pristine_trailer_status = trailers")
+        .expect("the pristine backend status must be latched");
+    assert!(
+        latch < reconcile,
+        "the backend gRPC status must be latched BEFORE reconciliation"
+    );
+}
+
+#[test]
+fn the_grpc_web_adapter_wraps_the_governed_body_from_the_outside() {
+    // The HTTP/2 relays reconcile inside `StripHopByHopTrailers`, which
+    // `into_grpc_web_streaming` must wrap from the OUTSIDE. Reversing that order
+    // would hand `GrpcWebStreamingBody` a raw backend trailer frame and encode
+    // ungoverned metadata into the client-visible terminal DATA frame.
+    let src = include_str!("../../../src/proxy/mod.rs");
+    for arm in [
+        // Direct-H2 gRPC pool streaming relay.
+        "Ok(GrpcResponseKind::Streaming(grpc_streaming)) => {",
+        // Generic relay (mesh-mTLS `StreamingH2`): the adapter is applied after
+        // the whole `match` that built the governed body.
+        "let h2_streaming_trailer_policy = if matches!(",
+    ] {
+        let region = src.split(arm).nth(1).expect("relay region not found");
+        let governed = region
+            .find("_strip_hop_by_hop_trailers(")
+            .expect("the relay must install the strip/govern wrapper");
+        let adapter = region
+            .find("into_grpc_web_streaming(")
+            .expect("the relay must apply the gRPC-Web adapter");
+        assert!(
+            governed < adapter,
+            "`{arm}`: the gRPC-Web adapter must wrap the already-governed body"
+        );
+    }
 }

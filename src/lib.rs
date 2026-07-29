@@ -3579,6 +3579,72 @@ pub mod _test_support {
         surviving_trailer_lines_for_test(&map)
     }
 
+    /// Run a translated gRPC-Web streaming response's TERMINAL step end to end:
+    /// hop-by-hop strip, the native-gRPC-terminal reconciliation, the buffered
+    /// trailer collection, and the gRPC-Web terminal frame build.
+    ///
+    /// This is the exact sequence both translated-gRPC-Web relays perform on a
+    /// non-empty streaming response — the H3-to-H2 bridge inline in
+    /// `handle_h3_grpc_streaming_response`, and the HTTP/2 relays through the
+    /// owned governor inside `StripHopByHopTrailers`, which
+    /// `proxy::body::GrpcWebStreamingBody` wraps from the OUTSIDE so the trailer
+    /// frame is already reconciled by the time it is encoded. Governed
+    /// application metadata must therefore never reach the returned frame, while
+    /// the reserved status fields must (GHSA-r78v-rc86-6r86).
+    ///
+    /// Returns `(wire bytes, decoded trailer frame, latched grpc status)`. In
+    /// binary mode the first two are identical; in text mode the first is the
+    /// base64 of the second, so one assertion set covers both encodings.
+    #[allow(clippy::too_many_arguments)]
+    pub fn govern_streaming_grpc_web_terminal_frame_for_test(
+        trailers: &[(&str, &str)],
+        pre_policy_headers: &HashMap<String, String>,
+        final_headers: &HashMap<String, String>,
+        policy_names: &[String],
+        unbounded_policy: bool,
+        header_phases_can_mutate: bool,
+        http_status: u16,
+        text_mode: bool,
+    ) -> (Vec<u8>, Vec<u8>, u32) {
+        let mut map = backend_trailer_map_for_test(trailers);
+        // Latched from the PRISTINE trailer block, before governance runs. Only
+        // a valid numeric status latches; anything else keeps deriving from the
+        // built frame, exactly as the relays do.
+        let pristine_status = map
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        let governance = crate::proxy::headers::ResponseTrailerGovernance {
+            policy_names,
+            policy_prefixes: &[],
+            unbounded: unbounded_policy,
+        };
+        let pre_policy = crate::proxy::headers::PrePolicyResponseHeaders::capture_for_streaming(
+            pre_policy_headers,
+            governance,
+            header_phases_can_mutate,
+        );
+        crate::proxy::headers::strip_response_hop_by_hop_trailers(&mut map);
+        crate::proxy::headers::reconcile_streaming_backend_trailers(
+            &mut map,
+            final_headers,
+            &pre_policy,
+            governance,
+            crate::proxy::headers::GatewayOwnedResponseHeaders::default(),
+            crate::proxy::headers::TrailerSectionKind::NativeGrpcTerminal,
+        );
+        let mut collected = HashMap::new();
+        crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&map, &mut collected);
+        use crate::plugins::grpc_web::build_streaming_trailer_data as build_frame;
+        let (wire, frame_status) = build_frame(&collected, http_status, text_mode);
+        let (binary, _) = build_frame(&collected, http_status, false);
+        (
+            wire.to_vec(),
+            binary.to_vec(),
+            pristine_status.unwrap_or(frame_status),
+        )
+    }
+
     fn backend_trailer_map_for_test(trailers: &[(&str, &str)]) -> http::HeaderMap {
         let mut map = http::HeaderMap::new();
         for (name, value) in trailers {
