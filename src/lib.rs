@@ -5164,11 +5164,25 @@ pub mod _test_support {
 
     pub use crate::k8s_controller::reconciler::{
         AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
-        shared_status_objects_snapshot, store_accepted_k8s_overlay, swap_merged_k8s_translation,
+        store_accepted_k8s_overlay, swap_merged_k8s_translation,
     };
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
     };
+
+    /// Test-only view of the crate-private shared status-object generation
+    /// helper.
+    pub fn shared_status_objects_snapshot(
+        objects: &[crate::config_sources::k8s::K8sObject],
+        gateway_writer_present: bool,
+        istio_writer_present: bool,
+    ) -> Option<std::sync::Arc<[crate::config_sources::k8s::K8sObject]>> {
+        crate::k8s_controller::reconciler::shared_status_objects_snapshot(
+            objects,
+            gateway_writer_present,
+            istio_writer_present,
+        )
+    }
 
     // ── K8s controller shutdown supervision (#3220) ─────────────────────────
 
