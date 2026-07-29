@@ -31,10 +31,14 @@ rejects crash artifacts larger than 64 KiB before upload.
   builds, 300 s per target, bounded crash artifacts uploaded after size/count
   checks, 7-day retention, concurrency capped at two targets.
 
-Both hosted lanes install `libcurl4-openssl-dev` before compiling. The fuzz
-crate links the main Ferrum Edge crate, whose Kafka dependency builds
-`librdkafka` from source and requires the libcurl development headers; the
-hosted runner image does not guarantee that header package.
+The fuzz crate links the main Ferrum Edge crate, whose Kafka dependency builds
+`librdkafka` from source with OAuthBearer OIDC disabled. librdkafka 2.12.1
+nevertheless includes `curl/curl.h` because one preprocessor guard tests whether
+the disabled macro is defined instead of whether it is enabled. The isolated
+fuzz workspace exposes an intentionally empty header from
+`fuzz/native_include/curl/curl.h`; all real curl code remains excluded by the
+upstream `#if WITH_OAUTHBEARER_OIDC` guards. This keeps the byte-frozen hosted
+workflows hermetic without installing an unused native dependency.
 
 ## Local workflow (optional)
 

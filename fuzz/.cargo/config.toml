@@ -1,0 +1,5 @@
+[env]
+# librdkafka 2.12.1 checks WITH_OAUTHBEARER_OIDC with #ifdef for one include
+# even when its build defines the disabled feature as 0. Make the narrowly
+# scoped compatibility header available without changing the frozen workflows.
+CPATH = { value = "native_include", relative = true }
