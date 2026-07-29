@@ -146,4 +146,13 @@ fn invalid_identifier_diagnostics_do_not_reflect_hostile_input() {
         .expect_err("unexpected trailing input");
     assert!(err.contains("unexpected trailing input"));
     assert!(!err.contains(hostile));
+
+    let hostile_number = "9".repeat(128);
+    let err = parse_access_log_filter_expression(&format!("duration >= {hostile_number}s"))
+        .expect_err("oversized integer");
+    assert!(err.contains("outside supported integer range"));
+    assert!(
+        !err.contains(&hostile_number),
+        "numeric parse diagnostics must not reflect hostile literals"
+    );
 }

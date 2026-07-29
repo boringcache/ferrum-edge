@@ -363,9 +363,8 @@ impl<'a> ExpressionParser<'a> {
             self.pos += 1;
         }
         let raw = &self.input[start..self.pos];
-        raw.parse::<i64>().map_err(|_| {
-            format!("{field} comparison value '{raw}' is outside supported integer range")
-        })
+        raw.parse::<i64>()
+            .map_err(|_| format!("{field} comparison value is outside supported integer range"))
     }
 
     fn parse_duration_unit_multiplier(&mut self) -> Result<i64, String> {
