@@ -1016,11 +1016,12 @@ enum CrossKindListener {
 /// GRPCRoute on the same host can never both materialize.
 ///
 /// The losing route is rejected by emitting a conflict for **every** conflict
-/// key it claims on that listener. That is what the rest of the pipeline
-/// already understands: `http_route_resources` drops every match whose key is
-/// a losing key (so no proxy, upstream, plugin, or materialized-parent record
-/// is produced), and the status writer sees all of the route's keys for that
-/// parent conflicted and reports `Accepted=False` with the conflict reason.
+/// key of the losing `(parentRef, hostname)` claim. That is what the rest of
+/// the pipeline already understands: `http_route_resources` drops every match
+/// whose key is a losing key (so no proxy, upstream, plugin, or
+/// materialized-parent record is produced), and the status writer sees all of
+/// the route's keys for that parent conflicted and reports `Accepted=False`
+/// with the conflict reason.
 ///
 /// Resolution is greedy over the total `(creationTimestamp, namespace, name)`
 /// order, so it is independent of the order objects arrive in: a route is
@@ -1032,8 +1033,14 @@ enum CrossKindListener {
 /// selector string, so a wildcard reference and a `sectionName` / `port`
 /// reference that name one listener contend with each other, while wildcard
 /// references reaching disjoint `allowedRoutes.kinds`-filtered listeners do
-/// not. A route that loses on one listener but survives on another keeps its
-/// claim, because the shared conflict key cannot express a partial withdrawal.
+/// not. A claim that reaches several listeners and loses on *any* of them is
+/// withdrawn whole: the shared conflict key cannot express a partial
+/// withdrawal, and Ferrum materializes HTTP-family Gateway API routes as
+/// port-agnostic `(hosts, listen_path)` proxies, so a surviving claim would
+/// still route on the listener where Gateway API forbids the merge. Keeping
+/// availability on the non-conflicting listener is not worth serving
+/// cross-kind traffic on the conflicting one, so the conservative withdrawal
+/// is the fail-closed choice.
 fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApiRouteConflict> {
     // listener -> the routes attached to it, with the hostnames they claim
     // there. Two different parentRef shapes selecting one listener land in the
@@ -1125,30 +1132,25 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
         }
         for ((parent_ref, hostname), keys) in keys_by_claim {
             // One wildcard parentRef can reach several listeners while emitting
-            // a single shared conflict key, so rejecting the claim after losing
-            // on one listener would also withdraw the route from listeners it
-            // legitimately won. The claim is rejected only when it lost on every
-            // listener it reaches.
+            // a single shared conflict key, and the materialized route is
+            // port-agnostic, so a claim kept because it won on listener B would
+            // still serve traffic on listener A, where Gateway API forbids the
+            // HTTPRoute/GRPCRoute merge. The representation cannot express
+            // "accepted on B only", so the whole claim is withdrawn on the
+            // first loss.
+            //
+            // The reported winner is the accepted opposite-kind Route on the
+            // lowest-ordered listener the claim lost on. `listeners_for`
+            // returns an ordered set and per-listener arbitration is greedy
+            // over a total `(creationTimestamp, namespace, name, kind)` order,
+            // so the choice is deterministic and independent of the order the
+            // objects arrived in.
             let listeners = entry.listeners_for(parent_ref, hostname);
-            let mut winner: Option<K8sResourceKey> = None;
-            let mut lost_on_every_listener = true;
-            for listener in &listeners {
-                match losses.get(&(index, listener.clone())) {
-                    Some(listener_winner) => {
-                        if winner.is_none() {
-                            winner = Some(listener_winner.clone());
-                        }
-                    }
-                    None => {
-                        lost_on_every_listener = false;
-                        break;
-                    }
-                }
-            }
-            if !lost_on_every_listener {
-                continue;
-            }
-            let Some(winner) = winner else {
+            let Some(winner) = listeners
+                .iter()
+                .find_map(|listener| losses.get(&(index, listener.clone())))
+                .cloned()
+            else {
                 continue;
             };
             for key in keys {
@@ -9113,10 +9115,15 @@ mod tests {
     }
 
     /// A wildcard parentRef can reach several listeners while emitting one
-    /// shared conflict key, so a loss on one listener must not withdraw the
-    /// route from a listener it still wins.
+    /// shared conflict key, and Ferrum materializes HTTP-family Gateway API
+    /// routes as port-agnostic `(hosts, listen_path)` proxies. A claim kept
+    /// because it won on the GRPCRoute-only listener would therefore still
+    /// route on the shared listener, where Gateway API v1.5.1 forbids the
+    /// HTTPRoute/GRPCRoute merge — the representation cannot express "accepted
+    /// on the other listener only". So the claim is withdrawn whole and the
+    /// GRPCRoute contributes no traffic state anywhere.
     #[test]
-    fn a_wildcard_parent_ref_surviving_on_another_listener_is_not_withdrawn() {
+    fn a_wildcard_parent_ref_losing_on_one_listener_is_withdrawn_whole() {
         let gateway = cross_kind_gateway(serde_json::json!([
             {
                 "name": "shared",
@@ -9137,9 +9144,10 @@ mod tests {
                 }
             }
         ]));
-        // The HTTPRoute pins the shared listener and is older, so it wins there.
-        // It takes a distinct listen path so the surviving GRPCRoute still has
-        // a route-table slot of its own.
+        // The HTTPRoute pins the shared listener and is older, so it wins
+        // there. Its distinct listen path means the GRPCRoute would have had a
+        // route-table slot of its own had the claim been kept — the withdrawal
+        // is the conflict decision, not a route-table collision.
         let http_route = cross_kind_http_route(
             serde_json::json!({"name": "edge", "sectionName": "shared"}),
             Some(serde_json::json!([{"path": {"type": "PathPrefix", "value": "/admin"}}])),
@@ -9149,22 +9157,58 @@ mod tests {
             serde_json::json!({"method": "SayHello"}),
         );
 
-        let result = translate_k8s_objects(&[gateway, http_route, grpc_route], options())
-            .expect("translation succeeds");
+        for objects in [
+            vec![gateway.clone(), http_route.clone(), grpc_route.clone()],
+            vec![grpc_route.clone(), http_route.clone(), gateway.clone()],
+        ] {
+            let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
 
-        let mut ports: Vec<u16> = result
-            .config
-            .proxies
-            .iter()
-            .map(|proxy| proxy.backend_port)
-            .collect();
-        ports.sort_unstable();
-        assert_eq!(
-            ports,
-            vec![8080, 50051],
-            "the GRPCRoute still owns the grpc-only listener its wildcard parentRef reaches"
-        );
-        assert!(result.config.validate_unique_listen_paths().is_ok());
+            let ports: Vec<u16> = result
+                .config
+                .proxies
+                .iter()
+                .map(|proxy| proxy.backend_port)
+                .collect();
+            assert_eq!(
+                ports,
+                vec![8080],
+                "the GRPCRoute loses on the shared listener, so its port-agnostic claim is \
+                 withdrawn from the grpc-only listener too"
+            );
+            assert!(
+                !result
+                    .config
+                    .upstreams
+                    .iter()
+                    .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
+                "the withdrawn GRPCRoute must not leave an upstream: {:?}",
+                result.config.upstreams
+            );
+            assert!(
+                !result
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                "the withdrawn GRPCRoute must contribute no dispatch rules"
+            );
+            assert!(
+                !result
+                    .materialized_route_parents
+                    .iter()
+                    .any(|entry| entry.route.kind == "GRPCRoute"),
+                "the withdrawn GRPCRoute must claim no materialized parent"
+            );
+            assert!(
+                result.warnings.iter().any(|warning| {
+                    warning.contains("GRPCRoute default/grpc")
+                        && warning.contains("Gateway API forbids merging")
+                }),
+                "the withdrawal must be reported: {:?}",
+                result.warnings
+            );
+            assert!(result.config.validate_unique_listen_paths().is_ok());
+        }
     }
 
     /// An explicit `null` is malformed operator input, not an omitted field.

@@ -195,9 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinning that listener by `sectionName` or `port` contend with each other,
   while two wildcard references that `allowedRoutes.kinds` sends to different
   listeners do not. A wildcard reference spanning several listeners emits one
-  shared conflict claim, so it is rejected only when it loses on every listener
-  that claim reaches, and route status always echoes the parentRef the operator
-  wrote. gRPC shapes Ferrum cannot represent exactly
+  shared conflict claim, and Ferrum's HTTP-family route representation is
+  port-agnostic, so a claim kept for the listener it won would still route on
+  the listener it lost: such a claim is conservatively withdrawn whole as soon
+  as it loses on **any** listener it reaches. Route status always echoes the
+  parentRef the operator wrote. gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)

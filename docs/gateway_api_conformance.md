@@ -166,12 +166,15 @@ materializes anything:
   and a GRPCRoute method predicate on the same host are a conflict even though
   their predicates are disjoint.
 - The losing Route produces no proxy, no upstream, no plugin, and no
-  materialized-parent record on that listener, so it cannot route traffic. It is
-  reported `Accepted=False` with `reason: Conflicted` and a message naming the
-  winner, and the translator emits a matching warning.
+  materialized-parent record for the rejected `(parentRef, hostname)` claim, so
+  it cannot route traffic. It is reported `Accepted=False` with
+  `reason: Conflicted` and a message naming the winner, and the translator emits
+  a matching warning.
 - Resolution is per listener and per hostname intersection. The same GRPCRoute
-  can still win on a different listener, or on a hostname the HTTPRoute does not
-  claim.
+  can still win on a hostname the HTTPRoute does not claim, or on a *separate*
+  parentRef claim (for example a second `sectionName`-pinned reference) that
+  reaches only a listener it wins. What it cannot do is keep one shared claim on
+  a subset of the listeners that claim reaches — see the wildcard rule below.
 - Rejection does not cascade: a route is only rejected when it overlaps an
   **accepted** route of the other kind, so a second HTTPRoute is unaffected by a
   GRPCRoute that already lost.
@@ -187,9 +190,14 @@ interchangeable:
   *different* listeners never share one, so neither is rejected.
 - A wildcard reference that reaches several listeners is arbitrated on each of
   them independently, but it emits one shared conflict claim, which cannot
-  express a partial withdrawal. Such a route is rejected only when it loses on
-  **every** listener that claim reaches; losing on one listener while surviving
-  on another leaves it accepted.
+  express a partial withdrawal — and Ferrum's route representation is
+  port-agnostic (see the known limitation below), so a claim kept for the
+  listener it won would still route on the listener it lost. Such a claim is
+  therefore **conservatively withdrawn whole on a loss on any listener it
+  reaches**, and the reported winner is the accepted opposite-kind Route on the
+  lowest-ordered listener it lost on. Availability on the non-conflicting
+  listener does not take priority over not serving cross-kind traffic on the
+  conflicting one.
 
 Route status is still reported against the parentRef the operator wrote —
 listener resolution is an internal arbitration detail and never rewrites the
@@ -201,11 +209,19 @@ and only claim-for-claim collisions are resolved as conflicts.
 
 **Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
 port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
-not distinguishable in the route table. Two routes that legitimately survive on
-different listeners but claim the same `(hostname, listen path)` therefore
-collide at config validation (`Overlapping host+listen_path`) rather than being
-served per listener port. Give such routes distinct listen paths, distinct
-hostnames, or distinct Gateways.
+not distinguishable in the route table. Two consequences follow:
+
+- Two routes that legitimately survive on different listeners but claim the same
+  `(hostname, listen path)` collide at config validation
+  (`Overlapping host+listen_path`) rather than being served per listener port.
+  Give such routes distinct listen paths, distinct hostnames, or distinct
+  Gateways.
+- A single `(parentRef, hostname)` claim spanning several listeners cannot be
+  restricted to the listeners it won, so a cross-kind loss on any one of them
+  withdraws the claim from all of them (above). A GRPCRoute that must keep
+  serving a listener an HTTPRoute also claims elsewhere needs a parentRef that
+  reaches only that listener (`sectionName` or `port`), a non-intersecting
+  hostname, or a separate Gateway.
 
 ### Fail-closed match shapes
 

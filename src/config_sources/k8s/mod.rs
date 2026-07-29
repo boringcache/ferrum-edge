@@ -909,13 +909,15 @@ where
         //
         // A cross-kind (HTTPRoute vs GRPCRoute) collision is different in
         // kind, not degree: Gateway API v1.5.1 requires the whole losing Route
-        // to be rejected on that listener, so every one of its matches is
-        // suppressed rather than just the colliding one.
+        // to be rejected on the shared listener, so every one of its matches is
+        // suppressed rather than just the colliding one. Because the
+        // materialized route is port-agnostic, the rejection covers the whole
+        // parentRef claim — including any other listener that claim reaches.
         let skipped_reason = if conflict.loser.kind == conflict.winner.kind {
             "the conflicting match was skipped"
         } else {
-            "the whole route was rejected on that listener because Gateway API forbids merging \
-             HTTPRoute and GRPCRoute rules"
+            "the whole route was withdrawn from that parentRef claim because Gateway API forbids \
+             merging HTTPRoute and GRPCRoute rules on a shared listener"
         };
         acc.warnings.push(format!(
             "Gateway API {} {}/{} conflicted on parent={} host={} path={} match={} and {}; winner is {}/{}",

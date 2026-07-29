@@ -643,6 +643,153 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
     }
 }
 
+/// The fail-closed edge between the two cases above: one wildcard parentRef
+/// reaches a shared listener *and* a GRPCRoute-only listener, emitting a single
+/// `(parentRef, hostname)` claim. It loses the cross-kind arbitration on the
+/// shared listener and would otherwise be accepted on the GRPCRoute-only one.
+///
+/// Ferrum materializes HTTP-family Gateway API routes as port-agnostic
+/// `(hosts, listen_path)` proxies, so a claim kept for the listener it won
+/// cannot be restricted to that listener — it would still route on the shared
+/// listener, exactly where Gateway API forbids HTTPRoute/GRPCRoute merging.
+/// The claim is therefore withdrawn whole: the GRPCRoute contributes no proxy,
+/// no upstream, no plugin, and no materialized parent anywhere, and is reported
+/// `Accepted=False`/`Conflicted` — independent of object observation order.
+#[test]
+fn cross_kind_wildcard_claim_losing_one_listener_is_withdrawn_from_all_listeners() {
+    let gateway = cross_kind_gateway(json!([
+        {
+            "name": "shared",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]}
+        },
+        {
+            "name": "grpc-only",
+            "port": 8080,
+            "protocol": "HTTP",
+            "allowedRoutes": {"kinds": [{"kind": "GRPCRoute"}]}
+        }
+    ]));
+    // The HTTPRoute pins the shared listener and is older, so it wins there.
+    // Its distinct listen path means the GRPCRoute would have had a route-table
+    // slot of its own had the claim been kept — the withdrawal is the conflict
+    // decision, not a `(hosts, listen_path)` collision.
+    let mut http_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "web",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "shared"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                "backendRefs": [{"name": "web", "port": 8080}]
+            }]
+        }),
+    );
+    http_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc_route = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "grpc",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"method": {"service": "pkg.Svc", "method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]
+        }),
+    );
+    grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway.clone(),
+            http_route.clone(),
+            grpc_route.clone(),
+        ],
+        vec![
+            grpc_route.clone(),
+            http_route.clone(),
+            gateway.clone(),
+            gateway_class(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+        // The losing GRPCRoute materializes no traffic state on *either*
+        // listener, including the one it would otherwise have won.
+        let ports: Vec<u16> = translation
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.backend_port)
+            .collect();
+        assert_eq!(
+            ports,
+            vec![8080],
+            "the withdrawn GRPCRoute must not keep the grpc-only listener"
+        );
+        assert!(
+            !translation
+                .config
+                .upstreams
+                .iter()
+                .any(|upstream| upstream.targets.iter().any(|target| target.port == 50051)),
+            "the withdrawn GRPCRoute must not leave an upstream: {:?}",
+            translation.config.upstreams
+        );
+        assert!(
+            !translation
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+            "the withdrawn GRPCRoute must contribute no dispatch rules"
+        );
+        assert!(
+            !translation
+                .materialized_route_parents
+                .iter()
+                .any(|entry| entry.route.kind == "GRPCRoute"),
+            "the withdrawn GRPCRoute must claim no materialized parent"
+        );
+
+        // ...and the withdrawal is reported, naming a real applicable winner.
+        let conflict = translation
+            .route_conflicts
+            .iter()
+            .find(|conflict| conflict.loser.kind == "GRPCRoute")
+            .expect("the withdrawal must be reported as a conflict");
+        assert_eq!(conflict.winner.kind, "HTTPRoute");
+        assert_eq!(conflict.winner.name, "web");
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+        let grpc_update = updates
+            .iter()
+            .find(|update| update.kind == "GRPCRoute" && update.name == "grpc")
+            .expect("the withdrawn GRPCRoute gets a status update");
+        let accepted = accepted_condition(grpc_update);
+        assert_eq!(accepted["status"].as_str(), Some("False"));
+        assert_eq!(accepted["reason"].as_str(), Some("Conflicted"));
+
+        let http_update = updates
+            .iter()
+            .find(|update| update.kind == "HTTPRoute" && update.name == "web")
+            .expect("the accepted HTTPRoute gets a status update");
+        assert_eq!(
+            accepted_condition(http_update)["status"].as_str(),
+            Some("True")
+        );
+    }
+}
+
 /// Gateway API v1.5.1 scopes the merge prohibition to the HTTP family, and
 /// Ferrum now claims `TCPRoute` through live black-box conformance checks. The
 /// whole-route cross-kind rejection must therefore stay confined to
