@@ -6656,71 +6656,53 @@ async fn handle_batch_create(
 
 // ---- Backup & Restore ----
 
-/// Export the current gateway config as a JSON backup payload.
-async fn handle_backup(
-    state: &AdminState,
-    query: Option<&str>,
-    namespace: &str,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let resource_filter = parse_backup_resources(query);
-    // Fail closed before database/spec loading when a filtered export would
-    // emit api_specs without the owning/generated resource classes required
-    // for a directly restorable payload.
-    if let Err(error) = validate_backup_api_specs_resource_filter(resource_filter.as_ref()) {
-        return Ok(json_response(
-            StatusCode::BAD_REQUEST,
-            &json!({"error": error}),
-        ));
-    }
+/// Fail-closed response when a database-backed backup that would emit
+/// `api_specs` cannot hold the namespace config admission lease for a single
+/// generation across config + document reads. Details stay redacted.
+fn backup_admission_unavailable_response() -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": "Backup aborted: config admission unavailable"}),
+    )
+}
 
-    // Try database first, then cached config
-    let (mut config, source) = if let Some(ref db) = state.db {
-        match db
-            .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
-            .await
-        {
-            Ok(config) => (config, "database"),
-            Err(_e) => {
-                warn_persistence_failure_redacted("backup_database_load");
-                match state.cached_gateway_config() {
-                    Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
-                    None => {
-                        return Ok(json_response(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &json!({"error": "Database unavailable and no cached config"}),
-                        ));
-                    }
-                }
-            }
-        }
-    } else {
-        match state.cached_gateway_config() {
-            Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
-            None => {
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": "No database configured and no cached config available"}),
-                ));
-            }
-        }
-    };
+/// Outcome of a database-backed export that includes the versioned
+/// `api_specs` section under the namespace config admission guard.
+enum ConsistentApiSpecsBackup {
+    /// Serialized JSON body for `source=database` (guard still held by caller).
+    Ready {
+        body_bytes: Vec<u8>,
+        proxy_count: usize,
+        consumer_count: usize,
+        plugin_config_count: usize,
+        upstream_count: usize,
+        api_specs_count: usize,
+    },
+    /// Authoritative config load failed; caller may use labeled cached fallback.
+    ConfigUnavailable,
+    /// Spec documents could not be loaded after config succeeded.
+    SpecsUnavailable,
+}
 
-    // Determine which resource types to include
-    let include_proxies = resource_filter
-        .as_ref()
-        .is_none_or(|f| f.contains("proxies"));
-    let include_consumers = resource_filter
-        .as_ref()
-        .is_none_or(|f| f.contains("consumers"));
-    let include_plugin_configs = resource_filter
-        .as_ref()
-        .is_none_or(|f| f.contains("plugin_configs"));
-    let include_upstreams = resource_filter
-        .as_ref()
-        .is_none_or(|f| f.contains("upstreams"));
-    let include_api_specs = resource_filter
-        .as_ref()
-        .is_none_or(|f| f.contains("api_specs"));
+fn backup_resource_includes(resource_filter: Option<&HashSet<&str>>, name: &str) -> bool {
+    resource_filter.is_none_or(|filter| filter.contains(name))
+}
+
+/// Build a restorable JSON backup from an already-loaded config snapshot.
+///
+/// `export_carries_api_specs` must be true only when `api_specs` is present and
+/// the caller proved a single generation (admission guard for database exports).
+fn serialize_backup_payload(
+    mut config: GatewayConfig,
+    source: &'static str,
+    resource_filter: Option<&HashSet<&str>>,
+    api_specs_owned: Option<ApiSpecsBackupSection>,
+) -> (Vec<u8>, usize, usize, usize, usize, usize) {
+    let include_proxies = backup_resource_includes(resource_filter, "proxies");
+    let include_consumers = backup_resource_includes(resource_filter, "consumers");
+    let include_plugin_configs = backup_resource_includes(resource_filter, "plugin_configs");
+    let include_upstreams = backup_resource_includes(resource_filter, "upstreams");
+    let include_api_specs = backup_resource_includes(resource_filter, "api_specs");
 
     // Backups must stay self-consistent: restore refuses a payload whose
     // resources carry an `api_spec_id` that the payload's `api_specs` section
@@ -6729,7 +6711,9 @@ async fn handle_backup(
     // fallback whose runtime snapshot has already been stripped of ownership
     // tags. Strip the tags in both cases so the exported resources restore as
     // hand-managed instead of producing a file that only fails at restore time.
-    let export_carries_api_specs = include_api_specs && source == "database";
+    let export_carries_api_specs = include_api_specs
+        && source == "database"
+        && api_specs_owned.is_some();
     if !export_carries_api_specs {
         crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
     }
@@ -6763,8 +6747,6 @@ async fn handle_backup(
     } else {
         empty_proxies.as_slice()
     };
-    // Empty when consumers are filtered out, so no separate placeholder is
-    // needed here.
     let consumers = canonical_consumers.as_slice();
     let plugin_configs = if include_plugin_configs {
         config.plugin_configs.as_slice()
@@ -6777,29 +6759,14 @@ async fn handle_backup(
         empty_upstreams.as_slice()
     };
 
-    // Load raw API specs from the primary. Filtered-out exports still emit an
-    // empty versioned section so restore treats them as an intentional wipe
-    // rather than a legacy backup. A cached fallback cannot prove ownership
-    // (its resources were stripped above), so it omits the section entirely and
-    // restores through the legacy `confirm_api_spec_deletion` gate.
-    let api_specs_owned: Option<ApiSpecsBackupSection> = if !include_api_specs {
+    // Filtered-out exports still emit an empty versioned section so restore
+    // treats them as an intentional wipe rather than a legacy backup. A cached
+    // fallback cannot prove ownership (resources were stripped above), so it
+    // omits the section and restores through `confirm_api_spec_deletion`.
+    let api_specs_owned = if !include_api_specs {
         Some(ApiSpecsBackupSection::empty())
-    } else if source == "cached" {
-        warn!("Backup: cached fallback omits api_specs (ownership tags unavailable)");
-        None
-    } else if let Some(ref db) = state.db {
-        match db.list_api_specs_with_content(namespace).await {
-            Ok(specs) => Some(ApiSpecsBackupSection::from_specs(&specs)),
-            Err(_error) => {
-                warn_persistence_failure_redacted("backup_api_specs_load");
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({"error": "Database unavailable while exporting API specs"}),
-                ));
-            }
-        }
     } else {
-        None
+        api_specs_owned
     };
     let api_specs_section = api_specs_owned.as_ref();
     let api_specs_count = api_specs_section
@@ -6825,19 +6792,19 @@ async fn handle_backup(
         api_specs: api_specs_section,
     };
 
-    // Serialize directly to bytes — no intermediate Value allocation.
     let body_bytes = serde_json::to_vec(&backup).unwrap_or_else(|_| b"{}".to_vec());
-    info!(
-        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+    (
+        body_bytes,
         proxies.len(),
         consumers.len(),
         plugin_configs.len(),
         upstreams.len(),
         api_specs_count,
-        body_bytes.len()
-    );
+    )
+}
 
-    let resp = Response::builder()
+fn backup_attachment_response(body_bytes: Vec<u8>, source: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/json")
         .header(
@@ -6853,8 +6820,221 @@ async fn handle_backup(
             Response::new(Full::new(Bytes::from(
                 "{\"error\":\"Internal Server Error\"}",
             )))
-        });
-    Ok(resp)
+        })
+}
+
+/// Load BackupExport config + raw API-spec documents and serialize them while
+/// the caller holds the namespace config admission lease.
+async fn build_consistent_api_specs_backup(
+    db: &dyn DatabaseBackend,
+    namespace: &str,
+    resource_filter: Option<&HashSet<&str>>,
+) -> ConsistentApiSpecsBackup {
+    let config = match db
+        .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
+        .await
+    {
+        Ok(config) => config,
+        Err(_error) => {
+            warn_persistence_failure_redacted("backup_database_load");
+            return ConsistentApiSpecsBackup::ConfigUnavailable;
+        }
+    };
+
+    let specs = match db.list_api_specs_with_content(namespace).await {
+        Ok(specs) => specs,
+        Err(_error) => {
+            warn_persistence_failure_redacted("backup_api_specs_load");
+            return ConsistentApiSpecsBackup::SpecsUnavailable;
+        }
+    };
+
+    let (
+        body_bytes,
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+    ) = serialize_backup_payload(
+        config,
+        "database",
+        resource_filter,
+        Some(ApiSpecsBackupSection::from_specs(&specs)),
+    );
+
+    ConsistentApiSpecsBackup::Ready {
+        body_bytes,
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+    }
+}
+
+/// Export the current gateway config as a JSON backup payload.
+async fn handle_backup(
+    state: &AdminState,
+    query: Option<&str>,
+    namespace: &str,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let resource_filter = parse_backup_resources(query);
+    // Fail closed before database/spec loading when a filtered export would
+    // emit api_specs without the owning/generated resource classes required
+    // for a directly restorable payload.
+    if let Err(error) = validate_backup_api_specs_resource_filter(resource_filter.as_ref()) {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": error}),
+        ));
+    }
+
+    let include_api_specs = backup_resource_includes(resource_filter.as_ref(), "api_specs");
+
+    // Database-backed exports that emit the versioned `api_specs` section must
+    // hold the same namespace config admission guard that API-spec POST/PUT/
+    // DELETE mutations acquire. Acquire before the first authoritative read and
+    // keep it through document load + serialization so a concurrent mutation
+    // cannot mix ownership tags from one generation with documents from another.
+    //
+    // Filtered backups that explicitly omit `api_specs` skip this guard: they
+    // strip ownership tags and emit an intentional empty wipe section, so they
+    // do not claim a consistent config↔document generation.
+    if include_api_specs
+        && let Some(ref db) = state.db
+    {
+        let guard = match crud::lock_namespace_config_admission(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(_error) => {
+                warn_persistence_failure_redacted("backup_namespace_admission_acquire");
+                return Ok(backup_admission_unavailable_response());
+            }
+        };
+
+        let export = match guard
+            .run_to_completion_while_held(build_consistent_api_specs_backup(
+                db.as_ref(),
+                namespace,
+                resource_filter.as_ref(),
+            ))
+            .await
+        {
+            Ok(crud::NamespaceConfigAdmissionCompletion::Held(outcome)) => outcome,
+            Ok(crud::NamespaceConfigAdmissionCompletion::Lost {
+                result: _,
+                error: _,
+            }) => {
+                // Never emit a payload assembled after the lease was lost —
+                // even a completed Ready body may straddle two generations.
+                warn_persistence_failure_redacted("backup_namespace_admission_lost");
+                return Ok(backup_admission_unavailable_response());
+            }
+            Err(_error) => {
+                warn_persistence_failure_redacted("backup_namespace_admission_before_export");
+                return Ok(backup_admission_unavailable_response());
+            }
+        };
+        drop(guard);
+
+        match export {
+            ConsistentApiSpecsBackup::Ready {
+                body_bytes,
+                proxy_count,
+                consumer_count,
+                plugin_config_count,
+                upstream_count,
+                api_specs_count,
+            } => {
+                info!(
+                    "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+                    proxy_count,
+                    consumer_count,
+                    plugin_config_count,
+                    upstream_count,
+                    api_specs_count,
+                    body_bytes.len()
+                );
+                return Ok(backup_attachment_response(body_bytes, "database"));
+            }
+            ConsistentApiSpecsBackup::SpecsUnavailable => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database unavailable while exporting API specs"}),
+                ));
+            }
+            ConsistentApiSpecsBackup::ConfigUnavailable => {
+                // Ordinary config-load failure under a held lease: labeled
+                // cached fallback (without api_specs) remains semantically safe.
+                // Do not treat admission loss as this path — that fails closed
+                // above without emitting a database-sourced backup.
+            }
+        }
+    }
+
+    // Unguarded path: no database, filtered omit of api_specs, or cached
+    // fallback after a held-lease config load failure.
+    let (config, source) = if include_api_specs && state.db.is_some() {
+        // Reaching here means the guarded path already attempted the database
+        // load and observed ConfigUnavailable. Skip a second unguarded DB read.
+        match state.cached_gateway_config() {
+            Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
+            None => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "Database unavailable and no cached config"}),
+                ));
+            }
+        }
+    } else if let Some(ref db) = state.db {
+        match db
+            .load_full_config_for_purpose(namespace, FullConfigLoadPurpose::BackupExport)
+            .await
+        {
+            Ok(config) => (config, "database"),
+            Err(_e) => {
+                warn_persistence_failure_redacted("backup_database_load");
+                match state.cached_gateway_config() {
+                    Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
+                    None => {
+                        return Ok(json_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            &json!({"error": "Database unavailable and no cached config"}),
+                        ));
+                    }
+                }
+            }
+        }
+    } else {
+        match state.cached_gateway_config() {
+            Some(c) => (filter_config_by_namespace(&c, namespace), "cached"),
+            None => {
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": "No database configured and no cached config available"}),
+                ));
+            }
+        }
+    };
+
+    if source == "cached" && include_api_specs {
+        warn!("Backup: cached fallback omits api_specs (ownership tags unavailable)");
+    }
+
+    let (body_bytes, proxy_count, consumer_count, plugin_config_count, upstream_count, api_specs_count) =
+        serialize_backup_payload(config, source, resource_filter.as_ref(), None);
+
+    info!(
+        "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+        body_bytes.len()
+    );
+
+    Ok(backup_attachment_response(body_bytes, source))
 }
 
 async fn validate_restore_candidate_on_blocking_pool(

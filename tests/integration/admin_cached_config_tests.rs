@@ -3351,6 +3351,152 @@ async fn test_backup_resource_filter() {
 }
 
 #[tokio::test]
+async fn backup_with_api_specs_serializes_through_namespace_admission() {
+    use std::time::Duration;
+
+    let tc = TestConfig::default();
+    let (state, _dir) = create_db_admin_state(&tc).await;
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Hold the same local admission mutex the durable guard acquires first.
+    let held = ferrum_edge::_test_support::lock_namespace_config_admission_for_test("ferrum").await;
+    let client = reqwest::Client::new();
+    let mut blocked = tokio::spawn({
+        let base_url = base_url.clone();
+        let token = token.clone();
+        async move {
+            client
+                .get(format!("{base_url}/backup"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+        }
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut blocked)
+            .await
+            .is_err(),
+        "full backup that emits api_specs must wait on namespace config admission"
+    );
+
+    // Filtered omit of api_specs does not take the guard and must proceed.
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=proxies", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "filtered omit of api_specs must not require admission: {body:?}"
+    );
+    assert_eq!(body["source"], "database");
+    assert_eq!(body["api_specs"]["items"].as_array().unwrap().len(), 0);
+
+    drop(held);
+    let response = tokio::time::timeout(Duration::from_secs(5), blocked)
+        .await
+        .expect("backup completes after admission release")
+        .expect("backup task joins")
+        .expect("backup HTTP succeeds");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("backup JSON");
+    assert_eq!(body["source"], "database");
+    assert_eq!(body["api_specs"]["section_version"], "1");
+}
+
+#[tokio::test]
+async fn backup_api_specs_fails_closed_when_admission_lease_cannot_be_acquired() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("backup_admission.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    // Remove the durable lease table so acquisition fails closed (Err), rather
+    // than contending (None → retry). Resource-filtered omit must still work.
+    sqlx::query("DROP TABLE config_admission_locks")
+        .execute(&pool)
+        .await
+        .expect("drop admission lease table");
+
+    let (status, body, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"].as_str(),
+        Some("Backup aborted: config admission unavailable")
+    );
+    assert!(
+        body.get("proxies").is_none(),
+        "acquisition failure must not emit a backup body: {body:?}"
+    );
+    assert!(
+        !body.to_string().contains("config_admission_locks")
+            && !body.to_string().contains("sqlite")
+            && !body.to_string().contains(&db_url),
+        "admission failure must stay redacted: {body:?}"
+    );
+
+    let (status, body, _) = admin_get(&base_url, "/backup?resources=proxies", &token).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "filtered omit of api_specs must not require the lease table: {body:?}"
+    );
+    assert_eq!(body["source"], "database");
+}
+
+#[tokio::test]
+async fn backup_admission_lease_loss_is_observed_fail_closed() {
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("backup_loss.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("connect sqlite");
+    let db: Arc<dyn ferrum_edge::config::db_backend::DatabaseBackend> = Arc::new(db);
+
+    let guard = ferrum_edge::_test_support::lock_namespace_config_admission_db_for_test(
+        db.clone(),
+        "ferrum",
+    )
+    .await
+    .expect("acquire admission for loss probe");
+
+    // Loss after the export future completes must surface as Lost (the same
+    // completion arm handle_backup maps to 503 without emitting the body).
+    let completion = guard
+        .run_to_completion_while_held(async {
+            guard.force_lose();
+            "assembled-backup-body"
+        })
+        .await
+        .expect("observer runs");
+    match completion {
+        ferrum_edge::_test_support::TestNamespaceConfigAdmissionCompletion::Lost(body) => {
+            assert_eq!(body, "assembled-backup-body");
+        }
+        ferrum_edge::_test_support::TestNamespaceConfigAdmissionCompletion::Held(_) => {
+            panic!("forced lease loss must not report Held");
+        }
+    }
+
+    // Loss before work starts fails closed without producing a body.
+    let before = guard
+        .run_to_completion_while_held(async { "should-not-run" })
+        .await;
+    assert!(
+        before.is_err(),
+        "lost lease before export must fail closed: {before:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_restore_requires_confirm() {
     let tc = TestConfig::default();
     let (state, _dir) = create_db_admin_state(&tc).await;

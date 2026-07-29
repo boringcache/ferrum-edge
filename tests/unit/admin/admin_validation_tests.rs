@@ -1165,6 +1165,64 @@ fn ambiguous_namespace_admission_acquisition_has_owned_cleanup() {
 }
 
 #[test]
+fn backup_with_api_specs_holds_admission_across_config_and_document_reads() {
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let backup_start = admin
+        .find("async fn handle_backup(")
+        .expect("backup handler");
+    let restore_start = admin[backup_start..]
+        .find("async fn handle_restore(")
+        .map(|offset| backup_start + offset)
+        .expect("restore handler after backup");
+    let backup = &admin[backup_start..restore_start];
+
+    // Guard before both authoritative reads; both reads live inside the
+    // held-lease export helper so a concurrent API-spec mutation cannot mix
+    // ownership tags from one generation with documents from another.
+    let acquire = backup
+        .find("crud::lock_namespace_config_admission(db.clone(), namespace).await")
+        .expect("api_specs-emitting backup must acquire namespace admission");
+    let run_held = backup
+        .find("run_to_completion_while_held(build_consistent_api_specs_backup(")
+        .expect("backup must observe the lease through export");
+    let helper = admin
+        .find("async fn build_consistent_api_specs_backup(")
+        .expect("consistent api_specs export helper");
+    let helper_end = admin[helper..]
+        .find("async fn handle_backup(")
+        .map(|offset| helper + offset)
+        .expect("helper precedes handle_backup");
+    let helper_body = &admin[helper..helper_end];
+    assert!(helper_body.contains("FullConfigLoadPurpose::BackupExport"));
+    assert!(helper_body.contains("list_api_specs_with_content(namespace)"));
+    assert!(
+        helper_body.find("load_full_config_for_purpose").expect("config load")
+            < helper_body
+                .find("list_api_specs_with_content")
+                .expect("spec load")
+    );
+    assert!(acquire < run_held);
+
+    // Acquisition failure and lease loss must fail closed — never emit the
+    // Lost payload as an authoritative database backup, and never fall through
+    // to a silent database-sourced export without the guard.
+    assert!(backup.contains("backup_admission_unavailable_response()"));
+    assert!(backup.contains("backup_namespace_admission_acquire"));
+    assert!(backup.contains("backup_namespace_admission_lost"));
+    assert!(backup.contains("backup_namespace_admission_before_export"));
+    assert!(backup.contains("NamespaceConfigAdmissionCompletion::Lost"));
+    assert!(
+        backup.contains(
+            "Filtered backups that explicitly omit `api_specs` skip this guard"
+        ),
+        "narrow skip for filtered omit must stay documented in code"
+    );
+    // Cached fallback stays available only after a held-lease config load
+    // failure, never after admission acquisition/loss.
+    assert!(backup.contains("ConsistentApiSpecsBackup::ConfigUnavailable"));
+}
+
+#[test]
 fn mongo_namespace_admission_uses_the_dedicated_lease_client() {
     let mongo_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_source.contains("fn lease_db(&self) -> MongoDatabaseHandle"));
