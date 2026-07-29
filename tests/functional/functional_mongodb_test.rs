@@ -1841,7 +1841,9 @@ const CHANGE_STREAM_TEST_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(1)
 const CHANGE_STREAM_TEST_MONGO_OP_TIMEOUT: Duration = Duration::from_secs(10);
 const CHANGE_STREAM_TEST_MONGO_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHANGE_STREAM_TEST_MONGO_SERVER_SELECTION_TIMEOUT: Duration = Duration::from_secs(5);
-const CHANGE_STREAM_TEST_DROP_JOIN_BUDGET: Duration = Duration::from_secs(6);
+// Longer than MONGO_OP_TIMEOUT so fallback cleanup normally completes before a
+// later test can observe a still-armed shared failpoint, while remaining bounded.
+const CHANGE_STREAM_TEST_DROP_JOIN_BUDGET: Duration = Duration::from_secs(12);
 
 /// Issue #3330 acceptance: real replica-set coverage for prompt wake-up,
 /// watcher disruption/reconnect with durable recovery across the gap, and
@@ -1972,8 +1974,9 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         if finished.load(Ordering::SeqCst) {
             let _ = handle.join();
         } else {
-            // Detach — never block the test runtime or nextest worker forever.
-            std::mem::forget(handle);
+            // Dropping a standard JoinHandle detaches the thread without
+            // leaking the handle allocation or blocking this nextest worker.
+            drop(handle);
         }
     }
 
@@ -2167,8 +2170,8 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
         failpoint_count(&result)
     }
 
-    async fn clear_fail_command_failpoint(client: &MongoClient, phase: &str) {
-        let _ = mongo_op_timeout(
+    async fn clear_fail_command_failpoint(client: &MongoClient, phase: &str) -> bool {
+        mongo_op_timeout(
             phase,
             "clear failCommand failpoint",
             client.database("admin").run_command(doc! {
@@ -2176,7 +2179,8 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
                 "mode": "off",
             }),
         )
-        .await;
+        .await
+        .is_ok()
     }
 
     async fn drop_config_changes(client: &MongoClient, database: &str, phase: &str) {
@@ -2527,16 +2531,26 @@ async fn test_mongodb_change_stream_wakes_config_reload_on_replica_set() {
 
     // Prefer explicit bounded async cleanup; RAII remains as a panic-path
     // fallback that cannot join forever and still clears the shared failpoint.
-    clear_fail_command_failpoint(&mongo_client, "phase3 clear failpoint").await;
-    failpoint_guard.disarm();
+    if clear_fail_command_failpoint(&mongo_client, "phase3 clear failpoint").await {
+        failpoint_guard.disarm();
+    }
     drop(harness);
-    let _ = mongo_op_timeout(
+    // Drop now: if the explicit clear failed, the still-armed guard retries
+    // with a fresh client and a bounded join before later tests can start.
+    drop(failpoint_guard);
+    if mongo_op_timeout(
         "teardown",
         "drop isolated change-stream database",
         mongo_client.database(&mongo_database).drop(),
     )
-    .await;
-    db_guard.disarm();
+    .await
+    .is_ok()
+    {
+        db_guard.disarm();
+    }
+    // Likewise, retry a failed explicit database drop through the bounded
+    // fresh-client fallback before this test reports completion.
+    drop(db_guard);
 
     println!(
         "  OK: phase3 periodic/authoritative poll applied committed config while \
