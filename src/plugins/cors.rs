@@ -440,10 +440,7 @@ impl CorsPlugin {
                                 wildcard = true;
                                 continue;
                             }
-                            validate_origin_matcher_len(
-                                "'allowed_origins' string entry",
-                                origin,
-                            )?;
+                            validate_origin_matcher_len("'allowed_origins' string entry", origin)?;
                             if origin.starts_with('*') {
                                 patterns.push(OriginPattern::WildcardSubdomain(
                                     validate_wildcard_origin(origin)?,
@@ -537,9 +534,9 @@ impl CorsPlugin {
                 validate_origin_prefix(prefix)?;
                 Ok(Some(OriginPattern::Prefix(prefix.to_string())))
             }
-            (None, None, Some(regex)) => Ok(Some(OriginPattern::Regex(compile_origin_regex(
-                regex,
-            )?))),
+            (None, None, Some(regex)) => {
+                Ok(Some(OriginPattern::Regex(compile_origin_regex(regex)?)))
+            }
             (None, None, None) => Err(
                 "cors: 'allowed_origins' object matcher must specify one of \
                  'exact', 'prefix', or 'regex'"
@@ -1177,9 +1174,7 @@ pub(crate) fn validate_origin_prefix(value: &str) -> Result<(), String> {
 /// field-specific message — never a dropped or approximated matcher.
 pub(crate) fn compile_origin_regex(pattern: &str) -> Result<Regex, String> {
     if pattern.is_empty() {
-        return Err(
-            "cors: 'allowed_origins' regex matcher must be a non-empty string".to_string(),
-        );
+        return Err("cors: 'allowed_origins' regex matcher must be a non-empty string".to_string());
     }
     validate_origin_matcher_len("'allowed_origins' regex matcher", pattern)?;
     let anchored = crate::config::types::anchor_regex_pattern(pattern);

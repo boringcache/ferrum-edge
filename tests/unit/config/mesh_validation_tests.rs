@@ -2353,9 +2353,18 @@ mod virtual_service_cors {
     fn out_of_bounds_origin_matchers_rejected_with_field_specific_diagnostics() {
         let oversized = "a".repeat(600);
         for (matcher, needle) in [
-            (MeshCorsOriginMatch::Exact(oversized.clone()), "byte matcher limit"),
-            (MeshCorsOriginMatch::Prefix(oversized.clone()), "byte matcher limit"),
-            (MeshCorsOriginMatch::Regex(oversized.clone()), "byte matcher limit"),
+            (
+                MeshCorsOriginMatch::Exact(oversized.clone()),
+                "byte matcher limit",
+            ),
+            (
+                MeshCorsOriginMatch::Prefix(oversized.clone()),
+                "byte matcher limit",
+            ),
+            (
+                MeshCorsOriginMatch::Regex(oversized.clone()),
+                "byte matcher limit",
+            ),
             (
                 MeshCorsOriginMatch::Regex(
                     "((((((((((((((((((((((((((((a))))))))))))))))))))))))))))".into(),

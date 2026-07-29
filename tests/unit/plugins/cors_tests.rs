@@ -2154,7 +2154,9 @@ async fn test_credentialed_literal_exact_preflight_reflects_the_source_origin() 
     };
     assert_eq!(status_code, 204);
     assert_eq!(
-        headers.get("access-control-allow-origin").map(String::as_str),
+        headers
+            .get("access-control-allow-origin")
+            .map(String::as_str),
         Some("https://app.example.com")
     );
     assert_eq!(

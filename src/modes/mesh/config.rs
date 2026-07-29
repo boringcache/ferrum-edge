@@ -2787,9 +2787,7 @@ fn validate_virtual_service_cors_policies(
                     if value != "*"
                         && let Err(err) = crate::plugins::cors::validate_literal_exact_origin(value)
                     {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] {err}"
-                        ));
+                        errors.push(format!("{context}: cors.allowed_origins[{index}] {err}"));
                     }
                 }
                 MeshCorsOriginMatch::Prefix(value) => {
