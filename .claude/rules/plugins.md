@@ -170,10 +170,13 @@ on a native-gRPC request.
 
 ## Centralized Rate Limiting
 
-- `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
+- `rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, and `udp_rate_limiting` support `sync_mode: "redis"`.
 - Shared Redis client lives in `src/plugins/utils/redis_rate_limiter.rs`.
 - Algorithm is two-window weighted with pipelined `INCR`/`GET`/`EXPIRE`; no Lua.
-- Key format is `{prefix}:{rate_key}:{window_index}`. Default prefix is
+- Key format is `{escaped-prefix:escaped-rate-key}:{window_index}` — the braces
+  are a Redis Cluster hash tag so every key of one atomic operation shares a
+  slot; `%`, braces, and `:` are percent-escaped inside it. Default prefix is
   `{FERRUM_NAMESPACE}:{plugin_name}:{plugin-config-id}` — the config-id component
   isolates independent policies of one plugin type inside a namespace while
   replicas of the same policy keep sharing a budget. An explicit
@@ -184,10 +187,38 @@ on a native-gRPC request.
   TTL/retention math uses the saturating helpers in
   `src/plugins/utils/rate_limit.rs`. Local sliding windows retain a fixed
   `SLIDING_WINDOW_BUCKET_COUNT` (64) aggregate buckets per key — never one
-  timestamp per request. Ordinary HTTP, GraphQL, gRPC method, and UDP
-  rate-limit plugin roots are closed key sets; the AI rate-limit root remains
-  intentionally open and must stay in parity with OpenAPI.
-- Redis outage falls back to in-memory and reconnects in the background.
+  timestamp per request. All six Redis-backed rate-limit plugin roots
+  (`rate_limiting`, `graphql`, `grpc_method_router`, `ai_rate_limiter`,
+  `ws_rate_limiting`, `udp_rate_limiting`) are closed key sets enforced by
+  `reject_unknown_keys` against the plugin's `*_CONFIG_KEYS` allowlist, and each
+  must stay in exact parity with an `additionalProperties: false` OpenAPI
+  schema. A new root key therefore lands in the runtime allowlist,
+  `openapi.yaml`, and `docs/plugins.md` together — none of these roots accepts
+  an undeclared property. Parity is enforced by
+  `rate_limiter_configs_are_closed_and_bounded_in_openapi` and
+  `graphql_config_schema_matches_runtime_validation` in
+  `tests/unit/openapi_yaml_tests.rs`.
+- Redis outage behavior is `redis_failure_policy` (`fail_closed` default,
+  `local_fallback` opt-in); only the opt-in falls back to in-memory. The client
+  reconnects in the background either way. `request_deduplication` expresses the
+  same choice as `on_redis_unavailable` and does NOT accept
+  `redis_failure_policy`; `ai_semantic_cache` has neither.
+- Redis Cluster is NOT supported and is screened, not assumed: `INFO CLUSTER`
+  at connect plus `MOVED`/`ASK`/`CROSSSLOT`/`CLUSTERDOWN`/`TRYAGAIN` reactively.
+  The proactive probe is bounded by `redis_connect_timeout_seconds` (no new
+  key); an unanswered probe is a retryable outage, never proof of Cluster, and
+  its unscreened connection must not carry a policy command.
+  Rejection is terminal for the client — recovery pings must never clear it, and
+  no connection publication, command success, or recovery that completes after
+  the rejection may restore availability (one `EnforcementAvailability` atomic;
+  `publish_reachable` cannot beat `reject_topology`).
+- `ai_rate_limiter` admission only reserves an estimate, so the authoritative
+  post-response reconciliation is also fail-closed: an `enforcement_unavailable`
+  charge on a 2xx returns the same generic 503 as admission. A non-2xx response
+  keeps its status (a failed charge/release there only over-counts).
+- Local and explicit Redis-fallback maps reserve hard cardinality atomically:
+  existing keys retain their active budgets at capacity, while previously unseen
+  keys fail closed until idle-state pruning frees a slot.
 - `redis_username` and `redis_password` plugin fields are honored on plain and TLS code paths and override URL user-info.
 - `rediss://` uses global `FERRUM_TLS_*`.
 

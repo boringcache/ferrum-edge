@@ -88,6 +88,15 @@ fn make_stream_summary(proxy_id: &str, protocol: &str) -> StreamTransactionSumma
     }
 }
 
+/// Strip live NodeWaypoint ADR series appended outside the render cache.
+fn metrics_without_live_node_waypoint_series(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| !line.contains("ferrum_mesh_node_waypoint_"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
@@ -1147,8 +1156,13 @@ async fn test_render_cache_returns_same_output() {
     let first = registry.render();
     let second = registry.render();
 
-    // Both should be identical (second is from cache)
-    assert_eq!(first, second);
+    // Registry-cached exposition must be stable across scrapes; live
+    // NodeWaypoint ADR series are appended outside the cache (issue #3334).
+    assert_eq!(
+        metrics_without_live_node_waypoint_series(&first),
+        metrics_without_live_node_waypoint_series(&second),
+        "registry render cache must return stable exposition between scrapes"
+    );
     assert!(first.contains("cache-test"));
 }
 

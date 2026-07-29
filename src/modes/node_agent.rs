@@ -667,8 +667,9 @@ async fn start_node_agent_admin_listeners(
 
     // Safe-by-default bind: when the operator opts into the node-agent admin
     // listener but configures neither an explicit bind nor an allowlist, fall
-    // back to loopback so unauthenticated `/metrics` and `/health` are not
-    // exposed on the network. See `decide_admin_bind_address`.
+    // back to loopback so the admin surface is not exposed on the network by
+    // default. Endpoint authentication and observability-detail tiers still
+    // apply. See `decide_admin_bind_address`.
     let signals = AdminBindSignals::from_env();
     let admin_http_addr = decide_admin_bind_address(
         &env_config.admin_bind_address,
@@ -740,9 +741,9 @@ impl AdminBindSignals {
 
 /// Pure helper: pick the admin listener bind address for node-agent mode.
 ///
-/// The admin bind defaults to loopback (`127.0.0.1`), keeping unauthenticated
-/// `/metrics` and `/health` off the network unless the operator opts in. Two
-/// opt-in signals are honored:
+/// The admin bind defaults to loopback (`127.0.0.1`), keeping the admin surface
+/// off the network unless the operator opts in. Endpoint authentication and
+/// observability-detail tiers still apply. Two opt-in signals are honored:
 ///
 /// - An explicit `FERRUM_ADMIN_BIND_ADDRESS` is used verbatim.
 /// - `FERRUM_ADMIN_ALLOWED_CIDRS` with no explicit bind binds to `0.0.0.0` so
@@ -778,7 +779,8 @@ fn decide_admin_bind_address(
         warn!(
             "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with FERRUM_ADMIN_ALLOWED_CIDRS and no explicit \
              FERRUM_ADMIN_BIND_ADDRESS; binding node-agent admin to 0.0.0.0:{port} (restricted by the \
-             allowlist) so unauthenticated /metrics and /health are reachable for cluster scraping. \
+             admin allowlist) so admin routes are reachable for cluster scraping; endpoint authentication \
+             and observability-detail policies still apply. \
              Set FERRUM_ADMIN_BIND_ADDRESS to pin a specific address."
         );
         return Ok(std::net::SocketAddr::new(
@@ -793,8 +795,8 @@ fn decide_admin_bind_address(
     if !configured_ip.is_loopback() {
         warn!(
             "FERRUM_NODE_AGENT_ADMIN_ENABLED=true with no allowlist or explicit bind address configured; \
-             defaulting node-agent admin listener to 127.0.0.1:{port} so unauthenticated /metrics and /health \
-             are not exposed on the network. To expose it, set FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list> \
+             defaulting node-agent admin listener to 127.0.0.1:{port} so the admin surface is not exposed \
+             on the network. To expose it, set FERRUM_ADMIN_ALLOWED_CIDRS=<cidr-list> \
              or FERRUM_ADMIN_BIND_ADDRESS=<address>."
         );
         return Ok(std::net::SocketAddr::new(

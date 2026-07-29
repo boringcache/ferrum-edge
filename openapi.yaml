@@ -9276,6 +9276,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            closes the WebSocket with a policy Close frame;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -9364,6 +9376,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            drops the datagram;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5
@@ -10463,10 +10487,125 @@ components:
 
     MeshHealthResponse:
       type: object
-      required: [egress_scope]
+      required: [egress_scope, node_waypoint_observability]
       properties:
         egress_scope:
           $ref: "#/components/schemas/MeshEgressScopeHealth"
+        node_waypoint_observability:
+          $ref: "#/components/schemas/NodeWaypointObservabilitySnapshot"
+          description: |
+            NodeWaypoint ADR observability counters (issue #3334). Present on
+            authenticated `/health`/`/status` mesh detail for every mesh process;
+            `enabled` is true only when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
+            Counters are process-static and monotonic across config reload and
+            SVID rotation; they reset on NodeWaypoint process restart.
+
+    NodeWaypointObservabilitySnapshot:
+      type: object
+      required:
+        - enabled
+        - hbone_handshakes
+        - asserted_identity
+        - destination_policy_rejections
+        - missing_destination_metadata
+        - plaintext_fallback_attempts
+      properties:
+        enabled:
+          type: boolean
+          description: True when NodeWaypoint ADR counter producers are active.
+        hbone_handshakes:
+          $ref: "#/components/schemas/NodeWaypointHboneHandshakeSnapshot"
+        asserted_identity:
+          $ref: "#/components/schemas/NodeWaypointAssertedIdentitySnapshot"
+        destination_policy_rejections:
+          $ref: "#/components/schemas/NodeWaypointDestinationPolicySnapshot"
+        missing_destination_metadata:
+          type: integer
+          format: uint64
+          description: Secured targets skipped for absent Workload.node_waypoint metadata.
+        plaintext_fallback_attempts:
+          type: integer
+          format: uint64
+          description: Prohibited plaintext fallback attempts blocked fail-closed.
+
+    NodeWaypointHboneHandshakeSnapshot:
+      type: object
+      required:
+        - inbound_tls_success
+        - inbound_tls_failure
+        - inbound_connect_success
+        - inbound_connect_failure
+        - outbound_dial_success
+        - outbound_dial_failure
+      properties:
+        inbound_tls_success:
+          type: integer
+          format: uint64
+        inbound_tls_failure:
+          type: integer
+          format: uint64
+        inbound_connect_success:
+          type: integer
+          format: uint64
+        inbound_connect_failure:
+          type: integer
+          format: uint64
+        outbound_dial_success:
+          type: integer
+          format: uint64
+        outbound_dial_failure:
+          type: integer
+          format: uint64
+
+    NodeWaypointAssertedIdentitySnapshot:
+      type: object
+      required:
+        - accepted
+        - rejected_untrusted_assertor
+        - rejected_trust_domain_mismatch
+        - rejected_unauthenticated_hbone
+        - rejected_malformed
+        - rejected_stale_or_unknown
+      properties:
+        accepted:
+          type: integer
+          format: uint64
+        rejected_untrusted_assertor:
+          type: integer
+          format: uint64
+        rejected_trust_domain_mismatch:
+          type: integer
+          format: uint64
+        rejected_unauthenticated_hbone:
+          type: integer
+          format: uint64
+        rejected_malformed:
+          type: integer
+          format: uint64
+        rejected_stale_or_unknown:
+          type: integer
+          format: uint64
+
+    NodeWaypointDestinationPolicySnapshot:
+      type: object
+      required:
+        - authz_deny
+        - scope_missing
+        - destination_scope_missing
+        - relay_destination_denied
+      properties:
+        authz_deny:
+          type: integer
+          format: uint64
+        scope_missing:
+          type: integer
+          format: uint64
+        destination_scope_missing:
+          type: integer
+          format: uint64
+        relay_destination_denied:
+          type: integer
+          format: uint64
 
     # ── Health response ─────────────────────────────────────────────
     HealthResponse:
@@ -13313,14 +13452,82 @@ components:
       description: >-
         Plugin: transaction_debugger — Emits verbose request/response and
         terminal diagnostics via tracing::debug on the transaction_debug
-        target. Request and response payloads are never captured. Requires
-        FERRUM_LOG_LEVEL=debug to see output. Unsupported keys are rejected.
+        target. Requires FERRUM_LOG_LEVEL=debug to see output. Unsupported keys
+        are rejected. Body capture is opt-in and default off. It never forces an
+        ineligible message to buffer: a body is sampled only when the message
+        declares an identity Content-Encoding, a Content-Length that fits inside
+        the configured cap, and a capturable textual Content-Type
+        (application/json, +json, text/json,
+        application/x-www-form-urlencoded, text/plain). gRPC
+        (application/grpc*), SSE (text/event-stream), WebSocket upgrades
+        (including H2/H3 Extended CONNECT, excluded by typed request
+        provenance rather than headers), XML, GraphQL, multipart, text/html,
+        binary media types, chunked/unknown-length, and encoded messages keep
+        streaming and are reported as omitted with a stable reason. XML and
+        GraphQL are excluded because Ferrum has no bounded structure-aware
+        redactor for them. Request samples are taken after all request
+        transforms (backend-visible bytes) and response samples after all
+        response transforms (client-visible bytes). Content-Length is only an
+        admission screen: both final body hooks re-check the actual body length
+        against the configured cap before any scan and fail closed with a
+        content-free over_capture_limit omission, and an actually empty body
+        (a HEAD or 304 response declares a length it never sends) is reported
+        with the fixed empty_body reason rather than as a malformed structured
+        body. Samples are redacted before rendering
+        (JSON/form per field, text/plain per line as a coarse
+        operator opt-in, plus credential-shaped values anywhere), a malformed
+        JSON body renders as a fixed content-free marker instead of a partial
+        rendering, control and bidi characters are escaped, non-UTF-8 bodies
+        (including an incomplete multibyte tail) render as a fixed marker, and
+        every capture reports whether it was captured, truncated, binary, or
+        omitted. When the transaction_debug DEBUG target is disabled no body is
+        buffered for capture. Captured bytes go only to the transaction_debug
+        tracing target and are never written into transaction-log metadata.
       properties:
         redacted_headers:
           type: array
           items:
             type: string
           description: Additional header names to redact beyond the built-in sensitive list
+        log_request_body:
+          type: boolean
+          default: false
+          description: >-
+            Enable bounded, redacted capture of the backend-visible request
+            body. Null is rejected.
+        log_response_body:
+          type: boolean
+          default: false
+          description: >-
+            Enable bounded, redacted capture of the client-visible response
+            body. Null is rejected.
+        max_request_body_bytes:
+          type: integer
+          default: 1024
+          minimum: 1
+          maximum: 8192
+          description: >-
+            Per-request capture budget in bytes. Requires log_request_body
+            true; out-of-range values are rejected, never clamped.
+        max_response_body_bytes:
+          type: integer
+          default: 1024
+          minimum: 1
+          maximum: 8192
+          description: >-
+            Per-response capture budget in bytes. Requires log_response_body
+            true; out-of-range values are rejected, never clamped.
+        redacted_body_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: '\S'
+          description: >-
+            Additional body field names (compared case-insensitively) to redact
+            beyond the built-in credential markers. Requires log_request_body or
+            log_response_body true.
 
     CorrelationIdConfig:
       type: object
@@ -13513,6 +13720,7 @@ components:
         - $ref: "#/components/schemas/ProxyAlertsTeamsChannel"
         - $ref: "#/components/schemas/ProxyAlertsDiscordChannel"
         - $ref: "#/components/schemas/ProxyAlertsWebhookChannel"
+        - $ref: "#/components/schemas/ProxyAlertsEmailChannel"
       discriminator:
         propertyName: type
         mapping:
@@ -13520,6 +13728,7 @@ components:
           teams: "#/components/schemas/ProxyAlertsTeamsChannel"
           discord: "#/components/schemas/ProxyAlertsDiscordChannel"
           webhook: "#/components/schemas/ProxyAlertsWebhookChannel"
+          email: "#/components/schemas/ProxyAlertsEmailChannel"
 
     ProxyAlertsSlackChannel:
       type: object
@@ -13622,6 +13831,87 @@ components:
         body_template:
           type: string
           description: Template body. Supports generic notification variables plus proxy_alerts variables such as `${rule_name}`, `${proxy_name}`, `${observed}`, `${threshold}`, `${sample_count}`, `${window_seconds}`, and `${reason}`.
+
+    ProxyAlertsEmailChannel:
+      type: object
+      additionalProperties: false
+      required: [type, smtp_host, from, to]
+      description: |
+        Native SMTP delivery. TLS is mandatory: `starttls` upgrades the session
+        and fails closed when the relay does not advertise STARTTLS, and
+        `implicit_tls` handshakes immediately (SMTPS). Plaintext SMTP is not
+        offered, `AUTH` is never sent before the handshake completes, and
+        certificate verification is always enforced (this channel does not honor
+        `FERRUM_TLS_NO_VERIFY`; use `FERRUM_TLS_CA_BUNDLE_PATH` for private CAs).
+      properties:
+        type:
+          type: string
+          enum: [email]
+        smtp_host:
+          type: string
+          description: SMTP relay hostname or IP literal. No scheme, port, path, or credentials.
+        smtp_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: SMTP port. Defaults to 587 for `starttls` and 465 for `implicit_tls`.
+        tls_mode:
+          type: string
+          enum: [starttls, implicit_tls]
+          default: starttls
+          description: TLS posture for the session. Both values complete a verified handshake before any credential or message data is written.
+        tls_server_name:
+          type: string
+          description: Verified TLS identity override. Defaults to `smtp_host`.
+        username:
+          type: string
+          description: SMTP AUTH username. Prefer `username_env`.
+        username_env:
+          type: string
+          description: Environment variable containing the SMTP AUTH username.
+        password:
+          type: string
+          description: SMTP AUTH password. Prefer `password_env`. Redacted from lower-privilege plugin projections and audit records; full-admin reads remain raw by repository policy.
+        password_env:
+          type: string
+          description: Environment variable containing the SMTP AUTH password.
+        from:
+          type: string
+          format: email
+          description: Envelope and header sender address (max 254 bytes, ASCII addr-spec).
+        to:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+            format: email
+          description: Recipient addresses. Duplicates are collapsed.
+        subject_template:
+          type: string
+          maxLength: 1024
+          default: "[${severity}] ${title}"
+          description: Subject template. Supports the generic notification variables plus the proxy_alerts variables; control characters in substituted values are folded to spaces.
+        body_template:
+          type: string
+          maxLength: 65536
+          default: "${body}\n\n${fields}"
+          description: "Plain-text body template. Adds `${fields}`, the notification's key/value rows rendered as `Name: value` lines."
+        helo_name:
+          type: string
+          description: EHLO identity. Defaults to the domain of `from`.
+        connect_timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 60000
+          default: 5000
+          description: Applied independently to DNS resolution, TCP connect, and the TLS handshake, so a stalled connect can take up to three times this value before it fails.
+        command_timeout_ms:
+          type: integer
+          minimum: 100
+          maximum: 120000
+          default: 10000
+          description: Bounds each SMTP command/reply exchange, including DATA.
 
     ProxyAlertsRule:
       description: |
@@ -17674,6 +17964,18 @@ components:
         redis_password:
           type: string
           description: Redis password for authentication
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5
@@ -19294,7 +19596,12 @@ components:
         Mirror response bodies are always drained under max_response_body_bytes
         so Content-Length responses do not strand keep-alive pools. Retained
         request bodies share Bytes with the primary buffer and are admitted under
-        max_in_flight plus max_retained_request_body_bytes. The mirror request
+        max_in_flight plus max_retained_request_body_bytes. Sampling and that
+        admission run in the authorize phase, BEFORE the request body is
+        collected: a percentage-zero, sampled-out, or saturated request keeps
+        streaming and never allocates a mirror body, and
+        max_mirrored_request_body_bytes bounds a single mirrored body even when
+        the global request-body limit is unlimited. The mirror request
         always has a finite deadline (mirror_timeout_ms, else positive proxy
         backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
         process-wide ferrum_request_mirror_*_total lifecycle counters are exported
@@ -19346,7 +19653,14 @@ components:
         mirror_request_body:
           type: boolean
           default: true
-          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy. Shared Bytes are charged against max_retained_request_body_bytes for each in-flight task."
+          description: >-
+            When true, the request body is forwarded to the mirror target.
+            Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads).
+            Body collection is gated by authorize-phase sampling and admission:
+            only an admitted request is buffered, and Shared Bytes are charged
+            against max_retained_request_body_bytes for each in-flight task.
+            When false, or when percentage quantizes to 0, this instance
+            declares no request-body capability at all.
         max_in_flight:
           type: integer
           format: uint64
@@ -19365,9 +19679,29 @@ components:
           default: 67108864
           description: >-
             Aggregate retained request-body budget for in-flight mirrors on this
-            plugin instance. Shared Bytes bodies are charged once per task for
-            their length; exhaustion drops the new mirror attempt without
-            affecting the primary request. Default is 64 MiB.
+            plugin instance. Charged at pre-buffer admission as the full
+            max_mirrored_request_body_bytes ceiling for every admitted request
+            (declared Content-Length is never trusted for the charge; it is used
+            only to skip already-oversized bodies before sampling) and reconciled
+            to the observed body length, returning any surplus exactly once.
+            Size this against max_in_flight times max_mirrored_request_body_bytes
+            when mirroring at high concurrency. Exhaustion drops the new mirror
+            attempt without affecting the primary request. Default is 64 MiB.
+        max_mirrored_request_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 10485760
+          description: >-
+            Positive plugin-local ceiling on one mirrored request body, applied
+            even when the global FERRUM_MAX_REQUEST_BODY_SIZE_BYTES is set to 0
+            (unlimited). Combined with the global limit by the proxy; the
+            strictest positive value wins, and it applies only to requests this
+            instance admitted for mirroring. An explicit value above
+            max_retained_request_body_bytes is rejected at construction; when
+            the key is omitted the default clamps down to
+            max_retained_request_body_bytes instead of failing.
+            Default is 10 MiB, matching the global default.
         mirror_timeout_ms:
           type: integer
           format: uint64
@@ -19853,6 +20187,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -19977,6 +20323,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -21193,6 +21551,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5

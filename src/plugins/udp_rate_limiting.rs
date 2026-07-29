@@ -9,10 +9,10 @@ use std::time::Instant;
 use tracing::warn;
 
 use super::utils::rate_limit::{
-    RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID, UdpRateLimitAlgorithm, UdpRateLimitOp,
-    apply_rate_limit_cleanup, debug_assert_closed_root_keys, validate_window_seconds,
+    RATE_LIMIT_REDIS_CONFIG_KEYS, RateLimitBackend, STANDALONE_RATE_LIMIT_CONFIG_ID,
+    UdpRateLimitAlgorithm, UdpRateLimitOp, apply_rate_limit_cleanup, debug_assert_closed_root_keys,
+    debug_assert_rate_limit_redis_keys, validate_window_seconds,
 };
-use super::utils::redis_rate_limiter::REDIS_PLUGIN_CONFIG_KEYS;
 use super::{
     Plugin, PluginHttpClient, ProxyProtocol, UDP_ONLY_PROTOCOLS, UdpDatagramContext,
     UdpDatagramVerdict,
@@ -27,14 +27,14 @@ const UDP_RATE_LIMITING_POLICY_CONFIG_KEYS: &[&str] =
 /// Closed top-level key set for `udp_rate_limiting` plugin config.
 ///
 /// Must stay aligned with OpenAPI `UdpRateLimitingConfig`,
-/// [`REDIS_PLUGIN_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
+/// [`RATE_LIMIT_REDIS_CONFIG_KEYS`], and `docs/plugins.md`. A misspelled
 /// `sync_mdoe`/`bytes_per_secnod` otherwise loaded silently as per-process,
 /// datagram-only enforcement.
 pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "datagrams_per_second",
     "bytes_per_second",
     "window_seconds",
-    // Shared Redis sync (see REDIS_PLUGIN_CONFIG_KEYS)
+    // Shared Redis sync (see RATE_LIMIT_REDIS_CONFIG_KEYS)
     "sync_mode",
     "redis_url",
     "redis_tls",
@@ -44,6 +44,7 @@ pub const UDP_RATE_LIMITING_CONFIG_KEYS: &[&str] = &[
     "redis_health_check_interval_seconds",
     "redis_username",
     "redis_password",
+    "redis_failure_policy",
 ];
 
 const MAX_STATE_ENTRIES: usize = 100_000;
@@ -96,10 +97,11 @@ impl UdpRateLimiting {
             .ok_or_else(|| "udp_rate_limiting: config must be an object".to_string())?;
         // Keeps the documented key groups aligned with the closed root
         // allowlist used for admission and OpenAPI parity.
+        debug_assert_rate_limit_redis_keys();
         debug_assert_closed_root_keys(
             UDP_RATE_LIMITING_CONFIG_KEYS,
             UDP_RATE_LIMITING_POLICY_CONFIG_KEYS,
-            REDIS_PLUGIN_CONFIG_KEYS,
+            RATE_LIMIT_REDIS_CONFIG_KEYS,
         );
         reject_unknown_keys(
             object,
@@ -154,6 +156,16 @@ impl UdpRateLimiting {
     #[cfg(test)]
     pub(crate) fn local_map_shard_amount(&self) -> usize {
         self.limiter.local_map_shard_amount()
+    }
+
+    /// Effective `redis_failure_policy` for advisory coverage: `None` for a
+    /// local-only config, `FailClosed` unless the operator opted into
+    /// `local_fallback`. Not a production API.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub(crate) fn redis_failure_policy_for_test(
+        &self,
+    ) -> Option<super::utils::rate_limit::RedisFailurePolicy> {
+        self.limiter.redis_failure_policy()
     }
 
     /// Effective Redis key prefix for policy-isolation coverage. Not a
@@ -433,8 +445,17 @@ impl Plugin for UdpRateLimiting {
         if outcome.allowed {
             return UdpDatagramVerdict::Forward;
         }
-        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
 
+        if outcome.enforcement_unavailable {
+            // Centralized enforcement could not be consulted under
+            // `redis_failure_policy: "fail_closed"`. A datagram has no error
+            // channel, so failing closed is the drop itself. The shared backend
+            // emits the bounded once-per-outage warning; per-datagram warnings
+            // here would be attacker-controlled log amplification.
+            return UdpDatagramVerdict::Drop;
+        }
+
+        super::prometheus_metrics::global_registry().record_rate_limit_exceeded();
         let limit_kind = match outcome.metric {
             Some("bytes") => "byte_count",
             _ => "datagram_count",
