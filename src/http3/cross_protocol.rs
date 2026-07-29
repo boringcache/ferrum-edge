@@ -122,12 +122,11 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_STATUS_HEADER, GrpcResponseKind, proxy_grpc_request_from_bytes,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, RejectBodyDisposition, apply_response_headers,
-    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
-    TrailerSectionKind,
+    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
+    RejectBodyDisposition, ResponseTrailerGovernance, TrailerSectionKind, apply_response_headers,
     is_backend_response_strip_header, parse_connection_listed_headers,
-    reconcile_streaming_backend_trailers,
-    sanitize_client_response_headers_for_wire, strip_response_hop_by_hop_trailers,
+    reconcile_streaming_backend_trailers, sanitize_client_response_headers_for_wire,
+    strip_response_hop_by_hop_trailers,
 };
 use crate::request_epoch::RequestEpoch;
 use crate::retry::ErrorClass;

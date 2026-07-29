@@ -46,12 +46,12 @@ use crate::proxy::grpc_proxy::{
     GATEWAY_DEADLINE_EXCEEDED_MESSAGE, GATEWAY_DEADLINE_EXCEEDED_MESSAGE_HEADER,
 };
 use crate::proxy::headers::{
-    ClientResponseFraming, RejectBodyDisposition, apply_response_headers,
-    GatewayOwnedResponseHeaders, PrePolicyResponseHeaders, ResponseTrailerGovernance,
-    ResponseTrailerPolicyWitness, TrailerSectionKind,
-    content_length_header_value, is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, remove_content_length_header,
-    reconcile_backend_trailers_with_response_policy, reconcile_streaming_backend_trailers,
+    ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
+    RejectBodyDisposition, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
+    TrailerSectionKind, apply_response_headers, content_length_header_value,
+    is_backend_request_strip_header, is_proxy_owned_forwarding_header,
+    parse_connection_listed_from_str_map, reconcile_backend_trailers_with_response_policy,
+    reconcile_streaming_backend_trailers, remove_content_length_header,
     sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
 };
