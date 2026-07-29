@@ -2878,9 +2878,14 @@ mod inner {
 
                 let collection = self.config_changes();
                 let resume = resume_token.clone();
-                let opened = self
-                    .open_config_changes_change_stream(&collection, &namespace, resume)
-                    .await;
+                // Race the open against shutdown: `watch()` is a network round
+                // trip (and can wait on server selection) that would otherwise
+                // ignore the watch channel until the driver call returns.
+                let opened = tokio::select! {
+                    _ = shutdown.changed() => break,
+                    opened = self
+                        .open_config_changes_change_stream(&collection, &namespace, resume) => opened,
+                };
                 let mut stream = match opened {
                     Ok(stream) => stream,
                     Err(e) => {
