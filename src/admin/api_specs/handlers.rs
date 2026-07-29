@@ -1110,9 +1110,8 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
     }
     match (from, to) {
         (SpecFormat::Yaml, SpecFormat::Json) => {
-            let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES).map_err(|e| {
-                format!("YAML parse error during conversion: {}", e.message())
-            })?;
+            let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
+                .map_err(|e| format!("YAML parse error during conversion: {}", e.message()))?;
             serde_json::to_vec_pretty(&jv).map_err(|e| format!("JSON serialization error: {e}"))
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {

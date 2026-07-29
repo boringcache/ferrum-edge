@@ -10,7 +10,7 @@
 use serde_json::{Map, Number, Value};
 use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
-use std::ptr::{addr_of_mut, NonNull};
+use std::ptr::{NonNull, addr_of_mut};
 use std::slice;
 use unsafe_libyaml as sys;
 
@@ -103,7 +103,10 @@ enum NodeKind {
     Sequence(Vec<usize>),
     Mapping(Vec<(usize, usize)>),
     /// Alias edge preserved until budgeted expansion.
-    Alias { target: usize, name: String },
+    Alias {
+        target: usize,
+        name: String,
+    },
 }
 
 struct Document {
@@ -176,10 +179,7 @@ impl Budgets {
 
 /// Parse `body` as a single YAML document and expand aliases into JSON under
 /// the given node budget (and the module's depth/alias/byte/work caps).
-pub(crate) fn parse_yaml_to_json(
-    body: &[u8],
-    max_nodes: usize,
-) -> Result<Value, BoundedYamlError> {
+pub(crate) fn parse_yaml_to_json(body: &[u8], max_nodes: usize) -> Result<Value, BoundedYamlError> {
     let document = compose_document(body, max_nodes)?;
     let root = document.root.ok_or(BoundedYamlError::EmptyDocument)?;
     let mut budgets = Budgets {
@@ -583,9 +583,7 @@ fn scalar_to_json(
             return if parse_null(value.as_bytes()).is_some() {
                 Ok(Value::Null)
             } else {
-                Err(BoundedYamlError::Parse(
-                    "invalid !!null scalar".to_string(),
-                ))
+                Err(BoundedYamlError::Parse("invalid !!null scalar".to_string()))
             };
         }
         if tag == "tag:yaml.org,2002:bool" {
@@ -862,9 +860,8 @@ unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, BoundedYamlE
         sys::YAML_DOCUMENT_START_EVENT => Ok(Event::DocumentStart),
         sys::YAML_DOCUMENT_END_EVENT => Ok(Event::DocumentEnd),
         sys::YAML_ALIAS_EVENT => {
-            let name = unsafe { optional_cstr(event.data.alias.anchor) }?.ok_or_else(|| {
-                BoundedYamlError::Parse("alias event missing name".to_string())
-            })?;
+            let name = unsafe { optional_cstr(event.data.alias.anchor) }?
+                .ok_or_else(|| BoundedYamlError::Parse("alias event missing name".to_string()))?;
             Ok(Event::Alias { name })
         }
         sys::YAML_SCALAR_EVENT => {
@@ -917,14 +914,9 @@ unsafe fn optional_cstr(ptr: *const sys::yaml_char_t) -> Result<Option<String>, 
     let Some(nn) = NonNull::new(ptr as *mut i8) else {
         return Ok(None);
     };
-    let s = unsafe { cstr_to_string(nn.as_ptr()) }.ok_or_else(|| {
-        BoundedYamlError::Parse("YAML identifier is not valid UTF-8".to_string())
-    })?;
-    if s.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(s))
-    }
+    let s = unsafe { cstr_to_string(nn.as_ptr()) }
+        .ok_or_else(|| BoundedYamlError::Parse("YAML identifier is not valid UTF-8".to_string()))?;
+    if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
 }
 
 unsafe fn cstr_to_string(ptr: *const i8) -> Option<String> {

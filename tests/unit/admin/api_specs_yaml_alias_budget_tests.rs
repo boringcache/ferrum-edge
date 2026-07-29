@@ -9,9 +9,7 @@ use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
 use serde_json::json;
 
 fn proxy_yaml(id: &str) -> String {
-    format!(
-        "x-ferrum-proxy:\n  id: {id}\n  backend_host: backend.internal\n  backend_port: 443\n"
-    )
+    format!("x-ferrum-proxy:\n  id: {id}\n  backend_host: backend.internal\n  backend_port: 443\n")
 }
 
 #[test]
