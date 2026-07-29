@@ -1,0 +1,39 @@
+name: Fuzz Lockfile Bootstrap
+
+on:
+  pull_request:
+    paths:
+      - fuzz/Cargo.toml
+      - fuzz/rust-toolchain.toml
+      - .github/workflows/fuzz-lockfile-bootstrap.yml
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Generate fuzz Cargo.lock
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
+        with:
+          toolchain: nightly-2025-07-01
+
+      - name: Generate the standalone fuzz-workspace lockfile
+        run: cargo generate-lockfile --manifest-path fuzz/Cargo.toml
+
+      - name: Upload generated lockfile
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: fuzz-cargo-lock-${{ github.sha }}
+          path: fuzz/Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
