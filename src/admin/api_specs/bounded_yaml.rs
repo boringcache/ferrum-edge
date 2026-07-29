@@ -636,12 +636,12 @@ fn charge_value_bytes(budgets: &mut Budgets, value: &Value) -> Result<(), Bounde
 
 /// Exact byte length of a string after `serde_json` quoting/escaping.
 ///
-/// Expanded-byte accounting must bound the representation that
-/// `serde_json::to_vec` / `to_vec_pretty` will emit. Counting decoded UTF-8
-/// alone underestimates quotes, backslashes, and control characters by up to
-/// six bytes each, which alias expansion can amplify past the public 32 MiB
-/// ceiling. Kept allocation-free (no scratch buffer) to avoid admin-path
-/// memory spikes. Logic mirrors `extractor::json_string_serialized_len`.
+/// Expanded-byte accounting must bound the compact representation that
+/// `serde_json::to_vec` will emit. Counting decoded UTF-8 alone underestimates
+/// quotes, backslashes, and control characters by up to six bytes each, which
+/// alias expansion can amplify past the public 32 MiB ceiling. Kept
+/// allocation-free (no scratch buffer) to avoid admin-path memory spikes.
+/// Logic mirrors `extractor::json_string_serialized_len`.
 fn json_string_serialized_len(value: &str) -> usize {
     value.chars().fold(2usize, |bytes, character| {
         let encoded = match character {

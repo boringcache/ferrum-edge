@@ -1112,7 +1112,9 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
         (SpecFormat::Yaml, SpecFormat::Json) => {
             let jv = parse_yaml_to_json(body, MAX_SOURCE_DOCUMENT_NODES)
                 .map_err(|e| format!("YAML parse error during conversion: {}", e.message()))?;
-            serde_json::to_vec_pretty(&jv).map_err(|e| format!("JSON serialization error: {e}"))
+            // Keep the negotiated representation within the same 32 MiB
+            // compact-JSON ceiling enforced during bounded YAML expansion.
+            serde_json::to_vec(&jv).map_err(|e| format!("JSON serialization error: {e}"))
         }
         (SpecFormat::Json, SpecFormat::Yaml) => {
             let jv: serde_json::Value = serde_json::from_slice(body)
