@@ -3306,6 +3306,7 @@ async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
         SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
@@ -3645,6 +3646,7 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
         SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
@@ -6866,6 +6868,7 @@ fn compact_snapshot_recovery_serializes_take_write_restore_attempts() {
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
         SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let first_recovery = Arc::clone(&recovery);
