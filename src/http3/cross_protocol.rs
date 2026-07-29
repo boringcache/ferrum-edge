@@ -6850,20 +6850,14 @@ pub(crate) fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
-    // A framed unary body is a NATIVE gRPC wire contract only. A gRPC-Web client
-    // reads body-framed trailers, so provenance is withheld there and the
-    // rejection stays on the translated trailers-only path (the plugin also
-    // refuses gRPC-Web terminate before invocation).
-    let normalized = crate::proxy::normalize_reject_response_with_provenance(
+    // Cross-protocol rejects run only after backend dispatch; `serverless_function`
+    // terminate short-circuits in `before_proxy`, so framed unary provenance
+    // never reaches this normalizer.
+    let normalized = crate::proxy::normalize_reject_response(
         status,
         body,
         headers,
         native_grpc || grpc_web,
-        if native_grpc && !grpc_web {
-            crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx)
-        } else {
-            crate::proxy::FramedGrpcUnaryProvenance::NONE
-        },
     );
     if native_grpc || grpc_web {
         apply_h3_grpc_reject_metadata(ctx, &normalized);
@@ -7387,8 +7381,7 @@ where
 }
 
 /// Send-only core of [`write_normalized_grpc_reject`]: writes the trailers-only
-/// gRPC reject (or a framed unary DATA + trailers response for serverless
-/// terminate) and FINs the send half WITHOUT touching the recv half. Bounded
+/// gRPC reject and FINs the send half WITHOUT touching the recv half. Bounded
 /// `S: SendStream<Bytes>` so it accepts both the full `RequestStream` and a
 /// `split()` send half.
 async fn write_normalized_grpc_reject_send<S>(
@@ -7400,52 +7393,36 @@ async fn write_normalized_grpc_reject_send<S>(
 where
     S: SendStream<Bytes>,
 {
-    let framed_unary = crate::proxy::framed_unary_reject_parts(reject).is_some();
     debug_assert!(
-        framed_unary || reject.body.is_empty(),
-        "normalized gRPC rejects should be trailers-only or framed unary with trailers"
+        reject.body.is_empty(),
+        "cross-protocol gRPC rejects must be trailers-only"
     );
     let mut headers = reject.headers.clone();
     strip_client_response_hop_by_hop_headers(&mut headers);
-    let mut resp_builder = Response::builder().status(reject.http_status);
-    for (key, value) in &headers {
-        let sanitized_grpc_message;
-        let header_value = if key.eq_ignore_ascii_case("grpc-message") {
-            sanitized_grpc_message = sanitize_h3_grpc_message_for_header(value);
-            if sanitized_grpc_message.is_empty() {
-                continue;
-            }
-            sanitized_grpc_message.as_str()
+    if let Some(key) = headers
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case("grpc-message"))
+        .cloned()
+    {
+        let sanitized = sanitize_h3_grpc_message_for_header(&headers[&key]);
+        if sanitized.is_empty() {
+            headers.remove(&key);
         } else {
-            value.as_str()
-        };
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(header_value),
-        ) {
-            resp_builder = resp_builder.header(name, val);
+            headers.insert(key, sanitized);
         }
     }
-    let resp = resp_builder
-        .body(())
-        .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
+    let resp = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(reject.http_status),
+        &headers,
+    )
+    .body(())
+    .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
-    let mut bytes_streamed = 0u64;
-    if framed_unary {
-        // Shared handle, not a copy: the authorized terminate frame keeps the
-        // allocation identity it was normalized with all the way to QUIC.
-        let data = reject.body.clone();
-        bytes_streamed = data.len() as u64;
-        stream.send_data(data).await?;
-        let trailers =
-            crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
-        stream.send_trailers(trailers).await?;
-    }
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {
         response_status: reject.http_status.as_u16(),
         response_streamed: false,
-        bytes_streamed,
+        bytes_streamed: 0,
         bytes_sent,
         backend_target: None,
         backend_resolved_ip: None,

@@ -12124,32 +12124,36 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     // A rejection that carries byte-exact `serverless_function` terminate
     // provenance is emitted as HEADERS + one uncompressed unary DATA frame +
     // terminal trailers. Everything else — including a body that merely looks
-    // like a gRPC frame — normalizes to trailers-only below. The `Bytes` clone
-    // is a refcount bump; the authorized frame that reaches `send_data` is the
-    // caller's own buffer, never a copy of it.
-    let normalized = crate::proxy::normalize_reject_response_with_provenance(
-        http_status,
-        http_body.clone(),
-        headers,
-        true,
-        framed_unary_provenance,
-    );
-    if let Some((framed_body, framed_trailers)) =
-        crate::proxy::framed_unary_reject_parts(&normalized)
-    {
-        let framed_body = framed_body.clone();
-        let resp = h3_framed_unary_initial_response(&normalized.headers)
-            .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
-        stream.send_response(resp).await?;
-        stream.send_data(framed_body).await?;
-        let trailers =
-            crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(framed_trailers);
-        stream.send_trailers(trailers).await?;
-        stream.finish().await?;
-        if halt_recv {
-            crate::http3::stream_util::halt_request_body(stream);
+    // like a gRPC frame — normalizes to trailers-only below. Only authorizing
+    // provenance can produce framed parts, so skip the full normalizer on the
+    // ordinary H3 gRPC reject flood. The `Bytes` clone is a refcount bump; the
+    // authorized frame that reaches `send_data` is the caller's own buffer,
+    // never a copy of it.
+    if framed_unary_provenance.is_authorizing() {
+        let normalized = crate::proxy::normalize_reject_response_with_provenance(
+            http_status,
+            http_body.clone(),
+            headers,
+            true,
+            framed_unary_provenance,
+        );
+        if let Some((framed_body, framed_trailers)) =
+            crate::proxy::framed_unary_reject_parts(&normalized)
+        {
+            let framed_body = framed_body.clone();
+            let resp = h3_framed_unary_initial_response(&normalized.headers)
+                .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
+            stream.send_response(resp).await?;
+            stream.send_data(framed_body).await?;
+            let trailers =
+                crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(framed_trailers);
+            stream.send_trailers(trailers).await?;
+            stream.finish().await?;
+            if halt_recv {
+                crate::http3::stream_util::halt_request_body(stream);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     // This writer uses H3's status-mapping table rather than the H1/H2
