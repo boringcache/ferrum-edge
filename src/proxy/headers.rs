@@ -860,7 +860,18 @@ fn streaming_content_length_needs_repair(
 /// Preserve at most one valid streaming representation length and canonicalize
 /// its spelling. Multiple case variants are duplicate `Content-Length` fields
 /// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
+///
+/// Already-safe common path: exactly one lowercase `content-length` whose value
+/// is untrimmed and parseable under the same acceptance policy as
+/// [`streaming_content_length_needs_repair`] is left untouched — no remove or
+/// reinsert allocation. Leading zeroes remain accepted (and preserved) because
+/// this path only requires `parse::<u64>()` success, matching the repair
+/// predicate rather than inventing a stricter decimal spelling.
 fn canonicalize_streaming_content_length(headers: &mut std::collections::HashMap<String, String>) {
+    // Hot path: nothing to repair — keep existing key/value storage.
+    if !streaming_content_length_needs_repair(headers) {
+        return;
+    }
     let mut parsed = None;
     let mut count = 0usize;
     for (name, value) in headers.iter() {
@@ -917,6 +928,18 @@ pub fn content_length_header_value(
 }
 
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
+    // Hot path: exactly one lowercase canonical Content-Length whose untrimmed
+    // decimal value already matches the trusted length — preserve existing
+    // key/value storage instead of remove+reinsert allocation.
+    if headers
+        .get("content-length")
+        .is_some_and(|value| canonical_content_length_matches(value, len))
+        && !headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length")
+    {
+        return;
+    }
     remove_content_length_header(headers);
     headers.insert("content-length".to_string(), len.to_string());
 }

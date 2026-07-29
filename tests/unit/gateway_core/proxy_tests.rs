@@ -3242,6 +3242,136 @@ fn test_reject_body_disposition_is_method_and_status_derived() {
     ));
 }
 
+/// ExactBody / Streaming wire sanitizer must not remove+reinsert an already
+/// canonical `content-length` on the common path (hot-path allocation invariant),
+/// while still repairing malformed / noncanonical spellings fail-closed.
+#[test]
+fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
+    use ferrum_edge::proxy::headers::{
+        sanitize_client_response_headers_for_wire, ClientResponseFraming,
+    };
+    use std::collections::HashMap;
+
+    // ExactBody: single lowercase matching decimal — no mutation of the value.
+    let mut exact = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("x-ok".to_string(), "1".to_string()),
+    ]);
+    let exact_cl_ptr = exact.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut exact,
+        ClientResponseFraming::ExactBody {
+            status: 200,
+            len: 42,
+        },
+    );
+    assert_eq!(exact.get("content-length").map(String::as_str), Some("42"));
+    assert_eq!(
+        exact.get("content-length").unwrap().as_ptr(),
+        exact_cl_ptr,
+        "ExactBody must preserve already-canonical Content-Length storage"
+    );
+
+    // ExactBody repair branches: mismatch, leading zeroes, whitespace, mixed-case.
+    for (key, value, expected) in [
+        ("content-length", "999", "4"),
+        ("content-length", "042", "42"),
+        ("content-length", "42 ", "42"),
+        ("Content-Length", "42", "42"),
+    ] {
+        let mut headers = HashMap::from([(key.to_string(), value.to_string())]);
+        let framing = ClientResponseFraming::ExactBody {
+            status: 200,
+            len: expected.parse().unwrap(),
+        };
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected),
+            "ExactBody must repair {key}: {value:?}"
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length"),
+            "ExactBody repair must leave only lowercase content-length"
+        );
+    }
+
+    // Streaming: single lowercase untrimmed parseable value — no mutation.
+    let mut streaming = HashMap::from([("content-length".to_string(), "42".to_string())]);
+    let streaming_cl_ptr = streaming.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut streaming,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert_eq!(
+        streaming.get("content-length").map(String::as_str),
+        Some("42")
+    );
+    assert_eq!(
+        streaming.get("content-length").unwrap().as_ptr(),
+        streaming_cl_ptr,
+        "Streaming must preserve already-safe Content-Length storage"
+    );
+
+    // Streaming acceptance preserves leading zeroes (parseable) without rewrite.
+    let mut leading_zero = HashMap::from([("content-length".to_string(), "042".to_string())]);
+    let leading_ptr = leading_zero.get("content-length").unwrap().as_ptr();
+    sanitize_client_response_headers_for_wire(
+        &mut leading_zero,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert_eq!(
+        leading_zero.get("content-length").map(String::as_str),
+        Some("042"),
+        "Streaming must not invent a stricter leading-zero policy"
+    );
+    assert_eq!(
+        leading_zero.get("content-length").unwrap().as_ptr(),
+        leading_ptr
+    );
+
+    // Streaming repair: invalid, whitespace-padded, mixed-case, duplicates.
+    let mut invalid = HashMap::from([("content-length".to_string(), "not-a-number".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut invalid,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert!(!invalid.contains_key("content-length"));
+
+    let mut padded = HashMap::from([("content-length".to_string(), " 42 ".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut padded,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert_eq!(padded.get("content-length").map(String::as_str), Some("42"));
+
+    let mut mixed = HashMap::from([("Content-Length".to_string(), "42".to_string())]);
+    sanitize_client_response_headers_for_wire(
+        &mut mixed,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
+    assert!(!mixed.contains_key("Content-Length"));
+
+    let mut duplicates = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("Content-Length".to_string(), "42".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(
+        &mut duplicates,
+        ClientResponseFraming::Streaming { status: 200 },
+    );
+    assert!(
+        !duplicates
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "duplicate Content-Length case variants must be stripped"
+    );
+}
+
+
 /// An *empty* ordinary reject is the residual the emptiness heuristic missed:
 /// zero is an authoritative length, so a plugin-authored `Content-Length: 999`
 /// must be replaced by canonical `0` rather than preserved as a streaming
