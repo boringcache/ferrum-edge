@@ -133,6 +133,122 @@ fn family_for_sample_name(name: &str, types: &BTreeMap<String, String>) -> Optio
     None
 }
 
+/// Metric name plus optional `{...}` label block, stopping before the sample value.
+///
+/// Spaces inside quoted label values are not treated as the value delimiter.
+fn split_sample_prefix(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' || bytes[0] == b':') {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b':')
+    {
+        i += 1;
+    }
+
+    if i < bytes.len() && bytes[i] == b'{' {
+        let mut in_quote = false;
+        loop {
+            if i >= bytes.len() {
+                panic!("malformed exposition sample line: unclosed label block: {line}");
+            }
+            let b = bytes[i];
+            if in_quote {
+                if b == b'\\' {
+                    if i + 1 >= bytes.len() {
+                        panic!(
+                            "malformed exposition sample line: trailing escape in label value: {line}"
+                        );
+                    }
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_quote = false;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => {
+                    in_quote = true;
+                    i += 1;
+                }
+                b'}' => {
+                    i += 1;
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+        if in_quote {
+            panic!("malformed exposition sample line: unclosed label quote: {line}");
+        }
+    }
+
+    if i >= bytes.len() || !bytes[i].is_ascii_whitespace() {
+        panic!("malformed exposition sample line: missing value separator: {line}");
+    }
+    Some(&line[..i])
+}
+
+fn parse_label_keys(label_body: &str) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    let bytes = label_body.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] == b',' || bytes[i].is_ascii_whitespace()) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key_start = i;
+        while i < bytes.len() && bytes[i] != b'=' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            panic!("malformed exposition label block: missing '=' in {label_body:?}");
+        }
+        let key = label_body[key_start..i].trim();
+        if key.is_empty() {
+            panic!("malformed exposition label block: empty key in {label_body:?}");
+        }
+        keys.insert(key.to_string());
+        i += 1;
+        if i >= bytes.len() || bytes[i] != b'"' {
+            panic!("malformed exposition label block: expected quoted value for key {key} in {label_body:?}");
+        }
+        i += 1;
+        let mut closed = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'\\' {
+                if i + 1 >= bytes.len() {
+                    panic!("malformed exposition label block: trailing escape in {label_body:?}");
+                }
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                i += 1;
+                closed = true;
+                break;
+            }
+            i += 1;
+        }
+        if !closed {
+            panic!("malformed exposition label block: unclosed value for key {key} in {label_body:?}");
+        }
+    }
+    keys
+}
+
 fn parse_exposition_families(text: &str) -> BTreeMap<String, ExpositionFamily> {
     let mut helps: BTreeMap<String, String> = BTreeMap::new();
     let mut types: BTreeMap<String, String> = BTreeMap::new();
@@ -163,28 +279,29 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, ExpositionFamily> {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        let name_and_maybe_labels = line.split_once(' ').map(|(a, _)| a).unwrap_or(line);
-        let (name, label_body) = if let Some(idx) = name_and_maybe_labels.find('{') {
-            let end = name_and_maybe_labels
+        let Some(prefix) = split_sample_prefix(line) else {
+            continue;
+        };
+        let (name, label_body) = if let Some(open) = prefix.find('{') {
+            let close = prefix
                 .rfind('}')
-                .unwrap_or(name_and_maybe_labels.len());
+                .expect("sample prefix opened label block without closing brace");
+            if close <= open {
+                panic!("malformed exposition sample line: invalid label block in {line}");
+            }
             (
-                &name_and_maybe_labels[..idx],
-                Some(&name_and_maybe_labels[idx + 1..end]),
+                &prefix[..open],
+                Some(&prefix[open + 1..close]),
             )
         } else {
-            (name_and_maybe_labels, None)
+            (prefix, None)
         };
         let Some(family) = family_for_sample_name(name, &types) else {
             continue;
         };
         let entry = labels.entry(family).or_default();
         if let Some(body) = label_body {
-            for piece in body.split(',') {
-                if let Some((key, _)) = piece.split_once('=') {
-                    entry.insert(key.to_string());
-                }
-            }
+            entry.extend(parse_label_keys(body));
         }
     }
 
@@ -923,5 +1040,34 @@ fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
     assert!(
         type_literals_in_rust_source(noise).is_empty(),
         "comment/identifier noise must not be treated as exported # TYPE literals"
+    );
+}
+
+#[test]
+fn parse_exposition_families_handles_quoted_label_values() {
+    let exposition = "\
+# HELP ferrum_api_bandwidth_charges_total Chargeable bandwidth by direction.\n\
+# TYPE ferrum_api_bandwidth_charges_total counter\n\
+ferrum_api_bandwidth_charges_total{consumer=\"contract-consumer\",proxy_id=\"contract-proxy\",proxy_name=\"Contract API\",currency=\"USD\",namespace=\"contract-ns\",direction=\"ingress\",protocol_family=\"http\"} 0.0002\n\
+# HELP ferrum_api_escape_fixture_total Parser regression for escaped label values.\n\
+# TYPE ferrum_api_escape_fixture_total counter\n\
+ferrum_api_escape_fixture_total{note=\"quote: \\\" and slash: \\\\\",proxy_id=\"p\"} 1\n\
+";
+    let parsed = parse_exposition_families(exposition);
+    assert_eq!(
+        parsed["ferrum_api_bandwidth_charges_total"].labels,
+        BTreeSet::from([
+            "consumer".into(),
+            "currency".into(),
+            "direction".into(),
+            "namespace".into(),
+            "protocol_family".into(),
+            "proxy_id".into(),
+            "proxy_name".into(),
+        ])
+    );
+    assert_eq!(
+        parsed["ferrum_api_escape_fixture_total"].labels,
+        BTreeSet::from(["note".into(), "proxy_id".into()])
     );
 }
