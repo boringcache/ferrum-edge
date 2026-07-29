@@ -17,7 +17,7 @@ controlPlane:
     create: true
     # Grants get/list/watch (+ status patch) for GatewayClass/Gateway/HTTPRoute/
     # GRPCRoute/TCPRoute/TLSRoute/ReferenceGrant. TCPRoute live data-plane
-    # conformance is gated by scripts/gateway_api_data_plane_conformance.sh.
+    # conformance is gated by scripts/gateway_api_tcproute_conformance.sh.
     gatewayApi: true
     istio: true
     meshConfig: true

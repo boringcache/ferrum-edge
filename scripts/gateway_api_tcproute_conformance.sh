@@ -25,7 +25,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: blackbox-tcp-a
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -72,7 +72,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: blackbox-tcp-a
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   selector:
     app: blackbox-tcp-a
@@ -85,7 +85,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: blackbox-tcp-b
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -132,7 +132,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: blackbox-tcp-b
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   selector:
     app: blackbox-tcp-b
@@ -145,7 +145,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: blackbox-tcp-cross
-  namespace: gateway-conformance-web-backend
+  namespace: ${BACKEND_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -192,7 +192,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: blackbox-tcp-cross
-  namespace: gateway-conformance-web-backend
+  namespace: ${BACKEND_NAMESPACE}
 spec:
   selector:
     app: blackbox-tcp-cross
@@ -205,7 +205,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: blackbox-tcp-empty
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   ports:
     - name: tcp
@@ -219,7 +219,7 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: ferrum-blackbox-tcp
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   gatewayClassName: ferrum
   listeners:
@@ -260,7 +260,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-main
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -274,7 +274,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-cross
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -282,19 +282,19 @@ spec:
   rules:
     - backendRefs:
         - name: blackbox-tcp-cross
-          namespace: gateway-conformance-web-backend
+          namespace: ${BACKEND_NAMESPACE}
           port: ${TCP_ECHO_BACKEND_PORT}
 ---
 apiVersion: gateway.networking.k8s.io/v1beta1
 kind: ReferenceGrant
 metadata:
   name: allow-infra-tcproute-to-blackbox-tcp-cross
-  namespace: gateway-conformance-web-backend
+  namespace: ${BACKEND_NAMESPACE}
 spec:
   from:
     - group: gateway.networking.k8s.io
       kind: TCPRoute
-      namespace: gateway-conformance-infra
+      namespace: ${DP_GATEWAY_NAMESPACE}
   to:
     - group: ""
       kind: Service
@@ -304,7 +304,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-fail
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -318,7 +318,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-delete
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -376,8 +376,8 @@ assert_tcp_exchange_fails() {
   local label="$2"
   local body=""
   if body="$(tcp_exchange 127.0.0.1 "$port" "should-fail" 2>/dev/null)"; then
-    if grep -qE '^blackbox-tcp-(a|b|cross):' <<<"$body"; then
-      echo "${label}: unexpected successful TCP echo on :${port}: ${body}" >&2
+    if [ -n "$body" ]; then
+      echo "${label}: unexpected backend data on :${port}: ${body}" >&2
       return 1
     fi
     # Accepted-then-reset/empty responses are still fail-closed (no backend echo).
@@ -457,7 +457,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-invalid
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -479,7 +479,7 @@ apiVersion: gateway.networking.k8s.io/v1alpha2
 kind: TCPRoute
 metadata:
   name: blackbox-tcp-denied
-  namespace: gateway-conformance-infra
+  namespace: ${DP_GATEWAY_NAMESPACE}
 spec:
   parentRefs:
     - name: ferrum-blackbox-tcp
@@ -487,7 +487,7 @@ spec:
   rules:
     - backendRefs:
         - name: blackbox-tcp-cross
-          namespace: gateway-conformance-web-backend
+          namespace: ${BACKEND_NAMESPACE}
           port: ${TCP_ECHO_BACKEND_PORT}
 YAML
   # Translation rejects unpermitted refs fail-closed; wait for status and refuse echo.
