@@ -3823,6 +3823,9 @@ async fn saturated_spool_delivery_does_not_count_failed_high_water_diversion() {
     set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
         SpoolWriteHookPoint::BeforeWrite => hook_gate.on_before_write(),
         SpoolWriteHookPoint::AfterWrite => hook_gate.on_after_write(),
+        // Quota inventory snapshots are unrelated to the delivery-channel
+        // saturation boundary this test intentionally stalls.
+        SpoolWriteHookPoint::QuotaInventoryTaken => {}
     })));
 
     let (_, _, spool_lost_baseline) = spool_delivery_totals();
