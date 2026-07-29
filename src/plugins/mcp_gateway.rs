@@ -3364,25 +3364,26 @@ impl McpGateway {
         }
 
         if invalid {
-            let response_values = responses
-                .into_iter()
-                .zip(envelopes.iter())
-                .filter_map(|(slot, envelope)| match envelope {
-                    // A valid notification never receives a JSON-RPC response,
-                    // even when an invalid sibling prevents the whole HTTP
-                    // batch from being forwarded.
-                    Some(envelope)
-                        if matches!(envelope.message_kind, McpMessageKind::Notification) =>
-                    {
-                        None
-                    }
-                    Some(envelope) => Some(json_rpc_error_value(
-                        envelope.id.clone(),
-                        -32600,
-                        "JSON-RPC batch was not forwarded because a sibling member was invalid",
-                    )),
-                    None => Some(slot),
-                });
+            let response_values =
+                responses
+                    .into_iter()
+                    .zip(envelopes.iter())
+                    .filter_map(|(slot, envelope)| match envelope {
+                        // A valid notification never receives a JSON-RPC response,
+                        // even when an invalid sibling prevents the whole HTTP
+                        // batch from being forwarded.
+                        Some(envelope)
+                            if matches!(envelope.message_kind, McpMessageKind::Notification) =>
+                        {
+                            None
+                        }
+                        Some(envelope) => Some(json_rpc_error_value(
+                            envelope.id.clone(),
+                            -32600,
+                            "JSON-RPC batch was not forwarded because a sibling member was invalid",
+                        )),
+                        None => Some(slot),
+                    });
             // Apply the response budget while the synthetic array is assembled,
             // not after serializing the entire result. Admitted member ids are
             // bounded by the request/item caps, but their combined reflected
