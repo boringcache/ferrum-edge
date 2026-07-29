@@ -12671,7 +12671,9 @@ components:
       description: >-
         Bounded boolean predicate tree for stdout logging. Runtime validation
         rejects trees larger than 32 nodes. This form is mutually exclusive
-        with the flat stdout filter predicates.
+        with the flat stdout filter predicates. Status-code nodes evaluate
+        false for stream summaries, which do not carry an HTTP status; duration
+        and error nodes continue to evaluate against stream fields.
       oneOf:
         - type: object
           additionalProperties: false

@@ -380,6 +380,30 @@ mod tests {
     }
 
     #[test]
+    fn stream_expression_treats_status_as_false_and_duration_normally() {
+        let plugin = StdoutLogging::new(&json!({
+            "filter": {
+                "expression": {
+                    "op": "or",
+                    "left": { "op": "status_code_min", "value": 500 },
+                    "right": { "op": "min_latency_ms", "value": 200 }
+                }
+            }
+        }))
+        .expect("plugin config");
+
+        assert!(plugin.should_log_stream_transaction(&stream_summary()));
+
+        let status_only = StdoutLogging::new(&json!({
+            "filter": {
+                "expression": { "op": "status_code_min", "value": 500 }
+            }
+        }))
+        .expect("plugin config");
+        assert!(!status_only.should_log_stream_transaction(&stream_summary()));
+    }
+
+    #[test]
     fn stream_min_latency_filter_excludes_fast_streams() {
         let plugin = StdoutLogging::new(&json!({
             "filter": { "min_latency_ms": 1000 }

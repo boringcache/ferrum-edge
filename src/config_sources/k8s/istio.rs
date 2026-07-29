@@ -4752,14 +4752,28 @@ fn telemetry(
         .and_then(|arr| arr.first())
         .map(|al| {
             let disabled = al.get("disabled").and_then(Value::as_bool).unwrap_or(false);
-            let filter = al
-                .get("filter")
-                .and_then(|f| f.get("expression"))
-                .and_then(Value::as_str)
-                .map(parse_access_log_filter_expression)
-                .transpose()
-                .map_err(|message| invalid_resource(object, message))?
-                .flatten();
+            let filter = match al.get("filter") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(filter)) => match filter.get("expression") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(expression)) => {
+                        parse_access_log_filter_expression(expression)
+                            .map_err(|message| invalid_resource(object, message))?
+                    }
+                    Some(_) => {
+                        return Err(invalid_resource(
+                            object,
+                            "Telemetry accessLogging.filter.expression must be a string",
+                        ));
+                    }
+                },
+                Some(_) => {
+                    return Err(invalid_resource(
+                        object,
+                        "Telemetry accessLogging.filter must be an object",
+                    ));
+                }
+            };
             Ok::<_, K8sTranslateError>(MeshAccessLoggingConfig {
                 enabled: !disabled,
                 filter,
@@ -7665,6 +7679,31 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("response.code filter must use a numeric comparison")
+        );
+    }
+
+    #[test]
+    fn telemetry_access_log_filter_non_string_expression_is_rejected() {
+        let err = translate_k8s_objects(
+            &[object(
+                "Telemetry",
+                serde_json::json!({
+                    "accessLogging": [{
+                        "filter": {
+                            "expression": {
+                                "response.code": {">=": 500}
+                            }
+                        }
+                    }]
+                }),
+            )],
+            options(),
+        )
+        .expect_err("non-string expression must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("accessLogging.filter.expression must be a string")
         );
     }
 
