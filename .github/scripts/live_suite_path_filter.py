@@ -68,11 +68,22 @@ SUITE_PATTERNS: dict[str, list[str]] = {
     ],
     "mesh-federation": [
         r"^\.github/workflows/(ci|multicluster-federation-live)\.yml$",
-        r"^\.github/scripts/live_suite_path_filter\.py$",
+        # `validate_live_assertions.py` is the emitted-artifact release gate in
+        # the workflow's `gate` job, so editing it changes what a live run must
+        # prove about the artifact it published.
+        r"^\.github/scripts/(live_suite_path_filter|validate_live_assertions)\.py$",
         r"^\.github/actions/package-ferrum-runtime-image/",
         r"^\.github/actions/setup-kubernetes-tools/",
         r"^tests/k8s/multicluster-federation/",
         r"^tests/k8s/lib/(live_assertions|spire)\.sh$",
+        # The GA-contract half of this suite is the enforced, non-deferred
+        # `multicluster-federation` rows of ga_contract.yaml, pinned by the
+        # hosted conformance suite (live_contract.rs,
+        # mesh_multicluster_federation.rs, wired through mod.rs /
+        # conformance_tests.rs). Editing any of them changes what the live
+        # fixture is required to prove, so the live datapath must re-run.
+        r"^tests/conformance/(ga_contract\.yaml|contract\.rs|live_contract\.rs|mesh_multicluster_federation\.rs|mod\.rs)$",
+        r"^tests/conformance_tests\.rs$",
         r"^Cargo\.(toml|lock)$",
         r"^build\.rs$",
         r"^rust-toolchain\.toml$",
