@@ -888,6 +888,23 @@ pub mod _test_support {
         crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
     }
 
+    /// Returns `(replayed api_spec ids, skipped spec count, cleared ownership
+    /// tag count, replayed proxy id → surviving api_spec_id)`.
+    #[allow(clippy::type_complexity)]
+    pub fn plan_additive_rollback_api_specs_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        snapshot_specs: Vec<crate::config::types::ApiSpec>,
+        current: crate::config::types::GatewayConfig,
+        current_spec_ids: Vec<String>,
+    ) -> (Vec<String>, usize, usize, Vec<(String, Option<String>)>) {
+        crate::admin::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            snapshot_specs,
+            current,
+            current_spec_ids,
+        )
+    }
+
     pub fn collect_rejecting_runtime_config_errors_for_test(
         config: &crate::config::types::GatewayConfig,
     ) -> Vec<String> {

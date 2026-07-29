@@ -269,18 +269,20 @@ pub(crate) fn validate_stored_api_spec_metadata(
 }
 
 /// Parse `body` under a **declared** format using the same bounded document
-/// parser as ingestion.
+/// parser as ingestion and return the spec-language version it declares.
 ///
-/// This only admits JSON/YAML syntax (plus the source-tree node cap and YAML
-/// anchor/alias rejection). It does **not** extract resources, re-resolve
-/// `$ref`s, or regenerate config — restore must keep historical backups
-/// restorable without replaying extraction.
-pub(crate) fn parse_declared_spec_document(
+/// This admits JSON/YAML syntax (plus the source-tree node cap and YAML
+/// anchor/alias rejection) and the same root `swagger`/`openapi` version
+/// detection [`extract`] performs, so a document that declares no supported
+/// OpenAPI/Swagger version is rejected. It does **not** extract resources,
+/// re-resolve `$ref`s, or regenerate config — restore must keep historical
+/// backups restorable without replaying extraction.
+pub(crate) fn parse_declared_spec_document_version(
     body: &[u8],
     declared_format: SpecFormat,
-) -> Result<(), ExtractError> {
-    let _root = parse_root_document(body, Some(declared_format))?;
-    Ok(())
+) -> Result<String, ExtractError> {
+    let (root, _) = parse_root_document(body, Some(declared_format))?;
+    detect_version(&root)
 }
 
 // ---------------------------------------------------------------------------

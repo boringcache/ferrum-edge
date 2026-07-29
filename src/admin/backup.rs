@@ -2,6 +2,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::config::db_backend::validate_api_spec_proxy_plugin_association;
 use crate::config::types::{
     ApiSpec, Consumer, GatewayConfig, PluginConfig, Proxy, SpecFormat, Upstream,
 };
@@ -447,24 +448,43 @@ pub(crate) fn validate_restore_api_specs_section(
             continue;
         }
         // Validate document syntax for the *declared* format with the same
-        // bounded parser as ingestion. Do not re-extract resources or resolve
+        // bounded parser as ingestion, and detect the spec-language version the
+        // document actually declares. Do not re-extract resources or resolve
         // external refs — historical backups must remain restorable as-is.
         // Parse errors are mapped to generic messages so serde snippets that
         // may contain document fragments never enter operator responses/logs.
-        if let Err(parse_error) = crate::admin::api_specs::extractor::parse_declared_spec_document(
-            &decompressed,
-            spec.spec_format,
-        ) {
-            let reason = match parse_error {
-                crate::admin::api_specs::ExtractError::InvalidJson(_) => {
-                    "document is not valid JSON for declared spec_format"
+        let document_version =
+            match crate::admin::api_specs::extractor::parse_declared_spec_document_version(
+                &decompressed,
+                spec.spec_format,
+            ) {
+                Ok(version) => version,
+                Err(parse_error) => {
+                    let reason = match parse_error {
+                        crate::admin::api_specs::ExtractError::InvalidJson(_) => {
+                            "document is not valid JSON for declared spec_format"
+                        }
+                        crate::admin::api_specs::ExtractError::InvalidYaml(_) => {
+                            "document is not valid YAML for declared spec_format"
+                        }
+                        crate::admin::api_specs::ExtractError::UnknownVersion => {
+                            "document declares no supported OpenAPI or Swagger version"
+                        }
+                        _ => "document failed bounded format validation",
+                    };
+                    errors.push(format!("api_spec '{}': {reason}", item.id));
+                    continue;
                 }
-                crate::admin::api_specs::ExtractError::InvalidYaml(_) => {
-                    "document is not valid YAML for declared spec_format"
-                }
-                _ => "document failed bounded format validation",
             };
-            errors.push(format!("api_spec '{}': {reason}", item.id));
+        // Stored `spec_version` is what `GET /api-specs` reports and what
+        // version-sensitive tooling keys off. A backup that claims one version
+        // while carrying a document that declares another must not persist.
+        // Never echo either value — both are attacker-controlled.
+        if document_version != spec.spec_version {
+            errors.push(format!(
+                "api_spec '{}': spec_version does not match the version declared by the document",
+                item.id
+            ));
             continue;
         }
         match proxy_by_id.get(spec.proxy_id.as_str()) {
@@ -519,10 +539,125 @@ pub(crate) fn validate_restore_api_specs_section(
         }
     }
 
+    validate_restore_api_spec_ownership_graph(
+        &specs,
+        proxies,
+        upstreams,
+        plugin_configs,
+        &mut errors,
+    );
+
     if errors.is_empty() {
         Ok(specs)
     } else {
         Err(errors)
+    }
+}
+
+/// Reject server-managed ownership graphs that the API-spec lifecycle can never
+/// produce and whose `PUT`/`DELETE` cleanup would therefore corrupt.
+///
+/// The checks mirror invariants already enforced elsewhere rather than inventing
+/// a second policy:
+///
+/// * exactly one proxy carries a spec's id and it is that spec's `proxy_id`
+///   (spec extraction stamps the owning proxy and nothing else);
+/// * a spec owns at most one upstream (`load_single_spec_owned_upstream` and the
+///   direct-proxy-delete recovery path both treat more as unrecoverable);
+/// * a spec-owned upstream is only referenced by its own proxy (`Proxy::
+///   after_validate` refuses attaching a spec-owned upstream to any other proxy);
+/// * every spec-owned plugin is valid for the owning proxy per
+///   [`validate_api_spec_proxy_plugin_association`] and is actually associated
+///   with it (extraction always rebuilds `proxy.plugins` from the spec plugins).
+///
+/// Hand-managed resources (`api_spec_id == None`) are never inspected, so the
+/// direct-admin drift that API-spec `PUT`/`DELETE` deliberately supports —
+/// hand-added plugins/upstreams attached to a spec-owned proxy, or a spec-owned
+/// proxy pointed at a hand-managed upstream — still restores unchanged.
+///
+/// Errors name only ids that already passed resource-id validation on the
+/// canonical restore candidate; no document content or metadata is echoed.
+fn validate_restore_api_spec_ownership_graph(
+    specs: &[ApiSpec],
+    proxies: &[Proxy],
+    upstreams: &[Upstream],
+    plugin_configs: &[PluginConfig],
+    errors: &mut Vec<String>,
+) {
+    let mut proxies_by_spec: HashMap<&str, Vec<&Proxy>> = HashMap::new();
+    for proxy in proxies {
+        if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+            proxies_by_spec.entry(spec_id).or_default().push(proxy);
+        }
+    }
+    let mut upstreams_by_spec: HashMap<&str, Vec<&Upstream>> = HashMap::new();
+    for upstream in upstreams {
+        if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+            upstreams_by_spec.entry(spec_id).or_default().push(upstream);
+        }
+    }
+    let mut plugins_by_spec: HashMap<&str, Vec<&PluginConfig>> = HashMap::new();
+    for plugin in plugin_configs {
+        if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+            plugins_by_spec.entry(spec_id).or_default().push(plugin);
+        }
+    }
+
+    for spec in specs {
+        let spec_id = spec.id.as_str();
+        let owning_proxy_id = spec.proxy_id.as_str();
+        let tagged_proxies = proxies_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        // The per-item pass already proved the declared owner carries the tag,
+        // so anything other than exactly that one proxy is a second claimant.
+        if tagged_proxies.len() != 1 || tagged_proxies[0].id != spec.proxy_id {
+            errors.push(format!(
+                "api_spec '{spec_id}': exactly one proxy may carry this api_spec_id and it must be the declared owning proxy '{owning_proxy_id}'"
+            ));
+            continue;
+        }
+        let owning_proxy = tagged_proxies[0];
+
+        let owned_upstreams = upstreams_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        if owned_upstreams.len() > 1 {
+            errors.push(format!(
+                "api_spec '{spec_id}': owns {} upstreams; at most one spec-owned upstream is supported",
+                owned_upstreams.len()
+            ));
+        }
+        for upstream in owned_upstreams {
+            for proxy in proxies {
+                if proxy.id != owning_proxy_id
+                    && proxy.upstream_id.as_deref() == Some(upstream.id.as_str())
+                {
+                    errors.push(format!(
+                        "api_spec '{spec_id}': spec-owned upstream '{}' is referenced by proxy '{}', which this api_spec does not own",
+                        upstream.id, proxy.id
+                    ));
+                }
+            }
+        }
+
+        let associated_plugin_ids: HashSet<&str> = owning_proxy
+            .plugins
+            .iter()
+            .map(|association| association.plugin_config_id.as_str())
+            .collect();
+        let owned_plugins = plugins_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        for plugin in owned_plugins {
+            if validate_api_spec_proxy_plugin_association(plugin, owning_proxy_id).is_err() {
+                errors.push(format!(
+                    "api_spec '{spec_id}': spec-owned plugin_config '{}' is not a valid association for owning proxy '{owning_proxy_id}'",
+                    plugin.id
+                ));
+                continue;
+            }
+            if !associated_plugin_ids.contains(plugin.id.as_str()) {
+                errors.push(format!(
+                    "api_spec '{spec_id}': spec-owned plugin_config '{}' is not associated with owning proxy '{owning_proxy_id}'",
+                    plugin.id
+                ));
+            }
+        }
     }
 }
 
@@ -1022,6 +1157,196 @@ mod tests {
                 .any(|e| e.contains("server_urls exceed maximum cardinality")),
             "expected server_urls cardinality rejection, got {err:?}"
         );
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_unknown_and_mismatched_spec_versions() {
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+
+        // A document with no supported OpenAPI/Swagger version must not persist,
+        // even though it is syntactically valid JSON for the declared format.
+        let versionless = br#"{"info":{"title":"t","version":"1"},"paths":{}}"#;
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![sample_spec_item("spec-1", "proxy-1", versionless)],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("versionless document");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("declares no supported OpenAPI or Swagger version")),
+            "expected unknown-version rejection, got {err:?}"
+        );
+
+        // Stored `spec_version` must equal the version the document declares.
+        let raw = br#"{"swagger":"2.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.spec_version = "3.1.0".to_string();
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("version mismatch");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("spec_version does not match the version")),
+            "expected version-mismatch rejection, got {err:?}"
+        );
+
+        // The matching declaration still restores.
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.spec_version = "2.0".to_string();
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let specs = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect("matching swagger 2.0 version must restore");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].spec_version, "2.0");
+    }
+
+    fn owned_proxy_scoped_plugin(
+        plugin_id: &str,
+        proxy_id: &str,
+        spec_id: &str,
+    ) -> serde_json::Value {
+        json!({
+            "id": plugin_id,
+            "plugin_name": "key_auth",
+            "namespace": "ferrum",
+            "scope": "proxy",
+            "proxy_id": proxy_id,
+            "config": {},
+            "api_spec_id": spec_id
+        })
+    }
+
+    fn owned_upstream(upstream_id: &str, spec_id: &str) -> Upstream {
+        serde_json::from_value(json!({
+            "id": upstream_id,
+            "name": upstream_id,
+            "namespace": "ferrum",
+            "targets": [],
+            "api_spec_id": spec_id
+        }))
+        .expect("upstream")
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_impossible_ownership_graphs() {
+        let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let section = || ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![sample_spec_item("spec-1", "proxy-1", raw)],
+        };
+
+        // A second proxy claiming the same spec id is unreachable through the
+        // API-spec lifecycle and would make PUT/DELETE cleanup ambiguous.
+        let proxies = vec![
+            sample_owned_proxy("spec-1", "proxy-1"),
+            sample_owned_proxy("spec-1", "proxy-2"),
+        ];
+        let err = validate_restore_api_specs_section(&section(), &proxies, &[], &[], 25)
+            .expect_err("second claimant proxy");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("exactly one proxy may carry this api_spec_id")),
+            "expected second-claimant rejection, got {err:?}"
+        );
+
+        // Two spec-owned upstreams for one spec break the single-owned-upstream
+        // lifecycle invariant.
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+        let upstreams = vec![owned_upstream("up-1", "spec-1"), owned_upstream("up-2", "spec-1")];
+        let err = validate_restore_api_specs_section(&section(), &proxies, &upstreams, &[], 25)
+            .expect_err("multiple owned upstreams");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("at most one spec-owned upstream is supported")),
+            "expected single-owned-upstream rejection, got {err:?}"
+        );
+
+        // A spec-owned upstream may not be attached to a proxy the spec does not
+        // own; direct admin already refuses that attachment.
+        let mut foreign_proxy = sample_owned_proxy("spec-1", "proxy-1");
+        foreign_proxy.id = "proxy-hand".to_string();
+        foreign_proxy.listen_path = Some("/hand".to_string());
+        foreign_proxy.api_spec_id = None;
+        foreign_proxy.upstream_id = Some("up-1".to_string());
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1"), foreign_proxy];
+        let err = validate_restore_api_specs_section(
+            &section(),
+            &proxies,
+            &[owned_upstream("up-1", "spec-1")],
+            &[],
+            25,
+        )
+        .expect_err("foreign reference to a spec-owned upstream");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("is referenced by proxy 'proxy-hand'")),
+            "expected foreign-upstream-reference rejection, got {err:?}"
+        );
+
+        // A spec-owned plugin targeted at another proxy is lifecycle-invalid.
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+        let plugin: PluginConfig =
+            serde_json::from_value(owned_proxy_scoped_plugin("plug-1", "proxy-other", "spec-1"))
+                .expect("plugin");
+        let err = validate_restore_api_specs_section(&section(), &proxies, &[], &[plugin], 25)
+            .expect_err("plugin targeting another proxy");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("is not a valid association for owning proxy 'proxy-1'")),
+            "expected wrong-proxy plugin rejection, got {err:?}"
+        );
+
+        // A spec-owned plugin the owning proxy does not attach can never be
+        // produced by extraction and would be silently inert.
+        let plugin: PluginConfig =
+            serde_json::from_value(owned_proxy_scoped_plugin("plug-1", "proxy-1", "spec-1"))
+                .expect("plugin");
+        let err =
+            validate_restore_api_specs_section(&section(), &proxies, &[], &[plugin.clone()], 25)
+                .expect_err("unassociated spec-owned plugin");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("is not associated with owning proxy 'proxy-1'")),
+            "expected unassociated-plugin rejection, got {err:?}"
+        );
+
+        // The well-formed graph — one owning proxy, one owned upstream, one
+        // attached owned plugin, plus untouched hand-managed resources — passes.
+        let mut owning_proxy = sample_owned_proxy("spec-1", "proxy-1");
+        owning_proxy.plugins = vec![crate::config::types::PluginAssociation {
+            plugin_config_id: "plug-1".to_string(),
+        }];
+        let hand_plugin: PluginConfig = serde_json::from_value(json!({
+            "id": "hand-plug",
+            "plugin_name": "key_auth",
+            "namespace": "ferrum",
+            "scope": "global",
+            "config": {}
+        }))
+        .expect("hand plugin");
+        let hand_upstream: Upstream = serde_json::from_value(json!({
+            "id": "hand-up",
+            "name": "hand-up",
+            "namespace": "ferrum",
+            "targets": []
+        }))
+        .expect("hand upstream");
+        let specs = validate_restore_api_specs_section(
+            &section(),
+            &[owning_proxy],
+            &[owned_upstream("up-1", "spec-1"), hand_upstream],
+            &[plugin, hand_plugin],
+            25,
+        )
+        .expect("a well-formed server-managed graph must restore");
+        assert_eq!(specs.len(), 1);
     }
 
     #[test]

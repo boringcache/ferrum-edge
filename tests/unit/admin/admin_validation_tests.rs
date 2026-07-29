@@ -990,6 +990,142 @@ fn intervening_clear_recovery_keeps_current_ids_and_rejects_invalid_union() {
     assert!(errors.iter().any(|error| error.contains("duplicate")));
 }
 
+fn recovery_owned_proxy(
+    proxy_id: &str,
+    spec_id: Option<&str>,
+) -> ferrum_edge::config::types::Proxy {
+    serde_json::from_value(json!({
+        "id": proxy_id,
+        "namespace": "ferrum",
+        "listen_path": format!("/{proxy_id}"),
+        "backend_scheme": "http",
+        "backend_host": "backend.example.com",
+        "backend_port": 8080,
+        "api_spec_id": spec_id
+    }))
+    .expect("recovery proxy")
+}
+
+fn recovery_api_spec(spec_id: &str, proxy_id: &str) -> ferrum_edge::config::types::ApiSpec {
+    let raw = br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+    ferrum_edge::config::types::ApiSpec {
+        id: spec_id.to_string(),
+        namespace: "ferrum".to_string(),
+        proxy_id: proxy_id.to_string(),
+        spec_version: "3.1.0".to_string(),
+        spec_format: ferrum_edge::config::types::SpecFormat::Json,
+        spec_content: ferrum_edge::admin::spec_codec::compress_gzip(raw).expect("compress"),
+        content_encoding: "gzip".to_string(),
+        uncompressed_size: raw.len() as u64,
+        content_hash: ferrum_edge::admin::spec_codec::sha256_hex(raw),
+        title: None,
+        info_version: None,
+        description: None,
+        contact_name: None,
+        contact_email: None,
+        license_name: None,
+        license_identifier: None,
+        tags: vec![],
+        server_urls: vec![],
+        operation_count: 0,
+        resource_hash: String::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+/// An intervening writer that re-created the snapshot's proxy id — but not its
+/// API spec — must not have that proxy silently re-parented to the snapshot
+/// spec. The spec is skipped and reported instead of inserted against a resource
+/// this replay never wrote.
+#[test]
+fn additive_rollback_skips_specs_whose_owning_proxy_id_was_recreated() {
+    let snapshot = ferrum_edge::config::types::GatewayConfig {
+        proxies: vec![recovery_owned_proxy("shared-proxy", Some("snapshot-spec"))],
+        ..Default::default()
+    };
+    // The intervening writer owns `shared-proxy` now, and carries no api_spec.
+    let current = ferrum_edge::config::types::GatewayConfig {
+        proxies: vec![recovery_owned_proxy("shared-proxy", None)],
+        ..Default::default()
+    };
+
+    let (replayed, skipped, cleared, proxy_ownership) =
+        ferrum_edge::_test_support::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            vec![recovery_api_spec("snapshot-spec", "shared-proxy")],
+            current,
+            Vec::new(),
+        );
+    assert!(
+        replayed.is_empty(),
+        "the snapshot spec must not be replayed against the intervening proxy: {replayed:?}"
+    );
+    assert_eq!(skipped, 1, "the skipped spec must be reported");
+    assert_eq!(cleared, 0);
+    assert!(
+        proxy_ownership.is_empty(),
+        "the intervening proxy already exists, so nothing is replayed: {proxy_ownership:?}"
+    );
+}
+
+/// When the whole owning snapshot graph is still absent, the spec replays and
+/// keeps its ownership tag.
+#[test]
+fn additive_rollback_replays_specs_whose_owning_proxy_is_also_replayed() {
+    let snapshot = ferrum_edge::config::types::GatewayConfig {
+        proxies: vec![recovery_owned_proxy("snapshot-proxy", Some("snapshot-spec"))],
+        ..Default::default()
+    };
+    let current = ferrum_edge::config::types::GatewayConfig {
+        proxies: vec![recovery_owned_proxy("intervening-proxy", None)],
+        ..Default::default()
+    };
+
+    let (replayed, skipped, cleared, proxy_ownership) =
+        ferrum_edge::_test_support::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            vec![recovery_api_spec("snapshot-spec", "snapshot-proxy")],
+            current,
+            Vec::new(),
+        );
+    assert_eq!(replayed, vec!["snapshot-spec".to_string()]);
+    assert_eq!(skipped, 0);
+    assert_eq!(cleared, 0);
+    assert_eq!(
+        proxy_ownership,
+        vec![("snapshot-proxy".to_string(), Some("snapshot-spec".to_string()))]
+    );
+}
+
+/// A replayed resource whose owning spec is not replayed (here the intervening
+/// writer already owns that spec id) is restored hand-managed rather than being
+/// handed to a spec that never generated it.
+#[test]
+fn additive_rollback_strips_ownership_tags_for_specs_it_cannot_replay() {
+    let snapshot = ferrum_edge::config::types::GatewayConfig {
+        proxies: vec![recovery_owned_proxy("snapshot-proxy", Some("shared-spec"))],
+        ..Default::default()
+    };
+    let current = ferrum_edge::config::types::GatewayConfig::default();
+
+    let (replayed, skipped, cleared, proxy_ownership) =
+        ferrum_edge::_test_support::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            vec![recovery_api_spec("shared-spec", "snapshot-proxy")],
+            current,
+            vec!["shared-spec".to_string()],
+        );
+    assert!(replayed.is_empty());
+    assert_eq!(skipped, 0, "an intervening-owned spec id is not a skip");
+    assert_eq!(cleared, 1);
+    assert_eq!(
+        proxy_ownership,
+        vec![("snapshot-proxy".to_string(), None)],
+        "the replayed proxy must not be attached to the intervening spec"
+    );
+}
+
 #[test]
 fn late_api_spec_post_compensation_preserves_intervening_proxy_plugins() {
     let api_spec_source = include_str!("../../../src/admin/api_specs/handlers.rs");

@@ -4923,25 +4923,188 @@ async fn restore_snapshot_after_intervening_clear(
             )]);
         }
     };
-    let missing_specs: Vec<ApiSpec> = snapshot
-        .api_specs
-        .iter()
-        .filter(|spec| !current_spec_ids.contains(&spec.id))
-        .cloned()
-        .collect();
-    if !missing_specs.is_empty() {
-        missing.api_specs = Some(ApiSpecsBackupSection::from_specs(&missing_specs));
+    let plan = plan_additive_rollback_api_specs(
+        &snapshot.api_specs,
+        &snapshot.payload,
+        &current_spec_ids,
+        &mut missing,
+    );
+    if !plan.replay.is_empty() {
+        missing.api_specs = Some(ApiSpecsBackupSection::from_specs(&plan.replay));
     }
 
     let mode = BatchConfigWriteMode::RestoreRollbackReplay {
         guard_owner: guard_owner.to_string(),
     };
-    let (_, errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
+    let (_, mut errors, _) = persist_payload_resources(db, &missing, false, &mode).await;
+    // Report an incomplete recovery rather than a silent success: the operator
+    // must reconcile these by hand. Counts only — no resource ids, which may be
+    // attacker-influenced payload values.
+    if plan.skipped_specs > 0 {
+        errors.push(format!(
+            "{} pre-restore API spec(s) were not replayed because an intervening writer already owns their resource ids; the intervening graph was left intact and no snapshot ownership was attached to it",
+            plan.skipped_specs
+        ));
+    }
+    if plan.cleared_ownership_tags > 0 {
+        errors.push(format!(
+            "{} replayed resource(s) were restored as hand-managed because their owning API spec could not be replayed",
+            plan.cleared_ownership_tags
+        ));
+    }
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
+}
+
+/// Which pre-restore API specs an additive rollback may safely replay.
+struct AdditiveRollbackApiSpecPlan {
+    /// Snapshot specs whose entire owning snapshot graph is also being replayed.
+    replay: Vec<ApiSpec>,
+    /// Snapshot specs deliberately left unrestored.
+    skipped_specs: usize,
+    /// Replayed resources whose `api_spec_id` was stripped because the spec it
+    /// names is not part of this replay.
+    cleared_ownership_tags: usize,
+}
+
+/// Decide which snapshot API specs an additive rollback replays, and strip
+/// ownership tags that would otherwise bind a replayed resource to a spec this
+/// replay does not create.
+///
+/// Selecting specs by spec id alone is unsound: an intervening writer can
+/// recreate the snapshot's *proxy* id without recreating the spec. The snapshot
+/// proxy is then not in `missing` (current ids win), so inserting the snapshot
+/// spec would attach it to the intervening writer's proxy and, because ownership
+/// stamping only walks `missing`, leave that proxy untagged — a spec owning a
+/// proxy it never generated. A spec is replayed only when its owning snapshot
+/// proxy carries its tag *and* is itself being replayed, and when every
+/// snapshot resource that spec owns is being replayed too. Everything else is
+/// skipped so the intervening writer's resources are never re-parented.
+fn plan_additive_rollback_api_specs(
+    snapshot_specs: &[ApiSpec],
+    snapshot_payload: &RestorePayload,
+    current_spec_ids: &HashSet<String>,
+    missing: &mut RestorePayload,
+) -> AdditiveRollbackApiSpecPlan {
+    let replayed_proxy_ids: HashSet<&str> =
+        missing.proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+    let replayed_upstream_ids: HashSet<&str> = missing
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.id.as_str())
+        .collect();
+    let replayed_plugin_ids: HashSet<&str> = missing
+        .plugin_configs
+        .iter()
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+
+    let mut replay = Vec::new();
+    let mut skipped_specs = 0usize;
+    for spec in snapshot_specs {
+        if current_spec_ids.contains(&spec.id) {
+            // The intervening writer owns this spec id; leave it untouched.
+            continue;
+        }
+        let owner_tagged = snapshot_payload.proxies.iter().any(|proxy| {
+            proxy.id == spec.proxy_id && proxy.api_spec_id.as_deref() == Some(spec.id.as_str())
+        });
+        let owning_proxy_replayed =
+            owner_tagged && replayed_proxy_ids.contains(spec.proxy_id.as_str());
+        let owned_upstreams_replayed = snapshot_payload
+            .upstreams
+            .iter()
+            .filter(|upstream| upstream.api_spec_id.as_deref() == Some(spec.id.as_str()))
+            .all(|upstream| replayed_upstream_ids.contains(upstream.id.as_str()));
+        let owned_plugins_replayed = snapshot_payload
+            .plugin_configs
+            .iter()
+            .filter(|plugin| plugin.api_spec_id.as_deref() == Some(spec.id.as_str()))
+            .all(|plugin| replayed_plugin_ids.contains(plugin.id.as_str()));
+        if owning_proxy_replayed && owned_upstreams_replayed && owned_plugins_replayed {
+            replay.push(spec.clone());
+        } else {
+            skipped_specs += 1;
+        }
+    }
+
+    // Any surviving tag must name a spec this replay actually creates. A tag
+    // naming an intervening spec would hand that spec resources it never
+    // generated, which its own PUT/DELETE cleanup would later delete.
+    let replayed_spec_ids: HashSet<&str> = replay.iter().map(|spec| spec.id.as_str()).collect();
+    let mut cleared_ownership_tags = 0usize;
+    for proxy in &mut missing.proxies {
+        if proxy
+            .api_spec_id
+            .as_deref()
+            .is_some_and(|spec_id| !replayed_spec_ids.contains(spec_id))
+        {
+            proxy.api_spec_id = None;
+            cleared_ownership_tags += 1;
+        }
+    }
+    for upstream in &mut missing.upstreams {
+        if upstream
+            .api_spec_id
+            .as_deref()
+            .is_some_and(|spec_id| !replayed_spec_ids.contains(spec_id))
+        {
+            upstream.api_spec_id = None;
+            cleared_ownership_tags += 1;
+        }
+    }
+    for plugin in &mut missing.plugin_configs {
+        if plugin
+            .api_spec_id
+            .as_deref()
+            .is_some_and(|spec_id| !replayed_spec_ids.contains(spec_id))
+        {
+            plugin.api_spec_id = None;
+            cleared_ownership_tags += 1;
+        }
+    }
+
+    AdditiveRollbackApiSpecPlan {
+        replay,
+        skipped_specs,
+        cleared_ownership_tags,
+    }
+}
+
+/// Test view of [`plan_additive_rollback_api_specs`]: the replayed spec ids, the
+/// skipped/cleared counts, and each replayed proxy's surviving ownership tag.
+#[doc(hidden)]
+// External tests reach this through the lib target's `_test_support` shim;
+// the bin target recompiles this module without that caller.
+#[allow(dead_code)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn plan_additive_rollback_api_specs_for_test(
+    snapshot: GatewayConfig,
+    snapshot_specs: Vec<ApiSpec>,
+    current: GatewayConfig,
+    current_spec_ids: Vec<String>,
+) -> (Vec<String>, usize, usize, Vec<(String, Option<String>)>) {
+    let snapshot_payload = restore_payload_from_config(snapshot);
+    let (_, mut missing) = intervening_clear_recovery_candidate(&snapshot_payload, &current);
+    let plan = plan_additive_rollback_api_specs(
+        &snapshot_specs,
+        &snapshot_payload,
+        &current_spec_ids.into_iter().collect(),
+        &mut missing,
+    );
+    (
+        plan.replay.iter().map(|spec| spec.id.clone()).collect(),
+        plan.skipped_specs,
+        plan.cleared_ownership_tags,
+        missing
+            .proxies
+            .iter()
+            .map(|proxy| (proxy.id.clone(), proxy.api_spec_id.clone()))
+            .collect(),
+    )
 }
 
 /// Finalize a failed restore. Attempts a best-effort rollback to the pre-restore
