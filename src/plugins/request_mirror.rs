@@ -581,19 +581,18 @@ impl MirrorBodyBudget {
     /// place: under-accounting would reopen the memory cap, while wrapping
     /// would panic in debug or wedge the budget in release.
     fn release(&self, bytes: u64) {
-        if bytes > 0 {
-            if let Err(current) =
-                self.used
-                    .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
-                        current.checked_sub(bytes)
-                    })
-            {
-                warn!(
-                    current,
-                    release_bytes = bytes,
-                    "request_mirror retained-body budget release underflow refused"
-                );
-            }
+        if bytes > 0
+            && let Err(current) = self.used.fetch_update(
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |current| current.checked_sub(bytes),
+            )
+        {
+            warn!(
+                current,
+                release_bytes = bytes,
+                "request_mirror retained-body budget release underflow refused"
+            );
         }
     }
 
