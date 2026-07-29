@@ -1835,7 +1835,8 @@ impl GrpcWalkBudget {
     }
 }
 
-/// Strings harvested from one decoded protobuf message tree.
+/// Strings harvested from one decoded protobuf message tree when the method
+/// does not restrict the scan with `text_fields`.
 #[derive(Default)]
 struct GrpcStrings {
     /// Every string *value* in the tree.
@@ -1843,16 +1844,6 @@ struct GrpcStrings {
     /// Every protobuf map key of string type. Matchable, never rewritable —
     /// the same limitation JSON object member names have.
     map_keys: Vec<String>,
-}
-
-impl GrpcStrings {
-    fn all(&self) -> Vec<&str> {
-        self.texts
-            .iter()
-            .chain(self.map_keys.iter())
-            .map(String::as_str)
-            .collect()
-    }
 }
 
 /// Everything one buffered gRPC response contributed to the scan.
@@ -1864,7 +1855,9 @@ struct GrpcScan {
     /// treat this as a second surface so a match or limit split across frames
     /// cannot hide between scalars.
     aggregate: String,
-    /// Protobuf map keys, which detection covers but redaction cannot rewrite.
+    /// Protobuf map keys governed by this scan. Present only when `text_fields`
+    /// is omitted (whole-message governance); detection covers them but
+    /// redaction cannot rewrite them. Empty when `text_fields` scopes the scan.
     map_keys: Vec<String>,
 }
 
@@ -1902,7 +1895,9 @@ impl GrpcScanError {
 /// The structural walk always covers the whole message tree — bounding it and
 /// proving there are no undecodable unknown fields — even when `text_fields`
 /// narrows what is scanned and rewritten. Known extension values are walked
-/// exactly like ordinary known fields.
+/// exactly like ordinary known fields. When `text_fields` is set, only those
+/// selected string scalars are collected; out-of-scope strings and map keys
+/// are neither cloned nor fed to detection.
 fn scan_grpc_body(
     body: &[u8],
     method: &GrpcMethodInspection,
@@ -1914,37 +1909,50 @@ fn scan_grpc_body(
     let frames = parse_grpc_frames(body, encoding, max_bytes, grpc.max_messages, max_scan_bytes)
         .map_err(GrpcScanError::Framing)?;
 
-    let mut strings = GrpcStrings::default();
-    let mut selected: Vec<String> = Vec::new();
+    let mut scanned: Vec<String> = Vec::new();
+    let mut map_keys: Vec<String> = Vec::new();
     for frame in &frames {
         let payload = frame.payload.as_ref();
         let message = DynamicMessage::decode(method.descriptor.clone(), payload)
             .map_err(|_| GrpcScanError::DecodeFailed)?;
-        let mut budget = GrpcWalkBudget::default();
-        collect_strings(&message, &mut strings, &mut budget)
-            .map_err(|_| GrpcScanError::WalkBudget)?;
-        let mut unknown_budget = GrpcWalkBudget::default();
-        if has_unknown_fields(&message, &mut unknown_budget) {
-            // Unknown fields carry bytes this contract cannot decode, so a
-            // clean scan of the known fields would not be evidence.
-            return Err(GrpcScanError::UnknownFields);
-        }
-        if let Some(paths) = method.text_fields.as_deref() {
-            let mut budget = GrpcWalkBudget::default();
-            collect_paths(&message, paths, &mut selected, &mut budget)
-                .map_err(|_| GrpcScanError::WalkBudget)?;
+        match method.text_fields.as_deref() {
+            None => {
+                let mut strings = GrpcStrings::default();
+                let mut budget = GrpcWalkBudget::default();
+                collect_strings(&message, &mut strings, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+                let mut unknown_budget = GrpcWalkBudget::default();
+                if has_unknown_fields(&message, &mut unknown_budget) {
+                    // Unknown fields carry bytes this contract cannot decode, so a
+                    // clean scan of the known fields would not be evidence.
+                    return Err(GrpcScanError::UnknownFields);
+                }
+                scanned.extend(strings.texts);
+                map_keys.extend(strings.map_keys);
+            }
+            Some(paths) => {
+                // Bound the complete tree without harvesting out-of-scope
+                // strings. `text_fields` cannot select map keys, so map-key
+                // matches stay out of detection for a scoped enrollment.
+                let mut budget = GrpcWalkBudget::default();
+                charge_message_tree(&message, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+                let mut unknown_budget = GrpcWalkBudget::default();
+                if has_unknown_fields(&message, &mut unknown_budget) {
+                    return Err(GrpcScanError::UnknownFields);
+                }
+                let mut budget = GrpcWalkBudget::default();
+                collect_paths(&message, paths, &mut scanned, &mut budget)
+                    .map_err(|_| GrpcScanError::WalkBudget)?;
+            }
         }
     }
 
-    let scanned = match method.text_fields {
-        None => strings.texts,
-        Some(_) => selected,
-    };
     let aggregate = scanned.concat();
     Ok(GrpcScan {
         scanned,
         aggregate,
-        map_keys: strings.map_keys,
+        map_keys,
     })
 }
 
@@ -2197,6 +2205,43 @@ fn collect_value(
                     strings.map_keys.push(key.clone());
                 }
                 collect_value(entry, strings, budget)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Charge the walk budget across the whole message tree without collecting
+/// string values. Used when `text_fields` already scopes which scalars are
+/// harvested, so out-of-scope clones are not paid for just to discard them.
+fn charge_message_tree(
+    message: &DynamicMessage,
+    budget: &mut GrpcWalkBudget,
+) -> Result<(), ()> {
+    budget.enter()?;
+    for (_, value) in message.fields() {
+        charge_value(value, budget)?;
+    }
+    for (_, value) in message.extensions() {
+        charge_value(value, budget)?;
+    }
+    budget.leave();
+    Ok(())
+}
+
+fn charge_value(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> Result<(), ()> {
+    budget.charge()?;
+    match value {
+        ProtobufValue::Message(message) => charge_message_tree(message, budget)?,
+        ProtobufValue::List(items) => {
+            for item in items {
+                charge_value(item, budget)?;
+            }
+        }
+        ProtobufValue::Map(entries) => {
+            for (_, entry) in entries {
+                charge_value(entry, budget)?;
             }
         }
         _ => {}
@@ -2582,6 +2627,7 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
         );
     }
     let mut parsed = Vec::with_capacity(fields.len());
+    let mut seen = HashSet::with_capacity(fields.len());
     for field in &fields {
         let segments: Vec<String> = field
             .split('.')
@@ -2598,6 +2644,16 @@ fn parse_grpc_text_fields(method_config: &Value) -> Result<Option<Vec<Vec<String
             return Err(
                 "ai_response_guard: a 'grpc.methods' 'text_fields' path exceeds the maximum \
                  nesting depth"
+                    .to_string(),
+            );
+        }
+        // Compare the normalized dotted form so `"a.b"` and `" a.b "` collide
+        // without echoing the configured path value into the diagnostic.
+        let normalized = segments.join(".");
+        if !seen.insert(normalized) {
+            return Err(
+                "ai_response_guard: a 'grpc.methods' 'text_fields' path is configured more \
+                 than once"
                     .to_string(),
             );
         }
@@ -2626,10 +2682,6 @@ fn load_grpc_descriptor_pool_inner(path: &str) -> Result<DescriptorPool, (bool, 
             "ai_response_guard: failed to parse protobuf descriptor".to_string(),
         )
     })
-}
-
-pub(crate) fn load_grpc_descriptor_pool(path: &str) -> Result<DescriptorPool, String> {
-    load_grpc_descriptor_pool_inner(path).map_err(|(_, message)| message)
 }
 
 /// Resolve every enrolled method against the pool, rejecting an unknown

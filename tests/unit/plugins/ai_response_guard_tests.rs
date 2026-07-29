@@ -3687,6 +3687,27 @@ fn grpc_config_rejects_unresolvable_descriptor_targets() {
     });
     assert!(AiResponseGuard::new(&unknown_field).is_err());
 
+    let duplicate_text_fields = json!({
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {"/test.Greeter/SayHello": {
+                "response_type": "test.HelloResponse",
+                "text_fields": ["message", " message "]
+            }}
+        }
+    });
+    let duplicate_err = AiResponseGuard::new(&duplicate_text_fields)
+        .expect_err("duplicate normalized text_fields paths must fail closed");
+    assert!(
+        duplicate_err.contains("text_fields") && duplicate_err.contains("more than once"),
+        "diagnostic must name the field without echoing the path value: {duplicate_err}"
+    );
+    assert!(
+        !duplicate_err.contains("message"),
+        "diagnostic must stay value-redacted: {duplicate_err}"
+    );
+
     // Shape-only admission must not need the node-local descriptor at all.
     assert!(
         AiResponseGuard::validate_config(&json!({
@@ -4615,5 +4636,143 @@ async fn grpc_gzip_bomb_is_bounded_by_max_scan_bytes() {
     assert_eq!(
         ctx.metadata.get("ai_response_guard_rejected"),
         Some(&"grpc_decoded_exceeds_max_scan_bytes".to_string())
+    );
+}
+
+const SCOPE_PB_LABEL_REPEATED: u64 = 3;
+
+fn scope_pb_message_field(name: &str, number: u32, label: u64, ty: &str) -> Vec<u8> {
+    let mut out = ext_pb_field(name, number, label, EXT_PB_TYPE_MESSAGE);
+    out.extend(ext_pb_str_field(6, ty));
+    out
+}
+
+fn scope_pb_as_map_entry(mut message: Vec<u8>) -> Vec<u8> {
+    // MessageOptions.map_entry = true (options field 7; map_entry field 7).
+    let options = ext_pb_varint_field(7, 1);
+    message.extend(ext_pb_len_field(7, &options));
+    message
+}
+
+/// proto2 FileDescriptorSet:
+/// ```proto
+/// package scope;
+/// message Reply {
+///   optional string body = 1;
+///   optional string meta = 2;
+///   map<string, string> labels = 3;
+/// }
+/// ```
+fn scoped_reply_descriptor_set() -> Vec<u8> {
+    let body = ext_pb_field("body", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let meta = ext_pb_field("meta", 2, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+
+    let key = ext_pb_field("key", 1, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let value = ext_pb_field("value", 2, EXT_PB_LABEL_OPTIONAL, EXT_PB_TYPE_STRING);
+    let mut entry = ext_pb_str_field(1, "LabelsEntry");
+    entry.extend(ext_pb_len_field(2, &key));
+    entry.extend(ext_pb_len_field(2, &value));
+    let entry = scope_pb_as_map_entry(entry);
+
+    let labels = scope_pb_message_field(
+        "labels",
+        3,
+        SCOPE_PB_LABEL_REPEATED,
+        ".scope.Reply.LabelsEntry",
+    );
+    let mut reply = ext_pb_str_field(1, "Reply");
+    reply.extend(ext_pb_len_field(2, &body));
+    reply.extend(ext_pb_len_field(2, &meta));
+    reply.extend(ext_pb_len_field(2, &labels));
+    reply.extend(ext_pb_len_field(3, &entry));
+
+    let mut file = ext_pb_str_field(1, "scope.proto");
+    file.extend(ext_pb_str_field(2, "scope"));
+    file.extend(ext_pb_len_field(4, &reply));
+    ext_pb_len_field(1, &file)
+}
+
+fn scoped_reply_descriptor_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("scope.bin"), scoped_reply_descriptor_set()).expect("write");
+    dir
+}
+
+fn scoped_reply_bytes(body: &str, meta: &str, map_key: &str, map_value: &str) -> Vec<u8> {
+    use prost::Message;
+    use prost_reflect::{DescriptorPool, DynamicMessage, MapKey, Value};
+    use std::collections::HashMap;
+
+    let pool = DescriptorPool::decode(scoped_reply_descriptor_set().as_slice()).unwrap();
+    let descriptor = pool.get_message_by_name("scope.Reply").unwrap();
+    let mut msg = DynamicMessage::new(descriptor);
+    msg.set_field_by_name("body", Value::String(body.to_string()));
+    msg.set_field_by_name("meta", Value::String(meta.to_string()));
+    let mut labels = HashMap::new();
+    labels.insert(
+        MapKey::String(map_key.to_string()),
+        Value::String(map_value.to_string()),
+    );
+    msg.set_field_by_name("labels", Value::Map(labels));
+    msg.encode_to_vec()
+}
+
+fn scoped_text_fields_guard(dir: &tempfile::TempDir) -> AiResponseGuard {
+    make_plugin(json!({
+        "action": "reject",
+        "pii_patterns": ["email"],
+        "grpc": {
+            "descriptor_path": dir.path().join("scope.bin").to_string_lossy(),
+            "methods": {
+                "/scope.Svc/Run": {
+                    "response_type": "scope.Reply",
+                    "text_fields": ["body"]
+                }
+            }
+        }
+    }))
+}
+
+/// `text_fields` is the enrollment contract: out-of-scope strings and map keys
+/// must not trigger detection, while an in-scope match still fails closed.
+#[tokio::test]
+async fn grpc_text_fields_ignore_out_of_scope_strings_and_map_keys() {
+    let dir = scoped_reply_descriptor_dir();
+    let plugin = scoped_text_fields_guard(&dir);
+
+    // Out-of-scope scalar + map key carry PII; selected `body` is clean.
+    let out_of_scope = grpc_frame(&scoped_reply_bytes(
+        "clean",
+        "mail ops@example.com",
+        "ops@example.com",
+        "also ops@example.com",
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &out_of_scope)
+                .await,
+            PluginResult::Continue
+        ),
+        "out-of-scope string/map-key matches must not reject under text_fields"
+    );
+
+    // Same out-of-scope PII, but the selected field also matches.
+    let in_scope = grpc_frame(&scoped_reply_bytes(
+        "mail ops@example.com",
+        "mail ops@example.com",
+        "ops@example.com",
+        "also ops@example.com",
+    ));
+    let mut ctx = grpc_ctx("/scope.Svc/Run");
+    assert!(
+        matches!(
+            plugin
+                .on_response_body(&mut ctx, 200, &mut grpc_headers(), &in_scope)
+                .await,
+            PluginResult::Reject { .. }
+        ),
+        "in-scope text_fields matches must still reject"
     );
 }

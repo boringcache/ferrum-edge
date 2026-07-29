@@ -2232,13 +2232,6 @@ fn load_protobuf_descriptor_pool_inner(
     })
 }
 
-pub(crate) fn load_protobuf_descriptor_pool(
-    descriptor_path: &str,
-) -> Result<DescriptorPool, String> {
-    load_protobuf_descriptor_pool_inner(descriptor_path)
-        .map_err(ProtobufDescriptorLoadError::into_message)
-}
-
 fn resolve_protobuf_shape(
     shape: &ProtobufShape,
     pool: &DescriptorPool,
