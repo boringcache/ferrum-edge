@@ -19780,7 +19780,11 @@ components:
         alphabet and printable-ASCII value grammar; `-bin` values must be
         standard base64 with or without padding. Names are case-insensitive,
         so two `trailers` members differing only in case are rejected rather
-        than one silently overwriting the other.
+        than one silently overwriting the other. The raw function output is
+        also screened for duplicate JSON object member names before parsing —
+        byte-identical, escaped-equivalent, or nested inside `trailers` — so a
+        document whose terminal outcome depends on which parser reads it is
+        refused instead of resolved.
         gRPC-Web terminate is rejected with 500. Streaming and compression
         contract shapes fail closed. Malformed or oversized function output
         fails closed without reflecting untrusted bodies. The validated

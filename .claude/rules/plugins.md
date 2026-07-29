@@ -116,6 +116,13 @@ body fails closed identically AND discards every terminal key the contract autho
 replacement error never ships beside the original contract's `grpc-status-details-bin` or
 custom trailers. `grpc_message` is authored as text and emitted percent-encoded per the
 gRPC HTTP mapping, with the 8 KiB wire ceiling measured on the encoded value.
+The raw function output is screened with the shared bounded
+`crate::util::json_dup_keys` scanner BEFORE `serde_json::from_slice`: a duplicate
+object member name (byte-identical, escaped-equivalent, or nested inside
+`trailers`) makes the authored terminal metadata parser-dependent, so it fails
+closed under the fixed `invalid_grpc_terminate_response` class with a
+fixed-cardinality reason that never echoes body bytes. Do not add a second
+ad hoc duplicate-key parser here.
 `request_deduplication` is not in this picture at all — it is `HTTP_ONLY_PROTOCOLS` while
 `HttpFlavor::Grpc` selects the `ProxyProtocol::Grpc` plugin view, so it is never effective
 on a native-gRPC request.

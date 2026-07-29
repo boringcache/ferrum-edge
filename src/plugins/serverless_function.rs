@@ -2102,6 +2102,17 @@ fn is_reserved_grpc_terminate_trailer_name(name: &str) -> bool {
 ///
 /// The gateway owns framing and reserved terminal metadata. Compression and
 /// streaming forms are rejected explicitly.
+///
+/// The raw bytes are screened with the shared bounded duplicate-member scanner
+/// ([`crate::util::json_dup_keys`], advisory `GHSA-c78j-5w9p-cpq6`) BEFORE
+/// `serde_json` collapses them. `serde_json` keeps the LAST of duplicate object
+/// members, so without this screen a function response carrying
+/// `"grpc_status": 0` twice — or spelling one of them with a `\u` escape, or
+/// duplicating a member of the nested `trailers` object — would have the
+/// gateway author a terminal status/trailer set that a first-wins parser reading
+/// the same bytes never agrees with. That authored representation is exactly
+/// what `FramedGrpcUnaryProvenance` then binds and emits as trailers, so the
+/// ambiguity must be refused rather than resolved.
 fn build_native_grpc_terminate_response(
     function_http_status: u16,
     body: &[u8],
@@ -2113,6 +2124,23 @@ fn build_native_grpc_terminate_response(
             format!(
                 "gRPC terminate requires a 2xx function HTTP status, got {function_http_status}"
             ),
+        ));
+    }
+
+    // Screen the RAW bytes before `serde_json` collapses duplicate members. The
+    // scanner walks nested objects under explicit budgets and compares DECODED
+    // member names, so an escaped-equivalent spelling and a duplicate inside
+    // `trailers` are both caught; budget exhaustion fails closed as well.
+    // Ordinary malformed bytes report nothing here and keep the existing
+    // malformed-body diagnostic below.
+    //
+    // `reason` is one of a fixed set of `&'static str` values and never contains
+    // any byte of the inspected document, so this stays operator-safe even
+    // though the function response is attacker-influencable through the request.
+    if let Some(reason) = crate::util::json_dup_keys::slice_ambiguity(body) {
+        return Err(InvocationFailure::new(
+            "invalid_grpc_terminate_response",
+            format!("gRPC terminate function response is ambiguous: {reason}"),
         ));
     }
 
@@ -2341,9 +2369,11 @@ fn build_native_grpc_terminate_response(
         // (map order) and loses an authored value, so reject it with a
         // field-specific diagnostic instead.
         //
-        // Deliberately scoped to case folding. Byte-identical duplicate JSON
-        // members are a `serde_json` last-wins property shared by every JSON
-        // contract in the gateway and are owned by PR #3403's detector.
+        // Deliberately scoped to case folding: the shared `json_dup_keys` screen
+        // at the top of this function already refused every JSON-level duplicate
+        // member name (including this nested `trailers` object), so what remains
+        // here is the HTTP-specific collision that JSON considers two distinct
+        // members.
         let mut seen_trailer_names: HashSet<String> = HashSet::with_capacity(trailers.len());
         for (name, value) in trailers {
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
@@ -2518,6 +2548,20 @@ pub mod test_helpers {
     ) -> Result<(u16, Bytes, HashMap<String, String>), String> {
         build_native_grpc_terminate_response(function_http_status, body, max_response_body_bytes)
             .map_err(|failure| failure.operator_detail)
+    }
+
+    /// The failure CODE for a refused terminate contract. That code — not the
+    /// operator detail — is the only thing `failure_result` puts in the
+    /// client-visible reject body, so a test that pins the fail-closed class
+    /// must assert on it rather than on the log-only diagnostic.
+    pub fn build_native_grpc_terminate_response_error_code_test(
+        function_http_status: u16,
+        body: &[u8],
+        max_response_body_bytes: usize,
+    ) -> Result<(), &'static str> {
+        build_native_grpc_terminate_response(function_http_status, body, max_response_body_bytes)
+            .map(|_| ())
+            .map_err(|failure| failure.code)
     }
 }
 

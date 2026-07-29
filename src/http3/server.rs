@@ -12090,6 +12090,20 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     {
         let mut builder = Response::builder().status(StatusCode::OK);
         for (k, v) in &normalized.headers {
+            // Multiple cookies are stored newline-joined in the reject header
+            // map, so each must become its own header line. Without the split,
+            // `HeaderValue::from_str` rejects the embedded newline and EVERY
+            // cookie is dropped — the trailers-only branch below and the H1/H2
+            // emitter (`headers::apply_response_headers`) both split, so the
+            // framed representation must too.
+            if k.eq_ignore_ascii_case("set-cookie") {
+                for cookie_val in v.split('\n') {
+                    if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
+                        builder = builder.header(hyper::header::SET_COOKIE, val);
+                    }
+                }
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (
                 hyper::header::HeaderName::from_bytes(k.as_bytes()),
                 hyper::header::HeaderValue::from_str(v),

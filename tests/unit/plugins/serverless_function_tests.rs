@@ -1815,6 +1815,89 @@ fn test_native_grpc_terminate_rejects_case_equivalent_trailer_names() {
     assert_eq!(headers.get("x-bar").map(String::as_str), Some("second"));
 }
 
+/// The terminate contract is parsed with `serde_json`, which keeps the LAST of
+/// duplicate object members; other parsers keep the FIRST
+/// (`GHSA-c78j-5w9p-cpq6`, CWE-436). The gateway authors terminal status and
+/// trailers from that collapsed view and then binds them as provenance, so an
+/// ambiguous document must be refused rather than resolved. Screening runs on
+/// the RAW bytes with the shared bounded `json_dup_keys` scanner, before
+/// `serde_json` ever sees them.
+#[test]
+fn test_native_grpc_terminate_rejects_duplicate_json_members() {
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_error_code_test as build_code;
+    use ferrum_edge::plugins::serverless_function::test_helpers::build_native_grpc_terminate_response_test as build;
+
+    const MAX_BODY: usize = 1024 * 1024;
+
+    // A member name spelled with a JSON `u`-escape for the code point of `s`.
+    // It DECODES to `grpc_status`, so it is the same member as the one before
+    // it even though the two spellings share no bytes — the case a scanner that
+    // compared raw names would miss. Assembled at runtime so the escape cannot
+    // be collapsed by source-level processing.
+    let escaped_status = format!("grpc_{}u0073tatus", '\\');
+    assert_eq!(
+        escaped_status.len(),
+        "grpc_status".len() + 5,
+        "the member name must carry the six-byte escape, not a decoded 's'"
+    );
+    let escaped_duplicate = format!(r#"{{"grpc_status": 0, "{escaped_status}": 7}}"#);
+
+    // Byte-identical duplicate: `serde_json` silently keeps `7`, while a
+    // first-wins parser reading the same bytes sees the successful `0`.
+    let repeated = r#"{"grpc_status": 0, "grpc_status": 7}"#;
+    // Nested: a duplicate inside the `trailers` object is equally ambiguous and
+    // equally reaches the authored terminal metadata.
+    let nested = r#"{"grpc_status": 0, "trailers": {"x-a": "1", "x-a": "2"}}"#;
+
+    let ambiguous = [
+        ("byte-identical", repeated),
+        ("escaped-equivalent", escaped_duplicate.as_str()),
+        ("nested-trailers", nested),
+    ];
+
+    for (label, document) in ambiguous {
+        let detail = build(200, document.as_bytes(), MAX_BODY)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: an ambiguous contract must be refused"));
+        assert!(
+            detail.contains("duplicate object member names"),
+            "{label}: fixed-cardinality reason expected, got {detail:?}"
+        );
+        // The diagnostic is fixed-cardinality and must never echo any byte of
+        // the inspected document — not a member name, not a value.
+        for echoed in ["grpc_status", "trailers", "x-a", "u0073"] {
+            assert!(
+                !detail.contains(echoed),
+                "{label}: diagnostic echoed body content {echoed:?}: {detail:?}"
+            );
+        }
+        // Fail closed under the same client-visible class as every other
+        // malformed-contract refusal, so no new error surface is introduced.
+        let code = build_code(200, document.as_bytes(), MAX_BODY)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: expected a refusal code"));
+        assert_eq!(code, "invalid_grpc_terminate_response", "{label}");
+    }
+
+    // Ordinary malformed bytes are NOT reclassified: the screen stays silent and
+    // the pre-existing malformed-body diagnostic still applies.
+    let malformed = build(200, b"{\"grpc_status\": ", MAX_BODY).unwrap_err();
+    assert!(
+        malformed.contains("must be a JSON object"),
+        "malformed input keeps its existing diagnostic, got {malformed:?}"
+    );
+
+    // An unambiguous contract is unaffected.
+    let clean = serde_json::to_vec(&json!({
+        "grpc_status": 0,
+        "trailers": {"x-a": "first", "x-b": "second"}
+    }))
+    .unwrap();
+    let (_, _, headers) = build(200, &clean, MAX_BODY).unwrap();
+    assert_eq!(headers.get("grpc-status").map(String::as_str), Some("0"));
+    assert_eq!(headers.get("x-a").map(String::as_str), Some("first"));
+}
+
 /// Custom trailers are gRPC metadata, not arbitrary HTTP fields. Enforce the
 /// protocol's narrower name/value grammar and binary-metadata encoding before
 /// the response is authorized to reach a native gRPC stream.
