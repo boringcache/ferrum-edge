@@ -324,7 +324,10 @@ fn charge_event_fields_registry_matches_struct() {
     // artifact alike.
     let value = serde_json::to_value(fully_populated_charge_event()).expect("serialize");
     let emitted: HashSet<String> = value.as_object().expect("object").keys().cloned().collect();
-    let names: HashSet<String> = CHARGE_EVENT_FIELDS.iter().map(|f| f.name.to_string()).collect();
+    let names: HashSet<String> = CHARGE_EVENT_FIELDS
+        .iter()
+        .map(|f| f.name.to_string())
+        .collect();
     let missing_from_registry: Vec<&String> = emitted.difference(&names).collect();
     let missing_from_struct: Vec<&String> = names.difference(&emitted).collect();
     assert!(
@@ -399,8 +402,14 @@ fn charge_event_identity_projection_matches_the_native_row() {
         .expect("schema present");
 
     for (label, event) in [
-        ("all optional members present", fully_populated_charge_event()),
-        ("all optional members absent", charge_event_without_optionals()),
+        (
+            "all optional members present",
+            fully_populated_charge_event(),
+        ),
+        (
+            "all optional members absent",
+            charge_event_without_optionals(),
+        ),
     ] {
         let rows = std::slice::from_ref(&event);
         let native = serialize_json_each_row(rows).expect("native");
