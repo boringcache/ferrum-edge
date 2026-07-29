@@ -3372,17 +3372,11 @@ impl HoldState {
     }
 
     /// Start the clock if content is held and it is not already running; stop it
-    /// when nothing is held any more. Idempotent, allocation-free, and called
-    /// after every ingest step.
-    fn sync(&mut self, held_bytes: usize) {
-        self.sync_from(held_bytes, None);
-    }
-
-    /// As [`Self::sync`], but preserve the arrival time of the transport chunk
-    /// that supplied newly-held bytes. A coalesced chunk may contain several
-    /// ready SSE events which are inspected incrementally; releasing an earlier
-    /// event must not give a later event from that already-arrived chunk a fresh
-    /// hold budget.
+    /// when nothing is held any more. When provided, preserve the arrival time
+    /// of the transport chunk that supplied newly-held bytes. A coalesced chunk
+    /// may contain several ready SSE events which are inspected incrementally;
+    /// releasing an earlier event must not give a later event from that
+    /// already-arrived chunk a fresh hold budget.
     fn sync_from(&mut self, held_bytes: usize, first_held_at: Option<std::time::Instant>) {
         if held_bytes == 0 {
             self.started = None;
@@ -3392,8 +3386,9 @@ impl HoldState {
     }
 
     /// Clear the clock after an expiry has applied a terminal policy and drained
-    /// or discarded the whole hold. Clean releases use [`Self::sync`] so a
-    /// partial release cannot refresh older bytes that remain held.
+    /// or discarded the whole hold. Clean releases synchronize the remaining
+    /// held bytes, so a partial release cannot refresh older bytes that remain
+    /// held.
     fn restart(&mut self) {
         self.started = None;
     }
