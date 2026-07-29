@@ -1,14 +1,32 @@
 use ferrum_edge::_test_support::{
-    SoapNonceReplayHarness, soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
+    MAX_NONCE_REPLAY_SCOPES_FOR_TESTS, SoapNonceReplayHarness,
+    soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
     soap_exclusive_canonicalize_element_for_test, soap_nonce_inconsistent_state_outcome_for_test,
+    soap_nonce_replay_registry_contains_for_test, soap_nonce_replay_scope_key_for_test,
+    soap_poison_process_replay_scope_for_test,
+    soap_retire_inconsistent_process_replay_scope_for_test,
+    soap_retire_same_cardinality_drift_scope_for_test,
+    soap_shared_claim_retention_seconds_for_test, soap_username_token_created_outcome_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
-use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
+use ferrum_edge::plugins::{
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
+
+/// The fixed PasswordDigest nonce claim retention, in seconds, on both the
+/// process and the shared path:
+/// `MAX_UT_CREATED_MAX_AGE_SECONDS (86400) + 2 × MAX_CLOCK_SKEW_SECONDS (3600) + 1`.
+///
+/// This is the *global* maximum admissible acceptance horizon — the widest span
+/// over which any configuration the schema admits can accept an unchanged
+/// UsernameToken — not a value derived from the configured window. It is not
+/// operator-tunable; `nonce.cache_ttl_seconds` no longer exists.
+const CLAIM_RETENTION_SECONDS: u64 = 93_601;
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
@@ -126,6 +144,9 @@ fn username_token_digest_config() -> serde_json::Value {
                 {"username": "alice", "password": "secret123"}
             ]
         },
+        // `replay_scope` has no default: a PasswordDigest policy must state
+        // which deployment shape its replay protection covers.
+        "nonce": { "replay_scope": "process" },
         "reject_missing_security_header": true
     })
 }
@@ -270,6 +291,29 @@ fn password_digest_token_with_created(
     nonce_bytes: &[u8],
     created: &str,
 ) -> String {
+    password_digest_security_block(username, password, nonce_bytes, created, Some(created))
+}
+
+/// A `wsu:Timestamp` bound to `created` (zero divergence).
+fn bound_timestamp(created: &str) -> String {
+    format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{}</wsu:Created></wsu:Timestamp>"#,
+        created
+    )
+}
+
+/// Full WS-Security content for a PasswordDigest request.
+///
+/// `timestamp_created` controls the outer instant independently of the token's
+/// own `Created`, which is what the binding tests need. `None` omits the outer
+/// Timestamp entirely.
+fn password_digest_security_block(
+    username: &str,
+    password: &str,
+    nonce_bytes: &[u8],
+    created: &str,
+    timestamp_created: Option<&str>,
+) -> String {
     let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
 
     let mut data = Vec::new();
@@ -281,15 +325,23 @@ fn password_digest_token_with_created(
     let digest_b64 =
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
 
+    let timestamp = timestamp_created.map(bound_timestamp).unwrap_or_default();
+
     format!(
-        r#"<wsse:UsernameToken>
+        r#"{}<wsse:UsernameToken>
         <wsse:Username>{}</wsse:Username>
         <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
         <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
         <wsu:Created>{}</wsu:Created>
     </wsse:UsernameToken>"#,
-        username, digest_b64, nonce_b64, created
+        timestamp, username, digest_b64, nonce_b64, created
     )
+}
+
+fn fresh_created() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 // ── Constructor validation tests ────────────────────────────────────────────
@@ -1079,30 +1131,7 @@ async fn test_password_digest_valid() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
     // Compute a valid PasswordDigest: Base64(SHA-1(nonce + created + password))
-    let nonce_bytes = b"test-nonce-12345";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"test-nonce-12345");
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
@@ -1119,30 +1148,7 @@ async fn test_password_digest_valid() {
 async fn test_password_digest_valid_over_utf16le_wire_bytes() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
-    let nonce_bytes = b"utf16-nonce-bytes";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"utf16-nonce-bytes");
     let body = wrap_soap(&ut);
     let bytes = encode_utf16_le(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
@@ -1312,30 +1318,7 @@ async fn test_password_digest_missing_created_is_structural_for_known_and_unknow
 async fn test_nonce_replay_detected() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
 
-    let nonce_bytes = b"replay-nonce-001";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"secret123");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce>{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "secret123", b"replay-nonce-001");
     let body = wrap_soap(&ut);
 
     // First request succeeds
@@ -2968,7 +2951,7 @@ fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
     let max_size: usize = 20;
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": max_size, "cache_ttl_seconds": 300 },
+        "nonce": { "max_cache_size": max_size },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -3004,7 +2987,7 @@ fn test_nonce_cache_enforces_max_size_without_evicting_live_entries() {
 fn test_nonce_replay_detected_via_direct_api() {
     let plugin = SoapWsSecurity::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 300 },
+        "nonce": { "max_cache_size": 100 },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -3015,14 +2998,14 @@ fn test_nonce_replay_detected_via_direct_api() {
 
 #[test]
 fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
-    // Once the TTL has elapsed, the atomic entry path must refresh inserted_at
-    // instead of treating reuse as a live replay. This covers the post-TTL
-    // Occupied insert branch used by successful PasswordDigest authentication.
-    // The external harness supplies deterministic monotonic instants, so no
-    // wall-clock sleep is required.
+    // Once the fixed retention horizon has elapsed, the atomic entry path must
+    // refresh inserted_at instead of treating reuse as a live replay. This
+    // covers the post-retention Occupied insert branch used by successful
+    // PasswordDigest authentication. The external harness supplies
+    // deterministic monotonic instants, so no wall-clock sleep is required.
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
-        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 1 },
+        "nonce": { "max_cache_size": 100 },
         "reject_missing_security_header": false
     }))
     .unwrap();
@@ -3034,13 +3017,19 @@ fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
     );
     assert!(
         harness
-            .claim_at("ttl-expired-nonce", Duration::from_millis(999))
+            .claim_at(
+                "ttl-expired-nonce",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+            )
             .is_err(),
-        "a repeat inside the TTL window is a live replay"
+        "a repeat inside the retention horizon is a live replay"
     );
     assert!(
         harness
-            .claim_at("ttl-expired-nonce", Duration::from_secs(1))
+            .claim_at(
+                "ttl-expired-nonce",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS)
+            )
             .is_ok(),
         "expired Occupied nonce must be refreshed, not rejected as a live replay"
     );
@@ -4080,8 +4069,12 @@ fn test_timestamp_bound_boundaries() {
 
 #[tokio::test]
 async fn test_out_of_range_expires_is_rejected_not_panicking() {
-    // An `Expires` far outside the four-digit year window would overflow
-    // `expires + skew` in chrono. It must be rejected as an invalid timestamp.
+    // Years outside `MIN_PARSED_YEAR..=MAX_PARSED_YEAR` are invalid at parse
+    // time. That clamp is what keeps later `Expires + skew` arithmetic inside
+    // chrono's representable range (see the module docs), so a six-digit year
+    // must reject rather than reach — or panic inside — the skew addition.
+    // Year 9999 is the *upper admitted* year and is intentionally accepted when
+    // the rest of the Timestamp policy holds; do not treat it as out-of-range.
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let created = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let security = format!(
@@ -4317,19 +4310,18 @@ fn test_non_string_cert_path_entry_is_rejected() {
 
 #[test]
 fn test_zero_nonce_cache_controls_are_rejected() {
-    for key in ["cache_ttl_seconds", "max_cache_size"] {
-        let mut nonce = serde_json::Map::new();
-        nonce.insert(key.to_string(), json!(0));
-        let config = json!({
-            "timestamp": { "require": true },
-            "nonce": Value::Object(nonce),
-            "reject_missing_security_header": false
-        });
-        let err = SoapWsSecurity::new(&config)
-            .err()
-            .expect("zero must be rejected");
-        assert!(err.contains(key), "unexpected error for {key}: {err}");
-    }
+    // `cache_ttl_seconds` is intentionally absent: retention is fixed, so the
+    // key is no longer part of the schema at all (see
+    // `the_removed_retention_key_is_rejected_rather_than_ignored`).
+    let config = json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 0 },
+        "reject_missing_security_header": false
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("zero must be rejected");
+    assert!(err.contains("max_cache_size"), "unexpected error: {err}");
 }
 
 // ── GHSA-3ffh-5842-8m92: bounded, cache-safe nonce state ───────────────────
@@ -4370,7 +4362,6 @@ fn test_nonce_cache_is_bounded_by_total_retained_bytes() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 64,
             "max_total_cache_bytes": 4_096
         },
@@ -4411,7 +4402,7 @@ async fn test_oversized_wire_nonce_is_rejected_structurally() {
             "password_type": "PasswordDigest",
             "credentials": [{"username": "alice", "password": "secret123"}]
         },
-        "nonce": { "max_encoded_length": 64 },
+        "nonce": { "replay_scope": "process", "max_encoded_length": 64 },
         "reject_missing_security_header": true
     }))
     .unwrap();
@@ -4538,7 +4529,6 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 3,
-            "cache_ttl_seconds": 10,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4559,7 +4549,7 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
         harness
             .claim_at("nonce-c-00000003", Duration::from_secs(3))
             .is_err(),
-        "same-key in-TTL claim must be a replay"
+        "same-key claim inside the retention horizon must be a replay"
     );
 
     let before = harness.snapshot().expect("snapshot");
@@ -4570,8 +4560,13 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(before.shared_key_entries, 3);
     assert_eq!(before.last_expired_removals, 0);
 
+    // One second past the fixed horizon, so the oldest entry — and only the
+    // oldest, because reclamation stops as soon as there is room — is expired.
     harness
-        .claim_at("nonce-d-00000004", Duration::from_secs(11))
+        .claim_at(
+            "nonce-d-00000004",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS + 1),
+        )
         .expect("one exact-oldest expiry must make room");
     let after_expiry = harness.snapshot().expect("snapshot");
     assert_eq!(after_expiry.entry_count, 3);
@@ -4582,7 +4577,10 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
     assert_eq!(after_expiry.last_expired_removals, 1);
 
     harness
-        .claim_at("nonce-b-00000002", Duration::from_secs(11))
+        .claim_at(
+            "nonce-b-00000002",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS + 1),
+        )
         .expect("expired same-key claim must refresh in place");
     let after_refresh = harness.snapshot().expect("snapshot");
     assert_eq!(after_refresh.entry_count, 3);
@@ -4595,9 +4593,10 @@ fn test_nonce_age_index_expiry_and_accounting_are_exact() {
 
 // ── Live entries are never evicted (GHSA-54mh-v348-j878) ───────────────────
 //
-// The remediation these tests pin is deliberate: replay coverage promised for
-// `cache_ttl_seconds` is honoured for the whole window. Capacity exhaustion is
-// a *rejection*, never a licence to unprotect an already-claimed nonce.
+// The remediation these tests pin is deliberate: the replay coverage a claim is
+// promised — the full fixed `CLAIM_RETENTION_SECONDS` horizon — is honoured for
+// the whole window. Capacity exhaustion is a *rejection*, never a licence to
+// unprotect an already-claimed nonce.
 
 #[test]
 fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
@@ -4605,7 +4604,6 @@ fn test_nonce_entry_cap_rejects_instead_of_evicting_live_entries() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 3,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4661,7 +4659,6 @@ fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4708,12 +4705,12 @@ fn test_nonce_tight_byte_cap_preserves_live_entry_and_rejects() {
 
 #[test]
 fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
-    const TTL: u64 = 60;
+    // Retention is fixed, not configured; drive the timeline off the constant.
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 100_000,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4758,12 +4755,11 @@ fn test_nonce_expired_entry_is_reclaimed_and_retry_succeeds() {
 
 #[test]
 fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
-    const TTL: u64 = 10;
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 4,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": 16,
             "max_total_cache_bytes": 4_096
         },
@@ -4775,18 +4771,19 @@ fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
     for (nonce, seconds) in [
         ("nonce-a-00000001", 0),
         ("nonce-b-00000002", 1),
-        ("nonce-c-00000003", 8),
-        ("nonce-d-00000004", 9),
+        ("nonce-c-00000003", TTL - 2),
+        ("nonce-d-00000004", TTL - 1),
     ] {
         harness
             .claim_at(nonce, Duration::from_secs(seconds))
             .expect("fresh nonce must admit");
     }
 
-    // At t=11 only the first two entries are past the 10s TTL. Admitting one
-    // nonce needs exactly one slot, so exactly one expired entry is reclaimed.
+    // At t=TTL+1 only the first two entries are past the retention horizon.
+    // Admitting one nonce needs exactly one slot, so exactly one expired entry
+    // is reclaimed.
     harness
-        .claim_at("nonce-e-00000005", Duration::from_secs(11))
+        .claim_at("nonce-e-00000005", Duration::from_secs(TTL + 1))
         .expect("an expired entry must make room");
     let snapshot = harness.snapshot().expect("snapshot");
     assert_eq!(snapshot.last_expired_removals, 1);
@@ -4799,7 +4796,7 @@ fn test_nonce_expiry_reclaims_only_expired_prefix_of_age_index() {
     for nonce in ["nonce-c-00000003", "nonce-d-00000004", "nonce-e-00000005"] {
         assert_eq!(
             harness
-                .claim_at(nonce, Duration::from_secs(12))
+                .claim_at(nonce, Duration::from_secs(TTL + 2))
                 .expect_err("live nonce must remain replay-protected"),
             "WS-Security: nonce replay detected",
             "{nonce} lost replay protection"
@@ -4815,7 +4812,6 @@ fn test_nonce_saturation_fails_closed_after_bounded_index_work() {
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 1_000_000,
-            "cache_ttl_seconds": 86_400,
             "max_encoded_length": 4_096,
             "max_total_cache_bytes": 4_096
         },
@@ -4873,13 +4869,12 @@ fn test_nonce_reclaim_over_bounded_budget_rejects_then_retries_to_success() {
     const ENTRY_LEN: usize = 16;
     const MAX_BYTES: usize = 4_096;
     const ENTRY_COUNT: usize = MAX_BYTES / ENTRY_LEN;
-    const TTL: u64 = 30;
+    const TTL: u64 = CLAIM_RETENTION_SECONDS;
 
     let harness = SoapNonceReplayHarness::new(&json!({
         "timestamp": { "require": true },
         "nonce": {
             "max_cache_size": 1_000_000,
-            "cache_ttl_seconds": TTL,
             "max_encoded_length": MAX_BYTES,
             "max_total_cache_bytes": MAX_BYTES
         },
@@ -5022,8 +5017,7 @@ fn test_nonce_inconsistent_age_index_fails_closed() {
     let err = soap_nonce_inconsistent_state_outcome_for_test(&json!({
         "timestamp": { "require": true },
         "nonce": {
-            "max_cache_size": 10,
-            "cache_ttl_seconds": 300
+            "max_cache_size": 10
         },
         "reject_missing_security_header": false
     }))
@@ -5047,7 +5041,6 @@ fn test_concurrent_nonce_admission_saturates_without_unprotecting_live_claims() 
             "timestamp": { "require": true },
             "nonce": {
                 "max_cache_size": MAX_ENTRIES,
-                "cache_ttl_seconds": 86_400,
                 "max_encoded_length": NONCE_LEN,
                 "max_total_cache_bytes": MAX_BYTES
             },
@@ -5141,7 +5134,6 @@ fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
             "timestamp": { "require": true },
             "nonce": {
                 "max_cache_size": 8,
-                "cache_ttl_seconds": 86_400,
                 "max_encoded_length": 32,
                 "max_total_cache_bytes": 4_096
             },
@@ -5192,4 +5184,1218 @@ fn test_concurrent_same_key_nonce_is_exact_replay_without_overshoot() {
     );
     assert_eq!(snapshot.retained_key_bytes, snapshot.recomputed_key_bytes);
     assert_eq!(snapshot.shared_key_entries, 1);
+}
+
+// ── GHSA-54mh-v348-j878: Created freshness, Timestamp binding, replay scope ──
+//
+// The remaining half of the advisory. PR #3353 already proved that an
+// authenticated live nonce is never evicted and that exhaustion fails closed;
+// these tests cover what was still open:
+//
+//   * the UsernameToken's own `wsu:Created` was only ever a digest input, never
+//     parsed or bounded, so a captured token stayed digest-valid forever;
+//   * nothing tied that instant to the outer `wsu:Timestamp`, so a captured
+//     token could be paired with a freshly minted outer Timestamp;
+//   * replay state was rebuilt per plugin instance, so a reload generation (and
+//     every additional replica) started from an empty cache.
+
+/// PasswordDigest policy with the outer-Timestamp binding switched off, so the
+/// inner freshness window can be observed on its own.
+fn digest_unbound_config(created_max_age_seconds: u64) -> Value {
+    json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "require_timestamp_binding": false,
+            "created_max_age_seconds": created_max_age_seconds,
+            "created_clock_skew_seconds": 0
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    })
+}
+
+fn offset_created(offset: chrono::Duration) -> String {
+    (chrono::Utc::now() + offset)
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
+async fn digest_outcome(plugin: &SoapWsSecurity, security_block: &str) -> PluginResult {
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(security_block));
+    let mut headers = soap_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await
+}
+
+#[tokio::test]
+async fn digest_created_that_is_too_old_is_rejected() {
+    // The digest still verifies — the token is genuine, just stale. Before this
+    // fix nothing looked at the instant, so "genuine but stale" was accepted.
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let stale = offset_created(-chrono::Duration::hours(1));
+    let block =
+        password_digest_security_block("alice", "secret123", b"stale-created-01", &stale, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "UsernameToken Created is too old", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_created_in_the_future_is_rejected() {
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let future = offset_created(chrono::Duration::hours(1));
+    let block =
+        password_digest_security_block("alice", "secret123", b"future-created-1", &future, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(
+        &result,
+        "UsernameToken Created is in the future",
+        &["alice"],
+    );
+}
+
+#[tokio::test]
+async fn digest_created_that_is_malformed_is_rejected_without_echoing_it() {
+    // The malformed value is a digest input bound to the shared secret, so the
+    // rejection must not echo it back.
+    const MALFORMED: &str = "SOAP_CREATED_CANARY_not-a-datetime";
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    for created in [MALFORMED, "99999-01-01T00:00:00Z", ""] {
+        let nonce = b"bad-created-01!!";
+        let block = password_digest_security_block("alice", "secret123", nonce, created, None);
+        let result = digest_outcome(&plugin, &block).await;
+        assert!(
+            is_reject(&result),
+            "malformed Created {created:?} must reject"
+        );
+        assert_eq!(reject_status(&result), 401);
+        assert!(
+            !reject_body(&result).contains(MALFORMED),
+            "the rejected Created value must never be echoed: {}",
+            reject_body(&result)
+        );
+    }
+}
+
+#[tokio::test]
+async fn digest_within_the_freshness_window_still_succeeds() {
+    let plugin = SoapWsSecurity::new(&digest_unbound_config(300)).unwrap();
+    let recent = offset_created(-chrono::Duration::seconds(30));
+    let block =
+        password_digest_security_block("alice", "secret123", b"fresh-created-01", &recent, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "a token inside its freshness window must still authenticate: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn captured_token_paired_with_a_fresh_timestamp_is_rejected() {
+    // The advisory's scenario 3, with the inner freshness window deliberately
+    // widened to 24h so it cannot be what rejects the request. The only thing
+    // standing between the attacker and a replay is the binding: the captured
+    // UsernameToken's own Created no longer matches the freshly generated outer
+    // Timestamp, and moving the inner instant would invalidate the digest.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true, "max_age_seconds": 300 },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "created_max_age_seconds": 86400,
+            "created_max_timestamp_divergence_seconds": 60
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    }))
+    .unwrap();
+
+    let captured = offset_created(-chrono::Duration::minutes(30));
+    let fresh_timestamp = offset_created(chrono::Duration::zero());
+    let block = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"captured-token-1",
+        &captured,
+        Some(&fresh_timestamp),
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "diverges from the Timestamp Created", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_without_an_outer_timestamp_is_rejected_by_default() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = fresh_created();
+    let block =
+        password_digest_security_block("alice", "secret123", b"no-timestamp-01!", &created, None);
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "requires a Timestamp", &["alice"]);
+}
+
+#[tokio::test]
+async fn digest_created_past_the_timestamp_expires_is_rejected() {
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": false, "max_age_seconds": 3600, "clock_skew_seconds": 300 },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}],
+            "created_clock_skew_seconds": 0,
+            "created_max_timestamp_divergence_seconds": 3600
+        },
+        "nonce": { "replay_scope": "process" },
+        "reject_missing_security_header": true
+    }))
+    .unwrap();
+
+    // The outer Timestamp must itself stay in policy (Expires is 4 minutes ago
+    // against a 5-minute outer skew, so it has not "expired" on its own terms),
+    // while the UsernameToken Created sits one minute ago — after that Expires
+    // with a zero UsernameToken skew.
+    let ts_created = offset_created(-chrono::Duration::minutes(10));
+    let ts_expires = offset_created(-chrono::Duration::minutes(4));
+    let ut_created = offset_created(-chrono::Duration::minutes(1));
+
+    let nonce = b"past-expires-01!";
+    let nonce_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce.as_slice());
+    let mut data = Vec::new();
+    data.extend_from_slice(nonce.as_slice());
+    data.extend_from_slice(ut_created.as_bytes());
+    data.extend_from_slice(b"secret123");
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    let digest_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    let block = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{ts_created}</wsu:Created><wsu:Expires>{ts_expires}</wsu:Expires></wsu:Timestamp>
+        <wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest_b64}</wsse:Password>
+        <wsse:Nonce>{nonce_b64}</wsse:Nonce>
+        <wsu:Created>{ut_created}</wsu:Created>
+    </wsse:UsernameToken>"#
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert_username_token_structural(&result, "past the Timestamp Expires", &["alice"]);
+}
+
+#[tokio::test]
+async fn a_present_timestamp_is_validated_even_when_not_required() {
+    // The binding is only meaningful if the outer instant it binds to has been
+    // validated. `timestamp.require: false` means "a Timestamp may be absent",
+    // never "an out-of-policy Timestamp is ignored".
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let stale_timestamp = offset_created(-chrono::Duration::hours(6));
+    let block = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"stale-outer-ts01",
+        &stale_timestamp,
+        Some(&stale_timestamp),
+    );
+    let result = digest_outcome(&plugin, &block).await;
+    assert!(is_reject(&result));
+    assert!(
+        reject_body(&result).contains("Timestamp Created is too old"),
+        "a present-but-stale Timestamp must be rejected on its own terms: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn malformed_outer_timestamp_values_are_not_echoed() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let created = fresh_created();
+    let marker = "credential-like-outer-timestamp-value";
+
+    let invalid_created = password_digest_security_block(
+        "alice",
+        "secret123",
+        b"bad-outer-created",
+        &created,
+        Some(marker),
+    );
+    let created_result = digest_outcome(&plugin, &invalid_created).await;
+    assert!(is_reject(&created_result));
+    assert!(!reject_body(&created_result).contains(marker));
+
+    let token =
+        password_digest_security_block("alice", "secret123", b"bad-outer-expiry!", &created, None);
+    let invalid_timestamp = format!(
+        r#"<wsu:Timestamp wsu:Id="TS-1"><wsu:Created>{created}</wsu:Created><wsu:Expires>{marker}</wsu:Expires></wsu:Timestamp>"#
+    );
+    let invalid_expires = format!("{invalid_timestamp}{token}");
+    let expires_result = digest_outcome(&plugin, &invalid_expires).await;
+    assert!(is_reject(&expires_result));
+    assert!(!reject_body(&expires_result).contains(marker));
+}
+
+// ── Replay scope admission ──────────────────────────────────────────────────
+
+#[test]
+fn password_digest_requires_an_explicit_replay_scope() {
+    // A gateway cannot see its own replica count, so the deployment shape has
+    // to be declared. Defaulting to process-local state is what let one
+    // captured token be spent once per replica.
+    let config = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("PasswordDigest without a declared replay scope must fail admission");
+    assert!(err.contains("config.nonce.replay_scope"), "{err}");
+    assert!(err.contains("cross-replica"), "{err}");
+}
+
+#[test]
+fn password_text_does_not_require_a_replay_scope() {
+    // PasswordText carries no nonce, so there is no replay state to scope.
+    assert!(SoapWsSecurity::new(&username_token_config()).is_ok());
+}
+
+#[test]
+fn openapi_requires_replay_scope_for_password_digest_only() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = &spec["components"]["schemas"]["SoapWsSecurityConfig"];
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("SoapWsSecurityConfig schema compiles");
+
+    let digest_missing_scope = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&digest_missing_scope).is_err(),
+        "OpenAPI must reject PasswordDigest without nonce.replay_scope"
+    );
+
+    let digest_default_password_type = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&digest_default_password_type).is_err(),
+        "omitted password_type defaults to PasswordDigest and still requires replay_scope"
+    );
+
+    let digest_ok = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "process" }
+    });
+    assert!(
+        validator.validate(&digest_ok).is_ok(),
+        "PasswordDigest with an explicit replay_scope must validate"
+    );
+
+    let shared_without_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "shared" }
+    });
+    assert!(
+        validator.validate(&shared_without_redis).is_err(),
+        "shared replay scope must require sync_mode=redis and redis_url"
+    );
+
+    let shared_with_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "shared" },
+        "sync_mode": "redis",
+        "redis_url": "redis://redis.internal:6379"
+    });
+    assert!(
+        validator.validate(&shared_with_redis).is_ok(),
+        "shared replay scope with Redis must validate"
+    );
+
+    let process_with_redis = json!({
+        "timestamp": { "require": true },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordDigest",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "nonce": { "replay_scope": "process" },
+        "sync_mode": "redis",
+        "redis_url": "redis://redis.internal:6379"
+    });
+    assert!(
+        validator.validate(&process_with_redis).is_err(),
+        "sync_mode=redis must require replay_scope=shared"
+    );
+
+    let text_ok = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        }
+    });
+    assert!(
+        validator.validate(&text_ok).is_ok(),
+        "PasswordText must remain valid without a replay scope"
+    );
+}
+
+#[test]
+fn invalid_replay_scope_value_is_rejected() {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("cluster");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("an unknown replay scope must reject");
+    assert!(err.contains("'process' or 'shared'"), "{err}");
+    assert!(
+        !err.contains("cluster"),
+        "the rejected value must not be echoed: {err}"
+    );
+}
+
+#[test]
+fn shared_replay_scope_requires_a_redis_backend() {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("shared");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("shared scope without redis must fail closed at admission");
+    assert!(err.contains("sync_mode"), "{err}");
+}
+
+#[test]
+fn redis_sync_mode_requires_the_shared_replay_scope() {
+    let mut config = username_token_digest_config();
+    config["sync_mode"] = json!("redis");
+    config["redis_url"] = json!("redis://127.0.0.1:6379");
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("a redis backend that nothing claims against must fail admission");
+    assert!(err.contains("replay_scope"), "{err}");
+}
+
+#[test]
+fn misspelled_redis_root_keys_still_fail_closed() {
+    let mut config = username_token_digest_config();
+    config["redis_ur1"] = json!("redis://127.0.0.1:6379");
+    assert!(
+        SoapWsSecurity::new(&config).is_err(),
+        "the root allowlist must union the shared Redis keys, not open the root"
+    );
+}
+
+#[test]
+fn zero_replay_bounds_remain_rejected_for_password_digest() {
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(0);
+    let err = SoapWsSecurity::new(&config)
+        .err()
+        .expect("nonce.max_cache_size = 0 must be rejected");
+    assert!(err.contains("max_cache_size"), "{err}");
+}
+
+// ── Replay state across generations, instances, and replicas ────────────────
+
+fn digest_plugin_with_config_id(config_id: Option<&str>) -> SoapWsSecurity {
+    SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        config_id,
+    )
+    .expect("digest plugin must construct")
+}
+
+// These construct a `PluginHttpClient`, so they run on a runtime like every
+// other client-constructing plugin test.
+#[tokio::test]
+async fn replay_state_survives_a_reload_generation_swap() {
+    // A reload builds a new plugin instance from the same plugin-config
+    // resource. Before this fix that instance started from an empty cache, so
+    // replaying a captured token across a reload always succeeded.
+    let scope = "soap-reload-scope-a";
+    let generation_one = digest_plugin_with_config_id(Some(scope));
+    assert!(
+        generation_one
+            .check_nonce_replay("reload-scope-nonce")
+            .is_ok()
+    );
+
+    let generation_two = digest_plugin_with_config_id(Some(scope));
+    let replay = generation_two
+        .check_nonce_replay("reload-scope-nonce")
+        .expect_err("a new generation must inherit the previous generation's claims");
+    assert!(replay.contains("nonce replay detected"), "{replay}");
+
+    // Live claims stay live for the old generation too — one shared scope.
+    let replay_old = generation_one
+        .check_nonce_replay("reload-scope-nonce")
+        .expect_err("the outgoing generation shares the same state");
+    assert!(replay_old.contains("nonce replay detected"), "{replay_old}");
+}
+
+#[tokio::test]
+async fn distinct_plugin_configs_do_not_share_a_replay_scope() {
+    let a = digest_plugin_with_config_id(Some("soap-scope-b"));
+    let b = digest_plugin_with_config_id(Some("soap-scope-c"));
+    assert!(a.check_nonce_replay("independent-scope-nonce").is_ok());
+    assert!(
+        b.check_nonce_replay("independent-scope-nonce").is_ok(),
+        "an unrelated plugin config must not answer from another policy's state"
+    );
+}
+
+#[tokio::test]
+async fn identityless_construction_gets_private_replay_state() {
+    // Admin config validation constructs the plugin without a resource id. That
+    // construction must not read, mutate, or consume a live proxy's claims.
+    let live = digest_plugin_with_config_id(Some("soap-scope-d"));
+    assert!(live.check_nonce_replay("validation-probe-nonce").is_ok());
+
+    let validation_instance = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    assert!(
+        validation_instance
+            .check_nonce_replay("validation-probe-nonce")
+            .is_ok(),
+        "a validation construction must not consult live replay state"
+    );
+    assert!(
+        live.check_nonce_replay("validation-probe-nonce").is_err(),
+        "and must not have consumed the live claim either"
+    );
+}
+
+// ── Retired process replay-scope pruning ────────────────────────────────────
+
+#[tokio::test]
+async fn active_strong_references_keep_a_replay_scope_from_being_pruned() {
+    let scope = "soap-prune-active-ref";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let live = digest_plugin_with_config_id(Some(scope));
+    live.check_nonce_replay("active-ref-nonce")
+        .expect("claim must admit");
+
+    // Creating an unrelated scope runs cold-path pruning; the live holder keeps
+    // strong_count > 1, so the scope must remain.
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-active-ref-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a scope with a live plugin generation must not be pruned"
+    );
+    assert!(
+        live.check_nonce_replay("active-ref-nonce").is_err(),
+        "the live claim must still be present"
+    );
+}
+
+#[tokio::test]
+async fn a_retired_scope_with_a_live_claim_is_retained() {
+    let scope = "soap-prune-live-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    {
+        let generation = digest_plugin_with_config_id(Some(scope));
+        generation
+            .check_nonce_replay("live-retired-nonce")
+            .expect("claim must admit");
+    }
+    // Registry is now the sole strong owner, but the newest claim is still live.
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-live-retired-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a retired scope with any live claim must stay fail-closed"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert!(
+        rejoined.check_nonce_replay("live-retired-nonce").is_err(),
+        "rejoining must inherit the live claim rather than starting empty"
+    );
+}
+
+#[tokio::test]
+async fn a_fully_expired_retired_scope_is_reclaimed() {
+    let scope = "soap-prune-expired-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let epoch = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(CLAIM_RETENTION_SECONDS + 120))
+        .expect("instant subtract");
+    {
+        let harness =
+            SoapNonceReplayHarness::with_scope(&username_token_digest_config(), scope, epoch)
+                .expect("scoped harness");
+        harness
+            .claim_at("expired-retired-nonce", Duration::ZERO)
+            .expect("backdated claim must admit");
+    }
+    assert!(soap_nonce_replay_registry_contains_for_test(&key).expect("registry"));
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-expired-retired-probe"));
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "a retired scope whose newest claim is past retention must be reclaimed"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert!(
+        rejoined.check_nonce_replay("expired-retired-nonce").is_ok(),
+        "reclaiming must free the slot without resurrecting expired claims"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_retired_scope_is_reclaimable() {
+    let scope = "soap-prune-empty-retired";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    {
+        let _generation = digest_plugin_with_config_id(Some(scope));
+    }
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-empty-retired-probe"));
+    assert!(
+        !soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "an empty retired scope must free its registry slot"
+    );
+}
+
+#[tokio::test]
+async fn retired_empty_scopes_free_registry_capacity() {
+    let http = PluginHttpClient::default();
+    let mut holders = Vec::new();
+    for i in 0..(MAX_NONCE_REPLAY_SCOPES_FOR_TESTS + 8) {
+        let id = format!("soap-prune-cap-fill-{i}");
+        match SoapWsSecurity::new_with_http_client_and_config_id(
+            &username_token_digest_config(),
+            http.clone(),
+            Some(&id),
+        ) {
+            Ok(plugin) => holders.push(plugin),
+            Err(err) => {
+                assert!(
+                    err.contains("refusing to create more"),
+                    "unexpected construction failure before the cap: {err}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(
+        !holders.is_empty(),
+        "test must hold at least one scope against the registry cap"
+    );
+    let overflow = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        http.clone(),
+        Some("soap-prune-cap-overflow-while-held"),
+    );
+    assert!(
+        overflow.is_err(),
+        "held empty scopes must consume registry capacity"
+    );
+
+    holders.clear();
+    SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        http,
+        Some("soap-prune-cap-after-reclaim"),
+    )
+    .expect("reclaiming empty retired scopes must free capacity for a new scope");
+}
+
+#[tokio::test]
+async fn poisoned_retired_scopes_are_not_replaced() {
+    let scope = "soap-prune-poisoned";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_poison_process_replay_scope_for_test(&username_token_digest_config(), scope)
+        .expect("poison helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-poisoned-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "poisoned state must remain fail-closed rather than being silently replaced"
+    );
+    let err = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        Some(scope),
+    )
+    .err()
+    .expect("rejoining a poisoned scope must fail closed");
+    assert!(err.contains("unavailable"), "{err}");
+}
+
+#[tokio::test]
+async fn inconsistent_retired_scopes_are_not_replaced() {
+    let scope = "soap-prune-inconsistent";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_retire_inconsistent_process_replay_scope_for_test(&username_token_digest_config(), scope)
+        .expect("inconsistent retire helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-inconsistent-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "structurally inconsistent state must not be silently replaced"
+    );
+    let rejoined = digest_plugin_with_config_id(Some(scope));
+    assert_eq!(
+        rejoined
+            .check_nonce_replay("inconsistent-probe-nonce")
+            .expect_err("inconsistent state must fail closed"),
+        "WS-Security: replay protection state is at capacity"
+    );
+}
+
+#[tokio::test]
+async fn same_cardinality_index_drift_is_not_reclaimed() {
+    let scope = "soap-prune-same-cardinality-drift";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    soap_retire_same_cardinality_drift_scope_for_test(&username_token_digest_config(), scope)
+        .expect("same-cardinality retire helper");
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-same-cardinality-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "cache/index mapping drift must not be reclaimed as expired state"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_generations_retain_one_shared_replay_state() {
+    let scope = "soap-prune-overlap-gens";
+    let key = soap_nonce_replay_scope_key_for_test(scope);
+    let generation_one = digest_plugin_with_config_id(Some(scope));
+    let generation_two = digest_plugin_with_config_id(Some(scope));
+    generation_one
+        .check_nonce_replay("overlap-nonce")
+        .expect("first claim");
+    drop(generation_one);
+    let _probe = digest_plugin_with_config_id(Some("soap-prune-overlap-gens-probe"));
+    assert!(
+        soap_nonce_replay_registry_contains_for_test(&key).expect("registry"),
+        "an overlapping live generation must keep the shared scope"
+    );
+    assert!(
+        generation_two.check_nonce_replay("overlap-nonce").is_err(),
+        "both generations must share one claim map"
+    );
+}
+
+#[tokio::test]
+async fn blank_plugin_config_id_fails_closed() {
+    let err = SoapWsSecurity::new_with_http_client_and_config_id(
+        &username_token_digest_config(),
+        PluginHttpClient::default(),
+        Some("   "),
+    )
+    .err()
+    .expect("a blank id would collapse every policy onto one scope");
+    assert!(err.contains("must not be blank"), "{err}");
+}
+
+// ── Shared (multi-replica) backend ──────────────────────────────────────────
+
+fn shared_scope_config(redis_url: &str) -> Value {
+    let mut config = username_token_digest_config();
+    config["nonce"]["replay_scope"] = json!("shared");
+    config["sync_mode"] = json!("redis");
+    config["redis_url"] = json!(redis_url);
+    config["redis_connect_timeout_seconds"] = json!(1);
+    config
+}
+
+#[tokio::test]
+async fn shared_replay_scope_constructs_and_advertises_its_backend_for_dns_warmup() {
+    let plugin =
+        SoapWsSecurity::new(&shared_scope_config("redis://soap-nonce.invalid:6379")).unwrap();
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["soap-nonce.invalid".to_string()],
+        "a shared replay backend must be pre-warmed like every other Redis-backed plugin"
+    );
+}
+
+#[tokio::test]
+async fn shared_replay_scope_never_answers_from_process_local_state() {
+    // A shared-scope instance holds no local map. Answering "not seen" from an
+    // empty one would be a silent, per-replica bypass, so the process-local
+    // entry point fails closed instead.
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let err = plugin
+        .check_nonce_replay("shared-scope-local-probe")
+        .expect_err("a shared-scope instance has no process-local claim to make");
+    assert!(err.contains("backend is unavailable"), "{err}");
+}
+
+#[tokio::test]
+async fn shared_backend_outage_fails_admission_closed() {
+    // Port 1 refuses immediately, so this is a deterministic outage rather than
+    // a timing-dependent one. A replay-protection outage must reject the
+    // request; degrading to process-local state would reinstate exactly the
+    // cross-replica bypass the shared backend exists to close.
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let token = password_digest_token("alice", "secret123", b"shared-outage-01");
+    let result = digest_outcome(&plugin, &token).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(
+        reject_body(&result).contains("replay protection backend is unavailable"),
+        "got: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn shared_backend_outage_rejects_before_it_can_be_treated_as_authenticated() {
+    let plugin = SoapWsSecurity::new(&shared_scope_config("redis://127.0.0.1:1")).unwrap();
+    let token = password_digest_token("alice", "secret123", b"shared-outage-02");
+    let mut ctx = make_ctx_with_soap_body(&wrap_soap(&token));
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert!(
+        !ctx.metadata.contains_key("soap_ws_username"),
+        "an unclaimable nonce must not leave an authenticated identity behind"
+    );
+}
+
+// ── Invalid-digest flood ordering ───────────────────────────────────────────
+
+#[tokio::test]
+async fn an_invalid_digest_flood_cannot_displace_a_captured_live_nonce() {
+    // Capacity is deliberately tiny. Unauthenticated attempts must never reach
+    // replay state at all, so no number of them can make room by displacing the
+    // legitimate claim, and the legitimate nonce stays replay-protected.
+    let mut config = username_token_digest_config();
+    config["nonce"]["max_cache_size"] = json!(2);
+    let plugin = SoapWsSecurity::new(&config).unwrap();
+
+    let victim = password_digest_token("alice", "secret123", b"victim-nonce-01!");
+    assert!(
+        matches!(
+            digest_outcome(&plugin, &victim).await,
+            PluginResult::Continue
+        ),
+        "the legitimate claim must be admitted first"
+    );
+
+    for index in 0..32u8 {
+        let nonce = format!("flood-nonce-{index:03}");
+        let attempt = password_digest_token("alice", "wrong-password", nonce.as_bytes());
+        let result = digest_outcome(&plugin, &attempt).await;
+        assert!(is_reject(&result), "an invalid digest must be rejected");
+        assert_eq!(
+            reject_body(&result),
+            r#"{"error":"WS-Security: invalid credentials"}"#,
+            "a failed attempt must not be reported as a replay-state outcome"
+        );
+    }
+
+    let replay = digest_outcome(&plugin, &victim).await;
+    assert!(is_reject(&replay));
+    assert!(
+        reject_body(&replay).contains("nonce replay detected"),
+        "the captured nonce must still be protected after the flood: {}",
+        reject_body(&replay)
+    );
+}
+
+// ── The claim must outlive the token, and every future token (GHSA-54mh) ────
+//
+// Binding the outer Timestamp stops a captured UsernameToken from being paired
+// with a freshly minted one. It does nothing once the *claim* has expired: the
+// captured request is then replayable unchanged, both of its instants still
+// inside their windows.
+//
+// Deriving retention from the *configured* window is not enough either. Replay
+// state outlives the generation that wrote it, so a claim has to cover every
+// window a later admitted generation may open — including a widening that lands
+// long after a per-generation retention would already have let the entry be
+// reclaimed or refreshed, at which point nothing can resurrect it. These tests
+// pin the contract that closes that: every claim, in both scopes, is retained
+// for the fixed `CLAIM_RETENTION_SECONDS` horizon — the widest acceptance span
+// the schema admits anywhere — with no operator knob able to shorten it.
+
+/// A PasswordDigest policy with an explicit inner `Created` window.
+fn digest_config_with_created_window(max_age: u64, skew: u64) -> Value {
+    let mut config = username_token_digest_config();
+    config["username_token"]["created_max_age_seconds"] = json!(max_age);
+    config["username_token"]["created_clock_skew_seconds"] = json!(skew);
+    config["username_token"]["require_timestamp_binding"] = json!(false);
+    config
+}
+
+fn retention_seconds_of(config: &Value) -> u64 {
+    SoapNonceReplayHarness::new(config)
+        .expect("config must admit")
+        .snapshot()
+        .expect("snapshot")
+        .retention_seconds
+}
+
+#[test]
+fn retention_is_the_fixed_global_horizon_for_every_admissible_window() {
+    // Not derived from the configured window: the narrowest and the widest
+    // admissible policies retain claims for exactly the same span, so no
+    // reload from any one of them to any other can leave a gap.
+    assert_eq!(
+        retention_seconds_of(&username_token_digest_config()),
+        CLAIM_RETENTION_SECONDS,
+        "the default policy"
+    );
+    for (max_age, skew) in [(1, 0), (1, 3_600), (300, 300), (86_400, 0), (86_400, 3_600)] {
+        assert_eq!(
+            retention_seconds_of(&digest_config_with_created_window(max_age, skew)),
+            CLAIM_RETENTION_SECONDS,
+            "created_max_age_seconds = {max_age}, created_clock_skew_seconds = {skew}"
+        );
+    }
+}
+
+#[test]
+fn the_removed_retention_key_is_rejected_rather_than_ignored() {
+    // `nonce.cache_ttl_seconds` cannot shorten retention any more, so it is gone
+    // from the schema entirely rather than accepted and silently ignored — an
+    // accepted-but-inert knob would misdescribe the guarantee. Per the build-out
+    // policy there is no compatibility shim.
+    for value in [json!(1), json!(901), json!(93_601), json!(200_000)] {
+        let mut config = username_token_digest_config();
+        config["nonce"]["cache_ttl_seconds"] = value.clone();
+        let err = SoapWsSecurity::new(&config)
+            .err()
+            .unwrap_or_else(|| panic!("nonce.cache_ttl_seconds = {value} must be rejected"));
+        assert!(
+            err.contains("cache_ttl_seconds"),
+            "the rejected key must be named: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_maximum_created_window_remains_admissible() {
+    // The fixed horizon is derived from the schema ceilings, so the widest
+    // acceptance settings stay configurable and are still covered.
+    let maximum = digest_config_with_created_window(86_400, 3_600);
+    assert_eq!(retention_seconds_of(&maximum), CLAIM_RETENTION_SECONDS);
+    assert_eq!(
+        CLAIM_RETENTION_SECONDS,
+        86_400 + 2 * 3_600 + 1,
+        "the horizon is MAX_UT_CREATED_MAX_AGE + 2 × MAX_CLOCK_SKEW + 1"
+    );
+}
+
+#[test]
+fn a_password_text_policy_is_not_forced_to_size_a_replay_cache() {
+    // Replay state is unreachable without PasswordDigest. The policy still
+    // admits with no nonce configuration at all.
+    let config = json!({
+        "timestamp": { "require": false },
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": "alice", "password": "secret123"}]
+        },
+        "reject_missing_security_header": true
+    });
+    assert_eq!(retention_seconds_of(&config), CLAIM_RETENTION_SECONDS);
+}
+
+#[test]
+fn the_created_acceptance_interval_has_exactly_the_span_the_retention_covers() {
+    // Exact endpoints at an injected instant, so nothing here races the clock.
+    const MAX_AGE: i64 = 10;
+    const SKEW: i64 = 5;
+    let config = digest_config_with_created_window(MAX_AGE as u64, SKEW as u64);
+    let created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .expect("fixed instant")
+        .with_timezone(&chrono::Utc);
+    let created = created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+
+    let decide = |now: chrono::DateTime<chrono::Utc>| {
+        soap_username_token_created_outcome_for_test(&config, "", &created, now)
+            .expect("config must admit")
+    };
+
+    // Earliest acceptance: the token may arrive a full skew *before* its own
+    // Created. This is the earliest instant at which its nonce can be claimed.
+    let earliest = created_at - chrono::Duration::seconds(SKEW);
+    assert!(
+        decide(earliest).is_ok(),
+        "the future-skew boundary is accepted"
+    );
+    assert!(
+        decide(earliest - chrono::Duration::seconds(1))
+            .expect_err("one second earlier is out of policy")
+            .contains("in the future")
+    );
+
+    // Latest acceptance.
+    let latest = created_at + chrono::Duration::seconds(MAX_AGE + SKEW);
+    assert!(decide(latest).is_ok(), "the max-age boundary is accepted");
+    assert!(
+        decide(latest + chrono::Duration::seconds(1))
+            .expect_err("one second later is out of policy")
+            .contains("too old")
+    );
+
+    // The span an unchanged token can be accepted over under this policy, and
+    // the widest span any admissible policy could ever accept it over. The
+    // fixed retention strictly exceeds both, which is what makes a later
+    // widening safe rather than merely improbable.
+    let acceptance_span = (latest - earliest).num_seconds() as u64;
+    assert_eq!(acceptance_span, (MAX_AGE + 2 * SKEW) as u64);
+    let widest_admissible_span = 86_400 + 2 * 3_600;
+    assert!(
+        CLAIM_RETENTION_SECONDS > acceptance_span
+            && CLAIM_RETENTION_SECONDS > widest_admissible_span,
+        "the claim must outlive every instant at which any admissible generation \
+         would accept the token"
+    );
+}
+
+#[test]
+fn a_claim_covers_the_widest_acceptable_instant_and_expires_only_after_it() {
+    // The widest admissible acceptance span, measured from the earliest instant
+    // a claim can be made, is 86400 + 2 × 3600 = 93600s. The claim is live
+    // through that instant and reclaimable exactly one second later.
+    let harness = SoapNonceReplayHarness::new(&digest_config_with_created_window(86_400, 3_600))
+        .expect("config must admit");
+    assert_eq!(
+        harness.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS
+    );
+
+    harness
+        .claim_at("boundary-nonce-01", Duration::ZERO)
+        .expect("the earliest possible claim admits");
+    assert_eq!(
+        harness
+            .claim_at(
+                "boundary-nonce-01",
+                Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+            )
+            .expect_err("the last acceptable instant must still be protected"),
+        "WS-Security: nonce replay detected"
+    );
+    // One second later the entry expires — and the token itself stopped being
+    // acceptable at that same instant, so nothing is left to replay.
+    harness
+        .claim_at(
+            "boundary-nonce-01",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS),
+        )
+        .expect("past the widest acceptance window the entry may be reclaimed");
+}
+
+// ── The residual this PR closes: retention across future generations ────────
+
+/// A time comfortably past the retention a *narrow* generation would have
+/// derived for itself (300 + 2 × 300 + 1 = 901s) and equally comfortably inside
+/// the fixed horizon.
+const PAST_NARROW_GENERATION_RETENTION: u64 = 2_000;
+
+#[tokio::test]
+async fn a_claim_stays_live_past_the_retention_its_own_generation_would_have_derived() {
+    // Under a per-generation retention this nonce was expired at t=901 and the
+    // repeat below was an in-place *refresh* — i.e. the captured token admitted
+    // a second time. The fixed horizon keeps it a replay.
+    let harness = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(300, 300),
+        "soap-future-generation-liveness",
+        std::time::Instant::now(),
+    )
+    .expect("narrow generation must admit");
+
+    harness
+        .claim_at("future-gen-nonce-01", Duration::ZERO)
+        .expect("the claim is admitted");
+    assert_eq!(
+        harness
+            .claim_at(
+                "future-gen-nonce-01",
+                Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+            )
+            .expect_err("the claim must still be live"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[tokio::test]
+async fn capacity_pressure_cannot_reclaim_a_claim_a_later_generation_still_needs() {
+    // The other way a claim used to disappear: once past the narrow
+    // generation's own retention it became reclaimable, so ordinary capacity
+    // pressure removed it — and a high-water mark cannot resurrect a removed
+    // entry. With a one-entry cap, the second nonce must be refused rather than
+    // allowed to evict the first.
+    let mut config = digest_config_with_created_window(300, 300);
+    config["nonce"]["max_cache_size"] = json!(1);
+    let harness = SoapNonceReplayHarness::with_scope(
+        &config,
+        "soap-future-generation-capacity",
+        std::time::Instant::now(),
+    )
+    .expect("narrow generation must admit");
+
+    harness
+        .claim_at("capacity-nonce-01", Duration::ZERO)
+        .expect("the first claim is admitted");
+    assert_eq!(
+        harness
+            .claim_at(
+                "capacity-nonce-02",
+                Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+            )
+            .expect_err("a live claim must never be evicted to make room"),
+        "WS-Security: replay protection state is at capacity"
+    );
+    let snapshot = harness.snapshot().expect("snapshot");
+    assert_eq!(snapshot.entry_count, 1);
+    assert_eq!(snapshot.last_expired_removals, 0);
+}
+
+#[tokio::test]
+async fn a_later_maximally_widened_generation_still_detects_the_replay() {
+    // The advisory's residual, end to end. A narrow generation claims a nonce.
+    // Well past the retention that generation would have derived for itself, a
+    // reload widens the acceptance window to the schema maximum — which is
+    // exactly when the captured token becomes acceptable again. The claim is
+    // still there, and stays there through the widened window's last acceptable
+    // instant.
+    let scope = "soap-future-generation-widening";
+    let epoch = std::time::Instant::now();
+    let narrow = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(300, 300),
+        scope,
+        epoch,
+    )
+    .expect("narrow generation must admit");
+    narrow
+        .claim_at("widening-nonce-01", Duration::ZERO)
+        .expect("the narrow generation claims the nonce");
+
+    // The reload lands after the old per-generation retention would have
+    // elapsed, so there is nothing left to extend — only what was never allowed
+    // to expire.
+    let wide = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(86_400, 3_600),
+        scope,
+        epoch,
+    )
+    .expect("widened generation must admit");
+    assert_eq!(
+        wide.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS,
+        "retention is the fixed horizon in every generation"
+    );
+
+    assert_eq!(
+        wide.claim_at(
+            "widening-nonce-01",
+            Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+        )
+        .expect_err("the widened generation must still see a replay"),
+        "WS-Security: nonce replay detected"
+    );
+    // And through the last instant the widened window itself would accept the
+    // unchanged token.
+    assert_eq!(
+        wide.claim_at(
+            "widening-nonce-01",
+            Duration::from_secs(CLAIM_RETENTION_SECONDS - 1)
+        )
+        .expect_err("the widened acceptance window must be fully covered"),
+        "WS-Security: nonce replay detected"
+    );
+}
+
+#[tokio::test]
+async fn no_generation_can_expire_or_refresh_another_generations_claim() {
+    // Both directions at once: neither a narrower nor a wider generation has a
+    // retention of its own to impose, so a claim behaves identically whichever
+    // generation observes it.
+    let scope = "soap-generation-symmetry";
+    let epoch = std::time::Instant::now();
+    let wide = SoapNonceReplayHarness::with_scope(
+        &digest_config_with_created_window(86_400, 3_600),
+        scope,
+        epoch,
+    )
+    .expect("wide generation must admit");
+    wide.claim_at("symmetry-nonce-01", Duration::ZERO)
+        .expect("the wide generation claims the nonce");
+
+    let narrow =
+        SoapNonceReplayHarness::with_scope(&digest_config_with_created_window(1, 0), scope, epoch)
+            .expect("narrow generation must admit");
+    assert_eq!(
+        narrow.snapshot().expect("snapshot").retention_seconds,
+        CLAIM_RETENTION_SECONDS,
+        "the narrowest admissible generation reads the same fixed horizon"
+    );
+
+    for (label, harness) in [("narrow", &narrow), ("wide", &wide)] {
+        assert_eq!(
+            harness
+                .claim_at(
+                    "symmetry-nonce-01",
+                    Duration::from_secs(PAST_NARROW_GENERATION_RETENTION)
+                )
+                .expect_err("no generation may expire or refresh the claim"),
+            "WS-Security: nonce replay detected",
+            "{label} generation"
+        );
+    }
+}
+
+// Constructs a Redis client like every other shared-backend test, so it runs
+// on a runtime.
+#[tokio::test]
+async fn the_shared_claim_ttl_is_the_fixed_future_safe_horizon() {
+    // `SET NX EX` cannot extend a key it did not create, so a per-generation TTL
+    // would be unfixable in the widening direction: keys written under the old
+    // value expire early whatever a later generation declares, and "raise,
+    // drain, then widen" is operator procedure rather than enforcement. Every
+    // replica and every generation therefore writes the same fixed horizon, so
+    // an existing key `SET NX` declines to touch already carries the full span.
+    // Observed through a pure seam — no live server is involved.
+    for (max_age, skew) in [(1, 0), (300, 300), (600, 120), (86_400, 3_600)] {
+        let mut config = shared_scope_config("redis://soap-nonce.invalid:6379");
+        config["username_token"]["created_max_age_seconds"] = json!(max_age);
+        config["username_token"]["created_clock_skew_seconds"] = json!(skew);
+        assert_eq!(
+            soap_shared_claim_retention_seconds_for_test(&config).expect("shared scope seam"),
+            CLAIM_RETENTION_SECONDS,
+            "created_max_age_seconds = {max_age}, created_clock_skew_seconds = {skew}"
+        );
+    }
+
+    // The keyspace retention is not declarable either, on this path or any
+    // other: the removed key fails admission closed.
+    let mut declared = shared_scope_config("redis://soap-nonce.invalid:6379");
+    declared["nonce"]["cache_ttl_seconds"] = json!(7_200);
+    let err = SoapWsSecurity::new(&declared)
+        .err()
+        .expect("a declared keyspace retention must be refused");
+    assert!(err.contains("cache_ttl_seconds"), "{err}");
 }
