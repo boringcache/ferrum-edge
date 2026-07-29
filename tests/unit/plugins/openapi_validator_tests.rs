@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::Arc;
 
-use super::plugin_utils::{assert_continue, assert_reject};
+use super::plugin_utils::{assert_continue, assert_reject, create_test_proxy};
 
 /// Stable client/log message for response-side decode/conversion failures.
 /// Backend-controlled encoding details must not cross this boundary.
@@ -4705,6 +4705,506 @@ async fn multipart_encoding_headers_use_full_json_schema_validation() {
             None => assert_continue(result),
         }
     }
+}
+
+fn multipart_header_content_plugin(header_object: Value) -> OpenapiValidator {
+    OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Meta": header_object
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .expect("multipart header content config must construct")
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_json_validates_on_live_path() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    for (meta, expected_status) in [
+        (r#"{"kind":"doc"}"#, None),
+        (r#"{"kind":"ab"}"#, Some(400)),
+        ("not-json", Some(400)),
+        (r#"{"extra":true}"#, Some(400)),
+    ] {
+        let body = format!(
+            "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {meta}\r\n\r\nhello\r\n--abc--\r\n"
+        );
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        match expected_status {
+            Some(status) => assert_reject(result, Some(status)),
+            None => assert_continue(result),
+        }
+    }
+
+    // Concrete media keys may carry valid token and quoted-string parameters;
+    // semicolons inside quotes remain data while the base type selects decoding.
+    let parameterized = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json; charset=\"utf-8\"; profile=\"v1;beta\"": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: {\"kind\":\"doc\"}\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_continue(
+        parameterized
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+}
+
+#[test]
+fn multipart_encoding_header_content_admission_rejects_malformed_and_exclusive_shapes() {
+    for (header_object, expected_fragment) in [
+        (
+            json!({
+                "schema": {"type": "string"},
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema",
+        ),
+        (json!({"content": {}}), "exactly one media type"),
+        (
+            json!({
+                "content": {
+                    "application/json": {"schema": {"type": "object"}},
+                    "text/plain": {"schema": {"type": "string"}}
+                }
+            }),
+            "exactly one media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "encoding": {"nested": {"style": "form"}}
+                    }
+                }
+            }),
+            "encoding",
+        ),
+        (
+            json!({
+                "content": {
+                    "multipart/form-data": {"schema": {"type": "object"}}
+                }
+            }),
+            "multipart/form-data",
+        ),
+        (
+            json!({"content": {"not-a-media": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"application/*": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"*/*": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"application/{json}": {"schema": {"type": "object"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({"content": {"text/pl{ain}": {"schema": {"type": "string"}}}}),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;\u{0001}charset=utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "valid HTTP header value",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset =utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset= utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json;; charset=utf-8": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json; charset=\"unterminated": {
+                        "schema": {"type": "object"}
+                    }
+                }
+            }),
+            "concrete media type",
+        ),
+        (
+            json!({
+                "content": {
+                    "application/json": {
+                        "schema": {"type": "object"},
+                        "example": {"kind": "one"},
+                        "examples": {"two": {"value": {"kind": "two"}}}
+                    }
+                }
+            }),
+            "mutually exclusive",
+        ),
+        (
+            json!({
+                "style": "simple",
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema-form Header Object field",
+        ),
+        (
+            json!({
+                "example": {"kind": "doc"},
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "schema-form Header Object field",
+        ),
+        (
+            json!({
+                "allowEmptyValue": true,
+                "content": {"application/json": {"schema": {"type": "object"}}}
+            }),
+            "not valid for Header Objects",
+        ),
+        (
+            json!({
+                "allowReserved": true,
+                "schema": {"type": "string"}
+            }),
+            "not valid for Header Objects",
+        ),
+    ] {
+        let error = config_error(json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/header-content",
+                "path_regex": "^/header-content$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {"X-Part-Meta": header_object}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }));
+        assert!(
+            error.contains(expected_fragment),
+            "malformed header content must fail closed with a field-specific diagnostic containing '{expected_fragment}': {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_plugin_cache_rebuild_replaces_and_deletes_live_contract()
+{
+    use chrono::Utc;
+    use ferrum_edge::PluginCache;
+    use ferrum_edge::config::types::{GatewayConfig, PluginAssociation, PluginConfig, PluginScope};
+    use ferrum_edge::plugins::ProxyProtocol;
+
+    fn header_content_config(header_object: Value) -> Value {
+        json!({
+            "operations": [{
+                "method": "POST",
+                "path_template": "/header-content",
+                "path_regex": "^/header-content$",
+                "request_body": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["title"],
+                                "properties": {"title": {"type": "string"}}
+                            },
+                            "encoding": {
+                                "title": {
+                                    "headers": {
+                                        "X-Part-Meta": header_object
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        })
+    }
+
+    fn gateway_with_validator(config: Value) -> GatewayConfig {
+        let mut proxy = create_test_proxy();
+        proxy.id = "p1".to_string();
+        proxy.listen_path = Some("/header-content".to_string());
+        proxy.plugins = vec![PluginAssociation {
+            plugin_config_id: "ov1".to_string(),
+        }];
+        GatewayConfig {
+            version: "1".to_string(),
+            proxies: vec![proxy],
+            consumers: vec![],
+            plugin_configs: vec![PluginConfig {
+                id: "ov1".to_string(),
+                namespace: ferrum_edge::config::types::default_namespace(),
+                plugin_name: "openapi_validator".to_string(),
+                config,
+                scope: PluginScope::Proxy,
+                proxy_id: Some("p1".to_string()),
+                enabled: true,
+                priority_override: None,
+                api_spec_id: Some("spec-1".to_string()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            upstreams: vec![],
+            loaded_at: Utc::now(),
+            known_namespaces: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    let content_config = header_content_config(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string", "minLength": 3}},
+                    "additionalProperties": false
+                }
+            }
+        }
+    }));
+    let schema_config = header_content_config(json!({
+        "required": true,
+        "schema": {"type": "string", "pattern": "^[a-z]{4}$"}
+    }));
+    let deleted_config = json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/header-content",
+            "path_regex": "^/header-content$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {}
+                        }
+                    }
+                }
+            }
+        }]
+    });
+
+    let cache = PluginCache::new(&gateway_with_validator(content_config))
+        .expect("content-form openapi_validator must admit");
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let json_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: {\"kind\":\"doc\"}\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let scalar_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "X-Part-Meta: abcd\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+    let missing_body = concat!(
+        "--abc\r\n",
+        "Content-Disposition: form-data; name=\"title\"\r\n",
+        "\r\n",
+        "hello\r\n",
+        "--abc--\r\n"
+    );
+
+    async fn run(
+        cache: &PluginCache,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        let plugins = cache.get_plugins_for_protocol("ferrum", "p1", ProxyProtocol::Http);
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.name() == "openapi_validator")
+            .expect("openapi_validator must be present after rebuild");
+        let mut ctx = post_ctx("/header-content");
+        ctx.headers = headers.clone();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, headers, body)
+            .await
+    }
+
+    assert_continue(run(&cache, &headers, json_body.as_bytes()).await);
+    assert_reject(
+        run(&cache, &headers, scalar_body.as_bytes()).await,
+        Some(400),
+    );
+
+    cache
+        .rebuild(&gateway_with_validator(schema_config))
+        .expect("schema-form replacement must rebuild");
+    assert_continue(run(&cache, &headers, scalar_body.as_bytes()).await);
+    assert_reject(run(&cache, &headers, json_body.as_bytes()).await, Some(400));
+
+    cache
+        .rebuild(&gateway_with_validator(deleted_config))
+        .expect("header-contract delete must rebuild");
+    assert_continue(run(&cache, &headers, missing_body.as_bytes()).await);
+}
+
+#[tokio::test]
+async fn multipart_encoding_header_content_rejects_oversized_header_block() {
+    let plugin = multipart_header_content_plugin(json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {"type": "object"}
+            }
+        }
+    }));
+    // Entire part header block must stay under the existing 8 KiB ceiling.
+    let oversized = "x".repeat(9 * 1024);
+    let body = format!(
+        "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\nX-Part-Meta: {{\"pad\":\"{oversized}\"}}\r\n\r\nhello\r\n--abc--\r\n"
+    );
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut ctx = post_ctx("/header-content");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
 }
 
 #[tokio::test]
