@@ -48,9 +48,9 @@ use crate::proxy::grpc_proxy::{
 use crate::proxy::headers::{
     ClientResponseFraming, GatewayOwnedResponseHeaders, PrePolicyResponseHeaders,
     RejectBodyDisposition, ResponseTrailerGovernance, ResponseTrailerPolicyWitness,
-    TrailerSectionKind, apply_response_headers, content_length_header_value,
-    is_backend_request_strip_header, is_proxy_owned_forwarding_header,
-    parse_connection_listed_from_str_map, reconcile_backend_trailers_with_response_policy,
+    TrailerSectionKind, apply_response_headers, is_backend_request_strip_header,
+    is_proxy_owned_forwarding_header, parse_connection_listed_from_str_map,
+    preserved_response_content_length, reconcile_backend_trailers_with_response_policy,
     reconcile_streaming_backend_trailers, remove_content_length_header,
     sanitize_client_response_headers_for_wire, strip_client_response_hop_by_hop_headers,
     strip_response_hop_by_hop_trailers,
@@ -5468,7 +5468,8 @@ async fn handle_h3_request(
         // client — the graceful-close recovery below still needs it to tell a
         // complete body from a truncated one (an inspected response strips
         // Content-Length because the inspector transforms the body).
-        let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
+        let declared_content_length =
+            preserved_response_content_length(&response_headers, response_status);
         if response_inspector.is_some() {
             // Ordinary Streaming framing removes the wire field anyway; this
             // case-insensitive omit additionally covers `HEAD`, where `Head`
@@ -9798,7 +9799,8 @@ async fn dispatch_grpc_native_h3(
     // would treat that truncated body as malformed before surfacing the gRPC
     // status, so strip it from the client-facing headers (captured first for the
     // internal graceful-close completeness check in the relay loop below).
-    let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
+    let declared_content_length =
+        preserved_response_content_length(&response_headers, response_status);
     // Ordinary Streaming framing removes the wire field; omit case-insensitively
     // here so no later reader of this map treats the backend length as
     // authoritative across an early terminal trailer.

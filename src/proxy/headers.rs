@@ -1166,24 +1166,6 @@ pub fn preserved_response_content_length(
     found
 }
 
-/// First parseable `Content-Length` value under any case spelling.
-///
-/// Used when a path must capture a backend-declared length for internal
-/// accounting before an intentional wire omit. Multiple conflicting variants
-/// are not reconciled here — the wire boundary fails closed separately.
-#[inline]
-pub fn content_length_header_value(
-    headers: &std::collections::HashMap<String, String>,
-) -> Option<u64> {
-    headers.iter().find_map(|(name, value)| {
-        if name.eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
-        }
-    })
-}
-
 fn set_content_length_header(headers: &mut std::collections::HashMap<String, String>, len: u64) {
     // Hot path: exactly one lowercase canonical Content-Length whose untrimmed
     // decimal value already matches the trusted length — preserve existing
@@ -2735,7 +2717,7 @@ mod tests {
             ("Content-Length".to_string(), "999".to_string()),
             ("x-ok".to_string(), "1".to_string()),
         ]);
-        assert_eq!(content_length_header_value(&headers), Some(999));
+        assert_eq!(preserved_response_content_length(&headers, 200), Some(999));
         remove_content_length_header(&mut headers);
         sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::Streaming);
         assert!(
@@ -2745,7 +2727,7 @@ mod tests {
             "mixed-case Content-Length must not survive omit-then-Streaming sanitize"
         );
         assert_eq!(headers.get("x-ok").map(String::as_str), Some("1"));
-        assert_eq!(content_length_header_value(&headers), None);
+        assert_eq!(preserved_response_content_length(&headers, 200), None);
     }
 
     #[test]
