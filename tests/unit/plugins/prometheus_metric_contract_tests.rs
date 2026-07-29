@@ -20,12 +20,10 @@ use serde_json::Value;
 
 const PROMETHEUS_METRIC_CONTRACT_JSON: &str =
     include_str!("../../../docs/prometheus_metric_contract.json");
-const PROMETHEUS_METRICS_REFERENCE_MD: &str =
-    include_str!("../../../docs/prometheus_metrics.md");
+const PROMETHEUS_METRICS_REFERENCE_MD: &str = include_str!("../../../docs/prometheus_metrics.md");
 const BUNDLED_PROMETHEUS_RULE_TEMPLATE: &str =
     include_str!("../../../charts/ferrum-mesh/templates/alerts-prometheusrule.yaml");
-const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] =
-    &["apiserver_admission_webhook_rejection_count"];
+const BUNDLED_EXTERNAL_METRIC_ALLOWLIST: &[&str] = &["apiserver_admission_webhook_rejection_count"];
 const SAMPLE_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count"];
 
 const API_CHARGEBACK_FAMILIES: &[&str] = &[
@@ -248,11 +246,12 @@ fn type_literals_in_rust_source(text: &str) -> BTreeMap<String, BTreeSet<String>
             };
             if (name.starts_with("ferrum_") || name.starts_with("chargeback_sink_"))
                 && matches!(ty, "counter" | "gauge" | "histogram" | "summary")
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
             {
-                found.entry(name.to_string()).or_default().insert(ty.to_string());
+                found
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(ty.to_string());
             }
             search_from = start + 1;
         }
@@ -487,13 +486,7 @@ fn representative_exposition() -> String {
     output.push_str(&bpf.exporter().render_prometheus());
 
     let chargeback = ChargebackRegistry::new();
-    chargeback.configure(
-        60,
-        3600,
-        0,
-        DEFAULT_MAX_ENTRIES,
-        DEFAULT_MAX_RETAINED_BYTES,
-    );
+    chargeback.configure(60, 3600, 0, DEFAULT_MAX_ENTRIES, DEFAULT_MAX_RETAINED_BYTES);
     let scope = InstanceScope::new("USD", "contract-ns");
     chargeback.record_http(
         &scope,
@@ -691,11 +684,13 @@ fn representative_metrics_exposition_matches_contract() {
         assert_eq!(
             fam.metric_type, observed.metric_type,
             "type drift for {name}: contract={} exposition={}",
-            fam.metric_type,
-            observed.metric_type
+            fam.metric_type, observed.metric_type
         );
         assert_eq!(fam.help, observed.help, "HELP drift for family {name}");
-        assert_eq!(fam.labels, observed.labels, "label-key drift for family {name}");
+        assert_eq!(
+            fam.labels, observed.labels,
+            "label-key drift for family {name}"
+        );
     }
     assert!(
         undocumented.is_empty(),
@@ -848,11 +843,19 @@ ferrum_request_duration_ms_sum{proxy_id=\"p\"} 1\n\
 ferrum_request_duration_ms_count{proxy_id=\"p\"} 1\n\
 ";
     let parsed = parse_exposition_families(exposition);
-    assert_eq!(parsed["ferrum_database_delta_backoff_bucket"].metric_type, "gauge");
-    assert!(parsed["ferrum_database_delta_backoff_bucket"]
-        .labels
-        .contains("bucket"));
-    assert_eq!(parsed["ferrum_request_duration_ms"].metric_type, "histogram");
+    assert_eq!(
+        parsed["ferrum_database_delta_backoff_bucket"].metric_type,
+        "gauge"
+    );
+    assert!(
+        parsed["ferrum_database_delta_backoff_bucket"]
+            .labels
+            .contains("bucket")
+    );
+    assert_eq!(
+        parsed["ferrum_request_duration_ms"].metric_type,
+        "histogram"
+    );
     assert!(parsed["ferrum_request_duration_ms"].labels.contains("le"));
     assert!(!parsed.contains_key("ferrum_database_delta_backoff"));
 }
@@ -900,7 +903,8 @@ fn production_type_literals_are_inventoried_with_matching_types() {
 #[test]
 fn production_type_literal_scanner_has_mutation_and_noise_regressions() {
     let contract = load_contract();
-    let synthetic = r##"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"##;
+    let synthetic =
+        r##"output.push_str("# TYPE ferrum_contract_mutation_missing_total counter\n");"##;
     let detected = type_literals_in_rust_source(synthetic);
     assert!(
         detected.contains_key("ferrum_contract_mutation_missing_total"),
