@@ -305,6 +305,49 @@ fn alias_bomb_fails_closed_under_budgets() {
 }
 
 #[test]
+fn control_character_string_escaping_cannot_bypass_byte_budget() {
+    // Each U+0001 is 1 decoded byte but `\u0001` (6 bytes) in compact JSON.
+    // 64 aliases × 100 KiB raw ≈ 6.25 MiB under a raw-length charge, but the
+    // escaped representation exceeds the public 32 MiB expanded-byte ceiling.
+    let chunk = "\\u0001".repeat(100_000);
+    let aliases = std::iter::repeat_n("  - *s\n", 64).collect::<String>();
+    let yaml = format!("s: &s \"{chunk}\"\nitems:\n{aliases}");
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(msg) if msg.contains("expanded byte limit")
+        ),
+        "control-character string escaping must hit the expanded-byte budget, got {err:?}"
+    );
+    assert!(
+        !format!("{err:?}").contains('\u{0001}'),
+        "byte-budget diagnostics must not echo hostile scalar payloads"
+    );
+}
+
+#[test]
+fn control_character_mapping_key_escaping_cannot_bypass_byte_budget() {
+    // Same inflation applied to mapping keys: alias reuse of a control-heavy
+    // key must charge JSON escaping, not decoded UTF-8 length alone.
+    let chunk = "\\u0001".repeat(100_000);
+    let aliases = std::iter::repeat_n("  - *e\n", 64).collect::<String>();
+    let yaml = format!("e: &e\n  \"{chunk}\": 1\nitems:\n{aliases}");
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(msg) if msg.contains("expanded byte limit")
+        ),
+        "control-character key escaping must hit the expanded-byte budget, got {err:?}"
+    );
+    assert!(
+        !format!("{err:?}").contains('\u{0001}'),
+        "byte-budget diagnostics must not echo hostile key material"
+    );
+}
+
+#[test]
 fn json_and_yaml_literal_parity_without_aliases() {
     let json = json!({
         "openapi": "3.1.0",

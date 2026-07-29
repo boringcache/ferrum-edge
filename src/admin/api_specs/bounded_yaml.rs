@@ -23,7 +23,9 @@ pub(crate) const MAX_YAML_DEPTH: usize = 128;
 /// Maximum number of alias edges followed during expansion.
 pub(crate) const MAX_YAML_ALIAS_REFERENCES: usize = 500_000;
 
-/// Maximum approximate byte size of the expanded JSON tree.
+/// Fail-closed upper bound on the compact JSON representation of the expanded
+/// tree (`serde_json` encoding), including string/key escaping and structural
+/// punctuation. Matches the public 32 MiB expanded-representation ceiling.
 pub(crate) const MAX_YAML_EXPANDED_BYTES: usize = 32 * 1024 * 1024;
 
 /// Maximum composition/expansion steps (event processing + node visits).
@@ -518,9 +520,12 @@ fn expand_node_inner(
         NodeKind::Sequence(items) => {
             budgets.enter_depth()?;
             budgets.charge_node()?;
+            // Compact JSON `[...]` framing. The per-element `+1` below is a
+            // trailing-comma overestimate and therefore fail-closed.
             budgets.charge_bytes(2)?;
             let mut out = Vec::with_capacity(items.len());
             for child in items {
+                budgets.charge_bytes(1)?;
                 out.push(expand_node(document, *child, budgets, expanding)?);
             }
             budgets.leave_depth();
@@ -529,6 +534,9 @@ fn expand_node_inner(
         NodeKind::Mapping(pairs) => {
             budgets.enter_depth()?;
             budgets.charge_node()?;
+            // Compact JSON `{...}` framing. Key string/escaping bytes are
+            // charged when the key scalar expands; `:` / `,` are charged here
+            // (trailing-comma overestimate, fail-closed).
             budgets.charge_bytes(2)?;
             let mut map = Map::new();
             let mut merges: Vec<Value> = Vec::new();
@@ -547,7 +555,7 @@ fn expand_node_inner(
                 if is_yaml_merge_key(document, *key_id) {
                     collect_merge_sources(value, &mut merges)?;
                 } else {
-                    budgets.charge_bytes(key.len())?;
+                    budgets.charge_bytes(2)?;
                     map.insert(key, value);
                 }
             }
@@ -617,11 +625,32 @@ fn collect_merge_sources(value: Value, out: &mut Vec<Value>) -> Result<(), Bound
 fn charge_value_bytes(budgets: &mut Budgets, value: &Value) -> Result<(), BoundedYamlError> {
     match value {
         Value::Null => budgets.charge_bytes(4),
-        Value::Bool(_) => budgets.charge_bytes(5),
+        Value::Bool(true) => budgets.charge_bytes(4),
+        Value::Bool(false) => budgets.charge_bytes(5),
         Value::Number(n) => budgets.charge_bytes(n.to_string().len()),
-        Value::String(s) => budgets.charge_bytes(s.len()),
+        Value::String(s) => budgets.charge_bytes(json_string_serialized_len(s)),
+        // Containers charge framing/separators while expanding children.
         Value::Array(_) | Value::Object(_) => Ok(()),
     }
+}
+
+/// Exact byte length of a string after `serde_json` quoting/escaping.
+///
+/// Expanded-byte accounting must bound the representation that
+/// `serde_json::to_vec` / `to_vec_pretty` will emit. Counting decoded UTF-8
+/// alone underestimates quotes, backslashes, and control characters by up to
+/// six bytes each, which alias expansion can amplify past the public 32 MiB
+/// ceiling. Kept allocation-free (no scratch buffer) to avoid admin-path
+/// memory spikes. Logic mirrors `extractor::json_string_serialized_len`.
+fn json_string_serialized_len(value: &str) -> usize {
+    value.chars().fold(2usize, |bytes, character| {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        bytes.saturating_add(encoded)
+    })
 }
 
 fn scalar_to_json(
