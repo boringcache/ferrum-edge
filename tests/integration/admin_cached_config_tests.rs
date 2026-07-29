@@ -4901,7 +4901,7 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
                 "tags": ["api_v1"],
                 "server_urls": [],
                 "operation_count": 0,
-                "resource_hash": "hash",
+                "resource_hash": "a".repeat(64),
                 "created_at": chrono::Utc::now().to_rfc3339(),
                 "updated_at": chrono::Utc::now().to_rfc3339()
             }]
@@ -4977,7 +4977,7 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
                 "tags": [],
                 "server_urls": [],
                 "operation_count": 0,
-                "resource_hash": "hash",
+                "resource_hash": "a".repeat(64),
                 "created_at": chrono::Utc::now().to_rfc3339(),
                 "updated_at": chrono::Utc::now().to_rfc3339()
             }]

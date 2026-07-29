@@ -71,7 +71,7 @@ cat ferrum-backup.json | jq '.counts'
 }
 ```
 
-The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). Database-backed exports always include the section (possibly with an empty `items` array).
+The `api_specs` field is a **versioned section** (`section_version`) carrying raw gzip-compressed documents as `spec_content_base64` plus the ownership/generated-resource metadata needed to reproduce managed relationships (`proxy_id`, `resource_hash`, timestamps, and companion `api_spec_id` tags on restored proxies/upstreams/plugin configs). `resource_hash` is either empty for legacy records or exactly 64 lowercase hexadecimal characters. Database-backed exports always include the section (possibly with an empty `items` array).
 
 An export that cannot carry spec documents also clears the `api_spec_id` tags on the resources it does export, so the payload never references specs it does not contain (restore rejects that shape). Two cases:
 
@@ -158,6 +158,13 @@ FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB=50
 # Increase to 200 MiB for extremely large deployments
 FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB=200
 ```
+
+The same limit bounds the aggregate decompressed API-spec content in one
+restore. Each document is also bounded by
+`FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB`. Validation rejects an aggregate declared
+size over the restore limit before decompressing anything and stops at the
+first corrupt or oversized gzip member. All of these checks happen before
+existing configuration is deleted.
 
 ### Size Guidance
 

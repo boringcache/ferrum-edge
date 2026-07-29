@@ -35,7 +35,8 @@ use crate::admin::backup::{
     ApiSpecsBackupSection, BackupCounts, BackupPayload, RestorePayload,
     clear_api_spec_ownership_tags, filter_config_by_namespace, parse_backup_resources,
     parse_confirm_api_spec_deletion, parse_restore_confirm,
-    validate_backup_api_specs_resource_filter, validate_restore_api_specs_section,
+    validate_backup_api_specs_resource_filter,
+    validate_restore_api_specs_section_with_total_limit,
 };
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
@@ -7136,13 +7137,17 @@ async fn handle_restore(
             let upstreams = payload.upstreams.clone();
             let plugin_configs = payload.plugin_configs.clone();
             let max_spec_body_mib = state.admin_spec_max_body_size_mib;
+            let max_total_spec_bytes = state
+                .admin_restore_max_body_size_mib
+                .saturating_mul(1024 * 1024);
             let validation = tokio::task::spawn_blocking(move || {
-                validate_restore_api_specs_section(
+                validate_restore_api_specs_section_with_total_limit(
                     &section,
                     &proxies,
                     &upstreams,
                     &plugin_configs,
                     max_spec_body_mib,
+                    max_total_spec_bytes,
                 )
             })
             .await;

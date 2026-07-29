@@ -12207,7 +12207,8 @@ components:
         and ownership metadata. Omitted entirely on cached-fallback exports
         (`X-Data-Source: cached`), which cannot prove spec ownership and so
         restore as legacy backups; database-backed exports always include it
-        (possibly with an empty `items` array).
+        (possibly with an empty `items` array). The aggregate decompressed
+        API-spec content is bounded by the configured restore body limit.
       required: [section_version, items]
       properties:
         section_version:
@@ -12288,6 +12289,8 @@ components:
           type: integer
         resource_hash:
           type: string
+          pattern: "^$|^[0-9a-f]{64}$"
+          description: Empty for legacy records or lowercase hex SHA-256 of the generated resource bundle
         created_at:
           type: string
           format: date-time

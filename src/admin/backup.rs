@@ -314,6 +314,7 @@ pub(crate) fn filter_config_by_namespace(config: &GatewayConfig, namespace: &str
 /// operator logs. Enforces the same stored-metadata bounds and declared-format
 /// document parse used by ordinary POST/PUT admission, without re-extracting
 /// resources or resolving external references.
+#[cfg(test)]
 pub(crate) fn validate_restore_api_specs_section(
     section: &ApiSpecsBackupSection,
     proxies: &[Proxy],
@@ -321,16 +322,42 @@ pub(crate) fn validate_restore_api_specs_section(
     plugin_configs: &[PluginConfig],
     max_spec_body_mib: usize,
 ) -> Result<Vec<ApiSpec>, Vec<String>> {
+    validate_restore_api_specs_section_with_total_limit(
+        section,
+        proxies,
+        upstreams,
+        plugin_configs,
+        max_spec_body_mib,
+        100 * 1024 * 1024,
+    )
+}
+
+pub(crate) fn validate_restore_api_specs_section_with_total_limit(
+    section: &ApiSpecsBackupSection,
+    proxies: &[Proxy],
+    upstreams: &[Upstream],
+    plugin_configs: &[PluginConfig],
+    max_spec_body_mib: usize,
+    max_total_spec_bytes: usize,
+) -> Result<Vec<ApiSpec>, Vec<String>> {
     let mut errors = Vec::new();
     if section.section_version != API_SPECS_BACKUP_SECTION_VERSION {
-        errors.push(format!(
-            "Unsupported api_specs.section_version '{}'; expected '{}'",
-            section.section_version, API_SPECS_BACKUP_SECTION_VERSION
-        ));
+        errors.push("Unsupported api_specs.section_version".to_string());
         return Err(errors);
     }
 
     let max_uncompressed = max_spec_body_mib.saturating_mul(1024 * 1024);
+    let declared_total: u128 = section
+        .items
+        .iter()
+        .map(|item| u128::from(item.uncompressed_size))
+        .sum();
+    if declared_total > max_total_spec_bytes as u128 {
+        errors.push(
+            "api_specs: aggregate uncompressed_size exceeds restore body limit".to_string(),
+        );
+        return Err(errors);
+    }
     // Compressed payload bound: reject absurd base64 that would decode past the
     // admin body ceiling even before gzip expansion.
     let max_compressed = max_uncompressed.saturating_mul(2).max(1024 * 1024);
@@ -342,6 +369,7 @@ pub(crate) fn validate_restore_api_specs_section(
         .collect();
 
     let mut specs = Vec::with_capacity(section.items.len());
+    let mut total_decompressed = 0usize;
     for item in &section.items {
         if let Err(error) = crate::config::types::validate_resource_id(&item.id) {
             errors.push(format!("api_spec id: {error}"));
@@ -369,9 +397,22 @@ pub(crate) fn validate_restore_api_specs_section(
             ));
             continue;
         }
-        if item.uncompressed_size as usize > max_uncompressed {
+        if u128::from(item.uncompressed_size) > max_uncompressed as u128 {
             errors.push(format!(
                 "api_spec '{}': uncompressed_size exceeds admin spec body limit",
+                item.id
+            ));
+            continue;
+        }
+        if !item.resource_hash.is_empty()
+            && (item.resource_hash.len() != 64
+                || !item
+                    .resource_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        {
+            errors.push(format!(
+                "api_spec '{}': resource_hash must be empty or lowercase SHA-256 hex",
                 item.id
             ));
             continue;
@@ -412,9 +453,16 @@ pub(crate) fn validate_restore_api_specs_section(
                     "api_spec '{}': compressed content is corrupt or oversized",
                     item.id
                 ));
-                continue;
+                return Err(errors);
             }
         };
+        total_decompressed = total_decompressed.saturating_add(decompressed.len());
+        if total_decompressed > max_total_spec_bytes {
+            errors.push(
+                "api_specs: aggregate decompressed content exceeds restore body limit".to_string(),
+            );
+            return Err(errors);
+        }
         if decompressed.len() as u64 != spec.uncompressed_size {
             errors.push(format!(
                 "api_spec '{}': uncompressed_size does not match decompressed content",
@@ -954,7 +1002,7 @@ mod tests {
             tags: vec![],
             server_urls: vec![],
             operation_count: 0,
-            resource_hash: "hash".to_string(),
+            resource_hash: "a".repeat(64),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1038,6 +1086,77 @@ mod tests {
         assert!(
             err.iter()
                 .any(|e| e.contains("Unsupported api_specs.section_version"))
+        );
+        assert!(err.iter().all(|e| !e.contains("99")));
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_aggregate_expansion_before_decompression() {
+        let raw =
+            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![
+                sample_spec_item("spec-1", "proxy-1", raw),
+                sample_spec_item("spec-2", "proxy-2", raw),
+            ],
+        };
+        let err = validate_restore_api_specs_section_with_total_limit(
+            &section,
+            &[],
+            &[],
+            &[],
+            25,
+            raw.len().saturating_mul(2).saturating_sub(1),
+        )
+        .expect_err("aggregate expansion must be bounded");
+        assert_eq!(
+            err,
+            vec!["api_specs: aggregate uncompressed_size exceeds restore body limit"]
+        );
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_actual_expansion_over_aggregate_limit() {
+        let raw =
+            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.uncompressed_size = 0;
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let err = validate_restore_api_specs_section_with_total_limit(
+            &section,
+            &[],
+            &[],
+            &[],
+            25,
+            raw.len().saturating_sub(1),
+        )
+        .expect_err("actual expansion must be bounded");
+        assert_eq!(
+            err,
+            vec!["api_specs: aggregate decompressed content exceeds restore body limit"]
+        );
+    }
+
+    #[test]
+    fn validate_api_specs_section_rejects_unbounded_resource_hash() {
+        let raw =
+            br#"{"openapi":"3.1.0","info":{"title":"t","version":"1"},"paths":{}}"#;
+        let mut item = sample_spec_item("spec-1", "proxy-1", raw);
+        item.resource_hash = "not-a-sha256".to_string();
+        let section = ApiSpecsBackupSection {
+            section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
+            items: vec![item],
+        };
+        let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
+        let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
+            .expect_err("resource hash must be bounded");
+        assert!(
+            err.iter()
+                .any(|e| e.contains("resource_hash must be empty or lowercase SHA-256 hex"))
         );
     }
 
