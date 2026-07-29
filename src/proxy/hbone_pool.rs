@@ -797,7 +797,21 @@ impl HboneConnectionPool {
         // HTTP HBONE path (`get_tunnel_via`).
         asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
-        let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        // This is a secured source-side HBONE dial, so it owns the same
+        // `outbound_dial` NodeWaypoint ADR phase as `get_tunnel_via` (issue
+        // #3334). WebSocket egress dials its own 1:1 connection rather than
+        // reusing the pooled HTTP senders, so without this the phase would be
+        // blind to every WebSocket session on the topology.
+        let (source_identity, _fingerprint) = match self.current_svid_identity_cached() {
+            Ok(identity) => identity,
+            Err(error) => {
+                crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+                    crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::OutboundDial,
+                    false,
+                );
+                return Err(error);
+            }
+        };
         let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
         // DR keepalive override resolved for the destination's APP port, not
@@ -807,34 +821,43 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port))
             .and_then(|o| o.tcp_keepalive.as_ref());
-        let sender = dial_h2_connect_sender(
-            &self.dns_cache,
-            &self.gateway_svid,
-            self.crls.load_full(),
-            proxy,
-            dial_host,
-            hbone_port,
-            expected_peer,
-            expected_trust_domain,
-            sni_override,
-            &pool_config,
-            keepalive_override,
-            None,
-        )
-        .await?;
-        let baggage = baggage_header_for_source(hbone_source_identity);
-        tokio::time::timeout(
-            Duration::from_millis(proxy.backend_connect_timeout_ms),
-            open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
-        )
-        .await
-        .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(app_host, app_port),
-            message: format!(
-                "timed out after {}ms waiting for HBONE WebSocket byte-tunnel CONNECT response",
-                proxy.backend_connect_timeout_ms
-            ),
-        })?
+        let dial_result: Result<H2ConnectTunnel, HbonePoolError> = async {
+            let sender = dial_h2_connect_sender(
+                &self.dns_cache,
+                &self.gateway_svid,
+                self.crls.load_full(),
+                proxy,
+                dial_host,
+                hbone_port,
+                expected_peer,
+                expected_trust_domain,
+                sni_override,
+                &pool_config,
+                keepalive_override,
+                None,
+            )
+            .await?;
+            let baggage = baggage_header_for_source(hbone_source_identity);
+            tokio::time::timeout(
+                Duration::from_millis(proxy.backend_connect_timeout_ms),
+                open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
+            )
+            .await
+            .map_err(|_| HbonePoolError::ConnectStream {
+                authority: authority_for_host_port(app_host, app_port),
+                message: format!(
+                    "timed out after {}ms waiting for HBONE WebSocket byte-tunnel CONNECT response",
+                    proxy.backend_connect_timeout_ms
+                ),
+            })?
+        }
+        .await;
+
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::OutboundDial,
+            dial_result.is_ok(),
+        );
+        dial_result
     }
 
     /// Open a datagram-over-HBONE CONNECT tunnel to a peer's HBONE listener over

@@ -236,7 +236,7 @@ labels.
 
 | Contract signal | Exact metric / admin field | Label set | Producer path | Unit / integration coverage | Live assertion / dashboard | Status |
 |---|---|---|---|---|---|---|
-| HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via`) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | mesh-overview NW panels; live IDs `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success` | **Implemented + live-wired** |
+| HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via` for pooled HTTP/raw-TCP egress and `get_ws_byte_tunnel` for the 1:1 WebSocket byte tunnel; counted per opened CONNECT tunnel, including tunnels multiplexed onto an already-established pooled H2 connection. Datagram tunnels are out of scope — NodeWaypoint emits no UDP capture listener) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | mesh-overview NW panels; live IDs `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success` | **Implemented + live-wired** |
 | Asserted source identity accepted/rejected | `ferrum_mesh_node_waypoint_asserted_identity_total` + admin `asserted_identity.*` | `result` ∈ {`accepted`,`rejected`}, `reason` ∈ {`honored`,`untrusted_assertor`,`trust_domain_mismatch`,`unauthenticated_hbone`,`malformed`,`stale_or_unknown`} | `mesh_authz` when `per_pod_policy_scoping` | unit observability tests + existing mesh_authz plugin tests | live ID `node_waypoint.observability.asserted_identity_rejected` | **Implemented + live-wired** |
 | Destination policy rejection | `ferrum_mesh_node_waypoint_destination_policy_rejections_total` + admin `destination_policy_rejections.*` | `reason` ∈ {`authz_deny`,`scope_missing`,`destination_scope_missing`,`relay_destination_denied`} | `mesh_authz` / open-relay guard (mutually exclusive with asserted-identity reject for one decision) | unit observability tests | Live deny paths exercise authz; counter panels on mesh-overview | **Implemented** |
 | Missing destination NodeWaypoint metadata | `ferrum_mesh_node_waypoint_missing_destination_metadata_total` + admin field | none | `build_outbound_mesh_targets` skip when identity-backed posture requires metadata | `mesh_outbound_node_waypoint_identity_backed_missing_metadata_fails_closed` + observability unit tests | Dashboard panel; live profile always publishes metadata so counter stays observational in H2 | **Implemented** |
@@ -244,9 +244,15 @@ labels.
 
 ### Increment ownership (no double-count of one failed session)
 
-1. Destination inbound: TLS failure increments **only** `phase=inbound_tls`.
-   CONNECT admission is never counted for that session.
-2. Destination inbound: TLS success then CONNECT reject increments **only**
+The rule is on the **failure** side: one failed session contributes exactly one
+`result="failure"` sample across the three phases. Success samples are per
+phase, so a session that clears an earlier phase records that phase's success
+even when a later phase then fails.
+
+1. Destination inbound: TLS failure increments **only** `phase=inbound_tls`
+   failure. CONNECT admission is never counted for that session.
+2. Destination inbound: TLS success then CONNECT reject increments
+   `inbound_tls` **success** and, as the session's only failure sample,
    `phase=inbound_connect` failure.
 3. Destination inbound: TLS + CONNECT admission success increments
    `inbound_tls` success and `inbound_connect` success (distinct phases of one

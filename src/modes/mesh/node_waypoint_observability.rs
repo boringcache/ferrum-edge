@@ -14,8 +14,15 @@
 //!   not a second ADR failure class).
 //! - `inbound_connect` — HBONE CONNECT admission after TLS succeeded
 //!   (authenticated peer / open-relay guard). Never incremented when TLS failed.
-//! - `outbound_dial` — source-side secured HBONE dial (TLS+H2+CONNECT) to a
-//!   destination NodeWaypoint. Independent of the destination's inbound phases.
+//! - `outbound_dial` — source-side secured HBONE dial to a destination
+//!   NodeWaypoint, counted once per opened CONNECT tunnel across both egress
+//!   entry points: the pooled HTTP/raw-TCP tunnel
+//!   (`HboneConnectionPool::get_tunnel_via`) and the 1:1 WebSocket byte tunnel
+//!   (`HboneConnectionPool::get_ws_byte_tunnel`). A tunnel opened over an
+//!   already-established pooled H2 connection still counts, so this is
+//!   "secured dial attempts", not "TLS handshakes". Datagram tunnels are out of
+//!   scope: NodeWaypoint emits no UDP capture listener and never relays UDP.
+//!   Independent of the destination's inbound phases.
 //!
 //! Asserted-identity and destination-policy counters are mutually exclusive for
 //! a single authz decision: identity rejection is recorded first and skips the

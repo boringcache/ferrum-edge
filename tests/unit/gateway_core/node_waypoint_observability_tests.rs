@@ -117,17 +117,34 @@ fn enabled_producers_increment_and_render_bounded_labels() {
         after.hbone_handshakes.outbound_dial_failure,
         before.hbone_handshakes.outbound_dial_failure + 1
     );
-    assert_eq!(
-        after.asserted_identity.accepted,
-        before.asserted_identity.accepted + 1
+    // `mesh_authz` is the production producer for the asserted-identity and
+    // destination-policy counters, and `tests/unit/plugins/mesh_plugins_tests.rs`
+    // drives `MeshAuthz` with `per_pod_policy_scoping: true` in THIS SAME test
+    // binary. `OBSERVABILITY_TEST_LOCK` only serialises the observability tests
+    // against each other, so a mesh_authz deny/honored-baggage case running on
+    // another libtest thread while the producers are enabled adds its own
+    // increments. Assert a lower bound for those three; the handshake, metadata,
+    // and plaintext-fallback counters have no other producer in this binary and
+    // stay exact.
+    assert!(
+        after.asserted_identity.accepted >= before.asserted_identity.accepted + 1,
+        "asserted identity accept must move (was {}, now {})",
+        before.asserted_identity.accepted,
+        after.asserted_identity.accepted
     );
-    assert_eq!(
-        after.asserted_identity.rejected_untrusted_assertor,
-        before.asserted_identity.rejected_untrusted_assertor + 1
+    assert!(
+        after.asserted_identity.rejected_untrusted_assertor
+            >= before.asserted_identity.rejected_untrusted_assertor + 1,
+        "untrusted-assertor reject must move (was {}, now {})",
+        before.asserted_identity.rejected_untrusted_assertor,
+        after.asserted_identity.rejected_untrusted_assertor
     );
-    assert_eq!(
-        after.destination_policy_rejections.authz_deny,
-        before.destination_policy_rejections.authz_deny + 1
+    assert!(
+        after.destination_policy_rejections.authz_deny
+            >= before.destination_policy_rejections.authz_deny + 1,
+        "authz_deny must move (was {}, now {})",
+        before.destination_policy_rejections.authz_deny,
+        after.destination_policy_rejections.authz_deny
     );
     assert_eq!(
         after.missing_destination_metadata,
@@ -181,8 +198,10 @@ fn enabled_producers_increment_and_render_bounded_labels() {
         );
     }
 
-    // Leave enabled for other tests that may race in parallel; producers are
-    // additive and snapshots compare deltas.
+    // Disable again before releasing the lock so unrelated suites in this
+    // binary (notably the `MeshAuthz` per-pod tests) do not keep moving the
+    // process-static counters while no observability test is running.
+    node_waypoint_observability::set_enabled(false);
 }
 
 /// `/metrics` must observe NodeWaypoint ADR counter movement even when the
@@ -238,6 +257,8 @@ fn node_waypoint_inbound_tls_failure_bypasses_metrics_render_cache() {
         "cached /metrics render must still reflect a fresh inbound_tls failure \
          (was {before_failure}, now {after_failure})"
     );
+
+    node_waypoint_observability::set_enabled(false);
 }
 
 /// Parse a Prometheus counter for an exact closed selector (`metric{…}`).
@@ -357,4 +378,6 @@ fn handshake_phase_ownership_is_independent() {
         after_connect.hbone_handshakes.inbound_tls_failure,
         after_tls.hbone_handshakes.inbound_tls_failure
     );
+
+    node_waypoint_observability::set_enabled(false);
 }
