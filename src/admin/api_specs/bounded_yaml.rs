@@ -12,6 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::slice;
+// Keep the conventional `sys` spelling for the raw FFI surface; every call is
+// still contained in an explicitly documented unsafe block.
+#[allow(clippy::unsafe_removed_from_name)]
 use unsafe_libyaml as sys;
 
 /// Maximum nesting depth while composing and expanding YAML documents.
@@ -408,7 +411,7 @@ fn register_anchor(
 
 fn attach_child(
     document: &mut Document,
-    stack: &mut Vec<Frame>,
+    stack: &mut [Frame],
     child: usize,
 ) -> Result<(), BoundedYamlError> {
     let Some(frame) = stack.last_mut() else {
