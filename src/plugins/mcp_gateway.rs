@@ -4915,20 +4915,14 @@ impl Plugin for McpGateway {
         if is_well_formed_json_rpc_error_response(&value) {
             return PluginResult::Continue;
         }
-        if value.get("result").is_some() && value.get("error").is_some() {
+        if !is_well_formed_json_rpc_result_response(&value) {
             return self.reject_invalid_tool_result(
                 ctx,
                 response_id,
-                "tools/call response contains both result and error",
+                "tools/call response has a malformed JSON-RPC result envelope",
             );
         }
-        let Some(result) = value.get("result") else {
-            return self.reject_invalid_tool_result(
-                ctx,
-                response_id,
-                "tools/call response missing result",
-            );
-        };
+        let result = &value["result"];
         // Legitimate tool execution errors are reported in-band with isError.
         if result
             .get("isError")
@@ -5376,6 +5370,16 @@ fn is_well_formed_json_rpc_error_response(value: &Value) -> bool {
                 && error.get("message").and_then(Value::as_str).is_some()
         })
     })
+}
+
+fn is_well_formed_json_rpc_result_response(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && object.contains_key("result")
+        && !object.contains_key("error")
+        && valid_json_rpc_response_id(value).is_some()
 }
 
 async fn upstream_response_json(

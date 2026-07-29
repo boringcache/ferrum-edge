@@ -8050,6 +8050,71 @@ async fn validate_tool_results_rejects_result_and_error_bypass() {
 }
 
 #[tokio::test]
+async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
+    let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
+    let plugin = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&format!("{}/mcp", server.uri())),
+    )
+    .unwrap()
+    .unwrap();
+    let session_id = initialize(&plugin).await;
+    let valid_result = json!({
+        "structuredContent": {
+            "temperature": 22.5,
+            "conditions": "Clear"
+        }
+    });
+    let malformed = [
+        (
+            "missing jsonrpc",
+            json!({"id": 157, "result": valid_result}),
+            json!(157),
+        ),
+        (
+            "wrong jsonrpc",
+            json!({"jsonrpc": "1.0", "id": 158, "result": valid_result}),
+            json!(158),
+        ),
+        (
+            "missing id",
+            json!({"jsonrpc": "2.0", "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "object id",
+            json!({"jsonrpc": "2.0", "id": {}, "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "array id",
+            json!({"jsonrpc": "2.0", "id": [], "result": valid_result}),
+            Value::Null,
+        ),
+        (
+            "boolean id",
+            json!({"jsonrpc": "2.0", "id": false, "result": valid_result}),
+            Value::Null,
+        ),
+    ];
+
+    for (offset, (case, upstream_value, expected_id)) in malformed.into_iter().enumerate() {
+        let mut ctx =
+            route_validated_tool_call(&plugin, &session_id, 220 + offset as i64 * 2).await;
+        let upstream_response = serde_json::to_vec(&upstream_value).unwrap();
+        let headers = known_json_response_headers(&upstream_response);
+        let (status, body, _) = reject_json(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &upstream_response)
+                .await,
+        );
+        assert_eq!(status, 200, "{case}");
+        assert_eq!(body["error"]["code"], -32012, "{case}");
+        assert_eq!(body["id"], expected_id, "{case}");
+    }
+}
+
+#[tokio::test]
 async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
