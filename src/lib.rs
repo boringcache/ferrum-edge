@@ -1140,6 +1140,22 @@ pub mod _test_support {
         plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
+    pub fn api_chargeback_sink_compact_projection_shortfall_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, usize, bool)> {
+        plugin.compact_projection_shortfall_for_tests()
+    }
+
+    /// Hold a snapshot generation's emission lock while a worker thread runs the
+    /// whole Full→Compact sequence. Returns
+    /// `(blocked_while_emission_held, compacted_after_release)`.
+    pub fn api_chargeback_sink_compact_excluded_by_emission_lock_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        hold: std::time::Duration,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_excluded_by_emission_lock_for_tests(hold)
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -1321,6 +1337,159 @@ pub mod _test_support {
         oversized: &crate::plugins::TransactionSummary,
     ) -> (u64, u64) {
         crate::plugins::kafka_logging::probe_byte_budget_before_serialize_for_test(oversized).await
+    }
+
+    /// Deterministic probe: the retained-byte lease must be transferred into
+    /// librdkafka's delivery-opaque state, so it is still held while librdkafka
+    /// retains its copy of a record it cannot deliver, and released exactly once
+    /// when producer destruction purges the queue.
+    ///
+    /// Returns `(instance_used_after_send, ceiling_used_after_send,
+    /// instance_used_after_destroy, ceiling_used_after_destroy)`, or a fixed,
+    /// secret-free diagnostic. librdkafka is an unconditional dependency and the
+    /// probe's broker is a local unreachable port, so a failure here is a defect
+    /// rather than an absent environment capability — callers must assert on it.
+    pub fn kafka_logging_probe_downstream_lease_ownership_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        record_count: usize,
+    ) -> Result<(usize, usize, usize, usize), String> {
+        crate::plugins::kafka_logging::probe_downstream_lease_ownership_for_test(
+            ceiling,
+            record_count,
+        )
+    }
+
+    // ── plugins/loki_logging ────────────────────────────────────────────────
+    /// Construct Loki logging against a test-owned retained-byte ceiling.
+    ///
+    /// This keeps ownership assertions isolated from concurrently running
+    /// observability tests that reserve against the process-global ceiling.
+    pub fn loki_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::loki_logging::LokiLogging, String> {
+        crate::plugins::loki_logging::LokiLogging::new_with_ceiling(config, http_client, ceiling)
+    }
+
+    /// Deterministic probe: a provisional `max_entry_bytes` reservation must
+    /// precede serialization and label construction. When `hold_bytes` fills
+    /// the isolated budget/ceiling so the provisional reservation is refused,
+    /// neither path may run. On success the lease shrinks to the exact retained
+    /// size and releases fully on drop. Returns
+    /// `(admitted, serialize_called, labels_called, charged_after_admit,
+    /// budget_used_after_admit, ceiling_used_after_admit, budget_used_after_drop,
+    /// ceiling_used_after_drop)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_provisional_admission_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        buffer_max_bytes: usize,
+        max_entry_bytes: usize,
+        hold_bytes: Option<usize>,
+    ) -> (bool, bool, bool, Option<usize>, usize, usize, usize, usize) {
+        let probe = crate::plugins::loki_logging::probe_loki_provisional_admission_for_test(
+            ceiling,
+            buffer_max_bytes,
+            max_entry_bytes,
+            hold_bytes,
+        );
+        (
+            probe.admitted,
+            probe.serialize_called,
+            probe.labels_called,
+            probe.charged_after_admit,
+            probe.budget_used_after_admit,
+            probe.ceiling_used_after_admit,
+            probe.budget_used_after_drop,
+            probe.ceiling_used_after_drop,
+        )
+    }
+
+    /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
+    /// wire body must be reserved against the retained-byte ceiling before it is
+    /// materialized, stay charged alongside the queued entries, and release on
+    /// drop. `distinct_label_sets` is the attacker-controlled grouping
+    /// dimension. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections, content_encoding,
+    /// grouping_bytes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        entry_count: usize,
+        line_bytes: usize,
+        gzip: bool,
+        distinct_label_sets: usize,
+    ) -> Option<(
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        u64,
+        Option<&'static str>,
+        usize,
+    )> {
+        crate::plugins::loki_logging::probe_loki_batch_materialization_for_test(
+            ceiling,
+            entry_count,
+            line_bytes,
+            gzip,
+            distinct_label_sets,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+                probe.content_encoding,
+                probe.grouping_bytes,
+            )
+        })
+    }
+
+    /// Exact Loki wire JSON for `entry_count` entries spread over
+    /// `distinct_label_sets` label sets, so grouping semantics, per-stream entry
+    /// order, and timestamp monotonicity can be pinned without a live server.
+    pub fn loki_logging_probe_payload_json_for_test(
+        entry_count: usize,
+        distinct_label_sets: usize,
+    ) -> Option<String> {
+        crate::plugins::loki_logging::probe_loki_payload_json_for_test(
+            entry_count,
+            distinct_label_sets,
+        )
+    }
+
+    // ── plugins/otel_tracing ────────────────────────────────────────────────
+    /// Deterministic probe: a trace exporter batch's intermediate `Value` tree
+    /// and serialized request body must be reserved against the retained-byte
+    /// ceiling before they are materialized, and released on every terminal
+    /// path. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections)`.
+    #[allow(clippy::type_complexity)]
+    pub fn otel_tracing_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        span_count: usize,
+        attribute_bytes: usize,
+    ) -> Option<(usize, usize, usize, usize, bool, u64)> {
+        crate::plugins::otel_tracing::probe_trace_batch_materialization_for_test(
+            ceiling,
+            span_count,
+            attribute_bytes,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+            )
+        })
     }
 
     // ── plugins/soap_ws_security ────────────────────────────────────────────
