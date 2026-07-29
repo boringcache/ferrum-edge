@@ -5110,7 +5110,8 @@ fn max_hold_ms_bounded_admission_is_field_specific() {
     for (streaming, expected) in cases {
         let config = with_streaming(streaming.clone());
         let error = AiSemanticFirewall::new(&config, PluginHttpClient::default())
-            .expect_err(&format!("config should fail closed: {streaming}"));
+            .err()
+            .unwrap_or_else(|| panic!("config should fail closed: {streaming}"));
         assert!(
             error.contains(expected),
             "expected {expected:?} for {streaming}, got {error:?}"
