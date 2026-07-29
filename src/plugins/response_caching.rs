@@ -121,6 +121,10 @@ const CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX: &str = "cache_request_headers_snaps
 /// unsafe method may require RFC 9111 §4.4 invalidation after a non-error
 /// response. Must match [`cache_key_host_part`] used by lookup/storage.
 const CACHE_PENDING_INVALIDATE_HOST_SUFFIX: &str = "cache_pending_invalidate_host";
+/// Client-facing path stashed alongside the authority partition above. The
+/// proxy may replace `RequestContext::path` with a backend route rewrite before
+/// `after_proxy`, so deferred invalidation must not read the then-current path.
+const CACHE_PENDING_INVALIDATE_PATH_SUFFIX: &str = "cache_pending_invalidate_path";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1004,6 +1008,8 @@ pub struct ResponseCaching {
     meta_headers_snapshot: String,
     /// Precomputed `response_caching.<id>.cache_pending_invalidate_host`.
     meta_pending_invalidate_host: String,
+    /// Precomputed `response_caching.<id>.cache_pending_invalidate_path`.
+    meta_pending_invalidate_path: String,
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
@@ -1069,6 +1075,10 @@ impl ResponseCaching {
                 instance_id,
                 CACHE_PENDING_INVALIDATE_HOST_SUFFIX,
             ),
+            meta_pending_invalidate_path: staging_metadata_key(
+                instance_id,
+                CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
+            ),
             config,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1133,6 +1143,7 @@ impl ResponseCaching {
     /// serving a stored representation must not flush peer path variants.
     fn clear_pending_invalidation(&self, ctx: &mut RequestContext) {
         ctx.metadata.remove(&self.meta_pending_invalidate_host);
+        ctx.metadata.remove(&self.meta_pending_invalidate_path);
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -1685,7 +1696,7 @@ impl ResponseCaching {
     /// same normalized Host partition that [`Self::build_base_cache_key`]
     /// embeds (including the empty partition when Host is absent), so a
     /// mutation on authority A cannot evict authority B on a shared proxy.
-    fn invalidate_path(&self, ctx: &RequestContext, host_part: &str) {
+    fn invalidate_path(&self, ctx: &RequestContext, host_part: &str, path: &str) {
         let _guard = self.accounting_guard();
         let proxy_id = ctx
             .matched_proxy
@@ -1699,7 +1710,6 @@ impl ResponseCaching {
         prefix.push(':');
         prefix.push_str(host_part);
         prefix.push(':');
-        let path = &ctx.path;
         let mut removed_size = 0usize;
 
         self.cache.retain(|key, entry| {
@@ -1739,6 +1749,8 @@ impl ResponseCaching {
             .unwrap_or_default();
         ctx.metadata
             .insert(self.meta_pending_invalidate_host.clone(), host_part);
+        ctx.metadata
+            .insert(self.meta_pending_invalidate_path.clone(), ctx.path.clone());
     }
 
     /// Apply a previously staged unsafe-method invalidation when the origin
@@ -1755,9 +1767,12 @@ impl ResponseCaching {
         let Some(host_part) = ctx.metadata.remove(&self.meta_pending_invalidate_host) else {
             return;
         };
+        let Some(path) = ctx.metadata.remove(&self.meta_pending_invalidate_path) else {
+            return;
+        };
         let status = ctx.origin_http_response_status().unwrap_or(response_status);
         if Self::is_non_error_status(status) {
-            self.invalidate_path(ctx, &host_part);
+            self.invalidate_path(ctx, &host_part, &path);
         }
     }
 
