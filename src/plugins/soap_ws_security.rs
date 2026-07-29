@@ -3257,7 +3257,7 @@ impl SoapWsSecurity {
         signed_info: Node<'a, 'i>,
         security: Node<'a, 'i>,
         signature_node: Node<'a, 'i>,
-        document: &ReferenceDigestDocument<'a, 'i>,
+        document: &ReferenceDigestDocument<'_, 'a, 'i>,
         budget: &mut WorkBudget,
     ) -> Result<ReferenceCoverage, String> {
         let references: Vec<Node<'a, 'i>> = signed_info
@@ -5334,10 +5334,10 @@ fn is_xml_id_attribute(name: &str, namespace: Option<&str>) -> bool {
 }
 
 /// Borrowed envelope state for [`SoapWsSecurity::verify_reference_digests`].
-struct ReferenceDigestDocument<'a, 'i> {
-    structure: &'a SoapEnvelopeStructure<'a, 'i>,
-    id_index: &'a DocumentIdIndex<'a, 'i>,
-    envelope: &'a str,
+struct ReferenceDigestDocument<'ctx, 'a, 'i: 'a> {
+    structure: &'ctx SoapEnvelopeStructure<'a, 'i>,
+    id_index: &'ctx DocumentIdIndex<'a, 'i>,
+    envelope: &'ctx str,
 }
 
 /// What a verified `SignedInfo` actually protects.
