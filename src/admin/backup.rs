@@ -606,7 +606,10 @@ fn validate_restore_api_spec_ownership_graph(
     for spec in specs {
         let spec_id = spec.id.as_str();
         let owning_proxy_id = spec.proxy_id.as_str();
-        let tagged_proxies = proxies_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        let tagged_proxies = proxies_by_spec
+            .get(spec_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         // The per-item pass already proved the declared owner carries the tag,
         // so anything other than exactly that one proxy is a second claimant.
         if tagged_proxies.len() != 1 || tagged_proxies[0].id != spec.proxy_id {
@@ -617,7 +620,10 @@ fn validate_restore_api_spec_ownership_graph(
         }
         let owning_proxy = tagged_proxies[0];
 
-        let owned_upstreams = upstreams_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        let owned_upstreams = upstreams_by_spec
+            .get(spec_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if owned_upstreams.len() > 1 {
             errors.push(format!(
                 "api_spec '{spec_id}': owns {} upstreams; at most one spec-owned upstream is supported",
@@ -642,7 +648,10 @@ fn validate_restore_api_spec_ownership_graph(
             .iter()
             .map(|association| association.plugin_config_id.as_str())
             .collect();
-        let owned_plugins = plugins_by_spec.get(spec_id).map(Vec::as_slice).unwrap_or(&[]);
+        let owned_plugins = plugins_by_spec
+            .get(spec_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         for plugin in owned_plugins {
             if validate_api_spec_proxy_plugin_association(plugin, owning_proxy_id).is_err() {
                 errors.push(format!(
@@ -1259,7 +1268,10 @@ mod tests {
         // Two spec-owned upstreams for one spec break the single-owned-upstream
         // lifecycle invariant.
         let proxies = vec![sample_owned_proxy("spec-1", "proxy-1")];
-        let upstreams = vec![owned_upstream("up-1", "spec-1"), owned_upstream("up-2", "spec-1")];
+        let upstreams = vec![
+            owned_upstream("up-1", "spec-1"),
+            owned_upstream("up-2", "spec-1"),
+        ];
         let err = validate_restore_api_specs_section(&section(), &proxies, &upstreams, &[], 25)
             .expect_err("multiple owned upstreams");
         assert!(

@@ -4989,8 +4989,11 @@ fn plan_additive_rollback_api_specs(
     current_spec_ids: &HashSet<String>,
     missing: &mut RestorePayload,
 ) -> AdditiveRollbackApiSpecPlan {
-    let replayed_proxy_ids: HashSet<&str> =
-        missing.proxies.iter().map(|proxy| proxy.id.as_str()).collect();
+    let replayed_proxy_ids: HashSet<&str> = missing
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id.as_str())
+        .collect();
     let replayed_upstream_ids: HashSet<&str> = missing
         .upstreams
         .iter()

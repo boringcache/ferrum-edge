@@ -1765,10 +1765,7 @@ async fn test_mongodb_replica_set_restore_failure_rolls_back_api_specs() {
     let (failpoint_client, initial_count) =
         enable_one_shot_insert_failpoint(&mongo_url, &harness.mongo_app_name, "proxies").await;
     let response_result = client
-        .post(format!(
-            "{}/restore?confirm=true",
-            harness.admin_base_url
-        ))
+        .post(format!("{}/restore?confirm=true", harness.admin_base_url))
         .header("Authorization", &auth_header)
         .json(&backup)
         .send()
@@ -1795,7 +1792,11 @@ async fn test_mongodb_replica_set_restore_failure_rolls_back_api_specs() {
         .expect("list API specs after MongoDB restore rollback");
     let specs_status = specs_response.status();
     let specs: serde_json::Value = specs_response.json().await.unwrap_or_else(|_| json!({}));
-    assert_eq!(specs_status.as_u16(), 200, "API-spec list failed: {specs:?}");
+    assert_eq!(
+        specs_status.as_u16(),
+        200,
+        "API-spec list failed: {specs:?}"
+    );
     assert!(
         specs["items"]
             .as_array()

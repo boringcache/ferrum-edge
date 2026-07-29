@@ -1074,7 +1074,10 @@ fn additive_rollback_skips_specs_whose_owning_proxy_id_was_recreated() {
 #[test]
 fn additive_rollback_replays_specs_whose_owning_proxy_is_also_replayed() {
     let snapshot = ferrum_edge::config::types::GatewayConfig {
-        proxies: vec![recovery_owned_proxy("snapshot-proxy", Some("snapshot-spec"))],
+        proxies: vec![recovery_owned_proxy(
+            "snapshot-proxy",
+            Some("snapshot-spec"),
+        )],
         ..Default::default()
     };
     let current = ferrum_edge::config::types::GatewayConfig {
@@ -1094,7 +1097,10 @@ fn additive_rollback_replays_specs_whose_owning_proxy_is_also_replayed() {
     assert_eq!(cleared, 0);
     assert_eq!(
         proxy_ownership,
-        vec![("snapshot-proxy".to_string(), Some("snapshot-spec".to_string()))]
+        vec![(
+            "snapshot-proxy".to_string(),
+            Some("snapshot-spec".to_string())
+        )]
     );
 }
 

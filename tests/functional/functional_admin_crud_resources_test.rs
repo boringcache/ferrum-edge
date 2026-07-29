@@ -530,14 +530,7 @@ async fn test_admin_backup_restore_api_specs_roundtrip_mongodb() {
         }
     });
 
-    let created = admin_post_json(
-        &client,
-        &gateway,
-        "/api-specs",
-        &auth,
-        openapi.clone(),
-    )
-    .await;
+    let created = admin_post_json(&client, &gateway, "/api-specs", &auth, openapi.clone()).await;
     assert!(
         created.get("id").is_some(),
         "mongodb api-spec create must succeed: {created}"
@@ -567,8 +560,7 @@ x-ferrum-proxy:
         .send()
         .await
         .expect("create MongoDB YAML API spec");
-    let yaml_created =
-        expect_json_success(yaml_response, "POST /api-specs (MongoDB YAML)").await;
+    let yaml_created = expect_json_success(yaml_response, "POST /api-specs (MongoDB YAML)").await;
     let yaml_spec_id = yaml_created["id"]
         .as_str()
         .expect("YAML spec id")
