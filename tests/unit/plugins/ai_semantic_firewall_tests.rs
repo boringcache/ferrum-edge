@@ -5598,9 +5598,7 @@ async fn hold_timeout_publishes_fixed_cardinality_metadata() {
 /// terminal metadata in `hook_order`. The fail-open instance must run first in
 /// the inspector chain so its released bytes reach the fail-closed sibling;
 /// hook order is independent of that chain order.
-async fn multi_instance_hold_timeout_metadata(
-    hook_order: [usize; 2],
-) -> (RequestContext, String) {
+async fn multi_instance_hold_timeout_metadata(hook_order: [usize; 2]) -> (RequestContext, String) {
     use ferrum_edge::plugins::create_response_stream_inspector;
     use ferrum_edge::proxy::deferred_log::BodyOutcome;
 
