@@ -1,11 +1,15 @@
 //! Tests for loki_logging plugin
 
+use ferrum_edge::_test_support::{
+    loki_logging_probe_provisional_admission_for_test, loki_logging_with_ceiling_for_test,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient,
     loki_logging::{
         LOKI_DEFAULT_BUFFER_MAX_BYTES, LOKI_DEFAULT_MAX_ENTRY_BYTES, LOKI_LOGGING_CONFIG_KEYS,
         LOKI_MAX_CUSTOM_HEADER_NAME_BYTES, LokiLogging,
     },
+    utils::byte_budget::RetainedByteCeiling,
 };
 use serde_json::json;
 use std::io::{self, Read};
@@ -82,6 +86,30 @@ async fn wait_for_requests(server: &MockServer, expected: usize) -> Vec<wiremock
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("Loki mock did not receive {expected} requests in time");
+}
+
+/// Poll until this test's isolated retained-byte ceiling is fully released.
+///
+/// Mock request receipt is not a delivery-completion boundary: the reserved
+/// batch payload stays charged until the HTTP round-trip finishes.
+async fn wait_for_retained_bytes_released(
+    ceiling: &'static RetainedByteCeiling,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if ceiling.used() == 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "isolated retained bytes did not release within {:?}; still {}",
+                timeout,
+                ceiling.used()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -883,15 +911,30 @@ async fn test_loki_retained_content_budget_bounds_buffered_entries() {
     );
 }
 
+/// A live Loki delivery must return the isolated retained-byte ceiling to
+/// exactly zero, and the recovered capacity must be genuinely reusable.
+///
+/// This is the end-to-end release boundary only. The in-flight peak — queued
+/// entries and the materialized wire body charged simultaneously, released on
+/// drop — is asserted deterministically by
+/// `byte_budget_tests::loki_batch_body_is_charged_alongside_the_queued_entries`,
+/// which observes the ceiling synchronously instead of racing a round trip.
+///
+/// Deliberately no assertion about a *second* entry being refused while the
+/// first is in flight: `send_batch` drops the queued batch as soon as the wire
+/// body is materialized, so the per-instance `buffer_max_bytes` leases are
+/// already released by the time the mock records the request. Only the payload
+/// reservation spans the round trip, and it is charged to the ceiling alone.
 #[tokio::test]
 async fn test_loki_retained_content_budget_is_released_after_delivery() {
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(64 * 1024)));
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/loki/api/v1/push"))
         .respond_with(ResponseTemplate::new(204).set_delay(Duration::from_millis(200)))
         .mount(&server)
         .await;
-    let plugin = LokiLogging::new(
+    let plugin = loki_logging_with_ceiling_for_test(
         &json!({
             "endpoint_url": format!("{}/loki/api/v1/push", server.uri()),
             "batch_size": 1,
@@ -904,6 +947,7 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
             "gzip": false
         }),
         default_client(),
+        ceiling,
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
@@ -915,11 +959,17 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
     plugin.log(&first).await;
     wait_for_requests(&server, 1).await;
 
-    let mut rejected_while_reserved = first.clone();
-    rejected_while_reserved.request_path = format!("/rejected-budget-canary/{large_path}");
-    plugin.log(&rejected_while_reserved).await;
+    // The mock response is delayed, so request receipt is not the delivery
+    // boundary: the reserved payload stays charged until the round trip
+    // finishes and it drops. A reservation leaked on any success, error, drop,
+    // or cancellation path would keep the ceiling above zero and time out here.
+    wait_for_retained_bytes_released(ceiling, Duration::from_secs(10)).await;
+    // High water proves the injected ceiling was really on the live path, not
+    // bypassed; a 64 KiB total must admit one 4 KiB-budgeted batch outright.
+    assert!(ceiling.high_water() > 0, "ceiling was never charged");
+    assert_eq!(ceiling.rejections(), 0, "no batch may be refused");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Capacity is genuinely reusable, not merely accounted as released.
     let mut admitted_after_release = first;
     admitted_after_release.request_path = format!("/released-budget-canary/{large_path}");
     plugin.log(&admitted_after_release).await;
@@ -949,12 +999,10 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
             .unwrap()
             .contains("released-budget-canary")
     }));
-    assert!(lines.iter().all(|line| {
-        !line["request_path"]
-            .as_str()
-            .unwrap()
-            .contains("rejected-budget-canary")
-    }));
+
+    // The second delivery drains the ceiling too, so nothing accumulates across
+    // batches.
+    wait_for_retained_bytes_released(ceiling, Duration::from_secs(10)).await;
 }
 
 #[tokio::test]
@@ -1447,5 +1495,84 @@ async fn test_loki_stalled_ack_drain_timeout_does_not_block_indefinitely() {
     panic!(
         "stalled Loki ACK must free the flush worker via the shared drain timeout; saw {} requests",
         requests.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn test_loki_refused_provisional_reservation_skips_serialize_and_labels() {
+    // Isolated ceiling filled so the provisional max-entry charge is refused
+    // before any attacker-shaped serialization or label construction.
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(64)));
+    let (
+        admitted,
+        serialize_called,
+        labels_called,
+        charged_after_admit,
+        budget_used_after_admit,
+        ceiling_used_after_admit,
+        _,
+        _,
+    ) = loki_logging_probe_provisional_admission_for_test(ceiling, 64, 1_024, Some(64));
+
+    assert!(!admitted, "denied provisional reservation must fail closed");
+    assert!(
+        !serialize_called,
+        "serializer must not run when provisional reservation is refused"
+    );
+    assert!(
+        !labels_called,
+        "label construction must not run when provisional reservation is refused"
+    );
+    assert_eq!(charged_after_admit, None);
+    assert_eq!(
+        budget_used_after_admit, 64,
+        "refused path must leave only the pre-held charge"
+    );
+    assert_eq!(
+        ceiling_used_after_admit, 64,
+        "refused path must leave only the pre-held ceiling charge"
+    );
+}
+
+#[test]
+fn test_loki_provisional_reservation_shrinks_to_exact_and_releases_on_drop() {
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(1_048_576)));
+    let max_entry_bytes = 4_096;
+    let (
+        admitted,
+        serialize_called,
+        labels_called,
+        charged_after_admit,
+        budget_used_after_admit,
+        ceiling_used_after_admit,
+        budget_used_after_drop,
+        ceiling_used_after_drop,
+    ) = loki_logging_probe_provisional_admission_for_test(
+        ceiling,
+        1_048_576,
+        max_entry_bytes,
+        None,
+    );
+
+    assert!(
+        admitted,
+        "small probe entry must admit under a fresh budget"
+    );
+    assert!(serialize_called, "successful admit must serialize");
+    assert!(labels_called, "successful admit must build labels");
+    let charged = charged_after_admit.expect("admitted lease must report a charge");
+    assert!(
+        charged > 0 && charged < max_entry_bytes,
+        "exact retained charge must be below the provisional max_entry_bytes lease"
+    );
+    assert_eq!(budget_used_after_admit, charged);
+    assert_eq!(ceiling_used_after_admit, charged);
+    assert_eq!(
+        budget_used_after_drop, 0,
+        "drop must release the shrunk instance charge exactly"
+    );
+    assert_eq!(
+        ceiling_used_after_drop, 0,
+        "drop must release the shrunk process reservation exactly"
     );
 }

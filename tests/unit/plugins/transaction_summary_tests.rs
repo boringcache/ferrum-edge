@@ -144,7 +144,7 @@ fn test_backend_response_carries_resolved_ip() {
 
     let resp = BackendResponse {
         status_code: 200,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: false,
         backend_resolved_ip: Some("10.244.1.42".to_string()),
@@ -166,7 +166,7 @@ fn test_backend_response_none_ip_on_connection_failure() {
 
     let resp = BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
+        body: ResponseBody::buffered(r#"{"error":"Backend unavailable"}"#.as_bytes().to_vec()),
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,
@@ -454,7 +454,7 @@ fn test_backend_response_carries_error_class() {
 
     let resp = BackendResponse {
         status_code: 502,
-        body: ResponseBody::Buffered(Vec::new()),
+        body: ResponseBody::buffered(Vec::new()),
         headers: HashMap::new(),
         connection_error: true,
         backend_resolved_ip: None,

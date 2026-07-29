@@ -212,7 +212,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut std::collections::HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
             ctx,
@@ -594,9 +594,9 @@ pub mod _test_support {
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
         status_code: u16,
-        body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
         headers: HashMap<String, String>,
-    ) -> (u16, Vec<u8>, HashMap<String, String>) {
+    ) -> (u16, bytes::Bytes, HashMap<String, String>) {
         let mut response_status = status_code;
         let mut response_headers = headers.clone();
         let response_body = crate::proxy::apply_plugin_rejection_response(
@@ -606,7 +606,7 @@ pub mod _test_support {
             &mut response_headers,
             crate::proxy::RejectedResponseParts {
                 status_code,
-                body,
+                body: body.into(),
                 headers,
             },
         )
@@ -918,6 +918,23 @@ pub mod _test_support {
         crate::admin::intervening_clear_recovery_candidate_for_test(snapshot, current)
     }
 
+    /// Returns `(replayed api_spec ids, skipped spec count, cleared ownership
+    /// tag count, replayed proxy id → surviving api_spec_id)`.
+    #[allow(clippy::type_complexity)]
+    pub fn plan_additive_rollback_api_specs_for_test(
+        snapshot: crate::config::types::GatewayConfig,
+        snapshot_specs: Vec<crate::config::types::ApiSpec>,
+        current: crate::config::types::GatewayConfig,
+        current_spec_ids: Vec<String>,
+    ) -> (Vec<String>, usize, usize, Vec<(String, Option<String>)>) {
+        crate::admin::plan_additive_rollback_api_specs_for_test(
+            snapshot,
+            snapshot_specs,
+            current,
+            current_spec_ids,
+        )
+    }
+
     pub fn collect_rejecting_runtime_config_errors_for_test(
         config: &crate::config::types::GatewayConfig,
     ) -> Vec<String> {
@@ -928,6 +945,54 @@ pub mod _test_support {
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {
         crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    /// Acquire the durable namespace config admission lease (same primitive as
+    /// admin mutations and api_specs-emitting backups) for external tests.
+    pub async fn lock_namespace_config_admission_db_for_test(
+        db: std::sync::Arc<dyn crate::config::db_backend::DatabaseBackend>,
+        namespace: &str,
+    ) -> Result<TestNamespaceConfigAdmissionGuard, String> {
+        crate::admin::crud::lock_namespace_config_admission(db, namespace)
+            .await
+            .map(TestNamespaceConfigAdmissionGuard)
+            .map_err(|_error| "namespace config admission unavailable".to_string())
+    }
+
+    /// Opaque handle around the production admission guard for external tests.
+    pub struct TestNamespaceConfigAdmissionGuard(crate::admin::crud::NamespaceConfigAdmissionGuard);
+
+    impl TestNamespaceConfigAdmissionGuard {
+        /// Force the lease into the lost state without waiting for TTL/renewal.
+        pub fn force_lose(&self) {
+            self.0.force_lose_for_test();
+        }
+
+        /// Run work under the same held-lease observer backup/mutations use.
+        pub async fn run_to_completion_while_held<F, T>(
+            &self,
+            future: F,
+        ) -> Result<TestNamespaceConfigAdmissionCompletion<T>, String>
+        where
+            F: std::future::Future<Output = T>,
+        {
+            match self.0.run_to_completion_while_held(future).await {
+                Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Held(result)) => {
+                    Ok(TestNamespaceConfigAdmissionCompletion::Held(result))
+                }
+                Ok(crate::admin::crud::NamespaceConfigAdmissionCompletion::Lost {
+                    result,
+                    error: _,
+                }) => Ok(TestNamespaceConfigAdmissionCompletion::Lost(result)),
+                Err(_error) => Err("namespace config admission unavailable".to_string()),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum TestNamespaceConfigAdmissionCompletion<T> {
+        Held(T),
+        Lost(T),
     }
 
     pub fn validate_plugin_configs_fatal_for_test(
@@ -1105,6 +1170,22 @@ pub mod _test_support {
         plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
+    pub fn api_chargeback_sink_compact_projection_shortfall_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, usize, bool)> {
+        plugin.compact_projection_shortfall_for_tests()
+    }
+
+    /// Hold a snapshot generation's emission lock while a worker thread runs the
+    /// whole Full→Compact sequence. Returns
+    /// `(blocked_while_emission_held, compacted_after_release)`.
+    pub fn api_chargeback_sink_compact_excluded_by_emission_lock_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        hold: std::time::Duration,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_excluded_by_emission_lock_for_tests(hold)
+    }
+
     // ── plugins/request_deduplication ─────────────────────────────────────────
     pub fn request_deduplication_with_instance_id_for_test(
         config: &serde_json::Value,
@@ -1147,7 +1228,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -1174,7 +1255,7 @@ pub mod _test_support {
         .await;
         crate::plugins::PluginResult::RejectBinary {
             status_code: status,
-            body: bytes::Bytes::from(body),
+            body,
             headers,
         }
     }
@@ -1286,6 +1367,159 @@ pub mod _test_support {
         oversized: &crate::plugins::TransactionSummary,
     ) -> (u64, u64) {
         crate::plugins::kafka_logging::probe_byte_budget_before_serialize_for_test(oversized).await
+    }
+
+    /// Deterministic probe: the retained-byte lease must be transferred into
+    /// librdkafka's delivery-opaque state, so it is still held while librdkafka
+    /// retains its copy of a record it cannot deliver, and released exactly once
+    /// when producer destruction purges the queue.
+    ///
+    /// Returns `(instance_used_after_send, ceiling_used_after_send,
+    /// instance_used_after_destroy, ceiling_used_after_destroy)`, or a fixed,
+    /// secret-free diagnostic. librdkafka is an unconditional dependency and the
+    /// probe's broker is a local unreachable port, so a failure here is a defect
+    /// rather than an absent environment capability — callers must assert on it.
+    pub fn kafka_logging_probe_downstream_lease_ownership_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        record_count: usize,
+    ) -> Result<(usize, usize, usize, usize), String> {
+        crate::plugins::kafka_logging::probe_downstream_lease_ownership_for_test(
+            ceiling,
+            record_count,
+        )
+    }
+
+    // ── plugins/loki_logging ────────────────────────────────────────────────
+    /// Construct Loki logging against a test-owned retained-byte ceiling.
+    ///
+    /// This keeps ownership assertions isolated from concurrently running
+    /// observability tests that reserve against the process-global ceiling.
+    pub fn loki_logging_with_ceiling_for_test(
+        config: &serde_json::Value,
+        http_client: crate::plugins::PluginHttpClient,
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+    ) -> Result<crate::plugins::loki_logging::LokiLogging, String> {
+        crate::plugins::loki_logging::LokiLogging::new_with_ceiling(config, http_client, ceiling)
+    }
+
+    /// Deterministic probe: a provisional `max_entry_bytes` reservation must
+    /// precede serialization and label construction. When `hold_bytes` fills
+    /// the isolated budget/ceiling so the provisional reservation is refused,
+    /// neither path may run. On success the lease shrinks to the exact retained
+    /// size and releases fully on drop. Returns
+    /// `(admitted, serialize_called, labels_called, charged_after_admit,
+    /// budget_used_after_admit, ceiling_used_after_admit, budget_used_after_drop,
+    /// ceiling_used_after_drop)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_provisional_admission_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        buffer_max_bytes: usize,
+        max_entry_bytes: usize,
+        hold_bytes: Option<usize>,
+    ) -> (bool, bool, bool, Option<usize>, usize, usize, usize, usize) {
+        let probe = crate::plugins::loki_logging::probe_loki_provisional_admission_for_test(
+            ceiling,
+            buffer_max_bytes,
+            max_entry_bytes,
+            hold_bytes,
+        );
+        (
+            probe.admitted,
+            probe.serialize_called,
+            probe.labels_called,
+            probe.charged_after_admit,
+            probe.budget_used_after_admit,
+            probe.ceiling_used_after_admit,
+            probe.budget_used_after_drop,
+            probe.ceiling_used_after_drop,
+        )
+    }
+
+    /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
+    /// wire body must be reserved against the retained-byte ceiling before it is
+    /// materialized, stay charged alongside the queued entries, and release on
+    /// drop. `distinct_label_sets` is the attacker-controlled grouping
+    /// dimension. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections, content_encoding,
+    /// grouping_bytes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        entry_count: usize,
+        line_bytes: usize,
+        gzip: bool,
+        distinct_label_sets: usize,
+    ) -> Option<(
+        usize,
+        usize,
+        usize,
+        usize,
+        bool,
+        u64,
+        Option<&'static str>,
+        usize,
+    )> {
+        crate::plugins::loki_logging::probe_loki_batch_materialization_for_test(
+            ceiling,
+            entry_count,
+            line_bytes,
+            gzip,
+            distinct_label_sets,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+                probe.content_encoding,
+                probe.grouping_bytes,
+            )
+        })
+    }
+
+    /// Exact Loki wire JSON for `entry_count` entries spread over
+    /// `distinct_label_sets` label sets, so grouping semantics, per-stream entry
+    /// order, and timestamp monotonicity can be pinned without a live server.
+    pub fn loki_logging_probe_payload_json_for_test(
+        entry_count: usize,
+        distinct_label_sets: usize,
+    ) -> Option<String> {
+        crate::plugins::loki_logging::probe_loki_payload_json_for_test(
+            entry_count,
+            distinct_label_sets,
+        )
+    }
+
+    // ── plugins/otel_tracing ────────────────────────────────────────────────
+    /// Deterministic probe: a trace exporter batch's intermediate `Value` tree
+    /// and serialized request body must be reserved against the retained-byte
+    /// ceiling before they are materialized, and released on every terminal
+    /// path. Returns `(queued_bytes, peak_bytes, after_body_dropped_bytes,
+    /// after_release_bytes, refused, rejections)`.
+    #[allow(clippy::type_complexity)]
+    pub fn otel_tracing_probe_batch_materialization_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        span_count: usize,
+        attribute_bytes: usize,
+    ) -> Option<(usize, usize, usize, usize, bool, u64)> {
+        crate::plugins::otel_tracing::probe_trace_batch_materialization_for_test(
+            ceiling,
+            span_count,
+            attribute_bytes,
+        )
+        .map(|probe| {
+            (
+                probe.queued_bytes,
+                probe.peak_bytes,
+                probe.after_body_dropped_bytes,
+                probe.after_release_bytes,
+                probe.refused,
+                probe.rejections,
+            )
+        })
     }
 
     // ── plugins/soap_ws_security ────────────────────────────────────────────
@@ -3519,7 +3753,7 @@ pub mod _test_support {
         flavor: crate::config::types::HttpFlavor,
         grpc_web_response_content_type: Option<&str>,
         http_status: StatusCode,
-        body: &[u8],
+        body: bytes::Bytes,
         headers: &HashMap<String, String>,
     ) -> bool {
         // No provenance seeding here: the production delegate seeds it, so this
@@ -3567,7 +3801,7 @@ pub mod _test_support {
     pub struct NormalizedRejectResponse {
         pub http_status: StatusCode,
         pub headers: HashMap<String, String>,
-        pub body: Vec<u8>,
+        pub body: bytes::Bytes,
         pub grpc_status: Option<u32>,
         pub grpc_message: Option<String>,
     }
@@ -3640,7 +3874,7 @@ pub mod _test_support {
         ctx.begin_buffered_deadline_response_header_provenance(&headers);
         headers.insert("x-correlation-id".to_string(), "request-123".to_string());
         ctx.record_deadline_response_header_mutations(&headers);
-        let mut body = b"backend response".to_vec();
+        let mut body = bytes::Bytes::from_static(b"backend response");
         let http_status = crate::http3::server::replace_buffered_h3_response_with_grpc_deadline(
             &mut ctx,
             grpc_web_response_content_type,
@@ -3664,8 +3898,9 @@ pub mod _test_support {
         grpc_web_response_content_type: Option<&str>,
         mut backend_headers: HashMap<String, String>,
         gateway_headers: HashMap<String, String>,
-        mut body: Vec<u8>,
+        body: impl Into<bytes::Bytes>,
     ) -> NormalizedRejectResponse {
+        let mut body = body.into();
         let mut ctx = crate::plugins::RequestContext::new(
             "127.0.0.1".to_string(),
             "POST".to_string(),
@@ -3699,7 +3934,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) -> bool {
         crate::proxy::run_deadline_bounded_response_committed_hooks(
             plugins,
@@ -3726,7 +3961,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         response_body_rejected: bool,
     ) -> (bool, bool) {
@@ -3805,7 +4040,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_synthetic_response_body_hooks(
             plugins,
@@ -3824,7 +4059,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
     ) {
         crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
             plugins,
@@ -3957,7 +4192,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
-    ) -> Option<(u16, Vec<u8>, HashMap<String, String>)> {
+    ) -> Option<(u16, bytes::Bytes, HashMap<String, String>)> {
         crate::proxy::run_after_proxy_hooks(plugins, ctx, response_status, response_headers)
             .await
             .map(|reject| (reject.status_code, reject.body, reject.headers))
@@ -3996,7 +4231,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
     ) -> bool {
         transform_buffered_response_body_with_deadline_and_policy_for_test(
@@ -4016,7 +4251,7 @@ pub mod _test_support {
         ctx: &mut crate::plugins::RequestContext,
         response_status: &mut u16,
         response_headers: &mut HashMap<String, String>,
-        response_body: &mut Vec<u8>,
+        response_body: &mut bytes::Bytes,
         grpc_web_response_content_type: Option<&str>,
         initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     ) -> bool {
@@ -4103,6 +4338,36 @@ pub mod _test_support {
         crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
     }
 
+    pub fn h3_normalize_reject_for_client_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        status: http::StatusCode,
+        body: bytes::Bytes,
+        headers: &std::collections::HashMap<String, String>,
+        native_grpc: bool,
+    ) -> (
+        NormalizedRejectResponse,
+        Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
+    ) {
+        let (normalized, grpc_web_error) =
+            crate::http3::cross_protocol::normalize_reject_for_client(
+                ctx,
+                status,
+                body,
+                headers,
+                native_grpc,
+            );
+        (
+            NormalizedRejectResponse {
+                http_status: normalized.http_status,
+                headers: normalized.headers,
+                body: normalized.body,
+                grpc_status: normalized.grpc_status,
+                grpc_message: normalized.grpc_message,
+            },
+            grpc_web_error,
+        )
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }
@@ -4123,7 +4388,7 @@ pub mod _test_support {
             None,
         );
         let body = match response.body {
-            crate::retry::ResponseBody::Buffered(body) => body,
+            crate::retry::ResponseBody::Buffered(body) => body.to_vec(),
             crate::retry::ResponseBody::Streaming { .. }
             | crate::retry::ResponseBody::StreamingH2(_)
             | crate::retry::ResponseBody::StreamingH3(_) => Vec::new(),
@@ -4248,8 +4513,12 @@ pub mod _test_support {
         headers: &HashMap<String, String>,
         is_grpc_request: bool,
     ) -> NormalizedRejectResponse {
-        let normalized =
-            crate::proxy::normalize_reject_response(status, body, headers, is_grpc_request);
+        let normalized = crate::proxy::normalize_reject_response(
+            status,
+            bytes::Bytes::copy_from_slice(body),
+            headers,
+            is_grpc_request,
+        );
         NormalizedRejectResponse {
             http_status: normalized.http_status,
             headers: normalized.headers,
@@ -5238,6 +5507,21 @@ pub mod _test_support {
         addr: std::net::SocketAddr,
     ) -> (std::net::SocketAddr, Arc<str>) {
         crate::http3::server::h3_client_identity(addr)
+    }
+
+    /// Construct `workload_metrics` with an injected environment lookup so
+    /// external tests can exercise `custom_env_tags` present/missing/empty/
+    /// oversized/non-Unicode outcomes without mutating process environment.
+    pub fn workload_metrics_new_with_env_lookup_for_test<F>(
+        config: &serde_json::Value,
+        env_lookup: F,
+    ) -> Result<crate::plugins::mesh::workload_metrics::WorkloadMetrics, String>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new_with_env_lookup_for_test(
+            config, env_lookup,
+        )
     }
 
     /// Build an email channel with deterministic `*_env` resolution for unit
