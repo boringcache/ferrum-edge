@@ -12088,31 +12088,7 @@ async fn send_h3_reject_flavor_aware_with_header_state(
     if let Some((framed_body, framed_trailers)) =
         crate::proxy::framed_unary_reject_parts(&normalized)
     {
-        let mut builder = Response::builder().status(StatusCode::OK);
-        for (k, v) in &normalized.headers {
-            // Multiple cookies are stored newline-joined in the reject header
-            // map, so each must become its own header line. Without the split,
-            // `HeaderValue::from_str` rejects the embedded newline and EVERY
-            // cookie is dropped — the trailers-only branch below and the H1/H2
-            // emitter (`headers::apply_response_headers`) both split, so the
-            // framed representation must too.
-            if k.eq_ignore_ascii_case("set-cookie") {
-                for cookie_val in v.split('\n') {
-                    if let Ok(val) = hyper::header::HeaderValue::from_str(cookie_val) {
-                        builder = builder.header(hyper::header::SET_COOKIE, val);
-                    }
-                }
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (
-                hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                hyper::header::HeaderValue::from_str(v),
-            ) {
-                builder = builder.header(name, val);
-            }
-        }
-        let resp = builder
-            .body(())
+        let resp = h3_framed_unary_initial_response(&normalized.headers)
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP/3 gRPC framed reject: {}", e))?;
         stream.send_response(resp).await?;
         stream
@@ -12225,6 +12201,16 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         crate::http3::stream_util::halt_request_body(stream);
     }
     Ok(())
+}
+
+/// Build the initial HEADERS block for an authorized framed unary gRPC reject.
+///
+/// Route through the shared response-header emitter so HTTP/3 preserves the
+/// proxy's newline-joined repeated-cookie representation exactly like H1/H2.
+pub(crate) fn h3_framed_unary_initial_response(
+    headers: &HashMap<String, String>,
+) -> Result<Response<()>, http::Error> {
+    apply_response_headers(Response::builder().status(StatusCode::OK), headers).body(())
 }
 
 pub(crate) fn h3_reject_log_status_and_metadata(

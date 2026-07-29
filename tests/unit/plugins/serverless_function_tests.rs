@@ -1282,6 +1282,26 @@ fn test_normalize_reject_preserves_framed_unary_grpc_body() {
     );
 }
 
+#[test]
+fn test_h3_framed_unary_reject_emits_each_cookie_as_a_separate_header() {
+    let mut headers = framed_grpc_terminate_reject_headers();
+    headers.insert(
+        "Set-Cookie".to_string(),
+        "a=1; Path=/\nb=2; Path=/".to_string(),
+    );
+
+    let emitted =
+        ferrum_edge::_test_support::h3_framed_unary_response_headers_for_test(&headers)
+            .expect("H3 framed unary response headers");
+    let cookies = emitted
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().expect("ASCII cookie"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(cookies, vec!["a=1; Path=/", "b=2; Path=/"]);
+}
+
 /// Provenance, not shape, authorizes a body on a native gRPC rejection. An
 /// unrelated plugin can produce a reject whose body is a byte-perfect
 /// uncompressed unary frame and whose headers claim `application/grpc` +

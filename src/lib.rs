@@ -4382,6 +4382,15 @@ pub mod _test_support {
         )
     }
 
+    /// Build the production HTTP/3 framed-unary initial response and expose its
+    /// headers for protocol-boundary regression coverage.
+    pub fn h3_framed_unary_response_headers_for_test(
+        headers: &HashMap<String, String>,
+    ) -> Result<http::HeaderMap, http::Error> {
+        crate::http3::server::h3_framed_unary_initial_response(headers)
+            .map(|response| response.headers().clone())
+    }
+
     /// The emitter-side decision every gRPC reject writer shares: `Some` means
     /// "write DATA and then these terminal trailers", `None` means
     /// "trailers-only". Exercises the production predicate, so a writer that

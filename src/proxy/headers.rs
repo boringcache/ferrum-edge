@@ -697,7 +697,7 @@ pub fn apply_response_headers(
     headers: &std::collections::HashMap<String, String>,
 ) -> http::response::Builder {
     for (k, v) in headers {
-        if k == "set-cookie" {
+        if k.eq_ignore_ascii_case("set-cookie") {
             for cookie_val in v.split('\n') {
                 if let Ok(val) = http::HeaderValue::from_str(cookie_val) {
                     builder = builder.header(http::header::SET_COOKIE, val);
