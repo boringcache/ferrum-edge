@@ -3934,7 +3934,8 @@ mod tests {
             ..DnsConfig::default()
         });
         let now = Instant::now();
-        let address = Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 80))]);
+        let address: Arc<[IpAddr]> =
+            Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 80))]);
 
         let shared = success_entry(
             address.clone(),
