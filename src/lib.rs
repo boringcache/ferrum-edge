@@ -506,7 +506,7 @@ pub mod _test_support {
         enabled_global_mesh_authz_configs: usize,
         built_global_tcp_mesh_authz_plugins: usize,
     ) -> bool {
-        crate::plugin_cache::node_waypoint_destination_authz_ready_from_counts_for_test(
+        crate::plugin_cache::node_waypoint_destination_authz_ready_from_counts(
             managed_config_present,
             enabled_global_mesh_authz_configs,
             built_global_tcp_mesh_authz_plugins,

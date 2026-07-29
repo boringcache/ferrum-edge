@@ -3301,7 +3301,12 @@ fn mesh_authz_global_config_state(config: &GatewayConfig) -> (bool, usize) {
 /// managed instance itself constructed AND survived the TCP protocol filter.
 /// Any construction failure, protocol-filter drop, or unexpected extra runtime
 /// instance fails closed rather than weakening this proof.
-fn node_waypoint_destination_authz_ready_from_counts(
+///
+/// `pub(crate)` so `_test_support` can pin the "managed row configured but its
+/// runtime policy never reached the prebuilt TCP chain" arm directly, without
+/// forging a plugin construction failure. A dedicated `_for_test` wrapper would
+/// be dead code in the binary target, which does not compile `lib.rs`.
+pub(crate) fn node_waypoint_destination_authz_ready_from_counts(
     managed_config_present: bool,
     enabled_global_mesh_authz_configs: usize,
     built_global_tcp_mesh_authz_plugins: usize,
@@ -3309,21 +3314,6 @@ fn node_waypoint_destination_authz_ready_from_counts(
     managed_config_present
         && enabled_global_mesh_authz_configs > 0
         && built_global_tcp_mesh_authz_plugins == enabled_global_mesh_authz_configs
-}
-
-/// Test seam for [`node_waypoint_destination_authz_ready_from_counts`] so the
-/// "managed row configured but its runtime policy never reached the prebuilt
-/// TCP chain" arm can be pinned without forging a plugin construction failure.
-pub(crate) fn node_waypoint_destination_authz_ready_from_counts_for_test(
-    managed_config_present: bool,
-    enabled_global_mesh_authz_configs: usize,
-    built_global_tcp_mesh_authz_plugins: usize,
-) -> bool {
-    node_waypoint_destination_authz_ready_from_counts(
-        managed_config_present,
-        enabled_global_mesh_authz_configs,
-        built_global_tcp_mesh_authz_plugins,
-    )
 }
 
 /// Precompute the generation-level NodeWaypoint destination-authz readiness
