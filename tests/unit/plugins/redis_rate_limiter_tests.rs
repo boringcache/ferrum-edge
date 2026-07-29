@@ -342,13 +342,15 @@ fn test_from_plugin_config_accepts_exact_max_redis_pool_size() {
 
 // ── Connection-attempt timeout wiring (issue #2310) ───────────────────────
 //
-// redis-rs 1.2.1 defaults ConnectionManager/AsyncConnectionConfig timeouts to
-// one second. Ferrum must install `redis_connect_timeout_seconds` into those
-// inner configs so values above one second are effective. Assertions below are
-// outcome-based (success/failure / config equality), not wall-clock ranges.
+// redis-rs 1.2.1 defaults `AsyncConnectionConfig` timeouts to one second.
+// Ferrum must install `redis_connect_timeout_seconds` into that inner config so
+// values above one second are effective. `AsyncConnectionConfig` exposes no
+// getter, so the wiring is pinned by source text plus the outer-bound value.
+// Assertions below are outcome-based (success/failure / config equality), not
+// wall-clock ranges.
 
 #[test]
-fn connect_timeout_is_installed_into_redis_manager_config_above_and_below_one_second() {
+fn connect_timeout_is_installed_into_redis_connection_config_above_and_below_one_second() {
     for seconds in [1_u64, 2, 5, 30] {
         let mut config = make_config("redis://127.0.0.1:6379/0", false);
         config.connect_timeout_seconds = seconds;
@@ -357,12 +359,15 @@ fn connect_timeout_is_installed_into_redis_manager_config_above_and_below_one_se
             client.connection_timeout_for_test(),
             Duration::from_secs(seconds)
         );
-        assert_eq!(
-            client.connection_manager_timeout_for_test(),
-            Some(Duration::from_secs(seconds)),
-            "inner ConnectionManagerConfig must carry Ferrum timeout ({seconds}s), not the crate 1s default"
-        );
     }
+
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    assert!(
+        source.contains(
+            "redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))"
+        ),
+        "inner AsyncConnectionConfig must carry Ferrum's timeout, not the crate 1s default"
+    );
 }
 
 /// Accept TCP, optionally delay, then answer every RESP array command with +OK.
@@ -433,7 +438,7 @@ async fn connect_timeout_above_one_second_allows_delayed_redis_handshake() {
         "cached path must honor redis_connect_timeout_seconds > 1s"
     );
 
-    // Fresh client for dedicated path (cached manager is already warm).
+    // Fresh client for the dedicated path (the pooled connection is already warm).
     let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
     config.connect_timeout_seconds = 5;
     config.health_check_interval_seconds = 60;
@@ -524,8 +529,8 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
         assert_eq!(config.key_prefix, prefix);
         let client = redis_rate_limit_client_for_test(config);
         assert_eq!(
-            client.connection_manager_timeout_for_test(),
-            Some(Duration::from_secs(seconds))
+            client.connection_timeout_for_test(),
+            Duration::from_secs(seconds)
         );
     }
 }
@@ -533,8 +538,8 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
 // ── redis_pool_size cardinality / selection (issue #2304) ─────────────────
 //
 // Before the fix, `redis_pool_size` was parsed and validated but every instance
-// cached exactly one ConnectionManager. These tests prove configured pool size
-// controls runtime cardinality and round-robin selection — not merely parsing.
+// cached exactly one connection. These tests prove configured pool size controls
+// runtime cardinality and round-robin selection — not merely parsing.
 
 #[test]
 fn pool_size_controls_client_cardinality_for_named_consumers() {
@@ -603,7 +608,7 @@ async fn pool_size_one_establishes_single_tcp_connection() {
         "pool_size=1 must open exactly one multiplexed TCP connection"
     );
 
-    // Re-warming must reuse the cached manager, not dial again.
+    // Re-warming must reuse the cached connection, not dial again.
     assert_eq!(client.warm_pool_for_test().await, 1);
     assert_eq!(accepts.load(Ordering::Relaxed), 1);
 
@@ -1103,7 +1108,7 @@ fn watch_transaction_path_pins_multiplexed_connection_not_connection_manager() {
         let impl_body = &body[brace..];
         assert!(
             !impl_body.contains("get_connection()"),
-            "{marker} must not use the pooled ConnectionManager path"
+            "{marker} must not use the shared pooled connection path"
         );
         assert!(
             !impl_body.contains("ConnectionManager"),
@@ -1220,7 +1225,8 @@ async fn watch_cas_helpers_fail_closed_when_connection_drops_after_watch() {
     // connections stays unavailable until the next config reload.
     assert!(
         client.health_checker_started_for_test(),
-        "a command-error transition to unavailable must arm the recovery checker"
+        "a dedicated command failure must arm recovery instead of pinning fail-closed consumers \
+         unavailable until reload"
     );
 
     let _ = shutdown.send(());
@@ -1459,6 +1465,1826 @@ fn redis_config_validation_diagnostics_are_value_redacted() {
         assert!(
             !parse_err.contains(secret),
             "parse diagnostic must not echo {secret:?}: {parse_err}"
+        );
+    }
+}
+
+// ── Redis topology screening (GHSA-87rq-v4hx-8rcq) ────────────────────────
+//
+// The shared client is not Cluster-aware. Pointing an enforcement plugin at a
+// Redis Cluster endpoint used to surface only as "Redis is down", which silently
+// turned one distributed budget into one budget per gateway process. These
+// prove the endpoint is screened proactively (INFO CLUSTER) and reactively
+// (Cluster-only error codes), and that the rejection is terminal.
+
+#[test]
+fn parse_cluster_enabled_recognizes_only_a_reported_value() {
+    use ferrum_edge::_test_support::parse_cluster_enabled;
+
+    assert_eq!(
+        parse_cluster_enabled("# Cluster\r\ncluster_enabled:1\r\n"),
+        Some(true)
+    );
+    assert_eq!(
+        parse_cluster_enabled("# Cluster\r\ncluster_enabled:0\r\n"),
+        Some(false)
+    );
+    // Any non-zero value counts as enabled.
+    assert_eq!(parse_cluster_enabled("cluster_enabled:2"), Some(true));
+    // Absent / unparseable stays unknown so RESP-compatible servers that do not
+    // report the field are never rejected by the proactive screen.
+    assert_eq!(
+        parse_cluster_enabled("# Server\r\nredis_version:7.2.4"),
+        None
+    );
+    assert_eq!(parse_cluster_enabled(""), None);
+    assert_eq!(parse_cluster_enabled("cluster_enabled:"), None);
+    assert_eq!(parse_cluster_enabled("cluster_enabled_extra:1"), None);
+}
+
+#[test]
+fn cluster_topology_codes_are_terminal_but_outage_codes_are_not() {
+    use ferrum_edge::_test_support::is_cluster_topology_code;
+
+    for code in ["MOVED", "ASK", "CROSSSLOT", "CLUSTERDOWN", "TRYAGAIN"] {
+        assert!(
+            is_cluster_topology_code(Some(code)),
+            "{code} proves an unsupported Cluster topology"
+        );
+    }
+    // MASTERDOWN/LOADING are ordinary replication/availability failures and must
+    // stay recoverable; None is a transport error, not a topology verdict.
+    for code in ["MASTERDOWN", "LOADING", "ERR", "NOAUTH", "WRONGTYPE"] {
+        assert!(
+            !is_cluster_topology_code(Some(code)),
+            "{code} must not permanently disable the endpoint"
+        );
+    }
+    assert!(!is_cluster_topology_code(None));
+}
+
+#[test]
+fn slot_keys_of_one_rate_key_share_a_hash_tag() {
+    use ferrum_edge::_test_support::redis_slot_key;
+
+    let config = || make_config("redis://127.0.0.1:6379/0", false);
+    let prev = redis_slot_key(config(), "ip:1.2.3.4", &["41"]);
+    let curr = redis_slot_key(config(), "ip:1.2.3.4", &["42"]);
+    assert_eq!(prev, "{ferrum%3Atest:ip%3A1.2.3.4}:41");
+    assert_eq!(curr, "{ferrum%3Atest:ip%3A1.2.3.4}:42");
+
+    fn hash_tag(key: &str) -> &str {
+        let open = key.find('{').expect("hash tag opens");
+        let close = key[open + 1..].find('}').expect("hash tag closes") + open + 1;
+        &key[open + 1..close]
+    }
+    assert_eq!(
+        hash_tag(&prev),
+        hash_tag(&curr),
+        "previous and current window buckets must land in one slot"
+    );
+
+    // The UDP datagram/byte pair of one client shares a slot too.
+    let datagrams = redis_slot_key(config(), "udp:1.2.3.4", &["datagrams", "7"]);
+    let bytes = redis_slot_key(config(), "udp:1.2.3.4", &["bytes", "7"]);
+    assert_eq!(hash_tag(&datagrams), hash_tag(&bytes));
+
+    // Distinct rate keys still spread across slots — the tag must not collapse
+    // an entire policy onto one hot slot.
+    let other = redis_slot_key(config(), "ip:5.6.7.8", &["42"]);
+    assert_ne!(hash_tag(&curr), hash_tag(&other));
+
+    // Caller-controlled braces cannot terminate the tag early, and delimiters
+    // are escaped so distinct prefix/rate-key pairs cannot collapse onto the
+    // same logical tag.
+    let hostile = redis_slot_key(config(), "identity}:x%y{z", &["42"]);
+    assert_eq!(hash_tag(&hostile), "ferrum%3Atest:identity%7D%3Ax%25y%7Bz");
+    assert_ne!(hash_tag(&hostile), hash_tag(&curr));
+}
+
+/// Parse one complete RESP command array out of `buf`.
+///
+/// Returns the uppercased command name and the number of bytes it consumed, or
+/// `None` when the buffer holds only a partial command. Framing has to be exact:
+/// a fake server that guesses reply counts from a read chunk (say, by counting
+/// `*` bytes) answers a split or coalesced write with the wrong number of
+/// replies, and an extra reply drives the client's multiplexed connection into
+/// an internal accounting underflow instead of the behavior under test.
+fn parse_resp_command(buf: &[u8]) -> Option<(String, usize)> {
+    fn read_line(buf: &[u8], from: usize) -> Option<(&[u8], usize)> {
+        let rest = buf.get(from..)?;
+        let idx = rest.windows(2).position(|w| w == b"\r\n")?;
+        Some((&rest[..idx], from + idx + 2))
+    }
+
+    if *buf.first()? != b'*' {
+        return None;
+    }
+    let (count_line, mut cursor) = read_line(buf, 1)?;
+    let argc: usize = std::str::from_utf8(count_line).ok()?.parse().ok()?;
+    let mut name = None;
+    for arg in 0..argc {
+        if *buf.get(cursor)? != b'$' {
+            return None;
+        }
+        let (len_line, after_len) = read_line(buf, cursor + 1)?;
+        let len: usize = std::str::from_utf8(len_line).ok()?.parse().ok()?;
+        let end = after_len.checked_add(len)?;
+        let payload = buf.get(after_len..end)?;
+        if buf.get(end..end + 2)? != b"\r\n" {
+            return None;
+        }
+        if arg == 0 {
+            name = Some(String::from_utf8_lossy(payload).to_uppercase());
+        }
+        cursor = end + 2;
+    }
+    Some((name?, cursor))
+}
+
+/// Minimal RESP server: replies `+OK` to every command except `INFO`, which gets
+/// `info_payload` as a bulk string. Once `after_info_reply` is set, every later
+/// command receives that raw reply instead of `+OK` — except `MULTI`, which is
+/// still answered `+OK` because that is what a real Cluster node does: it opens
+/// the transaction and redirects the keyed commands queued inside it. Counts
+/// accepted TCP connections and observed `INCR` commands.
+async fn spawn_topology_redis_server(
+    info_payload: &'static str,
+    after_info_reply: Option<&'static str>,
+) -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let incrs = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let incrs_task = Arc::clone(&incrs);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let incrs = Arc::clone(&incrs_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        let mut pending: Vec<u8> = Vec::new();
+                        let mut info_seen = false;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            pending.extend_from_slice(&buf[..n]);
+                            let mut reply = Vec::new();
+                            // Exactly one reply per fully received command, so
+                            // the client's in-flight accounting always matches.
+                            while let Some((name, consumed)) = parse_resp_command(&pending) {
+                                pending.drain(..consumed);
+                                if name == "INCR" {
+                                    incrs.fetch_add(1, Ordering::Relaxed);
+                                }
+                                if name == "INFO" {
+                                    info_seen = true;
+                                    reply.extend_from_slice(
+                                        format!("${}\r\n{info_payload}\r\n", info_payload.len())
+                                            .as_bytes(),
+                                    );
+                                } else if info_seen
+                                    && let Some(raw) = after_info_reply
+                                    && name != "MULTI"
+                                {
+                                    reply.extend_from_slice(raw.as_bytes());
+                                } else {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if reply.is_empty() {
+                                continue;
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx, accepts, incrs)
+}
+
+/// A Cluster endpoint must be refused at connect, before it can serve a single
+/// policy operation, and must never be redialed by the recovery checker.
+#[tokio::test]
+async fn cluster_enabled_endpoint_is_refused_before_serving_policy_operations() {
+    let (port, shutdown, accepts, incrs) =
+        spawn_topology_redis_server("# Cluster\r\ncluster_enabled:1\r\n", None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let first = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(first.is_err(), "a Cluster endpoint must not serve counters");
+    assert!(
+        client.is_topology_unsupported(),
+        "cluster_enabled:1 must be recorded as an unsupported topology"
+    );
+    assert!(!client.is_available(), "topology rejection is terminal");
+    assert_eq!(
+        incrs.load(Ordering::Relaxed),
+        0,
+        "no counter command may reach a Cluster endpoint"
+    );
+
+    let dials_after_first = accepts.load(Ordering::Relaxed);
+    let second = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(second.is_err());
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials_after_first,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// A server that hides its topology from `INFO` is still caught the first time
+/// it answers with a Cluster-only redirection.
+///
+/// The redirection has to be caught through the shape a real Cluster node
+/// produces: `incr_with_expire` sends a `MULTI`/`EXEC` transaction, the node
+/// accepts `MULTI` and redirects the keyed commands at queue time, and the
+/// client surfaces one aborted-transaction error whose *own* code is
+/// `EXECABORT` with the `MOVED` replies nested inside it.
+#[tokio::test]
+async fn cluster_redirection_error_permanently_disables_the_endpoint() {
+    let (port, shutdown, accepts, _incrs) = spawn_topology_redis_server(
+        "# Cluster\r\ncluster_enabled:0\r\n",
+        Some("-MOVED 1234 127.0.0.1:7001\r\n"),
+    )
+    .await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    let first = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(
+        first.is_err(),
+        "a MOVED redirection must fail the operation"
+    );
+    assert!(
+        client.is_topology_unsupported(),
+        "MOVED proves the endpoint is a Cluster this client cannot enforce against"
+    );
+    assert!(!client.is_available());
+
+    let dials = accepts.load(Ordering::Relaxed);
+    let second = client.incr_with_expire("{ferrum:test:key}:1", 60).await;
+    assert!(second.is_err());
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials,
+        "topology rejection must stop reconnection attempts"
+    );
+
+    let _ = shutdown.send(());
+}
+
+// ── Bounded topology screening + terminal rejection under concurrency ──────
+//   (GHSA-87rq-v4hx-8rcq)
+//
+// Two properties the screen has to hold beyond "a Cluster is refused":
+//
+// 1. The proactive `INFO CLUSTER` probe is bounded by the configured
+//    `redis_connect_timeout_seconds`. A server can accept and authenticate a
+//    connection and then never answer `INFO`; an unbounded screen would hang
+//    the first enforcement operation instead of refusing it. A probe that does
+//    not complete is an ordinary outage — never proof of Cluster topology — and
+//    its unscreened connection must not carry a policy command.
+// 2. Rejection is terminal *under concurrency*. A connection, command, or
+//    recovery probe that completes successfully after another task proved
+//    Cluster topology must not be published, must not be returned as a success,
+//    and must not make a failover health observer advertise a recovery.
+
+/// RESP wire form of the command-name bulk string the fake server matches on.
+const INFO_CMD: &[u8] = b"$4\r\nINFO\r\n";
+const GET_CMD: &[u8] = b"$3\r\nGET\r\n";
+
+/// How the fake server answers `INFO CLUSTER`.
+#[derive(Clone, Copy)]
+enum InfoBehavior {
+    /// Answer with this text as a bulk string.
+    Payload(&'static str),
+    /// Answer with these raw RESP bytes (an error line, for example).
+    Raw(&'static str),
+    /// Accept and authenticate the connection, then never answer `INFO`.
+    Never,
+    /// Answer the FIRST screen with this text, then report Cluster topology on
+    /// every later screen. Models an endpoint that is re-pointed at a Cluster
+    /// node after Ferrum already screened and cached a connection to it, so the
+    /// re-screen on the post-disconnect reconnect is what must catch it.
+    PayloadThenCluster(&'static str),
+    /// Answer the first `n` screens with this text, then report Cluster
+    /// topology. Models an endpoint that a whole warm pool screened cleanly
+    /// before the *background recovery probe* is the task that proves Cluster.
+    PayloadForFirstScreens(&'static str, usize),
+}
+
+const CLUSTER_INFO: &str = "# Cluster\r\ncluster_enabled:1\r\n";
+
+struct ScreenedServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    accepts: Arc<AtomicUsize>,
+    infos: Arc<AtomicUsize>,
+    gets: Arc<AtomicUsize>,
+}
+
+fn chunk_contains(chunk: &[u8], needle: &[u8]) -> bool {
+    chunk.windows(needle.len()).any(|window| window == needle)
+}
+
+/// Number of RESP command arrays in one read chunk — the redis crate pipelines
+/// its connection setup, so a single read can carry several commands.
+fn command_count(chunk: &[u8]) -> usize {
+    chunk.iter().filter(|&&byte| byte == b'*').count().max(1)
+}
+
+/// Minimal RESP server: `+OK` to every command except `INFO` (per
+/// [`InfoBehavior`]) and `GET` (always a nil bulk string). `info_delay` /
+/// `get_delay` hold the corresponding reply *after* counting it, so a test can
+/// land a concurrent topology rejection while that exact operation is in flight.
+async fn spawn_screened_redis_server(
+    info: InfoBehavior,
+    info_delay: Duration,
+    get_delay: Duration,
+) -> ScreenedServer {
+    spawn_screened_redis_server_with_drop(info, info_delay, get_delay, None).await
+}
+
+/// As [`spawn_screened_redis_server`], plus `drop_after_gets`: once a connection
+/// has answered that many `GET`s, the server closes the socket instead of
+/// replying. That is the physical disconnect a transparently reconnecting
+/// redis-rs `ConnectionManager` would paper over without re-screening.
+async fn spawn_screened_redis_server_with_drop(
+    info: InfoBehavior,
+    info_delay: Duration,
+    get_delay: Duration,
+    drop_after_gets: Option<usize>,
+) -> ScreenedServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let infos = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let infos_task = Arc::clone(&infos);
+    let gets_task = Arc::clone(&gets);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let infos = Arc::clone(&infos_task);
+                    let gets = Arc::clone(&gets_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        // Per-connection GET count, so the drop applies to each
+                        // physical socket independently.
+                        let mut conn_gets = 0usize;
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let chunk = &buf[..n];
+                            let mut reply: Vec<u8> = Vec::new();
+                            if chunk_contains(chunk, INFO_CMD) {
+                                let screen_index = infos.fetch_add(1, Ordering::Relaxed);
+                                tokio::time::sleep(info_delay).await;
+                                match info {
+                                    InfoBehavior::Payload(text) => {
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::PayloadThenCluster(first) => {
+                                        let text = if screen_index == 0 {
+                                            first
+                                        } else {
+                                            CLUSTER_INFO
+                                        };
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::PayloadForFirstScreens(first, clean_screens) => {
+                                        let text = if screen_index < clean_screens {
+                                            first
+                                        } else {
+                                            CLUSTER_INFO
+                                        };
+                                        let len = text.len();
+                                        let bulk = format!("${len}\r\n{text}\r\n");
+                                        reply.extend_from_slice(bulk.as_bytes());
+                                    }
+                                    InfoBehavior::Raw(raw) => {
+                                        reply.extend_from_slice(raw.as_bytes());
+                                    }
+                                    // Accepted, authenticated, silent.
+                                    InfoBehavior::Never => continue,
+                                }
+                            } else if chunk_contains(chunk, GET_CMD) {
+                                gets.fetch_add(1, Ordering::Relaxed);
+                                conn_gets += 1;
+                                if drop_after_gets.is_some_and(|limit| conn_gets > limit) {
+                                    // Physical disconnect: no reply, socket closed.
+                                    break;
+                                }
+                                tokio::time::sleep(get_delay).await;
+                                reply.extend_from_slice(b"$-1\r\n");
+                            } else {
+                                for _ in 0..command_count(chunk) {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    ScreenedServer {
+        port,
+        shutdown: shutdown_tx,
+        accepts,
+        infos,
+        gets,
+    }
+}
+
+fn screened_client(port: u16, connect_timeout_seconds: u64) -> RedisRateLimitClient {
+    let url = format!("redis://127.0.0.1:{port}/0");
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = connect_timeout_seconds;
+    // Long enough that no background recovery dial happens during a test.
+    config.health_check_interval_seconds = 3600;
+    config.pool_size = 1;
+    redis_rate_limit_client_for_test(config)
+}
+
+/// Await a server-side counter reaching `target`, so a race is landed at a known
+/// point rather than on a hopeful sleep.
+async fn wait_for_count(counter: &Arc<AtomicUsize>, target: usize, what: &str) {
+    for _ in 0..6_000 {
+        if counter.load(Ordering::Relaxed) >= target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{what} never reached {target}");
+}
+
+/// A RESP-compatible server that simply does not report `cluster_enabled` is not
+/// proven to be anything, so it must keep serving policy operations.
+#[tokio::test]
+async fn a_server_without_a_cluster_enabled_field_still_serves_policy_operations() {
+    let info = InfoBehavior::Payload("# Server\r\nredis_version:7.2.4\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert_eq!(
+        served,
+        Ok(None),
+        "an unknown topology must fall through to the reactive screen"
+    );
+    assert!(!client.is_topology_unsupported());
+    assert!(client.is_available());
+    assert_eq!(server.gets.load(Ordering::Relaxed), 1);
+
+    let _ = server.shutdown.send(());
+}
+
+/// A server that answers `INFO` with an ordinary command error (unknown command,
+/// restricted ACL) keeps the documented compatibility behavior.
+#[tokio::test]
+async fn an_unsupported_info_command_error_keeps_the_endpoint_usable() {
+    let info = InfoBehavior::Raw("-ERR unknown command 'INFO'\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let served = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert_eq!(
+        served,
+        Ok(None),
+        "a server error reply to INFO is not proof of Cluster topology"
+    );
+    assert!(!client.is_topology_unsupported());
+    assert!(client.is_available());
+
+    let _ = server.shutdown.send(());
+}
+
+/// An `INFO` answered with a Cluster-only wire code is itself proof, even when
+/// the server never reports `cluster_enabled`.
+#[tokio::test]
+async fn a_cluster_wire_error_on_the_info_probe_is_terminal() {
+    let info = InfoBehavior::Raw("-MOVED 1234 127.0.0.1:7001\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let client = screened_client(server.port, 5);
+
+    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    assert!(
+        refused.is_err(),
+        "a Cluster endpoint must not serve a policy operation"
+    );
+    assert!(
+        client.is_topology_unsupported(),
+        "a Cluster wire code on the screen proves the topology"
+    );
+    assert!(!client.is_available());
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        0,
+        "no policy command may reach a refused endpoint"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The finding that motivated the deadline: a server that accepts and
+/// authenticates but never answers `INFO` must not hang the first enforcement
+/// operation. The probe is bounded by `redis_connect_timeout_seconds`, and an
+/// unanswered screen is an outage — not proof of Cluster topology.
+#[tokio::test]
+async fn an_endpoint_that_never_answers_info_fails_closed_within_the_connect_timeout() {
+    let info = InfoBehavior::Never;
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    // One-second connect timeout, which now also bounds the topology probe.
+    let client = screened_client(server.port, 1);
+
+    let started = std::time::Instant::now();
+    let refused = client.get_bytes("{ferrum%3Atest:probe}").await;
+    let elapsed = started.elapsed();
+    assert!(
+        refused.is_err(),
+        "an unscreened endpoint must fail closed instead of serving the command"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the topology probe must be bounded by redis_connect_timeout_seconds, took {elapsed:?}"
+    );
+    assert!(!client.is_available());
+    assert!(
+        !client.is_topology_unsupported(),
+        "an unanswered probe is a retryable outage, not proof of Cluster topology"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        server.gets.load(Ordering::Relaxed),
+        0,
+        "a policy command must never run on a connection that was not screened"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A command whose reply lands *after* another task proved Cluster topology must
+/// be reported as a failure, so the consumer's `redis_failure_policy` governs.
+/// Over-counting one operation is safer than admitting traffic against a
+/// topology this client cannot enforce on.
+#[tokio::test]
+async fn a_command_completing_after_a_topology_rejection_fails_closed() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, Duration::ZERO, held).await;
+    let client = Arc::new(screened_client(server.port, 5));
+
+    // Control: this fake really does answer the command successfully, so the
+    // failure asserted below is attributable to the rejection alone.
+    let control = client.get_bytes("{ferrum%3Atest:control}").await;
+    assert_eq!(control, Ok(None));
+    assert!(client.is_available());
+
+    let racer = Arc::clone(&client);
+    let raced_key = "{ferrum%3Atest:raced}";
+    let inflight = tokio::spawn(async move { racer.get_bytes(raced_key).await });
+    // The server now holds the racing GET's reply.
+    wait_for_count(&server.gets, 2, "racing GET").await;
+    client.mark_topology_unsupported_for_test();
+
+    let raced = inflight.await.expect("racing task");
+    assert!(
+        raced.is_err(),
+        "a command that completed after the rejection must not be a success"
+    );
+    assert!(
+        !client.is_available(),
+        "topology rejection must stay terminal for this client generation"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "a failover health observer must never see a refused endpoint as available"
+    );
+
+    // Later operations, and the redials they would trigger, stay disabled.
+    let dials = server.accepts.load(Ordering::Relaxed);
+    let after = client.get_bytes("{ferrum%3Atest:after}").await;
+    assert!(after.is_err());
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        dials,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// A connection still being screened when another task proves Cluster topology
+/// must never be published to the hot path, even though its own screen passed.
+#[tokio::test]
+async fn a_connection_screened_across_a_topology_rejection_is_never_published() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, held, Duration::ZERO).await;
+    let client = Arc::new(screened_client(server.port, 5));
+
+    let connecting = Arc::clone(&client);
+    let inflight = tokio::spawn(async move { connecting.connect_cached_for_test().await });
+    // The server now holds the screen's INFO reply.
+    wait_for_count(&server.infos, 1, "screening INFO").await;
+    client.mark_topology_unsupported_for_test();
+
+    let published = inflight.await.expect("connecting task");
+    assert!(
+        !published,
+        "a connection screened across a rejection must not be published"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "no pool slot may hold a connection to a refused endpoint"
+    );
+    assert!(!client.is_available());
+    assert!(!client.observer_sees_available_for_test());
+
+    let _ = server.shutdown.send(());
+}
+
+/// The recovery checker's own race: its `PING` and topology screen both succeed,
+/// but a rejection landed while the probe was in flight. It must not restore
+/// availability, so no observer can advertise a false recovery.
+#[tokio::test]
+async fn a_recovery_probe_completing_after_a_rejection_advertises_no_recovery() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let held = Duration::from_millis(300);
+    let server = spawn_screened_redis_server(info, held, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Probe once per second so the race window is reached promptly.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = 1;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // Enter the state an outage produces: unavailable, recovery checker running.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+
+    // Let the recovery probe reach its topology screen, then prove Cluster
+    // topology from another task while that probe is still in flight.
+    wait_for_count(&server.infos, 1, "recovery screen INFO").await;
+    client.mark_topology_unsupported_for_test();
+
+    // The probe's PING and INFO both succeed after the rejection landed.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        !client.is_available(),
+        "a successful recovery probe must not resurrect a refused endpoint"
+    );
+    assert!(
+        !client.observer_sees_available_for_test(),
+        "no false recovery may be advertised to a failover health observer"
+    );
+    assert!(client.is_topology_unsupported());
+
+    let _ = server.shutdown.send(());
+}
+
+/// The background recovery probe can be the task that *proves* Cluster
+/// topology. When it is, the slots a previously healthy pool cached must be
+/// released there and then — not retained until the whole client generation
+/// drops. The probe owns only a `Weak` handle to the pool, which is exactly
+/// enough to clear it.
+#[tokio::test]
+async fn a_recovery_probe_proving_cluster_topology_clears_every_cached_pool_slot() {
+    const POOL_SIZE: usize = 3;
+    // Every warm-pool screen passes; the next screen (the recovery probe's)
+    // reports Cluster.
+    let clean = "# Cluster\r\ncluster_enabled:0\r\n";
+    let info = InfoBehavior::PayloadForFirstScreens(clean, POOL_SIZE);
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.connect_timeout_seconds = 5;
+    // Probe once per second so the rejection lands promptly.
+    config.health_check_interval_seconds = 1;
+    config.pool_size = POOL_SIZE;
+    let client = redis_rate_limit_client_for_test(config);
+
+    // Arm the recovery checker FIRST: marking unavailable also clears the pool,
+    // so warming afterwards is what leaves populated slots for the probe to
+    // find. The recovery loop sleeps one interval before its first probe.
+    client.mark_unavailable_for_test();
+    assert!(client.health_checker_started_for_test());
+    assert_eq!(client.warm_pool_for_test().await, POOL_SIZE);
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        POOL_SIZE,
+        "the probe must start from a fully populated cache"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), POOL_SIZE);
+    let warm_dials = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(warm_dials, POOL_SIZE);
+
+    for _ in 0..6_000 {
+        if client.is_topology_unsupported() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        client.is_topology_unsupported(),
+        "the recovery probe's own screen must prove Cluster topology"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "a rejection proven by the recovery probe must release every cached slot"
+    );
+    assert!(!client.is_available());
+    assert!(!client.observer_sees_available_for_test());
+
+    // Terminal: nothing re-establishes a slot, and the endpoint is never
+    // redialed for policy work.
+    assert_eq!(client.warm_pool_for_test().await, 0);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+    let probe_dials = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(
+        probe_dials,
+        warm_dials + 1,
+        "only the recovery probe's own connection may follow the warm pool"
+    );
+
+    // Two further probe intervals: the loop must stay parked on the terminal
+    // state rather than pinging, reconnecting, or repopulating the cache.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+    assert!(client.is_topology_unsupported());
+    assert!(!client.is_available());
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        probe_dials,
+        "a rejected topology must never be redialed"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Failover admission must not latch a second recovery interval (GHSA-87rq) ─
+//
+// The failover limiter used to gate admission on BOTH the client's semantic
+// availability and its own health-observer mirror. An ordinary command failure
+// makes the client unavailable; the client republishes availability at most one
+// health interval later, and the independent observer then needed a further
+// interval before its mirror agreed. Under the fail-closed default that turned
+// routine socket recycling into roughly two intervals of blanket refusals.
+// `is_available()` is now the only admission gate.
+
+/// One RESP round trip of the limiter's sliding window: the client sends
+/// `MULTI` / `GET` / `INCRBY` / `EXPIRE` / `EXEC` as a single pipeline, so a
+/// well-formed answer is `+OK`, three `+QUEUED`s, and the `EXEC` array.
+const TRANSACTION_PREAMBLE: &[u8] = b"+OK\r\n+QUEUED\r\n+QUEUED\r\n+QUEUED\r\n";
+/// `EXEC` array for a first-request window: `GET` nil, `INCRBY` → 1, `EXPIRE` → 1.
+const TRANSACTION_SUCCESS: &[u8] = b"*3\r\n$-1\r\n:1\r\n:1\r\n";
+/// A plain (non-Cluster) server error on `EXEC` — the ordinary retryable
+/// failure a recycled socket produces, not a topology proof.
+const TRANSACTION_FAILURE: &[u8] = b"-ERR simulated transient backend failure\r\n";
+const MULTI_CMD: &[u8] = b"$5\r\nMULTI\r\n";
+
+struct TransactionServer {
+    port: u16,
+    shutdown: oneshot::Sender<()>,
+    accepts: Arc<AtomicUsize>,
+    transactions: Arc<AtomicUsize>,
+}
+
+/// Screens clean on every connection, fails the FIRST sliding-window
+/// transaction with a plain server error, and answers every later transaction
+/// normally.
+async fn spawn_first_transaction_fails_redis_server() -> TransactionServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let transactions = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let transactions_task = Arc::clone(&transactions);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let transactions = Arc::clone(&transactions_task);
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let chunk = &buf[..n];
+                            let mut reply: Vec<u8> = Vec::new();
+                            if chunk_contains(chunk, INFO_CMD) {
+                                let text = "# Cluster\r\ncluster_enabled:0\r\n";
+                                let len = text.len();
+                                reply.extend_from_slice(
+                                    format!("${len}\r\n{text}\r\n").as_bytes(),
+                                );
+                            } else if chunk_contains(chunk, MULTI_CMD) {
+                                let index = transactions.fetch_add(1, Ordering::Relaxed);
+                                reply.extend_from_slice(TRANSACTION_PREAMBLE);
+                                if index == 0 {
+                                    reply.extend_from_slice(TRANSACTION_FAILURE);
+                                } else {
+                                    reply.extend_from_slice(TRANSACTION_SUCCESS);
+                                }
+                            } else {
+                                for _ in 0..command_count(chunk) {
+                                    reply.extend_from_slice(b"+OK\r\n");
+                                }
+                            }
+                            if stream.write_all(&reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    TransactionServer {
+        port,
+        shutdown: shutdown_tx,
+        accepts,
+        transactions,
+    }
+}
+
+/// Once the client's availability signal recovers, the very next admission is
+/// eligible for centralized enforcement — no observer tick in between. A
+/// terminal topology rejection still can never be overruled.
+#[tokio::test]
+async fn failover_admission_resumes_on_client_recovery_without_an_observer_tick() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+        RedisFailurePolicy,
+    };
+
+    let server = spawn_first_transaction_fails_redis_server().await;
+    let accepts = Arc::clone(&server.accepts);
+    let transactions = Arc::clone(&server.transactions);
+
+    let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{}/0", server.port),
+                "redis_pool_size": 1,
+                // Long enough that neither the client's recovery checker nor the
+                // failover observer can tick during this test: every transition
+                // below is one this test performs explicitly.
+                "redis_health_check_interval_seconds": 3600,
+            }),
+            &PluginHttpClient::default(),
+            DynamicHttpRateLimitAlgorithm::new(),
+        )
+        .expect("failover backend");
+    assert_eq!(
+        backend.redis_failure_policy(),
+        Some(RedisFailurePolicy::FailClosed),
+        "this coverage is about the fail-closed default's recovery latency"
+    );
+    let client = backend
+        .redis_client_arc_for_test()
+        .expect("failover backend must own a Redis client");
+    let op = DynamicRateLimitOp::new(vec![RateLimitWindowSpec {
+        limit: 1_000,
+        duration: Duration::from_secs(60),
+    }]);
+
+    // 1. The first centralized transaction fails, so the client marks itself
+    //    unavailable and the fail-closed policy refuses. This is the transition
+    //    that used to drive the failover mirror false as well.
+    let first = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("fail-closed refusal is an outcome, not a capacity denial");
+    assert!(!first.allowed);
+    assert!(first.enforcement_unavailable);
+    assert!(!client.is_available());
+    assert!(!client.is_topology_unsupported());
+    assert_eq!(transactions.load(Ordering::Relaxed), 1);
+    let dials_after_outage = accepts.load(Ordering::Relaxed);
+    assert_eq!(dials_after_outage, 1);
+
+    // 2. The client itself recovers — what a successful recovery probe does.
+    //    No observer tick can have happened: its interval is an hour away.
+    assert!(client.publish_reachable_for_test());
+    assert!(client.is_available());
+
+    // 3. The very next admission must be centrally enforced. Before the fix the
+    //    limiter also required its own observer mirror to agree, so this
+    //    admission was refused for up to another whole health interval.
+    let second = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-a".to_string(),
+            || "{ferrum%3Atest:identity-a}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(
+        second.allowed && !second.enforcement_unavailable,
+        "admission must be centrally enforced as soon as the client is available \
+         again, without waiting for the failover observer's own interval"
+    );
+    assert_eq!(
+        transactions.load(Ordering::Relaxed),
+        2,
+        "the recovered admission must actually reach Redis"
+    );
+    assert!(accepts.load(Ordering::Relaxed) > dials_after_outage);
+
+    // 4. A terminal topology rejection can never be overruled: no publication
+    //    restores availability, and admission never redials the endpoint.
+    client.mark_topology_unsupported_for_test();
+    assert!(!client.publish_reachable_for_test());
+    assert!(!client.is_available());
+    let dials_after_rejection = accepts.load(Ordering::Relaxed);
+    let refused = backend
+        .check_with_redis_key_and_local_capacity(
+            "identity-b".to_string(),
+            || "{ferrum%3Atest:identity-b}".to_string(),
+            &op,
+            1_000,
+        )
+        .await
+        .expect("outcome");
+    assert!(!refused.allowed);
+    assert!(refused.enforcement_unavailable);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        dials_after_rejection,
+        "a refused topology must not be redialed by admission"
+    );
+    assert_eq!(
+        transactions.load(Ordering::Relaxed),
+        2,
+        "no policy command may run against a refused endpoint"
+    );
+    assert!(client.is_topology_unsupported());
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Cached pool must not transparently reconnect (GHSA-87rq root review) ──
+//
+// redis-rs `ConnectionManager` re-establishes its physical socket internally.
+// Ferrum screens DNS, egress, and `INFO CLUSTER` only when it creates a
+// connection itself, so a manager in the hot-path pool could replace a screened
+// socket with an unscreened one after any blip. The pool therefore caches plain
+// `MultiplexedConnection`s: a broken connection surfaces its I/O error, the pool
+// is cleared, and the next operation re-establishes through the screened path.
+
+/// Static + type pin: the hot-path pool caches a non-reconnecting
+/// `MultiplexedConnection`, never a `ConnectionManager`, and no connection
+/// helper constructs one.
+#[test]
+fn cached_pool_pins_multiplexed_connection_not_connection_manager() {
+    let source = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+
+    assert!(
+        source.contains("connection: ArcSwap<Option<redis::aio::MultiplexedConnection>>"),
+        "pool slots must cache MultiplexedConnection"
+    );
+    assert!(
+        !source.contains("ArcSwap<Option<redis::aio::ConnectionManager>>"),
+        "pool slots must not cache a transparently reconnecting ConnectionManager"
+    );
+    assert!(
+        source.contains(
+            "async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::MultiplexedConnection>"
+        ),
+        "pooled establishment must return MultiplexedConnection"
+    );
+    assert!(
+        source.contains(
+            "async fn get_connection(&self) -> Option<redis::aio::MultiplexedConnection>"
+        ),
+        "pooled accessor must return MultiplexedConnection"
+    );
+
+    // No code path may construct a manager or its config any more.
+    for banned in [
+        "redis::aio::ConnectionManager::new",
+        "redis::aio::ConnectionManagerConfig",
+        "fn connect_manager",
+    ] {
+        assert!(
+            !source.contains(banned),
+            "obsolete ConnectionManager construction still present: {banned}"
+        );
+    }
+
+    let type_name = RedisRateLimitClient::cached_pool_connection_type_name_for_test();
+    assert_eq!(
+        type_name,
+        std::any::type_name::<redis::aio::MultiplexedConnection>()
+    );
+    assert!(
+        !type_name.contains("ConnectionManager"),
+        "pooled connection type must not be ConnectionManager: {type_name}"
+    );
+
+    // Both connect helpers dial multiplexed connections directly, and the
+    // pooled path screens topology before publishing into the ArcSwap slot.
+    let publish = source
+        .find("slot.connection.store(Arc::new(Some(conn.clone())))")
+        .expect("pooled publication site");
+    let establish = source
+        .find("match self.connect_multiplexed(client).await {")
+        .expect("pooled establishment site");
+    let screen = source[establish..publish]
+        .find("self.screen_topology(&mut conn)")
+        .expect("pooled path must screen topology before publishing");
+    assert!(
+        screen > 0,
+        "topology screen must sit between connect and publication"
+    );
+}
+
+/// A pooled connection that is physically disconnected must not be silently
+/// replaced by redis-rs. The failing command fails, the pool is cleared, and the
+/// re-established connection is screened again (`INFO CLUSTER` per socket).
+#[tokio::test]
+async fn pooled_reconnect_after_disconnect_reruns_the_topology_screen() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let server =
+        spawn_screened_redis_server_with_drop(info, Duration::ZERO, Duration::ZERO, Some(1)).await;
+    let client = screened_client(server.port, 5);
+
+    // First operation establishes and screens exactly one physical connection.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(server.accepts.load(Ordering::Relaxed), 1);
+    assert_eq!(server.infos.load(Ordering::Relaxed), 1);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 1);
+
+    // Second operation hits the server's disconnect. It must FAIL (not silently
+    // ride a redis-rs reconnect) and must drop the cached slot.
+    assert_eq!(
+        client.get_bytes("{ferrum%3Atest:probe}").await,
+        Err(()),
+        "a disconnected pooled connection must fail the operation, not auto-reconnect"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        0,
+        "an I/O failure must clear the cached pool"
+    );
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        1,
+        "redis-rs must not have dialled a replacement connection on its own"
+    );
+
+    // Third operation re-establishes — through the full screened path.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        2,
+        "recovery must open a new physical connection"
+    );
+    assert_eq!(
+        server.infos.load(Ordering::Relaxed),
+        2,
+        "every newly established pooled connection must be topology-screened"
+    );
+    assert_eq!(
+        client.cached_pool_cardinality_for_test(),
+        1,
+        "the pool stays bounded at redis_pool_size across reconnects"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// The topology-after-disconnect seam: an endpoint that screened clean, then
+/// disconnected, then came back reporting Cluster topology must be caught by the
+/// re-screen and refused terminally. A transparent reconnect would have skipped
+/// that screen entirely and kept serving policy operations.
+#[tokio::test]
+async fn cluster_topology_appearing_after_a_disconnect_is_caught_by_the_rescreen() {
+    let info = InfoBehavior::PayloadThenCluster("# Cluster\r\ncluster_enabled:0\r\n");
+    let server =
+        spawn_screened_redis_server_with_drop(info, Duration::ZERO, Duration::ZERO, Some(1)).await;
+    let client = screened_client(server.port, 5);
+
+    // Screened clean, serving normally.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    assert!(!client.is_topology_unsupported());
+
+    // Disconnect fails the in-flight operation and clears the pool.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert!(
+        !client.is_topology_unsupported(),
+        "an ordinary disconnect is an outage, never proof of Cluster topology"
+    );
+
+    // The reconnect re-screens and now sees cluster_enabled:1 — terminal refusal.
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert!(
+        client.is_topology_unsupported(),
+        "the post-disconnect re-screen must catch a Cluster endpoint"
+    );
+    assert!(!client.is_available());
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+
+    // Terminal: no further dialling of the refused endpoint.
+    let accepts_at_rejection = server.accepts.load(Ordering::Relaxed);
+    assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Err(()));
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        accepts_at_rejection,
+        "a refused topology must never be redialled"
+    );
+
+    let _ = server.shutdown.send(());
+}
+
+/// Every slot of a multi-slot pool is screened on establishment, and the pool
+/// never exceeds `redis_pool_size` physical connections.
+#[tokio::test]
+async fn every_pool_slot_is_screened_and_the_pool_stays_bounded() {
+    let info = InfoBehavior::Payload("# Cluster\r\ncluster_enabled:0\r\n");
+    let server = spawn_screened_redis_server(info, Duration::ZERO, Duration::ZERO).await;
+    let url = format!("redis://127.0.0.1:{}/0", server.port);
+    let mut config = make_config(&url, false);
+    config.pool_size = 3;
+    config.health_check_interval_seconds = 3600;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+    assert_eq!(server.accepts.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        server.infos.load(Ordering::Relaxed),
+        3,
+        "each pool slot must be screened on establishment"
+    );
+
+    // Many more operations than slots must reuse the bounded pool, not dial.
+    for _ in 0..12 {
+        assert_eq!(client.get_bytes("{ferrum%3Atest:probe}").await, Ok(None));
+    }
+    assert_eq!(
+        server.accepts.load(Ordering::Relaxed),
+        3,
+        "the round-robin pool must stay bounded at redis_pool_size"
+    );
+    assert_eq!(server.infos.load(Ordering::Relaxed), 3);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+
+    let _ = server.shutdown.send(());
+}
+
+// ── Identity-bearing keys must never reach operational logs (GHSA-87rq) ───
+//
+// Redis/rate-limit keys embed the enforcement identity dimension: internal
+// consumer usernames, `ctx.authenticated_identity`, and SPIFFE IDs. Emitting
+// them in a warning writes those identities into every configured log sink at
+// attacker-influenced rates. Diagnostics keep only bounded, non-identifying
+// context (operation name, redacted endpoint, pool slot, plugin name, static
+// topology reason, Redis error). Hashes/encodings are NOT an acceptable
+// substitute — they are still per-identity correlators.
+
+/// The eight limiter surfaces that talk to the shared Redis client.
+fn identity_log_guard_sources() -> [(&'static str, &'static str); 8] {
+    [
+        (
+            "src/plugins/utils/redis_rate_limiter.rs",
+            include_str!("../../../src/plugins/utils/redis_rate_limiter.rs"),
+        ),
+        (
+            "src/plugins/utils/rate_limit.rs",
+            include_str!("../../../src/plugins/utils/rate_limit.rs"),
+        ),
+        (
+            "src/plugins/rate_limiting.rs",
+            include_str!("../../../src/plugins/rate_limiting.rs"),
+        ),
+        (
+            "src/plugins/ai_rate_limiter.rs",
+            include_str!("../../../src/plugins/ai_rate_limiter.rs"),
+        ),
+        (
+            "src/plugins/ws_rate_limiting.rs",
+            include_str!("../../../src/plugins/ws_rate_limiting.rs"),
+        ),
+        (
+            "src/plugins/udp_rate_limiting.rs",
+            include_str!("../../../src/plugins/udp_rate_limiting.rs"),
+        ),
+        // The remaining two Redis-backed enforcement consumers. They do not log
+        // a rate key today, and this canary is what keeps that true: both build
+        // an identity-bearing key (`limit_by` consumer/identity/SPIFFE/IP) and
+        // both gained a fail-closed refusal arm here, which is exactly the kind
+        // of edit that tends to add a "which key?" diagnostic.
+        (
+            "src/plugins/graphql.rs",
+            include_str!("../../../src/plugins/graphql.rs"),
+        ),
+        (
+            "src/plugins/grpc_method_router.rs",
+            include_str!("../../../src/plugins/grpc_method_router.rs"),
+        ),
+    ]
+}
+
+/// Rust source with comments blanked out and string/char literal spans marked.
+///
+/// The mask is what makes the field/paren structure below trustworthy: a `,`,
+/// `(`, or `//` inside a literal is text, not syntax.
+struct MaskedSource {
+    chars: Vec<char>,
+    in_literal: Vec<bool>,
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn mask_source(source: &str) -> MaskedSource {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = chars.clone();
+    let mut in_literal = vec![false; chars.len()];
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Line comment.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out[i] = ' ';
+                i += 1;
+            }
+            continue;
+        }
+
+        // Block comment (Rust allows nesting).
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            let mut depth = 1usize;
+            out[i] = ' ';
+            out[i + 1] = ' ';
+            i += 2;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out[i] = ' ';
+                    out[i + 1] = ' ';
+                    i += 2;
+                    continue;
+                }
+                if chars[i] != '\n' {
+                    out[i] = ' ';
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Raw string: r"…", r#"…"#, br#"…"#.
+        if (c == 'r' || c == 'b') && (i == 0 || !is_ident_char(chars[i - 1])) {
+            let mut j = i + 1;
+            let raw = c == 'r' || chars.get(j) == Some(&'r');
+            if c == 'b' && chars.get(j) == Some(&'r') {
+                j += 1;
+            }
+            let hash_start = j;
+            while chars.get(j) == Some(&'#') {
+                j += 1;
+            }
+            let hashes = j - hash_start;
+            if raw && chars.get(j) == Some(&'"') {
+                let mut k = j + 1;
+                loop {
+                    if k >= chars.len() {
+                        break;
+                    }
+                    if chars[k] == '"'
+                        && (1..=hashes).all(|offset| chars.get(k + offset) == Some(&'#'))
+                    {
+                        k += hashes + 1;
+                        break;
+                    }
+                    k += 1;
+                }
+                for slot in in_literal.iter_mut().take(k.min(chars.len())).skip(i) {
+                    *slot = true;
+                }
+                i = k;
+                continue;
+            }
+        }
+
+        // Ordinary (or byte) string literal.
+        if c == '"' {
+            let mut j = i;
+            in_literal[j] = true;
+            j += 1;
+            while j < chars.len() {
+                in_literal[j] = true;
+                if chars[j] == '\\' {
+                    if j + 1 < chars.len() {
+                        in_literal[j + 1] = true;
+                    }
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '"' {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            i = j;
+            continue;
+        }
+
+        // Char literal — distinguished from a lifetime by its closing quote.
+        if c == '\'' {
+            let escaped = chars.get(i + 1) == Some(&'\\');
+            if escaped || chars.get(i + 2) == Some(&'\'') {
+                let mut j = i + 1;
+                in_literal[i] = true;
+                while j < chars.len() {
+                    in_literal[j] = true;
+                    if chars[j] == '\\' {
+                        if j + 1 < chars.len() {
+                            in_literal[j + 1] = true;
+                        }
+                        j += 2;
+                        continue;
+                    }
+                    if chars[j] == '\'' {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    MaskedSource {
+        chars: out,
+        in_literal,
+    }
+}
+
+/// Macro names whose arguments become log records.
+const TRACING_MACROS: [&str; 12] = [
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+    "span",
+    "trace_span",
+    "debug_span",
+    "info_span",
+    "warn_span",
+    "error_span",
+];
+
+/// Byte ranges of the argument list of every tracing macro invocation.
+fn tracing_argument_spans(masked: &MaskedSource) -> Vec<(usize, usize)> {
+    let chars = &masked.chars;
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] != '!' || masked.in_literal[i] {
+            i += 1;
+            continue;
+        }
+        // Macro name immediately before the `!` (path-qualified names such as
+        // `tracing::warn!` reduce to their last segment).
+        let mut name_start = i;
+        while name_start > 0 && is_ident_char(chars[name_start - 1]) {
+            name_start -= 1;
+        }
+        let name: String = chars[name_start..i].iter().collect();
+        let mut open = i + 1;
+        while open < chars.len() && chars[open].is_whitespace() {
+            open += 1;
+        }
+        if !TRACING_MACROS.contains(&name.as_str()) || chars.get(open) != Some(&'(') {
+            i += 1;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut j = open;
+        let mut close = None;
+        while j < chars.len() {
+            if !masked.in_literal[j] {
+                match chars[j] {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            j += 1;
+        }
+        let Some(close) = close else { break };
+        spans.push((open + 1, close));
+        i = close + 1;
+    }
+
+    spans
+}
+
+/// Top-level (comma-separated) argument ranges inside one invocation.
+fn top_level_fields(masked: &MaskedSource, start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut fields = Vec::new();
+    let mut depth = 0usize;
+    let mut field_start = start;
+    let mut i = start;
+    while i < end {
+        if !masked.in_literal[i] {
+            match masked.chars[i] {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    fields.push((field_start, i));
+                    field_start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if field_start < end {
+        fields.push((field_start, end));
+    }
+    fields
+}
+
+/// The range of the *value* a field records.
+///
+/// `name = expr` records `expr`; a shorthand field (`%key`, `?key`, `key`) and
+/// a message/format argument record themselves. Only values are inspected, so
+/// an innocuous value under a key-ish field name is not a false positive.
+fn recorded_value_range(masked: &MaskedSource, start: usize, end: usize) -> (usize, usize) {
+    let mut depth = 0usize;
+    let mut i = start;
+    while i < end {
+        if !masked.in_literal[i] {
+            match masked.chars[i] {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                '=' if depth == 0 => {
+                    let prev = masked.chars[start..i]
+                        .iter()
+                        .rev()
+                        .find(|c| !c.is_whitespace())
+                        .copied();
+                    // `==`, `!=`, `<=`, `>=`, `=>` are operators, not a field
+                    // assignment.
+                    if matches!(prev, Some('=' | '!' | '<' | '>'))
+                        || masked.chars.get(i + 1) == Some(&'=')
+                        || masked.chars.get(i + 1) == Some(&'>')
+                    {
+                        i += 1;
+                        continue;
+                    }
+                    let name: String = masked.chars[start..i].iter().collect();
+                    let name = name.trim().trim_start_matches(['%', '?']);
+                    let is_field_name = !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| is_ident_char(c) || c == '.' || c == ':')
+                        && name.chars().next().is_some_and(|c| !c.is_ascii_digit());
+                    if is_field_name {
+                        return (i + 1, end);
+                    }
+                    return (start, end);
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    (start, end)
+}
+
+/// Identifier tokens a value expression references, including inline format
+/// captures (`"… {key} …"`). Literal *text* is otherwise ignored, so a message
+/// that merely says "rate key" is not a finding.
+fn value_expression_tokens(masked: &MaskedSource, start: usize, end: usize) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut i = start;
+
+    while i < end {
+        if masked.in_literal[i] {
+            let literal_start = i;
+            while i < end && masked.in_literal[i] {
+                i += 1;
+            }
+            let text: String = masked.chars[literal_start..i].iter().collect();
+            let bytes: Vec<char> = text.chars().collect();
+            let mut k = 0usize;
+            while k < bytes.len() {
+                if bytes[k] == '{' {
+                    if bytes.get(k + 1) == Some(&'{') {
+                        k += 2;
+                        continue;
+                    }
+                    if let Some(offset) = bytes[k + 1..].iter().position(|c| *c == '}') {
+                        let inner: String = bytes[k + 1..k + 1 + offset].iter().collect();
+                        let capture = inner.split(':').next().unwrap_or("").trim().to_string();
+                        if !capture.is_empty()
+                            && capture.chars().all(is_ident_char)
+                            && !capture.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        {
+                            tokens.push(capture);
+                        }
+                        k += offset + 2;
+                        continue;
+                    }
+                }
+                k += 1;
+            }
+            continue;
+        }
+        let c = masked.chars[i];
+        if is_ident_char(c) {
+            current.push(c);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Documented operator configuration that merely *contains* "key" and carries no
+/// enforcement identity.
+const NON_IDENTITY_TOKENS: [&str; 4] = ["key_prefix", "key_prefixes", "contains_key", "keys"];
+
+/// Identity-bearing value names that do not spell "key".
+const IDENTITY_TOKENS: [&str; 8] = [
+    "identity",
+    "authenticated_identity",
+    "consumer",
+    "consumer_id",
+    "principal",
+    "spiffe_id",
+    "client_ip",
+    "peer_ip",
+];
+
+/// Whether an identifier used as a recorded value carries an enforcement
+/// identity.
+///
+/// SCREAMING_SNAKE_CASE names are exempt: a compile-time constant is a fixed
+/// string, so it cannot be a per-identity correlator however it is spelled.
+fn is_identity_bearing_token(token: &str) -> bool {
+    if token
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    if NON_IDENTITY_TOKENS.contains(&lower.as_str()) {
+        return false;
+    }
+    lower == "key"
+        || lower.ends_with("_key")
+        || lower.starts_with("key_")
+        || lower.contains("_key_")
+        || IDENTITY_TOKENS.contains(&lower.as_str())
+}
+
+/// Every identity-bearing token recorded as a value by a tracing macro, with the
+/// 1-based line of the field it appears in.
+fn identity_bearing_log_values(source: &str) -> Vec<(usize, String, String)> {
+    let masked = mask_source(source);
+    let mut newline_offsets: Vec<usize> = Vec::new();
+    for (index, c) in masked.chars.iter().enumerate() {
+        if *c == '\n' {
+            newline_offsets.push(index);
+        }
+    }
+    let line_of = |index: usize| newline_offsets.partition_point(|nl| *nl < index) + 1;
+
+    let mut findings = Vec::new();
+    for (start, end) in tracing_argument_spans(&masked) {
+        for (field_start, field_end) in top_level_fields(&masked, start, end) {
+            let (value_start, value_end) = recorded_value_range(&masked, field_start, field_end);
+            for token in value_expression_tokens(&masked, value_start, value_end) {
+                if is_identity_bearing_token(&token) {
+                    let field: String = masked.chars[field_start..field_end].iter().collect();
+                    findings.push((
+                        line_of(field_start),
+                        token,
+                        field.split_whitespace().collect::<Vec<_>>().join(" "),
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// Number of tracing invocations the scanner recognized — a self-check that the
+/// guard is actually reading these files rather than silently parsing nothing.
+fn tracing_invocation_count(source: &str) -> usize {
+    tracing_argument_spans(&mask_source(source)).len()
+}
+
+/// Static canary over the limiter surfaces that talk to the shared Redis client.
+///
+/// This is a canary, not a proof: it enforces one concrete boundary — no
+/// identity-bearing identifier may appear in an expression a `tracing` macro
+/// records as a value, in any field name, including shorthand fields, `%`/`?`
+/// render forms, and inline format captures. Code that reaches a log through
+/// something other than a literal tracing macro in these eight files (a helper
+/// that formats a string elsewhere, a `Display` impl that embeds a key) is
+/// outside what it can see.
+#[test]
+fn limiter_log_statements_never_carry_identity_bearing_keys() {
+    for (path, source) in identity_log_guard_sources() {
+        let findings = identity_bearing_log_values(source);
+        assert!(
+            findings.is_empty(),
+            "{path} records identity-bearing values in tracing macros: {findings:?}"
+        );
+    }
+}
+
+/// The scanner must actually parse these files. Without this, a parser bug that
+/// finds zero invocations would make the canary above pass vacuously forever.
+#[test]
+fn identity_log_guard_reads_every_governed_source() {
+    for (path, source) in identity_log_guard_sources() {
+        assert!(
+            tracing_invocation_count(source) > 0,
+            "{path}: the identity-log guard found no tracing macro invocations"
+        );
+    }
+
+    // The known non-identity operator field must be *seen and allowed*, not
+    // missed: it proves the scanner reaches real recorded values.
+    let redis = include_str!("../../../src/plugins/utils/redis_rate_limiter.rs");
+    let masked = mask_source(redis);
+    let mut saw_key_prefix_value = false;
+    for (start, end) in tracing_argument_spans(&masked) {
+        for (field_start, field_end) in top_level_fields(&masked, start, end) {
+            let (value_start, value_end) = recorded_value_range(&masked, field_start, field_end);
+            if value_expression_tokens(&masked, value_start, value_end)
+                .iter()
+                .any(|token| token == "key_prefix")
+            {
+                saw_key_prefix_value = true;
+            }
+        }
+    }
+    assert!(
+        saw_key_prefix_value,
+        "the guard must reach `key_prefix = %self.config.key_prefix` and allow it"
+    );
+}
+
+/// Bypass spellings the previous substring canary could not see, plus the
+/// non-findings it must not flag.
+#[test]
+fn identity_log_guard_catches_arbitrary_field_names_and_render_forms() {
+    let caught = [
+        // Arbitrary field name — the whole point of the strengthening.
+        r#"fn f() { warn!(anything_at_all = %key, "denied"); }"#,
+        r#"fn f() { warn!(rate_key = %redis_key, "denied"); }"#,
+        // Shorthand fields, both render sigils and the bare form.
+        r#"fn f() { warn!(%key, "denied"); }"#,
+        r#"fn f() { warn!(?redis_key, "denied"); }"#,
+        r#"fn f() { warn!(curr_key, "denied"); }"#,
+        // Expressions, not just bindings.
+        r#"fn f() { info!(detail = ?self.make_redis_key(id), "x"); }"#,
+        r#"fn f() { warn!(detail = %format!("{}", prev_key), "x"); }"#,
+        // Digests and encodings are still per-identity correlators.
+        r#"fn f() { warn!(fingerprint = %sha256(count_key), "x"); }"#,
+        // Inline format captures in the message itself.
+        r#"fn f() { debug!("window for {key} tripped"); }"#,
+        // Path-qualified macro.
+        r#"fn f() { tracing::warn!(field = %total_key, "x"); }"#,
+        // Identity values that do not spell "key".
+        r#"fn f() { warn!(who = %authenticated_identity, "x"); }"#,
+    ];
+    for source in caught {
+        assert!(
+            !identity_bearing_log_values(source).is_empty(),
+            "guard missed an identity-bearing log value: {source}"
+        );
+    }
+
+    let allowed = [
+        // Documented non-identity operator config.
+        r#"fn f() { warn!(key_prefix = %self.config.key_prefix, "x"); }"#,
+        // Ordinary bindings and non-tracing macros are not log records.
+        r#"fn f() { let previous_key = b(); assert!(!previous_key.is_empty()); }"#,
+        r#"fn f() { panic!("{previous_key}"); }"#,
+        r#"fn f() { let msg = format!("{count_key}"); }"#,
+        // A message that merely *mentions* a key is text, not a recorded value.
+        r#"fn f() { warn!(plugin = "rate_limiting", "rate key rejected"); }"#,
+        // Commented-out code is not compiled and is not a log statement.
+        "fn f() { /* warn!(rate_key = %key, \"x\"); */ }",
+        "fn f() { // warn!(rate_key = %key, \"x\");\n }",
+        // Compile-time constants cannot be per-identity correlators.
+        r#"fn f() { debug!(marker = %AI_REQUEST_METADATA_KEY, "x"); }"#,
+        // Field *names* alone are not values.
+        r#"fn f() { warn!(redis_key_present = %flag, "x"); }"#,
+    ];
+    for source in allowed {
+        assert!(
+            identity_bearing_log_values(source).is_empty(),
+            "guard produced a false positive: {source} -> {:?}",
+            identity_bearing_log_values(source)
         );
     }
 }

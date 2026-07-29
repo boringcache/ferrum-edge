@@ -360,6 +360,73 @@
       "options": {
         "legend": {"displayMode": "list", "placement": "bottom"}
       }
+    },
+    {
+      "id": 11,
+      "title": "NodeWaypoint HBONE handshake rate",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 40},
+      "targets": [
+        {
+          "expr": "sum by (phase, result) (rate(ferrum_mesh_node_waypoint_hbone_handshakes_total[5m]))",
+          "legendFormat": "{{phase}}/{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
+    },
+    {
+      "id": 12,
+      "title": "NodeWaypoint asserted identity + policy rejects",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 40},
+      "targets": [
+        {
+          "expr": "sum by (result, reason) (rate(ferrum_mesh_node_waypoint_asserted_identity_total[5m]))",
+          "legendFormat": "identity {{result}}/{{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(ferrum_mesh_node_waypoint_destination_policy_rejections_total[5m]))",
+          "legendFormat": "policy {{reason}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(ferrum_mesh_node_waypoint_missing_destination_metadata_total[5m]))",
+          "legendFormat": "missing metadata",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total[5m]))",
+          "legendFormat": "plaintext fallback blocked",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom"}
+      }
     }
   ],
   "annotations": {

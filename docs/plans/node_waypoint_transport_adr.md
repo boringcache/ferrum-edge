@@ -1,6 +1,6 @@
 # NodeWaypoint Secured Transport ADR
 
-Status: H2 live-gate baseline complete; NodeWaypoint remains Experimental
+Status: H2 live-gate baseline + observability contract implemented; NodeWaypoint remains Experimental (see Promotion gates)
 
 ## Context
 
@@ -224,17 +224,64 @@ slice.
 
 ## Observability
 
-The implementation must add bounded-cardinality metrics for:
+### ADR signal contract (implemented)
 
-- NodeWaypoint HBONE handshake success and failure;
-- asserted source identity accepted or rejected, with a bounded rejection
-  reason;
-- destination policy rejection;
-- missing destination NodeWaypoint metadata;
-- prohibited plaintext fallback attempts.
-
-SPIFFE IDs, pod names, node names, and remote URLs must not appear in metric
+Counters are process-static atomics in
+`src/modes/mesh/node_waypoint_observability.rs`. They are monotonic across
+config reload and SVID rotation, reset on NodeWaypoint (ambient) process
+restart, and are unaffected by node-agent restart. Producers are gated by
+`set_enabled(true)` at mesh startup when `FERRUM_MESH_TOPOLOGY=node_waypoint`.
+SPIFFE IDs, pod/workload/service/node names, IPs, and URLs never appear as
 labels.
+
+| Contract signal | Exact metric / admin field | Label set | Producer path | Unit / integration coverage | Live assertion / dashboard | Status |
+|---|---|---|---|---|---|---|
+| HBONE handshake success/failure | `ferrum_mesh_node_waypoint_hbone_handshakes_total` + `mesh.node_waypoint_observability.hbone_handshakes.*` on authenticated `/health` | `phase` ∈ {`inbound_tls`,`inbound_connect`,`outbound_dial`}, `result` ∈ {`success`,`failure`} | TLS accept (`src/tls/mod.rs`); CONNECT admission (`src/proxy/hbone_proxy.rs`); outbound dial (`HboneConnectionPool::get_tunnel_via` for pooled HTTP/raw-TCP egress and `get_ws_byte_tunnel` for the 1:1 WebSocket byte tunnel; counted per opened CONNECT tunnel, including tunnels multiplexed onto an already-established pooled H2 connection. Datagram tunnels are out of scope — NodeWaypoint emits no UDP capture listener) | `tests/unit/gateway_core/node_waypoint_observability_tests.rs` | mesh-overview NW panels; live IDs `node_waypoint.observability.hbone_handshake_inbound_tls_failure`, `node_waypoint.observability.hbone_handshake_outbound_success` | **Implemented + live-wired** |
+| Asserted source identity accepted/rejected | `ferrum_mesh_node_waypoint_asserted_identity_total` + admin `asserted_identity.*` | `result` ∈ {`accepted`,`rejected`}, `reason` ∈ {`honored`,`untrusted_assertor`,`trust_domain_mismatch`,`unauthenticated_hbone`,`malformed`,`stale_or_unknown`} | `mesh_authz` when `per_pod_policy_scoping` | unit observability tests + existing mesh_authz plugin tests | live ID `node_waypoint.observability.asserted_identity_rejected` | **Implemented + live-wired** |
+| Destination policy rejection | `ferrum_mesh_node_waypoint_destination_policy_rejections_total` + admin `destination_policy_rejections.*` | `reason` ∈ {`authz_deny`,`scope_missing`,`destination_scope_missing`,`relay_destination_denied`} | `mesh_authz` / open-relay guard (mutually exclusive with asserted-identity reject for one decision) | unit observability tests | Live deny paths exercise authz; counter panels on mesh-overview | **Implemented** |
+| Missing destination NodeWaypoint metadata | `ferrum_mesh_node_waypoint_missing_destination_metadata_total` + admin field | none | `build_outbound_mesh_targets` skip when identity-backed posture requires metadata | `mesh_outbound_node_waypoint_identity_backed_missing_metadata_fails_closed` + observability unit tests | Dashboard panel; live profile always publishes metadata so counter stays observational in H2 | **Implemented** |
+| Prohibited plaintext fallback attempt | `ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total` + admin field | none | Same fail-closed skip (blocked plaintext retention) | same as missing-metadata | Dashboard panel | **Implemented** |
+
+### Increment ownership (no double-count of one failed session)
+
+The rule is on the **failure** side: one failed session contributes exactly one
+`result="failure"` sample across the three phases. Success samples are per
+phase, so a session that clears an earlier phase records that phase's success
+even when a later phase then fails.
+
+1. Destination inbound: TLS failure increments **only** `phase=inbound_tls`
+   failure. CONNECT admission is never counted for that session.
+2. Destination inbound: TLS success then CONNECT reject increments
+   `inbound_tls` **success** and, as the session's only failure sample,
+   `phase=inbound_connect` failure.
+3. Destination inbound: TLS + CONNECT admission success increments
+   `inbound_tls` success and `inbound_connect` success (distinct phases of one
+   successful session).
+4. Source outbound dial is independent (`phase=outbound_dial`).
+5. Mesh-wide `ferrum_mesh_mtls_handshake_failures_total` remains the umbrella
+   TLS-failure series for all mesh topologies. On NodeWaypoint it correlates
+   with `inbound_tls` failures but is a distinct series (not a second ADR
+   failure class).
+
+### Overlapping signals (do not duplicate)
+
+| Existing signal | Role | Relationship to ADR set |
+|---|---|---|
+| `/overload` `node_waypoint_drops.*` | Accept-time cookie/identity drops | Capture/accept path only; not HBONE handshake or authz |
+| `ferrum_node_agent_capture_state` | Node-agent capture readiness | Node-agent process; orthogonal |
+| `ferrum_mesh_node_topology_degraded` | Node-agent topology degradation | Node-agent process; orthogonal |
+| `ferrum_mesh_mtls_handshake_failures_total` | Mesh-wide frontend TLS failures | Umbrella TLS series; NW ADR uses phased NW counters |
+| `ferrum_mesh_requests_total{response_code="403"}` | RED deny traffic | Outcome RED; ADR adds reason-bounded policy/identity counters |
+| `ferrum_mesh_bpf_*` | SOCK_OPS BPF counters | Transport/kernel events; not authz/handshake contract |
+| `GET /mesh/policy-denies/recent` | Authenticated deny ring | Drilldown; counters remain the scrape contract |
+
+### Residual / not claimed in this PR
+
+- Multi-hour soak / upgrade soak artifacts for Beta→GA are **not** produced by
+  this PR (see promotion gates).
+- Live assertion for missing-metadata / plaintext-fallback counter movement is
+  not required by the H2 production profile (metadata is always published);
+  unit/materialization coverage pins the producers.
 
 ## Live Assertion IDs
 
@@ -273,6 +320,82 @@ NodeWaypoint beyond Experimental:
 - `node_waypoint.ipv6.service_deny`
 - `node_waypoint.ipv6.pod_ip_bypass_guard`
 - `node_waypoint.ipv6.direct_inbound_guard`
+- `node_waypoint.observability.hbone_handshake_inbound_tls_failure`
+- `node_waypoint.observability.asserted_identity_rejected`
+- `node_waypoint.observability.hbone_handshake_outbound_success`
 
 Future H2 PRs should extend this list instead of renaming these IDs so artifacts
 remain comparable across commits.
+
+### Wired observability IDs
+
+Trusted baseline PR #3427 added these IDs to the SPIRE-production required set.
+They are the required Beta gate for representative ADR counter movement:
+
+- `node_waypoint.observability.hbone_handshake_inbound_tls_failure` — scrape
+  ambient `/metrics` before and after the plaintext-HBONE rejection check and
+  require `ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="inbound_tls",result="failure"}`
+  to increase.
+- `node_waypoint.observability.asserted_identity_rejected` — after the forged
+  assertor check and **before** assertor restore (restart resets the
+  process-static counters), require
+  `ferrum_mesh_node_waypoint_asserted_identity_total{result="rejected",reason="untrusted_assertor"}`
+  to be non-zero.
+- `node_waypoint.observability.hbone_handshake_outbound_success` — scrape
+  before and after the cross-node Service allow, then require
+  `ferrum_mesh_node_waypoint_hbone_handshakes_total{phase="outbound_dial",result="success"}`
+  to increase.
+
+The trusted baseline keeps `tests/k8s/node_waypoint_ebpf_live/run.sh` byte-for-byte
+aligned with the Cross policy while this PR supplies the producer contract. The
+contract is also pinned by
+`tests/unit/gateway_core/node_waypoint_observability_tests.rs`, including the
+`/metrics` render-cache bypass and the optional `gateway_namespace` label
+append that the live selectors would have to tolerate.
+
+## Promotion gates
+
+NodeWaypoint remains **Experimental** after this observability reconciliation.
+Promotion is explicit and evidence-backed:
+
+### Experimental → Beta
+
+All of the following must be true:
+
+1. **Semantic conformance.** ADR transport + observability rows above are
+   Implemented (this PR). Mesh topology matrix / support matrix still list
+   NodeWaypoint as Experimental until Beta criteria close.
+2. **Live assertion IDs (required).** Every ID listed under the SPIRE
+   production profile in `tests/k8s/node_waypoint_ebpf_live/run.sh`
+   `REQUIRED_LIVE_ASSERTIONS` passes on the platform profile
+   `kind-dual-stack-node-waypoint-ebpf`, **and** the three wired
+   `node_waypoint.observability.*` counter-movement IDs remain in that list and
+   pass there too.
+3. **Platform profiles.** At least one dual-stack kind profile with IPv4 +
+   IPv6 capture admission and SPIRE production identity.
+4. **Restart evidence.** `node_waypoint.identity.spire_restart_recovery`
+   remains green (SPIRE Agent + NodeWaypoint DaemonSet restart).
+5. **Stated non-goals remain non-goals.** Native gRPC over Ambient HBONE and
+   per-pod UDP/DTLS policy scoping on NodeWaypoint stay out-of-scope (see
+   `docs/mesh_supported_matrix.md`).
+6. **Release-blocking failures for Beta candidacy.** Any fail-open plaintext
+   fallback under identity-backed posture, any unbounded identity label on NW
+   ADR metrics, or loss of the wired observability live assertion IDs, blocks
+   Beta.
+
+### Beta → GA
+
+All Experimental→Beta criteria, plus:
+
+1. Enroll a GA contract row in `tests/conformance/ga_contract.yaml` with
+   `Maturity::Ga` semantic modules and required live assertion IDs (same
+   extend-not-rename rule).
+2. Soak / upgrade evidence: multi-hour dual-stack soak with counter monotonicity
+   across reload and SVID rotation, plus at least one NodeWaypoint chart upgrade
+   without plaintext regression.
+3. Supported kernel/CNI/IPv4/IPv6 scope documented in the support matrix with
+   live evidence (kernel ≥ 5.7, cgroup v2, bpffs, dual-stack CNI used by the
+   live profile).
+4. **Release-blocking for GA:** regression of any enrolled GA live assertion,
+   fail-open direct pod-IP bypass of destination policy, or loss of fail-closed
+   missing-metadata behavior.

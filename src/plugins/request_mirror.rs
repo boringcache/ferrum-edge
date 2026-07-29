@@ -100,6 +100,69 @@
 //! `max_in_flight` and a per-instance `max_retained_request_body_bytes` budget;
 //! leases release when the detached task ends.
 //!
+//! ## Pre-buffer admission (advisory `GHSA-jv66-mq44-m9v3`)
+//!
+//! Mirroring a request body is the only reason this plugin makes the gateway
+//! collect one, so every reason NOT to mirror is evaluated *before* the body is
+//! read:
+//!
+//! 1. **Deterministic disablement at construction.** `mirror_request_body:
+//!    false` or a `percentage` that quantizes to threshold `0` clears the body
+//!    capabilities outright (`RequestMirror::body_admission_enabled`). The
+//!    plugin cache's config-time upper bound then never marks the proxy as
+//!    needing a request-body buffer for this instance, so no per-request work
+//!    happens at all.
+//! 2. **Sampling and bounded admission in the `authorize` phase.** For a
+//!    body-mirroring instance, the plugin's `authorize` hook advances the
+//!    deterministic sampler once and, when the request is selected, acquires
+//!    the `max_in_flight` permit and reserves retained bytes from the aggregate
+//!    budget. A sampled-out or refused request stages a non-admitting decision
+//!    and keeps streaming — nothing is buffered, copied, or retained. The
+//!    built-in priority places this after the built-in rejecting authorization
+//!    hooks. Even when an operator priority override or custom plugin runs a
+//!    rejecting hook later, the proxy does not collect the body until the
+//!    complete authorization phase succeeds; rejection drops the staged permit
+//!    and reservation without reading the upload.
+//! 3. **Per-request buffering follows admission.** `should_buffer_request_body`
+//!    is a pure read of that staged decision (it is evaluated several times per
+//!    request), so only admitted requests buffer.
+//! 4. **A positive plugin-local ceiling.** `max_mirrored_request_body_bytes`
+//!    bounds a single mirrored body even when the global
+//!    `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` is configured as `0` (unlimited).
+//!    A request that already declares more than the ceiling is skipped before
+//!    sampling: it keeps streaming and is not mirrored, rather than truncating
+//!    the shadow payload or turning shadow policy into a client-visible `413`.
+//!    Otherwise every admitted request reserves the whole positive plugin-local
+//!    ceiling before collection — regardless of method, protocol, missing or
+//!    present `Content-Length`, or a declared zero/small length. Declared size
+//!    is untrusted for aggregate accounting: H3 drains under the collection
+//!    ceiling without enforcing equality with `Content-Length`, and Hyper's H2
+//!    `Incoming` length is likewise not the Ferrum allocation bound. Charging
+//!    only an attacker-declared byte would let many concurrent tiny declarations
+//!    each allocate up to the ceiling before `before_proxy` reconciliation,
+//!    exceeding `max_retained_request_body_bytes`. `before_proxy` then reconciles
+//!    the reservation to the observed length, returning the surplus (down to
+//!    `0` for an empty body) to the aggregate budget exactly once. The tradeoff:
+//!    mirroring mostly-bodyless traffic at high concurrency wants
+//!    `max_retained_request_body_bytes` sized against `max_in_flight ×
+//!    max_mirrored_request_body_bytes`, or a lower ceiling.
+//!    An undeclared (chunked) body larger than the ceiling is still rejected by
+//!    the combined request-body limit — raise `max_mirrored_request_body_bytes`
+//!    when mirroring routes that accept larger streamed uploads. That combined
+//!    limit is checked against the *collected* body, and a buffered-body
+//!    normalizer (configured request decompression) runs afterwards, so an
+//!    inflated buffer can still land above the ceiling; such a request is
+//!    refused rather than truncated, and its `mirror_error` names the ceiling
+//!    instead of the aggregate budget.
+//!
+//! The permit and the byte reservation are owned values held across body
+//! buffering, dispatch, and the detached task. Every exit — client
+//! cancellation, a body read error, a later plugin rejection, a mirror request
+//! timeout, a drain failure, or ordinary completion — drops them exactly once,
+//! so admission can neither leak nor double-release. A request claimed by
+//! `ai_stream_router` after admission releases both immediately and dispatches
+//! nothing; it does consume a sampling slot.
+//!
 //! ## Configuration
 //!
 //! ```json
@@ -124,7 +187,8 @@
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed; bytes are discarded after sizing so keep-alive pools can reclaim the socket. |
 //! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
-//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Shared `Bytes` bodies are charged once per task for their length; exhaustion drops the new mirror attempt without affecting the primary request. |
+//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Charged at admission (before the body is read: every admitted request reserves the whole `max_mirrored_request_body_bytes` ceiling) and reconciled to the observed length; exhaustion drops the new mirror attempt without affecting the primary request. Size against `max_in_flight × max_mirrored_request_body_bytes` when mirroring at high concurrency. |
+//! | `max_mirrored_request_body_bytes` | u64 | `10485760` (10 MiB) | Positive plugin-local ceiling on one mirrored request body, applied even when the global request-body limit is unlimited (`0`). An explicit value above `max_retained_request_body_bytes` is rejected at construction; the default clamps down to it instead, so a smaller aggregate budget alone never fails construction. Applies only to requests this instance admitted. |
 //! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
 //! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
 //! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
@@ -136,6 +200,11 @@
 //! accumulator), not randomized and not a contiguous prefix of each 1,000-request
 //! window. Configuration is quantized to tenths of a percent: the effective
 //! threshold is `round(percentage × 10)` clamped to `0..=1000`.
+//!
+//! Selection is evaluated once per eligible request, in the `authorize` phase
+//! for body-mirroring instances (so a sampled-out request never buffers) and in
+//! `before_proxy` otherwise. Either way each eligible request advances the
+//! phase exactly once.
 //!
 //! - `0%` (threshold 0) never selects; the phase accumulator is not advanced.
 //! - `100%` (threshold 1000) always selects; the phase accumulator is not advanced.
@@ -190,6 +259,7 @@ pub const REQUEST_MIRROR_CONFIG_KEYS: &[&str] = &[
     "forward_sensitive_header_allowlist",
     "forward_sensitive_headers",
     "max_in_flight",
+    "max_mirrored_request_body_bytes",
     "max_response_body_bytes",
     "max_retained_request_body_bytes",
     "mirror_host",
@@ -219,6 +289,16 @@ const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
 const MAX_MAX_IN_FLIGHT_MIRRORS: usize = 1 << 20;
 /// Per-instance retained request-body budget for detached mirror tasks.
 const DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Plugin-local per-request ceiling on a mirrored request body.
+///
+/// Mirroring a body is the only reason this plugin forces the gateway to
+/// collect one, so it must carry its own positive ceiling: the global
+/// `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` can be configured as `0` (unlimited),
+/// which would otherwise let one mirrored upload buffer without bound
+/// (advisory `GHSA-jv66-mq44-m9v3`). 10 MiB matches the global default, so the
+/// ceiling is a no-op on a default deployment and only bites when the operator
+/// removed or raised the global bound.
+const DEFAULT_MAX_MIRRORED_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
 /// Finite mirror deadline when the proxy has no positive read timeout.
 const DEFAULT_MIRROR_TIMEOUT_MS: u64 = 60_000;
 /// Hard ceiling on every mirror request deadline (plugin or proxy derived).
@@ -232,6 +312,14 @@ const MIRROR_CONCURRENCY_DROP_ERROR: &str =
     "mirror request dropped because max_in_flight limit was reached";
 const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
     "mirror request dropped because max_retained_request_body_bytes budget was exhausted";
+/// Distinct from [`MIRROR_BODY_BUDGET_DROP_ERROR`]: the aggregate budget had
+/// room, but the collected body exceeded this instance's per-request ceiling.
+/// Reachable when a buffered-body normalizer (configured request decompression)
+/// inflates the stored buffer after the proxy's combined request-body limit
+/// already accepted the collected bytes. Naming the aggregate budget here would
+/// send the operator to a knob that cannot fix it.
+const MIRROR_BODY_CEILING_DROP_ERROR: &str =
+    "mirror request dropped because the collected body exceeded max_mirrored_request_body_bytes";
 const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
 const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
 
@@ -450,33 +538,78 @@ impl MirrorBodyBudget {
         })
     }
 
-    fn try_retain(self: &Arc<Self>, bytes: Option<Bytes>) -> Option<RetainedMirrorBody> {
-        let reserved = bytes.as_ref().map_or(0, |body| body.len() as u64);
-        if reserved > 0 {
-            loop {
-                let current = self.used.load(Ordering::Relaxed);
-                if current.saturating_add(reserved) > self.max_bytes {
-                    return None;
-                }
-                if self
-                    .used
-                    .compare_exchange_weak(
-                        current,
-                        current + reserved,
-                        Ordering::SeqCst,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
+    /// Reserve `bytes` of the aggregate retained-body budget, returning a lease
+    /// that releases the reservation exactly once when dropped.
+    ///
+    /// Reservation happens BEFORE the body is collected (advisory
+    /// `GHSA-jv66-mq44-m9v3`), so callers reserve the worst case they can be
+    /// forced to retain — the full plugin-local per-request ceiling for every
+    /// admitted request. Declared `Content-Length` is never trusted for this
+    /// charge. [`MirrorBodyLease::reconcile`] shrinks the lease to the observed
+    /// length once the body exists.
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<MirrorBodyLease> {
+        if !self.try_add(bytes) {
+            return None;
         }
-        Some(RetainedMirrorBody {
-            bytes,
-            reserved,
+        Some(MirrorBodyLease {
+            reserved: bytes,
             budget: Arc::clone(self),
         })
+    }
+
+    /// Lock-free bounded add. Returns `false` without mutating when the budget
+    /// cannot cover `bytes`.
+    ///
+    /// `max_bytes` is operator-configurable across the whole `u64` range, so the
+    /// candidate total is computed with `checked_add` and the *same* value is
+    /// both compared and published. A saturating comparison would let
+    /// `used + bytes` wrap past a `u64::MAX` ceiling (silently in release,
+    /// panicking in debug) and hand out capacity the budget does not have;
+    /// arithmetic overflow is itself an exhausted budget and fails closed.
+    fn try_add(&self, bytes: u64) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut current = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(candidate) = current.checked_add(bytes) else {
+                return false;
+            };
+            if candidate > self.max_bytes {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                candidate,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Return `bytes` to the budget.
+    ///
+    /// Leases release exactly what they hold exactly once, so this never
+    /// underflows in practice. An invariant violation leaves the charge in
+    /// place: under-accounting would reopen the memory cap, while wrapping
+    /// would panic in debug or wedge the budget in release.
+    fn release(&self, bytes: u64) {
+        if bytes > 0
+            && let Err(current) =
+                self.used
+                    .fetch_update(Ordering::SeqCst, Ordering::Relaxed, |current| {
+                        current.checked_sub(bytes)
+                    })
+        {
+            warn!(
+                current,
+                release_bytes = bytes,
+                "request_mirror retained-body budget release underflow refused"
+            );
+        }
     }
 
     fn used_for_test(&self) -> u64 {
@@ -484,17 +617,198 @@ impl MirrorBodyBudget {
     }
 }
 
-struct RetainedMirrorBody {
-    bytes: Option<Bytes>,
+/// Owning claim on a slice of the aggregate retained-body budget.
+///
+/// Held from pre-buffer admission (`authorize`) through body collection,
+/// dispatch, and the detached task's terminal outcome. Dropping the lease —
+/// on client cancellation, a body read error, a plugin rejection before
+/// `before_proxy`, a mirror timeout, or ordinary task completion — releases the
+/// reservation exactly once.
+struct MirrorBodyLease {
     reserved: u64,
     budget: Arc<MirrorBodyBudget>,
 }
 
-impl Drop for RetainedMirrorBody {
-    fn drop(&mut self) {
-        if self.reserved > 0 {
-            self.budget.used.fetch_sub(self.reserved, Ordering::SeqCst);
+impl MirrorBodyLease {
+    /// Resize the reservation to the observed body length.
+    ///
+    /// Shrinking always succeeds and returns the surplus immediately. Growing
+    /// (possible on the rare fallback path that reserved less than the observed
+    /// body) is bounded by the same budget and returns `false` when it cannot
+    /// be covered, so the mirror attempt is dropped instead of retaining
+    /// unbudgeted bytes. Pre-buffer admission always reserves the full ceiling,
+    /// so the authorize → before_proxy path only shrinks.
+    fn reconcile(&mut self, actual: u64) -> bool {
+        if actual == self.reserved {
+            return true;
         }
+        if actual < self.reserved {
+            self.budget.release(self.reserved - actual);
+            self.reserved = actual;
+            return true;
+        }
+        if !self.budget.try_add(actual - self.reserved) {
+            return false;
+        }
+        self.reserved = actual;
+        true
+    }
+}
+
+impl Drop for MirrorBodyLease {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved);
+    }
+}
+
+/// Pre-buffer admission decision for one `request_mirror` instance on one
+/// request, staged by the `authorize` phase and consumed by `before_proxy`.
+pub(crate) struct RequestMirrorAdmission {
+    instance_id: u64,
+    state: MirrorAdmissionState,
+}
+
+enum MirrorAdmissionState {
+    /// The deterministic sampler did not select this request. No body is
+    /// buffered and no observability record is emitted (existing contract).
+    NotSelected,
+    /// Selected, and both a concurrency permit and a retained-byte reservation
+    /// were acquired before any body was read.
+    Admitted {
+        permit: tokio::sync::OwnedSemaphorePermit,
+        lease: MirrorBodyLease,
+    },
+    /// Selected but refused by `max_in_flight` or the aggregate byte budget.
+    /// The request stays streaming; `before_proxy` publishes the attributable
+    /// failure summary once the mirror target URL is known.
+    Dropped(&'static str),
+    /// `before_proxy` already took this instance's decision and now owns (or
+    /// has released) the lease. The tombstone stays staged so
+    /// `should_buffer_request_body` keeps answering what it answered before the
+    /// body was collected: the proxy re-evaluates that predicate *after*
+    /// `before_proxy` (`final_request_body_requirements` on a header-transformed
+    /// request), and a mid-request flip from `true` to `false` would silently
+    /// re-derive `requires_request_body_buffering` — and with it transport
+    /// choices like HBONE eligibility — from a body that is already buffered.
+    Consumed { admitted: bool },
+}
+
+impl RequestMirrorAdmission {
+    pub(crate) fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Whether this instance forced a request-body buffer for this request.
+    /// Stays `true` after `before_proxy` consumed the lease so the buffering
+    /// predicate is stable for the whole request.
+    pub(crate) fn is_admitted(&self) -> bool {
+        matches!(
+            self.state,
+            MirrorAdmissionState::Admitted { .. }
+                | MirrorAdmissionState::Consumed { admitted: true }
+        )
+    }
+}
+
+/// Staged `request_mirror` admissions for one live request context.
+///
+/// The common case is one effective `request_mirror` instance, so the first
+/// admission is stored inline in [`Self::first`] and the overflow `Vec` stays
+/// unallocated until a distinct second instance is staged. Arbitrary multi-
+/// instance support is preserved without bounding count.
+///
+/// Owned semaphore permits and retained-byte leases live only on the live
+/// request. Custom `Clone` returns an empty wrapper so `RequestContext`'s
+/// derived `Clone` cannot duplicate or double-release admission capacity.
+/// Custom `Debug` summarizes staging count only and never prints permit,
+/// lease, or drop-reason state.
+#[derive(Default)]
+pub(crate) struct RequestMirrorAdmissions {
+    first: Option<RequestMirrorAdmission>,
+    overflow: Vec<RequestMirrorAdmission>,
+}
+
+impl Clone for RequestMirrorAdmissions {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for RequestMirrorAdmissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let staged = usize::from(self.first.is_some()) + self.overflow.len();
+        f.debug_struct("RequestMirrorAdmissions")
+            .field("staged", &staged)
+            .finish()
+    }
+}
+
+impl RequestMirrorAdmissions {
+    /// Stage one instance's admission, replacing any earlier entry for the
+    /// same instance so a repeated evaluation cannot accumulate two leases.
+    pub(crate) fn stage(&mut self, admission: RequestMirrorAdmission) {
+        let instance_id = admission.instance_id();
+        if let Some(first) = self.first.as_mut()
+            && first.instance_id() == instance_id
+        {
+            *first = admission;
+            return;
+        }
+        if let Some(slot) = self
+            .overflow
+            .iter_mut()
+            .find(|staged| staged.instance_id() == instance_id)
+        {
+            *slot = admission;
+            return;
+        }
+        if self.first.is_none() {
+            self.first = Some(admission);
+        } else {
+            self.overflow.push(admission);
+        }
+    }
+
+    /// Whether the given instance was admitted and therefore needs the request
+    /// body buffered. Read-only and idempotent.
+    pub(crate) fn body_admitted(&self, instance_id: u64) -> bool {
+        if let Some(first) = self.first.as_ref()
+            && first.instance_id() == instance_id
+        {
+            return first.is_admitted();
+        }
+        self.overflow
+            .iter()
+            .any(|staged| staged.instance_id() == instance_id && staged.is_admitted())
+    }
+
+    /// Take one instance's staged admission, transferring ownership of its
+    /// permit and retained-byte lease to the caller.
+    ///
+    /// The slot is left in place as a [`MirrorAdmissionState::Consumed`]
+    /// tombstone rather than removed: the lease moves out exactly once (a second
+    /// take yields `Consumed`, never a second permit), while
+    /// `should_buffer_request_body` keeps reporting the same answer it gave
+    /// before the body was collected.
+    pub(crate) fn take(&mut self, instance_id: u64) -> Option<RequestMirrorAdmission> {
+        let slot = if self
+            .first
+            .as_ref()
+            .is_some_and(|first| first.instance_id() == instance_id)
+        {
+            self.first.as_mut()?
+        } else {
+            let index = self
+                .overflow
+                .iter()
+                .position(|staged| staged.instance_id() == instance_id)?;
+            self.overflow.get_mut(index)?
+        };
+        let tombstone = MirrorAdmissionState::Consumed {
+            admitted: slot.is_admitted(),
+        };
+        let state = std::mem::replace(&mut slot.state, tombstone);
+        Some(RequestMirrorAdmission { instance_id, state })
     }
 }
 
@@ -536,7 +850,10 @@ struct MirrorMetrics {
     cancellations: AtomicU64,
     /// Mirror attempts dropped at admission because `max_in_flight` was full.
     concurrency_drops: AtomicU64,
-    /// Mirror attempts dropped at admission because the byte budget was full.
+    /// Mirror attempts dropped at byte admission: either the aggregate
+    /// `max_retained_request_body_bytes` budget was full, or the collected body
+    /// exceeded the per-request `max_mirrored_request_body_bytes` ceiling. The
+    /// published `mirror_error` names which of the two refused the attempt.
     budget_drops: AtomicU64,
 }
 
@@ -703,6 +1020,27 @@ async fn drain_mirror_response_body(
     }
 }
 
+/// Declared request body length, read before the body exists.
+///
+/// Prefers the raw wire headers (no map materialization required) and falls
+/// back to the folded map for synthetic/test contexts that never carried raw
+/// headers. A malformed or absent value yields `None`, which admission treats
+/// as "unknown length" and charges the full plugin-local ceiling.
+fn request_content_length(ctx: &RequestContext) -> Option<u64> {
+    if ctx.has_raw_headers() {
+        // Every real proxy path sets raw headers, so the folded-map scan below
+        // never runs on the hot path — including for the common no-`Content-
+        // Length` request, where it would otherwise walk the whole map.
+        return ctx
+            .raw_header_get("content-length")
+            .and_then(|raw| raw.trim().parse::<u64>().ok());
+    }
+    ctx.headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+}
+
 fn request_host_header(headers: &HashMap<String, String>) -> Option<&str> {
     headers
         .iter()
@@ -733,7 +1071,18 @@ fn sample_threshold_from_percentage(percentage: f64) -> u64 {
     }
 }
 
+/// Process-unique identity for one constructed `RequestMirror`.
+///
+/// Multiple instances may be attached to one proxy, and each admits
+/// independently. The per-request admission slot is keyed on this id so one
+/// instance can never observe, consume, or release another instance's lease.
+/// Reload builds new instances and therefore new ids; a stale id simply never
+/// matches.
+static MIRROR_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+
 pub struct RequestMirror {
+    /// Process-unique id used to key this instance's per-request admission.
+    instance_id: u64,
     http_client: PluginHttpClient,
     /// Stable plugin-config resource id when constructed through the plugin
     /// cache / factory. Surfaced on mirror summaries for multi-instance
@@ -770,6 +1119,9 @@ pub struct RequestMirror {
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
     /// Aggregate retained request-body bytes across in-flight mirror tasks.
     body_budget: Arc<MirrorBodyBudget>,
+    /// Positive plugin-local ceiling on one mirrored request body, applied even
+    /// when the global request-body limit is unlimited.
+    max_mirrored_request_body_bytes: u64,
     /// Per-instance, bounded-lifetime mirror lifecycle counters.
     metrics: Arc<MirrorMetrics>,
 }
@@ -889,6 +1241,46 @@ impl RequestMirror {
                 .transpose()?
                 .unwrap_or(DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES);
 
+        let configured_max_mirrored_request_body_bytes =
+            optional_u64(config, "max_mirrored_request_body_bytes")?
+                .map(|v| {
+                    if v == 0 {
+                        Err(
+                            "request_mirror: 'max_mirrored_request_body_bytes' must be >= 1"
+                                .to_string(),
+                        )
+                    } else if usize::try_from(v).is_err() {
+                        Err(
+                            "request_mirror: 'max_mirrored_request_body_bytes' is too large for this platform"
+                                .to_string(),
+                        )
+                    } else {
+                        Ok(v)
+                    }
+                })
+                .transpose()?;
+        // A per-request ceiling above the aggregate budget could never be
+        // admitted (admission reserves the full ceiling up front), so the
+        // instance would silently never mirror a body. An explicit operator
+        // value that contradicts the aggregate budget is rejected at
+        // construction; the *default* ceiling instead clamps down to the
+        // configured budget, so an existing config that only sets a small
+        // `max_retained_request_body_bytes` keeps loading rather than failing
+        // startup on a key it never set.
+        let max_mirrored_request_body_bytes = match configured_max_mirrored_request_body_bytes {
+            Some(configured) => {
+                if configured > max_retained_request_body_bytes {
+                    return Err(format!(
+                        "request_mirror: 'max_mirrored_request_body_bytes' ({configured}) must not exceed 'max_retained_request_body_bytes' ({max_retained_request_body_bytes})"
+                    ));
+                }
+                configured
+            }
+            // `max_retained_request_body_bytes` is validated `>= 1` above, so
+            // the clamped default stays a positive ceiling.
+            None => DEFAULT_MAX_MIRRORED_REQUEST_BODY_BYTES.min(max_retained_request_body_bytes),
+        };
+
         let mirror_timeout_ms = optional_u64(config, "mirror_timeout_ms")?
             .map(|v| {
                 if v == 0 || v > MAX_MIRROR_TIMEOUT_MS {
@@ -929,6 +1321,7 @@ impl RequestMirror {
         };
 
         Ok(Self {
+            instance_id: MIRROR_INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed),
             http_client,
             plugin_config_id,
             mirror_host,
@@ -950,6 +1343,7 @@ impl RequestMirror {
             // panic on an out-of-range permit count.
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
             body_budget: MirrorBodyBudget::new(max_retained_request_body_bytes),
+            max_mirrored_request_body_bytes,
             metrics: Arc::new(MirrorMetrics::default()),
         })
     }
@@ -986,6 +1380,51 @@ impl RequestMirror {
     #[allow(dead_code)]
     pub(crate) fn max_retained_request_body_bytes_for_test(&self) -> u64 {
         self.body_budget.max_bytes
+    }
+
+    /// Configured plugin-local per-request body ceiling for external tests.
+    #[allow(dead_code)]
+    pub(crate) fn max_mirrored_request_body_bytes_for_test(&self) -> u64 {
+        self.max_mirrored_request_body_bytes
+    }
+
+    /// Whether this instance can ever force a pre-`before_proxy` request-body
+    /// buffer.
+    ///
+    /// Deterministic disablement (advisory `GHSA-jv66-mq44-m9v3`): an instance
+    /// with `mirror_request_body: false` never needs a body, and one quantized
+    /// to `percentage: 0` can never select a request, so neither may declare a
+    /// body capability. Both cases therefore keep every request streaming at
+    /// config time — the plugin cache's upper bound, the per-request buffering
+    /// predicate, and the `authorize`-phase admission hook all collapse to
+    /// "no body" without evaluating anything per request.
+    fn body_admission_enabled(&self) -> bool {
+        self.mirror_request_body && self.sample_threshold > 0
+    }
+
+    /// Bytes to reserve from the aggregate budget before the body is read.
+    ///
+    /// Fail-closed (advisory `GHSA-jv66-mq44-m9v3`): every otherwise admitted
+    /// body-mirroring request reserves the full positive plugin-local ceiling,
+    /// regardless of method, protocol, missing/present `Content-Length`, or a
+    /// declared zero/small length. Declared size is untrusted for aggregate
+    /// accounting — H3's collector enforces the collection ceiling without
+    /// requiring equality with `Content-Length`, and Hyper's H2 `Incoming`
+    /// length is not Ferrum's allocation bound — so charging only an
+    /// attacker-declared byte would let many concurrent tiny declarations each
+    /// allocate up to the ceiling before `before_proxy` reconciliation,
+    /// exceeding `max_retained_request_body_bytes`.
+    ///
+    /// Oversized declared lengths are skipped *before* this reservation (see
+    /// [`Self::authorize`]). The tradeoff is accepted and bounded: a tiny or
+    /// bodyless request briefly holds the ceiling, and `before_proxy`
+    /// reconciliation returns the surplus (down to `0` for an empty body)
+    /// exactly once as soon as the observed length is known. Operators
+    /// mirroring mostly-bodyless traffic at high concurrency should size
+    /// `max_retained_request_body_bytes` against
+    /// `max_in_flight × max_mirrored_request_body_bytes`, or lower the ceiling.
+    fn reserved_body_bytes(&self) -> u64 {
+        self.max_mirrored_request_body_bytes
     }
 
     /// Snapshot of the per-instance mirror lifecycle counters for external
@@ -1353,15 +1792,99 @@ impl Plugin for RequestMirror {
     }
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.mirror_request_body
+        self.body_admission_enabled()
     }
 
-    fn should_buffer_request_body(&self, _ctx: &RequestContext) -> bool {
-        self.mirror_request_body
+    /// Buffer only for a request this instance already admitted.
+    ///
+    /// The decision is made once per request by the `authorize` hook, before any
+    /// body is read, and is only read back here: this predicate is evaluated
+    /// several times per request by the proxy and must stay pure. A
+    /// percentage-zero, sampled-out, or admission-refused request therefore
+    /// never forces a buffer and keeps streaming (advisory
+    /// `GHSA-jv66-mq44-m9v3`).
+    fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
+        self.body_admission_enabled() && ctx.request_mirror_body_admitted(self.instance_id)
     }
 
     fn needs_request_body_bytes(&self) -> bool {
-        self.mirror_request_body
+        self.body_admission_enabled()
+    }
+
+    /// The mirror replays raw bytes only. Declining the UTF-8 copy avoids
+    /// retaining a second full-body representation alongside the shared
+    /// `Bytes` the detached task forwards.
+    fn needs_request_body_text(&self) -> bool {
+        false
+    }
+
+    /// Positive plugin-local ceiling on a mirrored body, combined with the
+    /// global limit by the proxy (strictest positive value wins). This is the
+    /// bound that survives `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES=0`.
+    ///
+    /// It applies only to requests this instance admitted, so a sampled-out or
+    /// unmirrored request never inherits a mirror-derived request-size policy.
+    fn request_body_buffer_limit(&self) -> Option<usize> {
+        self.body_admission_enabled()
+            .then(|| usize::try_from(self.max_mirrored_request_body_bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Body-mirroring instances participate in the `authorize` phase purely to
+    /// decide admission before the gateway collects a request body. They never
+    /// reject: mirroring stays fail-open for the primary request.
+    fn is_authorize_plugin(&self) -> bool {
+        self.body_admission_enabled()
+    }
+
+    /// Decide sampling and bounded mirror admission BEFORE body collection.
+    ///
+    /// The built-in priority places this after the built-in rejecting
+    /// authorization hooks. Operator priority overrides and custom plugins can
+    /// place another authorization hook later, but body collection still waits
+    /// for the complete authorization phase to succeed. A later rejection
+    /// therefore drops this staged decision without reading the upload. A
+    /// request that is not selected, or that cannot get a concurrency permit
+    /// and a retained-byte reservation, stages a non-admitting decision and
+    /// stays streaming.
+    ///
+    /// The sampler advances here rather than in `before_proxy`. Requests
+    /// rejected before this hook do not advance it. A later custom or
+    /// priority-overridden authorization rejection can consume a sampling slot,
+    /// as can a request later claimed by `ai_stream_router`; in both cases the
+    /// permit and reservation are released without dispatching a mirror.
+    async fn authorize(&self, ctx: &mut RequestContext) -> PluginResult {
+        if !self.body_admission_enabled() {
+            return PluginResult::Continue;
+        }
+        let declared_length = request_content_length(ctx);
+        // A body that already declares more than the plugin-local ceiling can
+        // never be mirrored intact. Skip it before sampling: the request keeps
+        // streaming, the primary path is untouched (no shadow-driven 413), and
+        // no truncated payload is replayed to the shadow destination.
+        let too_large_to_mirror =
+            declared_length.is_some_and(|len| len > self.max_mirrored_request_body_bytes);
+        let state = if too_large_to_mirror || !self.should_mirror() {
+            MirrorAdmissionState::NotSelected
+        } else {
+            match self.mirror_in_flight.clone().try_acquire_owned() {
+                Ok(permit) => match self.body_budget.try_reserve(self.reserved_body_bytes()) {
+                    Some(lease) => MirrorAdmissionState::Admitted { permit, lease },
+                    None => {
+                        self.metrics.bump_budget_drop();
+                        MirrorAdmissionState::Dropped(MIRROR_BODY_BUDGET_DROP_ERROR)
+                    }
+                },
+                Err(_) => {
+                    self.metrics.bump_concurrency_drop();
+                    MirrorAdmissionState::Dropped(MIRROR_CONCURRENCY_DROP_ERROR)
+                }
+            }
+        };
+        ctx.stage_request_mirror_admission(RequestMirrorAdmission {
+            instance_id: self.instance_id,
+            state,
+        });
+        PluginResult::Continue
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -1377,15 +1900,44 @@ impl Plugin for RequestMirror {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Take this instance's pre-buffer admission (staged by `authorize`)
+        // exactly once. Dropping it here releases the permit and the retained
+        // byte reservation; carrying it forward transfers ownership to the
+        // detached task.
+        let staged_admission = ctx.take_request_mirror_admission(self.instance_id);
         if ctx
             .metadata
             .get("ai_stream_router_claimed")
             .map(String::as_str)
             == Some("true")
         {
+            // The request was claimed after admission. Release the permit and
+            // reservation immediately rather than holding them for work that
+            // will never be dispatched.
+            drop(staged_admission);
             return PluginResult::Continue;
         }
-        if !self.should_mirror() {
+        let staged_state = match staged_admission {
+            Some(admission) => Some(admission.state),
+            // No staged decision: this instance does not mirror bodies, is
+            // quantized to `percentage: 0`, or `before_proxy` was invoked
+            // directly without the authorize phase. Fall back to the
+            // request-time sampler so behavior is unchanged for those paths.
+            None => {
+                if !self.should_mirror() {
+                    return PluginResult::Continue;
+                }
+                None
+            }
+        };
+        if matches!(staged_state, Some(MirrorAdmissionState::NotSelected)) {
+            // Sampled out before the body was collected. No shadow request, no
+            // observability record (existing contract), and nothing buffered.
+            return PluginResult::Continue;
+        }
+        if matches!(staged_state, Some(MirrorAdmissionState::Consumed { .. })) {
+            // This instance already ran `before_proxy` for this request. Never
+            // dispatch, sample, or acquire capacity a second time.
             return PluginResult::Continue;
         }
 
@@ -1459,26 +2011,52 @@ impl Plugin for RequestMirror {
         // (the full `mirror_url` is still used for the actual mirror request).
         let mirror_url_for_log = strip_query_params(&mirror_url).to_string();
 
-        let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                self.metrics.bump_concurrency_drop();
+        // Resolve the concurrency permit and any pre-buffer byte reservation.
+        // An admitted request already owns both from the authorize phase; the
+        // legacy path (body mirroring disabled or a direct invocation) acquires
+        // the permit here exactly as before.
+        let (permit, prereserved_lease) = match staged_state {
+            Some(MirrorAdmissionState::Admitted { permit, lease }) => (permit, Some(lease)),
+            Some(MirrorAdmissionState::Dropped(reason)) => {
+                // Refused before the body was collected. The primary request
+                // was unaffected and stayed streaming; publish the attributable
+                // failure now that the target URL is known.
                 warn!(
-                    "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
-                    method, mirror_url_for_log
+                    "request_mirror: dropped mirror request for {} {} at pre-buffer admission: {}",
+                    method, mirror_url_for_log, reason
                 );
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                     self.plugin_config_id.clone(),
                     mirror_url_for_log,
-                    MIRROR_CONCURRENCY_DROP_ERROR,
+                    reason,
                 )));
                 return PluginResult::Continue;
             }
+            // Handled above; kept exhaustive so a future state cannot silently
+            // fall through to an unadmitted dispatch.
+            Some(MirrorAdmissionState::NotSelected | MirrorAdmissionState::Consumed { .. }) => {
+                return PluginResult::Continue;
+            }
+            None => match self.mirror_in_flight.clone().try_acquire_owned() {
+                Ok(permit) => (permit, None),
+                Err(_) => {
+                    self.metrics.bump_concurrency_drop();
+                    warn!(
+                        "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
+                        method, mirror_url_for_log
+                    );
+                    ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                        self.plugin_config_id.clone(),
+                        mirror_url_for_log,
+                        MIRROR_CONCURRENCY_DROP_ERROR,
+                    )));
+                    return PluginResult::Continue;
+                }
+            },
         };
 
-        // Share immutable body bytes with the primary buffer (no detached
-        // `to_vec` duplication). Charge length against the per-instance
-        // retained-byte budget for the task lifetime (coupled to the permit).
+        // Share immutable body bytes with the primary buffer: one `Bytes`
+        // handle, no second `Vec`/`String` copy for the detached task.
         let body_bytes: Option<Bytes> = if self.mirror_request_body {
             ctx.request_body_bytes.clone().or_else(|| {
                 ctx.metadata
@@ -1488,19 +2066,52 @@ impl Plugin for RequestMirror {
         } else {
             None
         };
-        let retained_body = match self.body_budget.try_retain(body_bytes) {
-            Some(retained) => retained,
-            None => {
+        let observed_body_bytes = body_bytes.as_ref().map_or(0, |body| body.len() as u64);
+        // Reconcile the pre-buffer reservation with the real length: shrink the
+        // full-ceiling admission charge back into the budget, and refuse rather
+        // than retain unbudgeted bytes if the body somehow exceeds what was
+        // reserved or the plugin-local per-request ceiling.
+        //
+        // The two refusals are attributed separately. The proxy enforces the
+        // combined request-body limit on the *collected* body, but a buffered
+        // body normalizer runs after that check — configured request
+        // decompression can inflate the stored buffer past this instance's
+        // per-request ceiling. Reporting that as an exhausted aggregate budget
+        // would point the operator at `max_retained_request_body_bytes` when
+        // only `max_mirrored_request_body_bytes` can fix it.
+        let body_lease = if observed_body_bytes > self.max_mirrored_request_body_bytes {
+            // Release the staged full-ceiling reservation now rather than
+            // holding it while the failure summary is published.
+            drop(prereserved_lease);
+            Err(MIRROR_BODY_CEILING_DROP_ERROR)
+        } else {
+            match prereserved_lease {
+                Some(mut lease) => {
+                    if lease.reconcile(observed_body_bytes) {
+                        Ok(lease)
+                    } else {
+                        Err(MIRROR_BODY_BUDGET_DROP_ERROR)
+                    }
+                }
+                None => self
+                    .body_budget
+                    .try_reserve(observed_body_bytes)
+                    .ok_or(MIRROR_BODY_BUDGET_DROP_ERROR),
+            }
+        };
+        let body_lease = match body_lease {
+            Ok(lease) => lease,
+            Err(reason) => {
                 self.metrics.bump_budget_drop();
                 warn!(
-                    "request_mirror: dropping mirror request for {} {} because max_retained_request_body_bytes budget was exhausted",
-                    method, mirror_url_for_log
+                    "request_mirror: dropped mirror request for {} {} after body collection: {}",
+                    method, mirror_url_for_log, reason
                 );
                 drop(permit);
                 ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
                     self.plugin_config_id.clone(),
                     mirror_url_for_log,
-                    MIRROR_BODY_BUDGET_DROP_ERROR,
+                    reason,
                 )));
                 return PluginResult::Continue;
             }
@@ -1530,7 +2141,7 @@ impl Plugin for RequestMirror {
         let http_client = self.http_client.clone();
         let max_response_body_bytes = self.max_response_body_bytes;
         let mirror_plugin_id = self.plugin_config_id.clone();
-        let body_for_request = retained_body.bytes.clone();
+        let body_for_request = body_bytes;
         let metrics = Arc::clone(&self.metrics);
         metrics.bump_dispatched();
 
@@ -1538,9 +2149,12 @@ impl Plugin for RequestMirror {
         // The main request proceeds immediately — mirror latency has zero
         // impact on client response time.
         tokio::spawn(async move {
+            // Hold both admission resources for the whole task lifetime. Both
+            // release exactly once — on completion, timeout, transport/drain
+            // error, or cancellation — because they are owned values dropped
+            // when this future ends.
             let _permit = permit;
-            // Keep the body-budget lease alive for the task lifetime.
-            let _retained_body_lease = retained_body;
+            let _retained_body_lease = body_lease;
             // Count a cancellation if this task is dropped (runtime shutdown,
             // panic, or future cancellation) before recording a terminal
             // outcome. Settled below once a terminal metric is recorded.
