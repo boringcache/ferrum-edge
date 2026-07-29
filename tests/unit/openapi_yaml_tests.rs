@@ -6378,6 +6378,7 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         "ProxyAlertsTeamsChannel",
         "ProxyAlertsDiscordChannel",
         "ProxyAlertsWebhookChannel",
+        "ProxyAlertsEmailChannel",
     ] {
         assert_eq!(
             spec["components"]["schemas"][channel]["additionalProperties"],
@@ -6434,6 +6435,75 @@ fn proxy_alerts_schema_rejects_unknown_keys_and_keeps_open_maps() {
         }]
     });
     assert_component_validity(&spec, "ProxyAlertsConfig", &valid, true);
+
+    // Email channel (issue #3329): TLS-only closed variant.
+    let email_config = |channel: serde_json::Value| {
+        json!({
+            "channels": { "ops_email": channel },
+            "rules": [{
+                "name": "errors",
+                "type": "error_rate",
+                "status_codes": [500],
+                "threshold_percent": 5.0,
+                "channels": ["ops_email"]
+            }]
+        })
+    };
+    assert_component_validity(
+        &spec,
+        "ProxyAlertsConfig",
+        &email_config(json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "tls_mode": "starttls",
+            "username_env": "FERRUM_ALERT_SMTP_USERNAME",
+            "password_env": "FERRUM_ALERT_SMTP_PASSWORD",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"],
+            "subject_template": "[${severity}] ${title}",
+            "body_template": "${body}"
+        })),
+        true,
+    );
+    for invalid_email in [
+        // Unknown key.
+        json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"],
+            "smtp_hostt": "typo.example.com"
+        }),
+        // Plaintext is not an accepted posture.
+        json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "tls_mode": "none",
+            "from": "ferrum@example.com",
+            "to": ["oncall@example.com"]
+        }),
+        // Recipients are required and bounded below by one.
+        json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "from": "ferrum@example.com",
+            "to": []
+        }),
+        // Missing required `from`.
+        json!({
+            "type": "email",
+            "smtp_host": "smtp.example.com",
+            "to": ["oncall@example.com"]
+        }),
+    ] {
+        assert_component_validity(
+            &spec,
+            "ProxyAlertsConfig",
+            &email_config(invalid_email),
+            false,
+        );
+    }
 
     for (field, value) in [
         ("default_cooldown_seconds", json!(0)),
