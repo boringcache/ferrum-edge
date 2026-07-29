@@ -81,6 +81,17 @@ create_frontend_tls_secret() {
 }
 
 deploy_control_plane() {
+  # Namespaced reflectors must complete their initial list before the
+  # reconciler publishes any status, including cluster-scoped GatewayClass
+  # status. Create every explicit watch namespace before the controller starts
+  # so a not-yet-created upstream backend namespace cannot hold readiness open.
+  local watched_namespace
+  for watched_namespace in \
+    "$DP_GATEWAY_NAMESPACE" \
+    "$BACKEND_NAMESPACE" \
+    "$APP_BACKEND_NAMESPACE"; do
+    kubectl create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl apply -f -
+  done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
