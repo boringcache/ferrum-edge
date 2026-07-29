@@ -3231,9 +3231,12 @@ fn test_reject_body_disposition_is_method_and_status_derived() {
         ClientResponseFraming::ExactBody { len: 0, .. }
     ));
     // Empty omitted-by-protocol reject -> preserve the representation length.
+    // `Head` is the ONLY framing that may keep one; ordinary `Streaming` now
+    // removes Content-Length outright, so selecting it here would silently drop
+    // a HEAD reject's representation length instead of preserving it.
     assert!(matches!(
         ClientResponseFraming::for_final_reject(200, 0, RejectBodyDisposition::OmittedByProtocol),
-        ClientResponseFraming::Streaming { .. }
+        ClientResponseFraming::Head { .. }
     ));
     // Bytes about to be written always win over a claimed omission.
     assert!(matches!(
@@ -3298,59 +3301,56 @@ fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
         );
     }
 
-    // Streaming: single lowercase untrimmed parseable value — no mutation.
-    let mut streaming = HashMap::from([("content-length".to_string(), "42".to_string())]);
-    let streaming_cl_ptr = streaming.get("content-length").unwrap().as_ptr();
+    // Head: single lowercase untrimmed parseable value — no mutation.
+    let mut head = HashMap::from([("content-length".to_string(), "42".to_string())]);
+    let head_cl_ptr = head.get("content-length").unwrap().as_ptr();
     sanitize_client_response_headers_for_wire(
-        &mut streaming,
-        ClientResponseFraming::Streaming { status: 200 },
+        &mut head,
+        ClientResponseFraming::Head { status: 200 },
     );
+    assert_eq!(head.get("content-length").map(String::as_str), Some("42"));
     assert_eq!(
-        streaming.get("content-length").map(String::as_str),
-        Some("42")
-    );
-    assert_eq!(
-        streaming.get("content-length").unwrap().as_ptr(),
-        streaming_cl_ptr,
-        "Streaming must preserve already-safe Content-Length storage"
+        head.get("content-length").unwrap().as_ptr(),
+        head_cl_ptr,
+        "Head must preserve already-safe Content-Length storage"
     );
 
-    // Streaming acceptance preserves leading zeroes (parseable) without rewrite.
+    // Head acceptance preserves leading zeroes (parseable) without rewrite.
     let mut leading_zero = HashMap::from([("content-length".to_string(), "042".to_string())]);
     let leading_ptr = leading_zero.get("content-length").unwrap().as_ptr();
     sanitize_client_response_headers_for_wire(
         &mut leading_zero,
-        ClientResponseFraming::Streaming { status: 200 },
+        ClientResponseFraming::Head { status: 200 },
     );
     assert_eq!(
         leading_zero.get("content-length").map(String::as_str),
         Some("042"),
-        "Streaming must not invent a stricter leading-zero policy"
+        "Head must not invent a stricter leading-zero policy"
     );
     assert_eq!(
         leading_zero.get("content-length").unwrap().as_ptr(),
         leading_ptr
     );
 
-    // Streaming repair: invalid, whitespace-padded, mixed-case, duplicates.
+    // Head repair: invalid, whitespace-padded, mixed-case, duplicates.
     let mut invalid = HashMap::from([("content-length".to_string(), "not-a-number".to_string())]);
     sanitize_client_response_headers_for_wire(
         &mut invalid,
-        ClientResponseFraming::Streaming { status: 200 },
+        ClientResponseFraming::Head { status: 200 },
     );
     assert!(!invalid.contains_key("content-length"));
 
     let mut padded = HashMap::from([("content-length".to_string(), " 42 ".to_string())]);
     sanitize_client_response_headers_for_wire(
         &mut padded,
-        ClientResponseFraming::Streaming { status: 200 },
+        ClientResponseFraming::Head { status: 200 },
     );
     assert_eq!(padded.get("content-length").map(String::as_str), Some("42"));
 
     let mut mixed = HashMap::from([("Content-Length".to_string(), "42".to_string())]);
     sanitize_client_response_headers_for_wire(
         &mut mixed,
-        ClientResponseFraming::Streaming { status: 200 },
+        ClientResponseFraming::Head { status: 200 },
     );
     assert_eq!(mixed.get("content-length").map(String::as_str), Some("42"));
     assert!(!mixed.contains_key("Content-Length"));
@@ -3361,7 +3361,7 @@ fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
     ]);
     sanitize_client_response_headers_for_wire(
         &mut duplicates,
-        ClientResponseFraming::Streaming { status: 200 },
+        ClientResponseFraming::Head { status: 200 },
     );
     assert!(
         !duplicates
@@ -3844,14 +3844,17 @@ fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
 /// `42`, another as `0`, and another may reject the message — the exact framing
 /// disagreement this boundary exists to remove.
 #[test]
-fn test_streaming_sanitizer_rejects_non_digit_content_length_spellings() {
+fn test_head_sanitizer_rejects_non_digit_content_length_spellings() {
     use ferrum_edge::proxy::headers::{
         ClientResponseFraming, needs_client_response_wire_sanitization,
         sanitize_client_response_headers_for_wire,
     };
     use std::collections::HashMap;
 
-    let framing = ClientResponseFraming::Streaming { status: 200 };
+    // `Head` is the only framing that preserves a value at all, so it is the
+    // only one whose acceptance policy can be wrong in the "preserved a
+    // malformed spelling" direction.
+    let framing = ClientResponseFraming::Head { status: 200 };
 
     // Signed, non-numeric, and overflowing spellings are all refused. A
     // streaming body is framed by the protocol's own end-of-body signal, so
@@ -3970,11 +3973,246 @@ fn test_buffered_response_framing_is_body_derived_except_head() {
         assert!(
             matches!(
                 ClientResponseFraming::for_buffered_response(method, 200, 0),
-                ClientResponseFraming::Streaming { .. }
+                ClientResponseFraming::Head { .. }
             ),
             "{method} must preserve the backend representation length"
         );
     }
+}
+
+/// GHSA-xvr4 residual: an ordinary streamed non-HEAD response must not publish
+/// ANY `Content-Length` that survived the mutable response hooks — including a
+/// syntactically valid, lowercase, canonically spelled one.
+///
+/// This is the arm the earlier repair left open. Hop-by-hop stripping and the
+/// `ExactBody` overwrite covered the buffered writers, but the streaming arm
+/// preserved one valid value, and `security_headers.set` / `opa.deny_headers`
+/// could author exactly that. On a streamed body the gateway has not written the
+/// bytes yet, so it cannot verify the claim; publishing it lets one recipient on
+/// an HTTP/1.1 chain frame by the declared length while another frames by the
+/// protocol's own end-of-body signal.
+#[test]
+fn test_ordinary_streaming_framing_strips_every_content_length_spelling() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, needs_client_response_wire_sanitization,
+        sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    let framing = ClientResponseFraming::Streaming;
+
+    // Every one of these is a *valid* wire spelling that the previous Streaming
+    // arm preserved verbatim.
+    for (key, value) in [
+        ("content-length", "0"),
+        ("content-length", "42"),
+        ("content-length", "042"),
+        ("content-length", "18446744073709551615"),
+        ("Content-Length", "42"),
+        ("CONTENT-LENGTH", "42"),
+    ] {
+        let mut headers = HashMap::from([
+            (key.to_string(), value.to_string()),
+            ("x-ok".to_string(), "1".to_string()),
+        ]);
+        assert!(
+            needs_client_response_wire_sanitization(&headers, framing),
+            "{key}: {value:?} must be reported as needing repair, or the H3 hot \
+             path skips sanitization and publishes it verbatim"
+        );
+        sanitize_client_response_headers_for_wire(&mut headers, framing);
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "ordinary streaming must not publish {key}: {value:?} — the gateway \
+             cannot verify it against bytes it has not written"
+        );
+        assert_eq!(
+            headers.get("x-ok").map(String::as_str),
+            Some("1"),
+            "unrelated headers must survive the strip"
+        );
+    }
+
+    // A clean map still needs no work, so the allocation-free hot path stays.
+    let clean = HashMap::from([("x-ok".to_string(), "1".to_string())]);
+    assert!(!needs_client_response_wire_sanitization(&clean, framing));
+
+    // Hop-by-hop stripping is unchanged and composes with the length strip.
+    let mut both = HashMap::from([
+        ("connection".to_string(), "keep-alive, x-internal".to_string()),
+        ("x-internal".to_string(), "leak".to_string()),
+        ("transfer-encoding".to_string(), "chunked".to_string()),
+        ("content-length".to_string(), "42".to_string()),
+        ("x-ok".to_string(), "1".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(&mut both, framing);
+    assert_eq!(both.len(), 1, "only the ordinary header may survive");
+    assert_eq!(both.get("x-ok").map(String::as_str), Some("1"));
+}
+
+/// `HEAD` is the one exemption, and it is narrow: exactly one valid
+/// representation length survives, while invalid values, duplicate case
+/// variants, and no-body statuses are still stripped.
+#[test]
+fn test_head_framing_preserves_only_one_valid_representation_length() {
+    use ferrum_edge::proxy::headers::{
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
+    };
+    use std::collections::HashMap;
+
+    // Preserved: one valid value, canonicalized onto the lowercase key.
+    for (key, value, expected) in [
+        ("content-length", "1024", "1024"),
+        ("Content-Length", "1024", "1024"),
+        ("CONTENT-LENGTH", " 1024 ", "1024"),
+        ("content-length", "01024", "01024"),
+    ] {
+        let mut headers = HashMap::from([(key.to_string(), value.to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected),
+            "HEAD must keep the representation length from {key}: {value:?}"
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length") && name != "content-length"),
+            "HEAD repair must leave only the canonical lowercase key"
+        );
+    }
+
+    // Dropped: ambiguous duplicates across case variants.
+    let mut duplicates = HashMap::from([
+        ("content-length".to_string(), "1024".to_string()),
+        ("Content-Length".to_string(), "1024".to_string()),
+    ]);
+    sanitize_client_response_headers_for_wire(
+        &mut duplicates,
+        ClientResponseFraming::Head { status: 200 },
+    );
+    assert!(
+        !duplicates
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("content-length")),
+        "duplicate HEAD lengths are a HeaderMap duplicate field — fail closed"
+    );
+
+    // Dropped: spellings outside `1*DIGIT`.
+    for value in ["+1024", "-1", "10 24", "1024abc", "", "18446744073709551616"] {
+        let mut headers = HashMap::from([("content-length".to_string(), value.to_string())]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status: 200 },
+        );
+        assert!(
+            !headers.contains_key("content-length"),
+            "HEAD must drop the malformed spelling {value:?}"
+        );
+    }
+
+    // Dropped: statuses that forbid a body, even under HEAD framing.
+    for status in [100u16, 199, 204, 205, 304] {
+        let mut headers = HashMap::from([
+            ("content-length".to_string(), "1024".to_string()),
+            ("Content-Length".to_string(), "7".to_string()),
+        ]);
+        sanitize_client_response_headers_for_wire(
+            &mut headers,
+            ClientResponseFraming::Head { status },
+        );
+        assert!(
+            !headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("content-length")),
+            "status {status} forbids a body, so no length may survive"
+        );
+    }
+}
+
+/// The ordinary-vs-HEAD distinction is a typed framing decision derived from the
+/// trusted request method — not a caller-supplied boolean, and never inferred
+/// from a response header a plugin or backend controls.
+#[test]
+fn test_streaming_response_framing_constructor_is_method_derived() {
+    use ferrum_edge::proxy::headers::ClientResponseFraming;
+
+    for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_streaming_response(method, 200),
+                ClientResponseFraming::Streaming
+            ),
+            "{method} streaming responses must strip Content-Length"
+        );
+    }
+    for method in ["HEAD", "head", "HeAd"] {
+        assert!(
+            matches!(
+                ClientResponseFraming::for_streaming_response(method, 200),
+                ClientResponseFraming::Head { status: 200 }
+            ),
+            "{method} must select Head framing regardless of case"
+        );
+    }
+}
+
+/// The gateway's own accounting capture must reproduce exactly what the wire
+/// boundary would have accepted, so removing the field from the wire cannot
+/// silently change H3 graceful-close classification or the direct-H2
+/// large-response coalescer bypass.
+#[test]
+fn test_preserved_response_content_length_matches_boundary_acceptance() {
+    use ferrum_edge::proxy::headers::preserved_response_content_length;
+    use std::collections::HashMap;
+
+    for (key, value, expected) in [
+        ("content-length", "0", Some(0u64)),
+        ("content-length", "42", Some(42)),
+        ("content-length", "042", Some(42)),
+        ("Content-Length", "42", Some(42)),
+        ("content-length", " 42 ", Some(42)),
+        ("content-length", "+42", None),
+        ("content-length", "-1", None),
+        ("content-length", "4 2", None),
+        ("content-length", "", None),
+        ("content-length", "18446744073709551616", None),
+    ] {
+        let headers = HashMap::from([(key.to_string(), value.to_string())]);
+        assert_eq!(
+            preserved_response_content_length(&headers, 200),
+            expected,
+            "{key}: {value:?}"
+        );
+    }
+
+    // Conflicting duplicates are a HeaderMap duplicate field — fail closed
+    // rather than picking whichever variant iteration reached first.
+    let duplicates = HashMap::from([
+        ("content-length".to_string(), "42".to_string()),
+        ("Content-Length".to_string(), "43".to_string()),
+    ]);
+    assert_eq!(preserved_response_content_length(&duplicates, 200), None);
+
+    // No-body statuses have no declared length to account for.
+    let headers = HashMap::from([("content-length".to_string(), "42".to_string())]);
+    for status in [100u16, 204, 205, 304] {
+        assert_eq!(
+            preserved_response_content_length(&headers, status),
+            None,
+            "status {status} forbids a body"
+        );
+    }
+
+    assert_eq!(
+        preserved_response_content_length(&HashMap::new(), 200),
+        None
+    );
 }
 
 /// A buffered gRPC response with no DATA frames is trailers-only regardless of
@@ -4071,17 +4309,20 @@ fn test_buffered_grpc_plugin_reject_drops_plugin_authored_content_length() {
         Some("1")
     );
 
-    // Streaming framing is a separate contract: it preserves one valid plugin length.
-    let mut streaming_headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
+    // `Head` framing is the separate contract: it is the only arm that
+    // preserves one valid length, and buffered gRPC rejects must not select it
+    // for an empty body. Ordinary `Streaming` no longer preserves anything, so
+    // it is not a distinguishing counterexample here.
+    let mut head_headers = HashMap::from([("content-length".to_string(), "999".to_string())]);
     sanitize_client_response_headers_for_wire(
-        &mut streaming_headers,
-        ClientResponseFraming::Streaming { status: 200 },
+        &mut head_headers,
+        ClientResponseFraming::Head { status: 200 },
     );
     assert_eq!(
-        streaming_headers.get("content-length").map(String::as_str),
+        head_headers.get("content-length").map(String::as_str),
         Some("999"),
-        "streaming framing preserves the plugin length, which buffered gRPC rejects \
-         must not select for an empty body"
+        "Head framing preserves the representation length, which buffered gRPC \
+         rejects must not select for an empty body"
     );
 }
 

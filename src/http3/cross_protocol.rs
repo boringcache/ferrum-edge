@@ -2967,12 +2967,13 @@ where
         // Buffered bridge response: `response_body` below IS the wire body, so
         // publish its exact length instead of preserving whatever the backend or
         // a plugin left on the map. `apply_buffered_plain_plugin_reject` installs
-        // the plugin's own reject header map verbatim, so under streaming framing
-        // a plugin-authored `Content-Length` would reach the H3 wire disagreeing
-        // with the DATA frames actually sent (malformed per RFC 9114 §4.1.2).
-        // `HEAD` keeps streaming framing so the backend representation length
-        // survives instead of being overwritten with `0` — same rule the native
-        // H3 buffered writer applies through the shared constructor.
+        // the plugin's own reject header map verbatim, so without an exact
+        // derived length a plugin-authored `Content-Length` would reach the H3
+        // wire disagreeing with the DATA frames actually sent (malformed per
+        // RFC 9114 §4.1.2). `HEAD` selects `Head` framing so the backend
+        // representation length survives instead of being overwritten with `0`
+        // — same rule the native H3 buffered writer applies through the shared
+        // constructor.
         let buffered_framing = ClientResponseFraming::for_buffered_response(
             &ctx.method,
             response_status,
@@ -3165,9 +3166,11 @@ where
         None
     };
     // Strip Content-Length when inspecting — the inspector transforms the body, so
-    // the backend's declared length no longer matches what we send. Case-insensitive
-    // omit must run before `send_response_headers` Streaming sanitization, which
-    // would otherwise re-canonicalize a mixed-case plugin spelling onto the wire.
+    // the backend's declared length no longer matches what we send. Ordinary
+    // Streaming framing inside `send_response_headers` removes the field anyway;
+    // this case-insensitive omit additionally covers the `HEAD` case, where
+    // `Head` framing would otherwise preserve a representation length the
+    // inspector has invalidated.
     if response_inspector.is_some() {
         crate::proxy::headers::remove_content_length_header(&mut response_headers);
     }
@@ -3175,7 +3178,7 @@ where
     // Send response headers, then stream the body.
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         grpc_web_deadline_at,
-        send_response_headers(stream, status, &response_headers),
+        send_response_headers(stream, &ctx.method, status, &response_headers),
     )
     .await
     {
@@ -3724,8 +3727,9 @@ where
         )
     });
     if grpc_web_initial_terminal_metadata.is_some() {
-        // Omit before Streaming sanitization so a mixed-case plugin spelling
-        // cannot be re-canonicalized onto the wire.
+        // gRPC-Web translation reframes the body. Streaming framing removes the
+        // wire field; omit case-insensitively here so no later reader of this
+        // map treats the untranslated length as authoritative.
         crate::proxy::headers::remove_content_length_header(&mut streaming.headers);
     }
 
@@ -3739,7 +3743,17 @@ where
 
     if let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
         streaming.grpc_deadline_at,
-        send_response_headers(stream, streaming.status, &streaming.headers),
+        // Native gRPC / gRPC-Web streaming over the H3 bridge: gRPC has no HEAD
+        // and never frames with Content-Length, so pass ordinary Streaming
+        // framing explicitly rather than deriving a HEAD exemption from the
+        // request method (a `HEAD` carrying `content-type: application/grpc`
+        // must not buy a preserved length on a gRPC response).
+        send_response_headers_with_framing(
+            stream,
+            streaming.status,
+            &streaming.headers,
+            ClientResponseFraming::Streaming,
+        ),
     )
     .await
     {
@@ -5304,7 +5318,7 @@ where
             // produced the response. `apply_buffered_grpc_plugin_reject` replaces
             // `response_headers` with `normalize_h3_grpc_reject` output, which
             // copies every plugin-supplied field except content-type /
-            // grpc-status / grpc-message — under streaming framing a
+            // grpc-status / grpc-message — without a body-derived decision a
             // plugin-authored `Content-Length` would survive onto a
             // trailers-only response that sends no DATA frames, which RFC 9114
             // §4.1.2 makes malformed. Mirrors the main buffered gRPC path.
@@ -6904,12 +6918,17 @@ where
     super::server::drain_h3_request_body(stream, max_bytes).await
 }
 
-/// Streaming-framed response headers: the body length is not known here, so a
-/// valid backend `Content-Length` is preserved and an invalid one is repaired.
-/// Buffered writers whose wire body is already in hand must use
-/// [`send_response_headers_with_framing`] instead.
+/// Streaming-framed response headers: the final body length is not known here,
+/// so `Content-Length` is removed unless the trusted request method makes the
+/// wire body empty by protocol (`HEAD`, where a valid representation length is
+/// preserved and an invalid one dropped). Buffered writers whose wire body is
+/// already in hand must use [`send_response_headers_with_framing`] instead.
+///
+/// `method` is the request method the bridge dispatched, never a response
+/// header: the HEAD exemption must not be purchasable by a backend or plugin.
 async fn send_response_headers<S>(
     stream: &mut RequestStream<S, Bytes>,
+    method: &str,
     status: u16,
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error>
@@ -6922,7 +6941,7 @@ where
         stream,
         status,
         headers,
-        ClientResponseFraming::Streaming { status },
+        ClientResponseFraming::for_streaming_response(method, status),
     )
     .await
 }

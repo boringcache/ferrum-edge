@@ -17104,7 +17104,14 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to the policy-denial response.
+          description: >-
+            Headers added to the policy-denial response. Names and values are
+            validated at config load. Protocol-managed hop-by-hop and framing
+            destinations (`connection`, `content-length`, `keep-alive`,
+            `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+            `transfer-encoding`, `upgrade`, case-insensitive) are rejected: the
+            gateway derives Content-Length from the reject body and strips
+            connection/framing fields at the final H1/H2/H3 response boundary.
         fail_closed_status:
           type: integer
           format: uint16
@@ -17123,7 +17130,10 @@ components:
           additionalProperties:
             type: string
           default: {}
-          description: Headers added to fail-closed OPA error responses.
+          description: >-
+            Headers added to fail-closed OPA error responses. Same name/value
+            validation and protocol-managed hop-by-hop / framing destination
+            rejection as deny_headers.
         decision_pointer:
           type: array
           items:
@@ -17940,7 +17950,7 @@ components:
     SecurityHeadersConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected."
+      description: "Plugin: security_headers — Injects validated response security headers (secure defaults) and strips fingerprinting headers at the client-visible initial-header boundary, including buffered gRPC/gRPC-Web and WebSocket handshakes. Unknown configuration keys are rejected, and `set` rejects protocol-managed hop-by-hop / framing destinations (`remove` of those names remains allowed)."
       properties:
         content_type_options:
           oneOf:
@@ -18004,7 +18014,7 @@ components:
           additionalProperties:
             type: string
             pattern: '^[\u0009\u0020-\u007E]*$'
-          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
+          description: "Arbitrary response headers to set (name -> value). Names accept the complete HTTP field-name token grammar, are limited to 65,535 ASCII bytes, and are canonicalized to lowercase, EXCEPT protocol-managed hop-by-hop and framing destinations (`connection`, `content-length`, `keep-alive`, `proxy-authenticate`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, case-insensitive), which are rejected at construction — the gateway owns those fields at the final H1/H2/H3 response boundary, where it derives Content-Length from the final body, preserves a valid representation length only for HEAD, and removes it on ordinary streamed responses. Use remove for those names instead. Values must satisfy the HTTP HeaderValue builder rules: only HTAB and printable ASCII are accepted."
         remove:
           type: [array, "null"]
           items:
@@ -23009,7 +23019,14 @@ components:
             downstream_session_header:
               type: string
               default: mcp-session-id
-              description: Must be a valid HTTP header name; rejected at config validation otherwise.
+              description: >-
+                Must be a valid HTTP header name; rejected at config validation
+                otherwise. This name is stamped onto the client response, so
+                protocol-managed hop-by-hop and framing destinations
+                (`connection`, `content-length`, `keep-alive`,
+                `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
+                `transfer-encoding`, `upgrade`, case-insensitive) are also
+                rejected.
             upstream_session_header:
               type: string
               default: mcp-session-id

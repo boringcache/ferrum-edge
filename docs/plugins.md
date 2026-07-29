@@ -182,6 +182,58 @@ These headers are injected on all proxy paths (HTTP, gRPC, and WebSocket).
 
 ---
 
+## Final Response Framing
+
+Every H1/H2/H3 response builder is preceded by one shared client-wire
+sanitizer that runs *after* the last mutable response hook (`after_proxy`,
+body transforms, committed hooks, sticky-cookie injection). It strips
+response-direction hop-by-hop and `Connection`-listed fields, then decides
+`Content-Length` from the gateway's own view of the response — never from
+what a plugin or backend left on the header map:
+
+| Final response shape | `Content-Length` on the wire |
+|---|---|
+| Buffered / synthetic body (the gateway holds the exact bytes) | Set to the exact byte count. Any surviving value is replaced. Stripped entirely for a status that forbids a body. |
+| **Ordinary streamed body** (HTTP/1.1 chunked, H2/H3 `END_STREAM`) | **Removed** — including a syntactically valid lowercase value. |
+| `HEAD` (buffered or streamed) | One valid `1*DIGIT` representation length is preserved and its key canonicalized. Invalid values, duplicate case variants, and no-body statuses are stripped. |
+| Status that forbids a body (`1xx`, `204`, `205`, `304`) | Removed. |
+| Native gRPC Trailers-Only | Removed (gRPC never frames with `Content-Length`). |
+
+The streaming row is the security-relevant one. On a streamed response the
+gateway cannot compare a declared length against bytes it has not written
+yet, so a length that survives the response hooks is an unverifiable claim.
+Publishing it would let one recipient on an HTTP/1.1 chain believe the
+declared length while another reads to the protocol's own end-of-body
+signal — a request/response desync. Removing it is lossless for framing:
+HTTP/1.1 falls back to chunked transfer-coding (or connection close) and
+HTTP/2 / HTTP/3 frame the body with `END_STREAM` / FIN. The practical
+trade-off is that a streamed response no longer advertises its size, so
+clients relying on `Content-Length` for download progress see a chunked
+response instead.
+
+`HEAD` is the only exemption because its wire body is empty *by protocol*,
+so the field describes the representation a `GET` would have returned and
+cannot contradict the bytes sent. That exemption is selected from the
+trusted request method and the gateway-selected status — never from a
+response header name or value, so a plugin cannot buy it.
+
+Because that boundary owns these fields, plugins may not configure them as
+write destinations. `Connection`, `Content-Length`, `Keep-Alive`,
+`Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+`Transfer-Encoding`, and `Upgrade` (case-insensitive) are rejected at
+construction by every configuration surface that writes an arbitrary
+response-header name: [`response_transformer`](#response_transformer)
+`add`/`update` and rename destinations, [`response_mock`](#response-mock-plugin)
+`headers`, [`mesh_route_dispatch`](#mesh_route_dispatch)
+`response_transform`, [`security_headers`](#security_headers) `set`,
+[`opa`](#opa) `deny_headers` / `fail_closed_headers`, and
+[`mcp_gateway`](#mcp_gateway) `sessions.downstream_session_header`.
+Removing those names stays allowed everywhere — dropping a
+protocol-managed field is a no-op after the origin strip and never invents
+framing.
+
+---
+
 ## Logging Plugins
 
 > **Customizing transaction log output**: every logging plugin below
@@ -2701,10 +2753,10 @@ Delegates HTTP request authorization to [Open Policy Agent](https://www.openpoli
 | `fail_closed` | Boolean | `true` | Inverse of `fail_open`, accepted for explicit fail-closed configs. Do not set both fields. |
 | `deny_status` | Integer | `403` | HTTP 4xx/5xx status returned when OPA returns a policy denial. |
 | `deny_body` | String | `{"error":"forbidden by policy"}` | Response body returned on policy denial. |
-| `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load. |
+| `deny_headers` | Object | `{}` | Headers added to the policy-denial response. Names and values are validated at config load; protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive) are rejected — see [Final response framing](#final-response-framing). |
 | `fail_closed_status` | Integer | `503` | HTTP 4xx/5xx status returned when fail-closed handles OPA unavailability, timeouts, non-2xx responses, malformed JSON, or oversized responses. |
 | `fail_closed_body` | String | `{"error":"authorization service unavailable"}` | Response body returned on fail-closed OPA errors. |
-| `fail_closed_headers` | Object | `{}` | Headers added to fail-closed OPA error responses. Names and values are validated at config load. |
+| `fail_closed_headers` | Object | `{}` | Headers added to fail-closed OPA error responses. Same validation and protocol-managed destination rejection as `deny_headers`. |
 | `decision_pointer` | String[] | `["result"]` | Path inside the OPA JSON response to evaluate. Use `["result","allow"]` for `{ "result": { "allow": true } }`. |
 | `include_method` | Boolean | `true` | Include `input.method`. |
 | `include_path` | Boolean | `true` | Include `input.path`. |
@@ -3654,7 +3706,7 @@ config:
 - Unknown operations and unknown targets (valid here: `header` or `body`) are rejected.
 - Header operation fields are exact: only `add`/`update` accept `value`; only `rename` accepts `new_key`; `remove` accepts neither. Incompatible extras are rejected rather than ignored. Body rules use the same operation-field constraints.
 - Missing required fields (`value` on add/update, `new_key` on rename) are rejected.
-- Protocol-managed hop-by-hop and framing destinations are rejected for `add`/`update` and as rename destinations: `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and `Content-Length` (case-insensitive). `remove` of those names remains allowed. Multiple instances and mesh `response_transform` route overrides share the same destination contract so a later hook cannot reintroduce a framing field after an earlier local check. The gateway's final client-wire sanitizer still strips hop-by-hop / Connection-listed fields and derives or repairs `Content-Length` from the actual body/status/method after every mutable response hook and before every H1/H2/H3 builder.
+- Protocol-managed hop-by-hop and framing destinations are rejected for `add`/`update` and as rename destinations: `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, and `Content-Length` (case-insensitive). `remove` of those names remains allowed. Multiple instances and mesh `response_transform` route overrides share the same destination contract so a later hook cannot reintroduce a framing field after an earlier local check. The gateway's final client-wire sanitizer still strips hop-by-hop / Connection-listed fields and derives or repairs `Content-Length` from the actual body/status/method after every mutable response hook and before every H1/H2/H3 builder. See [Final response framing](#final-response-framing) for exactly which lengths that boundary keeps.
 - Every configured header `value` must parse as an HTTP `HeaderValue` — the same complete syntax accepted at H1/H2/H3 emission (HTAB, visible ASCII, and obs-text) — so CR/LF, DEL, and other forbidden control bytes fail construction instead of being dropped later at a protocol boundary.
 - Non-string values for `target`, `operation`, `key`, or `new_key` are rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
@@ -3701,6 +3753,19 @@ than horizontal tab, DEL, and non-ASCII characters are rejected. Invalid-name
 diagnostics identify the `set` or `remove` entry and render at most 96 escaped
 bytes of the hostile name before a truncation marker.
 
+`set` additionally **rejects protocol-managed hop-by-hop and framing
+destinations** at construction — `Connection`, `Content-Length`, `Keep-Alive`,
+`Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`,
+`Transfer-Encoding`, and `Upgrade`, case-insensitively, so `Content-Length`,
+`CONTENT-LENGTH`, and `content-length` all fail identically. This plugin
+writes in the response band, i.e. after the backend hop-by-hop strip and
+before the gateway's [final response framing](#final-response-framing)
+boundary, so a `Content-Length` configured here would be a length the gateway
+cannot verify against the bytes it is about to write. The diagnostic names the
+offending `set.<name>` entry using the canonical lowercase field name.
+`remove` of those same names remains allowed and is a no-op after the origin
+strip; use it when the intent is to drop the field rather than author one.
+
 **Priority:** 4080
 
 | Parameter | Type | Default | Description |
@@ -3711,7 +3776,7 @@ bytes of the hostile name before a truncation marker.
 | `hsts` | bool/string/object/null | `false` | Sets `Strict-Transport-Security`; `true` uses `max-age=31536000; includeSubDomains`, a string is used verbatim, or an object may set `max_age`, `include_subdomains`, and `preload`. |
 | `content_security_policy` | string/null | _(unset)_ | Optional `Content-Security-Policy` value. |
 | `permissions_policy` | string/null | _(unset)_ | Optional `Permissions-Policy` value. |
-| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar and values must pass downstream HTTP header-value validation. |
+| `set` | object/null | `{}` | Additional headers to set. Names accept the complete HTTP field-name grammar except protocol-managed hop-by-hop / framing destinations (`Connection`, `Content-Length`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, case-insensitive), which are rejected at construction. Values must pass downstream HTTP header-value validation. |
 | `remove` | string[]/null | `["server","x-powered-by"]` | Valid HTTP field names to remove case-insensitively; `null` disables built-in removals. |
 | `override_existing` | bool | `true` | Replace existing response headers with configured values. When `false`, only missing headers are added. |
 
@@ -3841,7 +3906,7 @@ Server-Sent Events stream handler. Validates inbound SSE client criteria, shapes
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `add_no_buffering_header` | bool | `true` | Add `X-Accel-Buffering: no` to disable nginx/ALB buffering |
-| `strip_content_length` | bool | `true` | Remove `Content-Length` (SSE streams are indefinite) |
+| `strip_content_length` | bool | `true` | Remove `Content-Length` from the initial response map (SSE streams are indefinite). `false` no longer leaves one on the wire: [final response framing](#final-response-framing) removes `Content-Length` from every ordinary streamed response. The flag still governs whether `content-length` joins this instance's response-trailer policy names and whether the gateway's own declared-length accounting sees the backend value. |
 | `retry_ms` | u64 | _(none)_ | EventSource reconnection hint (ms), prepended as `retry:` when wrapping; must be ≥ 1 |
 | `force_sse_content_type` | bool | `false` | Force `Content-Type: text/event-stream` even if backend returns something else |
 | `wrap_non_sse_responses` | bool | `false` | Wrap non-SSE response bodies in `data: ...\n\n` SSE event framing; implies client-visible `text/event-stream` for wrapped responses |
@@ -5905,7 +5970,7 @@ config:
     max_batch_response_bytes: 1048576
 ```
 
-`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. `validation.validate_tool_results` is reserved and rejected if set to `true` until result validation is implemented. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
+`sessions.max_sessions` and `sessions.session_ttl_seconds` bound downstream MCP sessions; idle or oldest sessions are evicted before accepting new `initialize` calls. The cap check, in-memory eviction, and insert are serialized (so concurrent `initialize` calls cannot grow the store past `max_sessions`) in a single scan, while the evicted sessions' upstream `DELETE` cleanup is issued concurrently *after* that critical section so eviction never blocks new sessions behind upstream network round trips. In `aggregate_router` mode the gateway mints a synthetic downstream session id and never forwards it upstream: routed calls strip the downstream session header and carry only a mediated upstream session id when one exists. Server ids must be URI-safe (`[A-Za-z0-9._-]`) because they appear in public `mcp://` resource URIs, and `sessions.downstream_session_header`/`sessions.upstream_session_header` must be valid HTTP header names; both are checked at config validation. `sessions.downstream_session_header` is stamped onto the client response, so it additionally rejects protocol-managed hop-by-hop / framing names (see [Final response framing](#final-response-framing)); `sessions.upstream_session_header` is a backend request field and keeps its own contract. `validation.validate_tool_results` is reserved and rejected if set to `true` until result validation is implemented. `initialize_upstreams: startup` is accepted as a V1 alias for `lazy` because MCP upstream initialization requires a downstream client session. In `aggregate_router` mode, advertising a capability with no dedicated dispatch — `capabilities.advertise_completions`, `capabilities.advertise_logging`, or `capabilities.advertise_tasks` — requires `capabilities.passthrough_unknown_methods: true` so those methods (`completion/complete`, `logging/*`, `tasks/*`) are routed to the primary upstream instead of advertised without support. If `observability.log_raw_arguments` is enabled, raw MCP tool arguments are copied into request metadata and may contain secrets or PII; prefer the default argument hashing unless the logging path is explicitly protected.
 
 **Discovery, catalogs, and locking.** Discovery catalogs are cached **per downstream session**, not gateway-wide, because an upstream MCP server may expose different tools/resources/prompts per initialized session (client identity/capabilities); a shared catalog could leak or hide entries across users. Catalog refresh is serialized per session (not globally) and upstream `initialize` is serialized per `(session, server)`, so a slow upstream throttles only the affected session/server rather than blocking discovery or initialization for unrelated clients. A consequence of per-session catalogs is that each new session performs its own upstream discovery. Cached resource-template routes are refreshed against their selected resource server after `discovery.cache_ttl_seconds`; a successful refresh removes withdrawn routes, while a transient refresh failure serves the previously discovered route stale until the next per-server retry window so long-lived sessions remain available. A URI that was never discovered still fails closed. Tool-only servers are not queried for resource templates. When two upstreams produce the same public tool or prompt name after namespacing, the colliding name is skipped from discovery for **all** colliding upstreams (logged as a warning) so it can never route to the wrong upstream, while the rest of the catalog stays usable. Exact resource and resource-template public URIs include the validated-unique server id (`mcp://{server_id}/...`), so their public keys cannot collide across upstreams; defensive duplicate-key suppression for exact resources uses the same fail-closed state. Collision tombstones survive degraded refreshes and are cleared only after every attempted upstream in that family lists successfully, so a temporary outage cannot choose a winner. Per-family tombstone retention is bounded by `validation.max_catalog_items_per_list` multiplied by the number of attempted upstream lists, the aggregate number of items one refresh can contribute. If repeated degraded refreshes exceed that history bound, the gateway retains one bounded overflow marker and returns JSON-RPC `-32006` for the entire affected family until a fully authoritative refresh rebuilds its collision state; it never selects attacker-ordered tombstones or temporarily republishes a formerly ambiguous route. A failing upstream otherwise degrades only itself: each per-server `tools/list` / `prompts/list` / `resources/list` / `resources/templates/list` failure (transport error, non-2xx status, or JSON-RPC error) keeps that upstream's last-good entries for that family served stale and retried on the next refresh window, while every other upstream and family refreshes normally — one unavailable upstream does not fail the whole aggregate catalog. Stale carried entries pass through the same collision handling as fresh ones, and only currently enabled and exposed servers can carry entries forward, so disabled or removed servers still drop out of the catalog. Degraded upstreams are surfaced as warning logs and bounded `mcp.catalog_degraded` metadata (sorted `server:family` pairs). Availability is tracked per catalog family and separately from entry count: if every attempted upstream for the requested family fails before that family has ever listed successfully, that family returns JSON-RPC `-32006` while healthy families remain usable; a prior successful empty list is last-good state and continues to return an empty catalog during a later outage. A partially refreshed catalog retries failed families on the normal `discovery.cache_ttl_seconds` window; when every attempted family is wholly unavailable, the catalog remains stale and the next request retries.
 

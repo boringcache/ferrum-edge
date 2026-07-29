@@ -17846,7 +17846,7 @@ pub(crate) fn build_response_from_normalized_reject(
     // empty HTTP reject has an authoritative length of exactly zero and must
     // replace any plugin-authored value. Only the trusted `body_disposition`
     // signal (HEAD representation length from `prepare_synthetic_response_wire`,
-    // or a no-body status) selects streaming framing. A native gRPC error is
+    // or a no-body status) selects `Head` framing. A native gRPC error is
     // trailers-only: gRPC never frames with Content-Length, so the field is
     // removed rather than invented as `0` or preserved from a plugin.
     let framing = if is_grpc_error {
@@ -18554,8 +18554,12 @@ pub(crate) fn strip_content_length_for_streaming_grpc_deadline(
     grpc_deadline_at: Option<tokio::time::Instant>,
 ) {
     if grpc_deadline_at.is_some() {
-        // Case-insensitive: Streaming sanitization would otherwise canonicalize
-        // a single mixed-case plugin/backend spelling back onto the wire.
+        // Case-insensitive, and load-bearing beyond the wire: ordinary
+        // Streaming framing removes `Content-Length` from the response the
+        // client sees, but the gateway's own declared-length captures
+        // (`preserved_response_content_length`, `content_length_header_value`)
+        // read this map first, and a length the deadline is about to invalidate
+        // must not inform truncation or coalescing decisions either.
         headers_mod::remove_content_length_header(response_headers);
     }
 }
@@ -24748,21 +24752,29 @@ async fn handle_proxy_request_inner(
                     });
                 if grpc_web_streaming_content_type.is_some() {
                     // Incremental translation changes the representation size
-                    // and carries terminal metadata in a final DATA frame.
-                    // Omit before Streaming sanitization so a mixed-case
-                    // plugin spelling cannot be re-canonicalized onto the wire.
+                    // and carries terminal metadata in a final DATA frame, so
+                    // the backend length describes nothing that will be written.
+                    // Defense in depth: the Streaming boundary below removes
+                    // every case variant anyway.
                     headers_mod::remove_content_length_header(&mut response_headers);
                 }
-                let cl = headers_mod::content_length_header_value(&response_headers);
+                // Native gRPC never frames with `Content-Length`, and the wire
+                // boundary below removes the field. Hyper reconstructs
+                // `Content-Length` from an exact `Body::size_hint()` when the
+                // header is absent, so the streaming body must not advertise a
+                // declared length either — otherwise the H2 writer would undo
+                // the strip.
+                let advertised_content_length: Option<u64> = None;
 
                 // Final protocol-aware boundary before the H2 gRPC streaming
                 // builder. Trailer frames are filtered separately by
                 // StripHopByHopTrailers.
+                // Native gRPC streaming: no HEAD exists on this dispatch and
+                // gRPC never frames with Content-Length, so ordinary Streaming
+                // framing (which removes it outright) is the whole contract.
                 headers_mod::sanitize_client_response_headers_for_wire(
                     &mut response_headers,
-                    headers_mod::ClientResponseFraming::Streaming {
-                        status: grpc_streaming.status,
-                    },
+                    headers_mod::ClientResponseFraming::Streaming,
                 );
 
                 // Build the response with the live Incoming body — hyper will forward
@@ -24832,7 +24844,7 @@ async fn handle_proxy_request_inner(
                 {
                     crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
                         grpc_streaming_trailer_governor.take(),
@@ -24841,7 +24853,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
                         state.max_response_body_size_bytes,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -24850,7 +24862,7 @@ async fn handle_proxy_request_inner(
                 } else {
                     crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                         grpc_streaming.body,
-                        cl,
+                        advertised_content_length,
                         state.h2_coalesce_target_bytes,
                         grpc_read_timeout_ms,
                         grpc_total_deadline,
@@ -25669,9 +25681,8 @@ async fn handle_proxy_request_inner(
                 // output, which copies every plugin-supplied field except
                 // content-type / grpc-status / grpc-message. Keying on
                 // `after_proxy_rejected` therefore left those two arms on
-                // streaming framing, which preserves a plugin-authored
-                // `Content-Length` on a trailers-only gRPC response that carries
-                // no DATA frames at all.
+                // buffered framing that would publish a length for a
+                // trailers-only gRPC response carrying no DATA frames at all.
                 //
                 //   - empty body: no DATA frames (native trailers-only, or a
                 //     plugin-replaced gRPC error). gRPC never frames with
@@ -27525,8 +27536,12 @@ async fn handle_proxy_request_inner(
         None
     };
     if response_inspector.is_some() {
-        // Inspector transforms the body; omit before Streaming sanitization so
-        // a mixed-case plugin spelling cannot be re-canonicalized onto the wire.
+        // Inspector transforms the body, so the backend's declared length no
+        // longer describes anything. Omit case-insensitively BEFORE the
+        // `preserved_response_content_length` capture below: Streaming framing
+        // already removes the wire field, but the H3 graceful-close
+        // completeness gate would otherwise judge the transformed body against
+        // the untransformed length.
         headers_mod::remove_content_length_header(&mut response_headers);
     }
     // Capture this before `method` is moved into the optional transaction
@@ -27643,8 +27658,10 @@ async fn handle_proxy_request_inner(
             already_ended,
             pristine_streaming_grpc_web_terminal_names.as_ref(),
         );
-        // Omit before Streaming sanitization so a mixed-case plugin spelling
-        // cannot be re-canonicalized onto the wire.
+        // Omit case-insensitively before the declared-length capture below:
+        // gRPC-Web translation reframes the body, so the backend length must
+        // not reach the wire (Streaming framing removes it) nor the gateway's
+        // own truncation/coalescing decisions.
         headers_mod::remove_content_length_header(&mut response_headers);
         Some((content_type.to_string(), terminal))
     } else {
@@ -27659,26 +27676,51 @@ async fn handle_proxy_request_inner(
     // and before the H1/H2 builder: strip hop-by-hop / Connection-listed fields
     // and derive or repair Content-Length from the actual body/status/method.
     // Gateway-owned Connection: close (drain/overload) is applied below.
-    // The buffered arms below apply the same rule as
-    // `ClientResponseFraming::for_buffered_response`, spelled out here because
-    // `method` has already moved into the transaction summary and only the
-    // precomputed `is_head` flag remains. Keep the three buffered writers
-    // (this one, native H3, and the H3 bridge) in agreement.
-    let framing = match &response_body {
-        // HEAD keeps a valid backend representation length; do not invent
-        // Content-Length: 0 from the empty wire body.
-        ResponseBody::Buffered(_) if is_head => headers_mod::ClientResponseFraming::Streaming {
+    // The arms below apply the same rules as
+    // `ClientResponseFraming::for_buffered_response` /
+    // `for_streaming_response`, spelled out here because `method` has already
+    // moved into the transaction summary and only the precomputed `is_head`
+    // flag remains. Keep the three buffered writers (this one, native H3, and
+    // the H3 bridge) in agreement.
+    //
+    // Streaming bodies capture their declared length for internal accounting
+    // FIRST: ordinary Streaming framing removes `Content-Length` from the wire
+    // map (a hook-authored value cannot be verified against bytes not yet
+    // written), while the H3 graceful-close classifier and the direct-H2
+    // large-response coalescer bypass still need the length the boundary would
+    // have accepted.
+    let declared_streaming_content_length =
+        headers_mod::preserved_response_content_length(&response_headers, response_status);
+    // What the WIRE may advertise, as opposed to what the gateway keeps for its
+    // own accounting. Hyper reconstructs `Content-Length` from an exact
+    // `Body::size_hint()` whenever the header is absent (the same mechanism
+    // `EmptyUnknownLengthBody` exists to defeat on 205), so stripping the header
+    // alone would leave a hook-authored length reaching H1/H2 clients through
+    // the streaming body's hint. Only `Head` framing may advertise one, and
+    // there it matches the representation length the boundary preserved.
+    let advertised_streaming_content_length = if is_head {
+        declared_streaming_content_length
+    } else {
+        None
+    };
+    let framing = if is_head {
+        // HEAD keeps a valid backend representation length whether the body was
+        // buffered or streamed: the wire body is empty by protocol, so the field
+        // cannot contradict the bytes sent. Do not invent Content-Length: 0 from
+        // the empty wire body either.
+        headers_mod::ClientResponseFraming::Head {
             status: response_status,
-        },
-        ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
-            status: response_status,
-            len: data.len() as u64,
-        },
-        ResponseBody::Streaming { .. }
-        | ResponseBody::StreamingH2(_)
-        | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming {
-            status: response_status,
-        },
+        }
+    } else {
+        match &response_body {
+            ResponseBody::Buffered(data) => headers_mod::ClientResponseFraming::ExactBody {
+                status: response_status,
+                len: data.len() as u64,
+            },
+            ResponseBody::Streaming { .. }
+            | ResponseBody::StreamingH2(_)
+            | ResponseBody::StreamingH3(_) => headers_mod::ClientResponseFraming::Streaming,
+        }
     };
     resp_builder =
         headers_mod::apply_sanitized_response_headers(resp_builder, &mut response_headers, framing);
@@ -27872,9 +27914,12 @@ async fn handle_proxy_request_inner(
                 }
                 inspected
             } else {
-                let cl = response_headers
-                    .get("content-length")
-                    .and_then(|v| v.parse::<u64>().ok());
+                // `cl` drives the gateway's own construction choices only;
+                // `advertised_cl` is what the body may report as an exact size
+                // hint, and hence what hyper may turn back into a wire
+                // `Content-Length`.
+                let cl = declared_streaming_content_length;
+                let advertised_cl = advertised_streaming_content_length;
                 // Build the base body from the shared protocol-agnostic builders
                 // first, THEN optionally wrap it in latency tracking via
                 // `into_tracked`. This guarantees the tracked path inherits the
@@ -27888,17 +27933,17 @@ async fn handle_proxy_request_inner(
                 let base = if state.response_buffer_cutoff_bytes == 0
                     && state.max_response_body_size_bytes == 0
                 {
-                    crate::proxy::body::direct_streaming_body(response, cl)
+                    crate::proxy::body::direct_streaming_body(response, advertised_cl)
                 } else if state.max_response_body_size_bytes > 0 && cl.is_none() {
                     // No Content-Length — enforce size limit while streaming instead
                     // of buffering the entire body into memory.
                     crate::proxy::body::size_limited_streaming_body(
                         response,
                         state.max_response_body_size_bytes,
-                        cl,
+                        advertised_cl,
                     )
                 } else {
-                    crate::proxy::body::coalescing_body(response, cl)
+                    crate::proxy::body::coalescing_body(response, advertised_cl)
                 };
                 let base = if let Some(guard) = reqwest_backend_guard {
                     base.with_reqwest_backend_guard(guard)
@@ -27966,9 +28011,12 @@ async fn handle_proxy_request_inner(
             }
         }
         ResponseBody::StreamingH2(resp) => {
-            let cl = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // `cl` is the gateway's internal size decision input (the
+            // large-response coalescer bypass); `advertised_cl` is the only one
+            // the body may expose as an exact size hint, which hyper would
+            // otherwise re-emit as a wire `Content-Length`.
+            let cl = declared_streaming_content_length;
+            let advertised_cl = advertised_streaming_content_length;
             // Plain-HTTPS direct-H2 large-response fast path.
             //
             // The backend's H2 writer already emits `http2_max_frame_size`
@@ -28022,7 +28070,7 @@ async fn handle_proxy_request_inner(
             {
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28034,7 +28082,7 @@ async fn handle_proxy_request_inner(
                 crate::proxy::body::size_limited_coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
                     state.max_response_body_size_bytes,
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28048,7 +28096,7 @@ async fn handle_proxy_request_inner(
                 // bypass kicks in at body.rs:~1184.
                 crate::proxy::body::direct_streaming_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     h2_read_timeout_ms,
                     None,
                     streaming_trailer_governor.take(),
@@ -28056,7 +28104,7 @@ async fn handle_proxy_request_inner(
             } else {
                 crate::proxy::body::coalescing_h2_body_strip_hop_by_hop_trailers(
                     resp.into_body(),
-                    cl,
+                    advertised_cl,
                     state.h2_coalesce_target_bytes,
                     h2_read_timeout_ms,
                     None,
@@ -28155,9 +28203,13 @@ async fn handle_proxy_request_inner(
             body
         }
         ResponseBody::StreamingH3(h3_resp) => {
-            let client_content_length = response_headers
-                .get("content-length")
-                .and_then(|v| v.parse::<u64>().ok());
+            // The length describing the CLIENT-facing representation (as
+            // opposed to `backend_content_length`, the backend's own
+            // pre-transform declaration). Captured before the final wire
+            // boundary removed the field: it is no longer advertised to the
+            // client, but the graceful-close success gate must still distinguish
+            // a complete body from a truncated one.
+            let client_content_length = declared_streaming_content_length;
             let success_on_drop_after_bytes =
                 h3_success_on_drop_after_response_bytes(inbound_version, client_content_length);
             let backend_content_length = streaming_h3_backend_content_length;
@@ -28189,6 +28241,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     h3_read_timeout_ms,
                     streaming_trailer_governor.take(),
                 )
@@ -28199,6 +28252,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),
@@ -28211,6 +28265,7 @@ async fn handle_proxy_request_inner(
                     h3_method,
                     response_status,
                     backend_content_length,
+                    advertised_streaming_content_length,
                     state.env_config.http3_coalesce_min_bytes,
                     state.env_config.http3_coalesce_max_bytes,
                     std::time::Duration::from_micros(state.env_config.http3_flush_interval_micros),

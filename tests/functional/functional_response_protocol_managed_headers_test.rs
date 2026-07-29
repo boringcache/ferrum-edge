@@ -447,3 +447,137 @@ async fn functional_empty_and_head_reject_framing_h1_h2_h3() {
         "H3: 204 must not advertise a body length"
     );
 }
+
+/// Body length the backend declares on the streaming path. It must exceed
+/// `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (default 65,536) so the gateway takes
+/// the STREAMING response arm rather than eagerly collecting the body into a
+/// buffered one — the buffered arm publishes its own derived length and is not
+/// what this test covers.
+const STREAMED_BODY_LEN: usize = 70_000;
+
+/// Backend that declares a perfectly valid `Content-Length` on a body large
+/// enough to be streamed rather than buffered by the gateway.
+async fn start_streaming_backend(hits: Arc<AtomicUsize>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind streaming backend");
+    let port = listener.local_addr().expect("addr").port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            hits.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = vec![b'z'; STREAMED_BODY_LEN];
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/octet-stream\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+        }
+    });
+    port
+}
+
+/// GHSA-xvr4-5p3r-h7cw residual: on an ordinary (non-`HEAD`) STREAMED response
+/// the gateway must publish no `Content-Length` at all, even when the value is
+/// a perfectly valid decimal.
+///
+/// The earlier repair covered the buffered writers (exact derived length) and
+/// hop-by-hop stripping, but the streaming arm preserved one syntactically valid
+/// value. Nothing on that arm can verify the claim against bytes not yet
+/// written, and `security_headers.set` / `opa.deny_headers` could author one in
+/// the response band — so a streamed response could ship a valid-but-false
+/// length. Removing it is lossless: H1 falls back to chunked transfer-coding and
+/// H2/H3 frame the body with END_STREAM / FIN, which is why every frontend below
+/// still receives the complete body.
+///
+/// Stripping the header alone is not sufficient on H1/H2: hyper reconstructs
+/// `Content-Length` from an exact `Body::size_hint()` whenever the header is
+/// absent, so the streaming body must not advertise the declared length either.
+/// A regression in *either* half fails this test.
+#[tokio::test]
+#[ignore]
+async fn functional_streamed_response_publishes_no_content_length_h1_h2_h3() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let backend_port = start_streaming_backend(Arc::clone(&hits)).await;
+    let (gateway, https_port) = spawn_gateway(backend_port).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy port ready");
+    let url = gateway.proxy_url("/api/streamed");
+
+    // --- H1 ---
+    let h1 = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("h1 client");
+    let h1_resp = h1.get(&url).send().await.expect("H1 streamed");
+    assert_eq!(h1_resp.status(), StatusCode::OK);
+    // `assert_no_protocol_managed` is deliberately NOT used on the H1 arm: with
+    // no `Content-Length`, hyper's own H1 writer frames the body with
+    // `Transfer-Encoding: chunked` and manages `Connection`. Those are
+    // gateway/transport-owned fields written after the plugin boundary, not
+    // backend- or plugin-authored leaks, so their presence here is correct.
+    assert!(
+        h1_resp.headers().get(header::CONTENT_LENGTH).is_none(),
+        "H1 streamed: a valid backend Content-Length must not survive the final \
+         boundary — the gateway cannot verify it against bytes not yet written"
+    );
+    assert_eq!(
+        h1_resp.bytes().await.expect("H1 body").len(),
+        STREAMED_BODY_LEN,
+        "H1 streamed: chunked framing must still deliver the complete body"
+    );
+
+    // --- H2 (h2c prior knowledge on the plaintext proxy port) ---
+    let h2 = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .no_proxy()
+        .build()
+        .expect("h2 client");
+    let h2_resp = h2.get(&url).send().await.expect("H2 streamed");
+    assert_eq!(h2_resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(h2_resp.status(), StatusCode::OK);
+    assert_no_protocol_managed(h2_resp.headers(), "H2 streamed");
+    assert!(
+        h2_resp.headers().get(header::CONTENT_LENGTH).is_none(),
+        "H2 streamed: no Content-Length may reach the client; END_STREAM frames \
+         the body"
+    );
+    assert_eq!(
+        h2_resp.bytes().await.expect("H2 body").len(),
+        STREAMED_BODY_LEN,
+        "H2 streamed: END_STREAM framing must still deliver the complete body"
+    );
+
+    // --- H3 ---
+    let h3 = Http3Client::insecure().expect("h3 client");
+    let h3_url = format!("https://localhost:{https_port}/api/streamed");
+    let h3_resp = h3_request_until_ready(&h3, &h3_url, Method::GET).await;
+    assert_eq!(h3_resp.status, StatusCode::OK);
+    assert_no_protocol_managed(&h3_resp.headers, "H3 streamed");
+    assert!(
+        h3_resp.headers.get(header::CONTENT_LENGTH).is_none(),
+        "H3 streamed: no Content-Length may reach the client; FIN frames the body"
+    );
+    assert_eq!(
+        h3_resp.body_bytes.len(),
+        STREAMED_BODY_LEN,
+        "H3 streamed: FIN framing must still deliver the complete body"
+    );
+    assert!(h3_resp.body_error.is_none(), "H3 streamed: clean body");
+
+    assert!(
+        hits.load(Ordering::SeqCst) >= 3,
+        "each frontend must have reached the streaming backend"
+    );
+}

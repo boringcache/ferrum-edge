@@ -5470,20 +5470,23 @@ async fn handle_h3_request(
         // Content-Length because the inspector transforms the body).
         let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
         if response_inspector.is_some() {
-            // Omit before Streaming sanitization so a mixed-case plugin
-            // spelling cannot be re-canonicalized onto the wire.
+            // Ordinary Streaming framing removes the wire field anyway; this
+            // case-insensitive omit additionally covers `HEAD`, where `Head`
+            // framing would otherwise preserve a representation length the
+            // inspector has invalidated.
             remove_content_length_header(&mut response_headers);
         }
 
         // Final protocol-aware strip after after_proxy: plugins must not
         // reintroduce connection-specific or framing fields onto the H3 wire
-        // (RFC 9114 §4.2). Streaming framing preserves a valid backend
-        // Content-Length and strips invalid / no-body lengths.
+        // (RFC 9114 §4.2). Ordinary streaming framing removes Content-Length —
+        // nothing here can verify a hook-authored value against the DATA frames
+        // still to be written; only HEAD keeps a valid representation length.
+        // The internal completeness check below uses `declared_content_length`,
+        // captured above.
         sanitize_client_response_headers_for_wire(
             &mut response_headers,
-            ClientResponseFraming::Streaming {
-                status: response_status,
-            },
+            ClientResponseFraming::for_streaming_response(&ctx.method, response_status),
         );
 
         // Send response headers on the H3 stream.
@@ -8838,12 +8841,16 @@ async fn stream_h3_open_response_to_client(
         &mut response_headers,
     );
 
-    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2).
+    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2). Ordinary
+    // streaming framing removes Content-Length; only HEAD keeps a valid
+    // representation length. Capture the declared length first — the
+    // graceful-close completeness gate in the relay loop below still needs it to
+    // tell a complete body from a truncated one.
+    let declared_content_length =
+        crate::proxy::headers::preserved_response_content_length(&response_headers, response_status);
     sanitize_client_response_headers_for_wire(
         &mut response_headers,
-        ClientResponseFraming::Streaming {
-            status: response_status,
-        },
+        ClientResponseFraming::for_streaming_response(method, response_status),
     );
 
     // Default `content-type` goes into the header MAP, not just the builder, so
@@ -8959,9 +8966,8 @@ async fn stream_h3_open_response_to_client(
                     }
                     Ok(None) => stream_done = true,
                     Err(error) => {
-                        let content_length = response_headers
-                            .get("content-length")
-                            .and_then(|v| v.parse::<u64>().ok());
+                        // Captured before the final wire boundary stripped it.
+                        let content_length = declared_content_length;
                         let received = total_streamed as u64;
                         if crate::http3::client::is_h3_graceful_close(&error)
                             && crate::http3::client::is_response_body_complete(
@@ -9791,8 +9797,9 @@ async fn dispatch_grpc_native_h3(
     // status, so strip it from the client-facing headers (captured first for the
     // internal graceful-close completeness check in the relay loop below).
     let declared_content_length: Option<u64> = content_length_header_value(&response_headers);
-    // Omit before Streaming sanitization so a mixed-case plugin/backend
-    // spelling cannot be re-canonicalized onto the wire.
+    // Ordinary Streaming framing removes the wire field; omit case-insensitively
+    // here so no later reader of this map treats the backend length as
+    // authoritative across an early terminal trailer.
     remove_content_length_header(&mut response_headers);
 
     // gRPC carries its terminal status in the TRAILERS frame; the initial HEADERS
@@ -9822,11 +9829,13 @@ async fn dispatch_grpc_native_h3(
     // streaming path applies the same sanitizer; the gRPC response path must
     // too, since `response_headers` here comes straight from the backend /
     // after_proxy hooks. Trailer *frames* are untouched.
+    //
+    // Ordinary Streaming framing: gRPC has no HEAD and never frames with
+    // Content-Length, so the field is removed outright rather than deriving a
+    // representation-length exemption from the request method.
     sanitize_client_response_headers_for_wire(
         &mut response_headers,
-        ClientResponseFraming::Streaming {
-            status: response_status,
-        },
+        ClientResponseFraming::Streaming,
     );
 
     // Send response headers. gRPC carries its own `content-type`
@@ -10881,12 +10890,15 @@ async fn proxy_to_backend_h3_streaming(
         &mut response_headers,
     );
 
-    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2).
+    // Final protocol-aware strip after after_proxy (RFC 9114 §4.2). Ordinary
+    // streaming framing removes Content-Length; only HEAD keeps a valid
+    // representation length. Capture the declared length first for the
+    // graceful-close completeness gate in the relay loop below.
+    let declared_content_length =
+        crate::proxy::headers::preserved_response_content_length(&response_headers, response_status);
     sanitize_client_response_headers_for_wire(
         &mut response_headers,
-        ClientResponseFraming::Streaming {
-            status: response_status,
-        },
+        ClientResponseFraming::for_streaming_response(method, response_status),
     );
 
     // Send response headers on the H3 stream. Default `content-type` goes into
@@ -11022,9 +11034,8 @@ async fn proxy_to_backend_h3_streaming(
                         stream_done = true;
                     }
                     Err(e) => {
-                        let cl: Option<u64> = response_headers
-                            .get("content-length")
-                            .and_then(|v| v.parse().ok());
+                        // Captured before the final wire boundary stripped it.
+                        let cl: Option<u64> = declared_content_length;
                         let received = total_streamed as u64;
                         if crate::http3::client::is_h3_graceful_close(&e)
                             && crate::http3::client::is_response_body_complete(
