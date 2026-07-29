@@ -3364,7 +3364,7 @@ impl McpGateway {
         }
 
         if invalid {
-            let responses = responses
+            let response_values = responses
                 .into_iter()
                 .zip(envelopes.iter())
                 .filter_map(|(slot, envelope)| match envelope {
@@ -3382,15 +3382,39 @@ impl McpGateway {
                         "JSON-RPC batch was not forwarded because a sibling member was invalid",
                     )),
                     None => Some(slot),
-                })
-                .collect();
+                });
+            // Apply the response budget while the synthetic array is assembled,
+            // not after serializing the entire result. Admitted member ids are
+            // bounded by the request/item caps, but their combined reflected
+            // size may still be much larger than max_batch_response_bytes.
+            // Serializing the whole array before checking that cap would let an
+            // invalid transparent batch allocate beyond the configured response
+            // budget even though the client ultimately receives only a bounded
+            // error.
+            let mut bounded_responses = Vec::new();
+            let mut response_bytes = 2usize;
+            for value in response_values {
+                if let Err(response) = self.push_bounded_batch_response(
+                    &mut bounded_responses,
+                    &mut response_bytes,
+                    value,
+                ) {
+                    self.clear_batch_item_routing_state(ctx);
+                    self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
+                    ctx.metadata.insert(
+                        "mcp.route_decision".to_string(),
+                        "synthetic_response".to_string(),
+                    );
+                    return response;
+                }
+            }
             self.clear_batch_item_routing_state(ctx);
             self.restore_batch_request_metadata(ctx, headers, &BTreeSet::new());
             ctx.metadata.insert(
                 "mcp.route_decision".to_string(),
                 "synthetic_response".to_string(),
             );
-            return self.bounded_batch_json_response(responses);
+            return self.bounded_batch_json_response(bounded_responses);
         }
 
         // Every member is independently valid. Route once to the single

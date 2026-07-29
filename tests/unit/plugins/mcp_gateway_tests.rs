@@ -7317,6 +7317,40 @@ async fn transparent_batch_invalid_sibling_fails_closed_without_forward() {
     );
 }
 
+#[test]
+fn transparent_invalid_batch_response_is_budgeted_while_assembled() {
+    // The client-visible overflow shape was already a bounded single error, so
+    // the regression is allocation ordering: the transparent invalid-sibling
+    // path must not serialize a potentially much larger complete array before
+    // enforcing max_batch_response_bytes.
+    let source = include_str!("../../../src/plugins/mcp_gateway.rs");
+    let handler = source
+        .split("fn handle_transparent_jsonrpc_batch(")
+        .nth(1)
+        .expect("transparent batch handler")
+        .split("/// Aggregate batches assemble")
+        .next()
+        .expect("bounded transparent batch handler");
+    let invalid_path = handler
+        .split("if invalid {")
+        .nth(1)
+        .expect("transparent invalid-sibling path");
+    assert!(
+        invalid_path.contains("self.push_bounded_batch_response("),
+        "transparent invalid responses must enforce the aggregate budget item by item"
+    );
+    let incremental_check = invalid_path
+        .find("self.push_bounded_batch_response(")
+        .expect("incremental response-budget check");
+    let final_serialize = invalid_path
+        .find("self.bounded_batch_json_response(")
+        .expect("final bounded response serialization");
+    assert!(
+        incremental_check < final_serialize,
+        "the response cap must run before final array serialization"
+    );
+}
+
 #[tokio::test]
 async fn transparent_batch_invalid_sibling_does_not_respond_to_valid_notification() {
     let plugin = create_plugin(
