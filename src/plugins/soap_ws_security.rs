@@ -4577,7 +4577,7 @@ impl SoapWsSecurity {
         if let Err(error) = self.validate_timestamp(security, now) {
             warn!(
                 failure_class = "timestamp",
-                "soap_ws_security: timestamp validation failed: {}", error
+                "soap_ws_security: timestamp validation failed"
             );
             return Err(SoapRejection::new(401, &error, "timestamp"));
         }
@@ -4586,10 +4586,7 @@ impl SoapWsSecurity {
         if self.username_token_enabled {
             match self.validate_username_token(security, now).await {
                 Ok(username) => {
-                    debug!(
-                        content_type = %content_type,
-                        "soap_ws_security: UsernameToken validated"
-                    );
+                    debug!("soap_ws_security: UsernameToken validated");
                     principal.principal.get_or_insert_with(|| username.clone());
                     principal.username = Some(username);
                 }
@@ -4609,7 +4606,7 @@ impl SoapWsSecurity {
                 Err(UsernameTokenError::Structural(detail)) => {
                     warn!(
                         failure_class = UsernameTokenError::STRUCTURAL_CLASS,
-                        "soap_ws_security: UsernameToken validation failed: {}", detail
+                        "soap_ws_security: UsernameToken structural validation failed"
                     );
                     return Err(SoapRejection::new(
                         401,
@@ -4640,7 +4637,7 @@ impl SoapWsSecurity {
                 Err(error) => {
                     warn!(
                         failure_class = "x509_signature",
-                        "soap_ws_security: X.509 signature validation failed: {}", error
+                        "soap_ws_security: X.509 signature validation failed"
                     );
                     return Err(SoapRejection::new(401, &error, "x509_signature"));
                 }
@@ -4661,7 +4658,7 @@ impl SoapWsSecurity {
                 Err(error) => {
                     warn!(
                         failure_class = "saml",
-                        "soap_ws_security: SAML validation failed: {}", error
+                        "soap_ws_security: SAML validation failed"
                     );
                     return Err(SoapRejection::new(401, &error, "saml"));
                 }
@@ -4902,11 +4899,22 @@ pub fn validate_composition(
             .collect();
 
         if !identity_soap.is_empty() && proxy.auth_mode == AuthMode::Multi {
-            let others: Vec<String> = CENTRAL_AUTH_PLUGIN_NAMES
+            // A second identity-establishing SOAP instance is another
+            // authentication plugin too. Multi-auth may stop after the first
+            // one succeeds or let the second one's success override the first
+            // one's rejection, so it carries the same message-gate bypass as a
+            // differently named mechanism.
+            let mut others: Vec<String> = identity_soap
                 .iter()
-                .flat_map(|name| effective(proxy, name))
+                .skip(1)
                 .map(|plugin| plugin.id.clone())
                 .collect();
+            others.extend(
+                CENTRAL_AUTH_PLUGIN_NAMES
+                    .iter()
+                    .flat_map(|name| effective(proxy, name))
+                    .map(|plugin| plugin.id.clone()),
+            );
             if !others.is_empty() {
                 errors.push(format!(
                     "soap_ws_security cannot be composed with another authentication plugin on                      proxy '{}' while auth_mode is 'multi': multi-auth stops at the first                      mechanism that establishes an identity and overrides a rejection with a                      later success, so WS-Security message validation would be skipped or                      ignored. soap_ws_security: {}; other auth plugins: {}. Use auth_mode                      'single', or disable the other mechanisms on this proxy",

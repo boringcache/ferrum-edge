@@ -16752,7 +16752,7 @@ components:
                 Require a wsu:Timestamp to be PRESENT and covered by the
                 signature. A message with no Timestamp is rejected rather than
                 passing vacuously, and pairing this with timestamp.require=false
-                is refused at admission as a contradiction.'s references
+                is refused at admission as a contradiction.
         saml:
           type: object
           description: |

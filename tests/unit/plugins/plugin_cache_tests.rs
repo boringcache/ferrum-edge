@@ -455,6 +455,45 @@ fn plugin_cache_threads_stable_config_id_into_soap_replay_scope() {
     );
 }
 
+fn identity_soap_plugin_config(id: &str, proxy_id: &str) -> PluginConfig {
+    let mut plugin = make_plugin_config(
+        id,
+        "soap_ws_security",
+        PluginScope::Proxy,
+        Some(proxy_id),
+        true,
+    );
+    plugin.config = json!({
+        "timestamp": {"require": false},
+        "username_token": {
+            "enabled": true,
+            "password_type": "PasswordText",
+            "credentials": [{"username": id, "password": "secret"}]
+        }
+    });
+    plugin
+}
+
+#[test]
+fn soap_composition_rejects_two_identity_instances_under_multi_auth() {
+    let mut proxy = make_proxy("soap", "/soap", vec!["soap-a", "soap-b"]);
+    proxy.auth_mode = AuthMode::Multi;
+    let config = make_config(
+        vec![proxy],
+        vec![
+            identity_soap_plugin_config("soap-a", "soap"),
+            identity_soap_plugin_config("soap-b", "soap"),
+        ],
+    );
+
+    let errors = ferrum_edge::plugins::soap_ws_security::validate_composition(&config)
+        .expect_err("multi-auth must not admit two SOAP message gates");
+    let joined = errors.join("; ");
+    assert!(joined.contains("soap-a"), "{joined}");
+    assert!(joined.contains("soap-b"), "{joined}");
+    assert!(joined.contains("auth_mode is 'multi'"), "{joined}");
+}
+
 fn plugin_client_with_ca(ca_path: &str) -> PluginHttpClient {
     use ferrum_edge::config::types::DEFAULT_NAMESPACE;
     use ferrum_edge::config::{BackendEgressPolicy, PoolConfig};
