@@ -1482,7 +1482,7 @@ async fn test_single_auth_missing_credentials_rejects_before_backend() {
 
     let (status_code, body, headers) = result.expect("missing credentials should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
         Some("ferrum-edge")
@@ -1623,7 +1623,7 @@ async fn test_single_auth_preserves_reject_from_plugin_that_sets_identity() {
 
     let (status, body, _headers) = result.expect("same-plugin rejection must remain terminal");
     assert_eq!(status, 403);
-    assert_eq!(body, br#"{"error":"account disabled"}"#);
+    assert_eq!(&body[..], br#"{"error":"account disabled"}"#);
 }
 
 #[tokio::test]
@@ -1648,7 +1648,7 @@ async fn test_multi_auth_all_missing_credentials_rejects_before_backend() {
 
     let (status_code, body, headers) = result.expect("all-missing multi-auth should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
         Some("ferrum-edge")
@@ -1683,7 +1683,7 @@ async fn test_multi_auth_preserves_specific_reject_when_surrounded_by_missing() 
     let (status_code, body, _headers) =
         result.expect("specific reject should win over generic missing fallback");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Specific auth failure"}"#);
+    assert_eq!(&body[..], br#"{"error":"Specific auth failure"}"#);
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
 }
@@ -1865,7 +1865,7 @@ async fn deadline_text_without_typed_provenance_does_not_claim_gateway_ownership
     .await;
 
     assert_eq!(status, 503);
-    assert_eq!(body.as_slice(), b"must not replace terminal deadline");
+    assert_eq!(&body[..], b"must not replace terminal deadline");
     assert_eq!(headers.get("x-replaced").map(String::as_str), Some("true"));
 }
 
@@ -2261,7 +2261,7 @@ async fn test_auth_rejection_merges_all_set_cookie_case_variants_deterministical
                 .expect("both auth attempts must reject");
 
         assert_eq!(status_code, 403);
-        assert_eq!(body, br#"{"error":"mixed-case rejection"}"#);
+        assert_eq!(&body[..], br#"{"error":"mixed-case rejection"}"#);
         assert_eq!(
             headers.get("X-Rejection").map(String::as_str),
             Some("selected")

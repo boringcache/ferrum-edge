@@ -642,3 +642,119 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
         );
     }
 }
+
+/// Gateway API v1.5.1 scopes the merge prohibition to the HTTP family, and
+/// Ferrum now claims `TCPRoute` through live black-box conformance checks. The
+/// whole-route cross-kind rejection must therefore stay confined to
+/// HTTPRoute/GRPCRoute: an L4 route sharing a Gateway with a losing GRPCRoute
+/// keeps its stream proxy and is never reported `Conflicted`.
+///
+/// Widening the arbitration to "any two different route kinds" would withdraw a
+/// TCPRoute whenever an HTTPRoute contended on the same Gateway — a regression
+/// only the 90-minute conformance lab would otherwise catch.
+#[test]
+fn cross_kind_rejection_does_not_reach_l4_routes_on_the_same_gateway() {
+    let gateway = cross_kind_gateway(json!([
+        {
+            "name": "web",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]}
+        },
+        {
+            "name": "db",
+            "port": 15432,
+            "protocol": "TCP",
+            "allowedRoutes": {"kinds": [{"kind": "TCPRoute"}]}
+        }
+    ]));
+    let mut http_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "web",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+        }),
+    );
+    http_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc_route = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "grpc",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"method": {"service": "pkg.Svc", "method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]
+        }),
+    );
+    grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+    // Deliberately the newest object: an order- or timestamp-driven widening of
+    // the arbitration would pick this one as the loser.
+    let mut tcp_route = object(
+        "gateway.networking.k8s.io/v1alpha2",
+        "TCPRoute",
+        "db",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "db"}],
+            "rules": [{"backendRefs": [{"name": "db", "port": 5432}]}]
+        }),
+    );
+    tcp_route.metadata.creation_timestamp = Some("2026-03-01T00:00:00Z".to_string());
+
+    let objects = vec![gateway_class(), gateway, http_route, grpc_route, tcp_route];
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    // The HTTP-family arbitration still runs, and it names only the GRPCRoute.
+    assert!(
+        translation
+            .route_conflicts
+            .iter()
+            .any(|conflict| conflict.loser.kind == "GRPCRoute"),
+        "the newer GRPCRoute must still lose the cross-kind arbitration: {:?}",
+        translation.route_conflicts
+    );
+    let l4_arbitrated = translation
+        .route_conflicts
+        .iter()
+        .any(|conflict| conflict.loser.kind == "TCPRoute" || conflict.winner.kind == "TCPRoute");
+    assert!(
+        !l4_arbitrated,
+        "an L4 route must never take part in HTTPRoute/GRPCRoute arbitration: {:?}",
+        translation.route_conflicts
+    );
+
+    // The TCPRoute still materializes its stream proxy on the TCP listener.
+    let tcp_proxy = translation
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.backend_port == 5432)
+        .expect("the TCPRoute must still materialize a stream proxy");
+    assert_eq!(tcp_proxy.listen_port, Some(15432));
+
+    // ...and the winning HTTPRoute is unaffected, while the loser stays absent.
+    assert!(
+        translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_port == 8080),
+        "the winning HTTPRoute must still materialize"
+    );
+    assert!(
+        !translation
+            .config
+            .proxies
+            .iter()
+            .any(|proxy| proxy.backend_port == 50051),
+        "the rejected GRPCRoute must not produce a proxy"
+    );
+}

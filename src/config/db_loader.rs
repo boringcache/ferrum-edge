@@ -2400,14 +2400,14 @@ impl DatabaseStore {
                 .await?;
         }
 
-        // Hot-path isolation: strip api_spec_id from runtime config. The row
-        // mappers preserve api_spec_id so admin GET/list paths can serialise
-        // it; here we ensure the gateway's in-memory `GatewayConfig` does
-        // not carry the ownership tag (the runtime never reads it, and CP
-        // gRPC broadcasts must not leak it to DPs). Mirrors the strip done
-        // by Mongo's `load_full_config`. See the cross-backend invariant
-        // test `runtime_load_strips_api_spec_id_from_resources`.
-        strip_api_spec_id_from_runtime_config(&mut config);
+        // Hot-path isolation: strip api_spec_id from runtime and CP config. The
+        // row mappers preserve api_spec_id so admin GET/list and backup export
+        // can serialise ownership; here we ensure the gateway's in-memory
+        // `GatewayConfig` and CP broadcasts do not carry the tag. Backup export
+        // keeps the tags so restore can recreate managed relationships.
+        if !matches!(purpose, FullConfigLoadPurpose::BackupExport) {
+            strip_api_spec_id_from_runtime_config(&mut config);
+        }
 
         self.check_slow_query("load_full_config", start);
         Ok(config)
@@ -2462,10 +2462,9 @@ impl DatabaseStore {
             .normalize_fields()
             .run()?;
 
-        // Match `load_full_config`: strip the api_spec ownership tag. A rollback
-        // re-applies these resources as hand-managed; the `api_specs` rows are
-        // captured separately by the caller.
-        strip_api_spec_id_from_runtime_config(&mut config);
+        // Preserve api_spec_id ownership tags. Restore rollback now recreates
+        // api_specs documents from the recovery snapshot and must re-stamp
+        // managed relationships rather than converting them to hand-managed.
 
         self.check_slow_query("load_namespace_snapshot", start);
         Ok(config)
@@ -2482,6 +2481,149 @@ impl DatabaseStore {
         let count: i64 = row.try_get("cnt")?;
         self.check_slow_query("count_api_specs", start);
         u64::try_from(count).map_err(|_| anyhow::anyhow!("api_specs count cannot be negative"))
+    }
+
+    /// Primary-only full export of every ApiSpec row including `spec_content`.
+    ///
+    /// Used by `GET /backup` and restore recovery snapshots. Never call from
+    /// runtime config loading or polling.
+    pub async fn list_api_specs_with_content(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
+        let start = Instant::now();
+        let rows: Vec<AnyRow> =
+            sqlx::query(&self.q("SELECT * FROM api_specs WHERE namespace = ? ORDER BY id ASC"))
+                .bind(namespace)
+                .fetch_all(&self.pool())
+                .await?;
+        let mut specs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            specs.push(row_to_api_spec(row)?);
+        }
+        self.check_slow_query("list_api_specs_with_content", start);
+        Ok(specs)
+    }
+
+    /// Insert API-spec metadata rows after their owned resources already exist.
+    pub async fn batch_insert_api_specs(
+        &self,
+        specs: &[crate::config::types::ApiSpec],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        let start = Instant::now();
+        if specs.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        for chunk in specs.chunks(Self::BATCH_CHUNK_SIZE) {
+            total += self.batch_insert_api_specs_chunk(chunk, mode).await?;
+        }
+        self.check_slow_query("batch_insert_api_specs", start);
+        Ok(total)
+    }
+
+    async fn batch_insert_api_specs_chunk(
+        &self,
+        specs: &[crate::config::types::ApiSpec],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        let mut tx = self.pool().begin().await?;
+        let mut admission_namespaces: Vec<&str> =
+            specs.iter().map(|spec| spec.namespace.as_str()).collect();
+        admission_namespaces.sort_unstable();
+        admission_namespaces.dedup();
+        for namespace in &admission_namespaces {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                .await?;
+        }
+        for spec in specs {
+            // Defense in depth: the owning proxy must already exist. Ownership
+            // tags are stamped separately because ordinary batch inserts omit
+            // `api_spec_id` so direct admin writes cannot forge managed state.
+            let proxy_row: Option<AnyRow> =
+                sqlx::query(&self.q("SELECT id FROM proxies WHERE namespace = ? AND id = ?"))
+                    .bind(&spec.namespace)
+                    .bind(&spec.proxy_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if proxy_row.is_none() {
+                anyhow::bail!(
+                    "cannot restore api_spec '{}': owning proxy '{}' is missing",
+                    spec.id,
+                    spec.proxy_id
+                );
+            }
+            self.insert_api_spec_tx(&mut tx, spec).await?;
+        }
+        let count = specs.len();
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Stamp `api_spec_id` tags onto restored resources from backup payload values.
+    pub async fn apply_api_spec_ownership_from_resources(
+        &self,
+        proxies: &[Proxy],
+        upstreams: &[Upstream],
+        plugin_configs: &[PluginConfig],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        let start = Instant::now();
+        let mut tx = self.pool().begin().await?;
+        let mut namespaces: Vec<&str> = proxies
+            .iter()
+            .map(|p| p.namespace.as_str())
+            .chain(upstreams.iter().map(|u| u.namespace.as_str()))
+            .chain(plugin_configs.iter().map(|p| p.namespace.as_str()))
+            .collect();
+        namespaces.sort_unstable();
+        namespaces.dedup();
+        for namespace in &namespaces {
+            self.lock_mtls_dns_admission_for_owner_tx(&mut tx, namespace, mode.guard_owner())
+                .await?;
+        }
+        for proxy in proxies {
+            if let Some(spec_id) = proxy.api_spec_id.as_deref() {
+                sqlx::query(
+                    &self.q("UPDATE proxies SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                )
+                .bind(spec_id)
+                .bind(&proxy.namespace)
+                .bind(&proxy.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        for upstream in upstreams {
+            if let Some(spec_id) = upstream.api_spec_id.as_deref() {
+                sqlx::query(
+                    &self.q("UPDATE upstreams SET api_spec_id = ? WHERE namespace = ? AND id = ?"),
+                )
+                .bind(spec_id)
+                .bind(&upstream.namespace)
+                .bind(&upstream.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        for plugin in plugin_configs {
+            if let Some(spec_id) = plugin.api_spec_id.as_deref() {
+                sqlx::query(
+                    &self.q(
+                        "UPDATE plugin_configs SET api_spec_id = ? WHERE namespace = ? AND id = ?",
+                    ),
+                )
+                .bind(spec_id)
+                .bind(&plugin.namespace)
+                .bind(&plugin.id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        self.check_slow_query("apply_api_spec_ownership_from_resources", start);
+        Ok(())
     }
 
     pub async fn count_namespace_resources(
@@ -9732,6 +9874,38 @@ impl DatabaseBackend for DatabaseStore {
 
     async fn count_api_specs(&self, namespace: &str) -> Result<u64, anyhow::Error> {
         DatabaseStore::count_api_specs(self, namespace).await
+    }
+
+    async fn list_api_specs_with_content(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<crate::config::types::ApiSpec>, anyhow::Error> {
+        DatabaseStore::list_api_specs_with_content(self, namespace).await
+    }
+
+    async fn batch_insert_api_specs(
+        &self,
+        specs: &[crate::config::types::ApiSpec],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<usize, anyhow::Error> {
+        DatabaseStore::batch_insert_api_specs(self, specs, mode).await
+    }
+
+    async fn apply_api_spec_ownership_from_resources(
+        &self,
+        proxies: &[Proxy],
+        upstreams: &[Upstream],
+        plugin_configs: &[PluginConfig],
+        mode: &BatchConfigWriteMode,
+    ) -> Result<(), anyhow::Error> {
+        DatabaseStore::apply_api_spec_ownership_from_resources(
+            self,
+            proxies,
+            upstreams,
+            plugin_configs,
+            mode,
+        )
+        .await
     }
 
     async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {

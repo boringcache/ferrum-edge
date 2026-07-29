@@ -766,7 +766,7 @@ Produces transaction summaries as JSON messages to an Apache Kafka topic. Uses a
 
 > **Requires a fully-open backend egress policy.** librdkafka resolves bootstrap hostnames itself and dials brokers advertised by cluster metadata, and the pinned `rdkafka 0.39` exposes no connect/resolve callback, so Ferrum cannot screen those addresses. `kafka_logging` therefore **fails closed** and is refused whenever the backend egress policy can deny any address — which includes the default posture. `broker_list` is parsed with librdkafka's exact `[proto://]host[:port]` grammar, so protocol-prefixed denied literals (e.g. `PLAINTEXT://169.254.169.254:9092`) are rejected too. See [Backend Egress / SSRF Protection](configuration.md#kafka_logging-requires-a-fully-open-egress-policy).
 
-Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue (Ferrum then releases its retained-byte lease). Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
+Hot-path admission is lock-free: Ferrum reserves both a bounded channel slot and a worst-case `max_entry_bytes` lease from the aggregate `buffer_max_bytes` budget before serializing or cloning attacker-shaped summary fields. It then enforces the exact per-entry limit, shrinks the lease to the purpose-built payload/key record's retained size, and queues that record. Local `ThreadedProducer::send` success only means the record was admitted to librdkafka's in-memory queue, which keeps its own copy of the payload until delivery resolves. Ferrum therefore does **not** release the retained-byte lease at that handoff: it transfers the lease into the record's librdkafka delivery opaque, so a stalled broker's pinned downstream queue stays charged to both the per-instance `buffer_max_bytes` budget and the process-wide retained-byte ceiling. The lease is released exactly once, by the delivery callback (terminal delivery, terminal failure, or purge-on-destroy) or by the immediate-`send`-rejection path that hands the opaque back. Terminal broker acknowledgement (including the local completion semantics of `acks: 0`) is observed through a delivery callback and exported as authenticated `kafka_logging` diagnostics/metrics (fixed labels/counters only). Graceful shutdown and reload atomically stop admission, await already-reserved admits and the batching worker, then await one producer flush whose complete blocking-pool scheduling and librdkafka work is bounded by `flush_timeout_seconds`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -1195,6 +1195,106 @@ current reservation depth. Alert on
 aggregate reject counter when diagnosing budget exhaustion: the aggregate also
 counts closed-admission and no-runtime rejects that occur normally at shutdown.
 
+### Process-wide retained-byte ceiling
+
+The task budget above bounds *pending delivery tasks*. A second, independent
+budget bounds *retained bytes*. Every observability sink instance —
+`http_logging`, `tcp_logging`, `udp_logging`, `statsd_logging`, `loki_logging`,
+`ws_logging`, `kafka_logging`, the OpenTelemetry/Zipkin/Datadog trace
+exporters, and `api_chargeback_sink` — already reserves against its own
+per-instance `buffer_max_bytes` budget before it clones, serializes, or
+compresses an attacker-shaped record. Each of those reservations now also takes
+a matching reservation against one process-wide ceiling,
+`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` (default 256 MiB).
+
+The process reservation is taken *first*, so a refused aggregate reservation
+never leaves per-instance bytes held, and the record is refused before any
+clone, serialization, or compression work happens. Reservations shrink to the
+exact retained size once the record is measured and release on drop, so
+delivery, drops, rejected channel handoffs, and cancellation all recover
+capacity without waiting for shutdown.
+
+This is what stops configuration from multiplying the bound: ten sink instances
+each configured at the 256 MiB per-instance hard maximum retain at most the one
+configured process total between them, not 2.5 GiB.
+
+#### What the ceiling covers, layer by layer
+
+The ceiling is an **end-to-end** retained-byte bound, not a queue bound. Every
+representation of an attacker-shaped record that can exist at the same time as
+the queued entry is charged to it:
+
+| Layer | Owner | Charged as | Released when |
+| --- | --- | --- | --- |
+| Serialized queued entry | the sink's admission path | `max_entry_bytes` lease, shrunk to the measured size | the entry is delivered, dropped, or cancelled |
+| Contiguous batch payload for `http_logging` / `tcp_logging` / `udp_logging` / `statsd_logging` / `ws_logging` | the delivery worker | the second of the two retained copies each entry's lease already charges | the payload and its retries finish |
+| librdkafka's own copy of a `kafka_logging` record | librdkafka, until delivery resolves | the record's lease is **transferred into the librdkafka delivery opaque** rather than released at handoff | the delivery callback fires — terminal delivery, terminal failure, or purge-on-destroy — or an immediate `send` rejection hands the opaque back |
+| `loki_logging` batch JSON body, and the gzip output when compression is enabled | the delivery worker | separate ceiling reservations taken *before* the body is written or compressed, sized from a conservative escaping/compression bound | the body and its retries finish |
+| `loki_logging` label-grouping order index | the payload writer | a ceiling reservation taken before the index is allocated; the index is one `usize` per entry and does **not** scale with the number of distinct dynamic label sets | the payload finishes being written |
+| Trace exporter batch `Value` tree and serialized request body | the exporter flush loop | separate ceiling reservations taken before the tree is built and before the body is serialized | the tree is dropped right after serialization; the body when its retries finish |
+| `api_chargeback_sink` JSONEachRow insert body (live batches) | the delivery worker | a ceiling reservation taken before serialization | the request finishes |
+| `api_chargeback_sink` decoded spool artifact and its line index | the replay worker | reservations taken *before* the file is read and before the index is allocated, sized from the artifact's declared decoded length — the on-disk length when it is uncompressed, and the decompressed size recorded in the zstd frame header for one this build wrote; only a frame carrying no content size (a foreign or hand-planted archive) falls back to the ratio-clamped decompression bound | the artifact is fully replayed, deferred, or dead-lettered |
+| `api_chargeback_sink` replay worklist and per-chunk body | the replay worker | a reservation for the whole worklist before it exists, plus one per chunk body | the chunk request finishes; the worklist when the file leaves replay |
+
+Two consequences are worth calling out:
+
+- **Batch materialization is charged to the process ceiling only**, never a
+  second time to the per-instance `buffer_max_bytes` budget. That budget is
+  already committed to the queued entries, so charging it again would refuse
+  every batch a full queue produces.
+- **A refused batch representation is not materialized.** `loki_logging` drops
+  the batch; the trace exporters halve the slice and retry, so a large
+  `batch_size` loses spans only when even a single span's representation cannot
+  be reserved. `api_chargeback_sink` never loses data to a refusal: a refused
+  live batch fails the flush and goes to the durable spool through the
+  pre-existing failed-batch path, and a refused spool artifact, worklist, or
+  chunk body is reported as *retryable* — the durable claim is released so a
+  later tick replays the same file in order, rather than quarantining a healthy
+  record.
+
+Retries never deep-copy a payload: each materialized body is an immutable
+refcounted buffer, and an attempt takes a handle rather than re-serializing.
+Spool replay never copies a row at all — chunking and 413 splitting address
+`(start, end)` byte ranges into the one decoded artifact, so splitting a batch
+cannot multiply retained row bytes.
+
+Telemetry uses fixed labels only — no attacker-controlled label values:
+
+- `ferrum_observability_retained_bytes` — current process-wide retention
+- `ferrum_observability_retained_bytes_high_water` — peak since startup
+- `ferrum_observability_max_retained_bytes` — the configured ceiling
+- `ferrum_observability_process_ceiling_rejections_total` — admissions refused
+  by the ceiling specifically, rather than by a per-instance budget. This counts
+  **reservations**, not records: one refusal can discard a whole batch, and some
+  refusals (chargeback replay) discard nothing at all.
+- `ferrum_observability_batch_materialization_lost_records_total` — the
+  record-scale companion: log entries, spans, and rows actually discarded
+  because their batch representation could not be materialized
+- `ferrum_observability_batch_materialization_losses_total` — discard events,
+  each of which lost one or more records
+- `ferrum_observability_batch_materialization_fallbacks_total` — batches
+  delivered complete but degraded, such as `loki_logging` sending uncompressed
+  because the gzip buffer could not be reserved. No record loss.
+
+Per-instance refusals stay on each sink's own drop accounting, so the counters
+together tell an operator whether to raise one sink's `buffer_max_bytes` or the
+process ceiling. If you see sustained
+`ferrum_observability_process_ceiling_rejections_total` growth alongside
+`ferrum_observability_batch_materialization_lost_records_total`, raise
+`FERRUM_LOG_DELIVERY_MAX_RETAINED_BYTES` or lower the affected sink's
+`batch_size`.
+
+Diagnostics on these paths are **sampled**, not per batch: the loss and fallback
+helpers warn on the first event and then every hundredth, with a fixed reason
+label and no payload content. Sustained ceiling saturation therefore produces a
+bounded warning stream, and the counters above — not the log — are the signal to
+alert on.
+
+The process-global stdout access-log sink is deliberately excluded: it is a
+single sink bounded by `FERRUM_LOG_BUFFER_CAPACITY` /
+`FERRUM_LOG_BUFFER_BYTES` / `FERRUM_LOG_MAX_RECORD_BYTES`, and it does not
+multiply with plugin instance count.
+
 A completed drain is terminal for that delivery lifecycle *generation*: its
 task and worker admission stay closed and its drain report stays cached, so
 late producers on a shutting-down process cannot reopen delivery work behind
@@ -1326,7 +1426,7 @@ The outer Loki timestamp is assigned in the plugin's single flush order and is s
 
 Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
 
-The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
+The channel slot is reserved before serialization. Hot-path admission then takes a provisional `max_entry_bytes` lease against both the per-instance `buffer_max_bytes` budget and the process-wide retained-byte ceiling **before** serializing the JSON line or constructing labels; a refused reservation skips both and fails closed. After admission the lease shrinks to the exact retained size (JSON line plus labels). Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 

@@ -216,7 +216,7 @@ async fn websocket_upgrade_without_api_key_rejects_before_backend() {
 
     let (status_code, body, headers) = result.expect("missing key should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Authentication required"}"#);
+    assert_eq!(&body[..], br#"{"error":"Authentication required"}"#);
     assert_eq!(
         headers.get("WWW-Authenticate").map(String::as_str),
         Some("ferrum-edge")
@@ -246,7 +246,7 @@ async fn websocket_upgrade_with_invalid_api_key_preserves_plugin_reject() {
 
     let (status_code, body, headers) = result.expect("invalid key should reject");
     assert_eq!(status_code, 401);
-    assert_eq!(body, br#"{"error":"Invalid API key"}"#);
+    assert_eq!(&body[..], br#"{"error":"Invalid API key"}"#);
     assert!(headers.is_empty());
     assert!(ctx.identified_consumer.is_none());
     assert!(ctx.authenticated_identity.is_none());
