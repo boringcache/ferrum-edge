@@ -331,10 +331,7 @@ fn parse_exposition_families(text: &str) -> BTreeMap<String, ExpositionFamily> {
             if close <= open {
                 panic!("malformed exposition sample line: invalid label block in {line}");
             }
-            (
-                &prefix[..open],
-                Some(&prefix[open + 1..close]),
-            )
+            (&prefix[..open], Some(&prefix[open + 1..close]))
         } else {
             (prefix, None)
         };
