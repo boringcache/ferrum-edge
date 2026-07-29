@@ -5140,14 +5140,8 @@ pub mod _test_support {
         value: &serde_json::Value,
         env: &HashMap<String, String>,
     ) -> Result<crate::notifications::channels::EmailChannel, String> {
-        crate::notifications::channels::EmailChannel::new_with_env_lookup(
-            name,
-            value,
-            &|var| {
-                env.get(var)
-                    .cloned()
-                    .ok_or(std::env::VarError::NotPresent)
-            },
-        )
+        crate::notifications::channels::EmailChannel::new_with_env_lookup(name, value, &|var| {
+            env.get(var).cloned().ok_or(std::env::VarError::NotPresent)
+        })
     }
 }

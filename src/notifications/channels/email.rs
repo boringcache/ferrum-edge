@@ -47,8 +47,8 @@ use crate::plugins::utils::{parse_socket_host, resolve_tcp_endpoint};
 
 use super::super::notification::{Notification, NotificationField};
 use super::super::templating::{render_template_bounded, validate_template};
-use super::{EnvVarLookup, resolve_optional_string_with_lookup};
 use super::webhook::base_vars;
+use super::{EnvVarLookup, resolve_optional_string_with_lookup};
 
 /// Static plugin/subsystem label used for DNS-resolution diagnostics.
 const CHANNEL_LABEL: &str = "notification_email";
@@ -322,10 +322,20 @@ impl EmailChannel {
             )
         })?;
 
-        let username =
-            resolve_optional_string_with_lookup(value, "username", "username_env", name, env_lookup)?;
-        let password =
-            resolve_optional_string_with_lookup(value, "password", "password_env", name, env_lookup)?;
+        let username = resolve_optional_string_with_lookup(
+            value,
+            "username",
+            "username_env",
+            name,
+            env_lookup,
+        )?;
+        let password = resolve_optional_string_with_lookup(
+            value,
+            "password",
+            "password_env",
+            name,
+            env_lookup,
+        )?;
         let credentials = match (username, password) {
             (Some(username), Some(password)) => {
                 validate_credential_component(&username, "username", name)?;
