@@ -164,7 +164,7 @@ Sorted by family name. Optional namespace labels are listed when the emitter sup
 | `ferrum_mesh_bpf_drop_reasons` | gauge | `reason` | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting). |
 | `ferrum_mesh_bpf_drops_total` | counter | `reason` | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks. |
 | `ferrum_mesh_bpf_ringbuf_events_total` | counter | — | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | Total events drained from the SOCK_OPS ringbuf. |
-| `ferrum_mesh_bpf_ringbuf_in_overrun_regime` | gauge | — | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | 1 while the consumer is in an overrun regime, 0 after recovery. |
+| `ferrum_mesh_bpf_ringbuf_in_overrun_regime` | gauge | — | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | 1 while the consumer is in an overrun regime, 0 after recovery. Pair with `_overruns_total` for alerting. |
 | `ferrum_mesh_bpf_ringbuf_overruns_total` | counter | — | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | Ringbuf overrun episodes. |
 | `ferrum_mesh_bpf_srtt_microseconds` | histogram | `le` | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count. |
 | `ferrum_mesh_bpf_syn_to_ack_microseconds` | histogram | `le` | `mesh_bpf` | `documented_only` | `when_plugin_enabled` | Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count. |

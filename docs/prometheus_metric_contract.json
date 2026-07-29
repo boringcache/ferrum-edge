@@ -1217,7 +1217,7 @@
   {
     "name": "ferrum_mesh_bpf_ringbuf_in_overrun_regime",
     "type": "gauge",
-    "help": "1 while the consumer is in an overrun regime, 0 after recovery.",
+    "help": "1 while the consumer is in an overrun regime, 0 after recovery. Pair with `_overruns_total` for alerting.",
     "labels": [],
     "subsystem": "mesh_bpf",
     "export_surface": "/metrics",
