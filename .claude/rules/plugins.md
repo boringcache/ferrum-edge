@@ -72,7 +72,7 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 3. `authorize`: ACL, mesh_authz, rate limiting
 4. `normalize_buffered_request_body_before_before_proxy`: configured request decompression (and any future early body normalizers) after the pre-`before_proxy` buffer is stored
 5. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
-6. `on_final_request_body`: body validator and gRPC-Web validation
+6. `on_final_request_body`: body validator, gRPC-Web validation, `ai_prompt_compressor` staged marker-sanitization rejection (4055), `ai_semantic_cache` exact/semantic lookup (4057), `ai_federation` provider dispatch (4060). `ai_semantic_cache` looks up here — not in `before_proxy` — so its replay partition binds the finalized outbound headers/query/destination and the fully transformed request body, and so a hit cannot bypass a fail-closed final-body validator. Its priority must stay strictly between `ai_prompt_compressor` and `ai_federation`.
 7. `after_proxy`: response-side counterpart to before_proxy
    - Successful H1/H2/H3 WebSocket handshakes bypass general `after_proxy` and
      instead run the synchronous, non-rejecting

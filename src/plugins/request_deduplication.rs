@@ -2862,6 +2862,16 @@ fn canonical_authority(headers: &HashMap<String, String>) -> String {
 /// their values (see [`RequestDeduplication::build_request_fingerprint`]) so a
 /// same-subject/different-scope credential cannot reuse another caller's stored
 /// result while the raw secret still never enters a key or a log line.
+///
+/// Per-request tracing/correlation identifiers are excluded here, and that is a
+/// *different* contract from the replay-partition one in
+/// `replay_partition::append_request_context_partition` (which binds them,
+/// because a retained representation may not be replayed across a
+/// backend-visible dimension). This fingerprint answers "is this the same
+/// operation?" for an idempotency key, and a client retrying a failed write
+/// emits a fresh trace ID by design. Binding it would make every retry a new
+/// operation and defeat the plugin's entire purpose — re-executing the side
+/// effect is the failure mode dedup exists to prevent.
 fn request_headers_for_fingerprint<'a>(
     headers: &'a HashMap<String, String>,
     idempotency_header: &str,

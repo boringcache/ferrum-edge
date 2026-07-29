@@ -34,6 +34,20 @@
 //! params, tools, response format, stream flag, system prompt, and
 //! system/developer message instructions).
 //!
+//! # Lifecycle
+//!
+//! Lookup runs at priority **4057**, in `on_final_request_body_with_context` —
+//! not in `before_proxy`. That is the first point at which the request the
+//! provider would actually receive exists: `request_transformer` (3000) has
+//! rewritten headers and the query, every `transform_request_body` hook has run
+//! (`compression` request decode at 4050, `ai_prompt_compressor` at 4055), and
+//! `ai_prompt_compressor`'s staged marker-sanitization rejection has already
+//! been enforced by its own final hook at 4055. Lookup still precedes
+//! `ai_federation` (4060), which performs provider I/O from the same stage, and
+//! every `before_proxy` admission guardrail (rate limiting, WAF, prompt shield,
+//! body/OpenAPI validation, semantic firewall, request guard, tool governor)
+//! still runs ahead of any hit. Store remains in `on_final_response_body`.
+//!
 //! # Storage
 //!
 //! - **local** (default): In-memory `DashMap` with TTL-based eviction
@@ -119,8 +133,9 @@ const AI_SEMANTIC_CACHE_CALLER_DOMAIN: &str = "ferrum-ai-semantic-cache-caller-v
 /// (`replay_partition::append_destination_partition`), which binds the proxy
 /// *namespace* the plugin's former hand-rolled encoding omitted.
 const AI_SEMANTIC_CACHE_DESTINATION_DOMAIN: &str = "ferrum-ai-semantic-cache-destination-v1";
-/// Backend-visible request context: original authority, method, path, raw query,
-/// and the live non-credential header view (credential values digested).
+/// Backend-visible request context: original authority, method, path, the
+/// effective outbound query, and the finalized non-credential header view
+/// (credential values digested).
 const AI_SEMANTIC_CACHE_REQUEST_DOMAIN: &str = "ferrum-ai-semantic-cache-request-v1";
 
 /// Fixed-shape retention, isolation, size, and keying fields at the plugin root.
@@ -2416,7 +2431,7 @@ impl AiSemanticCache {
     }
 
     /// Hot-path suppressor probe that increments the suppression counter when
-    /// active (mirrors production `before_proxy` behavior).
+    /// active (mirrors production lookup behavior).
     #[allow(dead_code)]
     pub(crate) fn redis_quarantine_is_suppressed_for_tests(&self, cache_key: &str) -> bool {
         self.redis_quarantine
@@ -2667,10 +2682,14 @@ fn append_identity_key_parts(
 
     // Backend-visible request context. The rest of this key is derived from the
     // request *body*, so without this the origin's other inputs — the original
-    // client authority, the raw query, and every non-credential request header —
-    // are unbound and two tenants separated only by a header or a query
-    // parameter share one retained completion. Credential values are digested
-    // inside the partition; no secret enters the assembled `String`.
+    // client authority, the effective outbound query, and every non-credential
+    // request header — are unbound and two tenants separated only by a header or
+    // a query parameter share one retained completion. Because lookup runs in
+    // the final-request-body hook, `request_headers` is the post-transform
+    // outbound map and the query is `request_transformer`'s published outbound
+    // query, so this is genuinely what the provider will see rather than the
+    // pre-transform request. Credential values are digested inside the
+    // partition; no secret enters the assembled `String`.
     let mut request = PartitionHasher::new(AI_SEMANTIC_CACHE_REQUEST_DOMAIN);
     replay_partition::append_request_context_partition(&mut request, ctx, request_headers);
     start_key_part(key_input, has_part);
@@ -4586,7 +4605,23 @@ impl Plugin for AiSemanticCache {
         self.rebuild_signal.notify_waiters();
     }
 
-    fn requires_request_body_before_before_proxy(&self) -> bool {
+    /// The request body must be buffered, but this plugin no longer needs it
+    /// *before* `before_proxy`: lookup runs in the final-request-body hook over
+    /// the fully transformed backend-visible bytes.
+    fn requires_request_body_buffering(&self) -> bool {
+        true
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        true
+    }
+
+    /// Lookup is a terminal request-phase boundary: a hit returns the retained
+    /// provider response instead of dispatching. Declaring it here keeps it
+    /// ahead of backend-only circuit-breaker / pool / TLS preflight, in the same
+    /// stage as `ai_federation` (4060) — and, because this plugin's priority is
+    /// 4057, ordered before it.
+    fn requires_final_request_body_before_backend_dispatch(&self) -> bool {
         true
     }
 
@@ -4617,10 +4652,40 @@ impl Plugin for AiSemanticCache {
             && !content_type.is_some_and(is_event_stream_content_type)
     }
 
-    async fn before_proxy(
+    /// Exact + semantic cache lookup over the **finalized backend-visible
+    /// request**.
+    ///
+    /// This deliberately runs in `on_final_request_body_with_context` rather
+    /// than `before_proxy`. A retained completion may only be replayed to a
+    /// request that provably shares every dimension the provider could decide
+    /// on, and in `before_proxy` none of those dimensions are final yet:
+    ///
+    /// * `request_transformer` (3000) has not rewritten headers or the query,
+    ///   so a "backend-visible" header/query partition taken there describes a
+    ///   request that will never be sent;
+    /// * no `transform_request_body` hook has run, so the prompt bytes keyed
+    ///   there are not the prompt bytes the provider would receive
+    ///   (`compression` request decode at 4050, `ai_prompt_compressor` at
+    ///   4055, `mcp_gateway`/`ai_stream_router` body rewrites);
+    /// * fail-closed final-request-body validators have not run, so a hit could
+    ///   answer a request the gateway had already decided to refuse — in
+    ///   particular `ai_prompt_compressor` stages a marker-sanitization
+    ///   rejection in its transform and enforces it in its final hook at 4055.
+    ///
+    /// Running here — after every request-body transform, after 4055, and
+    /// before `ai_federation`'s provider I/O at 4060 — makes the partition
+    /// describe the request that would actually be dispatched. Every admission
+    /// guardrail that must precede a hit (rate limiting, WAF, prompt shield,
+    /// body/OpenAPI validation, semantic firewall, request guard, tool
+    /// governor) still runs earlier, in `before_proxy`.
+    ///
+    /// Only `ctx.metadata` and the semantic staging maps survive this hook on
+    /// H1/H2, which is all this plugin writes.
+    async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
-        headers: &mut HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        body: &[u8],
     ) -> PluginResult {
         // Only cache POST requests with JSON body
         if ctx.method != "POST" {
@@ -4635,13 +4700,11 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
-        // Get request body
-        let body_str = match ctx.metadata.get("request_body") {
-            Some(b) if !b.is_empty() => b.as_str(),
-            _ => return PluginResult::Continue,
-        };
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
 
-        let json: Value = match serde_json::from_str(body_str) {
+        let json: Value = match serde_json::from_slice(body) {
             Ok(v) => v,
             Err(_) => return PluginResult::Continue,
         };
@@ -4950,11 +5013,11 @@ impl Plugin for AiSemanticCache {
         }
 
         // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
-        // `before_proxy` sets `meta_cache_key` so this hook stores the
-        // (real) backend response. But this plugin (priority 2996) runs before
-        // later synthetic-2xx producers such as `serverless_function` (3025),
-        // `response_mock` (3030), and `ai_federation` (4060), so when one of
-        // those short-circuits
+        // final-request-body hook sets `meta_cache_key` so this hook stores the
+        // (real) backend response. But this plugin (priority 4057) runs before
+        // later synthetic-2xx producers — most directly `ai_federation` (4060),
+        // whose provider dispatch answers from the same final-body stage — so
+        // when one of those short-circuits
         // with a 2xx body, the generic synthetic body-hook path
         // (`apply_synthetic_response_body_hooks`) re-runs this
         // `on_final_response_body` with `meta_cache_key` still set from
@@ -5650,7 +5713,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_mode_bypass_clears_only_this_instance_staging() {
-        // A prior `ai_semantic_cache` instance in the same `before_proxy` chain
+        // A prior `ai_semantic_cache` instance in the same final-request-body chain
         // may have staged a cache key/embedding/scope under its own instance id.
         // When a later reject-mode instance bypasses a multimodal request, it
         // must clear only its own staging so its `on_final_response_body` does
@@ -5676,8 +5739,7 @@ mod tests {
                 ]
             }]
         });
-        ctx.metadata
-            .insert("request_body".to_string(), body.to_string());
+        let wire_body = body.to_string();
         // Simulate staging owned by a sibling instance (different id).
         let sibling_id = plugin.instance_id.wrapping_add(1);
         ctx.metadata.insert(
@@ -5699,7 +5761,9 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
 
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, wire_body.as_bytes())
+            .await;
         assert!(matches!(result, PluginResult::Continue));
 
         assert!(

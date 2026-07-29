@@ -43,10 +43,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ai_semantic_cache` now uses that shared contract instead of a plugin-local
     encoding that omitted the proxy *namespace*, and additionally binds a
     length-framed backend-visible request-context digest (original client
-    authority and `Host`, method, path, the raw query as received, and every
-    non-credential live request header, with credential values digested), so
+    authority and `Host`, method, path, the effective outbound query, and every
+    non-credential request header, with credential values digested), so
     cross-namespace and header/query-only tenant collisions are closed for both
     exact and semantic lookup scopes.
+  - **`ai_semantic_cache` lookup moved to the final-request-body stage**
+    (priority `2996` → `4057`). It previously looked up in `before_proxy`,
+    ahead of `request_transformer` (3000) and every `transform_request_body`
+    hook, so the headers, query, and prompt bytes it called "backend-visible"
+    were pre-transform, and a hit could bypass a fail-closed final-request-body
+    validator — notably `ai_prompt_compressor`, which stages a
+    marker-sanitization rejection in its transform and enforces it in its final
+    hook at 4055. Lookup now runs in `on_final_request_body_with_context`, after
+    that rejection boundary and after every request-body transform, and still
+    before `ai_federation` (4060) performs provider I/O. Every `before_proxy`
+    admission guardrail continues to run ahead of any hit, exact/semantic Redis
+    behavior is unchanged, and store remains in `on_final_response_body`.
+  - **Tracing and correlation request headers are bound, not excluded.** The
+    request-context partition previously excluded `traceparent`, `tracestate`,
+    `b3`, `X-B3-*`, `X-Request-Id`, `X-Correlation-Id` and related names by
+    reusing the response-cache sanitation classifier and asserting they are
+    fresh "by construction". That is not a valid request-side proof:
+    `correlation_id` preserves a valid client-supplied identifier, the plugin
+    may be absent entirely, and the value reaches the origin either way. They
+    are now bound like any other backend-visible header. The separate
+    response-header replay sanitation contract still strips trace identifiers
+    from retained responses and is unchanged.
+  - **A consumed credential no longer reads as an anonymous caller.** The
+    authenticated/anonymous classification now treats a candidate credential
+    present in *either* the pristine inbound wire headers or the live
+    backend-visible headers as authentication. A credential that an earlier
+    plugin removed was previously invisible to the classifier, so such a caller
+    was labelled anonymous and `anonymous_caller_scope: shared` could drop its
+    canonical-address binding — the one relaxation that is meant to apply only
+    to callers who presented nothing.
   - **`request_deduplication` refuses composition it cannot witness.** Its
     lookup runs at priority 2750, before every plugin that selects the effective
     destination, so its key binds the *pre-dispatch* destination. Equal request
@@ -90,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     listed a body-bearing `cacheable_methods` entry now fail admission, and a
     proxy composing `request_deduplication` with `ai_stream_router`,
     `mcp_gateway`, `a2a_gateway`, or `mesh_route_dispatch` now fails admission.
+    `ai_semantic_cache` moves from priority `2996` to `4057`: a `before_proxy`
+    short-circuit that previously lost to a cache hit (`serverless_function`,
+    `response_mock`) now wins, and a priority override placing the cache at or
+    before a co-located `ai_prompt_compressor` re-opens the bypass this change
+    closes.
 
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via

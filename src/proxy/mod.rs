@@ -21517,6 +21517,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -21828,6 +21834,12 @@ async fn handle_proxy_request_inner(
                     ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                     ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                     ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                    // `ai_semantic_cache` stages its semantic miss (scope key +
+                    // embedding) from the final-request-body hook, and its store hook
+                    // runs later against the real context. Without carrying these two
+                    // maps back, every semantic miss would silently store as exact-only.
+                    ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                    ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
                 }
                 match final_body_result {
                     PluginResult::Continue => {
@@ -22477,6 +22489,12 @@ async fn handle_proxy_request_inner(
                 ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
                 ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
                 ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+                // `ai_semantic_cache` stages its semantic miss (scope key +
+                // embedding) from the final-request-body hook, and its store hook
+                // runs later against the real context. Without carrying these two
+                // maps back, every semantic miss would silently store as exact-only.
+                ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+                ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
             }
             match final_body_result {
                 PluginResult::Continue => {}
@@ -25313,6 +25331,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let (mut result, retained_body) = match initial_dispatch {
             BackendDispatchResult::Response {
@@ -25733,6 +25757,12 @@ async fn handle_proxy_request_inner(
             ctx.waf_metadata_initialized = body_hook_ctx.waf_metadata_initialized;
             ctx.waf_owned_metadata = body_hook_ctx.waf_owned_metadata;
             ctx.waf_instance_scores = body_hook_ctx.waf_instance_scores;
+            // `ai_semantic_cache` stages its semantic miss (scope key +
+            // embedding) from the final-request-body hook, and its store hook
+            // runs later against the real context. Without carrying these two
+            // maps back, every semantic miss would silently store as exact-only.
+            ctx.ai_semantic_cache_embeddings = body_hook_ctx.ai_semantic_cache_embeddings;
+            ctx.ai_semantic_cache_scope_keys = body_hook_ctx.ai_semantic_cache_scope_keys;
         }
         let resp = match dispatch {
             BackendDispatchResult::Response {

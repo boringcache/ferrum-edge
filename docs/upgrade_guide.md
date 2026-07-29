@@ -290,13 +290,47 @@ one fail-closed replay-partition contract
   split the two behaviors across separate proxies. Deduplication's priority is
   deliberately not moved after the dispatchers: it exists to refuse
   re-execution of a side effect *before* any of it happens.
+- **`ai_semantic_cache` lookup moved to the final-request-body stage, priority
+  `2996` → `4057`.** Lookup previously ran in `before_proxy`, ahead of
+  `request_transformer` (3000) and every `transform_request_body` hook, so the
+  headers, query, and prompt bytes it keyed were *pre-transform* — not what the
+  provider would receive — and a hit could bypass a fail-closed final-body
+  validator. It now runs in `on_final_request_body_with_context`, after
+  `ai_prompt_compressor` (4055) enforces its staged marker-sanitization
+  rejection and before `ai_federation` (4060) performs provider I/O. Practical
+  consequences:
+  - keys change; every previously retained entry is unreachable (intended
+    fail-closed outcome);
+  - a request whose headers, query, or body a transform rewrites now keys on the
+    rewritten form, so deployments running `request_transformer`,
+    `compression` request decode, or `ai_prompt_compressor` alongside the cache
+    will see a one-time key change and possibly a different hit distribution;
+  - a `before_proxy` short-circuit that previously lost to a cache hit
+    (`serverless_function` 3025, `response_mock` 3030) now wins, because it runs
+    first;
+  - a priority override that places an `ai_semantic_cache` instance at or before
+    a co-located `ai_prompt_compressor` re-opens the bypass and should not be
+    used.
 - **`ai_semantic_cache` keys bind more of the request.** They now use the shared
   destination contract (which includes the proxy **namespace**, previously
   omitted) plus a backend-visible request-context digest covering the original
-  client authority, the raw query, and every non-credential request header.
-  Deployments that varied only by header or query parameter and were previously
-  sharing one completion will now miss. Only transport/hop-by-hop framing fields
-  and per-request tracing/correlation identifiers are excluded.
+  client authority, the effective outbound query, and every non-credential
+  request header. Deployments that varied only by header or query parameter and
+  were previously sharing one completion will now miss. Only transport/hop-by-hop
+  framing fields Ferrum provably regenerates for the backend hop are excluded;
+  `Host`/authority is bound as its own field.
+- **Tracing and correlation request headers are now key dimensions.** An earlier
+  revision excluded `traceparent`, `tracestate`, `b3`, `X-B3-*`, `X-Request-Id`,
+  `X-Correlation-Id` and friends by reusing the *response*-cache sanitation
+  classifier and arguing they are fresh "by construction". That proof does not
+  hold on the request side: `correlation_id` preserves a valid client-supplied
+  ID, the plugin may not be configured at all, and the value reaches the origin
+  either way. They are bound like any other backend-visible header, so a client
+  that varies its trace header per request will now miss per request. Deployments
+  that want cross-trace sharing must strip or normalize those headers before the
+  cache — for example with `correlation_id` or `otel_tracing` in
+  `trace_context_trust: untrusted` mode. Response-header replay sanitation still
+  strips trace identifiers from a retained response; that contract is unchanged.
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
   disable caller isolation.** Every key now binds an authorization-context
   fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests

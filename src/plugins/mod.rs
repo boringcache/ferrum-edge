@@ -1887,7 +1887,13 @@ pub struct RequestContext {
     /// Core proxy lookups (IP resolution, host extraction) read from this
     /// directly via `raw_header_get()` to avoid eagerly converting every
     /// header to an owned `String`.
-    raw_headers: Option<HeaderMap>,
+    ///
+    /// Held behind an `Arc` so the lightweight final-request-body hook context
+    /// ([`Self::clone_for_final_request_body_hooks`]) can carry the pristine
+    /// wire view — replay-partition keying reads it to distinguish a caller
+    /// whose credential an earlier plugin consumed — without cloning a whole
+    /// `HeaderMap` per buffered request.
+    raw_headers: Option<Arc<HeaderMap>>,
     /// Materialized headers HashMap. Empty until `materialize_headers()` is
     /// called. Plugin code and backend dispatch read from this field.
     pub headers: HashMap<String, String>,
@@ -3421,13 +3427,25 @@ impl RequestContext {
             frontend_sni_hostname: self.frontend_sni_hostname.clone(),
             lb_generation: self.lb_generation,
             proxy_lifecycle_generation: self.proxy_lifecycle_generation,
-            raw_headers: None,
+            // Carried, not dropped: the final-request-body stage is where
+            // `ai_semantic_cache` derives its replay partition, and that
+            // partition binds the pristine inbound credential view (to keep a
+            // caller whose credential an earlier plugin consumed classified as
+            // authenticated) plus the effective backend-visible query. Both are
+            // cheap here — the header map is shared through an `Arc` and the
+            // query strings are short.
+            raw_headers: self.raw_headers.clone(),
             headers: self.headers.clone(),
             headers_materialized: true,
-            raw_query_string: None,
-            outbound_query_string: None,
-            query_params_materialized: false,
-            query_params: HashMap::new(),
+            raw_query_string: self.raw_query_string.clone(),
+            outbound_query_string: self.outbound_query_string.clone(),
+            // Carry the materialization state with the query strings. Leaving
+            // the flag `false` next to a published outbound query would let a
+            // later materialization pass resurrect the *pre-transform* raw
+            // query into `query_params`, which `publish_transformed_query`
+            // exists to prevent.
+            query_params_materialized: self.query_params_materialized,
+            query_params: self.query_params.clone(),
             matched_proxy: self.matched_proxy.clone(),
             identified_consumer: self.identified_consumer.clone(),
             authenticated_identity: self.authenticated_identity.clone(),
@@ -4048,7 +4066,7 @@ impl RequestContext {
     #[inline]
     pub fn set_raw_headers(&mut self, headers: HeaderMap) {
         self.headers_materialized = false;
-        self.raw_headers = Some(headers);
+        self.raw_headers = Some(Arc::new(headers));
     }
 
     /// Whether the pristine wire `HeaderMap` is still available for
@@ -4150,7 +4168,7 @@ impl RequestContext {
             return;
         };
         self.headers.reserve(raw.keys_len());
-        for (name, value) in raw {
+        for (name, value) in raw.iter() {
             if let Ok(v) = value.to_str() {
                 // http::HeaderName stores names in lowercase already (HTTP/2+3
                 // spec), and hyper normalizes HTTP/1.1 header names to
@@ -6203,9 +6221,9 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995), ai_semantic_cache (2996) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_semantic_cache (4057), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
@@ -6279,16 +6297,10 @@ pub mod priority {
     pub const A2A_GATEWAY: u16 = 2993;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
-    /// Runs after admission plugins and immediately before `ai_semantic_cache`
-    /// so cache identity can bind the post-routing effective destination;
-    /// backend dispatch applies the override after `before_proxy`.
+    /// Runs after admission plugins so `ai_semantic_cache` can bind the
+    /// post-routing effective destination; backend dispatch applies the
+    /// override after `before_proxy`.
     pub const MESH_ROUTE_DISPATCH: u16 = 2995;
-    /// `ai_semantic_cache`: exact/semantic LLM response cache. Runs after
-    /// route-dispatch plugins (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`,
-    /// `mesh_route_dispatch`) so exact and semantic keys include the canonical
-    /// route/operation identity and the effective destination/provider that
-    /// will serve a miss, and before request transformers / `ai_federation`.
-    pub const AI_SEMANTIC_CACHE: u16 = 2996;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;
@@ -6305,6 +6317,26 @@ pub mod priority {
     /// Runs after `compression` so opt-in request decompression exposes
     /// plaintext prompt JSON before this plugin rewrites the backend body.
     pub const AI_PROMPT_COMPRESSOR: u16 = 4055;
+    /// `ai_semantic_cache`: exact/semantic LLM response cache.
+    ///
+    /// Lookup runs in `on_final_request_body_with_context`, not `before_proxy`,
+    /// so the replay partition is derived from the request the provider would
+    /// actually receive: the finalized outbound headers, the effective query,
+    /// the post-routing destination, and the **fully transformed** request body
+    /// (every `transform_request_body` hook has run by then, including
+    /// `request_transformer` at 3000, `compression` at 4050, and
+    /// `ai_prompt_compressor` at 4055).
+    ///
+    /// The priority is pinned between `ai_prompt_compressor` (4055) and
+    /// `ai_federation` (4060) for two reasons that both fail closed:
+    ///
+    /// * **after 4055** — `ai_prompt_compressor` stages a marker-sanitization
+    ///   rejection in its body transform and enforces it in its final hook. A
+    ///   cache hit ordered ahead of that hook would return a retained response
+    ///   for a request the gateway had already decided to refuse;
+    /// * **before 4060** — `ai_federation` performs provider I/O from its own
+    ///   final hook, so the lookup must precede it or a hit saves nothing.
+    pub const AI_SEMANTIC_CACHE: u16 = 4057;
     pub const AI_FEDERATION: u16 = 4060;
     pub const AI_RESPONSE_GUARD: u16 = 4075;
     /// `security_headers`: injects response security headers and strips

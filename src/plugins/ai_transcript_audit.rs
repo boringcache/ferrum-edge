@@ -12,7 +12,7 @@
 //! Runs at priority `AI_TRANSCRIPT_AUDIT` (2740): after authentication and
 //! authorization, but before `request_deduplication` (2750) and reject-capable
 //! AI guardrails, so cached replays and blocked prompts can still be audited.
-//! It also remains before `ai_semantic_cache` (2996) / `ai_federation` (4060).
+//! It also remains before `ai_semantic_cache` (4057) / `ai_federation` (4060).
 //! The audit candidate is staged in `before_proxy` over the
 //! prebuffered request body (so terminate-and-respond plugins downstream cannot
 //! consume the transaction unaudited, and so the proxy's response buffering /
@@ -5705,7 +5705,7 @@ const MAX_INSTANCE_ID_DIGITS: usize = 20;
 /// to record-assembly time on every miss whose store is skipped (SSE,
 /// non-JSON, oversized, unparseable, synthetic short-circuit) and — because
 /// `ai_transcript_audit` (2740) runs its final-body hook before
-/// `ai_semantic_cache` (2996) clears staging — on ordinary misses too.
+/// `ai_semantic_cache` (4057) clears staging — on ordinary misses too.
 /// Exporting it would ship a stable, offline-checkable fingerprint of user
 /// prompt content to the audit collector even in `hash`/`metadata` modes,
 /// which exist precisely to avoid that.

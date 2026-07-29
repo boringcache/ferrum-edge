@@ -176,7 +176,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### AI Semantic Cache
 
-**What it stores:** Cached LLM responses keyed by family-correct prompt text (exact keys preserve LLM-significant case and whitespace; structural canonicalization remains for JSON key order and numeric sampling params). When `semantic_similarity_enabled` is true, local cache entries can also carry prompt embeddings and are indexed in a local HNSW vector snapshot for semantic lookup after exact misses.
+**What it stores:** Cached LLM responses keyed by family-correct prompt text (exact keys preserve LLM-significant case and whitespace; structural canonicalization remains for JSON key order and numeric sampling params). Lookup runs at priority 4057 in the final-request-body hook, so the prompt bytes and the backend-visible header/query/destination partition are the fully transformed ones the provider would receive, not the pre-transform request. When `semantic_similarity_enabled` is true, local cache entries can also carry prompt embeddings and are indexed in a local HNSW vector snapshot for semantic lookup after exact misses.
 
 **Default limit:** 10,000 entries. In semantic mode, HNSW snapshot memory and periodic full-index rebuild CPU also scale with this count and are charged against `max_total_size_bytes`.
 

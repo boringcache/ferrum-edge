@@ -191,9 +191,46 @@ fn make_consumer(username: &str) -> Arc<Consumer> {
     })
 }
 
-/// Drive a request through `before_proxy` and report whether the call
+/// Drive one cache lookup exactly the way the proxy does.
+///
+/// `ai_semantic_cache` looks up in `on_final_request_body_with_context` (the
+/// final-request-body stage at priority 4057), **not** `before_proxy`, so the
+/// key it derives describes the fully transformed request the provider would
+/// receive. The body it inspects is the hook's `&[u8]` parameter — the
+/// post-transform backend-visible bytes — so these tests keep staging the wire
+/// body in `ctx.metadata["request_body"]` for convenience and hand the same
+/// bytes to the hook. A test that needs the transformed body to differ from the
+/// staged one passes it explicitly through [`drive_cache_lookup_with_body`].
+async fn drive_cache_lookup(
+    plugin: &AiSemanticCache,
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+) -> PluginResult {
+    let body = ctx
+        .metadata
+        .get("request_body")
+        .cloned()
+        .unwrap_or_default();
+    drive_cache_lookup_with_body(plugin, ctx, headers, body.as_bytes()).await
+}
+
+/// Lookup over an explicit final backend-visible body, independent of whatever
+/// `ctx.metadata["request_body"]` holds. This is the shape a request-body
+/// transform produces.
+async fn drive_cache_lookup_with_body(
+    plugin: &AiSemanticCache,
+    ctx: &mut RequestContext,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    plugin
+        .on_final_request_body_with_context(ctx, headers, body)
+        .await
+}
+
+/// Drive a request through cache lookup and report whether the call
 /// returned a cache HIT (`RejectBinary`) or a MISS (`Continue`).
-async fn run_before_proxy_get_status(
+async fn run_lookup_get_status(
     plugin: &AiSemanticCache,
     body_str: &str,
     consumer: Option<Arc<Consumer>>,
@@ -212,12 +249,12 @@ async fn run_before_proxy_get_status(
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     matches!(
-        plugin.before_proxy(&mut ctx, &mut headers).await,
+        drive_cache_lookup(plugin, &mut ctx, &headers).await,
         PluginResult::RejectBinary { .. }
     )
 }
 
-async fn run_before_proxy(
+async fn run_lookup(
     plugin: &AiSemanticCache,
     body_str: &str,
     consumer: Option<Arc<Consumer>>,
@@ -235,11 +272,11 @@ async fn run_before_proxy(
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(plugin, &mut ctx, &headers).await;
     (ctx, result)
 }
 
-/// MISS+store helper: send a request through `before_proxy` (cache MISS) and
+/// MISS+store helper: send a request through cache lookup (cache MISS) and
 /// then write a synthetic response into the cache via `on_final_response_body`.
 async fn store_response(
     plugin: &AiSemanticCache,
@@ -259,7 +296,7 @@ async fn store_response(
     }
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = drive_cache_lookup(plugin, &mut ctx, &headers).await;
 
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -344,7 +381,7 @@ async fn normalize_semantic_cache_request(
     ctx.headers
         .insert("content-encoding".to_string(), encoding.to_string());
     ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(&body));
-    let mut headers = ctx.headers.clone();
+    let headers = ctx.headers.clone();
     headers.insert("content-length".to_string(), body.len().to_string());
     let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(compression) as Arc<dyn Plugin>];
 
@@ -481,7 +518,12 @@ fn test_new_default_config() {
     assert_eq!(plugin.name(), "ai_semantic_cache");
     assert_eq!(plugin.priority(), priority::AI_SEMANTIC_CACHE);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
-    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.needs_final_request_body_context());
+    assert!(plugin.requires_final_request_body_before_backend_dispatch());
+    // Lookup no longer reads the pre-`before_proxy` body snapshot: it runs over
+    // the finalized backend-visible bytes in the final-request-body hook.
+    assert!(!plugin.requires_request_body_before_before_proxy());
     assert!(plugin.requires_response_body_buffering());
     assert!(!plugin.modifies_request_headers());
     assert!(!plugin.modifies_request_body());
@@ -649,7 +691,7 @@ async fn test_semantic_embedding_signed_query_endpoint_still_reaches_provider() 
     .expect("signed query endpoint must be admitted");
 
     let body = serde_json::to_string(&semantic_request_body()).unwrap();
-    let (_, result) = run_before_proxy(&plugin, &body, None).await;
+    let (_, result) = run_lookup(&plugin, &body, None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "embedding call must fall through as a miss when no semantic hit exists"
@@ -690,7 +732,7 @@ async fn test_semantic_embedding_transport_diagnostics_redact_endpoint_secrets()
     .expect("credential-bearing endpoint must be admitted");
 
     let body = serde_json::to_string(&semantic_request_body()).unwrap();
-    let _ = run_before_proxy(&plugin, &body, None).await;
+    let _ = run_lookup(&plugin, &body, None).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while !writer.contents().contains("semantic embedding unavailable")
@@ -750,7 +792,7 @@ async fn test_semantic_embedding_slow_call_diagnostics_redact_endpoint_secrets()
     .expect("credential-bearing endpoint must be admitted");
 
     let body = serde_json::to_string(&semantic_request_body()).unwrap();
-    let _ = run_before_proxy(&plugin, &body, None).await;
+    let _ = run_lookup(&plugin, &body, None).await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while !writer.contents().contains("Slow plugin HTTP call")
@@ -1023,7 +1065,7 @@ async fn test_response_buffering_only_for_cache_misses() {
     );
     let mut get_headers = HashMap::new();
     get_headers.insert("content-type".to_string(), "application/json".to_string());
-    let result = plugin.before_proxy(&mut get_ctx, &mut get_headers).await;
+    let result = drive_cache_lookup(&plugin, &mut get_ctx, &get_headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!plugin.should_buffer_response_body(&get_ctx));
 
@@ -1042,9 +1084,7 @@ async fn test_response_buffering_only_for_cache_misses() {
     );
     let mut json_post_headers = HashMap::new();
     json_post_headers.insert("content-type".to_string(), "application/json".to_string());
-    let result = plugin
-        .before_proxy(&mut json_post_ctx, &mut json_post_headers)
-        .await;
+    let result = drive_cache_lookup(&plugin, &mut json_post_ctx, &json_post_headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(plugin.should_buffer_response_body(&json_post_ctx));
 }
@@ -1070,7 +1110,7 @@ async fn test_response_buffering_releases_streaming_ai_responses() {
     );
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
     assert!(plugin.should_buffer_response_body_for_content_type(
@@ -1091,7 +1131,7 @@ async fn test_response_buffering_releases_streaming_ai_responses() {
 fn test_requires_request_body() {
     let config = json!({});
     let plugin = make_plugin(config);
-    assert!(plugin.requires_request_body_before_before_proxy());
+    assert!(plugin.requires_request_body_buffering());
 }
 
 #[tokio::test]
@@ -1118,7 +1158,7 @@ async fn test_cache_miss_then_hit() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx1).unwrap(), "MISS");
     assert!(has_staged_cache_key(&plugin, &ctx1));
@@ -1143,7 +1183,7 @@ async fn test_cache_miss_then_hit() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     match result {
         PluginResult::RejectBinary {
             status_code,
@@ -1173,10 +1213,10 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
         let compression =
             Arc::new(CompressionPlugin::new(&json!({"decompress_request": true})).unwrap());
 
-        let (mut first_ctx, mut first_headers, first_body) =
+        let (mut first_ctx, first_headers, first_body) =
             normalize_semantic_cache_request(&compression, encoding, &body).await;
         assert_eq!(first_body, body);
-        let first = cache.before_proxy(&mut first_ctx, &mut first_headers).await;
+        let first = drive_cache_lookup(&cache, &mut first_ctx, &first_headers).await;
         assert!(matches!(first, PluginResult::Continue));
         assert_eq!(staged_status(&cache, &first_ctx), Some("MISS"));
 
@@ -1187,10 +1227,10 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
             .await;
         assert!(matches!(stored, PluginResult::Continue));
 
-        let (mut retry_ctx, mut retry_headers, retry_body) =
+        let (mut retry_ctx, retry_headers, retry_body) =
             normalize_semantic_cache_request(&compression, encoding, &body).await;
         assert_eq!(retry_body, body);
-        match cache.before_proxy(&mut retry_ctx, &mut retry_headers).await {
+        match drive_cache_lookup(&cache, &mut retry_ctx, &retry_headers).await {
             PluginResult::RejectBinary {
                 status_code,
                 headers,
@@ -1210,7 +1250,7 @@ async fn configured_decompression_preserves_semantic_cache_miss_store_hit_lifecy
 }
 
 // Regression: a synthetic short-circuit 2xx body (produced by a LATER
-// before_proxy plugin such as `ai_federation` / `mesh_route_dispatch` /
+// later plugin such as `ai_federation` / `mesh_route_dispatch` /
 // `response_mock` / `serverless_function`, all of which run AFTER this plugin)
 // must NOT be stored under the cache key that this plugin set on its own MISS.
 // Storing it would replay a locally-generated body — that never reached the
@@ -1243,12 +1283,12 @@ async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx1).unwrap(), "MISS");
     assert!(has_staged_cache_key(&plugin, &ctx1));
 
-    // A later before_proxy plugin short-circuits with a synthetic 2xx body. The
+    // A later plugin short-circuits with a synthetic 2xx body. The
     // proxy sets the synthetic marker before running the response-body hooks.
     ctx1.metadata.insert(
         SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY.to_string(),
@@ -1286,7 +1326,7 @@ async fn synthetic_short_circuit_2xx_is_not_stored_in_semantic_cache() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "request matching a synthetic short-circuit must MISS, not replay a poisoned cache entry; got {result:?}"
@@ -1320,7 +1360,7 @@ async fn genuine_backend_response_is_still_stored_without_synthetic_marker() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(has_staged_cache_key(&plugin, &ctx1));
 
@@ -1348,7 +1388,7 @@ async fn genuine_backend_response_is_still_stored_without_synthetic_marker() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     match result {
         PluginResult::RejectBinary {
             status_code, body, ..
@@ -1376,7 +1416,7 @@ async fn exact_cache_key_differs_for_different_image_url() {
     .await;
 
     let body_b_str = serde_json::to_string(&body_b).unwrap();
-    let (mut ctx_b, result) = run_before_proxy(&plugin, &body_b_str, None).await;
+    let (mut ctx_b, result) = run_lookup(&plugin, &body_b_str, None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "different image_url must exact-miss instead of replaying cached response A"
@@ -1389,7 +1429,7 @@ async fn exact_cache_key_differs_for_different_image_url() {
         .on_final_response_body(&mut ctx_b, 200, &response_headers, br#""B""#)
         .await;
 
-    let (_, result) = run_before_proxy(&plugin, &body_b_str, None).await;
+    let (_, result) = run_lookup(&plugin, &body_b_str, None).await;
     match result {
         PluginResult::RejectBinary { body, .. } => {
             assert_eq!(&body[..], br#""B""#);
@@ -1463,7 +1503,7 @@ async fn exact_cache_key_differs_for_base64_audio_and_file_parts() {
         .await;
 
         let (_, result) =
-            run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+            run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
         assert!(
             matches!(result, PluginResult::Continue),
             "{name} content must exact-miss instead of replaying cached response A"
@@ -1508,7 +1548,7 @@ async fn exact_cache_key_treats_mixed_case_text_type_as_non_text() {
     )
     .await;
 
-    let (ctx_mixed, result) = run_before_proxy(
+    let (ctx_mixed, result) = run_lookup(
         &plugin,
         &serde_json::to_string(&mixed_case_body).unwrap(),
         None,
@@ -1563,7 +1603,7 @@ async fn exact_cache_key_treats_text_type_without_string_text_as_non_text() {
     .await;
 
     let (ctx_b, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "a \"text\"-typed part without a string `text` must be fingerprinted, so a differing non-string value is an exact MISS"
@@ -1595,7 +1635,7 @@ async fn semantic_cache_scope_differs_for_different_image_url() {
     .await;
 
     let (ctx_b, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "semantic scope must include image fingerprint and miss different image_url"
@@ -1614,7 +1654,7 @@ async fn cache_does_not_store_raw_multimodal_url_in_metadata() {
     let url = "https://example.com/private-image.png?token=secret";
     let body = multimodal_image_url_body(url);
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
 
     for key in [
@@ -1662,7 +1702,7 @@ async fn scope_by_consumer_false_still_does_not_cross_replay_multimodal() {
     .await;
 
     let (ctx_b, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
+        run_lookup(&plugin, &serde_json::to_string(&body_b).unwrap(), Some(bob)).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "multimodal fingerprint must prevent cross-replay even when consumer scoping is disabled"
@@ -1679,7 +1719,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
 
     let body = multimodal_image_url_body("https://example.com/a.png");
     let body_str = serde_json::to_string(&body).unwrap();
-    let (mut ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    let (mut ctx, result) = run_lookup(&plugin, &body_str, None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"));
     assert!(
@@ -1694,7 +1734,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
         .await;
     assert_eq!(plugin.tracked_keys_count(), Some(0));
 
-    let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    let (ctx, result) = run_lookup(&plugin, &body_str, None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx), Some("BYPASS"));
     assert_eq!(
@@ -1710,7 +1750,7 @@ async fn cache_multimodal_reject_bypasses_multimodal_and_text_only_still_caches(
     let text_body_str = serde_json::to_string(&text_body).unwrap();
     store_response(&plugin, &text_body_str, None, br#""Paris""#).await;
 
-    let (_, result) = run_before_proxy(&plugin, &text_body_str, None).await;
+    let (_, result) = run_lookup(&plugin, &text_body_str, None).await;
     match result {
         PluginResult::RejectBinary { body, .. } => assert_eq!(&body[..], br#""Paris""#),
         other => panic!("Expected text-only exact cache HIT under reject mode, got {other:?}"),
@@ -1725,7 +1765,7 @@ async fn exact_only_multimodal_skips_semantic_embedding_call() {
 
     let body = multimodal_image_url_body("https://example.com/a.png");
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
 
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
@@ -1778,7 +1818,7 @@ async fn test_semantic_similarity_hit_after_exact_miss() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     match result {
         PluginResult::RejectBinary { headers, body, .. } => {
             assert_eq!(
@@ -1824,7 +1864,7 @@ async fn test_semantic_similarity_miss_below_threshold() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "orthogonal embeddings should miss when below semantic_similarity_threshold"
@@ -1853,7 +1893,7 @@ async fn test_semantic_embedding_failure_falls_back_to_miss() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx), Some("MISS"));
 
@@ -1893,7 +1933,7 @@ async fn test_semantic_similarity_respects_response_shaping_scope() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "semantic hit must not cross response-shaping parameters"
@@ -1930,7 +1970,7 @@ async fn test_semantic_similarity_respects_system_message_scope() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "semantic cache must not cross system/developer instruction scopes"
@@ -1967,7 +2007,7 @@ async fn test_google_gemini_semantic_provider_uses_provider_response_shape() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         hit,
         "Gemini embedding.values responses should support semantic hits"
@@ -2044,7 +2084,7 @@ async fn test_semantic_similarity_respects_consumer_scope() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "semantic match must not cross consumer scope"
@@ -2074,7 +2114,7 @@ async fn test_different_prompts_no_cache_hit() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let _ = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     let response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
@@ -2098,7 +2138,7 @@ async fn test_different_prompts_no_cache_hit() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx2).unwrap(), "MISS");
 }
@@ -2125,7 +2165,7 @@ async fn test_exact_key_preserves_case_and_whitespace() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let _ = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     let response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
@@ -2149,7 +2189,7 @@ async fn test_exact_key_preserves_case_and_whitespace() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "exact keys must preserve LLM-significant case and whitespace"
@@ -2228,7 +2268,7 @@ async fn exact_key_recursively_canonicalizes_json_object_order() {
     }"#;
 
     store_response(&plugin, first, None, br#""canonical""#).await;
-    let hit = run_before_proxy_get_status(&plugin, reordered, None).await;
+    let hit = run_lookup_get_status(&plugin, reordered, None).await;
     assert!(
         hit,
         "object insertion order at every nesting level must not change the exact key"
@@ -2255,7 +2295,7 @@ async fn test_exact_key_distinguishes_code_case_and_indentation() {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "print(\"a\")"}]
     });
-    let miss = run_before_proxy_get_status(
+    let miss = run_lookup_get_status(
         &plugin,
         &serde_json::to_string(&body_print_a_lower).unwrap(),
         None,
@@ -2281,7 +2321,7 @@ async fn test_exact_key_distinguishes_code_case_and_indentation() {
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "def f():\n    return 1"}]
     });
-    let miss_indent = run_before_proxy_get_status(
+    let miss_indent = run_lookup_get_status(
         &plugin,
         &serde_json::to_string(&body_indent_four).unwrap(),
         None,
@@ -2315,7 +2355,7 @@ async fn test_different_model_no_cache_hit() {
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
 
-    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let _ = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
     let response_headers =
         HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let _ = plugin
@@ -2339,7 +2379,7 @@ async fn test_different_model_no_cache_hit() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     assert!(matches!(result, PluginResult::Continue));
 
     // Provider model identifiers may differ only by case.
@@ -2359,7 +2399,7 @@ async fn test_different_model_no_cache_hit() {
     let mut headers3 = HashMap::new();
     headers3.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx3, &headers3).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "case-distinct model identifiers must not share exact cache entries"
@@ -2376,9 +2416,9 @@ async fn test_get_request_skipped() {
         "GET".to_string(),
         "/chat".to_string(),
     );
-    let mut headers = HashMap::new();
+    let headers = HashMap::new();
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(staged_status(&plugin, &ctx).is_none());
 }
@@ -2396,7 +2436,7 @@ async fn test_non_json_skipped() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "text/plain".to_string());
 
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 
@@ -2421,7 +2461,7 @@ async fn test_error_response_not_cached() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    let _ = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let _ = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
 
     // 500 response should not be cached
     let response_headers =
@@ -2523,7 +2563,7 @@ async fn response_admission_requires_valid_json_media_type_and_body() {
             "messages": [{"role": "user", "content": case.name}]
         });
         let (mut ctx, result) =
-            run_before_proxy(&plugin, &serde_json::to_string(&request).unwrap(), None).await;
+            run_lookup(&plugin, &serde_json::to_string(&request).unwrap(), None).await;
         assert!(matches!(result, PluginResult::Continue));
 
         let mut response_headers = HashMap::new();
@@ -2580,7 +2620,7 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
         .insert("request_body".to_string(), body_str.clone());
     let mut headers1 = HashMap::new();
     headers1.insert("content-type".to_string(), "application/json".to_string());
-    let _ = plugin.before_proxy(&mut ctx1, &mut headers1).await;
+    let _ = drive_cache_lookup(&plugin, &mut ctx1, &headers1).await;
 
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -2613,7 +2653,7 @@ async fn test_sensitive_response_headers_not_replayed_on_cache_hit() {
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
-    let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let result = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     match result {
         PluginResult::RejectBinary { headers, .. } => {
             assert!(
@@ -2685,7 +2725,7 @@ async fn test_different_system_prompt_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `system` prompts must NOT collapse to the same cache key"
@@ -2718,7 +2758,7 @@ async fn test_different_system_array_form_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different array-form `system` prompts must NOT collapse to the same cache key"
@@ -2753,7 +2793,7 @@ async fn test_different_temperature_no_cache_hit_with_default_config() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `temperature` must NOT collapse with `include_params_in_key=true` default"
@@ -2784,7 +2824,7 @@ async fn test_sub_cent_sampling_params_do_not_collapse() {
     )
     .await;
 
-    let temperature_hit = run_before_proxy_get_status(
+    let temperature_hit = run_lookup_get_status(
         &temperature_plugin,
         &serde_json::to_string(&nearby_temperature).unwrap(),
         None,
@@ -2815,7 +2855,7 @@ async fn test_sub_cent_sampling_params_do_not_collapse() {
     )
     .await;
 
-    let top_p_hit = run_before_proxy_get_status(
+    let top_p_hit = run_lookup_get_status(
         &top_p_plugin,
         &serde_json::to_string(&nearby_top_p).unwrap(),
         None,
@@ -2858,7 +2898,7 @@ async fn test_numerically_equivalent_sampling_params_collapse() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None)
+        run_lookup_get_status(&plugin, &serde_json::to_string(&equivalent).unwrap(), None)
             .await;
     assert!(
         hit,
@@ -2890,14 +2930,14 @@ async fn test_same_request_different_consumer_no_cache_hit_with_default_config()
     )
     .await;
 
-    let hit = run_before_proxy_get_status(&plugin, &body_str, Some(bob.clone())).await;
+    let hit = run_lookup_get_status(&plugin, &body_str, Some(bob.clone())).await;
     assert!(
         !hit,
         "consumer `bob` MUST NOT receive a cache hit on `alice`'s entry under default config"
     );
 
     // Sanity check: alice's repeat hits her own entry.
-    let alice_hit = run_before_proxy_get_status(&plugin, &body_str, Some(alice.clone())).await;
+    let alice_hit = run_lookup_get_status(&plugin, &body_str, Some(alice.clone())).await;
     assert!(
         alice_hit,
         "consumer `alice` SHOULD see her own cache entry on repeat"
@@ -2930,7 +2970,7 @@ async fn test_same_request_same_consumer_same_params_cache_hit_positive() {
     )
     .await;
 
-    let hit = run_before_proxy_get_status(&plugin, &body_str, Some(consumer)).await;
+    let hit = run_lookup_get_status(&plugin, &body_str, Some(consumer)).await;
     assert!(
         hit,
         "fully-identical request from the same consumer MUST hit the cache (positive control)"
@@ -2967,7 +3007,7 @@ async fn test_stream_true_vs_false_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None)
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body_stream).unwrap(), None)
             .await;
     assert!(
         !hit,
@@ -3002,7 +3042,7 @@ async fn test_different_tools_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `tools` definitions must NOT collapse to the same cache key"
@@ -3035,7 +3075,7 @@ async fn test_different_response_format_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(
         !hit,
         "different `response_format` must NOT collapse to the same cache key"
@@ -3068,7 +3108,7 @@ async fn test_different_seed_no_cache_hit() {
     .await;
 
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(!hit, "different `seed` must NOT collapse cache keys");
 }
 
@@ -3214,7 +3254,7 @@ fn json_pad_body(tag: &str, pad_bytes: usize) -> Vec<u8> {
 }
 
 async fn miss_cache_key(plugin: &AiSemanticCache, request_body: &str) -> String {
-    let (ctx, result) = run_before_proxy(plugin, request_body, None).await;
+    let (ctx, result) = run_lookup(plugin, request_body, None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "expected cache MISS so the store path is exercised"
@@ -3489,7 +3529,7 @@ async fn test_same_key_replacement_dirties_vector_index_on_embedding_change() {
     // Force an exact-path cache key without calling the (unreachable) embedding
     // endpoint: stage cache_key via a miss that fails closed to exact.
     let cache_key = {
-        let (ctx, result) = run_before_proxy(&plugin, &request_body, None).await;
+        let (ctx, result) = run_lookup(&plugin, &request_body, None).await;
         assert!(matches!(result, PluginResult::Continue));
         ctx.metadata
             .get(&staging_key(&plugin, "cache_key"))
@@ -3543,7 +3583,7 @@ async fn assert_exact_hit_roundtrip(body: serde_json::Value, response_body: &[u8
     let plugin = make_plugin(json!({"ttl_seconds": 300}));
     let body_str = serde_json::to_string(&body).unwrap();
     store_response(&plugin, &body_str, None, response_body).await;
-    let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    let (ctx, result) = run_lookup(&plugin, &body_str, None).await;
     match result {
         PluginResult::RejectBinary {
             status_code,
@@ -3574,7 +3614,7 @@ async fn assert_exact_miss_for_variant(
     )
     .await;
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
     assert!(!hit, "variant must miss the exact cache");
 }
 
@@ -3876,7 +3916,7 @@ async fn unknown_and_ambiguous_shapes_bypass_caching() {
         }),
     ] {
         let body_str = serde_json::to_string(&body).unwrap();
-        let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+        let (ctx, result) = run_lookup(&plugin, &body_str, None).await;
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(
             staged_status(&plugin, &ctx),
@@ -3991,7 +4031,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         br#"{"city":"Paris"}"#,
     )
     .await;
-    let (ctx, result) = run_before_proxy(
+    let (ctx, result) = run_lookup(
         &plugin,
         &serde_json::to_string(&gemini2_same_scope).unwrap(),
         None,
@@ -4015,7 +4055,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         "contents": [{"role": "user", "parts": [{"text": "What city is France's capital?"}]}],
         "generationConfig": {"temperature": 0}
     });
-    let isolated = run_before_proxy_get_status(
+    let isolated = run_lookup_get_status(
         &plugin,
         &serde_json::to_string(&gemini_other_instruction).unwrap(),
         None,
@@ -4044,7 +4084,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
     )
     .await;
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None)
+        run_lookup_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None)
             .await;
     assert!(
         hit,
@@ -4056,7 +4096,7 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         "instructions": "Plain text only.",
         "input": "What city is France's capital?"
     });
-    let isolated = run_before_proxy_get_status(
+    let isolated = run_lookup_get_status(
         &plugin,
         &serde_json::to_string(&responses_isolated).unwrap(),
         None,
@@ -4131,7 +4171,7 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 
     for variant in variants {
         assert!(
-            !run_before_proxy_get_status(&plugin, &serde_json::to_string(&variant).unwrap(), None)
+            !run_lookup_get_status(&plugin, &serde_json::to_string(&variant).unwrap(), None)
                 .await,
             "semantic lookup must not cross message tool state or provider-native controls"
         );
@@ -4164,7 +4204,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     )
     .await;
     assert!(
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None).await
+        run_lookup_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None).await
     );
     let cohere_isolated = json!({
         "model": "command-r",
@@ -4172,7 +4212,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         "message": "What city is France's capital?"
     });
     assert!(
-        !run_before_proxy_get_status(
+        !run_lookup_get_status(
             &plugin,
             &serde_json::to_string(&cohere_isolated).unwrap(),
             None
@@ -4198,7 +4238,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     )
     .await;
     assert!(
-        !run_before_proxy_get_status(
+        !run_lookup_get_status(
             &plugin,
             &serde_json::to_string(&cohere_other_conversation).unwrap(),
             None
@@ -4223,14 +4263,14 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     )
     .await;
     assert!(
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await
+        run_lookup_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await
     );
     let tgi_isolated = json!({
         "inputs": "What city is France's capital?",
         "parameters": {"temperature": 1.0}
     });
     assert!(
-        !run_before_proxy_get_status(
+        !run_lookup_get_status(
             &plugin,
             &serde_json::to_string(&tgi_isolated).unwrap(),
             None
@@ -4254,14 +4294,14 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     )
     .await;
     assert!(
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&titan2).unwrap(), None).await
+        run_lookup_get_status(&plugin, &serde_json::to_string(&titan2).unwrap(), None).await
     );
     let titan_isolated = json!({
         "inputText": "What city is France's capital?",
         "textGenerationConfig": {"temperature": 1.0}
     });
     assert!(
-        !run_before_proxy_get_status(
+        !run_lookup_get_status(
             &plugin,
             &serde_json::to_string(&titan_isolated).unwrap(),
             None
@@ -4346,7 +4386,7 @@ async fn complex_provider_native_inputs_build_semantic_keys_without_collisions()
         )
         .await;
         assert!(
-            run_before_proxy_get_status(&plugin, &serde_json::to_string(&lookup).unwrap(), None,)
+            run_lookup_get_status(&plugin, &serde_json::to_string(&lookup).unwrap(), None,)
                 .await,
             "same-family structured prompt variants should semantic-hit"
         );
@@ -4420,7 +4460,7 @@ async fn reject_mode_detects_provider_native_multimodal_shapes() {
 
     for (body, multimodal) in cases {
         let body_str = serde_json::to_string(&body).unwrap();
-        let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+        let (ctx, result) = run_lookup(&plugin, &body_str, None).await;
         assert!(matches!(result, PluginResult::Continue));
         assert_eq!(
             staged_status(&plugin, &ctx),
@@ -4453,7 +4493,7 @@ async fn distinct_families_do_not_exact_or_semantic_collide() {
     .await;
 
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "Gemini body must not exact-hit a Messages-family entry"
@@ -4521,11 +4561,11 @@ async fn run_two_instance_miss_store_semantic_hit(exact_first: bool) {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     assert!(matches!(
-        first.before_proxy(&mut ctx, &mut headers).await,
+        drive_cache_lookup(first, &mut ctx, &headers).await,
         PluginResult::Continue
     ));
     assert!(matches!(
-        second.before_proxy(&mut ctx, &mut headers).await,
+        drive_cache_lookup(second, &mut ctx, &headers).await,
         PluginResult::Continue
     ));
 
@@ -4587,7 +4627,7 @@ async fn run_two_instance_miss_store_semantic_hit(exact_first: bool) {
     rebuild_ai_semantic_cache_vector_index(&semantic).await;
 
     // Exact instance exact-hits the identical prompt from its own store.
-    let (ctx_exact_hit, exact_hit) = run_before_proxy(&exact, &body1_str, None).await;
+    let (ctx_exact_hit, exact_hit) = run_lookup(&exact, &body1_str, None).await;
     match exact_hit {
         PluginResult::RejectBinary {
             status_code, body, ..
@@ -4610,7 +4650,7 @@ async fn run_two_instance_miss_store_semantic_hit(exact_first: bool) {
         "messages": [{"role": "user", "content": "Which city is France's capital?"}]
     });
     let body2_str = serde_json::to_string(&body2).unwrap();
-    let (ctx_semantic_hit, semantic_hit) = run_before_proxy(&semantic, &body2_str, None).await;
+    let (ctx_semantic_hit, semantic_hit) = run_lookup(&semantic, &body2_str, None).await;
     match semantic_hit {
         PluginResult::RejectBinary {
             status_code,
@@ -4631,7 +4671,7 @@ async fn run_two_instance_miss_store_semantic_hit(exact_first: bool) {
     assert_eq!(staged_match(&semantic, &ctx_semantic_hit), Some("semantic"));
 
     // Exact instance must still miss the non-identical prompt (no stolen vector).
-    let (ctx_exact_miss, exact_miss) = run_before_proxy(&exact, &body2_str, None).await;
+    let (ctx_exact_miss, exact_miss) = run_lookup(&exact, &body2_str, None).await;
     assert!(
         matches!(exact_miss, PluginResult::Continue),
         "non-semantic instance must not inherit a sibling semantic hit"
@@ -4671,14 +4711,14 @@ async fn reject_bypass_clears_only_current_instance_staging() {
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     assert!(matches!(
-        text_cache.before_proxy(&mut ctx, &mut headers).await,
+        drive_cache_lookup(&text_cache, &mut ctx, &headers).await,
         PluginResult::Continue
     ));
     assert_eq!(staged_status(&text_cache, &ctx), Some("MISS"));
     assert!(has_staged_cache_key(&text_cache, &ctx));
 
     assert!(matches!(
-        reject_cache.before_proxy(&mut ctx, &mut headers).await,
+        drive_cache_lookup(&reject_cache, &mut ctx, &headers).await,
         PluginResult::Continue
     ));
     assert_eq!(staged_status(&reject_cache, &ctx), Some("BYPASS"));
@@ -4815,7 +4855,7 @@ async fn test_embedding_response_rejects_oversize_body() {
         "messages": [{"role": "user", "content": "oversize embedding body"}]
     });
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     assert!(
@@ -4849,7 +4889,7 @@ async fn test_embedding_response_rejects_oversize_dimension() {
         "messages": [{"role": "user", "content": "oversize embedding dimension"}]
     });
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     assert!(
@@ -4885,7 +4925,7 @@ async fn large_finite_embedding_components_normalize_without_zero_collapse() {
         "messages": [{"role": "user", "content": "large finite embedding components"}]
     });
     let (ctx, result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
     let embedding = ai_semantic_cache_embedding(&ctx, instance_id(&plugin))
@@ -4950,7 +4990,7 @@ async fn invalid_first_embedding_does_not_pin_learned_dimension() {
         "messages": [{"role": "user", "content": "invalid first embedding"}]
     });
     let (first_ctx, first_result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&first_body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&first_body).unwrap(), None).await;
     assert!(matches!(first_result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &first_ctx).unwrap(), "MISS");
     assert!(
@@ -4963,7 +5003,7 @@ async fn invalid_first_embedding_does_not_pin_learned_dimension() {
         "messages": [{"role": "user", "content": "valid second embedding different dim"}]
     });
     let (second_ctx, second_result) =
-        run_before_proxy(&plugin, &serde_json::to_string(&second_body).unwrap(), None).await;
+        run_lookup(&plugin, &serde_json::to_string(&second_body).unwrap(), None).await;
     assert!(matches!(second_result, PluginResult::Continue));
     assert_eq!(staged_status(&plugin, &second_ctx).unwrap(), "MISS");
     let embedding = ai_semantic_cache_embedding(&second_ctx, instance_id(&plugin))
@@ -5037,7 +5077,7 @@ async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
         "messages": [{"role": "user", "content": "canonical params"}]
     });
     let hit =
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None)
+        run_lookup_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None)
             .await;
     assert!(
         hit,
@@ -5066,7 +5106,7 @@ async fn distinct_request_paths_do_not_collide_within_one_proxy() {
             .insert("request_body".to_string(), body_str.to_string());
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
         (ctx, result)
     }
 
@@ -5243,7 +5283,7 @@ async fn identical_semantic_misses_coalesce_to_one_embedding_call() {
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
-            plugin.before_proxy(&mut ctx, &mut headers).await
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await
         }));
     }
     start.wait().await;
@@ -5294,7 +5334,7 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
         ctx.metadata.insert("request_body".to_string(), body_leader);
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        plugin_leader.before_proxy(&mut ctx, &mut headers).await
+        drive_cache_lookup(&plugin_leader, &mut ctx, &headers).await
     });
     // Let the leader claim the slot, then cancel before it publishes.
     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -5316,7 +5356,7 @@ async fn leader_cancel_reelects_one_replacement_without_stampede() {
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
-            plugin.before_proxy(&mut ctx, &mut headers).await
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await
         }));
     }
     for task in followers {
@@ -5370,7 +5410,7 @@ async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
-            plugin.before_proxy(&mut ctx, &mut headers).await
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await
         }));
     }
     for task in tasks {
@@ -5418,7 +5458,7 @@ async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
             ctx.metadata.insert("request_body".to_string(), body_str);
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
-            plugin.before_proxy(&mut ctx, &mut headers).await
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await
         }));
     }
     for task in tasks {
@@ -5478,7 +5518,7 @@ async fn embedding_semaphore_admission_wait_is_bounded() {
             );
             let mut headers = HashMap::new();
             headers.insert("content-type".to_string(), "application/json".to_string());
-            plugin.before_proxy(&mut ctx, &mut headers).await
+            drive_cache_lookup(&plugin, &mut ctx, &headers).await
         }));
     }
 
@@ -5518,7 +5558,7 @@ async fn route_rewrite_and_effective_upstream_isolate_cache_entries() {
             .insert("request_body".to_string(), body_str.to_string());
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
         (ctx, result)
     }
 
@@ -5618,6 +5658,36 @@ fn priority_is_after_route_dispatch_plugins() {
             priority::AI_SEMANTIC_CACHE > priority::AI_STREAM_ROUTER,
             "cache lookup must observe ai_stream_router destination overrides"
         );
+    }
+}
+
+/// The lookup priority is load-bearing in both directions.
+///
+/// Above `ai_prompt_compressor` (4055): that plugin stages a
+/// marker-sanitization rejection in `transform_request_body_with_context` and
+/// enforces it in `on_final_request_body_with_context`. A cache hit ordered
+/// ahead of that hook would answer a request the gateway had already refused.
+///
+/// Below `ai_federation` (4060): federation performs provider I/O from the same
+/// stage, so a hit that lands after it saves nothing.
+#[test]
+fn lookup_priority_sits_between_prompt_compressor_and_federation() {
+    let plugin = make_plugin(json!({}));
+    assert!(plugin.requires_final_request_body_before_backend_dispatch());
+    assert!(plugin.needs_final_request_body_context());
+    const {
+        assert!(
+            priority::AI_SEMANTIC_CACHE > priority::AI_PROMPT_COMPRESSOR,
+            "a hit must not bypass ai_prompt_compressor's staged final rejection"
+        );
+        assert!(
+            priority::AI_SEMANTIC_CACHE < priority::AI_FEDERATION,
+            "lookup must precede ai_federation's external provider dispatch"
+        );
+        // Every request-body transform, including `request_transformer` and
+        // `compression` request decode, has run before this point.
+        assert!(priority::AI_SEMANTIC_CACHE > priority::REQUEST_TRANSFORMER);
+        assert!(priority::AI_SEMANTIC_CACHE > priority::COMPRESSION);
     }
 }
 
@@ -5859,7 +5929,7 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
         .insert("request_body".to_string(), body_str.clone());
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
-    let first = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let first = drive_cache_lookup(&plugin, &mut ctx, &headers).await;
     assert!(matches!(first, PluginResult::Continue));
     let cache_key = staged_cache_key_value(&plugin, &ctx)
         .expect("miss must stage a cache key")
@@ -5880,7 +5950,7 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
     ctx2.metadata.insert("request_body".to_string(), body_str);
     let mut headers2 = HashMap::new();
     headers2.insert("content-type".to_string(), "application/json".to_string());
-    let second = plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    let second = drive_cache_lookup(&plugin, &mut ctx2, &headers2).await;
     assert!(
         matches!(second, PluginResult::Continue),
         "suppressed quarantine must remain a miss, never a hit"
@@ -5888,7 +5958,7 @@ async fn redis_quarantine_suppressed_key_stays_fail_closed_miss() {
     assert_eq!(staged_status(&plugin, &ctx2), Some("MISS"));
     assert!(
         ai_semantic_cache_redis_quarantine_suppressions_for_test(&plugin) > before,
-        "before_proxy must observe the local suppressor on the Redis path"
+        "cache lookup must observe the local suppressor on the Redis path"
     );
 }
 
@@ -6016,8 +6086,8 @@ fn semantic_ctx(client_ip: &str, body_str: &str) -> RequestContext {
 }
 
 async fn semantic_store(plugin: &AiSemanticCache, ctx: &mut RequestContext, response_body: &[u8]) {
-    let mut headers = ctx.headers.clone();
-    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    let headers = ctx.headers.clone();
+    let _ = drive_cache_lookup(plugin, ctx, &headers).await;
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     let _ = plugin
@@ -6026,9 +6096,9 @@ async fn semantic_store(plugin: &AiSemanticCache, ctx: &mut RequestContext, resp
 }
 
 async fn semantic_is_hit(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> bool {
-    let mut headers = ctx.headers.clone();
+    let headers = ctx.headers.clone();
     matches!(
-        plugin.before_proxy(ctx, &mut headers).await,
+        drive_cache_lookup(plugin, ctx, &headers).await,
         PluginResult::RejectBinary { .. }
     )
 }
@@ -6151,7 +6221,7 @@ async fn exact_key_framing_defeats_role_content_delimiter_collisions() {
     )
     .await;
     assert!(
-        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&genuine).unwrap(), None)
+        !run_lookup_get_status(&plugin, &serde_json::to_string(&genuine).unwrap(), None)
             .await,
         "delimiter-bearing message content must not collide with a different conversation"
     );
@@ -6181,7 +6251,7 @@ async fn exact_key_framing_defeats_newline_field_boundary_forgery() {
     )
     .await;
     assert!(
-        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&plain).unwrap(), None).await,
+        !run_lookup_get_status(&plugin, &serde_json::to_string(&plain).unwrap(), None).await,
         "a newline inside a model name must not forge a key-part boundary"
     );
 }
@@ -6246,8 +6316,8 @@ fn partition_ctx(
 }
 
 async fn partition_store(plugin: &AiSemanticCache, ctx: &mut RequestContext) {
-    let mut headers = ctx.headers.clone();
-    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    let headers = ctx.headers.clone();
+    let _ = drive_cache_lookup(plugin, ctx, &headers).await;
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
     let _ = plugin
@@ -6256,9 +6326,9 @@ async fn partition_store(plugin: &AiSemanticCache, ctx: &mut RequestContext) {
 }
 
 async fn partition_is_hit(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> bool {
-    let mut headers = ctx.headers.clone();
+    let headers = ctx.headers.clone();
     matches!(
-        plugin.before_proxy(ctx, &mut headers).await,
+        drive_cache_lookup(plugin, ctx, &headers).await,
         PluginResult::RejectBinary { .. }
     )
 }
@@ -6336,11 +6406,17 @@ async fn exact_key_isolates_header_only_differences() {
     );
 }
 
-/// The header binding excludes only transport framing and per-request
-/// correlation identifiers. Without that carve-out every entry would be a
-/// singleton whenever tracing is enabled.
+/// Tracing and correlation identifiers are backend-visible and therefore bound.
+///
+/// The previous revision excluded them by reusing the *response*-cache
+/// sanitation classifier and arguing they are fresh "by construction". That is
+/// not a valid request-side proof: `correlation_id` preserves a valid
+/// client-supplied identifier, the plugin may not be configured at all, and the
+/// value reaches the origin either way — so a client can pin a stable trace ID
+/// and the origin can vary on it. Under the complete backend-visible partition
+/// contract a changed trace header is a conservative miss.
 #[tokio::test]
-async fn exact_key_ignores_per_request_trace_headers() {
+async fn exact_key_binds_per_request_trace_headers() {
     let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
 
     let mut first = partition_ctx(
@@ -6364,8 +6440,51 @@ async fn exact_key_ignores_per_request_trace_headers() {
         )],
     );
     assert!(
-        partition_is_hit(&plugin, &mut second).await,
-        "a fresh trace identifier must not defeat the cache"
+        !partition_is_hit(&plugin, &mut second).await,
+        "a changed backend-visible trace identifier must partition the cache"
+    );
+
+    // The identical trace context still hits, so the binding is a partition and
+    // not an unconditional bypass.
+    let mut repeat = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )],
+    );
+    assert!(
+        partition_is_hit(&plugin, &mut repeat).await,
+        "an unchanged trace identifier must still hit"
+    );
+}
+
+/// Correlation identifiers are bound for the same reason: `correlation_id`
+/// preserves a valid client-supplied `x-request-id` rather than regenerating
+/// one, so the value is attacker-chosen, stable, and reaches the origin.
+#[tokio::test]
+async fn exact_key_binds_client_supplied_correlation_id() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut first = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[("x-request-id", "client-chosen-a")],
+    );
+    partition_store(&plugin, &mut first).await;
+
+    let mut second = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[("x-request-id", "client-chosen-b")],
+    );
+    assert!(
+        !partition_is_hit(&plugin, &mut second).await,
+        "a client-supplied correlation ID is backend-visible and must partition"
     );
 }
 
@@ -6474,8 +6593,8 @@ async fn shared_anonymous_scope_does_not_relax_authenticated_callers() {
 // neighborhood must stage different scope keys.
 
 async fn staged_scope_key(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> Option<String> {
-    let mut headers = ctx.headers.clone();
-    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    let headers = ctx.headers.clone();
+    let _ = drive_cache_lookup(plugin, ctx, &headers).await;
     ai_semantic_cache_scope_key(ctx, instance_id(plugin)).map(str::to_string)
 }
 
@@ -6533,5 +6652,438 @@ async fn semantic_scope_key_isolates_namespace_query_and_header_dimensions() {
         staged_scope_key(&plugin, &mut other_header).await,
         Some(baseline_scope),
         "a tenant-selecting request header must not share a semantic scope"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lookup lifecycle: the partition describes the request the provider receives
+//
+// Lookup runs in `on_final_request_body_with_context` at priority 4057, after
+// `request_transformer` (3000) rewrites headers/query, after every
+// `transform_request_body` hook, and after `ai_prompt_compressor` (4055)
+// enforces its staged marker-sanitization rejection — but before
+// `ai_federation` (4060) performs provider I/O. Each test below pins one arm of
+// that contract.
+// ---------------------------------------------------------------------------
+
+/// Build the ordered plugin slice the proxy would run for one buffered request.
+fn ordered_plugins(plugins: Vec<Arc<dyn Plugin>>) -> Vec<Arc<dyn Plugin>> {
+    let mut plugins = plugins;
+    plugins.sort_by_key(|plugin| plugin.priority());
+    plugins
+}
+
+/// A header/query transform changes the final key, because the partition is
+/// taken over the *outbound* header map and the transformer-published query.
+///
+/// The pre-transform view — what a `before_proxy` lookup would have keyed —
+/// does not reach the entry stored under the post-transform view, which is the
+/// whole point: the earlier lookup site described a request that is never sent.
+#[tokio::test]
+async fn header_and_query_transform_change_the_lookup_partition() {
+    use ferrum_edge::plugins::request_transformer::RequestTransformer;
+
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    // Two transformer generations that differ only in what they author onto the
+    // backend-visible request.
+    let transformer = |tenant: &str| {
+        RequestTransformer::new(&json!({
+            "rules": [
+                {"operation": "add", "target": "header", "key": "X-Tenant-Id", "value": tenant},
+                {"operation": "add", "target": "query", "key": "tenant", "value": tenant},
+            ]
+        }))
+        .expect("transformer config must be valid")
+    };
+
+    // Run `request_transformer` exactly where the proxy does (`before_proxy`),
+    // then hand the resulting outbound view to the cache lookup.
+    async fn transformed_lookup(
+        cache: &AiSemanticCache,
+        transformer: &RequestTransformer,
+    ) -> (RequestContext, PluginResult) {
+        let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+        let mut headers = ctx.headers.clone();
+        assert!(matches!(
+            transformer.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        let result = drive_cache_lookup(cache, &mut ctx, &headers).await;
+        (ctx, result)
+    }
+
+    let acme = transformer("acme");
+    let (mut seeded_ctx, seeded) = transformed_lookup(&plugin, &acme).await;
+    assert!(matches!(seeded, PluginResult::Continue), "first is a miss");
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut seeded_ctx, 200, &response_headers, br#""stored""#)
+        .await;
+
+    // A different transform generation authors a different tenant header and
+    // query pair, so it must not replay the first tenant's completion.
+    let globex = transformer("globex");
+    let (_, other_tenant) = transformed_lookup(&plugin, &globex).await;
+    assert!(
+        matches!(other_tenant, PluginResult::Continue),
+        "a transform-authored header/query must partition the cache"
+    );
+
+    // The identical transform still hits, so the binding partitions rather than
+    // disabling the cache.
+    let (_, same_tenant) = transformed_lookup(&plugin, &acme).await;
+    assert!(
+        matches!(same_tenant, PluginResult::RejectBinary { .. }),
+        "the same finalized request must still hit"
+    );
+
+    // And the *pre-transform* view — the one a `before_proxy` lookup would have
+    // keyed — cannot reach the entry stored under the finalized view.
+    let mut untransformed =
+        partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    assert!(
+        !partition_is_hit(&plugin, &mut untransformed).await,
+        "the pre-transform request must not share the finalized partition"
+    );
+}
+
+/// A request-body transform changes both the exact key and the semantic scope
+/// identity, because the lookup keys the hook's final body — not the
+/// pre-transform snapshot staged in `ctx.metadata["request_body"]`.
+#[tokio::test]
+async fn request_body_transform_changes_exact_and_semantic_identity() {
+    let mock_server = MockServer::start().await;
+    // Each distinct final body is a semantic miss and embeds once; the exact
+    // count is not the property under test.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [1.0, 0.0, 0.0]}]
+        })))
+        .mount(&mock_server)
+        .await;
+    let mut config = semantic_config(&mock_server);
+    config["ttl_seconds"] = json!(300);
+    config["scope_by_consumer"] = json!(false);
+    let plugin = make_plugin(config);
+
+    let pre_transform =
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"the original prompt"}]}"#;
+    let transformed_a =
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"compressed prompt A"}]}"#;
+    let transformed_b =
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"compressed prompt B"}]}"#;
+
+    // Same staged pre-transform body in every case; only the final backend
+    // body differs.
+    async fn identity(
+        plugin: &AiSemanticCache,
+        pre_transform: &str,
+        final_body: &str,
+    ) -> (String, String) {
+        let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+        ctx.metadata
+            .insert("request_body".to_string(), pre_transform.to_string());
+        let headers = ctx.headers.clone();
+        let result =
+            drive_cache_lookup_with_body(plugin, &mut ctx, &headers, final_body.as_bytes()).await;
+        assert!(matches!(result, PluginResult::Continue), "each body misses");
+        let exact = staged_cache_key_value(plugin, &ctx)
+            .expect("an ordinary miss must stage a store key")
+            .to_string();
+        let scope = ai_semantic_cache_scope_key(&ctx, instance_id(plugin))
+            .map(str::to_string)
+            .expect("a semantic miss must stage a scope key");
+        (exact, scope)
+    }
+
+    let (exact_a, scope_a) = identity(&plugin, pre_transform, transformed_a).await;
+    let (exact_b, scope_b) = identity(&plugin, pre_transform, transformed_b).await;
+    let (exact_a_again, scope_a_again) = identity(&plugin, pre_transform, transformed_a).await;
+
+    assert_ne!(
+        exact_a, exact_b,
+        "the exact key must follow the transformed backend-visible body"
+    );
+    assert_ne!(
+        scope_a, scope_b,
+        "the semantic scope must follow the transformed backend-visible body"
+    );
+    assert_eq!(exact_a, exact_a_again, "identical final bodies key alike");
+    assert_eq!(scope_a, scope_a_again, "identical final bodies scope alike");
+}
+
+/// `ai_prompt_compressor` stages a marker-sanitization rejection in its body
+/// transform and enforces it in its final hook at 4055. A cache hit at 4057
+/// must not be able to answer that request.
+///
+/// The cache is seeded with the identical body first, so if lookup ran ahead of
+/// the rejection boundary this request would return `200` from the cache
+/// instead of the compressor's `413`.
+#[tokio::test]
+async fn staged_prompt_compressor_rejection_is_not_bypassed_by_a_cache_hit() {
+    use ferrum_edge::_test_support::run_request_body_stage_with_context_for_test;
+    use ferrum_edge::plugins::ai_prompt_compressor::AiPromptCompressor;
+
+    let cache = Arc::new(make_plugin(
+        json!({ "ttl_seconds": 300, "scope_by_consumer": false }),
+    ));
+    // A configured preserve tag makes marker sanitation a correctness boundary,
+    // so a body above the hard scan bound fails closed with `413` instead of
+    // passing through with markers intact.
+    let compressor = Arc::new(
+        AiPromptCompressor::new(&json!({ "preserve_tag": "keep" }))
+            .expect("compressor config must be valid"),
+    );
+
+    // > 1 MiB (HARD_MAX_SCAN_BYTES) so the compressor stages `413`.
+    let oversized_prompt = "a".repeat(1_200_000);
+    let body = serde_json::to_string(&json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": oversized_prompt}]
+    }))
+    .expect("body serializes");
+
+    // Seed the cache with this exact request so a bypass would be observable.
+    let mut seed_ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    seed_ctx
+        .metadata
+        .insert("request_body".to_string(), body.clone());
+    let seed_headers = seed_ctx.headers.clone();
+    assert!(matches!(
+        drive_cache_lookup(&cache, &mut seed_ctx, &seed_headers).await,
+        PluginResult::Continue
+    ));
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = cache
+        .on_final_response_body(&mut seed_ctx, 200, &response_headers, br#""cached""#)
+        .await;
+
+    // Sanity: with the compressor absent, the very same request is a HIT.
+    let mut hit_ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    hit_ctx
+        .metadata
+        .insert("request_body".to_string(), body.clone());
+    let hit_headers = hit_ctx.headers.clone();
+    assert!(
+        matches!(
+            drive_cache_lookup(&cache, &mut hit_ctx, &hit_headers).await,
+            PluginResult::RejectBinary { .. }
+        ),
+        "the seeded entry must be reachable without the compressor"
+    );
+
+    // With the compressor composed, the staged rejection wins.
+    let plugins = ordered_plugins(vec![
+        Arc::clone(&compressor) as Arc<dyn Plugin>,
+        Arc::clone(&cache) as Arc<dyn Plugin>,
+    ]);
+    assert_eq!(
+        plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["ai_prompt_compressor", "ai_semantic_cache"],
+        "the compressor's final hook must run before cache lookup"
+    );
+
+    let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let headers = ctx.headers.clone();
+    let (_, result) =
+        run_request_body_stage_with_context_for_test(&plugins, &mut ctx, &headers, body.as_bytes())
+            .await;
+    match result {
+        PluginResult::Reject { status_code, .. } => assert_eq!(
+            status_code, 413,
+            "the staged marker-sanitization rejection must be the response"
+        ),
+        other => panic!("a cache hit must not bypass the staged rejection: {other:?}"),
+    }
+    assert!(
+        !has_staged_cache_key(&cache, &ctx),
+        "a request refused before lookup must not stage a store key"
+    );
+}
+
+/// Lookup precedes `ai_federation`'s external dispatch, and an ordinary miss
+/// still stages a store key so the genuine backend response is retained.
+///
+/// The federation provider points at an unresolvable host, so if lookup were
+/// ordered after federation this request would come back as a provider failure
+/// rather than the retained completion.
+#[tokio::test]
+async fn lookup_precedes_federation_dispatch_and_misses_still_stage_a_store_key() {
+    use ferrum_edge::_test_support::run_request_body_stage_with_context_for_test;
+    use ferrum_edge::plugins::ai_federation::AiFederation;
+
+    let cache = Arc::new(make_plugin(
+        json!({ "ttl_seconds": 300, "scope_by_consumer": false }),
+    ));
+    let federation = Arc::new(
+        AiFederation::new(
+            &json!({
+                "providers": [{
+                    "name": "unreachable",
+                    "provider_type": "openai_compatible",
+                    "api_key": "sk-test-key",
+                    "model_patterns": ["gpt-*"],
+                    "base_url": "https://provider.example.invalid/v1/chat/completions"
+                }]
+            }),
+            PluginHttpClient::default(),
+        )
+        .expect("federation config must be valid"),
+    );
+
+    let plugins = ordered_plugins(vec![
+        Arc::clone(&cache) as Arc<dyn Plugin>,
+        Arc::clone(&federation) as Arc<dyn Plugin>,
+    ]);
+    assert_eq!(
+        plugins
+            .iter()
+            .map(|plugin| plugin.name())
+            .collect::<Vec<_>>(),
+        vec!["ai_semantic_cache", "ai_federation"],
+        "cache lookup must be ordered before federation's provider dispatch"
+    );
+
+    // An ordinary miss stages a store key so the genuine backend response is
+    // retained by `on_final_response_body`.
+    let mut seed_ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    let seed_headers = seed_ctx.headers.clone();
+    assert!(matches!(
+        drive_cache_lookup(&cache, &mut seed_ctx, &seed_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        has_staged_cache_key(&cache, &seed_ctx),
+        "an ordinary miss must stage a store key for the genuine backend response"
+    );
+    assert_eq!(staged_status(&cache, &seed_ctx), Some("MISS"));
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = cache
+        .on_final_response_body(&mut seed_ctx, 200, &response_headers, br#"{"id":"cached"}"#)
+        .await;
+
+    // Replaying the identical request through the composed stage is answered by
+    // the cache; federation never dispatches to its (unreachable) provider.
+    let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    let headers = ctx.headers.clone();
+    let (_, result) = run_request_body_stage_with_context_for_test(
+        &plugins,
+        &mut ctx,
+        &headers,
+        REPLAY_BODY.as_bytes(),
+    )
+    .await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(body.as_ref(), br#"{"id":"cached"}"#.as_slice());
+        }
+        other => panic!("the cache must answer before federation dispatches: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caller classification: a credential consumed by an earlier plugin is still
+// authentication (GHSA-w27g-65rf-h7xm).
+// ---------------------------------------------------------------------------
+
+/// Build a context whose credential exists only on the pristine inbound wire —
+/// an earlier plugin (`key_auth` stripping its key header, `ai_stream_router`
+/// replacing the client token) removed it from the live view and resolved no
+/// gateway identity.
+fn pristine_only_credential_ctx(client_ip: &str, token: &str) -> RequestContext {
+    let mut ctx = partition_ctx(Some(proxy_in_namespace("tenant-a")), client_ip, None, &[]);
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(token).expect("token must be a valid header value"),
+    );
+    ctx.set_raw_headers(raw);
+    ctx
+}
+
+/// A credential present only in the pristine view still partitions by caller.
+#[tokio::test]
+async fn pristine_only_credential_still_partitions_by_caller() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut narrow = pristine_only_credential_ctx("127.0.0.1", "Bearer client-token-read-only");
+    partition_store(&plugin, &mut narrow).await;
+
+    let mut broad = pristine_only_credential_ctx("127.0.0.1", "Bearer client-token-admin");
+    assert!(
+        !partition_is_hit(&plugin, &mut broad).await,
+        "a consumed credential must still separate two callers"
+    );
+
+    let mut same = pristine_only_credential_ctx("127.0.0.1", "Bearer client-token-read-only");
+    assert!(
+        partition_is_hit(&plugin, &mut same).await,
+        "the same consumed credential must still hit"
+    );
+}
+
+/// A pristine-only credential is classified as *authenticated*, so the caller is
+/// bound to its canonical address like any other authenticated caller.
+#[tokio::test]
+async fn pristine_only_credential_is_address_partitioned() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut first = pristine_only_credential_ctx("127.0.0.1", "Bearer client-token-read-only");
+    partition_store(&plugin, &mut first).await;
+
+    let mut other_address =
+        pristine_only_credential_ctx("10.0.0.7", "Bearer client-token-read-only");
+    assert!(
+        !partition_is_hit(&plugin, &mut other_address).await,
+        "an authenticated caller binds its canonical address"
+    );
+}
+
+/// `anonymous_caller_scope: shared` relaxes the address binding for *anonymous*
+/// callers only. A caller whose credential an earlier plugin consumed is not
+/// anonymous, so the opt-out must not reach it.
+///
+/// Without treating the pristine view as authentication, this caller would have
+/// been classified anonymous and two different source addresses would have
+/// shared one retained completion.
+#[tokio::test]
+async fn anonymous_shared_opt_out_does_not_reach_a_pristine_only_credential() {
+    let shared = make_plugin(json!({
+        "ttl_seconds": 300,
+        "scope_by_consumer": false,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut first = pristine_only_credential_ctx("127.0.0.1", "Bearer client-token-read-only");
+    partition_store(&shared, &mut first).await;
+
+    let mut other_address =
+        pristine_only_credential_ctx("10.0.0.7", "Bearer client-token-read-only");
+    assert!(
+        !partition_is_hit(&shared, &mut other_address).await,
+        "the anonymous shared opt-out must not relax an authenticated caller"
+    );
+
+    // A genuinely anonymous caller (no credential in either view) still gets the
+    // opt-out, so the attestation is not silently inert.
+    let mut anon_a = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    partition_store(&shared, &mut anon_a).await;
+    let mut anon_b = partition_ctx(Some(proxy_in_namespace("tenant-a")), "10.0.0.7", None, &[]);
+    assert!(
+        partition_is_hit(&shared, &mut anon_b).await,
+        "an anonymous caller must still share under the opt-out"
     );
 }
