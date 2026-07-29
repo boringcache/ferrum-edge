@@ -1,6 +1,8 @@
 //! Tests for loki_logging plugin
 
-use ferrum_edge::_test_support::loki_logging_with_ceiling_for_test;
+use ferrum_edge::_test_support::{
+    loki_logging_probe_provisional_admission_for_test, loki_logging_with_ceiling_for_test,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient,
     loki_logging::{
@@ -1493,5 +1495,81 @@ async fn test_loki_stalled_ack_drain_timeout_does_not_block_indefinitely() {
     panic!(
         "stalled Loki ACK must free the flush worker via the shared drain timeout; saw {} requests",
         requests.load(Ordering::SeqCst)
+    );
+}
+
+#[test]
+fn test_loki_refused_provisional_reservation_skips_serialize_and_labels() {
+    // Isolated ceiling filled so the provisional max-entry charge is refused
+    // before any attacker-shaped serialization or label construction.
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(64)));
+    let (
+        admitted,
+        serialize_called,
+        labels_called,
+        charged_after_admit,
+        budget_used_after_admit,
+        ceiling_used_after_admit,
+        _,
+        _,
+    ) = loki_logging_probe_provisional_admission_for_test(ceiling, 64, 1_024, Some(64));
+
+    assert!(!admitted, "denied provisional reservation must fail closed");
+    assert!(
+        !serialize_called,
+        "serializer must not run when provisional reservation is refused"
+    );
+    assert!(
+        !labels_called,
+        "label construction must not run when provisional reservation is refused"
+    );
+    assert_eq!(charged_after_admit, None);
+    assert_eq!(
+        budget_used_after_admit, 64,
+        "refused path must leave only the pre-held charge"
+    );
+    assert_eq!(
+        ceiling_used_after_admit, 64,
+        "refused path must leave only the pre-held ceiling charge"
+    );
+}
+
+#[test]
+fn test_loki_provisional_reservation_shrinks_to_exact_and_releases_on_drop() {
+    let ceiling = Box::leak(Box::new(RetainedByteCeiling::new(1_048_576)));
+    let max_entry_bytes = 4_096;
+    let (
+        admitted,
+        serialize_called,
+        labels_called,
+        charged_after_admit,
+        budget_used_after_admit,
+        ceiling_used_after_admit,
+        budget_used_after_drop,
+        ceiling_used_after_drop,
+    ) = loki_logging_probe_provisional_admission_for_test(
+        ceiling,
+        1_048_576,
+        max_entry_bytes,
+        None,
+    );
+
+    assert!(admitted, "small probe entry must admit under a fresh budget");
+    assert!(serialize_called, "successful admit must serialize");
+    assert!(labels_called, "successful admit must build labels");
+    let charged = charged_after_admit.expect("admitted lease must report a charge");
+    assert!(
+        charged > 0 && charged < max_entry_bytes,
+        "exact retained charge must be below the provisional max_entry_bytes lease"
+    );
+    assert_eq!(budget_used_after_admit, charged);
+    assert_eq!(ceiling_used_after_admit, charged);
+    assert_eq!(
+        budget_used_after_drop, 0,
+        "drop must release the shrunk instance charge exactly"
+    );
+    assert_eq!(
+        ceiling_used_after_drop, 0,
+        "drop must release the shrunk process reservation exactly"
     );
 }

@@ -1301,6 +1301,48 @@ pub mod _test_support {
         crate::plugins::loki_logging::LokiLogging::new_with_ceiling(config, http_client, ceiling)
     }
 
+    /// Deterministic probe: a provisional `max_entry_bytes` reservation must
+    /// precede serialization and label construction. When `hold_bytes` fills
+    /// the isolated budget/ceiling so the provisional reservation is refused,
+    /// neither path may run. On success the lease shrinks to the exact retained
+    /// size and releases fully on drop. Returns
+    /// `(admitted, serialize_called, labels_called, charged_after_admit,
+    /// budget_used_after_admit, ceiling_used_after_admit, budget_used_after_drop,
+    /// ceiling_used_after_drop)`.
+    #[allow(clippy::type_complexity)]
+    pub fn loki_logging_probe_provisional_admission_for_test(
+        ceiling: &'static crate::plugins::utils::byte_budget::RetainedByteCeiling,
+        buffer_max_bytes: usize,
+        max_entry_bytes: usize,
+        hold_bytes: Option<usize>,
+    ) -> (
+        bool,
+        bool,
+        bool,
+        Option<usize>,
+        usize,
+        usize,
+        usize,
+        usize,
+    ) {
+        let probe = crate::plugins::loki_logging::probe_loki_provisional_admission_for_test(
+            ceiling,
+            buffer_max_bytes,
+            max_entry_bytes,
+            hold_bytes,
+        );
+        (
+            probe.admitted,
+            probe.serialize_called,
+            probe.labels_called,
+            probe.charged_after_admit,
+            probe.budget_used_after_admit,
+            probe.ceiling_used_after_admit,
+            probe.budget_used_after_drop,
+            probe.ceiling_used_after_drop,
+        )
+    }
+
     /// Deterministic probe: a Loki batch's serialized (and optionally gzipped)
     /// wire body must be reserved against the retained-byte ceiling before it is
     /// materialized, stay charged alongside the queued entries, and release on

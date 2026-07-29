@@ -131,15 +131,49 @@ struct LokiFlushConfig {
 
 struct LokiByteLease {
     used_bytes: Arc<AtomicUsize>,
-    bytes: usize,
+    /// Current retained charge. Atomic so a provisional reservation can shrink
+    /// race-safely against `Drop` without temporarily releasing the whole lease.
+    bytes: AtomicUsize,
     /// Matching reservation against the process-wide observability ceiling, so
     /// multiple Loki instances cannot multiply past the process total.
-    _process: ProcessByteReservation,
+    process: ProcessByteReservation,
+}
+
+impl LokiByteLease {
+    /// Reduce this lease from its provisional charge to the exact retained
+    /// charge. Never releases-and-reacquires; only subtracts the unused delta.
+    /// No-op when `new_bytes` is not strictly smaller than the current charge.
+    fn shrink_to(&self, new_bytes: usize) {
+        let mut current = self.bytes.load(Ordering::Acquire);
+        while new_bytes < current {
+            match self.bytes.compare_exchange_weak(
+                current,
+                new_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.used_bytes
+                        .fetch_sub(current - new_bytes, Ordering::AcqRel);
+                    self.process.shrink_to(new_bytes);
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn charged_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for LokiByteLease {
     fn drop(&mut self) {
-        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        let bytes = self.bytes.swap(0, Ordering::AcqRel);
+        if bytes != 0 {
+            self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 }
 
@@ -158,6 +192,10 @@ impl LokiByteBudget {
             dropped_count: AtomicU64::new(0),
             ceiling,
         }
+    }
+
+    fn used(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
     }
 
     fn try_acquire(&self, bytes: usize) -> Option<Arc<LokiByteLease>> {
@@ -181,8 +219,8 @@ impl LokiByteBudget {
 
         Some(Arc::new(LokiByteLease {
             used_bytes: Arc::clone(&self.used_bytes),
-            bytes,
-            _process: process,
+            bytes: AtomicUsize::new(bytes),
+            process,
         }))
     }
 
@@ -443,40 +481,18 @@ impl LokiLogging {
         T: serde::Serialize,
         F: FnOnce() -> BTreeMap<String, String>,
     {
+        // Slot first, then provisional aggregate bytes, then serialize/labels.
         let Some(permit) = self.logger.try_reserve() else {
             return;
         };
-
-        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
-        if let Err(error) = serde_json::to_writer(&mut writer, value) {
-            if writer.limit_exceeded {
-                self.byte_budget
-                    .record_drop("serialized entry exceeded max_entry_bytes");
-            } else {
-                warn!("Loki logging: failed to serialize {kind}: {error}");
-            }
+        let Some((line, labels, lease)) = admit_under_byte_budget(
+            &self.byte_budget,
+            self.max_entry_bytes,
+            value,
+            kind,
+            build_labels,
+        ) else {
             return;
-        }
-        let labels = build_labels();
-        let Some(retained_bytes) = retained_entry_bytes(writer.bytes.len(), &labels) else {
-            self.byte_budget
-                .record_drop("entry and labels exceeded byte accounting range");
-            return;
-        };
-        if retained_bytes > self.max_entry_bytes {
-            self.byte_budget
-                .record_drop("entry and labels exceeded max_entry_bytes");
-            return;
-        }
-        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
-            return;
-        };
-        let line = match String::from_utf8(writer.bytes) {
-            Ok(line) => Arc::<str>::from(line),
-            Err(error) => {
-                warn!("Loki logging: serialized {kind} was not UTF-8: {error}");
-                return;
-            }
         };
         permit.send(LokiEntry {
             labels: Arc::new(labels),
@@ -693,6 +709,50 @@ fn retained_entry_bytes(line_bytes: usize, labels: &BTreeMap<String, String>) ->
     })
 }
 
+/// Acquire a provisional `max_entry_bytes` lease, serialize under the per-entry
+/// bound, build labels, then shrink the lease to the exact retained charge
+/// (JSON line + labels). Returns `None` without invoking the serializer or
+/// label builder when the aggregate gate denies.
+fn admit_under_byte_budget<T, F>(
+    byte_budget: &LokiByteBudget,
+    max_entry_bytes: usize,
+    value: &T,
+    kind: &str,
+    build_labels: F,
+) -> Option<(Arc<str>, BTreeMap<String, String>, Arc<LokiByteLease>)>
+where
+    T: serde::Serialize,
+    F: FnOnce() -> BTreeMap<String, String>,
+{
+    let lease = byte_budget.try_acquire(max_entry_bytes)?;
+    let mut writer = BoundedJsonWriter::new(max_entry_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if writer.limit_exceeded {
+            byte_budget.record_drop("serialized entry exceeded max_entry_bytes");
+        } else {
+            warn!("Loki logging: failed to serialize {kind}: {error}");
+        }
+        return None;
+    }
+    let labels = build_labels();
+    let Some(retained_bytes) = retained_entry_bytes(writer.bytes.len(), &labels) else {
+        byte_budget.record_drop("entry and labels exceeded byte accounting range");
+        return None;
+    };
+    if retained_bytes > max_entry_bytes {
+        byte_budget.record_drop("entry and labels exceeded max_entry_bytes");
+        return None;
+    }
+    lease.shrink_to(retained_bytes);
+    match String::from_utf8(writer.bytes) {
+        Ok(line) => Some((Arc::<str>::from(line), labels, lease)),
+        Err(error) => {
+            warn!("Loki logging: serialized {kind} was not UTF-8: {error}");
+            None
+        }
+    }
+}
+
 fn serialized_entry_bytes<T: serde::Serialize>(value: &T, kind: &str) -> Result<usize, String> {
     let mut writer = CountingJsonWriter::default();
     serde_json::to_writer(&mut writer, value)
@@ -789,6 +849,104 @@ fn validate_minimum_entry_budget(
         ));
     }
     Ok(())
+}
+
+/// Observations from [`probe_loki_provisional_admission_for_test`].
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // field reads happen only in `_test_support` wrappers
+pub(crate) struct LokiProvisionalAdmissionProbe {
+    /// Whether admission returned a queued line/lease.
+    pub(crate) admitted: bool,
+    /// Whether the custom `Serialize` implementation ran.
+    pub(crate) serialize_called: bool,
+    /// Whether the label-construction closure ran.
+    pub(crate) labels_called: bool,
+    /// Lease charge after a successful shrink (exact retained size).
+    pub(crate) charged_after_admit: Option<usize>,
+    /// Per-instance budget used after a successful admit.
+    pub(crate) budget_used_after_admit: usize,
+    /// Isolated ceiling used after a successful admit.
+    pub(crate) ceiling_used_after_admit: usize,
+    /// Per-instance budget used after the admitted lease drops.
+    pub(crate) budget_used_after_drop: usize,
+    /// Isolated ceiling used after the admitted lease drops.
+    pub(crate) ceiling_used_after_drop: usize,
+}
+
+/// Deterministic hot-path admission probe for external unit tests.
+///
+/// Reserves against an isolated [`RetainedByteCeiling`]. When `hold_bytes` is
+/// `Some`, that many bytes are held first so the provisional `max_entry_bytes`
+/// reservation is refused — serialization and label construction must not run.
+/// On success the provisional lease shrinks to the exact retained size and is
+/// fully released when the returned lease drops.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
+pub(crate) fn probe_loki_provisional_admission_for_test(
+    ceiling: &'static RetainedByteCeiling,
+    buffer_max_bytes: usize,
+    max_entry_bytes: usize,
+    hold_bytes: Option<usize>,
+) -> LokiProvisionalAdmissionProbe {
+    use std::sync::atomic::AtomicBool;
+
+    let budget = LokiByteBudget::with_ceiling(buffer_max_bytes, ceiling);
+    let _hold = hold_bytes.and_then(|bytes| budget.try_acquire(bytes));
+
+    let serialize_called = AtomicBool::new(false);
+    let labels_called = AtomicBool::new(false);
+
+    struct Probe<'a>(&'a AtomicBool);
+    impl serde::Serialize for Probe<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.store(true, Ordering::SeqCst);
+            serializer.serialize_str("probe")
+        }
+    }
+
+    let admitted = admit_under_byte_budget(
+        &budget,
+        max_entry_bytes,
+        &Probe(&serialize_called),
+        "probe",
+        || {
+            labels_called.store(true, Ordering::SeqCst);
+            let mut labels = BTreeMap::new();
+            labels.insert("service".to_string(), "ferrum-edge".to_string());
+            labels
+        },
+    );
+
+    let serialize_ran = serialize_called.load(Ordering::SeqCst);
+    let labels_ran = labels_called.load(Ordering::SeqCst);
+
+    match admitted {
+        Some((_line, _labels, lease)) => {
+            let charged_after_admit = lease.charged_bytes();
+            let budget_used_after_admit = budget.used();
+            let ceiling_used_after_admit = ceiling.used();
+            drop(lease);
+            LokiProvisionalAdmissionProbe {
+                admitted: true,
+                serialize_called: serialize_ran,
+                labels_called: labels_ran,
+                charged_after_admit: Some(charged_after_admit),
+                budget_used_after_admit,
+                ceiling_used_after_admit,
+                budget_used_after_drop: budget.used(),
+                ceiling_used_after_drop: ceiling.used(),
+            }
+        }
+        None => LokiProvisionalAdmissionProbe {
+            admitted: false,
+            serialize_called: serialize_ran,
+            labels_called: labels_ran,
+            charged_after_admit: None,
+            budget_used_after_admit: budget.used(),
+            ceiling_used_after_admit: ceiling.used(),
+            budget_used_after_drop: budget.used(),
+            ceiling_used_after_drop: ceiling.used(),
+        },
+    }
 }
 
 /// Observations from [`probe_loki_batch_materialization_for_test`].
