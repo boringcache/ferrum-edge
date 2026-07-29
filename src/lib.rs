@@ -2744,6 +2744,13 @@ pub mod _test_support {
         )
     }
 
+    // ── util/json_dup_keys ───────────────────────────────────────────────────
+    pub fn json_scan_memo_entry_count_for_test(
+        memo: &crate::util::json_dup_keys::JsonScanMemo,
+    ) -> usize {
+        memo.entry_count_for_test()
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two

@@ -463,6 +463,9 @@ impl JsonScanMemo {
         if bytes.len() < Self::MIN_MEMO_BYTES {
             return slice_ambiguity(bytes);
         }
+        if bytes.len() > GOVERNED_JSON_LIMITS.max_bytes {
+            return Some(JsonScanReject::TooLarge.reason());
+        }
         let digest = sha256(bytes);
         if let Some(entry) = self
             .entries
@@ -486,6 +489,12 @@ impl JsonScanMemo {
     /// [`JsonScanMemo::ambiguity`] for a `&str` document.
     pub fn ambiguity_str(&mut self, text: &str) -> Option<&'static str> {
         self.ambiguity(text.as_bytes())
+    }
+
+    /// Retained memo entry count for deterministic external regression tests.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    pub(crate) fn entry_count_for_test(&self) -> usize {
+        self.entries.len()
     }
 }
 
