@@ -1,0 +1,2217 @@
+[
+  {
+    "name": "chargeback_sink_events_enqueued_total",
+    "type": "counter",
+    "help": "Chargeback sink events admitted to the in-memory channel or accepted by a durable overflow handoff.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_events_exported_total",
+    "type": "counter",
+    "help": "Chargeback sink events successfully exported to ClickHouse.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_export_failures_total",
+    "type": "counter",
+    "help": "Chargeback sink export failures by bounded reason.",
+    "labels": [
+      "reason"
+    ],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_export_latency_seconds",
+    "type": "histogram",
+    "help": "Chargeback sink ClickHouse export latency in seconds.",
+    "labels": [
+      "le"
+    ],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_byte_budget_exhausted_total",
+    "type": "counter",
+    "help": "Chargeback sink export admissions rejected by the retained-byte budget.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_depth",
+    "type": "gauge",
+    "help": "Chargeback sink in-memory queue depth.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_full_drops_total",
+    "type": "counter",
+    "help": "Chargeback sink events dropped because the bounded in-memory queue was full and no durable overflow path accepted ownership. Shutdown/unavailable admission is not counted here.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_high_water_diversions_total",
+    "type": "counter",
+    "help": "Chargeback sink events whose high-water durable spool-delivery handoff was accepted. Spool delivery saturation/closure is counted by spool loss metrics, not this counter.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_high_water_hits_total",
+    "type": "counter",
+    "help": "Chargeback sink enqueue attempts observed at or above the queue high-water mark (telemetry only).",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_queue_retained_bytes",
+    "type": "gauge",
+    "help": "Chargeback sink retained export and spool-delivery bytes under the configured buffer_max_bytes budget.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_cardinality_rejections_total",
+    "type": "counter",
+    "help": "Snapshot charges that could not be accumulated or overflow-spooled under hard budgets.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_emits_total",
+    "type": "counter",
+    "help": "Chargeback sink snapshot delta events emitted.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_entries",
+    "type": "gauge",
+    "help": "Snapshot accumulator identities retained in memory.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_finalizations_oldest_age_seconds",
+    "type": "gauge",
+    "help": "Age in seconds of the oldest pending snapshot finalization recovery.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_finalizations_pending",
+    "type": "gauge",
+    "help": "Snapshot generations retaining unspooled terminal deltas after admission closed.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_finalizations_pending_bytes",
+    "type": "gauge",
+    "help": "Estimated retained bytes for pending snapshot finalization recovery state.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_overflow_pending_total",
+    "type": "counter",
+    "help": "Snapshot overflow charges staged for the next durable emission when async spool handoff was unavailable or its write failed.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_overflow_spooled_total",
+    "type": "counter",
+    "help": "Snapshot charges durably spooled through the bounded async delivery worker after accumulator cardinality or byte budget overflow.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_snapshot_retained_bytes",
+    "type": "gauge",
+    "help": "Estimated snapshot accumulator retained bytes under configured max_retained_bytes.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_available",
+    "type": "gauge",
+    "help": "Whether committed spool storage is currently writable (1) or unavailable (0). Aggregate is 1 only when every spool-enabled live instance is available.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_bytes",
+    "type": "gauge",
+    "help": "Chargeback sink on-disk owned spool bytes (active, temp, corrupt, and dead-lettered files).",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_drops_total",
+    "type": "counter",
+    "help": "Chargeback sink spool files dropped to enforce max_bytes.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_events_lost_total",
+    "type": "counter",
+    "help": "Chargeback sink events lost with dropped spool delivery jobs.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_files",
+    "type": "gauge",
+    "help": "Chargeback sink on-disk owned spool file count (active, temp, corrupt, and dead-lettered files).",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_jobs_enqueued_total",
+    "type": "counter",
+    "help": "Chargeback sink jobs accepted by the async spool delivery worker.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_jobs_lost_total",
+    "type": "counter",
+    "help": "Chargeback sink spool delivery jobs dropped under saturation or write failure.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_jobs_written_total",
+    "type": "counter",
+    "help": "Chargeback sink jobs successfully written by the async spool delivery worker.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_prepare_failures_total",
+    "type": "counter",
+    "help": "Chargeback sink committed spool storage preparation failures.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_unbound_files",
+    "type": "gauge",
+    "help": "Retained spool records not bound to a live destination identity. Never replayed or deleted; an observed lower bound when the bounded aggregate scan is truncated.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "chargeback_sink_spool_unbound_namespaces",
+    "type": "gauge",
+    "help": "Managed spool namespaces still holding records for a destination identity no live instance owns; an observed lower bound when the bounded aggregate scan is truncated.",
+    "labels": [],
+    "subsystem": "api_chargeback_sink",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_admin_active_connections",
+    "type": "gauge",
+    "help": "Admin/management-plane connections currently in flight.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_admin_max_connections",
+    "type": "gauge",
+    "help": "Configured admin connection cap (0 = unlimited).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_admin_max_connections_per_ip",
+    "type": "gauge",
+    "help": "Configured per-source-IP admin connection cap (0 = unlimited).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_admin_rejected_connections_total",
+    "type": "counter",
+    "help": "Admin connections rejected by the connection limiter, by reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "admin",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_ai_completion_tokens_total",
+    "type": "counter",
+    "help": "Completion tokens reported by AI providers.",
+    "labels": [
+      "proxy_id",
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_estimated_cost_currency_units_total",
+    "type": "counter",
+    "help": "Estimated AI cost in the configured currency units, retaining sub-micro precision and rounding the aggregate to six decimals.",
+    "labels": [
+      "proxy_id",
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_federation_circuit_half_open_probes_total",
+    "type": "counter",
+    "help": "ai_federation provider half-open probes admitted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_federation_circuit_open_skips_total",
+    "type": "counter",
+    "help": "ai_federation provider attempts skipped by an open circuit.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_federation_circuits_closed_total",
+    "type": "counter",
+    "help": "ai_federation provider circuit half-open recoveries.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_federation_circuits_open",
+    "type": "gauge",
+    "help": "Current ai_federation provider circuits in open or half-open recovery state.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_federation_circuits_opened_total",
+    "type": "counter",
+    "help": "ai_federation provider circuit closed-to-open transitions.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_ai_prompt_tokens_total",
+    "type": "counter",
+    "help": "Prompt tokens reported by AI providers.",
+    "labels": [
+      "proxy_id",
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_ai_tokens_total",
+    "type": "counter",
+    "help": "Total tokens reported by AI providers.",
+    "labels": [
+      "proxy_id",
+      "provider",
+      "namespace"
+    ],
+    "subsystem": "ai",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_series_present"
+  },
+  {
+    "name": "ferrum_backend_duration_ms",
+    "type": "histogram",
+    "help": "Backend response time in milliseconds.",
+    "labels": [
+      "proxy_id",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_client_disconnects_total",
+    "type": "counter",
+    "help": "Requests where the client disconnected before receiving the full response.",
+    "labels": [
+      "proxy_id",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_compression_codec_admitted_total",
+    "type": "counter",
+    "help": "Compression codec jobs admitted to the bounded spawn_blocking pool.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_compression_codec_join_failures_total",
+    "type": "counter",
+    "help": "Compression codec spawn_blocking tasks that failed to join.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_compression_codec_saturated_total",
+    "type": "counter",
+    "help": "Compression codec admission refusals when the bounded pool is saturated.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_compression_codec_worker_failures_total",
+    "type": "counter",
+    "help": "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_compression_response_buffer_admitted_total",
+    "type": "counter",
+    "help": "Response-compression buffer admissions granted (bounds bodies collected for compression).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_compression_response_buffer_saturated_total",
+    "type": "counter",
+    "help": "Response-compression buffer admission refusals; the response streams identity (or 406) instead.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "compression",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_configsync_delta_rejections_total",
+    "type": "counter",
+    "help": "Non-empty ConfigSync deltas rejected by the DP, forcing an authoritative FULL_SNAPSHOT resync.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "configsync",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_configsync_diverged",
+    "type": "gauge",
+    "help": "Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "configsync",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_configsync_divergence_recoveries_total",
+    "type": "counter",
+    "help": "ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "configsync",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_configsync_fenced_full_snapshots_total",
+    "type": "counter",
+    "help": "ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "configsync",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_active_connections",
+    "type": "gauge",
+    "help": "CP gRPC listener connections currently admitted (pre-handshake through served HTTP/2 session).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_grpc",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_max_connections",
+    "type": "gauge",
+    "help": "Configured CP gRPC connection cap (0 = unlimited).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_grpc",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_max_connections_per_ip",
+    "type": "gauge",
+    "help": "Configured per-source-IP CP gRPC connection cap (0 = unlimited).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "cp_grpc",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_cp_grpc_rejected_connections_total",
+    "type": "counter",
+    "help": "CP gRPC connections rejected before any handshake work was allocated, by reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "cp_grpc",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_connected",
+    "type": "gauge",
+    "help": "Whether the backend config-change watcher currently has an open stream (1) or is degraded (0). Periodic polling stays authoritative either way.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_degraded_reason",
+    "type": "gauge",
+    "help": "Current bounded degraded reason for the backend config-change watcher. Exactly one reason is 1.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_events_total",
+    "type": "counter",
+    "help": "Config-change notifications observed by the backend watcher. Each one only triggers the authoritative cursor poll; it never advances the accepted sequence.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_history_losses_total",
+    "type": "counter",
+    "help": "Times the retained watch resume point fell out of the backend's history and was dropped.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_invalidations_total",
+    "type": "counter",
+    "help": "Backend config-change watch invalidations (watched collection dropped, renamed, or database dropped).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_change_stream_reconnects_total",
+    "type": "counter",
+    "help": "Times the backend config-change watcher (re)established a stream.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_delta_backoff_bucket",
+    "type": "gauge",
+    "help": "Current rejected-delta retry backoff bucket. Exactly one bucket is 1.",
+    "labels": [
+      "bucket",
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_delta_consecutive_identical_rejections",
+    "type": "gauge",
+    "help": "Consecutive identical rejected database deltas currently being retried.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_delta_forced_full_reloads_total",
+    "type": "counter",
+    "help": "Authoritative full reload attempts triggered by repeated rejected database deltas.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_delta_recoveries_total",
+    "type": "counter",
+    "help": "Rejected database delta recovery events after an accepted incremental apply or full reload.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_delta_rejections_total",
+    "type": "counter",
+    "help": "Database incremental deltas rejected by validation, bucketed by bounded resource category.",
+    "labels": [
+      "resource_category",
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_database_poll_last_completed_timestamp_seconds",
+    "type": "gauge",
+    "help": "Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "database_polling",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_edge_overhead_ms",
+    "type": "histogram",
+    "help": "Gateway overhead (excluding backend and plugins) in milliseconds.",
+    "labels": [
+      "proxy_id",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_kafka_logging_accepting",
+    "type": "gauge",
+    "help": "Whether the Kafka logging generation still admits new records.",
+    "labels": [
+      "generation"
+    ],
+    "subsystem": "kafka_logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_kafka_logging_healthy",
+    "type": "gauge",
+    "help": "Whether the Kafka logging generation recovered from its latest failure.",
+    "labels": [
+      "generation"
+    ],
+    "subsystem": "kafka_logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_kafka_logging_in_flight",
+    "type": "gauge",
+    "help": "Records waiting in librdkafka for terminal delivery.",
+    "labels": [
+      "generation"
+    ],
+    "subsystem": "kafka_logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_kafka_logging_records_total",
+    "type": "counter",
+    "help": "Kafka logging record outcomes.",
+    "labels": [
+      "generation",
+      "outcome"
+    ],
+    "subsystem": "kafka_logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_kafka_logging_retained_bytes",
+    "type": "gauge",
+    "help": "Ferrum userspace retained payload+key bytes awaiting librdkafka admission.",
+    "labels": [
+      "generation"
+    ],
+    "subsystem": "kafka_logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled"
+  },
+  {
+    "name": "ferrum_log_sink_accepted_records_total",
+    "type": "counter",
+    "help": "Records accepted by the bounded process log sink.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_dropped_records_total",
+    "type": "counter",
+    "help": "Log records dropped by bounded admission.",
+    "labels": [
+      "sink",
+      "reason"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_healthy",
+    "type": "gauge",
+    "help": "Whether the process log sink has recovered from its latest I/O or drain failure.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_io_failures_total",
+    "type": "counter",
+    "help": "Underlying writer and flush failures.",
+    "labels": [
+      "sink",
+      "reason"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_queued_bytes",
+    "type": "gauge",
+    "help": "Serialized bytes admitted but not yet completed.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_queued_records",
+    "type": "gauge",
+    "help": "Records admitted but not yet completed.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_reserved_bytes",
+    "type": "gauge",
+    "help": "Byte budget reserved by admitted records.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_shutdown_incomplete_records_total",
+    "type": "counter",
+    "help": "Records still outstanding when a bounded drain deadline was reached.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_log_sink_shutdown_timeouts_total",
+    "type": "counter",
+    "help": "Bounded process log drain deadlines reached.",
+    "labels": [
+      "sink"
+    ],
+    "subsystem": "logging",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_process_initialized"
+  },
+  {
+    "name": "ferrum_mesh_bpf_drop_reasons",
+    "type": "gauge",
+    "help": "Well-known BPF drop reason labels (gauge=1 to make the label set self-documenting).",
+    "labels": [
+      "reason"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_drop_reasons",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_drops_total",
+    "type": "counter",
+    "help": "Connection-bypass decisions by reason, produced by the connect4/connect6 capture hooks.",
+    "labels": [
+      "reason"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_drops_total",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_ringbuf_events_total",
+    "type": "counter",
+    "help": "Total events drained from the SOCK_OPS ringbuf.",
+    "labels": [],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_ringbuf_events_total",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_ringbuf_in_overrun_regime",
+    "type": "gauge",
+    "help": "1 while the consumer is in an overrun regime, 0 after recovery.",
+    "labels": [],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_ringbuf_in_overrun_regime",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_ringbuf_overruns_total",
+    "type": "counter",
+    "help": "Ringbuf overrun episodes.",
+    "labels": [],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_ringbuf_overruns_total",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_srtt_microseconds",
+    "type": "histogram",
+    "help": "TCP smoothed RTT samples in microseconds. Fixed le buckets plus sum/count.",
+    "labels": [
+      "le"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_srtt_microseconds",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_syn_to_ack_microseconds",
+    "type": "histogram",
+    "help": "Time between SYN send and ACK observation in microseconds. Fixed le buckets plus sum/count.",
+    "labels": [
+      "le"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_syn_to_ack_microseconds",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_bpf_tcp_events_total",
+    "type": "counter",
+    "help": "TCP-layer events captured by the BPF SOCK_OPS program.",
+    "labels": [
+      "event"
+    ],
+    "subsystem": "mesh_bpf",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "when_plugin_enabled",
+    "name_template": "{prefix}_tcp_events_total",
+    "default_prefix": "ferrum_mesh_bpf"
+  },
+  {
+    "name": "ferrum_mesh_ca_health",
+    "type": "gauge",
+    "help": "Mesh CA backend health, 1 healthy and 0 unhealthy.",
+    "labels": [
+      "ca_type",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_cert_expiry_seconds",
+    "type": "gauge",
+    "help": "Seconds until mesh X.509-SVID expiry.",
+    "labels": [
+      "spiffe_id",
+      "source",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_cert_rotation_failures_total",
+    "type": "counter",
+    "help": "Mesh certificate rotation failures.",
+    "labels": [
+      "spiffe_id",
+      "source",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_config_last_received_timestamp_seconds",
+    "type": "gauge",
+    "help": "Unix timestamp of the last installed mesh config slice.",
+    "labels": [
+      "namespace",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_config_revision_adoptions_total",
+    "type": "counter",
+    "help": "Foreign mesh config authorities adopted after the configured grace period.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_config_revision_rejections_total",
+    "type": "counter",
+    "help": "Mesh slices quarantined by the config-revision freshness gate before replacing live state, by reason.",
+    "labels": [
+      "reason"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_config_update_rejections_total",
+    "type": "counter",
+    "help": "MeshSubscribe responses refused before apply, by consumer and reason.",
+    "labels": [
+      "consumer",
+      "reason"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_dns_upstream_id_exhaustions_total",
+    "type": "counter",
+    "help": "Mesh DNS upstream transaction ID exhaustion events.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_federation_bundle_age_seconds",
+    "type": "gauge",
+    "help": "Age of the cached federated trust bundle, in seconds.",
+    "labels": [
+      "trust_domain",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_federation",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_federation_last_success_timestamp_seconds",
+    "type": "gauge",
+    "help": "Unix timestamp of last successful SPIFFE federation poll.",
+    "labels": [
+      "trust_domain",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_federation",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_federation_poll_failures_total",
+    "type": "counter",
+    "help": "SPIFFE federation trust-bundle poll failures.",
+    "labels": [
+      "trust_domain",
+      "endpoint",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_federation",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_hbone_relay_failures_total",
+    "type": "counter",
+    "help": "HBONE CONNECT tunnel relay failures after the 200 response has been sent.",
+    "labels": [
+      "proxy_id",
+      "direction",
+      "error_class",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_inbound_plaintext_allowed",
+    "type": "gauge",
+    "help": "1 when the mesh inbound listener was allowed to come up without enforced mTLS (dev opt-out posture; production mode refuses this). 0 otherwise.",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_mesh_mtls_handshake_failures_total",
+    "type": "counter",
+    "help": "Frontend mesh TLS/mTLS handshake failures.",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_topology_degraded",
+    "type": "gauge",
+    "help": "Node-agent detected missing eBPF prerequisites or a build without eBPF capture. 1 with a reason label means degraded, 0 with reason=\"none\" means nominal.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_asserted_identity_total",
+    "type": "counter",
+    "help": "Asserted source-identity decisions on inbound NodeWaypoint HBONE. Rejection reasons are compile-time-bounded; SPIFFE IDs never appear as labels.\\n",
+    "labels": [
+      "result",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_destination_policy_rejections_total",
+    "type": "counter",
+    "help": "Destination-side AuthorizationPolicy / scope / open-relay rejections on NodeWaypoint. Distinct from asserted-identity rejections.\\n",
+    "labels": [
+      "reason",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_hbone_handshakes_total",
+    "type": "counter",
+    "help": "NodeWaypoint HBONE handshake outcomes by phase. One failed session increments exactly one phase (inbound_tls XOR inbound_connect on the destination; outbound_dial is independent on the source).\\n",
+    "labels": [
+      "phase",
+      "result",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_missing_destination_metadata_total",
+    "type": "counter",
+    "help": "Secured NodeWaypoint service targets skipped because Workload.node_waypoint metadata was absent.\\n",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total",
+    "type": "counter",
+    "help": "Prohibited plaintext fallback attempts blocked under identity-backed NodeWaypoint (fail-closed instead of retaining a plaintext backend).\\n",
+    "labels": [
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_node_waypoint",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_outbound_registry_decisions_total",
+    "type": "counter",
+    "help": "Mesh outbound registry decisions with bounded host buckets (<admit_explicit>, <admit_wildcard>, <denied>).",
+    "labels": [
+      "namespace",
+      "host_bucket",
+      "decision"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_outbound_registry_stream_decisions_total",
+    "type": "counter",
+    "help": "Mesh outbound registry decisions for stream-family egress (TCP/UDP/TCP+TLS/UDP+DTLS) by protocol.",
+    "labels": [
+      "namespace",
+      "protocol",
+      "decision"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_remote_discovery_endpoint_age_seconds",
+    "type": "gauge",
+    "help": "Age of the cached remote-cluster endpoints, in seconds.",
+    "labels": [
+      "cluster",
+      "trust_domain",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_remote_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_remote_discovery_last_success_timestamp_seconds",
+    "type": "gauge",
+    "help": "Unix timestamp of last successful remote-cluster endpoint discovery poll.",
+    "labels": [
+      "cluster",
+      "trust_domain",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_remote_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_remote_discovery_poll_failures_total",
+    "type": "counter",
+    "help": "Remote-cluster endpoint discovery poll failures.",
+    "labels": [
+      "cluster",
+      "trust_domain",
+      "control_plane",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_remote_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_remote_discovery_poll_successes_total",
+    "type": "counter",
+    "help": "Successful remote-cluster endpoint discovery polls.",
+    "labels": [
+      "cluster",
+      "trust_domain",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh_remote_discovery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_request_duration_ms",
+    "type": "histogram",
+    "help": "Mesh request duration in milliseconds.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace",
+      "le"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_requests_total",
+    "type": "counter",
+    "help": "Mesh requests by Istio/GAMMA identity labels.",
+    "labels": [
+      "source_workload",
+      "source_namespace",
+      "source_principal",
+      "source_app",
+      "source_service",
+      "destination_workload",
+      "destination_namespace",
+      "destination_principal",
+      "destination_app",
+      "destination_service",
+      "request_protocol",
+      "response_code",
+      "response_flags",
+      "connection_security_policy",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "alert_and_dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_subscribe_audience_rejections_total",
+    "type": "counter",
+    "help": "MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason.",
+    "labels": [
+      "subscription",
+      "reason"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_tcp_egress_connections_total",
+    "type": "counter",
+    "help": "Raw-TCP mesh egress relay connections by transport and outcome.",
+    "labels": [
+      "transport",
+      "result",
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_mesh_trust_bundle_version",
+    "type": "gauge",
+    "help": "Monotonic version of observed mesh trust bundles.",
+    "labels": [
+      "source",
+      "gateway_namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_attach_errors_total",
+    "type": "counter",
+    "help": "Node-agent BPF attachment or map update errors.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_capture_state",
+    "type": "gauge",
+    "help": "Node-agent capture backend condition. Exactly one state label is 1.",
+    "labels": [
+      "state",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_cni_socket_lifecycle_total",
+    "type": "counter",
+    "help": "Node-agent CNI socket lifecycle failures by bounded reason.",
+    "labels": [
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_pod_annotation_updates_applied_total",
+    "type": "counter",
+    "help": "Mid-life pod includeOutboundPorts annotation changes re-applied to the BPF map.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_pod_annotation_updates_failed_total",
+    "type": "counter",
+    "help": "Mid-life pod includeOutboundPorts annotation changes that failed to re-apply (annotation parse error or BPF map write error). Cgroup-id-unavailable retries are intentionally not counted here because they are routinely observed during early pod startup and are retried on the next Apply event.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_pods_enrolled_total",
+    "type": "counter",
+    "help": "Pods enrolled for node-agent capture.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_node_agent_pods_unenrolled_total",
+    "type": "counter",
+    "help": "Pods unenrolled from node-agent capture.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "node_agent",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_observability_batch_materialization_fallbacks_total",
+    "type": "counter",
+    "help": "Batches delivered complete but in a degraded representation, such as uncompressed because the compressed copy could not be reserved. No record loss.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_batch_materialization_losses_total",
+    "type": "counter",
+    "help": "Discard events, each of which lost one or more records.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_batch_materialization_lost_records_total",
+    "type": "counter",
+    "help": "Log entries, spans, and rows discarded because their batch representation could not be materialized under the retained-byte ceiling. Counts records, not reservations.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_active_tasks",
+    "type": "gauge",
+    "help": "Deferred observability tasks currently owned by the shutdown lifecycle.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_active_workers",
+    "type": "gauge",
+    "help": "Queue workers currently owned by the shutdown lifecycle.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_admitted_tasks",
+    "type": "gauge",
+    "help": "Deferred observability tasks holding an admission permit (registry plus in-flight spawn handoff).",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_cancelled_tasks_total",
+    "type": "counter",
+    "help": "Delivery tasks cancelled on shutdown-budget expiry or during spawn/cancel handoff races.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_capacity_rejected_tasks_total",
+    "type": "counter",
+    "help": "Delivery tasks rejected specifically because the aggregate task budget was exhausted.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_drain_timeouts_total",
+    "type": "counter",
+    "help": "Observability shutdown drains that exhausted their shared deadline.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_generation",
+    "type": "gauge",
+    "help": "Current delivery lifecycle generation; increments when a serving cycle reopens delivery after a drain.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_lost_worker_records_total",
+    "type": "counter",
+    "help": "Queued records abandoned when worker drain exceeded the shutdown budget.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_max_tasks",
+    "type": "gauge",
+    "help": "Configured aggregate admission budget for terminal, mirror, and deadline-cleanup tasks.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_delivery_rejected_tasks_total",
+    "type": "counter",
+    "help": "Delivery tasks rejected after lifecycle admission closed, task-budget exhaustion, or without a runtime.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_max_retained_bytes",
+    "type": "gauge",
+    "help": "Configured process-wide retained-byte ceiling shared by all observability sink instances.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_process_ceiling_rejections_total",
+    "type": "counter",
+    "help": "Sink admissions refused specifically by the process-wide retained-byte ceiling rather than a per-instance budget.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_retained_bytes",
+    "type": "gauge",
+    "help": "Bytes currently retained across every observability sink instance in this process.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_observability_retained_bytes_high_water",
+    "type": "gauge",
+    "help": "Peak process-wide observability retention observed since startup.",
+    "labels": [],
+    "subsystem": "observability_delivery",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_rate_limit_exceeded_total",
+    "type": "counter",
+    "help": "Total rate limit rejections.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_duration_ms",
+    "type": "histogram",
+    "help": "Request duration in milliseconds.",
+    "labels": [
+      "proxy_id",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_budget_drops_total",
+    "type": "counter",
+    "help": "request_mirror attempts dropped because max_retained_request_body_bytes was exhausted.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_cancellations_total",
+    "type": "counter",
+    "help": "request_mirror tasks dropped before a terminal outcome (shutdown/panic/cancellation).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_completed_total",
+    "type": "counter",
+    "help": "request_mirror tasks that fully drained a response within byte and time bounds.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_concurrency_drops_total",
+    "type": "counter",
+    "help": "request_mirror attempts dropped because max_in_flight was saturated.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_dispatched_total",
+    "type": "counter",
+    "help": "request_mirror detached tasks admitted past concurrency and retained-body budgets.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_drain_failures_total",
+    "type": "counter",
+    "help": "request_mirror response-body drain transport failures.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_drain_timeouts_total",
+    "type": "counter",
+    "help": "request_mirror response-body drain deadline expiries.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_drain_truncations_total",
+    "type": "counter",
+    "help": "request_mirror responses truncated at max_response_body_bytes during bounded drain.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_request_failures_total",
+    "type": "counter",
+    "help": "request_mirror pre-response transport failures (DNS, refused, reset, TLS, \u2026).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_request_mirror_request_timeouts_total",
+    "type": "counter",
+    "help": "request_mirror request-phase deadline expiries (connect/headers/body).",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "request_mirror",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_requests_total",
+    "type": "counter",
+    "help": "Total number of requests processed.",
+    "labels": [
+      "proxy_id",
+      "method",
+      "status_code",
+      "grpc_status",
+      "namespace"
+    ],
+    "subsystem": "prometheus_metrics",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "always"
+  },
+  {
+    "name": "ferrum_stream_connections_total",
+    "type": "counter",
+    "help": "Total stream connections (TCP/UDP).",
+    "labels": [
+      "proxy_id",
+      "protocol",
+      "namespace"
+    ],
+    "subsystem": "stream",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_stream_disconnects_total",
+    "type": "counter",
+    "help": "Stream disconnects (TCP/UDP) by cause and direction.",
+    "labels": [
+      "proxy_id",
+      "protocol",
+      "cause",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "stream",
+    "export_surface": "/metrics",
+    "bundled": "dashboard",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_stream_duration_ms",
+    "type": "histogram",
+    "help": "Stream connection duration in milliseconds.",
+    "labels": [
+      "proxy_id",
+      "protocol",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "stream",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_cert_expiry_seconds",
+    "type": "gauge",
+    "help": "Seconds until the certificate leaf not_after timestamp. Negative means expired.",
+    "labels": [
+      "cert_id",
+      "source",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_cert_not_before_seconds",
+    "type": "gauge",
+    "help": "Certificate leaf not_before timestamp as Unix seconds.",
+    "labels": [
+      "cert_id",
+      "source",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_cert_rotations_total",
+    "type": "counter",
+    "help": "TLS certificate rotation outcomes by cert ID, reason, and outcome.",
+    "labels": [
+      "cert_id",
+      "reason",
+      "outcome",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_inventory_snapshot_max_age_seconds",
+    "type": "gauge",
+    "help": "Configured maximum snapshot age (FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS) before a scrape schedules a background refresh.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_inventory_snapshot_timestamp_seconds",
+    "type": "gauge",
+    "help": "Unix timestamp of the cached, non-secret TLS inventory snapshot backing the certificate gauges.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_source_fetch_duration_seconds",
+    "type": "histogram",
+    "help": "TLS material source fetch duration in seconds.",
+    "labels": [
+      "scheme",
+      "kind",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_source_fetch_failures_total",
+    "type": "counter",
+    "help": "TLS material source fetch failures by scheme, kind, and bounded reason.",
+    "labels": [
+      "scheme",
+      "kind",
+      "reason",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_tls_source_refresh_total",
+    "type": "counter",
+    "help": "TLS material source refresh attempts by scheme, kind, surface, and outcome.",
+    "labels": [
+      "scheme",
+      "kind",
+      "surface",
+      "outcome",
+      "namespace"
+    ],
+    "subsystem": "tls",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_websocket_bytes_total",
+    "type": "counter",
+    "help": "WebSocket payload bytes relayed by direction.",
+    "labels": [
+      "proxy_id",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "websocket",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_websocket_frames_total",
+    "type": "counter",
+    "help": "WebSocket frames relayed by direction.",
+    "labels": [
+      "proxy_id",
+      "direction",
+      "namespace"
+    ],
+    "subsystem": "websocket",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_websocket_session_duration_ms",
+    "type": "histogram",
+    "help": "WebSocket session duration in milliseconds.",
+    "labels": [
+      "proxy_id",
+      "result",
+      "direction",
+      "io_side",
+      "error_class",
+      "le",
+      "namespace"
+    ],
+    "subsystem": "websocket",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_websocket_sessions_total",
+    "type": "counter",
+    "help": "Completed WebSocket sessions by bounded terminal classification.",
+    "labels": [
+      "proxy_id",
+      "result",
+      "direction",
+      "io_side",
+      "error_class",
+      "namespace"
+    ],
+    "subsystem": "websocket",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_xds_first_slice_nacks_total",
+    "type": "counter",
+    "help": "NACKs of a required mesh-slice type while the data plane is still waiting for its first slice.",
+    "labels": [
+      "namespace",
+      "type_url"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_xds_streams_rejected_total",
+    "type": "counter",
+    "help": "ADS streams rejected for exceeding the per-node concurrent-stream ceiling.",
+    "labels": [],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  },
+  {
+    "name": "ferrum_xds_warming_partial_applies_total",
+    "type": "counter",
+    "help": "Mesh slices applied while marked as xDS required-version skewed. Normal coherent xDS apply should not increment this.",
+    "labels": [
+      "namespace"
+    ],
+    "subsystem": "mesh",
+    "export_surface": "/metrics",
+    "bundled": "documented_only",
+    "emission": "conditional"
+  }
+]

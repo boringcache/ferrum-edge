@@ -1841,6 +1841,9 @@ jobs:
           python3 -m pip install --require-hashes \
             -r ./scripts/check_helm_values_schema_parity.requirements.txt
           python3 ./scripts/check_helm_values_schema_parity.py
+          # DOC-10: executable Prometheus metric contract (inventory ↔ docs ↔ charts).
+          # Static only — no promtool pin; Rust unit tests cover representative /metrics.
+          python3 -I .github/scripts/validate_prometheus_metric_contract.py
           helm lint ./charts/ferrum-mesh
           # Unknown / misspelled keys must fail schema validation (additionalProperties: false).
           if helm lint ./charts/ferrum-mesh --set ambient.enabld=true \
