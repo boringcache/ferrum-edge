@@ -810,10 +810,7 @@ fn legacy_tool_use_id(message_index: usize) -> String {
     format!("call_legacy_{message_index}")
 }
 
-fn parse_legacy_tool_arguments_object(
-    arguments: &str,
-    field_path: &str,
-) -> Result<Value, String> {
+fn parse_legacy_tool_arguments_object(arguments: &str, field_path: &str) -> Result<Value, String> {
     if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
         return Err(format!(
             "{field_path} arguments exceed the maximum allowed size"
@@ -824,9 +821,7 @@ fn parse_legacy_tool_arguments_object(
         format!("{field_path} arguments are not valid JSON")
     })?;
     if !parsed.is_object() {
-        return Err(format!(
-            "{field_path} arguments must encode a JSON object"
-        ));
+        return Err(format!("{field_path} arguments must encode a JSON object"));
     }
     Ok(parsed)
 }
@@ -924,9 +919,9 @@ fn parse_openai_function_call(
     if function_call_value.is_null() {
         return Ok(None);
     }
-    let function_call = function_call_value.as_object().ok_or_else(|| {
-        format!("messages[{message_index}].function_call must be an object")
-    })?;
+    let function_call = function_call_value
+        .as_object()
+        .ok_or_else(|| format!("messages[{message_index}].function_call must be an object"))?;
     let name = function_call
         .get("name")
         .and_then(Value::as_str)
@@ -938,9 +933,7 @@ fn parse_openai_function_call(
         .get("arguments")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            format!(
-                "messages[{message_index}].function_call.arguments must be a JSON string"
-            )
+            format!("messages[{message_index}].function_call.arguments must be a JSON string")
         })?;
     let field_path = format!("messages[{message_index}].function_call");
     let arguments = parse_legacy_tool_arguments_object(arguments, &field_path)?;
@@ -1112,9 +1105,7 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|value| valid_tool_name(value))
-                .ok_or_else(|| {
-                    format!("messages[{index}] function message has invalid name")
-                })?;
+                .ok_or_else(|| format!("messages[{index}] function message has invalid name"))?;
             let Some((_pending_id, pending_name)) = pending_legacy.take() else {
                 return Err(format!(
                     "messages[{index}] function result has no unmatched preceding assistant function_call"

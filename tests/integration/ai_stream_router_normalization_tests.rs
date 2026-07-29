@@ -166,10 +166,7 @@ async fn claim_preserves_legacy_function_call_history() {
         parsed["messages"][1]["content"][0]["id"],
         json!("call_legacy_1")
     );
-    assert_eq!(
-        parsed["messages"][1]["content"][0]["name"],
-        json!("lookup")
-    );
+    assert_eq!(parsed["messages"][1]["content"][0]["name"], json!("lookup"));
     assert_eq!(
         parsed["messages"][2]["content"][0]["type"],
         json!("tool_result")
