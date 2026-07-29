@@ -198,8 +198,8 @@ Authenticated `GET /health` reports the watcher under
 signal and does not force `status: degraded`, because polling still applies
 committed changes.
 
-`GET /metrics` exposes fixed-cardinality families (no resource IDs, namespaces,
-or URLs as labels):
+`GET /metrics` exposes fixed-cardinality families (the only deployment label is
+the configured gateway namespace; no resource IDs or URLs appear as labels):
 
 - `ferrum_database_change_stream_connected`
 - `ferrum_database_change_stream_degraded_reason{reason="none|connect_failed|stream_error|history_lost|invalidated|unauthorized|unsupported_topology|stopped"}`

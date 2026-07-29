@@ -2532,7 +2532,8 @@ impl MetricsRegistry {
 
             // Backend config-change watcher (issue #3330). Fixed cardinality:
             // one series per family plus one `reason` label from the bounded
-            // degraded-reason enum. No resource IDs, namespaces, or URLs.
+            // degraded-reason enum. The only deployment label is the existing
+            // stable gateway namespace; there are no resource IDs or URLs.
             if let Some(change_stream) = snapshot.change_stream {
                 output.push_str(
                     "# HELP ferrum_database_change_stream_connected Whether the backend config-change watcher currently has an open stream (1) or is degraded (0). Periodic polling stays authoritative either way.\n",
