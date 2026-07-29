@@ -3116,11 +3116,8 @@ mod tests {
             ..MeshSliceRequest::default()
         };
 
-        let filtered = CpGrpcServer::filter_config_to_mesh_request_for_scope(
-            &config,
-            &request,
-            &CpScope::All,
-        );
+        let filtered =
+            CpGrpcServer::filter_config_to_mesh_request_for_scope(&config, &request, &CpScope::All);
         let mesh = filtered.mesh.as_ref().expect("mesh should remain");
         assert!(
             mesh.workloads.is_empty() && mesh.peer_authentications.is_empty(),

@@ -1207,8 +1207,9 @@ fn prepare_normalized_gateway_config_for_mesh(
         // proxy's own inbound mTLS resolution.
         mesh.node_waypoint_capture_destinations =
             mesh_slice.node_waypoint_capture_destinations.clone();
-        mesh.node_waypoint_capture_peer_authentications =
-            mesh_slice.node_waypoint_capture_peer_authentications.clone();
+        mesh.node_waypoint_capture_peer_authentications = mesh_slice
+            .node_waypoint_capture_peer_authentications
+            .clone();
         // Back-project the slice's narrowed LOCAL-INBOUND service view (kept
         // SEPARATE from the egress-narrowed `services` — never folded in, per
         // the egress-scope security rule) so the router's inbound per-port

@@ -576,10 +576,7 @@ pub fn build_slice_carriers(slice: &MeshSlice) -> Vec<MeshSliceCarrier> {
             slice.node_waypoint_capture_destinations.clone(),
         ));
     }
-    if !slice
-        .node_waypoint_capture_peer_authentications
-        .is_empty()
-    {
+    if !slice.node_waypoint_capture_peer_authentications.is_empty() {
         carriers.push(MeshSliceCarrier::NodeWaypointCapturePeerAuthentications(
             slice.node_waypoint_capture_peer_authentications.clone(),
         ));

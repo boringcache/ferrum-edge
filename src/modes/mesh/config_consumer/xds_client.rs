@@ -2367,14 +2367,13 @@ mod tests {
 
     #[test]
     fn initial_requests_are_ordered_cds_first() {
-        let requests = ClientSubscriptionState::new()
-            .build_initial_requests(
-                "node-a",
-                "default",
-                None,
-                None,
-                crate::xds::carrier::XdsNodeScoping::default(),
-            );
+        let requests = ClientSubscriptionState::new().build_initial_requests(
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let type_urls: Vec<&str> = requests
             .iter()
             .map(|request| request.type_url.as_str())
@@ -2418,14 +2417,13 @@ mod tests {
         assert_eq!(metadata.workload_spiffe_id.as_deref(), Some(spiffe));
         assert_eq!(metadata.waypoint_name.as_deref(), Some("waypoint"));
         // Without a workload SPIFFE, metadata stays empty (prior wire shape).
-        let none = ClientSubscriptionState::new()
-            .build_initial_requests(
-                "host-1",
-                "default",
-                None,
-                None,
-                crate::xds::carrier::XdsNodeScoping::default(),
-            );
+        let none = ClientSubscriptionState::new().build_initial_requests(
+            "host-1",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         assert!(none[0].node.as_ref().unwrap().metadata.is_empty());
     }
 
@@ -2507,12 +2505,12 @@ mod tests {
         state.mark_acked(CDS_TYPE_URL);
 
         let requests = state.build_initial_requests(
-                "node-a",
-                "default",
-                None,
-                None,
-                crate::xds::carrier::XdsNodeScoping::default(),
-            );
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let cds = requests
             .iter()
             .find(|request| request.type_url == CDS_TYPE_URL)
@@ -2554,12 +2552,12 @@ mod tests {
             state
                 .subscriptions
                 .build_initial_requests(
-                "node-a",
-                "default",
-                None,
-                None,
-                crate::xds::carrier::XdsNodeScoping::default(),
-            )
+                    "node-a",
+                    "default",
+                    None,
+                    None,
+                    crate::xds::carrier::XdsNodeScoping::default(),
+                )
                 .iter()
                 .all(|request| request.version_info.is_empty())
         );
@@ -3584,15 +3582,13 @@ mod tests {
             .record_response(CDS_TYPE_URL, "v7", "n7");
         state.subscriptions.mark_acked(CDS_TYPE_URL);
         state.reset_for_new_stream();
-        let initial = state
-            .subscriptions
-            .build_initial_requests(
-                "node-a",
-                "default",
-                None,
-                None,
-                crate::xds::carrier::XdsNodeScoping::default(),
-            );
+        let initial = state.subscriptions.build_initial_requests(
+            "node-a",
+            "default",
+            None,
+            None,
+            crate::xds::carrier::XdsNodeScoping::default(),
+        );
         let cds = initial
             .iter()
             .find(|r| r.type_url == CDS_TYPE_URL)

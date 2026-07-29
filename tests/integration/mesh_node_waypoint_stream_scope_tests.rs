@@ -527,7 +527,8 @@ mod node_waypoint_capture_inventory {
     /// node's NodeWaypoint must be absent.
     #[test]
     fn local_slicing_carries_the_cross_namespace_capture_destination_and_policy() {
-        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        let slice =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
 
         assert_eq!(
             slice
@@ -602,7 +603,8 @@ mod node_waypoint_capture_inventory {
     /// this the xDS DP would silently hold an empty inventory.
     #[test]
     fn the_capture_inventory_round_trips_over_the_xds_ecds_carriers() {
-        let slice = MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        let slice =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
         let resources = ferrum_edge::xds::translator::translate_mesh_slice_carriers(&slice);
 
         let mut rebuilt = MeshSlice::default();
@@ -655,7 +657,8 @@ mod node_waypoint_capture_inventory {
     /// a stale — and more permissive — capture posture.
     #[test]
     fn content_eq_observes_the_capture_inventory() {
-        let strict = MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
+        let strict =
+            MeshSlice::from_gateway_config(&config_with_workloads(), node_waypoint_request());
 
         let mut permissive_config = config_with_workloads();
         permissive_config

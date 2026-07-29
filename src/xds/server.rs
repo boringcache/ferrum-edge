@@ -409,12 +409,8 @@ impl XdsAdsServer {
         scoping: XdsNodeScoping,
     ) -> bool {
         let current = self.config.load_full();
-        let filtered = self.filter_config_for_xds_request(
-            current.as_ref(),
-            namespace,
-            waypoint_name,
-            scoping,
-        );
+        let filtered =
+            self.filter_config_for_xds_request(current.as_ref(), namespace, waypoint_name, scoping);
         self.replace_stream_config_if_changed(stream_config, filtered)
     }
 
@@ -1835,7 +1831,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
-                                        false,
+                                        XdsNodeScoping::default(),
                                     );
                                     continue;
                                 };
@@ -1844,7 +1840,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
-                                        false,
+                                        XdsNodeScoping::default(),
                                     );
                                     continue;
                                 };
@@ -2133,7 +2129,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
-                                        false,
+                                        XdsNodeScoping::default(),
                                     );
                                     continue;
                                 };
@@ -2142,7 +2138,7 @@ impl AggregatedDiscoveryService for XdsAdsServer {
                                         &mut stream_config,
                                         &stream_namespace,
                                         None,
-                                        false,
+                                        XdsNodeScoping::default(),
                                     );
                                     continue;
                                 };
