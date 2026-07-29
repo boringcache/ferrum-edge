@@ -10,6 +10,7 @@ use ferrum_edge::_test_support::RateLimitCleanupHarness;
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::utils::rate_limit::{
     DynamicHttpRateLimitAlgorithm, DynamicRateLimitOp, RateLimitBackend, RateLimitWindowSpec,
+    RedisFailurePolicy,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -35,12 +36,18 @@ fn local_backend() -> RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> {
 fn failover_backend() -> RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> {
     // Point at a closed port so Redis is unavailable and admission lands in
     // the local fallback map (the Redis-fallback consumer path).
+    //
+    // `redis_failure_policy: "local_fallback"` is required, not incidental:
+    // the secure default (`fail_closed`, GHSA-87rq-v4hx-8rcq) refuses during an
+    // outage before the fallback map is ever consulted, so without the explicit
+    // opt-in this fixture would prove nothing about local capacity admission.
     RateLimitBackend::from_plugin_config(
         "rate_limiting",
         &json!({
             "sync_mode": "redis",
             "redis_url": "redis://127.0.0.1:9/0",
-            "redis_health_check_interval_seconds": 1
+            "redis_health_check_interval_seconds": 1,
+            "redis_failure_policy": "local_fallback"
         }),
         &PluginHttpClient::default(),
         DynamicHttpRateLimitAlgorithm::new(),
@@ -156,6 +163,15 @@ async fn redis_fallback_path_denies_new_local_keys_at_capacity() {
     let backend = failover_backend();
     let op = http_op();
     let max_entries = 2usize;
+
+    // Pin the opt-in: if this fixture ever drifts back to the fail-closed
+    // default, the refusals below would be enforcement-unavailable denials
+    // rather than the capacity denials this test exists to prove.
+    assert_eq!(
+        backend.redis_failure_policy(),
+        Some(RedisFailurePolicy::LocalFallback),
+        "capacity coverage must run on the explicit local-fallback opt-in"
+    );
 
     // First checks fail Redis and populate local fallback.
     let first = backend

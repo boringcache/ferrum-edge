@@ -98,6 +98,7 @@ use url::Url;
 
 use sha2::{Digest, Sha256};
 
+use crate::util::json_dup_keys;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
@@ -214,6 +215,31 @@ const MAX_BLOCKED_ARG_PATTERN_NAME_BYTES: usize = 256;
 /// bounds redacted argument / response growth so zero-width patterns cannot
 /// amplify past the inspectable window.
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fixed reason for a governed request body whose objects carry duplicate
+/// member names (advisory `GHSA-c78j-5w9p-cpq6`). `serde_json` keeps the LAST
+/// value while a first-key-wins backend acts on the first, so the tool name or
+/// arguments this plugin evaluated need not be the ones the backend executes.
+/// This plugin forwards the original bytes, so ambiguity is refused rather than
+/// canonicalized.
+const AMBIGUOUS_REQUEST_JSON: &str =
+    "request body contains duplicate JSON object member names and cannot be governed unambiguously";
+/// Response-side counterpart of [`AMBIGUOUS_REQUEST_JSON`].
+const AMBIGUOUS_RESPONSE_JSON: &str = "response body contains duplicate JSON object member names and cannot be governed unambiguously";
+/// A governed tool call whose `arguments` JSON STRING carries duplicate member
+/// names. The enclosing document scan cannot see inside a JSON string, so the
+/// string content gets its own screen and an ambiguous one makes the call
+/// ungovernable — the same posture as a non-string `function.arguments`.
+const AMBIGUOUS_TOOL_ARGUMENTS: &str =
+    "tool call arguments contain duplicate JSON object member names and cannot be policy-checked";
+/// Fixed-cardinality transaction-log label for duplicate-key ambiguity under
+/// global `mode: dry_run`. Never echoes body, key, argument, tool, or
+/// backend-controlled bytes; repeated ambiguous events reuse this same value.
+const AMBIGUITY_OBSERVATION_REASON: &str = "ambiguous_json";
+/// Metadata key for [`AMBIGUITY_OBSERVATION_REASON`]. Kept separate from
+/// `decision` so dry-run can record the observation as `decision=dry_run`
+/// without claiming enforcement via `decision=deny`.
+const UNINSPECTABLE_REASON_KEY: &str = "ai_tool_governor.uninspectable_reason";
 /// Upper bound on bytes the streaming inspector may retain (held tool-call
 /// frames plus the partial-event carry buffer). A backend that streams
 /// never-finishing tool-call deltas cannot grow gateway memory past this: on
@@ -455,6 +481,13 @@ struct ToolCall {
     /// The arguments parsed as JSON, if they parse. Required-arg and JSON Schema
     /// checks run on this.
     parsed_args: Option<Value>,
+    /// The arguments arrived as a JSON STRING whose content parses but carries
+    /// duplicate object member names. `parsed_args` then holds the last-wins
+    /// collapse of a document a first-key-wins backend reads differently, so the
+    /// call cannot be policy-checked (advisory `GHSA-c78j-5w9p-cpq6`). Treated
+    /// exactly like a missing name or a non-string argument delta: fail closed
+    /// in enforce mode, forward in dry-run.
+    args_ambiguous: bool,
 }
 
 /// Deterministic per-call outcome, before any approval resolution.
@@ -1262,6 +1295,15 @@ impl GovernorEngine {
         let response_body = read_response_body_bounded(response, MAX_APPROVAL_RESPONSE_BYTES)
             .await
             .map_err(|e| format!("response read failed: {e}"))?;
+        // The approval verdict is a security decision taken from this document,
+        // so a duplicate `decision` / `allow` member makes it unusable rather
+        // than resolved on `serde_json`'s last-wins collapse. Approval failures
+        // are already fail-closed for the caller.
+        if json_dup_keys::slice_ambiguity(&response_body).is_some() {
+            return Err(
+                "response contains duplicate JSON object member names and is ambiguous".to_string(),
+            );
+        }
         let value: Value = serde_json::from_slice(&response_body)
             .map_err(|e| format!("response parse failed: {e}"))?;
 
@@ -1745,6 +1787,45 @@ impl AiToolGovernor {
         set_decision_metadata(metadata, "deny");
     }
 
+    /// Dry-run observation for duplicate-key ambiguity: forward traffic, but
+    /// positively record a sanitized fixed-cardinality finding. Uses
+    /// `decision=dry_run` (never `deny`) so logs cannot claim the bytes were
+    /// blocked, and reuses [`set_decision_metadata`] so a stronger earlier
+    /// decision from another surface/instance is not erased.
+    fn write_ambiguity_observation_into(
+        engine: &GovernorEngine,
+        metadata: &mut HashMap<String, String>,
+    ) {
+        // This label describes observation without enforcement and is valid
+        // only for global dry-run mode. In particular, an enforce-mode plugin
+        // configured for streaming-response inspection only may tentatively
+        // scan an ambiguous request to choose a safe dispatch path, but that
+        // request is outside its governance surface and must not be mislabeled
+        // as a dry-run policy decision.
+        if engine.mode != Mode::DryRun || !engine.observability.emit_metadata {
+            return;
+        }
+        metadata.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
+        metadata.insert(
+            "ai_tool_governor.mode".to_string(),
+            engine.mode.as_str().to_string(),
+        );
+        set_decision_metadata(metadata, "dry_run");
+        // Sticky single label: multiple ambiguous events must not grow
+        // metadata cardinality or retain distinct reason strings.
+        metadata
+            .entry(UNINSPECTABLE_REASON_KEY.to_string())
+            .or_insert_with(|| AMBIGUITY_OBSERVATION_REASON.to_string());
+    }
+
+    /// True when `reason` is one of the fixed duplicate-key ambiguity strings
+    /// (not a generic uninspectable cause such as encoding or size).
+    fn is_ambiguity_reason(reason: &str) -> bool {
+        reason == AMBIGUOUS_REQUEST_JSON
+            || reason == AMBIGUOUS_RESPONSE_JSON
+            || reason == AMBIGUOUS_TOOL_ARGUMENTS
+    }
+
     fn merge_stream_metadata(
         target: &mut HashMap<String, String>,
         source: &HashMap<String, String>,
@@ -1757,6 +1838,13 @@ impl AiToolGovernor {
         }
         if let Some(mode) = source.get("ai_tool_governor.mode") {
             target.insert("ai_tool_governor.mode".to_string(), mode.clone());
+        }
+        // Preserve the fixed ambiguity observation even when a higher-rank
+        // decision from another surface wins the sticky merge below.
+        if let Some(reason) = source.get(UNINSPECTABLE_REASON_KEY) {
+            target
+                .entry(UNINSPECTABLE_REASON_KEY.to_string())
+                .or_insert_with(|| reason.clone());
         }
 
         let previous_rank = target
@@ -1828,6 +1916,29 @@ impl AiToolGovernor {
         }
     }
 
+    /// Fail closed when any governed request call's `arguments` arrived as a
+    /// JSON string whose content carries duplicate object member names.
+    ///
+    /// The enclosing body screen cannot see inside a JSON string, so this is the
+    /// request-side mirror of the ungovernable-call posture the response and
+    /// streaming paths already apply: enforce rejects before the bytes reach the
+    /// backend; dry-run forwards while recording a sanitized observation so
+    /// audit mode never disrupts traffic and never claims enforcement.
+    fn ambiguous_args_rejection(
+        &self,
+        ctx: &mut RequestContext,
+        calls: &[ToolCall],
+    ) -> Option<PluginResult> {
+        if !calls.iter().any(|call| call.args_ambiguous) {
+            return None;
+        }
+        if self.engine.mode == Mode::Enforce {
+            return Some(self.reject_uninspectable(ctx, "request body", AMBIGUOUS_TOOL_ARGUMENTS));
+        }
+        Self::write_ambiguity_observation_into(&self.engine, &mut ctx.metadata);
+        None
+    }
+
     /// Governs a decoded request body's MCP/A2A tool calls and tool definitions.
     async fn govern_request(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
         // JSON-RPC batch envelope (`[{"method":"tools/call",...}, ...]`): govern
@@ -1865,6 +1976,9 @@ impl AiToolGovernor {
             }
             if calls.is_empty() {
                 return PluginResult::Continue;
+            }
+            if let Some(rejection) = self.ambiguous_args_rejection(ctx, &calls) {
+                return rejection;
             }
             let corr = self.correlation(ctx, None, None);
             // Request path: no `transform_request_body` hook exists to rewrite
@@ -1919,6 +2033,11 @@ impl AiToolGovernor {
         if self.inspect.mcp_tool_calls {
             match extract_mcp_tool_call_for_policy(json, ctx) {
                 McpToolCallExtraction::Call(call) => {
+                    if let Some(rejection) =
+                        self.ambiguous_args_rejection(ctx, std::slice::from_ref(&call))
+                    {
+                        return rejection;
+                    }
                     let batch = self
                         .engine
                         .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
@@ -1943,6 +2062,10 @@ impl AiToolGovernor {
         if self.inspect.a2a_methods
             && let Some(call) = extract_a2a_method(json)
         {
+            if let Some(rejection) = self.ambiguous_args_rejection(ctx, std::slice::from_ref(&call))
+            {
+                return rejection;
+            }
             let batch = self
                 .engine
                 .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
@@ -2130,10 +2253,12 @@ impl AiToolGovernor {
         // entry the extractor cannot policy-check (a missing or non-string
         // name) fails closed in enforce mode and forwards in dry-run.
         if ungovernable {
-            return self.uninspectable_governed_response(
-                ctx,
-                "response contains a tool call that cannot be policy-checked (missing or non-string name)",
-            );
+            let reason = if calls.iter().any(|call| call.args_ambiguous) {
+                AMBIGUOUS_TOOL_ARGUMENTS
+            } else {
+                "response contains a tool call that cannot be policy-checked (missing or non-string name, or ambiguous arguments)"
+            };
+            return self.uninspectable_governed_response(ctx, reason);
         }
         if calls.is_empty() {
             return PluginResult::Continue;
@@ -2225,25 +2350,35 @@ impl AiToolGovernor {
                 "streamed response body is not valid UTF-8 and cannot be inspected",
             );
         }
+        let extracted = extract_sse_tool_calls(body);
+        // Mirror the live streaming finalizer: a buffered SSE tool call that
+        // cannot be policy-checked (missing `function.name` or non-string
+        // `function.arguments`) is ungovernable. Fail closed in enforce, forward
+        // in dry-run.
+        //
+        // Screen BEFORE staging the skip hash (same ordering as the decoded
+        // JSON ambiguity screens): an ungovernable body was never governed, so
+        // recording its hash would let dry-run Continue — or a later final
+        // re-check after an enforce Reject — hash-skip bytes that must be
+        // re-evaluated as uninspectable.
+        if extracted.ungovernable {
+            let reason = if extracted.ambiguous {
+                AMBIGUOUS_RESPONSE_JSON
+            } else {
+                "streamed response body contains an ungovernable tool call"
+            };
+            return self.uninspectable_governed_response(ctx, reason);
+        }
         // Record the hash of the SSE body governed here so the post-transform
         // `on_final_response_body` re-check (which routes SSE-labeled/shaped
         // bodies back through this path) can skip an unchanged body instead of
         // re-governing it — for `require_approval` policies that would mean a
         // duplicate approval webhook call. Stored on the non-serialized
         // per-instance `ai_tool_governor_response_hashes` map so this body-derived hash never
-        // reaches transaction logs.
+        // reaches transaction logs. Staged only after the ungovernable screen
+        // so governable responses (including empty-call bodies) keep
+        // no-duplicate-approval skip behavior.
         self.set_response_hash(ctx, sha256_hex_bytes(body));
-        let extracted = extract_sse_tool_calls(body);
-        // Mirror the live streaming finalizer: a buffered SSE tool call that
-        // cannot be policy-checked (missing `function.name` or non-string
-        // `function.arguments`) is ungovernable. Fail closed in enforce, forward
-        // in dry-run.
-        if extracted.ungovernable {
-            return self.uninspectable_governed_response(
-                ctx,
-                "streamed response body contains an ungovernable tool call",
-            );
-        }
         if extracted.calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -2300,7 +2435,9 @@ impl AiToolGovernor {
 
     /// A governed response body that cannot be inspected (an unsupported or
     /// undecodable content-encoding, an ungovernable call, or an oversized
-    /// body): fail closed in enforce mode, forward in dry-run.
+    /// body): fail closed in enforce mode, forward in dry-run. Duplicate-key
+    /// ambiguity additionally records a sanitized dry-run observation so
+    /// rollout logs positively witness the finding without claiming deny.
     fn uninspectable_governed_response(
         &self,
         ctx: &mut RequestContext,
@@ -2308,6 +2445,9 @@ impl AiToolGovernor {
     ) -> PluginResult {
         if self.engine.mode == Mode::Enforce {
             return self.reject_uninspectable(ctx, "response body", reason);
+        }
+        if Self::is_ambiguity_reason(reason) {
+            Self::write_ambiguity_observation_into(&self.engine, &mut ctx.metadata);
         }
         PluginResult::Continue
     }
@@ -2393,6 +2533,22 @@ impl Plugin for AiToolGovernor {
             .get("request_body_size_bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+
+        // Duplicate-object-member screen of the pre-transform request body,
+        // computed before the `ctx.metadata` borrow below so it can use the
+        // shared per-request memo (`body_validator` inspects this same body in
+        // this same phase). The memo is moved out and straight back; it is keyed
+        // on body digests, so moving it preserves every verdict. Bodies past the
+        // inspection window are skipped here — they are already uninspectable
+        // for size and must not pay for a scan.
+        let mut json_scan_memo = std::mem::take(&mut ctx.json_scan_memo);
+        let body_ambiguity = ctx
+            .metadata
+            .get("request_body")
+            .filter(|body| body.len() <= MAX_PARSE_BYTES)
+            .and_then(|body| json_scan_memo.ambiguity_str(body));
+        ctx.json_scan_memo = json_scan_memo;
+
         let body = ctx.metadata.get("request_body");
 
         // A missing Content-Type is accepted by MCP/A2A gateways, but it is
@@ -2422,6 +2578,16 @@ impl Plugin for AiToolGovernor {
             }
         }
 
+        // Duplicate object member names make the governed document and the
+        // dispatched bytes disagree: `serde_json` keeps the LAST tool name or
+        // argument while a first-key-wins backend executes the first. This
+        // plugin has no request-body transform, so it cannot canonicalize —
+        // the body joins the uninspectable class and fails closed in enforce
+        // mode (advisory `GHSA-c78j-5w9p-cpq6`).
+        if uninspectable.is_none() && body_ambiguity.is_some() {
+            uninspectable = Some(AMBIGUOUS_REQUEST_JSON);
+        }
+
         let json = match uninspectable {
             Some(_) => None,
             // `request_body` metadata is absent for a non-UTF-8 (binary) body:
@@ -2433,6 +2599,9 @@ impl Plugin for AiToolGovernor {
                 .unwrap_or("request body is not parseable JSON despite a JSON content-type");
             if enforce_request {
                 return self.reject_uninspectable(ctx, "request body", reason);
+            }
+            if Self::is_ambiguity_reason(reason) {
+                Self::write_ambiguity_observation_into(&self.engine, &mut ctx.metadata);
             }
             if detects_streaming {
                 ctx.metadata
@@ -2534,7 +2703,15 @@ impl Plugin for AiToolGovernor {
 
         let inspectable =
             !has_non_identity_content_encoding(headers) && body.len() <= MAX_PARSE_BYTES;
-        let json = inspectable
+        // Screen the FINAL backend-visible bytes for duplicate object member
+        // names, sharing the verdict with the other governed plugins running in
+        // this stage. Ambiguity makes the body uninspectable: these are the
+        // exact bytes the backend will parse, and this plugin cannot rewrite
+        // them (advisory `GHSA-c78j-5w9p-cpq6`).
+        let ambiguity = inspectable
+            .then(|| ctx.json_scan_memo.ambiguity(body))
+            .flatten();
+        let json = (inspectable && ambiguity.is_none())
             .then(|| serde_json::from_slice::<Value>(body).ok())
             .flatten();
 
@@ -2620,8 +2797,15 @@ impl Plugin for AiToolGovernor {
                 return self.reject_uninspectable(
                     ctx,
                     "request body",
-                    "final request body cannot be inspected (encoded, oversized, or not JSON)",
+                    if ambiguity.is_some() {
+                        AMBIGUOUS_REQUEST_JSON
+                    } else {
+                        "final request body cannot be inspected (encoded, oversized, or not JSON)"
+                    },
                 );
+            }
+            if ambiguity.is_some() {
+                Self::write_ambiguity_observation_into(&self.engine, &mut ctx.metadata);
             }
             return PluginResult::Continue;
         };
@@ -2782,6 +2966,20 @@ impl Plugin for AiToolGovernor {
                     if !self.governs_buffered_json(ctx) {
                         return PluginResult::Continue;
                     }
+                    // Same duplicate-member screen the other decoded JSON paths
+                    // run, and BEFORE the skip hash is staged: an ambiguous body
+                    // governed from the `serde_json` last-wins view while the
+                    // client reads a first-wins view is uninspectable, and
+                    // recording its hash first would let the terminal re-check
+                    // hash-skip the very bytes that were never governable
+                    // (advisory `GHSA-c78j-5w9p-cpq6`).
+                    if ctx
+                        .json_scan_memo
+                        .ambiguity(strip_json_bom(&decoded))
+                        .is_some()
+                    {
+                        return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
+                    }
                     self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                     let Some(json) = parse_json_within_limit(&decoded) else {
                         return self.uninspectable_governed_response(
@@ -2835,6 +3033,18 @@ impl Plugin for AiToolGovernor {
             }
             return PluginResult::Continue;
         }
+        // Duplicate-object-member screen of the raw backend body. A body whose
+        // `choices[].message.tool_calls[]` this plugin would evaluate on a
+        // last-wins collapse, while the client's parser reads a first-wins view
+        // of the same bytes, is uninspectable — and these bytes are forwarded
+        // unchanged, so ambiguity cannot be canonicalized away (advisory
+        // `GHSA-c78j-5w9p-cpq6`). Screened on the BOM-stripped bytes the parse
+        // below actually consumes.
+        if body.len() <= MAX_PARSE_BYTES
+            && ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some()
+        {
+            return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
+        }
         // The plaintext parse is attempted only within the wire cap (the cap
         // bounds serde CPU); an encoded body past it goes straight to the
         // bounded decode branch. `parse_json_within_limit` strips a leading
@@ -2875,6 +3085,18 @@ impl Plugin for AiToolGovernor {
                 if looks_like_sse(&decoded) {
                     return self.govern_buffered_sse(ctx, &decoded).await;
                 }
+                // Same duplicate-member screen on the DECODED bytes: a
+                // compressed governed body must not reach policy on a
+                // last-wins collapse either. Screened BEFORE the hash is
+                // staged, so an ambiguous body never gets a skip hash the
+                // terminal re-check could honour.
+                if ctx
+                    .json_scan_memo
+                    .ambiguity(strip_json_bom(&decoded))
+                    .is_some()
+                {
+                    return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
+                }
                 // Record the DECODED hash: the final re-check compares its
                 // own decode against this, so a compression-only final body
                 // is hash-skipped instead of re-governed (no duplicate
@@ -2910,14 +3132,12 @@ impl Plugin for AiToolGovernor {
         // `calls.is_empty()` would Continue even under `default_action: deny`.
         // Fail closed in enforce mode, forward in dry-run.
         if ungovernable {
-            if self.engine.mode == Mode::Enforce {
-                return self.reject_uninspectable(
-                    ctx,
-                    "response body",
-                    "response contains a tool call that cannot be policy-checked (missing or non-string name)",
-                );
-            }
-            return PluginResult::Continue;
+            let reason = if calls.iter().any(|call| call.args_ambiguous) {
+                AMBIGUOUS_TOOL_ARGUMENTS
+            } else {
+                "response contains a tool call that cannot be policy-checked (missing or non-string name, or ambiguous arguments)"
+            };
+            return self.uninspectable_governed_response(ctx, reason);
         }
         if calls.is_empty() {
             return PluginResult::Continue;
@@ -3033,6 +3253,21 @@ impl Plugin for AiToolGovernor {
         // governed body — now inspected by `on_response_body` — is also
         // redactable rather than forwarded unredacted; the re-serialized output
         // is BOM-free valid JSON.
+        //
+        // Defence in depth: `on_response_body` already fails closed on an
+        // ambiguous governed body, but a later transform could hand this hook
+        // different bytes. Clearing the skip ledgers (rather than returning a
+        // silent `None`, which would forward the body unredacted and let the
+        // terminal re-check hash-skip it) routes the ambiguity to
+        // `on_final_response_body`, which fails closed — the same recovery the
+        // serialization-overflow branch below uses. Use the shared per-request
+        // memo (exact BOM-stripped bytes as key) like every other
+        // context-bearing screen on this plugin.
+        if ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some() {
+            self.clear_response_hash(ctx);
+            ctx.ai_tool_governor_call_hashes.remove(&self.instance_id);
+            return None;
+        }
         let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
         // Consume the preflight memo with the rewrite attempt so hostile
         // redacted arguments are not retained after the transform installs
@@ -3252,10 +3487,17 @@ impl Plugin for AiToolGovernor {
         // bytes. Header relabeling must not disable the re-check, so a
         // JSON-shaped body is inspected even when a transform rewrote the
         // content type (mirrors `on_response_body`).
-        if (json_ct || looks_like_json(body))
-            && let Some(json) = parse_json_within_limit(body)
-        {
-            return self.govern_final_response(ctx, &json).await;
+        if json_ct || looks_like_json(body) {
+            // Duplicate-member screen of the client-visible bytes before the
+            // terminal re-check evaluates them.
+            if body.len() <= MAX_PARSE_BYTES
+                && ctx.json_scan_memo.ambiguity(strip_json_bom(body)).is_some()
+            {
+                return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
+            }
+            if let Some(json) = parse_json_within_limit(body) {
+                return self.govern_final_response(ctx, &json).await;
+            }
         }
 
         // When a later transform encoded the final body (e.g. the `compression`
@@ -3317,6 +3559,14 @@ impl Plugin for AiToolGovernor {
             // Content-type / JSON-shape gates against the DECODED bytes.
             if !json_ct && !looks_like_json(&decoded) {
                 return PluginResult::Continue;
+            }
+            // Duplicate-member screen on the DECODED client-visible bytes.
+            if ctx
+                .json_scan_memo
+                .ambiguity(strip_json_bom(&decoded))
+                .is_some()
+            {
+                return self.uninspectable_governed_response(ctx, AMBIGUOUS_RESPONSE_JSON);
             }
             let Some(json) = parse_json_within_limit(&decoded) else {
                 // Decoded but oversized or not parseable JSON: cannot verify a
@@ -3575,7 +3825,7 @@ impl StreamingToolCallAccumulator {
                     ToolCallsContainer::Array(items) => items,
                     // Present but not an array: cannot be accumulated. Flag the
                     // batch ungovernable (mirrors the buffered non-array case) so
-                    // `has_ungovernable_call()` fails closed in enforce.
+                    // `finalize_checked()` fails closed in enforce.
                     ToolCallsContainer::Malformed => {
                         self.malformed = true;
                         &[]
@@ -3707,33 +3957,49 @@ impl StreamingToolCallAccumulator {
         self.calls.iter().all(|((c, _), _)| finished.contains(c))
     }
 
-    /// Whether any accumulated tool call cannot be policy-checked: it never
-    /// received a `function.name`, its `function.arguments` arrived as a
-    /// non-string JSON value, a frame carried a MALFORMED `tool_calls`
-    /// container (present but not an array), or its streaming identity is
-    /// ambiguous (duplicate indexes / conflicting ids). `build_calls()`
-    /// silently drops unnamed calls and `push_frame` cannot accumulate a
-    /// non-array container, so a governable named call in the same batch must
-    /// not carry an ungovernable sibling past policy.
-    fn has_ungovernable_call(&self) -> bool {
-        self.malformed
-            || self
-                .calls
-                .iter()
-                .any(|(_, c)| c.name.is_empty() || c.non_string_args || c.ambiguous_identity)
-    }
-
-    fn build_calls(&self) -> Vec<ToolCall> {
-        self.calls
-            .iter()
-            .filter(|(_, c)| !c.name.is_empty())
-            .map(|(_, c)| ToolCall {
+    /// Authoritative checked finalization for a sealed batch: each accumulated
+    /// call's `arguments` string is screened for duplicate-member ambiguity at
+    /// most once. Returns `Err` (ungovernable) when any call cannot be
+    /// policy-checked — malformed container, missing name, non-string args,
+    /// ambiguous identity, or duplicate-member arguments — otherwise the built
+    /// governable calls. Both the live streaming finalizer and the buffered-SSE
+    /// batch sealer consult this single choke point so their ungovernable
+    /// semantics and argument-scan cost cannot drift. Duplicate-key argument
+    /// failures are distinguished so dry-run can record an ambiguity
+    /// observation without claiming enforcement.
+    fn finalize_checked(&self) -> Result<Vec<ToolCall>, CheckedFinalizeError> {
+        if self.malformed {
+            return Err(CheckedFinalizeError::Ungovernable);
+        }
+        let mut out = Vec::with_capacity(self.calls.len());
+        for (_, c) in &self.calls {
+            if c.name.is_empty() || c.non_string_args || c.ambiguous_identity {
+                return Err(CheckedFinalizeError::Ungovernable);
+            }
+            // One ambiguity scan per call: an ambiguous arguments document
+            // makes the whole batch ungovernable (same class as a missing name).
+            if json_dup_keys::str_ambiguity(&c.arguments).is_some() {
+                return Err(CheckedFinalizeError::AmbiguousArguments);
+            }
+            out.push(ToolCall {
                 name: c.name.clone(),
                 parsed_args: serde_json::from_str(&c.arguments).ok(),
+                args_ambiguous: false,
                 raw_args: c.arguments.clone(),
-            })
-            .collect()
+            });
+        }
+        Ok(out)
     }
+}
+
+/// Why a sealed streaming batch cannot be policy-checked.
+enum CheckedFinalizeError {
+    /// At least one call's `arguments` JSON string carries duplicate object
+    /// member names (advisory `GHSA-c78j-5w9p-cpq6`).
+    AmbiguousArguments,
+    /// Missing name, non-string args, malformed container, or ambiguous
+    /// identity — generic ungovernable, distinct from duplicate-key ambiguity.
+    Ungovernable,
 }
 
 /// Result of finalizing accumulated tool calls at a completion boundary.
@@ -3983,6 +4249,21 @@ impl ToolCallStreamInspector {
         }
     }
 
+    fn record_ambiguity_observation(&self) {
+        let Some(slot) = &self.stream_metadata else {
+            return;
+        };
+        match slot.lock() {
+            Ok(mut metadata) => {
+                AiToolGovernor::write_ambiguity_observation_into(&self.engine, &mut metadata);
+            }
+            Err(poisoned) => {
+                let mut metadata = poisoned.into_inner();
+                AiToolGovernor::write_ambiguity_observation_into(&self.engine, &mut metadata);
+            }
+        }
+    }
+
     /// Evaluate the accumulated tool calls at a completion boundary. On
     /// release, appends the held raw bytes to `out` and resets batch state.
     async fn finalize(&mut self, out: &mut Vec<u8>) -> Finalize {
@@ -3990,25 +4271,42 @@ impl ToolCallStreamInspector {
             return Finalize::Released;
         }
         // Any accumulated tool call that cannot be policy-checked — no
-        // `function.name`, or non-string `function.arguments` — makes the whole
+        // `function.name`, non-string `function.arguments`, malformed container,
+        // ambiguous identity, or duplicate-member arguments — makes the whole
         // batch ungovernable: a governable named call in the same SSE batch
         // could otherwise carry an unchecked sibling to the client. Enforce mode
         // fails closed (cut the stream); dry-run releases the held frames
-        // unchanged so observation never disrupts traffic. Detecting ANY
-        // ungovernable call (not just the all-unnamed case) is required because
-        // `build_calls()` silently drops unnamed calls.
-        if self.accumulator.has_ungovernable_call() {
-            if self.engine.mode == Mode::Enforce {
-                self.record_uninspectable_metadata();
+        // unchanged so observation never disrupts traffic. A single
+        // `finalize_checked` pass both screens and builds so arguments are not
+        // scanned twice. Duplicate-key argument ambiguity records a dry-run
+        // observation; other ungovernable causes keep their prior forward-only
+        // dry-run posture.
+        let calls = match self.accumulator.finalize_checked() {
+            Err(CheckedFinalizeError::AmbiguousArguments) => {
+                if self.engine.mode == Mode::Enforce {
+                    self.record_uninspectable_metadata();
+                    self.held.clear();
+                    return Finalize::Blocked;
+                }
+                self.record_ambiguity_observation();
+                out.extend_from_slice(&self.held);
                 self.held.clear();
-                return Finalize::Blocked;
+                self.reset_batch();
+                return Finalize::Released;
             }
-            out.extend_from_slice(&self.held);
-            self.held.clear();
-            self.reset_batch();
-            return Finalize::Released;
-        }
-        let calls = self.accumulator.build_calls();
+            Err(CheckedFinalizeError::Ungovernable) => {
+                if self.engine.mode == Mode::Enforce {
+                    self.record_uninspectable_metadata();
+                    self.held.clear();
+                    return Finalize::Blocked;
+                }
+                out.extend_from_slice(&self.held);
+                self.held.clear();
+                self.reset_batch();
+                return Finalize::Released;
+            }
+            Ok(calls) => calls,
+        };
         if calls.is_empty() {
             // Saw a tool-call array but no governable calls (e.g. an empty
             // array): nothing to check, release the held frames unchanged.
@@ -4115,6 +4413,24 @@ impl ToolCallStreamInspector {
     /// JSON-shaped plaintext within the size cap.
     async fn finalize_json_body(&mut self) -> ResponseStreamAction {
         let body = std::mem::take(&mut self.carry);
+        // An UNPARSEABLE JSON-shaped body is released (documented above); an
+        // AMBIGUOUS one is not. It parses — a denied `tool_calls[]` can be
+        // hiding behind a duplicate member whose last-wins collapse this
+        // gateway would clear but the client's parser would not read
+        // (advisory `GHSA-c78j-5w9p-cpq6`). Enforce cuts the stream before any
+        // held byte is released; dry-run forwards unchanged.
+        if json_dup_keys::slice_ambiguity(strip_json_bom(&body)).is_some() {
+            if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
+                warn!(
+                    target: "ai_tool_governor",
+                    "JSON-shaped stream contains duplicate JSON object member names; cutting stream"
+                );
+                return self.terminate(Vec::new());
+            }
+            self.record_ambiguity_observation();
+            return ResponseStreamAction::Forward(Bytes::from(body));
+        }
         let Ok(json) = serde_json::from_slice::<Value>(strip_json_bom(&body)) else {
             return ResponseStreamAction::Forward(Bytes::from(body));
         };
@@ -4127,6 +4443,9 @@ impl ToolCallStreamInspector {
                     "JSON-shaped stream contains an ungovernable tool call; cutting stream"
                 );
                 return self.terminate(Vec::new());
+            }
+            if calls.iter().any(|call| call.args_ambiguous) {
+                self.record_ambiguity_observation();
             }
             return ResponseStreamAction::Forward(Bytes::from(body));
         }
@@ -4247,6 +4566,30 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     }
                     out.extend_from_slice(&event);
                 }
+                SseEvent::Ambiguous => {
+                    // The frame parses but its objects carry duplicate member
+                    // names, so no tool-call extraction from it can be trusted:
+                    // a `tool_calls` delta the client's parser reads may not be
+                    // the one this gateway would evaluate. Cut the stream in
+                    // enforce mode BEFORE any held bytes are released; dry-run
+                    // records a sanitized observation and forwards, holding only
+                    // to preserve arrival order behind a pending batch.
+                    if self.engine.mode == Mode::Enforce {
+                        self.record_uninspectable_metadata();
+                        warn!(
+                            target: "ai_tool_governor",
+                            "SSE data payload contains duplicate JSON object member names; cutting stream"
+                        );
+                        self.held.clear();
+                        return self.terminate(out);
+                    }
+                    self.record_ambiguity_observation();
+                    if self.saw_tool_calls {
+                        self.held.extend_from_slice(&event);
+                    } else {
+                        out.extend_from_slice(&event);
+                    }
+                }
                 SseEvent::OtherData | SseEvent::NoData => {
                     if self.saw_tool_calls {
                         // A governed batch is pending: hold to preserve
@@ -4339,6 +4682,23 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     self.saw_tool_calls = true;
                     self.accumulator.push_frame(&frame);
                     self.held.extend_from_slice(&event);
+                }
+                // Same posture as the mid-stream ambiguous frame: an
+                // uninspectable trailing event must not be flushed to the
+                // client in enforce mode alongside a released batch. Dry-run
+                // records the observation and still forwards the trailing bytes.
+                SseEvent::Ambiguous if self.engine.mode == Mode::Enforce => {
+                    self.record_uninspectable_metadata();
+                    warn!(
+                        target: "ai_tool_governor",
+                        "trailing SSE data payload contains duplicate JSON object member names; cutting stream"
+                    );
+                    self.held.clear();
+                    return self.terminate(Vec::new());
+                }
+                SseEvent::Ambiguous => {
+                    self.record_ambiguity_observation();
+                    trailing = event;
                 }
                 _ => trailing = event,
             }
@@ -4452,6 +4812,12 @@ fn sse_lines(text: &str) -> Vec<&str> {
 enum SseEvent {
     Frame(Value),
     Done,
+    /// The `data:` payload parses as JSON but carries duplicate object member
+    /// names, so the frame this gateway would evaluate is not necessarily the
+    /// frame the client's parser reads (advisory `GHSA-c78j-5w9p-cpq6`). The
+    /// held bytes must not be released on the strength of a governed decision
+    /// taken over a last-wins collapse.
+    Ambiguous,
     OtherData,
     NoData,
 }
@@ -4489,6 +4855,12 @@ fn classify_event(event: &[u8]) -> SseEvent {
     }
     if trimmed == "[DONE]" {
         return SseEvent::Done;
+    }
+    // Screen the concatenated `data:` payload before it becomes the frame
+    // policy is evaluated against. `OtherData` (unparseable) stays a forwarding
+    // outcome; ambiguity is a distinct, fail-closed one.
+    if json_dup_keys::str_ambiguity(trimmed).is_some() {
+        return SseEvent::Ambiguous;
     }
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => SseEvent::Frame(value),
@@ -4599,6 +4971,11 @@ struct BufferedSseExtract {
     /// `function.name` / non-string `function.arguments`) — the mirror of the
     /// live streaming finalizer's ungovernable state.
     ungovernable: bool,
+    /// True when ungovernability came from duplicate-key ambiguity (an
+    /// ambiguous `data:` frame or duplicate-member arguments string), so
+    /// dry-run can record the fixed observation without treating generic
+    /// ungovernable traffic the same way.
+    ambiguous: bool,
     /// First `model` a data frame reported, mirroring the live inspector's
     /// `record_frame_context` — approval webhook/cache keys must carry the
     /// served model even when request metadata is absent.
@@ -4631,6 +5008,7 @@ impl BufferedSseBatches {
             extract: BufferedSseExtract {
                 calls: Vec::new(),
                 ungovernable: false,
+                ambiguous: false,
                 model: None,
                 provider: None,
             },
@@ -4639,13 +5017,21 @@ impl BufferedSseBatches {
 
     /// Seal the pending batch at a completion boundary: fold its calls (under
     /// their TRUE per-batch names) and its ungovernable state into the
-    /// extract, then reset the accumulator for the next batch.
+    /// extract, then reset the accumulator for the next batch. Uses the same
+    /// single checked-finalization pass as the live streaming finalizer so
+    /// argument ambiguity is screened once per call.
     fn seal_batch(&mut self) {
         if !self.saw_tool_calls {
             return;
         }
-        self.extract.ungovernable |= self.acc.has_ungovernable_call();
-        self.extract.calls.extend(self.acc.build_calls());
+        match self.acc.finalize_checked() {
+            Err(CheckedFinalizeError::AmbiguousArguments) => {
+                self.extract.ungovernable = true;
+                self.extract.ambiguous = true;
+            }
+            Err(CheckedFinalizeError::Ungovernable) => self.extract.ungovernable = true,
+            Ok(calls) => self.extract.calls.extend(calls),
+        }
         self.acc = StreamingToolCallAccumulator::default();
         self.finished.clear();
         self.saw_tool_calls = false;
@@ -4678,6 +5064,14 @@ impl BufferedSseBatches {
             // `[DONE]` is a definitive batch boundary even when no
             // `finish_reason` frame arrived.
             SseEvent::Done => self.seal_batch(),
+            // Buffered mirror of the live inspector's ambiguous-frame cut: a
+            // `data:` payload whose objects carry duplicate member names cannot
+            // be extracted from faithfully, so the whole body is ungovernable
+            // and `govern_buffered_sse` fails closed in enforce mode.
+            SseEvent::Ambiguous => {
+                self.extract.ungovernable = true;
+                self.extract.ambiguous = true;
+            }
             SseEvent::OtherData | SseEvent::NoData => {}
         }
     }
@@ -4725,8 +5119,16 @@ fn extract_sse_tool_calls(body: &[u8]) -> BufferedSseExtract {
 }
 
 fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
+    // A JSON STRING argument payload is a second, independently parsed document
+    // that the enclosing body's duplicate-member screen could not see into, so
+    // screen its content here. A non-string `Value` came from the enclosing
+    // document and was already screened with it.
+    let mut args_ambiguous = false;
     let (raw_args, parsed_args) = match args {
-        Some(Value::String(s)) => (s.clone(), serde_json::from_str::<Value>(s).ok()),
+        Some(Value::String(s)) => {
+            args_ambiguous = json_dup_keys::str_ambiguity(s).is_some();
+            (s.clone(), serde_json::from_str::<Value>(s).ok())
+        }
         Some(value) => (value.to_string(), Some(value.clone())),
         None => (String::new(), None),
     };
@@ -4734,6 +5136,7 @@ fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
         name: name.to_string(),
         raw_args,
         parsed_args,
+        args_ambiguous,
     }
 }
 
@@ -4798,6 +5201,12 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
             },
         }
     }
+    // A `function.arguments` JSON STRING whose content carries duplicate object
+    // member names is a second document the enclosing body screen could not see
+    // into. It is checkable in form but not in meaning, so it joins the
+    // ungovernable class rather than being evaluated on a last-wins collapse
+    // the client's parser may not share (advisory `GHSA-c78j-5w9p-cpq6`).
+    ungovernable |= out.iter().any(|call| call.args_ambiguous);
     (out, ungovernable)
 }
 
@@ -4859,6 +5268,7 @@ fn extract_mcp_tool_call(json: &Value) -> McpToolCallExtraction {
             name: name.to_string(),
             raw_args: "{}".to_string(),
             parsed_args: Some(json!({})),
+            args_ambiguous: false,
         }),
         Some(arguments) => McpToolCallExtraction::Call(tool_call_from(name, Some(arguments))),
     }

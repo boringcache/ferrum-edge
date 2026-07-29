@@ -23,14 +23,15 @@ templated against the live metrics.
 | Dashboard | Metrics consumed |
 |---|---|
 | gateway-overview | `ferrum_requests_total`, `ferrum_request_duration_ms_bucket`, `ferrum_backend_duration_ms_bucket`, `ferrum_edge_overhead_ms_bucket`, `ferrum_rate_limit_exceeded_total`, `ferrum_client_disconnects_total`, `ferrum_stream_connections_total`, `ferrum_stream_disconnects_total` |
-| mesh-overview | `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms_bucket`, `ferrum_mesh_mtls_handshake_failures_total`, `ferrum_mesh_config_last_received_timestamp_seconds` |
+| mesh-overview | `ferrum_mesh_requests_total`, `ferrum_mesh_request_duration_ms_bucket`, `ferrum_mesh_mtls_handshake_failures_total`, `ferrum_mesh_config_last_received_timestamp_seconds`, `ferrum_mesh_node_waypoint_hbone_handshakes_total`, `ferrum_mesh_node_waypoint_asserted_identity_total`, `ferrum_mesh_node_waypoint_destination_policy_rejections_total`, `ferrum_mesh_node_waypoint_missing_destination_metadata_total`, `ferrum_mesh_node_waypoint_plaintext_fallback_attempts_total` |
 | certificate-posture | `ferrum_mesh_cert_expiry_seconds`, `ferrum_mesh_cert_rotation_failures_total`, `ferrum_mesh_ca_health`, `ferrum_mesh_trust_bundle_version`, `ferrum_mesh_federation_bundle_age_seconds`, `ferrum_mesh_federation_poll_failures_total` |
 | egress-scope | `ferrum_mesh_outbound_registry_decisions_total{decision="admit"\|"deny"}` |
 | policy-deny | `ferrum_mesh_requests_total{response_code="403"}`, `ferrum_mesh_outbound_registry_decisions_total{decision="deny"}` |
 
-All names are emitted in `src/plugins/prometheus_metrics.rs` and
-`src/plugins/mesh/prometheus_helpers.rs`; alert rules built on the same
-names live in `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`.
+Names are emitted in `src/plugins/prometheus_metrics.rs`,
+`src/plugins/mesh/prometheus_helpers.rs`, and
+`src/modes/mesh/node_waypoint_observability.rs`; alert rules built on the
+same names live in `charts/ferrum-mesh/templates/alerts-prometheusrule.yaml`.
 
 ## Installing via the Helm chart
 
@@ -71,9 +72,9 @@ either:
 ## Notes on what is and isn't covered
 
 - **Active-connections / pool-utilization gauges** are not exposed in
-  Prometheus format. The gateway surfaces them only via the unauthenticated
-  `GET /overload` and JWT-authenticated `GET /metrics/runtime` JSON
-  endpoints, so they are intentionally absent from `gateway-overview.json`.
+  Prometheus format. The gateway surfaces them only in authenticated detail
+  from `GET /overload` and the JWT-authenticated `GET /metrics/runtime` JSON
+  endpoint, so they are intentionally absent from `gateway-overview.json`.
 - **Per-rule mesh authz denies** are surfaced in transaction logs only
   (`mesh_authz.deny_policy` metadata), not as Prometheus labels. The
   `policy-deny.json` dashboard groups denies by source / destination

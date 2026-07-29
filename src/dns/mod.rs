@@ -3,9 +3,10 @@
 //! All gateway components (connection pool, health probes, service discovery,
 //! plugin HTTP clients) share a single `DnsCache` instance so that:
 //! - DNS lookups are off the hot request path (pre-warmed at startup)
-//! - TTL-based expiration prevents stale entries from persisting
+//! - Answer data is shared per hostname while freshness is evaluated per caller
+//!   (so distinct `dns_cache_ttl_seconds` values on shared backends stay isolated)
 //! - Stale-while-revalidate serves the old IP while refreshing in the background
-//! - Background refresh keeps entries warm without per-request DNS queries
+//! - Background refresh keeps entries warm without per-request DNS query storms
 //!
 //! The cache also provides `DnsCacheResolver` — a `reqwest::dns::Resolve`
 //! implementation that plugs into every `reqwest::Client` so all HTTP clients
@@ -28,7 +29,7 @@ use std::future::Future;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -177,36 +178,90 @@ fn dns_name_without_trailing_root(name: impl std::fmt::Display) -> String {
     name
 }
 
+/// Sentinel for [`DnsCacheEntry::shortest_per_proxy_ttl_secs`]: no per-proxy
+/// override has been observed for this hostname yet.
+const NO_PER_PROXY_TTL: u64 = u64::MAX;
+
+/// Sentinel for [`DnsCacheEntry::longest_per_proxy_ttl_secs`]: no per-proxy
+/// override has been observed yet (0 can never be a real observed TTL because
+/// `effective_ttl` floors through `min_ttl`).
+const NO_LONGEST_PER_PROXY_TTL: u64 = 0;
+
 /// A cached DNS entry with TTL and stale-while-revalidate support.
+///
+/// Answer data (addresses, native TTL, publish time) is shared per hostname so
+/// concurrent consumers deduplicate DNS queries. Freshness is evaluated per
+/// caller against that shared publish time using the caller's own effective TTL
+/// (`dns_cache_ttl_seconds` → global override → native), so proxy ordering and
+/// warmup order cannot steal another proxy's TTL policy.
 #[derive(Debug, Clone)]
 struct DnsCacheEntry {
     addresses: Arc<[IpAddr]>,
     /// Lock-free round-robin cursor shared by fresh and stale cache readers.
     /// Replacing an answer set on refresh resets the cursor to zero.
     next_start: Arc<AtomicU64>,
-    expires_at: Instant,
-    /// Deadline after which stale data is no longer served.
+    /// When this answer (or error) was published into the cache.
+    resolved_at: Instant,
+    /// Native TTL from the DNS response at publish time (success entries).
+    /// Caller freshness is `resolved_at + effective_ttl(native_ttl, caller_ttl)`.
+    /// Unused for error entries (`Duration::ZERO`); error expiry uses
+    /// `applied_ttl` instead.
+    native_ttl: Duration,
+    /// Absolute eviction deadline hint for the shared row. Success entries use
+    /// [`DnsCache::shared_stale_deadline`] (longest effective TTL among
+    /// policies actually observed for the hostname) so a short-TTL peer cannot
+    /// evict data a longer-TTL peer still needs, while global/native short
+    /// TTLs remain age-evictable only when a default consumer was observed.
+    /// Error entries use the error backoff window (no stale-while-revalidate).
+    /// Eviction recomputes success retention from observed consumer state so a
+    /// later long-TTL or default note can extend the row without a rewrite.
     stale_deadline: Instant,
-    /// The total TTL duration that was applied when this entry was inserted.
-    /// Stored so background refresh can compute per-entry refresh thresholds
-    /// (since each record may have a different native TTL).
+    /// Effective TTL used for proactive background-refresh thresholding.
+    /// Success: shortest effective TTL among policies actually observed
+    /// (default/global/native only when a `None` consumer was seen).
+    /// Error: current error-backoff TTL. Recomputed on publish; scans also
+    /// re-derive from observation atomics so a later short-TTL or default
+    /// consumer can tighten refresh without waiting for the next resolve miss.
     applied_ttl: Duration,
     /// The record type that produced this result (for CACHE ordering).
     record_type_used: Option<CachedRecordType>,
     /// Whether this is a cached error/empty response.
     is_error: bool,
-    /// The originating per-proxy `dns_cache_ttl_seconds` (if any) that produced
-    /// this entry. Stored so proactive background refresh and failed-retry
-    /// re-resolution can re-thread it through `effective_ttl`, preserving the
-    /// per-proxy TTL preference across refreshes instead of silently falling
-    /// back to the global override or the native record TTL.
+    /// Cooldown after a synchronous refresh of an expired success row failed.
     ///
-    /// Note: when two proxies resolve the same hostname with different
-    /// `dns_cache_ttl_seconds`, only one TTL wins (whichever request populated
-    /// the entry first). See `warmup` deduplication notes.
-    original_per_proxy_ttl: Option<u64>,
-    /// Consecutive failed resolutions while this hostname remains an error
-    /// entry. Used to compute exponential error-TTL backoff. Reset on success.
+    /// The shared answer must remain available to longer-TTL consumers that
+    /// still consider it fresh. Callers already past their own stale window
+    /// observe the cached refresh error until this deadline instead of
+    /// hammering DNS or replacing the shared success with a hostname-wide
+    /// error entry. The cooldown uses the same exponential error backoff as
+    /// error rows (`consecutive_failures`), so a hostname whose DNS is down for
+    /// the whole retention window of a long-TTL peer is not re-queried at a
+    /// fixed `error_ttl` cadence for hours.
+    refresh_error_deadline: Option<Instant>,
+    /// Shortest observed explicit per-proxy `dns_cache_ttl_seconds` for this
+    /// hostname. `NO_PER_PROXY_TTL` means no explicit override observed yet.
+    /// Tightened atomically on cache hits so proactive refresh / failed-retry
+    /// scheduling tracks the most aggressive explicit consumer without a
+    /// DashMap write on the hot path. Never used to decide another caller's
+    /// freshness.
+    shortest_per_proxy_ttl_secs: Arc<AtomicU64>,
+    /// Longest observed explicit per-proxy `dns_cache_ttl_seconds` for this
+    /// hostname. `NO_LONGEST_PER_PROXY_TTL` means no explicit override observed
+    /// yet. Raised atomically on hits so shared-row age eviction retains data
+    /// for the most patient explicit consumer without shrinking when a
+    /// short-TTL peer arrives later.
+    longest_per_proxy_ttl_secs: Arc<AtomicU64>,
+    /// Whether any caller with `dns_cache_ttl_seconds = None` (default /
+    /// global / native policy) has been observed for this hostname. Set
+    /// atomically on hits so retention and proactive refresh include that
+    /// policy only when it was actually requested — never because native TTL
+    /// exists on the shared answer. Shared across success refresh, error
+    /// transitions, clones, and generation guards via the same `Arc`.
+    default_consumer_observed: Arc<AtomicBool>,
+    /// Consecutive failed resolutions for this hostname: error-entry failures,
+    /// and refresh failures against a preserved success row (see
+    /// `refresh_error_deadline`). Used to compute exponential error-TTL
+    /// backoff. Reset to zero on every successful publication.
     consecutive_failures: u32,
     /// When the current failure streak began. `None` for success entries.
     /// Error entries older than the failed-entry lifetime cap (`stale_ttl`,
@@ -214,6 +269,79 @@ struct DnsCacheEntry {
     /// failed-retry task is enabled, so decommissioned hostnames cannot
     /// occupy the cache forever.
     first_failed_at: Option<Instant>,
+}
+
+impl DnsCacheEntry {
+    fn load_shortest_per_proxy_ttl(&self) -> Option<u64> {
+        let secs = self.shortest_per_proxy_ttl_secs.load(Ordering::Relaxed);
+        if secs == NO_PER_PROXY_TTL {
+            None
+        } else {
+            Some(secs)
+        }
+    }
+
+    fn load_longest_per_proxy_ttl(&self) -> Option<u64> {
+        let secs = self.longest_per_proxy_ttl_secs.load(Ordering::Relaxed);
+        if secs == NO_LONGEST_PER_PROXY_TTL {
+            None
+        } else {
+            Some(secs)
+        }
+    }
+
+    fn load_default_consumer_observed(&self) -> bool {
+        self.default_consumer_observed.load(Ordering::Relaxed)
+    }
+
+    fn note_per_proxy_ttl(&self, per_proxy_ttl: Option<u64>) {
+        let Some(secs) = per_proxy_ttl else {
+            // A real default consumer was observed: retention / refresh must
+            // include global/native effective policy for this hostname. Read
+            // before writing — the flag is monotonic and most proxies carry no
+            // `dns_cache_ttl_seconds`, so an unconditional store would dirty
+            // this shared cache line on every cache hit for no state change.
+            if !self.default_consumer_observed.load(Ordering::Relaxed) {
+                self.default_consumer_observed
+                    .store(true, Ordering::Relaxed);
+            }
+            return;
+        };
+        let mut cur = self.shortest_per_proxy_ttl_secs.load(Ordering::Relaxed);
+        while secs < cur {
+            match self.shortest_per_proxy_ttl_secs.compare_exchange_weak(
+                cur,
+                secs,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+        let mut longest = self.longest_per_proxy_ttl_secs.load(Ordering::Relaxed);
+        while secs > longest {
+            match self.longest_per_proxy_ttl_secs.compare_exchange_weak(
+                longest,
+                secs,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => longest = observed,
+            }
+        }
+    }
+
+    /// Absolute expiry instant for error entries (`resolved_at + applied_ttl`).
+    fn error_expires_at(&self) -> Instant {
+        self.resolved_at + self.applied_ttl
+    }
+
+    fn refresh_error_is_live(&self, now: Instant) -> bool {
+        self.refresh_error_deadline
+            .is_some_and(|deadline| deadline > now)
+    }
 }
 
 /// A bounded, policy-approved DNS answer set in deterministic dial order.
@@ -361,7 +489,8 @@ where
 struct FailedRetryGeneration {
     consecutive_failures: u32,
     first_failed_at: Instant,
-    expires_at: Instant,
+    resolved_at: Instant,
+    applied_ttl: Duration,
 }
 
 /// One hostname selected for a failed-retry cycle, with the error generation
@@ -605,42 +734,181 @@ impl DnsCache {
         Ok(())
     }
 
+    /// Per-caller fresh-until instant for a shared success entry.
+    fn consumer_fresh_until(&self, entry: &DnsCacheEntry, per_proxy_ttl: Option<u64>) -> Instant {
+        entry.resolved_at + self.effective_ttl(entry.native_ttl, per_proxy_ttl)
+    }
+
+    /// Per-caller stale-until instant (fresh window + `stale_ttl`).
+    fn consumer_stale_until(&self, entry: &DnsCacheEntry, per_proxy_ttl: Option<u64>) -> Instant {
+        self.consumer_fresh_until(entry, per_proxy_ttl) + self.stale_ttl
+    }
+
+    /// Shared-row retention TTL: longest effective TTL among policies actually
+    /// observed for the hostname. Explicit-only rows use the longest explicit
+    /// override even when native/global is longer; a default (`None`) consumer
+    /// includes global/native so a shorter explicit peer cannot age-evict data
+    /// still fresh for that default consumer. With no observations yet, fall
+    /// back to global/native so brand-new rows stay coherent and reclaimable.
+    fn shared_retention_ttl(
+        &self,
+        native_ttl: Duration,
+        longest_per_proxy: Option<u64>,
+        default_consumer_observed: bool,
+    ) -> Duration {
+        let mut retention = Duration::ZERO;
+        if default_consumer_observed {
+            retention = retention.max(self.effective_ttl(native_ttl, None));
+        }
+        if let Some(secs) = longest_per_proxy {
+            retention = retention.max(self.effective_ttl(native_ttl, Some(secs)));
+        }
+        if retention.is_zero() {
+            retention = self.effective_ttl(native_ttl, None);
+        }
+        retention.min(Self::MAX_TTL)
+    }
+
+    /// Absolute age-eviction deadline for a shared success answer.
+    fn shared_stale_deadline(
+        &self,
+        resolved_at: Instant,
+        native_ttl: Duration,
+        longest_per_proxy: Option<u64>,
+        default_consumer_observed: bool,
+    ) -> Instant {
+        resolved_at
+            + self.shared_retention_ttl(native_ttl, longest_per_proxy, default_consumer_observed)
+            + self.stale_ttl
+    }
+
+    /// Proactive-refresh TTL: shortest effective TTL among policies actually
+    /// observed for this hostname. Include default/global/native only when a
+    /// `None` consumer was observed; include the shortest explicit override
+    /// when one was observed.
+    fn observed_refresh_ttl(
+        &self,
+        native_ttl: Duration,
+        shortest_per_proxy: Option<u64>,
+        default_consumer_observed: bool,
+    ) -> Duration {
+        let mut refresh: Option<Duration> = None;
+        if default_consumer_observed {
+            let policy = self.effective_ttl(native_ttl, None);
+            refresh = Some(match refresh {
+                Some(prev) => prev.min(policy),
+                None => policy,
+            });
+        }
+        if let Some(secs) = shortest_per_proxy {
+            let explicit = self.effective_ttl(native_ttl, Some(secs));
+            refresh = Some(match refresh {
+                Some(prev) => prev.min(explicit),
+                None => explicit,
+            });
+        }
+        refresh.unwrap_or_else(|| self.effective_ttl(native_ttl, None))
+    }
+
+    fn refresh_ttl_for_entry(&self, entry: &DnsCacheEntry) -> Duration {
+        self.observed_refresh_ttl(
+            entry.native_ttl,
+            entry.load_shortest_per_proxy_ttl(),
+            entry.load_default_consumer_observed(),
+        )
+    }
+
     fn cache_success_entry(
         &self,
         hostname: &str,
         addresses: Vec<IpAddr>,
         record_type: Option<CachedRecordType>,
-        ttl: Duration,
-        original_per_proxy_ttl: Option<u64>,
+        native_ttl: Duration,
+        per_proxy_ttl: Option<u64>,
         consume_for_caller: bool,
     ) -> Result<ResolvedAddresses, anyhow::Error> {
         // This is the single success insertion path for foreground resolves,
         // stale refreshes, proactive background refreshes, and failed-retry
         // recovery. Cache reads intentionally trust entries accepted here.
         //
-        // Clamp the effective TTL so an unbounded override / record TTL cannot
-        // overflow the `Instant + Duration` arithmetic below (or the
-        // `Duration * u32` threshold in the proactive refresh loop).
-        let ttl = ttl.min(Self::MAX_TTL);
+        // Clamp native TTL so unbounded record TTLs cannot overflow
+        // `Instant + Duration` / `Duration * u32` arithmetic later.
+        let native_ttl = native_ttl.min(Self::MAX_TTL);
         let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
-        let next_start = Arc::new(AtomicU64::new(0));
         let cache_key = dns_hostname_key(hostname);
+        let now = Instant::now();
 
-        self.cache.insert(
-            cache_key.into_owned(),
-            DnsCacheEntry {
-                addresses: addresses.clone(),
-                next_start: next_start.clone(),
-                expires_at: Instant::now() + ttl,
-                stale_deadline: Instant::now() + ttl + self.stale_ttl,
-                applied_ttl: ttl,
-                record_type_used: record_type,
-                is_error: false,
-                original_per_proxy_ttl,
-                consecutive_failures: 0,
-                first_failed_at: None,
-            },
-        );
+        let next_start = Arc::new(AtomicU64::new(0));
+        let build_entry =
+            |shortest: Arc<AtomicU64>, longest: Arc<AtomicU64>, default_obs: Arc<AtomicBool>| {
+                let shortest_ttl = {
+                    let secs = shortest.load(Ordering::Relaxed);
+                    if secs == NO_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let longest_ttl = {
+                    let secs = longest.load(Ordering::Relaxed);
+                    if secs == NO_LONGEST_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let default_consumer_observed = default_obs.load(Ordering::Relaxed);
+                let applied_ttl =
+                    self.observed_refresh_ttl(native_ttl, shortest_ttl, default_consumer_observed);
+                DnsCacheEntry {
+                    addresses: addresses.clone(),
+                    next_start: next_start.clone(),
+                    resolved_at: now,
+                    native_ttl,
+                    // Retain for the longest observed consumer policy; per-caller
+                    // freshness is computed separately. Eviction recomputes from
+                    // observation atomics so a later note can extend.
+                    stale_deadline: self.shared_stale_deadline(
+                        now,
+                        native_ttl,
+                        longest_ttl,
+                        default_consumer_observed,
+                    ),
+                    applied_ttl,
+                    record_type_used: record_type,
+                    is_error: false,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: shortest,
+                    longest_per_proxy_ttl_secs: longest,
+                    default_consumer_observed: default_obs,
+                    consecutive_failures: 0,
+                    first_failed_at: None,
+                }
+            };
+
+        // Preserve and tighten observation atomics under the DashMap entry
+        // guard. A check-then-insert sequence lets two cold concurrent resolvers
+        // each create independent atomics and makes the last writer reintroduce
+        // order-dependent refresh/retention policy.
+        match self.cache.entry(cache_key.into_owned()) {
+            Entry::Occupied(mut occupied) => {
+                occupied.get().note_per_proxy_ttl(per_proxy_ttl);
+                let shortest = occupied.get().shortest_per_proxy_ttl_secs.clone();
+                let longest = occupied.get().longest_per_proxy_ttl_secs.clone();
+                let default_obs = occupied.get().default_consumer_observed.clone();
+                occupied.insert(build_entry(shortest, longest, default_obs));
+            }
+            Entry::Vacant(vacant) => {
+                let shortest = Arc::new(AtomicU64::new(per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL)));
+                let longest = Arc::new(AtomicU64::new(
+                    per_proxy_ttl.unwrap_or(NO_LONGEST_PER_PROXY_TTL),
+                ));
+                // Vacant insert observes this caller's policy: None marks the
+                // default consumer; Some records only the explicit override.
+                let default_obs = Arc::new(AtomicBool::new(per_proxy_ttl.is_none()));
+                vacant.insert(build_entry(shortest, longest, default_obs));
+            }
+        }
 
         if consume_for_caller {
             Ok(ResolvedAddresses::rotated(addresses, &next_start))
@@ -682,86 +950,101 @@ impl DnsCache {
             ));
         }
 
-        // 3. Check cache with stale-while-revalidate
-        let mut prior_per_proxy_ttl = None;
+        // 3. Check cache with per-consumer freshness + shared stale-while-revalidate
+        let mut expired_success_generation = None;
         if let Some(entry) = self.cache.get(cache_hostname) {
             let now = Instant::now();
-            prior_per_proxy_ttl = entry.original_per_proxy_ttl;
+            // Track this caller's TTL for proactive refresh scheduling only —
+            // never apply another consumer's TTL to this caller's freshness.
+            entry.note_per_proxy_ttl(per_proxy_ttl);
 
-            // Fresh entry — return immediately
-            if entry.expires_at > now && !entry.addresses.is_empty() && !entry.is_error {
-                crate::runtime_metrics::global_ref().record_dns_hit();
-                return Ok(ResolvedAddresses::rotated(
-                    entry.addresses.clone(),
-                    &entry.next_start,
-                ));
-            }
+            if !entry.is_error && !entry.addresses.is_empty() {
+                let fresh_until = self.consumer_fresh_until(&entry, per_proxy_ttl);
+                if fresh_until > now {
+                    crate::runtime_metrics::global_ref().record_dns_hit();
+                    return Ok(ResolvedAddresses::rotated(
+                        entry.addresses.clone(),
+                        &entry.next_start,
+                    ));
+                }
 
-            // Stale but within stale window — return stale data, trigger background refresh
-            if entry.stale_deadline > now && !entry.addresses.is_empty() && !entry.is_error {
-                let host = cache_hostname.to_string();
-                // Deduplicate: only spawn a refresh if one isn't already in progress
-                if self.refreshing.insert(host.clone(), ()).is_none() {
-                    // Try to acquire a semaphore permit to bound concurrent refreshes.
-                    // If all permits are taken, skip the refresh — the entry stays
-                    // stale and the next request will retry the semaphore.
-                    match self.refresh_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => {
-                            let cache = self.clone();
-                            let ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
-                            tokio::spawn(async move {
-                                if let Err(e) = cache.refresh_entry(&host, ttl).await {
-                                    warn!("DNS stale refresh failed for {}: {}", host, e);
-                                }
-                                cache.refreshing.remove(&host);
-                                drop(permit);
-                            });
-                            debug!(
-                                "DNS serving stale entry for {} (background refresh triggered)",
-                                hostname
-                            );
+                // Stale for this consumer but within their SWR window — serve
+                // shared data and trigger one deduplicated background refresh.
+                if self.consumer_stale_until(&entry, per_proxy_ttl) > now {
+                    let host = cache_hostname.to_string();
+                    if self.refreshing.insert(host.clone(), ()).is_none() {
+                        match self.refresh_semaphore.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                let cache = self.clone();
+                                // Refresh publishes shared data; scheduling uses
+                                // the shortest observed per-proxy (including this
+                                // caller) so short-TTL peers keep getting updates.
+                                let refresh_ttl =
+                                    per_proxy_ttl.or_else(|| entry.load_shortest_per_proxy_ttl());
+                                tokio::spawn(async move {
+                                    if let Err(e) = cache.refresh_entry(&host, refresh_ttl).await {
+                                        warn!("DNS stale refresh failed for {}: {}", host, e);
+                                    }
+                                    cache.refreshing.remove(&host);
+                                    drop(permit);
+                                });
+                                debug!(
+                                    "DNS serving stale entry for {} (background refresh triggered)",
+                                    hostname
+                                );
+                            }
+                            Err(_) => {
+                                self.refreshing.remove(&host);
+                                debug!(
+                                    "DNS serving stale entry for {} (refresh skipped, concurrency limit reached)",
+                                    hostname
+                                );
+                            }
                         }
-                        Err(_) => {
-                            // Concurrency limit reached — remove the dedup entry
-                            // so a future request can retry when a permit frees up.
-                            self.refreshing.remove(&host);
-                            debug!(
-                                "DNS serving stale entry for {} (refresh skipped, concurrency limit reached)",
-                                hostname
-                            );
-                        }
+                    } else {
+                        debug!(
+                            "DNS serving stale entry for {} (refresh already in progress)",
+                            hostname
+                        );
                     }
-                } else {
-                    debug!(
-                        "DNS serving stale entry for {} (refresh already in progress)",
+                    crate::runtime_metrics::global_ref().record_dns_stale();
+                    return Ok(ResolvedAddresses::rotated(
+                        entry.addresses.clone(),
+                        &entry.next_start,
+                    ));
+                }
+                if entry.refresh_error_is_live(now) {
+                    // A shorter-TTL peer's failed synchronous refresh must not
+                    // replace this shared answer and invalidate a longer-TTL
+                    // peer that still considers it fresh. This caller is past
+                    // its own stale window, so return the bounded cached error
+                    // while leaving the shared success row intact.
+                    crate::runtime_metrics::global_ref().record_dns_error();
+                    anyhow::bail!(
+                        "DNS resolution failed for {} (cached refresh error)",
                         hostname
                     );
                 }
-                crate::runtime_metrics::global_ref().record_dns_stale();
-                return Ok(ResolvedAddresses::rotated(
-                    entry.addresses.clone(),
-                    &entry.next_start,
-                ));
-            }
-
-            // Cached error that hasn't expired — return error immediately
-            if entry.is_error && entry.expires_at > now {
+                // Past this consumer's stale window — fall through to sync resolve.
+                // Shared row may still be fresh for longer-TTL peers; leave it.
+                expired_success_generation = Some(entry.next_start.clone());
+            } else if entry.is_error && entry.error_expires_at() > now {
+                // Cached error that hasn't expired — return error immediately
                 crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution failed for {} (cached error)", hostname);
             }
         }
 
-        let per_proxy_ttl = per_proxy_ttl.or(prior_per_proxy_ttl);
-
-        // 4. Perform actual DNS resolution
+        // 4. Perform actual DNS resolution.
+        // Do not inherit another consumer's per-proxy TTL on miss — each caller
+        // supplies its own policy (or falls through to global/native).
         match self.timed_resolve(cache_hostname).await {
             Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
                 let addrs = match self.cache_success_entry(
                     cache_hostname,
                     addrs,
                     record_type,
-                    ttl,
+                    native_ttl,
                     per_proxy_ttl,
                     true,
                 ) {
@@ -773,13 +1056,13 @@ impl DnsCache {
                 };
 
                 debug!(
-                    "DNS resolved {} -> {:?} (native_ttl={:?}, effective_ttl={:?})",
+                    "DNS resolved {} -> {:?} (native_ttl={:?}, per_proxy_ttl={:?})",
                     hostname,
                     addrs
                         .first()
                         .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
                     native_ttl,
-                    ttl
+                    per_proxy_ttl
                 );
                 crate::runtime_metrics::global_ref().record_dns_miss();
                 Ok(addrs)
@@ -789,12 +1072,12 @@ impl DnsCache {
                 // /etc/hosts, so DNS lookup can fail.  Respect dns_order:
                 // if AAAA appears before A, prefer IPv6 loopback.
                 let addr = self.localhost_addr();
-                let ttl = self.effective_ttl(Duration::from_secs(3600), per_proxy_ttl);
+                let native_ttl = Duration::from_secs(3600);
                 let addrs = match self.cache_success_entry(
                     cache_hostname,
                     vec![addr],
                     None,
-                    ttl,
+                    native_ttl,
                     per_proxy_ttl,
                     true,
                 ) {
@@ -809,12 +1092,20 @@ impl DnsCache {
                 Ok(addrs)
             }
             Ok(_) => {
-                self.cache_error(cache_hostname, per_proxy_ttl);
+                self.cache_error(
+                    cache_hostname,
+                    per_proxy_ttl,
+                    expired_success_generation.as_ref(),
+                );
                 crate::runtime_metrics::global_ref().record_dns_error();
                 anyhow::bail!("DNS resolution returned no addresses for {}", hostname);
             }
             Err(e) => {
-                self.cache_error(cache_hostname, per_proxy_ttl);
+                self.cache_error(
+                    cache_hostname,
+                    per_proxy_ttl,
+                    expired_success_generation.as_ref(),
+                );
                 crate::runtime_metrics::global_ref().record_dns_error();
                 Err(e)
             }
@@ -914,12 +1205,18 @@ impl DnsCache {
             anyhow::bail!("DNS refresh returned no addresses for {}", hostname);
         }
 
-        let ttl = self.effective_ttl(native_ttl, per_proxy_ttl);
-        self.cache_success_entry(hostname, addrs, record_type, ttl, per_proxy_ttl, false)?;
+        self.cache_success_entry(
+            hostname,
+            addrs,
+            record_type,
+            native_ttl,
+            per_proxy_ttl,
+            false,
+        )?;
 
         debug!(
-            "DNS background refresh: {} refreshed (ttl={:?})",
-            hostname, ttl
+            "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
+            hostname, native_ttl, per_proxy_ttl
         );
         Ok(())
     }
@@ -941,57 +1238,124 @@ impl DnsCache {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     }
 
-    fn cache_error(&self, hostname: &str, per_proxy_ttl: Option<u64>) {
+    fn cache_error(
+        &self,
+        hostname: &str,
+        per_proxy_ttl: Option<u64>,
+        expired_success_generation: Option<&Arc<AtomicU64>>,
+    ) {
         let cache_key = dns_hostname_key(hostname);
         let cache_hostname = cache_key.as_ref();
         let now = Instant::now();
 
-        // Preserve any prior per-proxy TTL recorded for this hostname so that
-        // when the failed-retry task promotes the entry back to success, it can
-        // re-thread the original per-proxy TTL through `effective_ttl` rather
-        // than silently falling back to the global override or native TTL.
-        //
-        // When the prior entry is already an error, continue the failure streak
-        // (increment consecutive_failures, keep first_failed_at) so exponential
-        // backoff and age eviction stay coherent across request-path and
-        // background-retry re-caches. A transition from success → error starts
-        // a fresh streak.
-        let (prior_ttl, consecutive_failures, first_failed_at) =
-            if let Some(entry) = self.cache.get(cache_hostname) {
-                let prior_ttl = entry.original_per_proxy_ttl;
-                if entry.is_error {
-                    (
-                        prior_ttl,
-                        entry.consecutive_failures.saturating_add(1),
-                        entry.first_failed_at.or(Some(now)),
-                    )
+        match self.cache.entry(cache_hostname.to_string()) {
+            Entry::Occupied(mut occupied) if !occupied.get().is_error => {
+                occupied.get().note_per_proxy_ttl(per_proxy_ttl);
+                if expired_success_generation
+                    .is_some_and(|generation| Arc::ptr_eq(generation, &occupied.get().next_start))
+                {
+                    // A short-TTL caller may be expired while a long-TTL peer
+                    // still owns a fresh view of this shared answer. Preserve
+                    // the answer and cache only a bounded refresh-error
+                    // cooldown for callers past their own stale window.
+                    if occupied.get().refresh_error_is_live(now) {
+                        // A concurrent expired caller already armed this round's
+                        // cooldown. Every racer passed the liveness gate before
+                        // the first failure landed, so advancing the backoff per
+                        // caller would slam a busy hostname straight to the cap
+                        // on its first failed round.
+                        debug!(
+                            "DNS refresh error for {} already covered by a live cooldown",
+                            hostname
+                        );
+                    } else {
+                        // Back off like an error row: the shared row survives
+                        // for the longest observed consumer, which can be far
+                        // longer than the expired caller's own window, so a
+                        // fixed `error_ttl` cooldown would re-query a dead
+                        // hostname at that cadence for the whole retention
+                        // period. `cache_success_entry` resets the streak on the
+                        // next successful publication.
+                        let mut preserved = occupied.get().clone();
+                        let ttl = self.error_backoff_ttl(preserved.consecutive_failures);
+                        let failures = preserved.consecutive_failures.saturating_add(1);
+                        preserved.consecutive_failures = failures;
+                        preserved.refresh_error_deadline = Some(now + ttl);
+                        occupied.insert(preserved);
+                        debug!(
+                            "DNS cached refresh error for {} without replacing shared success (ttl={:?}, consecutive_failures={})",
+                            hostname, ttl, failures
+                        );
+                    }
                 } else {
-                    (prior_ttl, 0, Some(now))
+                    // A successful refresh won the race while this lookup was
+                    // in flight. Never taint that newer generation with a stale
+                    // failure.
+                    debug!(
+                        "DNS ignored stale refresh error for {} after a newer success",
+                        hostname
+                    );
                 }
-            } else {
-                (None, 0, Some(now))
-            };
-
-        let ttl = self.error_backoff_ttl(consecutive_failures);
-        self.cache.insert(
-            cache_hostname.to_string(),
-            DnsCacheEntry {
-                addresses: Arc::from([]),
-                next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: now + ttl,
-                stale_deadline: now + ttl, // no stale serving for errors
-                applied_ttl: ttl,
-                record_type_used: None,
-                is_error: true,
-                original_per_proxy_ttl: per_proxy_ttl.or(prior_ttl),
-                consecutive_failures,
-                first_failed_at,
-            },
-        );
-        debug!(
-            "DNS cached error for {} (ttl={:?}, consecutive_failures={})",
-            hostname, ttl, consecutive_failures
-        );
+            }
+            Entry::Occupied(mut occupied) => {
+                let current = occupied.get();
+                current.note_per_proxy_ttl(per_proxy_ttl);
+                let shortest = current.shortest_per_proxy_ttl_secs.clone();
+                let longest = current.longest_per_proxy_ttl_secs.clone();
+                let default_obs = current.default_consumer_observed.clone();
+                let consecutive_failures = current.consecutive_failures.saturating_add(1);
+                let first_failed_at = current.first_failed_at.or(Some(now));
+                let ttl = self.error_backoff_ttl(consecutive_failures);
+                occupied.insert(DnsCacheEntry {
+                    addresses: Arc::from([]),
+                    next_start: Arc::new(AtomicU64::new(0)),
+                    resolved_at: now,
+                    native_ttl: Duration::ZERO,
+                    stale_deadline: now + ttl,
+                    applied_ttl: ttl,
+                    record_type_used: None,
+                    is_error: true,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: shortest,
+                    longest_per_proxy_ttl_secs: longest,
+                    default_consumer_observed: default_obs,
+                    consecutive_failures,
+                    first_failed_at,
+                });
+                debug!(
+                    "DNS cached error for {} (ttl={:?}, consecutive_failures={})",
+                    hostname, ttl, consecutive_failures
+                );
+            }
+            Entry::Vacant(vacant) => {
+                let consecutive_failures = 0;
+                let ttl = self.error_backoff_ttl(consecutive_failures);
+                vacant.insert(DnsCacheEntry {
+                    addresses: Arc::from([]),
+                    next_start: Arc::new(AtomicU64::new(0)),
+                    resolved_at: now,
+                    native_ttl: Duration::ZERO,
+                    stale_deadline: now + ttl,
+                    applied_ttl: ttl,
+                    record_type_used: None,
+                    is_error: true,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                        per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL),
+                    )),
+                    longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                        per_proxy_ttl.unwrap_or(NO_LONGEST_PER_PROXY_TTL),
+                    )),
+                    default_consumer_observed: Arc::new(AtomicBool::new(per_proxy_ttl.is_none())),
+                    consecutive_failures,
+                    first_failed_at: Some(now),
+                });
+                debug!(
+                    "DNS cached error for {} (ttl={:?}, consecutive_failures={})",
+                    hostname, ttl, consecutive_failures
+                );
+            }
+        }
     }
 
     /// Wraps `do_resolve` with timing instrumentation. When the configured
@@ -1205,7 +1569,7 @@ impl DnsCache {
         let cache_key = dns_hostname_key(hostname);
         self.cache
             .get(cache_key.as_ref())
-            .map(|e| e.is_error && e.expires_at > Instant::now())
+            .map(|e| e.is_error && e.error_expires_at() > Instant::now())
             .unwrap_or(false)
     }
 
@@ -1242,7 +1606,7 @@ impl DnsCache {
     /// Evict expired entries and enforce max cache size.
     /// Removes entries past their lifetime first, then — if still over capacity —
     /// prefers error entries for eviction over live success entries (oldest
-    /// `expires_at` within each class) so failed hostnames cannot displace
+    /// logical expiry within each class) so failed hostnames cannot displace
     /// working cache rows.
     ///
     /// Error entries are retained past their per-attempt error TTL so the
@@ -1257,7 +1621,8 @@ impl DnsCache {
         let error_max_age = self.failed_entry_lifetime_cap();
 
         // Phase 1: Remove entries past their lifetime.
-        // - Success entries: past stale_deadline.
+        // - Success entries: past recomputed shared retention from policies
+        //   actually observed for the hostname (+ stale_ttl).
         // - Error entries with retry enabled: past first_failed_at + stale_ttl.
         // - Error entries with retry disabled: past stale_deadline (same as
         //   success), so they cannot accumulate unbounded without a consumer.
@@ -1269,20 +1634,38 @@ impl DnsCache {
                 if retry_enabled {
                     return true;
                 }
+                return entry.stale_deadline > now;
             }
-            entry.stale_deadline > now
+            self.shared_stale_deadline(
+                entry.resolved_at,
+                entry.native_ttl,
+                entry.load_longest_per_proxy_ttl(),
+                entry.load_default_consumer_observed(),
+            ) > now
         });
 
         // Phase 2: If still over capacity, evict to 75%. Prefer error entries
         // over live success entries so a backlog of failed hostnames cannot
-        // displace working cache rows; within each class, oldest expires_at
+        // displace working cache rows; within each class, oldest logical expiry
         // first (backed-off error TTLs sort later among errors).
         if self.cache.len() > self.max_cache_size {
             let target_size = self.max_cache_size * 3 / 4; // Evict to 75% capacity
             let mut entries: Vec<(String, bool, Instant)> = self
                 .cache
                 .iter()
-                .map(|e| (e.key().clone(), e.is_error, e.expires_at))
+                .map(|e| {
+                    let expires = if e.is_error {
+                        e.error_expires_at()
+                    } else {
+                        self.shared_stale_deadline(
+                            e.resolved_at,
+                            e.native_ttl,
+                            e.load_longest_per_proxy_ttl(),
+                            e.load_default_consumer_observed(),
+                        )
+                    };
+                    (e.key().clone(), e.is_error, expires)
+                })
                 .collect();
             entries.sort_by(|a, b| match (a.1, b.1) {
                 (true, false) => std::cmp::Ordering::Less,
@@ -1327,15 +1710,16 @@ impl DnsCache {
                 aged_out.push(entry.key().clone());
                 continue;
             }
-            if entry.expires_at <= now {
-                let first_failed_at = entry.first_failed_at.unwrap_or(entry.expires_at);
+            if entry.error_expires_at() <= now {
+                let first_failed_at = entry.first_failed_at.unwrap_or(entry.error_expires_at());
                 candidates.push(FailedRetryCandidate {
                     hostname: entry.key().clone(),
-                    per_proxy_ttl: entry.original_per_proxy_ttl,
+                    per_proxy_ttl: entry.load_shortest_per_proxy_ttl(),
                     generation: FailedRetryGeneration {
                         consecutive_failures: entry.consecutive_failures,
                         first_failed_at,
-                        expires_at: entry.expires_at,
+                        resolved_at: entry.resolved_at,
+                        applied_ttl: entry.applied_ttl,
                     },
                 });
             }
@@ -1358,7 +1742,8 @@ impl DnsCache {
         entry.is_error
             && entry.consecutive_failures == generation.consecutive_failures
             && entry.first_failed_at == Some(generation.first_failed_at)
-            && entry.expires_at == generation.expires_at
+            && entry.resolved_at == generation.resolved_at
+            && entry.applied_ttl == generation.applied_ttl
     }
 
     /// Remove an aged-out retry candidate only when the current map entry is
@@ -1394,10 +1779,10 @@ impl DnsCache {
         generation: &FailedRetryGeneration,
         addresses: Vec<IpAddr>,
         record_type: Option<CachedRecordType>,
-        ttl: Duration,
-        original_per_proxy_ttl: Option<u64>,
+        native_ttl: Duration,
+        per_proxy_ttl: Option<u64>,
     ) -> Result<Option<Vec<IpAddr>>, anyhow::Error> {
-        let ttl = ttl.min(Self::MAX_TTL);
+        let native_ttl = native_ttl.min(Self::MAX_TTL);
         // Validate before taking the shard lock so a denied answer is never
         // published and the guard is not held across policy work.
         let addresses = self.screen_backend_addresses_policy(addresses, hostname)?;
@@ -1409,15 +1794,47 @@ impl DnsCache {
                 if !Self::matches_failed_retry_generation(occupied.get(), generation) {
                     return Ok(None);
                 }
+                let shortest = occupied.get().shortest_per_proxy_ttl_secs.clone();
+                let longest = occupied.get().longest_per_proxy_ttl_secs.clone();
+                let default_obs = occupied.get().default_consumer_observed.clone();
+                occupied.get().note_per_proxy_ttl(per_proxy_ttl);
+                let shortest_ttl = {
+                    let secs = shortest.load(Ordering::Relaxed);
+                    if secs == NO_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let longest_ttl = {
+                    let secs = longest.load(Ordering::Relaxed);
+                    if secs == NO_LONGEST_PER_PROXY_TTL {
+                        None
+                    } else {
+                        Some(secs)
+                    }
+                };
+                let default_consumer_observed = default_obs.load(Ordering::Relaxed);
+                let applied_ttl =
+                    self.observed_refresh_ttl(native_ttl, shortest_ttl, default_consumer_observed);
                 occupied.insert(DnsCacheEntry {
                     addresses: addresses.clone(),
                     next_start: Arc::new(AtomicU64::new(0)),
-                    expires_at: now + ttl,
-                    stale_deadline: now + ttl + self.stale_ttl,
-                    applied_ttl: ttl,
+                    resolved_at: now,
+                    native_ttl,
+                    stale_deadline: self.shared_stale_deadline(
+                        now,
+                        native_ttl,
+                        longest_ttl,
+                        default_consumer_observed,
+                    ),
+                    applied_ttl,
                     record_type_used: record_type,
                     is_error: false,
-                    original_per_proxy_ttl,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: shortest,
+                    longest_per_proxy_ttl_secs: longest,
+                    default_consumer_observed: default_obs,
                     consecutive_failures: 0,
                     first_failed_at: None,
                 });
@@ -1454,19 +1871,26 @@ impl DnsCache {
                     occupied.remove();
                     return false;
                 }
-                let prior_ttl = current.original_per_proxy_ttl;
+                let shortest = current.shortest_per_proxy_ttl_secs.clone();
+                let longest = current.longest_per_proxy_ttl_secs.clone();
+                let default_obs = current.default_consumer_observed.clone();
+                current.note_per_proxy_ttl(per_proxy_ttl);
                 let consecutive_failures = current.consecutive_failures.saturating_add(1);
                 let first_failed_at = current.first_failed_at.or(Some(now));
                 let ttl = self.error_backoff_ttl(consecutive_failures);
                 occupied.insert(DnsCacheEntry {
                     addresses: Arc::from([]),
                     next_start: Arc::new(AtomicU64::new(0)),
-                    expires_at: now + ttl,
+                    resolved_at: now,
+                    native_ttl: Duration::ZERO,
                     stale_deadline: now + ttl,
                     applied_ttl: ttl,
                     record_type_used: None,
                     is_error: true,
-                    original_per_proxy_ttl: per_proxy_ttl.or(prior_ttl),
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: shortest,
+                    longest_per_proxy_ttl_secs: longest,
+                    default_consumer_observed: default_obs,
                     consecutive_failures,
                     first_failed_at,
                 });
@@ -1519,13 +1943,14 @@ impl DnsCache {
 
                     match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                            let ttl = cache.effective_ttl(native_ttl, per_proxy_ttl);
+                            let applied_ttl =
+                                cache.effective_ttl(native_ttl, per_proxy_ttl);
                             match cache.apply_failed_retry_success(
                                 &hostname,
                                 &generation,
                                 addrs,
                                 record_type,
-                                ttl,
+                                native_ttl,
                                 per_proxy_ttl,
                             ) {
                                 Ok(Some(addrs)) => {
@@ -1533,7 +1958,7 @@ impl DnsCache {
                                     // so operators notice the outage ended.
                                     warn!(
                                         "DNS failed retry: '{}' resolved successfully -> {:?} (ttl={:?})",
-                                        hostname, addrs[0], ttl
+                                        hostname, addrs[0], applied_ttl
                                     );
                                 }
                                 Ok(None) => {
@@ -1670,11 +2095,12 @@ impl DnsCache {
                 cache.evict_expired();
 
                 // Collect entries nearing expiration (past the configured refresh threshold).
-                // Each entry uses its own applied_ttl for threshold computation since
-                // native DNS TTLs vary per record. Capture each entry's
-                // originating per-proxy TTL so the refresh re-threads it through
-                // `effective_ttl` (otherwise refreshes silently downgrade to the
-                // global override or native TTL).
+                // Freshness for request callers is per-consumer; proactive refresh uses the
+                // shortest effective TTL among policies actually observed for the hostname
+                // so short-TTL peers stay warm without spawning per-consumer DNS storms.
+                // Capture the shortest explicit TTL so the refresh re-threads observation
+                // state through `cache_success_entry` (default-consumer flag is preserved
+                // via the shared atomic Arc).
                 let now = Instant::now();
                 let mut to_refresh: Vec<(String, Option<u64>)> = Vec::new();
                 let refresh_remaining_pct = (100 - cache.refresh_threshold_percent as u32).max(1);
@@ -1685,11 +2111,12 @@ impl DnsCache {
                         continue;
                     }
 
-                    let remaining = entry.expires_at.saturating_duration_since(now);
-                    // Use this entry's own applied_ttl for threshold computation
-                    let threshold = entry.applied_ttl * refresh_remaining_pct / 100;
+                    let refresh_ttl = cache.refresh_ttl_for_entry(entry.value());
+                    let expires_at = entry.resolved_at + refresh_ttl;
+                    let remaining = expires_at.saturating_duration_since(now);
+                    let threshold = refresh_ttl * refresh_remaining_pct / 100;
                     if remaining < threshold && remaining > Duration::ZERO {
-                        to_refresh.push((entry.key().clone(), entry.original_per_proxy_ttl));
+                        to_refresh.push((entry.key().clone(), entry.load_shortest_per_proxy_ttl()));
                     }
                 }
 
@@ -1697,19 +2124,18 @@ impl DnsCache {
                 for (hostname, per_proxy_ttl) in to_refresh {
                     match cache.timed_resolve(&hostname).await {
                         Ok((addrs, record_type, native_ttl)) if !addrs.is_empty() => {
-                            let refresh_ttl = cache.effective_ttl(native_ttl, per_proxy_ttl);
                             match cache.cache_success_entry(
                                 &hostname,
                                 addrs,
                                 record_type,
-                                refresh_ttl,
+                                native_ttl,
                                 per_proxy_ttl,
                                 false,
                             ) {
                                 Ok(_) => {
                                     debug!(
-                                        "DNS background refresh: {} refreshed (ttl={:?})",
-                                        hostname, refresh_ttl
+                                        "DNS background refresh: {} refreshed (native_ttl={:?}, per_proxy_ttl={:?})",
+                                        hostname, native_ttl, per_proxy_ttl
                                     );
                                 }
                                 Err(e) => {
@@ -1787,7 +2213,11 @@ impl DnsCache {
     ///
     /// Hostnames are deduplicated before resolution — if multiple proxies or
     /// plugins share the same hostname, only one DNS lookup is performed.
-    /// Unique hostnames are resolved concurrently up to the configured limit.
+    /// Per-proxy TTL policies are NOT first-writer-wins: warmup still issues a
+    /// single shared lookup (and keeps the first static override seen), but
+    /// each later `resolve` evaluates freshness with that caller's own
+    /// `dns_cache_ttl_seconds`. Unique hostnames are resolved concurrently up
+    /// to the configured limit.
     pub async fn warmup(&self, hostnames: Vec<(String, Option<String>, Option<u64>)>) {
         let total_hostnames = hostnames.len();
 
@@ -1797,14 +2227,57 @@ impl DnsCache {
         // Ignore them at this shared boundary so every startup/reload caller is
         // protected even if its hostname collector includes placeholders.
         //
-        // Deduplicate by hostname, keeping the first override/TTL seen for each.
-        let mut seen = HashSet::new();
-        let unique: Vec<_> = hostnames
-            .into_iter()
-            .filter(|(host, _, _)| {
-                !host.trim().is_empty() && seen.insert(dns_hostname_key(host).into_owned())
-            })
-            .collect();
+        // Deduplicate by hostname for query coalescing. Keep the first override
+        // plus the full observed TTL-policy range. The one lookup uses the
+        // shortest explicit TTL for proactive refresh, then records the longest
+        // explicit and default/global/native policies on the shared row so
+        // age eviction cannot discard data still fresh for a warmup consumer
+        // that has not sent its first request yet.
+        struct WarmupPolicy {
+            override_ip: Option<String>,
+            shortest_explicit_ttl: Option<u64>,
+            longest_explicit_ttl: Option<u64>,
+            default_consumer_observed: bool,
+        }
+
+        let mut seen: HashMap<String, WarmupPolicy> = HashMap::new();
+        for (host, override_ip, ttl) in hostnames {
+            if host.trim().is_empty() {
+                continue;
+            }
+            let key = dns_hostname_key(&host).into_owned();
+            match seen.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(WarmupPolicy {
+                        override_ip,
+                        shortest_explicit_ttl: ttl,
+                        longest_explicit_ttl: ttl,
+                        default_consumer_observed: ttl.is_none(),
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let policy = slot.get_mut();
+                    if policy.override_ip.is_none() && override_ip.is_some() {
+                        policy.override_ip = override_ip;
+                    }
+                    if let Some(ttl) = ttl {
+                        policy.shortest_explicit_ttl = Some(
+                            policy
+                                .shortest_explicit_ttl
+                                .map_or(ttl, |existing| existing.min(ttl)),
+                        );
+                        policy.longest_explicit_ttl = Some(
+                            policy
+                                .longest_explicit_ttl
+                                .map_or(ttl, |existing| existing.max(ttl)),
+                        );
+                    } else {
+                        policy.default_consumer_observed = true;
+                    }
+                }
+            }
+        }
+        let unique: Vec<_> = seen.into_iter().collect();
 
         if unique.is_empty() {
             debug!("DNS warmup: no hostnames to resolve");
@@ -1819,11 +2292,29 @@ impl DnsCache {
         );
 
         stream::iter(unique)
-            .for_each_concurrent(self.warmup_concurrency, |(host, override_ip, ttl)| {
+            .for_each_concurrent(self.warmup_concurrency, |(host, policy)| {
                 let cache = self.clone();
                 async move {
-                    match cache.resolve(&host, override_ip.as_deref(), ttl).await {
-                        Ok(addr) => debug!("DNS warmup: {} -> {}", host, addr),
+                    match cache
+                        .resolve(
+                            &host,
+                            policy.override_ip.as_deref(),
+                            policy.shortest_explicit_ttl,
+                        )
+                        .await
+                    {
+                        Ok(addr) => {
+                            let cache_key = dns_hostname_key(&host);
+                            if let Some(entry) = cache.cache.get(cache_key.as_ref()) {
+                                if let Some(longest) = policy.longest_explicit_ttl {
+                                    entry.note_per_proxy_ttl(Some(longest));
+                                }
+                                if policy.default_consumer_observed {
+                                    entry.note_per_proxy_ttl(None);
+                                }
+                            }
+                            debug!("DNS warmup: {} -> {}", host, addr);
+                        }
                         Err(e) => warn!("DNS warmup failed for {}: {}", host, e),
                     }
                 }
@@ -2121,10 +2612,9 @@ mod tests {
     //! Inline tests for private internals of the DNS cache. Public-API tests
     //! live in `tests/unit/gateway_core/dns_tests.rs`.
     //!
-    //! These tests verify that the originating per-proxy `dns_cache_ttl_seconds`
-    //! is preserved across proactive background refresh and failed-retry
-    //! re-resolution — two paths that previously called `effective_ttl(_, None)`
-    //! and silently downgraded entries to the global TTL override / native TTL.
+    //! These tests verify per-consumer TTL isolation on shared hostnames and that
+    //! the shortest observed per-proxy `dns_cache_ttl_seconds` is preserved across
+    //! proactive background refresh and failed-retry re-resolution.
     use super::*;
     use crate::config::{BackendAllowIps, BackendEgressPolicy};
     use std::collections::HashMap;
@@ -2139,26 +2629,58 @@ mod tests {
         }
     }
 
+    fn success_entry(
+        addresses: Arc<[IpAddr]>,
+        resolved_at: Instant,
+        native_ttl: Duration,
+        per_proxy_ttl: Option<u64>,
+        stale_deadline: Instant,
+    ) -> DnsCacheEntry {
+        let applied_ttl = per_proxy_ttl
+            .map(Duration::from_secs)
+            .unwrap_or(native_ttl)
+            .max(Duration::from_secs(1));
+        DnsCacheEntry {
+            addresses,
+            next_start: Arc::new(AtomicU64::new(0)),
+            resolved_at,
+            native_ttl,
+            stale_deadline,
+            applied_ttl,
+            record_type_used: Some(CachedRecordType::A),
+            is_error: false,
+            refresh_error_deadline: None,
+            shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                per_proxy_ttl.unwrap_or(NO_PER_PROXY_TTL),
+            )),
+            longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                per_proxy_ttl.unwrap_or(NO_LONGEST_PER_PROXY_TTL),
+            )),
+            // Test helper `None` means "no consumers noted yet", not "default
+            // consumer observed" — callers that need the default flag note it.
+            default_consumer_observed: Arc::new(AtomicBool::new(false)),
+            consecutive_failures: 0,
+            first_failed_at: None,
+        }
+    }
+
     fn seed_answer(cache: &DnsCache, hostname: &str, addresses: Vec<IpAddr>, stale: bool) {
         let now = Instant::now();
+        let native_ttl = Duration::from_secs(60);
+        let resolved_at = if stale {
+            now - native_ttl - Duration::from_secs(1)
+        } else {
+            now
+        };
         cache.cache.insert(
             hostname.to_string(),
-            DnsCacheEntry {
-                addresses: addresses.into(),
-                next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: if stale {
-                    now - Duration::from_secs(1)
-                } else {
-                    now + Duration::from_secs(60)
-                },
-                stale_deadline: now + Duration::from_secs(60),
-                applied_ttl: Duration::from_secs(60),
-                record_type_used: Some(CachedRecordType::A),
-                is_error: false,
-                original_per_proxy_ttl: None,
-                consecutive_failures: 0,
-                first_failed_at: None,
-            },
+            success_entry(
+                addresses.into(),
+                resolved_at,
+                native_ttl,
+                None,
+                now + Duration::from_secs(3600),
+            ),
         );
     }
 
@@ -2576,7 +3098,7 @@ mod tests {
 
         let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
         assert_eq!(
-            entry.original_per_proxy_ttl,
+            entry.load_shortest_per_proxy_ttl(),
             Some(600),
             "per-proxy TTL must be stored on the cache entry"
         );
@@ -2597,7 +3119,7 @@ mod tests {
             .unwrap();
 
         let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
-        assert_eq!(entry.original_per_proxy_ttl, Some(450));
+        assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(450));
         assert_eq!(entry.applied_ttl, Duration::from_secs(450));
     }
 
@@ -2607,7 +3129,7 @@ mod tests {
     ///
     /// Simulates the proactive refresh code path by inserting a near-expiring
     /// entry tagged with `original_per_proxy_ttl: Some(600)` and re-resolving
-    /// via the same `effective_ttl(native_ttl, entry.original_per_proxy_ttl)`
+    /// via the same `effective_ttl(native_ttl, entry.load_shortest_per_proxy_ttl())`
     /// call the background task uses.
     #[tokio::test]
     async fn proactive_refresh_preserves_per_proxy_ttl() {
@@ -2621,12 +3143,19 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() + Duration::from_secs(1),
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(1);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
+                native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(600),
                 record_type_used: None,
                 is_error: false,
-                original_per_proxy_ttl: Some(600),
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: None,
             },
@@ -2639,7 +3168,7 @@ mod tests {
             .cache
             .get("127.0.0.1")
             .expect("seeded entry")
-            .original_per_proxy_ttl;
+            .load_shortest_per_proxy_ttl();
         assert_eq!(captured, Some(600));
 
         let (addrs, record_type, native_ttl) = cache.timed_resolve("127.0.0.1").await.unwrap();
@@ -2659,12 +3188,23 @@ mod tests {
             DnsCacheEntry {
                 addresses: addrs.into(),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() + refresh_ttl,
+                resolved_at: {
+                    let exp = Instant::now() + refresh_ttl;
+                    exp.checked_sub(refresh_ttl).unwrap_or(exp)
+                },
+                native_ttl: refresh_ttl,
                 stale_deadline: Instant::now() + refresh_ttl + cache.stale_ttl,
                 applied_ttl: refresh_ttl,
                 record_type_used: record_type,
                 is_error: false,
-                original_per_proxy_ttl: captured,
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                    (captured).unwrap_or(NO_PER_PROXY_TTL),
+                )),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(
+                    (captured).unwrap_or(NO_LONGEST_PER_PROXY_TTL),
+                )),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: None,
             },
@@ -2672,7 +3212,7 @@ mod tests {
 
         let refreshed = cache.cache.get("127.0.0.1").expect("refreshed entry");
         assert_eq!(refreshed.applied_ttl, Duration::from_secs(600));
-        assert_eq!(refreshed.original_per_proxy_ttl, Some(600));
+        assert_eq!(refreshed.load_shortest_per_proxy_ttl(), Some(600));
     }
 
     /// End-to-end: spinning up the actual background task on a near-expiring
@@ -2701,12 +3241,19 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() + Duration::from_secs(4),
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(4);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
+                native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
                 record_type_used: None,
                 is_error: false,
-                original_per_proxy_ttl: Some(600),
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: None,
             },
@@ -2727,12 +3274,13 @@ mod tests {
         while Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if let Some(entry) = cache.cache.get("127.0.0.1") {
-                let remaining = entry.expires_at.saturating_duration_since(Instant::now());
+                let remaining = (entry.resolved_at + entry.applied_ttl)
+                    .saturating_duration_since(Instant::now());
                 // Refresh has happened when remaining is significantly larger
                 // than the seeded 4s (i.e., the entry was re-inserted).
                 if remaining > Duration::from_secs(60) {
                     observed_applied = entry.applied_ttl;
-                    observed_per_proxy = entry.original_per_proxy_ttl;
+                    observed_per_proxy = entry.load_shortest_per_proxy_ttl();
                     observed_remaining = remaining;
                     break;
                 }
@@ -2768,7 +3316,7 @@ mod tests {
     async fn cache_error_records_first_failure_per_proxy_ttl() {
         let cache = DnsCache::new(config_with_global_override(None));
 
-        cache.cache_error("example.invalid", Some(600));
+        cache.cache_error("example.invalid", Some(600), None);
 
         let err_entry = cache
             .cache
@@ -2776,17 +3324,17 @@ mod tests {
             .expect("error entry exists");
         assert!(err_entry.is_error);
         assert_eq!(
-            err_entry.original_per_proxy_ttl,
+            err_entry.load_shortest_per_proxy_ttl(),
             Some(600),
             "first failed lookup must keep the request's per-proxy TTL"
         );
     }
 
-    /// `cache_error` preserves any prior `original_per_proxy_ttl` so that when
-    /// the failed-retry task later promotes the error back to a success, it
-    /// can re-thread the original per-proxy TTL through `effective_ttl`.
+    /// A refresh failure over an existing success must preserve both the
+    /// shared answer and its shortest observed per-proxy TTL. Only callers
+    /// already past their own stale window observe the bounded error cooldown.
     #[tokio::test]
-    async fn cache_error_preserves_prior_per_proxy_ttl() {
+    async fn cache_error_preserves_prior_success_and_per_proxy_ttl() {
         let cache = DnsCache::new(config_with_global_override(None));
 
         // Seed a successful entry with a per-proxy TTL.
@@ -2795,12 +3343,19 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() + Duration::from_secs(60),
+                resolved_at: {
+                    let exp = Instant::now() + Duration::from_secs(60);
+                    exp.checked_sub(Duration::from_secs(600)).unwrap_or(exp)
+                },
+                native_ttl: Duration::from_secs(600),
                 stale_deadline: Instant::now() + Duration::from_secs(60),
                 applied_ttl: Duration::from_secs(600),
                 record_type_used: None,
                 is_error: false,
-                original_per_proxy_ttl: Some(600),
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: None,
             },
@@ -2808,23 +3363,36 @@ mod tests {
 
         // Now cache an error for the same hostname (simulating a transient
         // resolve failure picked up by the on-demand path).
-        cache.cache_error("example.invalid", None);
-
-        let err_entry = cache
+        let generation = cache
             .cache
             .get("example.invalid")
-            .expect("error entry exists");
-        assert!(err_entry.is_error);
+            .expect("success generation")
+            .next_start
+            .clone();
+        cache.cache_error("example.invalid", None, Some(&generation));
+
+        let preserved = cache
+            .cache
+            .get("example.invalid")
+            .expect("success entry remains");
+        assert!(!preserved.is_error);
         assert_eq!(
-            err_entry.original_per_proxy_ttl,
+            preserved.addresses.as_ref(),
+            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]
+        );
+        assert!(preserved.refresh_error_is_live(Instant::now()));
+        assert_eq!(
+            preserved.load_shortest_per_proxy_ttl(),
             Some(600),
-            "cache_error must carry forward the prior per-proxy TTL so the \
-             failed-retry task can preserve it on re-resolution success"
+            "cache_error must preserve the prior per-proxy TTL without \
+             replacing the shared success row"
         );
     }
 
     /// If a cached error expires and the next `resolve()` call has no explicit
-    /// TTL, the prior entry's TTL must still win over global/native TTLs.
+    /// TTL, the shortest observed per-proxy TTL is retained for refresh
+    /// scheduling (`applied_ttl`) while the caller's freshness still uses
+    /// global/native policy (not another proxy's override).
     #[tokio::test]
     async fn resolve_preserves_prior_ttl_from_expired_error() {
         let cache = DnsCache::new(config_with_global_override(Some(3600)));
@@ -2833,12 +3401,19 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() - Duration::from_secs(1),
+                resolved_at: {
+                    let exp = Instant::now() - Duration::from_secs(1);
+                    exp.checked_sub(Duration::from_secs(5)).unwrap_or(exp)
+                },
+                native_ttl: Duration::ZERO,
                 stale_deadline: Instant::now() - Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(5),
                 record_type_used: None,
                 is_error: true,
-                original_per_proxy_ttl: Some(600),
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(600)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: Some(Instant::now() - Duration::from_secs(1)),
             },
@@ -2846,14 +3421,21 @@ mod tests {
 
         let _ = cache.resolve("127.0.0.1", None, None).await.unwrap();
 
-        let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
-        assert!(!entry.is_error);
-        assert_eq!(entry.original_per_proxy_ttl, Some(600));
-        assert_eq!(
-            entry.applied_ttl,
-            Duration::from_secs(600),
-            "resolve must reuse the expired error entry's per-proxy TTL"
-        );
+        {
+            let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
+            assert!(!entry.is_error);
+            assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(600));
+            assert_eq!(
+                entry.applied_ttl,
+                Duration::from_secs(600),
+                "refresh scheduling must keep the shortest observed per-proxy TTL"
+            );
+            // Caller with no per-proxy override evaluates freshness under global 3600s.
+            assert!(
+                cache.consumer_fresh_until(&entry, None) > Instant::now(),
+                "None-TTL caller uses global/native freshness, independent of shortest=600 refresh hint"
+            );
+        }
     }
 
     /// Same prior-TTL preservation contract for `resolve_all()`.
@@ -2865,12 +3447,19 @@ mod tests {
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at: Instant::now() - Duration::from_secs(1),
+                resolved_at: {
+                    let exp = Instant::now() - Duration::from_secs(1);
+                    exp.checked_sub(Duration::from_secs(5)).unwrap_or(exp)
+                },
+                native_ttl: Duration::ZERO,
                 stale_deadline: Instant::now() - Duration::from_secs(1),
                 applied_ttl: Duration::from_secs(5),
                 record_type_used: None,
                 is_error: true,
-                original_per_proxy_ttl: Some(450),
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(450)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(450)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures: 0,
                 first_failed_at: Some(Instant::now() - Duration::from_secs(1)),
             },
@@ -2880,7 +3469,7 @@ mod tests {
 
         let entry = cache.cache.get("127.0.0.1").expect("entry should exist");
         assert!(!entry.is_error);
-        assert_eq!(entry.original_per_proxy_ttl, Some(450));
+        assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(450));
         assert_eq!(
             entry.applied_ttl,
             Duration::from_secs(450),
@@ -2902,17 +3491,22 @@ mod tests {
             now - Duration::from_secs((-expires_offset) as u64)
         };
         let ttl = cache.error_backoff_ttl(consecutive_failures);
+        let resolved_at = expires_at.checked_sub(ttl).unwrap_or(expires_at);
         cache.cache.insert(
             hostname.to_string(),
             DnsCacheEntry {
                 addresses: Arc::from([]),
                 next_start: Arc::new(AtomicU64::new(0)),
-                expires_at,
+                resolved_at,
+                native_ttl: Duration::ZERO,
                 stale_deadline: expires_at,
                 applied_ttl: ttl,
                 record_type_used: None,
                 is_error: true,
-                original_per_proxy_ttl: None,
+                refresh_error_deadline: None,
+                shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_PER_PROXY_TTL)),
+                longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_LONGEST_PER_PROXY_TTL)),
+                default_consumer_observed: Arc::new(AtomicBool::new(false)),
                 consecutive_failures,
                 first_failed_at: Some(now - age),
             },
@@ -2943,7 +3537,7 @@ mod tests {
             ..DnsConfig::default()
         });
 
-        cache.cache_error("dead.invalid", None);
+        cache.cache_error("dead.invalid", None, None);
         {
             let entry = cache.cache.get("dead.invalid").expect("error entry");
             assert_eq!(entry.consecutive_failures, 0);
@@ -2951,14 +3545,14 @@ mod tests {
             assert!(entry.first_failed_at.is_some());
         }
 
-        cache.cache_error("dead.invalid", None);
+        cache.cache_error("dead.invalid", None, None);
         {
             let entry = cache.cache.get("dead.invalid").expect("error entry");
             assert_eq!(entry.consecutive_failures, 1);
             assert_eq!(entry.applied_ttl, Duration::from_secs(10));
         }
 
-        cache.cache_error("dead.invalid", None);
+        cache.cache_error("dead.invalid", None, None);
         {
             let entry = cache.cache.get("dead.invalid").expect("error entry");
             assert_eq!(entry.consecutive_failures, 2);
@@ -3077,7 +3671,8 @@ mod tests {
             first_failed_at: entry
                 .first_failed_at
                 .expect("error entries record first_failed_at"),
-            expires_at: entry.expires_at,
+            resolved_at: entry.resolved_at,
+            applied_ttl: entry.applied_ttl,
         }
     }
 
@@ -3144,7 +3739,7 @@ mod tests {
         let entry = cache.cache.get("svc.example").expect("foreground entry");
         assert!(!entry.is_error);
         assert_eq!(entry.addresses.as_ref(), &[foreground_ip]);
-        assert_eq!(entry.original_per_proxy_ttl, Some(30));
+        assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(30));
         assert_eq!(entry.consecutive_failures, 0);
     }
 
@@ -3183,7 +3778,7 @@ mod tests {
         // request-path cache_error would) so the original generation is stale.
         insert_error_entry(&cache, "svc.example", -1, 0, Duration::from_secs(1));
         let older_generation = snapshot_error_generation(&cache, "svc.example");
-        cache.cache_error("svc.example", None);
+        cache.cache_error("svc.example", None, None);
         {
             let entry = cache.cache.get("svc.example").expect("newer error");
             assert_eq!(entry.consecutive_failures, 1);
@@ -3233,7 +3828,7 @@ mod tests {
         assert_eq!(entry.addresses.as_ref(), &[recovered]);
         assert_eq!(entry.consecutive_failures, 0);
         assert!(entry.first_failed_at.is_none());
-        assert_eq!(entry.original_per_proxy_ttl, Some(60));
+        assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(60));
     }
 
     #[test]
@@ -3263,7 +3858,8 @@ mod tests {
             .expect("denied retry must leave the selected error generation intact");
         assert!(entry.is_error);
         assert_eq!(entry.consecutive_failures, generation.consecutive_failures);
-        assert_eq!(entry.expires_at, generation.expires_at);
+        assert_eq!(entry.resolved_at, generation.resolved_at);
+        assert_eq!(entry.applied_ttl, generation.applied_ttl);
     }
 
     /// A slow retry that crosses the failed-entry age cap must drop the entry
@@ -3309,12 +3905,19 @@ mod tests {
                 DnsCacheEntry {
                     addresses: Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))]),
                     next_start: Arc::new(AtomicU64::new(0)),
-                    expires_at: now + Duration::from_secs(offset),
+                    resolved_at: {
+                        let exp = now + Duration::from_secs(offset);
+                        exp.checked_sub(Duration::from_secs(offset)).unwrap_or(exp)
+                    },
+                    native_ttl: Duration::from_secs(offset),
                     stale_deadline: now + Duration::from_secs(offset + 60),
                     applied_ttl: Duration::from_secs(offset),
                     record_type_used: None,
                     is_error: false,
-                    original_per_proxy_ttl: None,
+                    refresh_error_deadline: None,
+                    shortest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_PER_PROXY_TTL)),
+                    longest_per_proxy_ttl_secs: Arc::new(AtomicU64::new(NO_LONGEST_PER_PROXY_TTL)),
+                    default_consumer_observed: Arc::new(AtomicBool::new(false)),
                     consecutive_failures: 0,
                     first_failed_at: None,
                 },
@@ -3349,6 +3952,62 @@ mod tests {
         );
     }
 
+    /// Capacity trimming must rank live rows by the longest observed consumer
+    /// deadline, not the shortest proactive-refresh TTL. Otherwise a short-TTL
+    /// peer can make a shared row the first live answer evicted while a
+    /// long-TTL peer still considers it fresh.
+    #[test]
+    fn capacity_eviction_preserves_row_fresh_for_longest_consumer() {
+        let cache = DnsCache::new(DnsConfig {
+            max_cache_size: 2,
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            ..DnsConfig::default()
+        });
+        let now = Instant::now();
+        let address: Arc<[IpAddr]> =
+            Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 80))]);
+
+        let shared = success_entry(
+            address.clone(),
+            now - Duration::from_secs(10),
+            Duration::from_secs(600),
+            Some(5),
+            now + Duration::from_secs(590),
+        );
+        shared.note_per_proxy_ttl(Some(600));
+        cache.cache.insert("shared.example".to_string(), shared);
+        cache.cache.insert(
+            "short.example".to_string(),
+            success_entry(
+                address.clone(),
+                now,
+                Duration::from_secs(30),
+                Some(30),
+                now + Duration::from_secs(30),
+            ),
+        );
+        cache.cache.insert(
+            "medium.example".to_string(),
+            success_entry(
+                address,
+                now,
+                Duration::from_secs(60),
+                Some(60),
+                now + Duration::from_secs(60),
+            ),
+        );
+
+        cache.evict_expired();
+
+        assert_eq!(cache.cache_len(), 1, "capacity target is 75% of max");
+        assert!(
+            cache.cache.get("shared.example").is_some(),
+            "the 600s consumer's shared row must outlive 30s/60s rows even though \
+             its shortest refresh policy is already expired"
+        );
+    }
+
     /// Policy-denied retry success must advance error backoff (via the same
     /// generation-guarded apply path) so the expired entry is not selected
     /// again on every subsequent cycle.
@@ -3372,7 +4031,679 @@ mod tests {
                 .expect("error retained");
             assert_eq!(entry.consecutive_failures, 1);
             assert_eq!(entry.applied_ttl, Duration::from_secs(10));
-            assert!(entry.expires_at > Instant::now());
+            assert!(entry.error_expires_at() > Instant::now());
         }
+    }
+
+    /// Acceptance fixture from issue #2415: shared hostname, 5s vs 600s, both
+    /// note orders. Freshness is evaluated from a shared `resolved_at` without
+    /// sleeping wall-clock time.
+    #[test]
+    fn shared_hostname_5s_600s_freshness_both_note_orders() {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 3600,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let now = Instant::now();
+        let resolved_at = now - Duration::from_secs(10);
+        let entry = success_entry(
+            Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10))]),
+            resolved_at,
+            Duration::from_secs(3600),
+            None,
+            now + Duration::from_secs(7200),
+        );
+
+        for note_order in [[5u64, 600u64], [600u64, 5u64]] {
+            for ttl in note_order {
+                entry.note_per_proxy_ttl(Some(ttl));
+            }
+            assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(5));
+            assert_eq!(entry.load_longest_per_proxy_ttl(), Some(600));
+            assert!(
+                cache.consumer_fresh_until(&entry, Some(600)) > now,
+                "600s consumer must still be fresh 10s after publish (order={note_order:?})"
+            );
+            assert!(
+                cache.consumer_fresh_until(&entry, Some(5)) <= now,
+                "5s consumer must be past fresh 10s after publish (order={note_order:?})"
+            );
+            assert!(
+                cache.consumer_stale_until(&entry, Some(5)) > now,
+                "5s consumer must still be inside the shared SWR window"
+            );
+            assert_eq!(
+                cache.shared_retention_ttl(
+                    entry.native_ttl,
+                    entry.load_longest_per_proxy_ttl(),
+                    entry.load_default_consumer_observed(),
+                ),
+                Duration::from_secs(600),
+                "shared-row age eviction must retain for the longest peer, not the shortest"
+            );
+        }
+    }
+
+    /// Shared-row age eviction must honor global/native short TTLs when a
+    /// default consumer was observed (so `evict_expired` can reclaim) while a
+    /// later long per-proxy note extends retention without letting a short peer
+    /// shrink it. Explicit-only rows must not keep native TTL as an implicit
+    /// consumer.
+    #[test]
+    fn shared_row_retention_tracks_longest_consumer_and_global_override() {
+        let short_global = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 1,
+            ttl_override_seconds: Some(1),
+            ..DnsConfig::default()
+        });
+        assert_eq!(
+            short_global.shared_retention_ttl(Duration::from_secs(86_400), None, true),
+            Duration::from_secs(1),
+            "global override alone must remain age-evictable"
+        );
+        assert_eq!(
+            short_global.shared_retention_ttl(Duration::from_secs(86_400), Some(600), true),
+            Duration::from_secs(600),
+            "longest per-proxy must extend retention past a short global override"
+        );
+
+        let no_global = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 1,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let now = Instant::now();
+        let resolved_at = now - Duration::from_secs(30);
+        let entry = success_entry(
+            Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 51))]),
+            resolved_at,
+            Duration::from_secs(60),
+            None,
+            now + Duration::from_secs(3600),
+        );
+        entry.note_per_proxy_ttl(Some(5));
+        entry.note_per_proxy_ttl(Some(600));
+        let deadline = no_global.shared_stale_deadline(
+            entry.resolved_at,
+            entry.native_ttl,
+            entry.load_longest_per_proxy_ttl(),
+            entry.load_default_consumer_observed(),
+        );
+        assert!(
+            deadline > now + Duration::from_secs(500),
+            "30s after publish, a 600s peer must still keep the shared row"
+        );
+        assert!(
+            no_global.shared_stale_deadline(entry.resolved_at, entry.native_ttl, Some(5), false,)
+                < now,
+            "explicit-only 5s retention must already be past deadline; native 60s must not dominate"
+        );
+    }
+
+    /// Order-independent coverage: explicit-only consumers control retention and
+    /// refresh without inventing a default/native consumer; mixed default +
+    /// explicit consumers fold both policies into the max/min.
+    #[test]
+    fn shared_row_observation_state_drives_retention_and_refresh() {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 1,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let native = Duration::from_secs(60);
+
+        for note_order in [vec![Some(5u64), Some(30u64)], vec![Some(30u64), Some(5u64)]] {
+            let entry = success_entry(
+                Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 71))]),
+                Instant::now(),
+                native,
+                None,
+                Instant::now() + Duration::from_secs(3600),
+            );
+            for ttl in &note_order {
+                entry.note_per_proxy_ttl(*ttl);
+            }
+            assert!(
+                !entry.load_default_consumer_observed(),
+                "explicit-only notes must not invent a default consumer (order={note_order:?})"
+            );
+            assert_eq!(
+                cache.shared_retention_ttl(
+                    native,
+                    entry.load_longest_per_proxy_ttl(),
+                    entry.load_default_consumer_observed(),
+                ),
+                Duration::from_secs(30),
+                "explicit-only retention uses longest override, not native 60s"
+            );
+            assert_eq!(
+                cache.refresh_ttl_for_entry(&entry),
+                Duration::from_secs(5),
+                "explicit-only refresh uses shortest override, not native 60s"
+            );
+        }
+
+        for note_order in [
+            vec![None, Some(600u64)],
+            vec![Some(600u64), None],
+            vec![None, Some(5u64), Some(600u64)],
+            vec![Some(600u64), Some(5u64), None],
+        ] {
+            let entry = success_entry(
+                Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 72))]),
+                Instant::now(),
+                native,
+                None,
+                Instant::now() + Duration::from_secs(3600),
+            );
+            for ttl in &note_order {
+                entry.note_per_proxy_ttl(*ttl);
+            }
+            assert!(
+                entry.load_default_consumer_observed(),
+                "a None note must mark the default consumer (order={note_order:?})"
+            );
+            assert_eq!(
+                cache.shared_retention_ttl(
+                    native,
+                    entry.load_longest_per_proxy_ttl(),
+                    entry.load_default_consumer_observed(),
+                ),
+                Duration::from_secs(600),
+                "mixed retention is max(native, longest explicit)"
+            );
+            let expected_refresh = if note_order.contains(&Some(5)) {
+                Duration::from_secs(5)
+            } else {
+                // default native 60s is shorter than explicit 600s
+                Duration::from_secs(60)
+            };
+            assert_eq!(
+                cache.refresh_ttl_for_entry(&entry),
+                expected_refresh,
+                "mixed refresh is min among observed policies (order={note_order:?})"
+            );
+        }
+
+        // Explicit-only 5s consumer must expire under native 60s wall time.
+        let now = Instant::now();
+        let short_only = success_entry(
+            Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 73))]),
+            now - Duration::from_secs(30),
+            native,
+            None,
+            now + Duration::from_secs(3600),
+        );
+        short_only.note_per_proxy_ttl(Some(5));
+        assert!(
+            cache.shared_stale_deadline(
+                short_only.resolved_at,
+                short_only.native_ttl,
+                short_only.load_longest_per_proxy_ttl(),
+                short_only.load_default_consumer_observed(),
+            ) < now,
+            "explicit-only 5s row must be age-evictable despite native 60s"
+        );
+    }
+
+    /// A short-TTL caller's failed synchronous refresh must not replace the
+    /// shared success row while a longer-TTL peer still considers that answer
+    /// fresh. The failed caller gets a bounded cached-error cooldown instead.
+    #[test]
+    fn short_ttl_refresh_failure_preserves_long_ttl_fresh_answer() {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            error_ttl_seconds: 10,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let now = Instant::now();
+        cache.cache.insert(
+            "shared.example".to_string(),
+            success_entry(
+                Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 44))]),
+                now - Duration::from_secs(10),
+                Duration::from_secs(600),
+                Some(5),
+                now + Duration::from_secs(86_400),
+            ),
+        );
+
+        let generation = cache
+            .cache
+            .get("shared.example")
+            .expect("success generation")
+            .next_start
+            .clone();
+        cache.cache_error("shared.example", Some(5), Some(&generation));
+
+        let entry = cache.cache.get("shared.example").expect("shared answer");
+        assert!(
+            !entry.is_error,
+            "refresh failure must preserve the answer row"
+        );
+        assert_eq!(
+            entry.addresses.as_ref(),
+            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 44))]
+        );
+        assert!(
+            cache.consumer_fresh_until(&entry, Some(600)) > now,
+            "600s peer must retain its still-fresh shared answer"
+        );
+        assert!(
+            cache.consumer_stale_until(&entry, Some(5)) <= now,
+            "5s peer is past its own stale window"
+        );
+        assert!(
+            entry.refresh_error_is_live(Instant::now()),
+            "expired peer must receive a bounded cached refresh error"
+        );
+    }
+
+    /// Repeated refresh rounds against a preserved shared answer must back off
+    /// exponentially. A shared row survives for its longest observed consumer,
+    /// so a fixed `error_ttl` cooldown would re-query a dead hostname every few
+    /// seconds for that entire window while the long-TTL peer keeps serving the
+    /// cached answer. Callers racing inside one live cooldown must not each
+    /// advance the streak.
+    #[test]
+    fn preserved_refresh_error_cooldown_backs_off_exponentially() {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 3600,
+            error_ttl_seconds: 5,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let address = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 47));
+        let now = Instant::now();
+        cache.cache.insert(
+            "shared.example".to_string(),
+            success_entry(
+                Arc::from([address]),
+                now - Duration::from_secs(10),
+                Duration::from_secs(600),
+                Some(5),
+                now + Duration::from_secs(86_400),
+            ),
+        );
+        // The 600s peer's row stays live across every failed 5s-peer refresh.
+        cache
+            .cache
+            .get("shared.example")
+            .expect("seeded row")
+            .note_per_proxy_ttl(Some(600));
+        let generation = cache
+            .cache
+            .get("shared.example")
+            .expect("success generation")
+            .next_start
+            .clone();
+
+        for (attempt, expected_secs) in [(1u32, 5u64), (2, 10), (3, 20)] {
+            let before = Instant::now();
+            cache.cache_error("shared.example", Some(5), Some(&generation));
+            let after = Instant::now();
+            let (is_error, deadline, failures) = {
+                let entry = cache
+                    .cache
+                    .get("shared.example")
+                    .expect("shared answer must survive every failed refresh");
+                (
+                    entry.is_error,
+                    entry.refresh_error_deadline.expect("cooldown armed"),
+                    entry.consecutive_failures,
+                )
+            };
+            let expected = Duration::from_secs(expected_secs);
+            assert!(!is_error, "attempt {attempt}: answer row must be preserved");
+            assert_eq!(
+                failures, attempt,
+                "attempt {attempt}: refresh failures must accumulate on the shared row"
+            );
+            assert!(
+                deadline >= before + expected && deadline <= after + expected,
+                "attempt {attempt}: cooldown must be {expected:?}, not a fixed error_ttl"
+            );
+
+            // A caller racing inside the live cooldown must not advance the
+            // streak — otherwise one failed round on a busy hostname jumps
+            // straight to the backoff cap.
+            cache.cache_error("shared.example", Some(5), Some(&generation));
+            {
+                let entry = cache.cache.get("shared.example").expect("still preserved");
+                assert_eq!(
+                    entry.consecutive_failures, attempt,
+                    "attempt {attempt}: a racing caller must not advance the backoff"
+                );
+                assert_eq!(
+                    entry.refresh_error_deadline,
+                    Some(deadline),
+                    "attempt {attempt}: a racing caller must not extend the cooldown"
+                );
+            }
+
+            // Let the cooldown lapse so the next iteration is a new round.
+            if let Some(mut entry) = cache.cache.get_mut("shared.example") {
+                entry.refresh_error_deadline = Some(before);
+            }
+        }
+
+        // A successful republication clears both the cooldown and the streak.
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![address],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(5),
+                false,
+            )
+            .expect("republish");
+        let entry = cache.cache.get("shared.example").expect("republished row");
+        assert!(entry.refresh_error_deadline.is_none());
+        assert_eq!(entry.consecutive_failures, 0);
+    }
+
+    /// Success publication must preserve shared observation atomics under the
+    /// DashMap entry guard; replacing them with new atomics would let cold
+    /// concurrent insertion order choose proactive-refresh / retention policy
+    /// again.
+    #[test]
+    fn success_republication_preserves_and_tightens_shortest_ttl_atomic() {
+        let cache = DnsCache::new(config_with_global_override(None));
+        let address = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 45));
+
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![address],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(600),
+                false,
+            )
+            .expect("first publish");
+        let first = cache
+            .cache
+            .get("shared.example")
+            .expect("first row")
+            .shortest_per_proxy_ttl_secs
+            .clone();
+        let first_longest = cache
+            .cache
+            .get("shared.example")
+            .expect("first row")
+            .longest_per_proxy_ttl_secs
+            .clone();
+        let first_default = cache
+            .cache
+            .get("shared.example")
+            .expect("first row")
+            .default_consumer_observed
+            .clone();
+
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![address],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(5),
+                false,
+            )
+            .expect("second publish");
+        // A default consumer hit after the explicit publishers must stick on the
+        // same Arc so later retention/refresh include native/global policy.
+        cache
+            .cache
+            .get("shared.example")
+            .expect("second row")
+            .note_per_proxy_ttl(None);
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![address],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                None,
+                false,
+            )
+            .expect("third publish with default consumer");
+        let entry = cache.cache.get("shared.example").expect("third row");
+        assert!(Arc::ptr_eq(&first, &entry.shortest_per_proxy_ttl_secs));
+        assert!(Arc::ptr_eq(
+            &first_longest,
+            &entry.longest_per_proxy_ttl_secs
+        ));
+        assert!(Arc::ptr_eq(
+            &first_default,
+            &entry.default_consumer_observed
+        ));
+        assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(5));
+        assert_eq!(entry.load_longest_per_proxy_ttl(), Some(600));
+        assert!(entry.load_default_consumer_observed());
+    }
+
+    /// A failed lookup from an older success generation must not attach a
+    /// refresh-error cooldown to a newer answer that won the in-flight race.
+    #[test]
+    fn stale_refresh_failure_does_not_taint_newer_success() {
+        let cache = DnsCache::new(DnsConfig {
+            error_ttl_seconds: 10,
+            ..DnsConfig::default()
+        });
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 45))],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(5),
+                false,
+            )
+            .expect("old success");
+        let old_generation = cache
+            .cache
+            .get("shared.example")
+            .expect("old generation")
+            .next_start
+            .clone();
+
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 46))],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(5),
+                false,
+            )
+            .expect("new success");
+        cache.cache_error("shared.example", Some(5), Some(&old_generation));
+
+        let entry = cache.cache.get("shared.example").expect("new success row");
+        assert_eq!(
+            entry.addresses.as_ref(),
+            &[IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 46))]
+        );
+        assert!(
+            entry.refresh_error_deadline.is_none(),
+            "stale failure must not taint a newer success generation"
+        );
+    }
+
+    /// Two proxies sharing one hostname must each honor their own TTL regardless
+    /// of which consumer populated the shared answer first.
+    #[tokio::test]
+    async fn shared_hostname_per_proxy_ttl_isolation_both_insertion_orders() {
+        for (first_ttl, second_ttl) in [(1u64, 600u64), (600u64, 1u64)] {
+            let cache = DnsCache::new(DnsConfig {
+                min_ttl_seconds: 1,
+                stale_ttl_seconds: 0,
+                ttl_override_seconds: None,
+                ..DnsConfig::default()
+            });
+            let host = "127.0.0.1";
+
+            cache
+                .resolve(host, None, Some(first_ttl))
+                .await
+                .expect("first consumer resolve");
+            cache
+                .resolve(host, None, Some(second_ttl))
+                .await
+                .expect("second consumer resolve");
+            assert_eq!(cache.cache_len(), 1, "shared hostname must stay one row");
+            assert_eq!(
+                cache
+                    .cache
+                    .get(host)
+                    .expect("shared row")
+                    .load_shortest_per_proxy_ttl(),
+                Some(1),
+                "shortest observed per-proxy TTL must be tracked for refresh scheduling"
+            );
+
+            // Past the 1s consumer window; still inside the 600s window.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            {
+                let now = Instant::now();
+                let entry = cache.cache.get(host).expect("shared row after sleep");
+                assert!(
+                    cache.consumer_fresh_until(&entry, Some(600)) > now,
+                    "order=({first_ttl},{second_ttl}): 600s consumer must remain fresh"
+                );
+                assert!(
+                    cache.consumer_fresh_until(&entry, Some(1)) <= now,
+                    "order=({first_ttl},{second_ttl}): 1s consumer must be past fresh"
+                );
+            }
+
+            // Short-TTL re-resolve publishes a new shared row; still one entry.
+            let _ = cache.resolve(host, None, Some(1)).await.unwrap();
+            assert_eq!(cache.cache_len(), 1);
+            {
+                let refreshed = cache.cache.get(host).expect("re-resolved row");
+                assert!(
+                    cache.consumer_fresh_until(&refreshed, Some(1)) > Instant::now(),
+                    "short-TTL re-resolve must publish a fresh shared answer"
+                );
+            }
+        }
+    }
+
+    /// Warmup / reload reordering must not change per-consumer freshness.
+    #[tokio::test]
+    async fn warmup_reload_reordering_preserves_per_proxy_ttl_isolation() {
+        for hostnames in [
+            vec![
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+                ("127.0.0.1".to_string(), None, Some(600u64)),
+            ],
+            vec![
+                ("127.0.0.1".to_string(), None, Some(600u64)),
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+            ],
+        ] {
+            let cache = DnsCache::new(DnsConfig {
+                min_ttl_seconds: 1,
+                stale_ttl_seconds: 0,
+                ..DnsConfig::default()
+            });
+            cache.warmup(hostnames).await;
+            assert_eq!(cache.cache_len(), 1);
+            assert_eq!(
+                cache
+                    .cache
+                    .get("127.0.0.1")
+                    .expect("warmed")
+                    .load_shortest_per_proxy_ttl(),
+                Some(1)
+            );
+            assert_eq!(
+                cache
+                    .cache
+                    .get("127.0.0.1")
+                    .expect("warmed")
+                    .load_longest_per_proxy_ttl(),
+                Some(600),
+                "warmup must retain the longest advertised policy before first traffic"
+            );
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let now = Instant::now();
+            let entry = cache.cache.get("127.0.0.1").expect("warmed row");
+            assert!(cache.consumer_fresh_until(&entry, Some(600)) > now);
+            assert!(cache.consumer_fresh_until(&entry, Some(1)) <= now);
+        }
+
+        for hostnames in [
+            vec![
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+                ("127.0.0.1".to_string(), None, None),
+            ],
+            vec![
+                ("127.0.0.1".to_string(), None, None),
+                ("127.0.0.1".to_string(), None, Some(1u64)),
+            ],
+        ] {
+            let cache = DnsCache::new(DnsConfig {
+                ttl_override_seconds: Some(3600),
+                min_ttl_seconds: 1,
+                stale_ttl_seconds: 0,
+                ..DnsConfig::default()
+            });
+            cache.warmup(hostnames).await;
+            let entry = cache.cache.get("127.0.0.1").expect("warmed");
+            assert_eq!(entry.load_shortest_per_proxy_ttl(), Some(1));
+            assert!(
+                entry.load_default_consumer_observed(),
+                "warmup must retain a default/global/native consumer in either order"
+            );
+            assert_eq!(
+                cache.shared_retention_ttl(
+                    entry.native_ttl,
+                    entry.load_longest_per_proxy_ttl(),
+                    entry.load_default_consumer_observed(),
+                ),
+                Duration::from_secs(3600),
+                "default/global retention must be known before first traffic"
+            );
+        }
+    }
+
+    /// Per-proxy TTL still beats global override and native TTL for that caller.
+    #[tokio::test]
+    async fn per_proxy_ttl_precedence_over_global_and_native_with_shared_row() {
+        let cache = DnsCache::new(DnsConfig {
+            ttl_override_seconds: Some(3600),
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 0,
+            ..DnsConfig::default()
+        });
+        // Native for 127.0.0.1 is 24h; global override is 3600s; per-proxy is 1s.
+        cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
+        // A peer without per-proxy override uses the global 3600s policy on the
+        // same shared row.
+        cache.resolve("127.0.0.1", None, None).await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let now = Instant::now();
+        let entry = cache.cache.get("127.0.0.1").expect("shared row");
+        assert!(
+            cache.consumer_fresh_until(&entry, None) > now,
+            "global-policy consumer must remain fresh"
+        );
+        assert!(
+            cache.consumer_fresh_until(&entry, Some(1)) <= now,
+            "per-proxy 1s consumer must expire despite global 3600s override"
+        );
     }
 }

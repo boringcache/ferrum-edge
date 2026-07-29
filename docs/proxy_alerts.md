@@ -2,7 +2,7 @@
 
 Watches primary proxy traffic and dispatches notifications when configured rules breach their thresholds. Hooks into the `log()`, `on_stream_disconnect()`, and selected WebSocket disconnect lifecycle phases (priority `9250`, after every logging sink). Works across all protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP, UDP/DTLS). Shadow summaries emitted by `request_mirror` are ignored so mirror-target failures do not page the live proxy owner.
 
-The channel layer (Slack, Microsoft Teams, Discord, generic Webhook) lives in [`docs/notifications.md`](notifications.md) and is reusable from any subsystem.
+The channel layer (Slack, Microsoft Teams, Discord, generic Webhook, SMTP email) lives in [`docs/notifications.md`](notifications.md) and is reusable from any subsystem.
 
 ## When to use it
 
@@ -220,7 +220,7 @@ Counts stream disconnects whose `disconnect_cause` matches one of `causes`. Stre
 
 ### Webhook template variables
 
-In addition to the [generic notification template variables](notifications.md#template-variables-provided-by-the-notifications-layer), the proxy_alerts plugin exposes these to the webhook channel `body_template`:
+In addition to the [generic notification template variables](notifications.md#template-variables-provided-by-the-notifications-layer), the proxy_alerts plugin exposes these to the operator-templated channels — the `webhook` channel's `body_template` and the `email` channel's `subject_template` / `body_template`:
 
 | Variable | Value |
 |----------|-------|

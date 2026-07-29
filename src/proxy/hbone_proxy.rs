@@ -433,6 +433,10 @@ pub(super) async fn handle_hbone_request(
             "mesh_authz.deny_policy".to_string(),
             "hbone_unauthenticated_peer".to_string(),
         );
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
@@ -475,6 +479,10 @@ pub(super) async fn handle_hbone_request(
         is_tls,
         ctx.tls_client_cert_der.is_some(),
     ) {
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
         return super::reject_mesh_inbound_peer_auth_transport_mismatch(
             state,
             plugins,
@@ -510,6 +518,13 @@ pub(super) async fn handle_hbone_request(
             "mesh_authz.deny_policy".to_string(),
             "hbone_relay_destination_denied".to_string(),
         );
+        crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+            false,
+        );
+        crate::modes::mesh::node_waypoint_observability::record_destination_policy_rejection(
+            crate::modes::mesh::node_waypoint_observability::NodeWaypointDestinationPolicyRejectReason::RelayDestinationDenied,
+        );
         let reject = finalize_reject_response_with_after_proxy_hooks(
             plugins,
             ctx,
@@ -531,6 +546,13 @@ pub(super) async fn handle_hbone_request(
         record_request(state, reject.http_status.as_u16());
         return build_response_from_normalized_reject(reject);
     }
+
+    // CONNECT admission succeeded past peer-identity and open-relay guards.
+    // Circuit-breaker / upgrade failures after this are not handshake failures.
+    crate::modes::mesh::node_waypoint_observability::record_hbone_handshake(
+        crate::modes::mesh::node_waypoint_observability::NodeWaypointHboneHandshakePhase::InboundConnect,
+        true,
+    );
 
     // HBONE records the circuit-breaker outcome at header time (its `StreamingH2`
     // responses are excluded from the deferred-dispatch path, #1649), so the
