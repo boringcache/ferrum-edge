@@ -2027,6 +2027,18 @@ pub struct RequestContext {
     /// `ai_response_guard_replay_redactions`. Instance scoping prevents one
     /// governor from consuming another instance's transform requirement.
     pub(crate) ai_tool_governor_replay_redactions: HashSet<u64>,
+    /// Per-request memo of duplicate-object-member screens over governed JSON
+    /// bodies (advisory `GHSA-c78j-5w9p-cpq6`). `openapi_validator`,
+    /// `body_validator`, and `ai_tool_governor` can all inspect the same
+    /// buffered body in one hook stage; the first screen's verdict is staged
+    /// here so the chain scans it once.
+    ///
+    /// Entries are keyed on the body's SHA-256 digest and length — never on an
+    /// assertion a client, a backend, or `ctx.metadata` can write — so a
+    /// transform that rewrites the body is re-screened rather than inheriting a
+    /// stale verdict. Private for the same reason as the hash ledgers above: a
+    /// body digest must not reach transaction logs.
+    pub(crate) json_scan_memo: crate::util::json_dup_keys::JsonScanMemo,
     /// Per-instance governed-call identity multisets (identity hash -> count),
     /// the one-for-one skip ledgers final re-checks consume. Kept off
     /// `metadata` for the same reason as the response hashes.
@@ -2563,6 +2575,7 @@ impl RequestContext {
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
             ai_tool_governor_replay_redactions: HashSet::new(),
+            json_scan_memo: crate::util::json_dup_keys::JsonScanMemo::default(),
             ai_tool_governor_call_hashes: HashMap::new(),
             ai_tool_governor_request_hashes: HashMap::new(),
             ai_tool_governor_redaction_memos: HashMap::new(),
@@ -3381,6 +3394,9 @@ impl RequestContext {
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
             ai_tool_governor_replay_redactions: self.ai_tool_governor_replay_redactions.clone(),
+            // Carried into the final-request-body stage so every plugin in that
+            // stage shares one duplicate-key screen of the same body.
+            json_scan_memo: self.json_scan_memo.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
             ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             ai_tool_governor_redaction_memos: self.ai_tool_governor_redaction_memos.clone(),

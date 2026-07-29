@@ -953,6 +953,7 @@ jobs:
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_response_stream_test
+              functional_json_duplicate_key_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
               functional_request_mirror_grpc_transport_test
