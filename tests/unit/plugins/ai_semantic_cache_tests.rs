@@ -6199,3 +6199,339 @@ async fn semantic_cache_config_admits_anonymous_caller_scope_key() {
         );
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Destination + request-context partition (GHSA-37gg-v9m4-8445)
+//
+// The plugin's key is derived from the request *body*, so without an explicit
+// binding the effective destination, the original authority, the raw query, and
+// the backend-visible headers are all unbound. The custom destination encoding
+// this plugin used to carry additionally omitted the proxy namespace.
+// ---------------------------------------------------------------------------
+
+/// A proxy identical to `create_test_proxy()` except for its namespace, so a
+/// test can hold the proxy *ID* fixed and vary only the tenant boundary.
+fn proxy_in_namespace(namespace: &str) -> Arc<ferrum_edge::config::types::Proxy> {
+    let mut proxy = create_test_proxy();
+    proxy.namespace = namespace.to_string();
+    Arc::new(proxy)
+}
+
+/// Build a context for the replay-partition tests with every dimension the
+/// caller wants to vary made explicit.
+fn partition_ctx(
+    proxy: Option<Arc<ferrum_edge::config::types::Proxy>>,
+    client_ip: &str,
+    raw_query: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        client_ip.to_string(),
+        "POST".to_string(),
+        "/v1/chat/completions".to_string(),
+    );
+    ctx.matched_proxy = proxy;
+    ctx.metadata
+        .insert("request_body".to_string(), REPLAY_BODY.to_string());
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    for (name, value) in extra_headers {
+        ctx.headers.insert((*name).to_string(), (*value).to_string());
+    }
+    if let Some(query) = raw_query {
+        ctx.set_raw_query_string(query.to_string());
+    }
+    ctx
+}
+
+async fn partition_store(plugin: &AiSemanticCache, ctx: &mut RequestContext) {
+    let mut headers = ctx.headers.clone();
+    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    let mut response_headers = HashMap::new();
+    response_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(ctx, 200, &response_headers, br#""stored""#)
+        .await;
+}
+
+async fn partition_is_hit(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> bool {
+    let mut headers = ctx.headers.clone();
+    matches!(
+        plugin.before_proxy(ctx, &mut headers).await,
+        PluginResult::RejectBinary { .. }
+    )
+}
+
+/// The former encoding wrote only `proxy.id`, so two tenants on one proxy ID in
+/// separate namespaces shared every exact and semantic partition.
+#[tokio::test]
+async fn exact_key_isolates_one_proxy_id_across_namespaces() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut tenant_a = partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    partition_store(&plugin, &mut tenant_a).await;
+
+    let mut tenant_b = partition_ctx(Some(proxy_in_namespace("tenant-b")), "127.0.0.1", None, &[]);
+    assert!(
+        !partition_is_hit(&plugin, &mut tenant_b).await,
+        "one proxy ID in two namespaces must not share a completion"
+    );
+
+    let mut tenant_a_again =
+        partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    assert!(
+        partition_is_hit(&plugin, &mut tenant_a_again).await,
+        "the same namespace must still hit"
+    );
+}
+
+/// The raw query is backend-visible and was entirely unbound.
+#[tokio::test]
+async fn exact_key_isolates_query_only_differences() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut with_beta = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        Some("api-version=2024-beta"),
+        &[],
+    );
+    partition_store(&plugin, &mut with_beta).await;
+
+    let mut with_ga = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        Some("api-version=2024-ga"),
+        &[],
+    );
+    assert!(
+        !partition_is_hit(&plugin, &mut with_ga).await,
+        "a query parameter the backend acts on must partition the cache"
+    );
+}
+
+/// Non-credential request headers are backend-visible policy dimensions.
+#[tokio::test]
+async fn exact_key_isolates_header_only_differences() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut tenant_a = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[("x-tenant-id", "acme")],
+    );
+    partition_store(&plugin, &mut tenant_a).await;
+
+    let mut tenant_b = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[("x-tenant-id", "globex")],
+    );
+    assert!(
+        !partition_is_hit(&plugin, &mut tenant_b).await,
+        "a tenant-selecting request header must partition the cache"
+    );
+}
+
+/// The header binding excludes only transport framing and per-request
+/// correlation identifiers. Without that carve-out every entry would be a
+/// singleton whenever tracing is enabled.
+#[tokio::test]
+async fn exact_key_ignores_per_request_trace_headers() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let mut first = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )],
+    );
+    partition_store(&plugin, &mut first).await;
+
+    let mut second = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )],
+    );
+    assert!(
+        partition_is_hit(&plugin, &mut second).await,
+        "a fresh trace identifier must not defeat the cache"
+    );
+}
+
+/// An earlier `ai_stream_router` replaces the client credential with the
+/// provider's. Binding only the live header view would collapse two clients.
+#[tokio::test]
+async fn exact_key_survives_an_earlier_credential_rewrite() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300, "scope_by_consumer": false }));
+
+    let build = |client_token: &str| {
+        let mut ctx = partition_ctx(
+            Some(proxy_in_namespace("tenant-a")),
+            "127.0.0.1",
+            None,
+            &[("authorization", "Bearer sk-provider-shared")],
+        );
+        let mut raw = http::HeaderMap::new();
+        raw.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_str(client_token).expect("client token"),
+        );
+        ctx.set_raw_headers(raw);
+        ctx
+    };
+
+    let mut narrow = build("Bearer client-token-read-only");
+    partition_store(&plugin, &mut narrow).await;
+
+    let mut broad = build("Bearer client-token-read-write-admin");
+    assert!(
+        !partition_is_hit(&plugin, &mut broad).await,
+        "an earlier router rewrite must not erase the original caller distinction"
+    );
+
+    let mut same = build("Bearer client-token-read-only");
+    assert!(
+        partition_is_hit(&plugin, &mut same).await,
+        "the same original caller must still hit"
+    );
+}
+
+/// The provider still receives Ferrum's regenerated forwarding identity for an
+/// authenticated caller, so the address is bound for them too.
+#[tokio::test]
+async fn exact_key_isolates_authenticated_callers_by_canonical_address() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 300 }));
+
+    let mut office = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "203.0.113.7",
+        None,
+        &[("authorization", "Bearer alice-token")],
+    );
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    partition_store(&plugin, &mut office).await;
+
+    let mut cafe = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "198.51.100.9",
+        None,
+        &[("authorization", "Bearer alice-token")],
+    );
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    assert!(
+        !partition_is_hit(&plugin, &mut cafe).await,
+        "one authenticated caller at two canonical addresses must not share a completion"
+    );
+}
+
+/// `anonymous_caller_scope: shared` attests about anonymous callers only.
+#[tokio::test]
+async fn shared_anonymous_scope_does_not_relax_authenticated_callers() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut office = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "203.0.113.7",
+        None,
+        &[("authorization", "Bearer alice-token")],
+    );
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    partition_store(&plugin, &mut office).await;
+
+    let mut cafe = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "198.51.100.9",
+        None,
+        &[("authorization", "Bearer alice-token")],
+    );
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    assert!(
+        !partition_is_hit(&plugin, &mut cafe).await,
+        "the shared attestation covers anonymous callers only"
+    );
+}
+
+// --- Semantic scope key -----------------------------------------------------
+//
+// The exact key and the semantic scope key share `append_identity_key_parts`,
+// but the *semantic* lookup scope is what admits an approximate match, so it is
+// asserted directly rather than by inference. The staged scope key is read back
+// through `_test_support`; two contexts that must not share a semantic
+// neighborhood must stage different scope keys.
+
+async fn staged_scope_key(plugin: &AiSemanticCache, ctx: &mut RequestContext) -> Option<String> {
+    let mut headers = ctx.headers.clone();
+    let _ = plugin.before_proxy(ctx, &mut headers).await;
+    ai_semantic_cache_scope_key(ctx, instance_id(plugin)).map(str::to_string)
+}
+
+#[tokio::test]
+async fn semantic_scope_key_isolates_namespace_query_and_header_dimensions() {
+    let mock_server = MockServer::start().await;
+    // Every request here is a semantic miss, so each one embeds. The exact call
+    // count is not the property under test (singleflight coalescing may fold
+    // repeats), so no `expect` bound is asserted.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [1.0, 0.0, 0.0]}]
+        })))
+        .mount(&mock_server)
+        .await;
+    let mut config = semantic_config(&mock_server);
+    config["scope_by_consumer"] = json!(false);
+    let plugin = make_plugin(config);
+
+    let mut baseline =
+        partition_ctx(Some(proxy_in_namespace("tenant-a")), "127.0.0.1", None, &[]);
+    let baseline_scope = staged_scope_key(&plugin, &mut baseline)
+        .await
+        .expect("a semantic miss stages its scope key");
+
+    let mut other_namespace =
+        partition_ctx(Some(proxy_in_namespace("tenant-b")), "127.0.0.1", None, &[]);
+    assert_ne!(
+        staged_scope_key(&plugin, &mut other_namespace).await,
+        Some(baseline_scope.clone()),
+        "one proxy ID in two namespaces must not share a semantic scope"
+    );
+
+    let mut other_query = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        Some("api-version=2024-beta"),
+        &[],
+    );
+    assert_ne!(
+        staged_scope_key(&plugin, &mut other_query).await,
+        Some(baseline_scope.clone()),
+        "a backend-visible query must not share a semantic scope"
+    );
+
+    let mut other_header = partition_ctx(
+        Some(proxy_in_namespace("tenant-a")),
+        "127.0.0.1",
+        None,
+        &[("x-tenant-id", "globex")],
+    );
+    assert_ne!(
+        staged_scope_key(&plugin, &mut other_header).await,
+        Some(baseline_scope),
+        "a tenant-selecting request header must not share a semantic scope"
+    );
+}

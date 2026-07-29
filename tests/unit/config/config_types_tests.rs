@@ -6186,3 +6186,178 @@ fn an_internally_disabled_local_mcp_gateway_shadows_an_enabled_global_one() {
          which applies no rewrite"
     );
 }
+
+// ── request_deduplication / route-dispatch destination composition ───────────
+//
+// Deduplication looks up at priority 2750, ahead of every plugin that selects
+// the effective destination. Binding the request inputs those plugins route on
+// does not witness the *route policy* they apply, and a dedup record outlives
+// that policy — it survives a config reload, a restart, and (with
+// `sync_mode: redis`) replicas on different generations. So the composition is
+// refused structurally instead of proven.
+
+fn destination_plugin_config(
+    name: &str,
+    id: &str,
+    scope: PluginScope,
+    proxy_id: Option<&str>,
+) -> PluginConfig {
+    PluginConfig {
+        id: id.into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: name.into(),
+        config: serde_json::json!({}),
+        scope,
+        proxy_id: proxy_id.map(str::to_string),
+        enabled: true,
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }
+}
+
+#[test]
+fn dedup_with_every_unwitnessable_destination_plugin_is_rejected() {
+    for name in ferrum_edge::plugins::request_deduplication::UNWITNESSABLE_DESTINATION_PLUGINS {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+            destination_plugin_config(name, "dispatch1", PluginScope::Proxy, Some("p1")),
+        ];
+        let mut proxy = make_proxy("p1", "/api");
+        associate(&mut proxy, &["dedup1", "dispatch1"]);
+        config.proxies = vec![proxy];
+
+        let errors = config
+            .validate_plugin_references()
+            .expect_err("the pair must be refused");
+        let joined = errors.join("; ");
+        assert!(
+            joined.contains(&format!(
+                "request_deduplication cannot be composed with {name}"
+            )),
+            "unexpected errors for {name}: {joined}"
+        );
+        assert!(
+            joined.contains("selects the effective destination"),
+            "the destination reason must be stated for {name}: {joined}"
+        );
+        // Operators need both offending ids and the proxy to act on the error.
+        assert!(
+            joined.contains("dedup1") && joined.contains("dispatch1") && joined.contains("p1"),
+            "{joined}"
+        );
+    }
+}
+
+/// One name may appear in both composition lists (`mcp_gateway` does). It must
+/// be reported exactly once, under the stronger destination reason, so the fix
+/// is not obscured by a duplicate error for the same pair.
+#[test]
+fn a_plugin_in_both_composition_lists_is_reported_once() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        mcp_gateway_plugin_config("mcp1", PluginScope::Proxy, Some("p1")),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "mcp1"]);
+    config.proxies = vec![proxy];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("dedup + mcp_gateway must be refused");
+    let mentions = errors
+        .iter()
+        .filter(|error| error.contains("request_deduplication cannot be composed with mcp_gateway"))
+        .count();
+    assert_eq!(mentions, 1, "expected exactly one error: {errors:?}");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("selects the effective destination")),
+        "mcp_gateway must be reported under the destination reason: {errors:?}"
+    );
+}
+
+/// A globally scoped destination plugin is effective on every proxy, so it
+/// composes with a proxy-scoped deduplication instance just the same.
+#[test]
+fn dedup_and_a_global_destination_plugin_are_rejected() {
+    let mut config = empty_config();
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        destination_plugin_config("ai_stream_router", "router-global", PluginScope::Global, None),
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1"]);
+    config.proxies = vec![proxy];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("a global ai_stream_router still runs on this proxy");
+    assert!(
+        errors.iter().any(|error| error
+            .contains("request_deduplication cannot be composed with ai_stream_router")),
+        "unexpected errors: {errors:?}"
+    );
+}
+
+/// A disabled instance selects nothing, so it must not block deduplication.
+#[test]
+fn a_disabled_destination_plugin_does_not_block_dedup() {
+    let mut config = empty_config();
+    let mut router =
+        destination_plugin_config("ai_stream_router", "router1", PluginScope::Proxy, Some("p1"));
+    router.enabled = false;
+    config.plugin_configs = vec![
+        dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+        router,
+    ];
+    let mut proxy = make_proxy("p1", "/api");
+    associate(&mut proxy, &["dedup1", "router1"]);
+    config.proxies = vec![proxy];
+
+    assert!(
+        config.validate_plugin_references().is_ok(),
+        "a disabled ai_stream_router selects no destination and must not block deduplication"
+    );
+}
+
+/// The documented remedy: split the two behaviors across proxies.
+#[test]
+fn dedup_and_destination_plugins_on_separate_proxies_are_admitted() {
+    for name in ferrum_edge::plugins::request_deduplication::UNWITNESSABLE_DESTINATION_PLUGINS {
+        let mut config = empty_config();
+        config.plugin_configs = vec![
+            dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1")),
+            destination_plugin_config(name, "dispatch1", PluginScope::Proxy, Some("p2")),
+        ];
+        let mut dedup_proxy = make_proxy("p1", "/api");
+        associate(&mut dedup_proxy, &["dedup1"]);
+        let mut dispatch_proxy = make_proxy("p2", "/dispatch");
+        associate(&mut dispatch_proxy, &["dispatch1"]);
+        config.proxies = vec![dedup_proxy, dispatch_proxy];
+
+        assert!(
+            config.validate_plugin_references().is_ok(),
+            "{name} on a separate proxy never composes with deduplication"
+        );
+    }
+}
+
+/// The ban list must stay in sync with the plugins that actually write a
+/// `route_override_*` field or terminate the request with their own endpoint.
+/// A new destination mutator that is not listed silently reopens the hole.
+#[test]
+fn every_unwitnessable_destination_plugin_name_is_a_real_plugin() {
+    let available = ferrum_edge::plugins::available_plugins();
+    for name in ferrum_edge::plugins::request_deduplication::UNWITNESSABLE_DESTINATION_PLUGINS {
+        assert!(
+            available.contains(name),
+            "'{name}' is banned from composing with request_deduplication but is not a \
+             registered plugin — the ban would silently never fire"
+        );
+    }
+}

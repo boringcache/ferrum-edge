@@ -9,14 +9,24 @@
 //! * **Caller authorization** — not a display subject. Two credentials can carry
 //!   the same `sub` with different scopes, audiences, or tenancy claims, so the
 //!   partition binds a digest of the actual credential material presented on
-//!   this request together with the mechanism that accepted it.
-//! * **Canonical caller context** — an anonymous caller is bound to the
+//!   this request together with the mechanism that accepted it. *Both* credential
+//!   views are bound, under distinct provenance labels: the pristine inbound wire
+//!   view (`RequestContext`'s retained raw `HeaderMap`) and the live,
+//!   backend-visible view the calling plugin was handed. An earlier plugin that
+//!   rewrites credentials — `ai_stream_router` strips the client credential and
+//!   injects the provider's — therefore cannot erase the original caller
+//!   distinction.
+//! * **Canonical caller context** — every caller is bound to the
 //!   gateway-resolved peer address, because Ferrum regenerates
 //!   `X-Forwarded-For` on every outbound HTTP request and the origin therefore
-//!   observes it. Operators whose origins provably ignore caller address may
-//!   opt one plugin instance out with [`AnonymousCallerScope::Shared`].
+//!   observes it regardless of whether the caller authenticated. Operators whose
+//!   origins provably ignore caller address may opt one plugin instance out for
+//!   *anonymous* callers only, with [`AnonymousCallerScope::Shared`].
 //! * **Effective destination** — the post-routing upstream / host / port /
 //!   scheme / authority and rewritten path, not the originally matched proxy.
+//! * **Request context** — the backend-visible live header view, the original
+//!   client authority, and the raw query, for plugins whose own key does not
+//!   already bind them ([`append_request_context_partition`]).
 //!
 //! Every component is serialized with typed, length-framed fields
 //! ([`PartitionHasher`]) so no attacker-controlled byte can impersonate a field
@@ -60,6 +70,45 @@ pub fn is_credential_context_header(name: &str) -> bool {
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
+/// Headers that are never visible to the backend as sent by the client, and so
+/// cannot be a dimension the origin varies on.
+///
+/// Only two classes qualify, and both are provable rather than assumed:
+///
+/// * transport/hop-by-hop framing fields, which Ferrum owns and regenerates for
+///   the backend hop (RFC 9110 §7.6.1) — `host` is excluded here only because
+///   every caller of [`append_request_context_partition`] binds the canonical
+///   authority as its own field;
+/// * per-request tracing/correlation identifiers, classified by the repository's
+///   existing `cache_headers::is_per_request_trace_header` contract: a fresh
+///   value on every request by construction, so binding them would make every
+///   entry a singleton without excluding any policy dimension.
+///
+/// Everything else — including ordinary custom, tenancy, routing, versioning,
+/// and representation headers — is bound. A conservative miss is preferred to an
+/// unbound dimension.
+const NON_BACKEND_VISIBLE_REQUEST_HEADERS: &[&str] = &[
+    "connection",
+    "host",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Whether `name` is excluded from the backend-visible request-header view.
+///
+/// See `NON_BACKEND_VISIBLE_REQUEST_HEADERS` for why the set is exactly this
+/// narrow.
+pub fn is_non_backend_visible_request_header(name: &str) -> bool {
+    NON_BACKEND_VISIBLE_REQUEST_HEADERS
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        || super::cache_headers::is_per_request_trace_header(name)
+}
+
 /// How an *anonymous* caller (no gateway identity, no credential header, no
 /// peer SPIFFE identity) is partitioned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +122,11 @@ pub enum AnonymousCallerScope {
     /// caller address for this route, so anonymous callers may share one
     /// retained result. This deliberately re-opens cross-caller replay for
     /// address-sensitive origins and must only be set when that is known-safe.
+    ///
+    /// It applies to anonymous callers only. An authenticated caller always
+    /// binds its canonical address, because the origin receives Ferrum's
+    /// regenerated forwarding identity for that caller too and may vary policy
+    /// or content by it independently of the credential.
     Shared,
 }
 
@@ -113,6 +167,11 @@ pub enum PartitionRefusal {
     /// The caller is anonymous and the canonical peer address could not be
     /// parsed, so the caller dimension the origin observes cannot be bound.
     AnonymousCallerAddressUnavailable,
+    /// The caller authenticated but the canonical peer address could not be
+    /// parsed. The origin still receives Ferrum's regenerated forwarding
+    /// identity, so this dimension is not optional for authenticated callers
+    /// either and there is no attestation that relaxes it.
+    AuthenticatedCallerAddressUnavailable,
 }
 
 impl PartitionRefusal {
@@ -122,6 +181,9 @@ impl PartitionRefusal {
         match self {
             Self::AnonymousCallerAddressUnavailable => {
                 "anonymous caller has no canonical peer address to bind"
+            }
+            Self::AuthenticatedCallerAddressUnavailable => {
+                "authenticated caller has no canonical peer address to bind"
             }
         }
     }
@@ -204,13 +266,88 @@ pub fn value_digest(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
+/// SHA-256 of one raw field-line, for wire values that need not be valid UTF-8.
+pub fn bytes_digest(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+/// Bind the gateway-resolved canonical peer address, or refuse.
+///
+/// The octets are hashed directly — no `format!` on the request path — and the
+/// family tag keeps a v4-mapped v6 address distinct from its v4 form.
+fn append_canonical_address(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    unavailable: PartitionRefusal,
+) -> Result<(), PartitionRefusal> {
+    let address = ctx.canonical_client_ip().ok_or(unavailable)?;
+    match address {
+        IpAddr::V4(v4) => hasher.field("caller.address_v4", &v4.octets()),
+        IpAddr::V6(v6) => hasher.field("caller.address_v6", &v6.octets()),
+    }
+    Ok(())
+}
+
+/// Bind the *pristine inbound* credential context from the retained wire
+/// `HeaderMap`, under provenance labels distinct from the live view.
+///
+/// This is what makes the partition survive an earlier credential rewrite.
+/// `ai_stream_router` runs at a lower priority than the post-routing replay
+/// plugins and replaces the client's `authorization` with the selected
+/// provider's key, so by the time `response_caching` or `ai_semantic_cache`
+/// builds a key, the live header view no longer distinguishes two client tokens
+/// that resolve to one subject with different scopes. `RequestContext` retains
+/// the wire map for exactly this class of decision, and plugins never mutate it.
+///
+/// Every candidate name is framed whether present or not, with its field-line
+/// count ahead of its digests, so neither a repeated field line nor an absent
+/// header can reproduce another request's preimage. Availability of the wire map
+/// is itself framed: a context without one lands in its own keyspace rather than
+/// silently matching a request that provably carried no credential.
+fn append_original_credential_context(hasher: &mut PartitionHasher, ctx: &RequestContext) {
+    let available = ctx.has_raw_headers();
+    hasher.bool_value("caller.origin_view", available);
+    if !available {
+        return;
+    }
+    hasher.count("caller.origin_names", CREDENTIAL_CONTEXT_HEADERS.len());
+    for candidate in CREDENTIAL_CONTEXT_HEADERS {
+        hasher.text("caller.origin_credential_name", candidate);
+        hasher.count(
+            "caller.origin_credential_lines",
+            ctx.raw_header_value_bytes(candidate).count(),
+        );
+        for line in ctx.raw_header_value_bytes(candidate) {
+            hasher.nested("caller.origin_credential_digest", &bytes_digest(line));
+        }
+    }
+}
+
 /// Append the caller-authorization dimension of the replay partition.
 ///
 /// Authenticated callers are bound to a *context* fingerprint — mechanism,
 /// resolved identity, consumer, peer SPIFFE identity, and a digest of every
 /// credential header actually presented — rather than to a display subject, so
 /// two tokens with the same `sub` and different scopes never share a retained
-/// result. Anonymous callers are bound per [`AnonymousCallerScope`].
+/// result.
+///
+/// Two credential views are bound under separate provenance labels:
+///
+/// * `caller.credential_*` — the **live, backend-visible** view passed in
+///   `request_headers`, which is what the origin will actually receive;
+/// * `caller.origin_credential_*` — the **pristine inbound wire** view retained
+///   by `RequestContext`, which an earlier route-dispatch plugin cannot rewrite.
+///
+/// Binding only the live view would let `ai_stream_router` — which strips the
+/// client credential and injects the provider's before the post-routing replay
+/// plugins run — collapse two distinct client tokens onto one partition.
+///
+/// Every caller, authenticated or not, additionally binds its canonical peer
+/// address: Ferrum regenerates `X-Forwarded-For` on the backend hop for
+/// authenticated callers too, so the origin can vary policy or content by it
+/// independently of the credential. [`AnonymousCallerScope::Shared`] is the
+/// operator's attestation that it does not, and it applies to anonymous callers
+/// only. A caller whose canonical address cannot be derived is refused.
 ///
 /// `request_headers` must be the same header view the plugin will use for the
 /// rest of the key (the `before_proxy` `headers` parameter, or a restored
@@ -261,8 +398,7 @@ pub fn append_caller_partition(
 
     let identity = ctx.effective_identity();
     let peer_spiffe_id = ctx.peer_spiffe_id.as_ref().map(|id| id.as_str());
-    let authenticated =
-        identity.is_some() || peer_spiffe_id.is_some() || !credentials.is_empty();
+    let authenticated = identity.is_some() || peer_spiffe_id.is_some() || !credentials.is_empty();
 
     hasher.text(
         "caller.class",
@@ -289,11 +425,18 @@ pub fn append_caller_partition(
         hasher.nested("caller.credential_digest", digest);
     }
 
+    append_original_credential_context(hasher, ctx);
+
     if authenticated {
-        // An authenticated caller's partition is its authorization context; the
-        // peer address adds nothing the origin can key on beyond it.
-        hasher.text("caller.address_scope", "authenticated");
-        return Ok(());
+        // The origin observes this caller's regenerated forwarding identity
+        // regardless of how it authenticated, so the address is bound here too
+        // and no operator attestation relaxes it.
+        hasher.text("caller.address_scope", "authenticated_caller_address");
+        return append_canonical_address(
+            hasher,
+            ctx,
+            PartitionRefusal::AuthenticatedCallerAddressUnavailable,
+        );
     }
 
     match anonymous_scope {
@@ -302,17 +445,12 @@ pub fn append_caller_partition(
             Ok(())
         }
         AnonymousCallerScope::CallerAddress => {
-            let address = ctx
-                .canonical_client_ip()
-                .ok_or(PartitionRefusal::AnonymousCallerAddressUnavailable)?;
             hasher.text("caller.address_scope", "caller_address");
-            // Hash the raw octets: no `format!` on the request path, and the
-            // family tag keeps a v4-mapped v6 address distinct from its v4 form.
-            match address {
-                IpAddr::V4(v4) => hasher.field("caller.address_v4", &v4.octets()),
-                IpAddr::V6(v6) => hasher.field("caller.address_v6", &v6.octets()),
-            }
-            Ok(())
+            append_canonical_address(
+                hasher,
+                ctx,
+                PartitionRefusal::AnonymousCallerAddressUnavailable,
+            )
         }
     }
 }
@@ -343,7 +481,10 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
         None => {
             hasher.text("dst.kind", "direct");
             hasher.text("dst.backend_host", ctx.effective_backend_host(proxy));
-            hasher.u64_value("dst.backend_port", u64::from(ctx.effective_backend_port(proxy)));
+            hasher.u64_value(
+                "dst.backend_port",
+                u64::from(ctx.effective_backend_port(proxy)),
+            );
             let scheme = ctx
                 .route_override_backend_scheme
                 .or(proxy.backend_scheme)
@@ -358,4 +499,69 @@ pub fn append_destination_partition(hasher: &mut PartitionHasher, ctx: &RequestC
         "dst.rewrite_path_is_absolute",
         ctx.route_override_path_is_absolute,
     );
+}
+
+/// Append the backend-visible request-context dimension: original client
+/// authority, method, raw query, and the live header view.
+///
+/// This exists for plugins whose own key is derived from a request *body* and
+/// therefore does not already bind the request line and headers the way
+/// `response_caching` does. Without it, two requests differing only in a tenancy
+/// header or a query parameter share one retained representation even though the
+/// origin sees both differences.
+///
+/// Framing rules:
+///
+/// * headers are sorted by name so map iteration order cannot change the digest,
+///   and the pair count is bound ahead of the pairs;
+/// * a header classified by [`is_credential_context_header`] contributes a
+///   SHA-256 digest of its value, never the value — no secret enters the digest
+///   preimage in cleartext, a key, metadata, a log line, or a diagnostic;
+/// * only [`is_non_backend_visible_request_header`] names are excluded, and the
+///   excluded-name count is itself bound so an excluded header cannot silently
+///   change how many pairs were expected.
+///
+/// `request_headers` must be the live `before_proxy` header view, not
+/// `ctx.headers`.
+pub fn append_request_context_partition(
+    hasher: &mut PartitionHasher,
+    ctx: &RequestContext,
+    request_headers: &HashMap<String, String>,
+) {
+    // Original client-facing authority, independent of any `route_override_*`
+    // rewrite the destination partition binds. Multi-host proxies must not
+    // collide even when they resolve to one backend.
+    hasher.optional_text("req.authority", ctx.request_authority.as_deref());
+    hasher.optional_text(
+        "req.host",
+        request_headers
+            .get("host")
+            .map(|host| host.to_ascii_lowercase())
+            .as_deref(),
+    );
+    hasher.text("req.method", &ctx.method);
+    hasher.text("req.path", &ctx.path);
+    // Raw query exactly as received: no parsing, sorting, or percent-decoding,
+    // so two spellings the origin can distinguish stay distinguishable.
+    hasher.optional_text("req.query", ctx.raw_query_string());
+
+    let mut names: Vec<&str> = request_headers
+        .keys()
+        .map(String::as_str)
+        .filter(|name| !is_non_backend_visible_request_header(name))
+        .collect();
+    names.sort_unstable();
+    hasher.count("req.headers", names.len());
+    for name in names {
+        hasher.text("req.header_name", name);
+        // `names` came from this map's keys, so the lookup always resolves.
+        let value = request_headers.get(name).map(String::as_str).unwrap_or("");
+        if is_credential_context_header(name) {
+            hasher.bool_value("req.header_is_credential", true);
+            hasher.nested("req.header_digest", &value_digest(value));
+        } else {
+            hasher.bool_value("req.header_is_credential", false);
+            hasher.text("req.header_value", value);
+        }
+    }
 }

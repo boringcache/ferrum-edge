@@ -22,18 +22,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     only add the display identity to the digest. `request_deduplication` also
     stops excluding credential headers from the request fingerprint and binds
     their digests instead, so a same-subject/different-scope credential is a
-    conflict rather than a replay.
-  - **Anonymous callers bind canonical caller context.** A new
+    conflict rather than a replay. Both credential views are bound under separate
+    provenance labels — the pristine inbound wire headers and the live
+    backend-visible headers — because the post-routing caches run after
+    `ai_stream_router`, which strips the client credential and injects the
+    provider's; binding only the live view would collapse two distinct client
+    tokens onto one partition.
+  - **Every caller binds canonical caller context.** A new
     `anonymous_caller_scope` option (`caller_address` default, `shared` opt-out)
     binds the gateway-resolved canonical peer address, which the origin observes
-    through Ferrum's regenerated `X-Forwarded-For`. A caller whose canonical
-    address cannot be derived is refused rather than keyed incompletely.
+    through Ferrum's regenerated `X-Forwarded-For`. Authenticated callers bind it
+    too — the backend receives their regenerated forwarding identity as well and
+    may vary policy or content by it — so the `shared` attestation applies to
+    anonymous callers only. A caller whose canonical address cannot be derived is
+    refused rather than keyed incompletely.
   - **Effective destination is part of the key.** `response_caching` and
     `ai_semantic_cache` run after every route-dispatch plugin and now bind the
     post-routing upstream / host / port / scheme / authority and rewritten path,
     so a header-selected tenant backend cannot replay another backend's result.
-    `request_deduplication` binds it too and documents why its earlier lookup is
-    still sound: every routing input is already bound into its fingerprint.
+    `ai_semantic_cache` now uses that shared contract instead of a plugin-local
+    encoding that omitted the proxy *namespace*, and additionally binds a
+    length-framed backend-visible request-context digest (original client
+    authority and `Host`, method, path, the raw query as received, and every
+    non-credential live request header, with credential values digested), so
+    cross-namespace and header/query-only tenant collisions are closed for both
+    exact and semantic lookup scopes.
+  - **`request_deduplication` refuses composition it cannot witness.** Its
+    lookup runs at priority 2750, before every plugin that selects the effective
+    destination, so its key binds the *pre-dispatch* destination. Equal request
+    inputs do not witness the live route policy, and a dedup record outlives that
+    policy across configuration reload, restart, and `sync_mode: redis` replicas
+    on different generations — so the previous "equal inputs imply equal
+    destination" argument is withdrawn. `ai_stream_router`, `mcp_gateway`,
+    `a2a_gateway`, and `mesh_route_dispatch` are now rejected on the same proxy
+    as `request_deduplication`, at config admission and again at plugin-cache
+    construction, with an error naming both plugin config IDs and the proxy.
   - **Body-bearing response caching is refused.** `cacheable_methods` now
     accepts only the bodyless retrieval methods `GET` and `HEAD`; a
     body-bearing method is rejected at admission, and at runtime any request
@@ -64,7 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** key derivation changed in all three plugins, so entries stored
     by a previous build are unreachable — the intended fail-closed outcome for
     anything keyed under the weaker partition. `response_caching` configs that
-    listed a body-bearing `cacheable_methods` entry now fail admission.
+    listed a body-bearing `cacheable_methods` entry now fail admission, and a
+    proxy composing `request_deduplication` with `ai_stream_router`,
+    `mcp_gateway`, `a2a_gateway`, or `mesh_route_dispatch` now fails admission.
 
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via

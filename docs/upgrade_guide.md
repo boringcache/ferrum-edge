@@ -269,13 +269,34 @@ one fail-closed replay-partition contract
   before cutover and reduce the list to `GET` / `HEAD`. At runtime, any request
   that declares a body (`Transfer-Encoding`, or a non-zero/unparsable
   `Content-Length`) bypasses lookup and storage.
-- **Anonymous callers are partitioned by canonical peer address by default.**
-  The new `anonymous_caller_scope` option defaults to `caller_address` in all
-  three plugins, which the origin observes through Ferrum's regenerated
-  `X-Forwarded-For`. On a high-fanout public route whose origin provably does
-  not vary by caller address, set `anonymous_caller_scope: "shared"` to restore
-  the previous sharing — this is an explicit attestation and re-opens
-  cross-caller replay for address-sensitive origins.
+- **Every caller is partitioned by canonical peer address.** The origin
+  observes it through Ferrum's regenerated `X-Forwarded-For`, for authenticated
+  callers as much as anonymous ones. The new `anonymous_caller_scope` option
+  (default `caller_address`) lets you attest that a route's origin does not vary
+  by caller address and restore the previous sharing with
+  `anonymous_caller_scope: "shared"` — but that attestation covers **anonymous**
+  callers only; authenticated callers always bind their address, and there is no
+  opt-out. A caller whose canonical address cannot be derived bypasses the cache
+  (and is not deduplicated).
+- **`request_deduplication` can no longer share a proxy with a route-dispatch
+  plugin.** `ai_stream_router`, `mcp_gateway`, `a2a_gateway`, and
+  `mesh_route_dispatch` all select the effective destination *after* the dedup
+  lookup, and nothing available at lookup time witnesses the route policy they
+  will apply — a record read back after a reload, a restart, or from another
+  replica through shared Redis could replay a representation produced against a
+  different backend. The pair now fails admission in database, control-plane,
+  data-plane, and file modes, and again at plugin-cache construction. Audit
+  every proxy carrying `request_deduplication` before cutover; the remedy is to
+  split the two behaviors across separate proxies. Deduplication's priority is
+  deliberately not moved after the dispatchers: it exists to refuse
+  re-execution of a side effect *before* any of it happens.
+- **`ai_semantic_cache` keys bind more of the request.** They now use the shared
+  destination contract (which includes the proxy **namespace**, previously
+  omitted) plus a backend-visible request-context digest covering the original
+  client authority, the raw query, and every non-credential request header.
+  Deployments that varied only by header or query parameter and were previously
+  sharing one completion will now miss. Only transport/hop-by-hop framing fields
+  and per-request tracing/correlation identifiers are excluded.
 - **`scope_by_consumer: false` and `cache_key_include_consumer` no longer
   disable caller isolation.** Every key now binds an authorization-context
   fingerprint (mechanism, identity, consumer, peer SPIFFE identity, and digests

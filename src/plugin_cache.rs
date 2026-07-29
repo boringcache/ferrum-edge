@@ -4310,12 +4310,14 @@ fn validate_api_chargeback_ownership(config: &GatewayConfig) -> Result<(), Strin
     crate::plugins::api_chargeback::validate_composition(config).map_err(|errors| errors.join("; "))
 }
 
-/// A `request_deduplication` replay is a finalized representation served
-/// without re-running the response-body rewrites of higher-priority plugins.
-/// Reject composing it with a plugin whose rewrite is derived from live
-/// upstream discovery state (`mcp_gateway`), which no persisted digest can
-/// witness, before constructing a cache generation that would otherwise replay
-/// under an unprovable policy.
+/// A `request_deduplication` replay is a finalized representation served before
+/// higher-priority plugins run at all. Reject composing it with a plugin whose
+/// response rewrite is derived from live upstream discovery state
+/// (`mcp_gateway`), and with every plugin that still selects the effective
+/// destination after the dedup lookup (`ai_stream_router`, `mcp_gateway`,
+/// `a2a_gateway`, `mesh_route_dispatch`) — neither is witnessable by a persisted
+/// digest — before constructing a cache generation that would otherwise replay
+/// under an unprovable policy or against a different backend.
 fn validate_replay_provenance_composition(config: &GatewayConfig) -> Result<(), String> {
     crate::plugins::request_deduplication::validate_composition(config)
         .map_err(|errors| errors.join("; "))

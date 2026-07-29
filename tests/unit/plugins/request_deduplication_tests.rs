@@ -6259,6 +6259,75 @@ async fn dedup_isolates_effective_route_destination() {
     );
 }
 
+/// The origin receives Ferrum's regenerated forwarding identity for an
+/// authenticated caller too, so an idempotent operation claimed from one
+/// address must not be replayable from another.
+#[tokio::test]
+async fn dedup_isolates_authenticated_callers_by_canonical_address() {
+    let plugin = make_plugin(json!({ "ttl_seconds": 60 }));
+
+    let mut office = dedup_ctx("203.0.113.7", "order-addr-1");
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    office.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut office, b"office-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut cafe = dedup_ctx("198.51.100.9", "order-addr-1");
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    cafe.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    let mut cafe_headers = cafe.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut cafe, &mut cafe_headers).await,
+            PluginResult::Continue
+        ),
+        "one authenticated caller at two canonical addresses must not replay"
+    );
+}
+
+/// `anonymous_caller_scope: shared` attests about anonymous callers only.
+#[tokio::test]
+async fn dedup_shared_anonymous_scope_does_not_relax_authenticated_callers() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 60,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut office = dedup_ctx("203.0.113.7", "order-addr-2");
+    office.authenticated_identity = Some("alice@example.com".to_string());
+    office.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    assert!(matches!(
+        dedup_cycle(&plugin, &mut office, b"office-result").await,
+        PluginResult::Continue
+    ));
+
+    let mut cafe = dedup_ctx("198.51.100.9", "order-addr-2");
+    cafe.authenticated_identity = Some("alice@example.com".to_string());
+    cafe.headers.insert(
+        "authorization".to_string(),
+        "Bearer alice-token".to_string(),
+    );
+    let mut cafe_headers = cafe.headers.clone();
+    assert!(
+        matches!(
+            plugin.before_proxy(&mut cafe, &mut cafe_headers).await,
+            PluginResult::Continue
+        ),
+        "the shared attestation covers anonymous callers only"
+    );
+}
+
 #[tokio::test]
 async fn dedup_config_admits_anonymous_caller_scope_key() {
     for value in ["caller_address", "caller-address", "shared", " SHARED "] {

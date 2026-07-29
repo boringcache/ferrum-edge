@@ -5561,6 +5561,159 @@ async fn anonymous_caller_scope_shared_is_an_explicit_operator_opt_out() {
     );
 }
 
+/// Build a context whose *pristine inbound* credential differs from the *live*
+/// backend-visible one, exactly as `ai_stream_router` leaves it: the client's
+/// token is stripped and the selected provider's key is injected.
+///
+/// `response_caching` runs at priority 3500, after `ai_stream_router` at 2984,
+/// so the live view it is handed no longer distinguishes the two clients.
+fn ctx_with_rewritten_credential(
+    client_token: &str,
+    provider_key: &str,
+    client_ip: &str,
+) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        client_ip.to_string(),
+        "GET".to_string(),
+        "/v1/models".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+
+    let mut raw = http::HeaderMap::new();
+    raw.insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(client_token).expect("client token"),
+    );
+    ctx.set_raw_headers(raw);
+
+    // The live, backend-visible view an earlier router already rewrote. Both
+    // callers present the *same* bytes here — only the retained wire view can
+    // still tell them apart.
+    ctx.headers.insert(
+        "authorization".to_string(),
+        provider_key.to_string(),
+    );
+    ctx
+}
+
+/// GHSA-w27g-65rf-h7xm: two client tokens that an earlier route-dispatch plugin
+/// replaced with one provider credential must not collapse onto one partition.
+/// Binding only the live `before_proxy` header view did exactly that.
+#[tokio::test]
+async fn replay_partition_survives_an_earlier_credential_rewrite() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut narrow = ctx_with_rewritten_credential(
+        "Bearer client-token-read-only",
+        "Bearer sk-provider-shared",
+        "203.0.113.7",
+    );
+    seed_public_entry(&plugin, &mut narrow, b"read-only-view").await;
+
+    // Same rewritten live credential, same address, same target — only the
+    // original inbound token differs.
+    let mut broad = ctx_with_rewritten_credential(
+        "Bearer client-token-read-write-admin",
+        "Bearer sk-provider-shared",
+        "203.0.113.7",
+    );
+    assert!(
+        !lookup_is_hit(&plugin, &mut broad).await,
+        "an earlier router rewrite must not erase the original caller distinction"
+    );
+
+    // The identical original caller still hits, so the binding is a partition
+    // and not a blanket cache disable.
+    let mut same = ctx_with_rewritten_credential(
+        "Bearer client-token-read-only",
+        "Bearer sk-provider-shared",
+        "203.0.113.7",
+    );
+    assert!(
+        lookup_is_hit(&plugin, &mut same).await,
+        "the same original caller must still hit"
+    );
+}
+
+/// The backend receives Ferrum's regenerated forwarding identity for
+/// authenticated callers too, so it may vary policy or content by address
+/// independently of the credential.
+#[tokio::test]
+async fn replay_partition_isolates_authenticated_callers_by_canonical_address() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({ "ttl_seconds": 60 }));
+
+    let mut first = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/api/reports".to_string(),
+    );
+    first.matched_proxy = Some(Arc::new(create_test_proxy()));
+    first.authenticated_identity = Some("alice@example.com".to_string());
+    first.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    seed_public_entry(&plugin, &mut first, b"office-view").await;
+
+    let mut elsewhere = RequestContext::new(
+        "198.51.100.9".to_string(),
+        "GET".to_string(),
+        "/api/reports".to_string(),
+    );
+    elsewhere.matched_proxy = Some(Arc::new(create_test_proxy()));
+    elsewhere.authenticated_identity = Some("alice@example.com".to_string());
+    elsewhere.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    assert!(
+        !lookup_is_hit(&plugin, &mut elsewhere).await,
+        "one authenticated caller at two canonical addresses must not share an entry"
+    );
+}
+
+/// `anonymous_caller_scope: shared` is an attestation about *anonymous* callers.
+/// It must not relax the authenticated caller's address binding.
+#[tokio::test]
+async fn shared_anonymous_scope_does_not_relax_authenticated_callers() {
+    let _policy_guard = response_cache_replay_policy_guard();
+    let plugin = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "anonymous_caller_scope": "shared"
+    }));
+
+    let mut first = RequestContext::new(
+        "203.0.113.7".to_string(),
+        "GET".to_string(),
+        "/api/reports".to_string(),
+    );
+    first.matched_proxy = Some(Arc::new(create_test_proxy()));
+    first.authenticated_identity = Some("alice@example.com".to_string());
+    first.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    seed_public_entry(&plugin, &mut first, b"office-view").await;
+
+    let mut elsewhere = RequestContext::new(
+        "198.51.100.9".to_string(),
+        "GET".to_string(),
+        "/api/reports".to_string(),
+    );
+    elsewhere.matched_proxy = Some(Arc::new(create_test_proxy()));
+    elsewhere.authenticated_identity = Some("alice@example.com".to_string());
+    elsewhere.headers.insert(
+        "authorization".to_string(),
+        "Bearer scope-read-only".to_string(),
+    );
+    assert!(
+        !lookup_is_hit(&plugin, &mut elsewhere).await,
+        "the shared attestation covers anonymous callers only"
+    );
+}
+
 #[tokio::test]
 async fn replay_partition_isolates_effective_route_destination() {
     let _policy_guard = response_cache_replay_policy_guard();

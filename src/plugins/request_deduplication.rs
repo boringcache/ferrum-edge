@@ -95,6 +95,23 @@
 //! pre-existing data, `ResponsePresentationPolicy::Dynamic` collapses the
 //! proxy's presentation digest to `None` at runtime, which fails both storage
 //! and replay closed through the rules above.
+//!
+//! The same refusal — for a different reason — covers every plugin that selects
+//! the *destination*. This plugin's `before_proxy` runs at
+//! `priorities::REQUEST_DEDUPLICATION`, ahead of `ai_stream_router`,
+//! `mcp_gateway`, `a2a_gateway`, and `mesh_route_dispatch`, so the destination
+//! partition it binds is the pre-dispatch one. Binding the request inputs those
+//! plugins route on does **not** substitute for the destination: a route
+//! decision is a function of the request *and* the live route policy, and a
+//! deduplication record outlives that policy. The record is read back across a
+//! configuration reload, across a restart, and — with `sync_mode: redis` —
+//! across replicas that are not on the same generation. Two byte-identical
+//! requests can therefore select different destinations while presenting equal
+//! fingerprints, which the previous "equal inputs imply equal destination"
+//! argument silently assumed away. Nothing available at lookup time witnesses
+//! the route policy that a *later* plugin will apply, so the composition is
+//! refused structurally rather than proven. See
+//! [`UNWITNESSABLE_DESTINATION_PLUGINS`].
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -162,8 +179,7 @@ const EXECUTION_BARRIER_CAPACITY_BODY: &str =
 /// Deterministic refusal when no complete, stable replay partition can be
 /// derived for this caller and `enforce_required` demands the guarantee. Never
 /// echoes the caller context that could not be resolved.
-const UNPARTITIONABLE_CALLER_BODY: &str =
-    r#"{"error":"Idempotency cannot be enforced: the caller context for this request cannot be partitioned"}"#;
+const UNPARTITIONABLE_CALLER_BODY: &str = r#"{"error":"Idempotency cannot be enforced: the caller context for this request cannot be partitioned"}"#;
 /// Deterministic body for a completion that must never be replayed: the
 /// protected operation already ran externally and has no safe replay value.
 const NON_REPLAYABLE_COMPLETION_BODY: &str = r#"{"error":"This idempotency key already completed an external operation and cannot be replayed safely"}"#;
@@ -310,14 +326,55 @@ use super::{Plugin, PluginHttpClient, PluginResult, RequestContext, ResponsePoli
 /// the list cannot drift away from the runtime behavior it stands in for.
 pub const DYNAMIC_RESPONSE_PRESENTATION_PLUGINS: &[&str] = &["mcp_gateway"];
 
-fn dynamic_response_presentation_is_active(plugin: &crate::config::types::PluginConfig) -> bool {
+/// Plugins that select or rewrite the effective destination *after*
+/// `request_deduplication` has already decided whether to replay, and whose
+/// decision therefore cannot be witnessed at lookup time.
+///
+/// A dedup key binds the pre-dispatch destination plus the request inputs. That
+/// is not equivalent to binding the post-dispatch destination: these plugins
+/// route on the live route policy as well as on the request, and a dedup record
+/// survives config reload, process restart, and (under `sync_mode: redis`)
+/// replicas on different generations. Equal request bytes at two different times
+/// can select two different backends, so a replay can return a representation
+/// the current policy would never have produced.
+///
+/// Every current destination mutator is listed:
+///
+/// * `ai_stream_router` — selects the provider host/authority/path per request
+///   from its configured routing rules;
+/// * `mcp_gateway` — rewrites host/authority/path from live upstream discovery
+///   state (also in [`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`] for its response
+///   rewrite);
+/// * `mesh_route_dispatch` — selects `route_override_upstream_id` /
+///   backend host / authority from the live mesh route table;
+/// * `a2a_gateway` — terminates and serves its own endpoint, so a replay
+///   returns bytes the gateway never re-evaluated against the current agent
+///   card.
+///
+/// Deduplication's priority is deliberately *not* moved to run after them: it
+/// exists to refuse re-execution of a side effect before any of it happens, and
+/// a late lookup would defeat that. Widening this list is the correct response
+/// to a new destination mutator; narrowing it requires a concrete proof that the
+/// mutator's decision is a pure function of inputs already in the dedup key and
+/// stays so across reload and across replicas.
+pub const UNWITNESSABLE_DESTINATION_PLUGINS: &[&str] = &[
+    "a2a_gateway",
+    "ai_stream_router",
+    "mcp_gateway",
+    "mesh_route_dispatch",
+];
+
+/// Whether an effective instance's hooks actually apply, for both composition
+/// lists. An instance that is merged but inert neither rewrites a response nor
+/// selects a destination, so it cannot make deduplication unprovable.
+fn plugin_hooks_are_active(plugin: &crate::config::types::PluginConfig) -> bool {
     if !plugin.enabled {
         return false;
     }
     match plugin.plugin_name.as_str() {
         // `mcp_gateway` retains an explicit, validated inner enable switch.
         // When false, none of its request or response hooks apply, so there is
-        // no dynamic presentation policy to make deduplication unprovable.
+        // neither a dynamic presentation policy nor a destination rewrite.
         "mcp_gateway" => {
             plugin
                 .config
@@ -330,7 +387,15 @@ fn dynamic_response_presentation_is_active(plugin: &crate::config::types::Plugin
 }
 
 /// Reject composing `request_deduplication` with a plugin whose response-body
-/// presentation policy cannot be proven stable for a retained representation.
+/// presentation policy — or whose effective destination — cannot be proven
+/// stable for a retained representation.
+///
+/// Two independent refusals share this entry point:
+///
+/// * [`UNWITNESSABLE_DESTINATION_PLUGINS`] — the plugin picks the destination
+///   after deduplication has already decided whether to replay;
+/// * [`DYNAMIC_RESPONSE_PRESENTATION_PLUGINS`] — the plugin's response rewrite
+///   is derived from live runtime state.
 ///
 /// A dedup replay is a *finalized* representation: the synthetic replay path
 /// skips ordinary presentation transforms, and `request_deduplication`'s
@@ -406,7 +471,7 @@ pub fn validate_composition(
         };
         effective
             .into_iter()
-            .filter(|plugin| dynamic_response_presentation_is_active(plugin))
+            .filter(|plugin| plugin_hooks_are_active(plugin))
             .map(|plugin| plugin.id.clone())
             .collect()
     };
@@ -417,7 +482,33 @@ pub fn validate_composition(
         if dedup_ids.is_empty() {
             continue;
         }
+        // A name in both lists is reported once, under the destination reason:
+        // it is the stronger refusal (the replay is not merely presented under a
+        // stale policy, it may belong to a different backend altogether) and a
+        // duplicate error for one pair only obscures the fix.
+        for name in UNWITNESSABLE_DESTINATION_PLUGINS {
+            let dispatch_ids = effective_ids(proxy, name);
+            if dispatch_ids.is_empty() {
+                continue;
+            }
+            errors.push(format!(
+                "request_deduplication cannot be composed with {name} on proxy '{}': \
+                 deduplication runs before {name} selects the effective destination, so a \
+                 stored record cannot witness the route policy that will serve a miss. \
+                 A record read back after a configuration reload, after a restart, or from \
+                 another replica through shared Redis may therefore replay a representation \
+                 produced against a different backend. \
+                 request_deduplication: {}; {name}: {}. \
+                 Disable one of them on this proxy",
+                proxy.id,
+                dedup_ids.join(", "),
+                dispatch_ids.join(", ")
+            ));
+        }
         for dynamic_name in DYNAMIC_RESPONSE_PRESENTATION_PLUGINS {
+            if UNWITNESSABLE_DESTINATION_PLUGINS.contains(dynamic_name) {
+                continue;
+            }
             let dynamic_ids = effective_ids(proxy, dynamic_name);
             if dynamic_ids.is_empty() {
                 continue;
@@ -1159,36 +1250,50 @@ impl RequestDeduplication {
     ///   + peer SPIFFE identity + digests of the credential headers actually
     ///   presented), not merely a display subject, so two tokens with equal
     ///   `sub` and different scopes cannot claim one another's operation;
-    /// * an anonymous caller's canonical peer address (see
-    ///   [`AnonymousCallerScope`]), which the origin observes through Ferrum's
-    ///   regenerated `X-Forwarded-For`;
+    /// * every caller's canonical peer address, which the origin observes
+    ///   through Ferrum's regenerated `X-Forwarded-For`; only an *anonymous*
+    ///   caller's binding can be relaxed by operator attestation (see
+    ///   [`AnonymousCallerScope`]);
     /// * the effective post-routing destination, so a header-selected upstream
     ///   cannot replay a result produced against a different backend.
     ///
-    /// Returns `None` when no complete stable partition can be derived; the
-    /// caller must then refuse to deduplicate rather than key incompletely.
+    /// Returns `Err` when no complete stable partition can be derived; the
+    /// caller must then refuse to deduplicate rather than key incompletely. The
+    /// refusal's `reason()` is a compiled-in static string safe to emit in a
+    /// debug line.
     ///
-    /// ## Why a pre-routing lookup is sound here
+    /// ## The lookup is pre-routing, and that is handled structurally
     ///
     /// This plugin's `before_proxy` runs at priority
-    /// [`super::priority::REQUEST_DEDUPLICATION`], ahead of the route-dispatch
-    /// plugins (`ai_stream_router`, `a2a_gateway`, `mesh_route_dispatch`), so
-    /// the destination partition it binds is the pre-dispatch one. That is
-    /// admissible because every input those plugins route on — method,
-    /// authority, path, raw query, request headers, and the exact backend-
-    /// visible request body — is itself bound into
-    /// [`Self::build_request_fingerprint`]. Two requests that would select
-    /// different effective destinations therefore cannot present equal
-    /// fingerprints, and a fingerprint mismatch is a conflict, never a replay.
-    /// `mcp_gateway`, whose rewrite is derived from live upstream discovery
-    /// state rather than from the request, cannot be proven equivalent this way
-    /// and is refused outright by [`validate_composition`].
+    /// [`super::priority::REQUEST_DEDUPLICATION`], ahead of every route-dispatch
+    /// plugin, so the destination partition bound here is the *pre-dispatch*
+    /// one.
+    ///
+    /// Binding the inputs those plugins route on — method, authority, path, raw
+    /// query, request headers, and the exact backend-visible request body, all
+    /// of which [`Self::build_request_fingerprint`] covers — does **not** make
+    /// the pre-dispatch destination equivalent to the post-dispatch one. A route
+    /// decision is a function of the request *and* the live route policy, while a
+    /// deduplication record outlives that policy: it is read back after a
+    /// configuration reload, after a restart, and under `sync_mode: redis` by
+    /// replicas that are not on the same generation. Two byte-identical requests
+    /// separated by a route policy change select different destinations while
+    /// presenting equal fingerprints, so a fingerprint match is not proof of a
+    /// shared destination.
+    ///
+    /// Rather than assume it away, the composition is refused: every plugin that
+    /// can still change the destination after this lookup is listed in
+    /// [`UNWITNESSABLE_DESTINATION_PLUGINS`] and rejected by
+    /// [`validate_composition`] at config admission and at plugin-cache
+    /// construction. What remains is a proxy whose destination is fixed by
+    /// configuration for the life of the plugin generation, and the destination
+    /// partition bound here is that destination.
     fn build_key(
         &self,
         ctx: &RequestContext,
         request_headers: &HashMap<String, String>,
         idempotency_value: &str,
-    ) -> Option<String> {
+    ) -> Result<String, replay_partition::PartitionRefusal> {
         let mut hasher = PartitionHasher::new(DEDUP_LOGICAL_KEY_VERSION);
         hasher.text("plugin_config_id", &self.config_id);
         // The Redis prefix is operator-configurable and may deliberately be
@@ -1198,16 +1303,12 @@ impl RequestDeduplication {
         // replay one another's operation. `append_destination_partition` frames
         // the namespace, proxy, route rewrite, and effective upstream/backend.
         replay_partition::append_destination_partition(&mut hasher, ctx);
-        if replay_partition::append_caller_partition(
+        replay_partition::append_caller_partition(
             &mut hasher,
             ctx,
             request_headers,
             self.anonymous_caller_scope,
-        )
-        .is_err()
-        {
-            return None;
-        }
+        )?;
         // Retained for operators who additionally want the display identity in
         // the partition; the caller partition above already isolates callers.
         hasher.bool_value("scope_by_consumer", self.scope_by_consumer);
@@ -1219,7 +1320,7 @@ impl RequestDeduplication {
         let mut key = String::with_capacity(67);
         key.push_str("v5:");
         key.push_str(&hasher.hex());
-        Some(key)
+        Ok(key)
     }
 
     fn replay_response(&self, ctx: &mut RequestContext, cached: &CachedResponse) -> PluginResult {
@@ -3113,31 +3214,31 @@ impl Plugin for RequestDeduplication {
                     return PluginResult::Continue;
                 }
             };
-            let Some(key) = self.build_key(ctx, headers, idempotency_value) else {
-                // Fail closed on the replay dimension: with no derivable
-                // partition there is no key under which a retained result can
-                // be proven to belong to this caller, so nothing is looked up
-                // or stored. Operators who require the idempotency guarantee
-                // itself (`enforce_required`) get an explicit refusal instead
-                // of a silent single-execution downgrade. Content-free: the
-                // reason never carries caller or key material.
-                // `AnonymousCallerScope::CallerAddress` with an unparsable
-                // peer address is currently the only way the partition can
-                // fail; the reason is a static, content-free string.
-                debug!(
-                    reason = replay_partition::PartitionRefusal::AnonymousCallerAddressUnavailable
-                        .reason(),
-                    "request_deduplication: refusing to deduplicate without a complete replay \
-                     partition for this caller"
-                );
-                if self.enforce_required {
-                    return PluginResult::Reject {
-                        status_code: 503,
-                        body: UNPARTITIONABLE_CALLER_BODY.to_string(),
-                        headers: HashMap::new(),
-                    };
+            let key = match self.build_key(ctx, headers, idempotency_value) {
+                Ok(key) => key,
+                Err(refusal) => {
+                    // Fail closed on the replay dimension: with no derivable
+                    // partition there is no key under which a retained result
+                    // can be proven to belong to this caller, so nothing is
+                    // looked up or stored. Operators who require the
+                    // idempotency guarantee itself (`enforce_required`) get an
+                    // explicit refusal instead of a silent single-execution
+                    // downgrade. Content-free: the reason is a compiled-in
+                    // static string and never carries caller or key material.
+                    debug!(
+                        reason = refusal.reason(),
+                        "request_deduplication: refusing to deduplicate without a complete \
+                         replay partition for this caller"
+                    );
+                    if self.enforce_required {
+                        return PluginResult::Reject {
+                            status_code: 503,
+                            body: UNPARTITIONABLE_CALLER_BODY.to_string(),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    return PluginResult::Continue;
                 }
-                return PluginResult::Continue;
             };
             let fingerprint = match self.build_request_fingerprint(ctx, headers) {
                 Ok(fingerprint) => fingerprint,

@@ -115,6 +115,13 @@ fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
 const AI_SEMANTIC_CACHE_EXACT_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-exact-v2";
 const AI_SEMANTIC_CACHE_SCOPE_KEY_DOMAIN: &str = "ferrum-ai-semantic-cache-scope-v2";
 const AI_SEMANTIC_CACHE_CALLER_DOMAIN: &str = "ferrum-ai-semantic-cache-caller-v1";
+/// Effective destination under the shared canonical contract
+/// (`replay_partition::append_destination_partition`), which binds the proxy
+/// *namespace* the plugin's former hand-rolled encoding omitted.
+const AI_SEMANTIC_CACHE_DESTINATION_DOMAIN: &str = "ferrum-ai-semantic-cache-destination-v1";
+/// Backend-visible request context: original authority, method, path, raw query,
+/// and the live non-credential header view (credential values digested).
+const AI_SEMANTIC_CACHE_REQUEST_DOMAIN: &str = "ferrum-ai-semantic-cache-request-v1";
 
 /// Fixed-shape retention, isolation, size, and keying fields at the plugin root.
 pub const AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS: &[&str] = &[
@@ -2624,10 +2631,13 @@ fn append_identity_key_parts(
     // identity, and a digest of every credential header actually presented.
     // Two tokens sharing a `sub` but carrying different scopes, audiences, or
     // tenancy claims therefore land in different partitions even though
-    // `effective_identity()` renders them identically. Anonymous callers bind
-    // to their canonical peer address unless the operator attested otherwise.
-    // The partition is an opaque digest; no credential, claim, or address byte
-    // reaches the key.
+    // `effective_identity()` renders them identically. Credential digests cover
+    // both the pristine inbound wire view and the live backend-visible one, so
+    // the `ai_stream_router` rewrite that runs before this plugin cannot erase
+    // the original caller distinction. Every caller also binds its canonical
+    // peer address; only an anonymous caller's binding is relaxable by operator
+    // attestation. The partition is an opaque digest; no credential, claim, or
+    // address byte reaches the key.
     let mut caller = PartitionHasher::new(AI_SEMANTIC_CACHE_CALLER_DOMAIN);
     replay_partition::append_caller_partition(
         &mut caller,
@@ -2640,44 +2650,32 @@ fn append_identity_key_parts(
     key_input.push_str("caller:");
     key_input.push_str(&caller.hex());
 
-    if let Some(ref proxy) = ctx.matched_proxy {
-        start_key_part(key_input, has_part);
-        key_input.push_str("proxy:");
-        append_len_prefixed(key_input, &proxy.id);
+    // Effective destination under the *shared* canonical contract rather than a
+    // plugin-local encoding. This plugin runs after the route-dispatch plugins
+    // (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`, `mesh_route_dispatch`),
+    // so `route_override_*` already reflects the destination that will serve a
+    // miss. The shared contract binds the proxy *namespace*, listen path,
+    // upstream/host/port/scheme, rewritten path, and authority, and frames the
+    // unmatched-proxy case explicitly — the previous hand-rolled encoding
+    // omitted the namespace entirely, so one proxy ID in two namespaces shared a
+    // partition.
+    let mut destination = PartitionHasher::new(AI_SEMANTIC_CACHE_DESTINATION_DOMAIN);
+    replay_partition::append_destination_partition(&mut destination, ctx);
+    start_key_part(key_input, has_part);
+    key_input.push_str("dst:");
+    key_input.push_str(&destination.hex());
 
-        // Canonical route/operation identity within the same proxy. This plugin
-        // runs after route-dispatch plugins (`ai_stream_router`, `mcp_gateway`,
-        // `a2a_gateway`, `mesh_route_dispatch`) so `route_override_*` already
-        // reflects the effective destination that will serve a miss. Exact and
-        // semantic scope keys share these dimensions:
-        // - `listen_path` (route template / matched proxy route identity; binds
-        //   dynamic path segments to the configured route rather than only the
-        //   raw request path)
-        // - request path (distinguishes sibling operations under one template
-        //   and rewritten public paths)
-        // - post-routing rewrite path when present
-        // - effective destination/provider (upstream id, or direct host/port/
-        //   scheme override, else the proxy's configured backend identity)
-        start_key_part(key_input, has_part);
-        key_input.push_str("route:");
-        if let Some(listen_path) = proxy.listen_path.as_deref() {
-            key_input.push_str("lp:");
-            append_len_prefixed(key_input, listen_path);
-            key_input.push('|');
-        }
-        key_input.push_str("path:");
-        append_len_prefixed(key_input, &ctx.path);
-        if let Some(rewrite) = ctx.route_override_path.as_deref() {
-            key_input.push_str("|rw:");
-            append_len_prefixed(key_input, rewrite);
-            if ctx.route_override_path_is_absolute {
-                key_input.push_str("|rwa:1");
-            }
-        }
-        start_key_part(key_input, has_part);
-        key_input.push_str("dst:");
-        append_effective_destination_identity(ctx, proxy.as_ref(), key_input);
-    }
+    // Backend-visible request context. The rest of this key is derived from the
+    // request *body*, so without this the origin's other inputs — the original
+    // client authority, the raw query, and every non-credential request header —
+    // are unbound and two tenants separated only by a header or a query
+    // parameter share one retained completion. Credential values are digested
+    // inside the partition; no secret enters the assembled `String`.
+    let mut request = PartitionHasher::new(AI_SEMANTIC_CACHE_REQUEST_DOMAIN);
+    replay_partition::append_request_context_partition(&mut request, ctx, request_headers);
+    start_key_part(key_input, has_part);
+    key_input.push_str("req:");
+    key_input.push_str(&request.hex());
 
     if plugin.scope_by_consumer
         && let Some(identity) = ctx.effective_identity()
@@ -4682,19 +4680,15 @@ impl Plugin for AiSemanticCache {
         let multimodal_fingerprint = build_multimodal_fingerprint(&json);
 
         // Build cache key
-        let cache_key = match self.build_cache_key(
-            ctx,
-            headers,
-            &json,
-            multimodal_fingerprint.as_deref(),
-        ) {
-            Some(k) => k,
-            None => {
-                self.clear_instance_staging(ctx);
-                self.set_cache_status(ctx, "BYPASS");
-                return PluginResult::Continue;
-            }
-        };
+        let cache_key =
+            match self.build_cache_key(ctx, headers, &json, multimodal_fingerprint.as_deref()) {
+                Some(k) => k,
+                None => {
+                    self.clear_instance_staging(ctx);
+                    self.set_cache_status(ctx, "BYPASS");
+                    return PluginResult::Continue;
+                }
+            };
 
         // Periodic cleanup — scheduled off the request hot path so no single
         // request pays the full-map scan / oldest-entry eviction.
@@ -4805,9 +4799,7 @@ impl Plugin for AiSemanticCache {
                         ) {
                             self.redis_quarantine.note_suppression();
                         } else {
-                            debug!(
-                                "ai_semantic_cache: quarantining empty Redis entry"
-                            );
+                            debug!("ai_semantic_cache: quarantining empty Redis entry");
                             self.quarantine_invalid_redis_entry(
                                 redis,
                                 &redis_key,
@@ -4830,9 +4822,7 @@ impl Plugin for AiSemanticCache {
         // Check local cache
         if let Some(entry) = self.cache.get(&cache_key) {
             if Instant::now().duration_since(entry.inserted_at) < self.ttl {
-                debug!(
-                    "ai_semantic_cache: cache HIT, returning cached response"
-                );
+                debug!("ai_semantic_cache: cache HIT, returning cached response");
                 let mut response_headers = entry.headers.clone();
                 response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
                 self.clear_instance_staging(ctx);
@@ -4909,9 +4899,7 @@ impl Plugin for AiSemanticCache {
         }
 
         // Cache miss — store the key for on_final_response_body
-        debug!(
-            "ai_semantic_cache: cache MISS"
-        );
+        debug!("ai_semantic_cache: cache MISS");
         ctx.metadata.insert(self.meta_cache_key.clone(), cache_key);
         self.set_cache_status(ctx, "MISS");
 
@@ -5136,33 +5124,6 @@ impl Plugin for AiSemanticCache {
 
     fn tracked_keys_count(&self) -> Option<usize> {
         Some(self.cache.len())
-    }
-}
-
-fn append_effective_destination_identity(
-    ctx: &RequestContext,
-    proxy: &crate::config::types::Proxy,
-    key_input: &mut String,
-) {
-    if let Some(upstream) = ctx.effective_upstream_id(proxy) {
-        key_input.push_str("up:");
-        append_len_prefixed(key_input, upstream);
-    } else {
-        // Direct-backend override or the proxy's configured backend. Always bind
-        // host/port so a route rewrite to a different provider cannot share a
-        // cache entry with the proxy default destination.
-        key_input.push_str("host:");
-        append_len_prefixed(key_input, ctx.effective_backend_host(proxy));
-        let _ = write!(key_input, "|port:{}", ctx.effective_backend_port(proxy));
-        if let Some(scheme) = ctx.route_override_backend_scheme {
-            let _ = write!(key_input, "|scheme:{scheme}");
-        } else if let Some(scheme) = proxy.backend_scheme {
-            let _ = write!(key_input, "|pscheme:{scheme}");
-        }
-    }
-    if let Some(authority) = ctx.route_override_authority.as_deref() {
-        key_input.push_str("|auth:");
-        append_len_prefixed(key_input, authority);
     }
 }
 

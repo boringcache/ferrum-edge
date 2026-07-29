@@ -849,10 +849,7 @@ fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, St
     }
 }
 
-fn optional_string<'a>(
-    config: &'a Value,
-    field: &'static str,
-) -> Result<Option<&'a str>, String> {
+fn optional_string<'a>(config: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
     match config.get(field) {
         Some(Value::String(value)) => Ok(Some(value.as_str())),
         Some(Value::Null) | None => Ok(None),
@@ -1140,9 +1137,12 @@ pub struct ResponseCaching {
     meta_pending_invalidate_host: String,
     /// Precomputed `response_caching.<id>.cache_pending_invalidate_path`.
     meta_pending_invalidate_path: String,
+    /// Parsed configuration, including how anonymous callers are partitioned
+    /// (`config.anonymous_caller_scope`, see [`AnonymousCallerScope`]). The
+    /// scope is deliberately *not* mirrored onto a second field: one owner
+    /// means a later edit cannot leave the two copies disagreeing about the
+    /// partition contract.
     config: ResponseCachingConfig,
-    /// How anonymous callers are partitioned (see [`AnonymousCallerScope`]).
-    anonymous_caller_scope: AnonymousCallerScope,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
     total_size: Arc<AtomicUsize>,
@@ -1215,7 +1215,6 @@ impl ResponseCaching {
                 CACHE_PENDING_INVALIDATE_PATH_SUFFIX,
             ),
             config,
-            anonymous_caller_scope,
             cache: Arc::new(DashMap::with_shard_amount(shard_amount)),
             vary_index: Arc::new(DashMap::with_shard_amount(shard_amount)),
             total_size: Arc::new(AtomicUsize::new(0)),
@@ -1391,12 +1390,17 @@ impl ResponseCaching {
     ///   [`replay_partition::append_caller_partition`]. Authenticated callers
     ///   bind a fingerprint of the credential material and mechanism, not a
     ///   display subject, so two tokens resolving to one `sub` with different
-    ///   scopes cannot share an entry. Anonymous callers bind their canonical
-    ///   peer address, which the origin observes through Ferrum's regenerated
-    ///   `X-Forwarded-For`, unless the operator attested otherwise.
+    ///   scopes cannot share an entry. Both the pristine inbound wire
+    ///   credentials and the live backend-visible ones are bound under separate
+    ///   provenance labels, so an earlier `ai_stream_router` credential rewrite
+    ///   cannot erase the original caller distinction. Every caller also binds
+    ///   its canonical peer address, which the origin observes through Ferrum's
+    ///   regenerated `X-Forwarded-For`; only an *anonymous* caller's address
+    ///   binding can be relaxed by operator attestation.
     ///
-    /// Returns `None` when no complete stable partition can be derived, in
-    /// which case the caller must neither look up nor store.
+    /// Returns `Err` when no complete stable partition can be derived, in
+    /// which case the caller must neither look up nor store. The refusal's
+    /// `reason()` is a compiled-in static string safe to emit in a debug line.
     ///
     /// `request_headers` is supplied separately because in `before_proxy` the
     /// gateway may have temporarily moved `ctx.headers` out of the context to
@@ -1411,7 +1415,7 @@ impl ResponseCaching {
         &self,
         ctx: &RequestContext,
         request_headers: &HashMap<String, String>,
-    ) -> Option<String> {
+    ) -> Result<String, replay_partition::PartitionRefusal> {
         let mut hasher = PartitionHasher::new(RESPONSE_CACHING_BASE_KEY_DOMAIN);
         replay_partition::append_destination_partition(&mut hasher, ctx);
 
@@ -1435,19 +1439,15 @@ impl ResponseCaching {
         // isolated — the caller partition below is unconditional. It is kept in
         // the digest so flipping it still produces a disjoint keyspace rather
         // than silently reusing entries minted under the other setting.
-        hasher.bool_value(
-            "include_consumer",
-            self.config.cache_key_include_consumer,
-        );
+        hasher.bool_value("include_consumer", self.config.cache_key_include_consumer);
         replay_partition::append_caller_partition(
             &mut hasher,
             ctx,
             request_headers,
             self.config.anonymous_caller_scope,
-        )
-        .ok()?;
+        )?;
 
-        Some(hasher.hex())
+        Ok(hasher.hex())
     }
 
     /// Append the Vary component to an already-derived base key.
@@ -1766,7 +1766,9 @@ impl ResponseCaching {
             }
         }
         self.add_total_size_locked(entry_size);
-        maintenance.eviction_queue.push_back((cache_key, insert_seq));
+        maintenance
+            .eviction_queue
+            .push_back((cache_key, insert_seq));
     }
 
     /// Remove one entry and every piece of metadata that described it.
@@ -1907,11 +1909,9 @@ impl ResponseCaching {
             return;
         }
         let cache = Arc::clone(&self.cache);
-        maintenance.eviction_queue.retain(|(key, seq)| {
-            cache
-                .get(key)
-                .is_some_and(|entry| entry.insert_seq == *seq)
-        });
+        maintenance
+            .eviction_queue
+            .retain(|(key, seq)| cache.get(key).is_some_and(|entry| entry.insert_seq == *seq));
     }
 
     /// Invalidate cache entries matching a path under one authority partition.
@@ -2094,7 +2094,6 @@ impl ResponseCaching {
 
         directives.public || directives.must_revalidate || directives.s_maxage.is_some()
     }
-
 
     /// Stash the transformed-header values `before_proxy` saw for every
     /// key that can land in the cache key — `host`, the sensitive
@@ -2401,22 +2400,23 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let Some(base_key) = self.build_base_cache_key(ctx, headers) else {
-            // Fail closed: without a complete, stable partition there is no key
-            // under which a retained representation can be proven to belong to
-            // this caller, so nothing is looked up and nothing is stored. The
-            // reason is a static string and carries no caller context.
-            // `AnonymousCallerScope::CallerAddress` with an unparsable peer
-            // address is currently the only way the partition can fail; the
-            // reason is a static, content-free string.
-            debug!(
-                reason = replay_partition::PartitionRefusal::AnonymousCallerAddressUnavailable
-                    .reason(),
-                "response_caching: bypassing without a complete replay partition for this caller"
-            );
-            self.clear_lookup_staging(ctx);
-            self.set_cache_status(ctx, "BYPASS");
-            return PluginResult::Continue;
+        let base_key = match self.build_base_cache_key(ctx, headers) {
+            Ok(base_key) => base_key,
+            Err(refusal) => {
+                // Fail closed: without a complete, stable partition there is no
+                // key under which a retained representation can be proven to
+                // belong to this caller, so nothing is looked up and nothing is
+                // stored. The refusal's reason is a compiled-in static string
+                // and carries no caller, credential, or key material.
+                debug!(
+                    reason = refusal.reason(),
+                    "response_caching: bypassing without a complete replay partition for this \
+                     caller"
+                );
+                self.clear_lookup_staging(ctx);
+                self.set_cache_status(ctx, "BYPASS");
+                return PluginResult::Continue;
+            }
         };
         ctx.metadata
             .insert(self.meta_base_key.clone(), base_key.clone());
@@ -2817,12 +2817,9 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let invalidation_scope = self.invalidation_scope(
-            ctx,
-            lookup_headers.headers.get("host").map(String::as_str),
-        );
-        let invalidation_path: Arc<str> =
-            Arc::from(encode_path_for_cache_key(&ctx.path).as_ref());
+        let invalidation_scope =
+            self.invalidation_scope(ctx, lookup_headers.headers.get("host").map(String::as_str));
+        let invalidation_path: Arc<str> = Arc::from(encode_path_for_cache_key(&ctx.path).as_ref());
 
         // Copy the potentially large body before entering the publication
         // critical section. The final key and response Vary header cannot be
