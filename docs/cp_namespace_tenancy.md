@@ -215,10 +215,13 @@ token. `FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH` points at a JSON document:
   via a `secret_path` pointing at the same material. Every data plane in the
   fleet already holds that value, so any of them could name that credential's
   `kid` and reach its namespaces: the bundle would be structurally valid and
-  semantically identical to the pre-advisory posture. Startup cannot detect the
-  reuse (it never compares key bytes across sources); it only enforces that a
-  bundle exists. Generate one fresh secret per credential — or, better, use an
-  asymmetric key so the data plane cannot sign at all.
+  semantically identical to the pre-advisory posture. **Startup refuses it.**
+  `"secret_env": "FERRUM_CP_DP_GRPC_JWT_SECRET"` is rejected by variable name
+  before the read, and an inline `secret` or a `secret_path` whose contents
+  equal the effective fleet secret is rejected by resolved bytes. The
+  diagnostic names only the bundle path, the `kid`, and the variable name —
+  never key material. Generate one fresh secret per credential — or, better,
+  use an asymmetric key so the data plane cannot sign at all.
 - Startup refuses duplicate `kid`s (ambiguous key selection), unknown
   algorithms, algorithm/material mismatches, empty namespace lists, and
   unreadable material.
@@ -236,6 +239,21 @@ certificate encodes no SPIFFE namespace contributes no evidence, and a
 shared-CA certificate can never *widen* what a credential permits. Two tenants
 issued leaves by one CA are separated by their credentials and (when present)
 by their SPIFFE namespaces — never by the fact that both chains validate.
+
+**Upgrade note — align the two namespace keyspaces.** This intersection is new
+behavior: before it, a CP/DP mTLS peer certificate contributed nothing to
+authorization. A SPIFFE namespace is the *workload's* namespace (in Kubernetes,
+the pod's), while `SubscribeRequest.namespace` / `FERRUM_NAMESPACE` is the
+*Ferrum configuration* namespace. Mesh data planes align by construction. A
+plain `dp`-mode gateway does not have to: if it presents a SPIFFE client
+certificate from, say, `ns/ferrum-system` while subscribing to configuration
+namespace `ferrum`, the intersection is empty and the CP now answers
+`PermissionDenied` ("not authorized for any namespace"). Fix it by aligning the
+Ferrum namespace with the workload namespace, or by presenting a CP/DP gRPC
+client certificate that carries no SPIFFE URI SAN (which contributes no
+evidence, leaving the credential binding as the only ceiling). Do not "fix" it
+by widening the credential's `namespaces` list — that grants the bearer the
+extra namespaces for real.
 
 ### Fail-closed startup
 

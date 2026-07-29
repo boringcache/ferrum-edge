@@ -1980,7 +1980,12 @@ pub async fn run(
     // unsafe override.
     let (grpc_secret, cp_dp_verifier) = match env_config.cp_dp_grpc_trust_bundle_path.as_deref() {
         Some(path) => {
-            let bundle = CpDpTrustBundle::load_from_path(path).map_err(|e| {
+            // The effective fleet secret is threaded in so a bound credential
+            // backed by it is refused rather than silently re-creating the
+            // advisory (GHSA-3f2j-wwqw-grmg). It is used for comparison only
+            // and is never rendered.
+            let fleet_secret = env_config.cp_dp_grpc_jwt_secret.as_deref();
+            let bundle = CpDpTrustBundle::load_from_path(path, fleet_secret).map_err(|e| {
                 anyhow::anyhow!("FERRUM_CP_DP_GRPC_TRUST_BUNDLE_PATH could not be loaded: {e}")
             })?;
             // Warn (not fail) on a served namespace no credential can reach:

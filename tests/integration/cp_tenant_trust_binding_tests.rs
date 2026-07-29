@@ -65,7 +65,7 @@ fn two_tenant_bundle() -> Arc<CpDpVerifier> {
         ]
     })
     .to_string();
-    let bundle = CpDpTrustBundle::from_document_str(&document, "test-bundle")
+    let bundle = CpDpTrustBundle::from_document_str(&document, "test-bundle", None)
         .expect("two-tenant bundle must load");
     Arc::new(CpDpVerifier::TrustBundle(bundle))
 }
@@ -640,7 +640,7 @@ fn duplicate_key_ids_are_refused_as_ambiguous_selection() {
         ]
     })
     .to_string();
-    let error = CpDpTrustBundle::from_document_str(&document, "dup-bundle")
+    let error = CpDpTrustBundle::from_document_str(&document, "dup-bundle", None)
         .expect_err("duplicate kids must be refused");
     assert!(error.contains("duplicate kid"), "got: {error}");
 }
@@ -693,7 +693,7 @@ fn malformed_bundles_are_refused_without_echoing_material() {
 
     for (document, expected) in cases {
         let raw = document.to_string();
-        let error = CpDpTrustBundle::from_document_str(&raw, "bad-bundle")
+        let error = CpDpTrustBundle::from_document_str(&raw, "bad-bundle", None)
             .expect_err("malformed bundle must be refused");
         assert!(
             error.contains(expected),
@@ -704,6 +704,59 @@ fn malformed_bundles_are_refused_without_echoing_material() {
             "startup errors must not echo secret material, got: {error}"
         );
     }
+}
+
+/// A bound credential backed by the fleet-wide `FERRUM_CP_DP_GRPC_JWT_SECRET`
+/// is structurally valid but semantically identical to the pre-advisory
+/// posture: every data plane already holds that value, so any of them could
+/// name this `kid` and reach its namespaces. Loading must refuse it — by
+/// variable name for `secret_env`, and by resolved bytes for `secret` /
+/// `secret_path`.
+#[test]
+fn fleet_secret_backed_credentials_are_refused() {
+    const FLEET: &str = "fleet-wide-cp-dp-secret-2026-ferrum-edge";
+
+    // Inline material equal to the effective fleet secret.
+    let document = json!({
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256", "secret": FLEET,
+              "namespaces": [TENANT_A] },
+        ]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "fleet-bundle", Some(FLEET))
+        .expect_err("a credential backed by the fleet secret must be refused");
+    assert!(error.contains("GHSA-3f2j-wwqw-grmg"), "got: {error}");
+    assert!(
+        !error.contains(FLEET),
+        "the refusal must not echo the secret, got: {error}"
+    );
+
+    // `secret_env` naming the fleet variable is refused by name, even when the
+    // effective fleet secret was configured through `ferrum.conf` and is not
+    // available for a by-value comparison.
+    let document = json!({
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256",
+              "secret_env": "FERRUM_CP_DP_GRPC_JWT_SECRET",
+              "namespaces": [TENANT_A] },
+        ]
+    })
+    .to_string();
+    let error = CpDpTrustBundle::from_document_str(&document, "fleet-env-bundle", None)
+        .expect_err("secret_env naming the fleet variable must be refused");
+    assert!(error.contains("GHSA-3f2j-wwqw-grmg"), "got: {error}");
+
+    // A distinct per-tenant secret still loads with the fleet secret present.
+    let document = json!({
+        "keys": [
+            { "kid": TENANT_A, "algorithm": "HS256", "secret": TENANT_A_SECRET,
+              "namespaces": [TENANT_A] },
+        ]
+    })
+    .to_string();
+    CpDpTrustBundle::from_document_str(&document, "distinct-bundle", Some(FLEET))
+        .expect("a per-tenant secret distinct from the fleet secret must load");
 }
 
 // ── Fail-closed startup ──────────────────────────────────────────────────
@@ -1131,7 +1184,7 @@ fn single_tenant_bundle() -> Arc<CpDpVerifier> {
         ]
     })
     .to_string();
-    let bundle = CpDpTrustBundle::from_document_str(&document, "single-tenant-bundle")
+    let bundle = CpDpTrustBundle::from_document_str(&document, "single-tenant-bundle", None)
         .expect("single-tenant bundle must load");
     Arc::new(CpDpVerifier::TrustBundle(bundle))
 }

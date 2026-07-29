@@ -45,6 +45,13 @@
 //! [`CpDpVerifier::validate_for_scope`]. There is deliberately no unsafe
 //! override and no legacy shim.
 //!
+//! Bundle loading also refuses a symmetric credential backed by the fleet-wide
+//! `FERRUM_CP_DP_GRPC_JWT_SECRET` — by variable name for `secret_env`, and by
+//! resolved bytes for `secret` / `secret_path`. Such a credential is
+//! structurally valid but semantically identical to the pre-advisory posture:
+//! every data plane already holds that value, so any of them could name the
+//! credential's `kid` and reach its namespaces.
+//!
 //! # Disclosure discipline
 //!
 //! Nothing in this module renders key material, token bytes, or claim values.
@@ -73,6 +80,13 @@ const MAX_KEY_ID_LEN: usize = 128;
 /// Minimum length for a symmetric (`HS*`) verification secret, matching the
 /// admin-JWT convention elsewhere in the gateway.
 const MIN_HS_SECRET_LEN: usize = 32;
+
+/// The fleet-wide CP/DP secret. Backing a *bound* credential with this value
+/// silently re-creates the advisory: every data plane already holds it, so any
+/// of them could name that credential's `kid` and reach its namespaces. The
+/// bundle would be structurally valid and semantically identical to the
+/// pre-advisory posture, so loading refuses it outright.
+const FLEET_SECRET_ENV: &str = "FERRUM_CP_DP_GRPC_JWT_SECRET";
 
 /// Why a request-time tenant-authorization decision failed.
 ///
@@ -252,7 +266,11 @@ impl CpDpTrustBundle {
     /// Every failure is fatal at startup: a control plane that cannot state
     /// which credential may reach which tenant must not serve multi-tenant
     /// configuration at all.
-    pub fn load_from_path(path: &str) -> Result<Self, String> {
+    ///
+    /// `fleet_secret` is the effective `FERRUM_CP_DP_GRPC_JWT_SECRET`, when the
+    /// operator configured one. It is used only to *refuse* a bound credential
+    /// backed by that value; it is never rendered.
+    pub fn load_from_path(path: &str, fleet_secret: Option<&str>) -> Result<Self, String> {
         let metadata = std::fs::metadata(path)
             .map_err(|e| format!("failed to stat CP/DP trust bundle '{path}': {e}"))?;
         if !metadata.is_file() {
@@ -266,12 +284,18 @@ impl CpDpTrustBundle {
         }
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read CP/DP trust bundle '{path}': {e}"))?;
-        Self::from_document_str(&raw, path)
+        Self::from_document_str(&raw, path, fleet_secret)
     }
 
     /// Parse and validate a trust-bundle document. `origin` is used only in
-    /// error text so an operator can tell which file failed.
-    pub fn from_document_str(raw: &str, origin: &str) -> Result<Self, String> {
+    /// error text so an operator can tell which file failed. `fleet_secret` is
+    /// the effective `FERRUM_CP_DP_GRPC_JWT_SECRET`, used only to refuse a
+    /// credential backed by it.
+    pub fn from_document_str(
+        raw: &str,
+        origin: &str,
+        fleet_secret: Option<&str>,
+    ) -> Result<Self, String> {
         let document: TrustBundleDocument = serde_json::from_str(raw)
             .map_err(|e| format!("CP/DP trust bundle '{origin}' is not valid JSON: {e}"))?;
         if let Some(version) = document.version
@@ -291,7 +315,7 @@ impl CpDpTrustBundle {
 
         let mut keys: HashMap<String, TrustedKey> = HashMap::with_capacity(document.keys.len());
         for entry in document.keys {
-            let key = entry.into_trusted_key(origin)?;
+            let key = entry.into_trusted_key(origin, fleet_secret)?;
             if keys.contains_key(&key.kid) {
                 // Ambiguous key selection is a configuration error, not a
                 // runtime tie-break: two credentials answering to one `kid`
@@ -565,8 +589,26 @@ impl std::fmt::Debug for TrustBundleKeyDocument {
     }
 }
 
+/// Diagnostic for a bound credential backed by the fleet-wide secret.
+///
+/// Renders only operator-authored identifiers (`origin`, `kid`) and the
+/// variable *name*; no key material of either credential is included.
+fn fleet_secret_reuse_error(origin: &str, kid: &str) -> String {
+    format!(
+        "CP/DP trust bundle '{origin}': key '{kid}' is backed by the fleet-wide \
+         {FLEET_SECRET_ENV}. Every data plane holds that value, so any of them could name this \
+         `kid` and reach this credential's namespaces — the cross-tenant forgery advisory \
+         GHSA-3f2j-wwqw-grmg exists to close. Give each credential its own material, or use an \
+         asymmetric public key so no data plane can sign at all."
+    )
+}
+
 impl TrustBundleKeyDocument {
-    fn into_trusted_key(self, origin: &str) -> Result<TrustedKey, String> {
+    fn into_trusted_key(
+        self,
+        origin: &str,
+        fleet_secret: Option<&str>,
+    ) -> Result<TrustedKey, String> {
         let kid = self.kid.trim().to_string();
         if kid.is_empty() {
             return Err(format!(
@@ -651,6 +693,14 @@ impl TrustBundleKeyDocument {
             let secret = if let Some(inline) = self.secret {
                 inline
             } else if let Some(var) = self.secret_env.as_deref() {
+                // Naming the fleet variable is refused by *name*, before the
+                // read: it is unambiguous operator intent to bind a credential
+                // to the value every data plane already holds, and the
+                // by-value check below cannot see it when the effective
+                // secret was configured through `ferrum.conf` instead.
+                if var.trim() == FLEET_SECRET_ENV {
+                    return Err(fleet_secret_reuse_error(origin, &kid));
+                }
                 std::env::var(var).map_err(|_| {
                     format!(
                         "CP/DP trust bundle '{origin}': key '{kid}' references environment \
@@ -679,6 +729,13 @@ impl TrustBundleKeyDocument {
                     "CP/DP trust bundle '{origin}': key '{kid}' symmetric secret must be at \
                      least {MIN_HS_SECRET_LEN} bytes"
                 ));
+            }
+            // Whatever source it came from — inline, env, or file — a bound
+            // credential must not carry the fleet-wide secret. Comparing the
+            // resolved bytes is what makes `secret_path` (a symlink or copy of
+            // the same material) detectable at all.
+            if fleet_secret.is_some_and(|fleet| !fleet.is_empty() && fleet == secret.as_str()) {
+                return Err(fleet_secret_reuse_error(origin, &kid));
             }
             DecodingKey::from_secret(secret.as_bytes())
         } else {
