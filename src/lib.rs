@@ -5134,7 +5134,7 @@ pub mod _test_support {
 
     pub use crate::k8s_controller::reconciler::{
         AcceptedK8sOverlay, merge_k8s_translation, publish_k8s_reconcile,
-        store_accepted_k8s_overlay, swap_merged_k8s_translation,
+        shared_status_objects_snapshot, store_accepted_k8s_overlay, swap_merged_k8s_translation,
     };
     pub use crate::k8s_controller::{
         CpPublicationGate, K8sOverlaySlot, compose_db_with_k8s_overlay, empty_k8s_overlay_slot,
