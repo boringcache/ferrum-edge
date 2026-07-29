@@ -8118,7 +8118,7 @@ async fn validate_tool_results_rejects_malformed_json_rpc_result_envelopes() {
 async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let mut config = aggregate_output_validation_config(&format!("{}/mcp", server.uri()));
-    config["validation"]["max_upstream_response_bytes"] = json!(64);
+    config["validation"]["max_upstream_response_bytes"] = json!(4 * 1024);
     let plugin = create_plugin("mcp_gateway", &config).unwrap().unwrap();
     let session_id = initialize(&plugin).await;
     let mut ctx = route_validated_tool_call(&plugin, &session_id, 160).await;
@@ -8133,7 +8133,7 @@ async fn validate_tool_results_rejects_malformed_and_oversized_results() {
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
 
-    let oversized = vec![b'x'; 128];
+    let oversized = vec![b'x'; 8 * 1024];
     let oversized_headers = known_json_response_headers(&oversized);
     let (status, body, _) = reject_json(
         plugin
