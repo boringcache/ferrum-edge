@@ -4593,8 +4593,7 @@ impl ResponseStreamInspector for StreamInspector {
                         // transport chunk before normal ingest can reinterpret
                         // it as a fresh event.
                         if self.window.in_passthrough() && consumed < chunk.len() {
-                            let (fwd, took) =
-                                self.window.ingest_passthrough(&chunk[consumed..]);
+                            let (fwd, took) = self.window.ingest_passthrough(&chunk[consumed..]);
                             released.extend_from_slice(&fwd);
                             consumed = consumed.saturating_add(took);
                             if self.window.in_passthrough() {
