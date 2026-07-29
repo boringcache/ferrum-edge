@@ -3698,7 +3698,8 @@ fn grpc_config_rejects_unresolvable_descriptor_targets() {
         }
     });
     let duplicate_err = AiResponseGuard::new(&duplicate_text_fields)
-        .expect_err("duplicate normalized text_fields paths must fail closed");
+        .err()
+        .expect("duplicate normalized text_fields paths must fail closed");
     assert!(
         duplicate_err.contains("text_fields") && duplicate_err.contains("more than once"),
         "diagnostic must name the field without echoing the path value: {duplicate_err}"

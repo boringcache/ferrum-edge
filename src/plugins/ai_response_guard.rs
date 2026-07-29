@@ -2237,7 +2237,7 @@ fn charge_value(value: &ProtobufValue, budget: &mut GrpcWalkBudget) -> Result<()
             }
         }
         ProtobufValue::Map(entries) => {
-            for (_, entry) in entries {
+            for entry in entries.values() {
                 charge_value(entry, budget)?;
             }
         }
