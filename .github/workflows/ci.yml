@@ -951,6 +951,7 @@ jobs:
               functional_router_cache_test
               functional_secrets_test
               functional_ai_plugins_test
+              functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_response_stream_test
