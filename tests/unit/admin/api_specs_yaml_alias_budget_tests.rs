@@ -288,6 +288,30 @@ fn anchored_scalar_title_survives_alias_reuse() {
 }
 
 #[test]
+fn integer_outside_exact_json_range_fails_closed() {
+    let yaml = format!(
+        concat!(
+            "openapi: '3.1.0'\n",
+            "info:\n",
+            "  title: Integer Range\n",
+            "  version: '1.0.0'\n",
+            "x-too-large: 18446744073709551616\n",
+            "{}",
+        ),
+        proxy_yaml("integer-range-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(msg)
+                if msg.contains("outside the exact JSON numeric range")
+        ),
+        "an oversized YAML integer must not be rounded through f64, got {err:?}"
+    );
+}
+
+#[test]
 fn alias_bomb_fails_closed_under_budgets() {
     let yaml = format!(
         concat!(

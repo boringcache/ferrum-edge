@@ -711,6 +711,14 @@ fn untagged_plain_scalar(value: &str) -> Result<Value, BoundedYamlError> {
     if let Some(n) = int_to_json(value) {
         return Ok(n);
     }
+    // Do not silently round an integer that is syntactically valid YAML but
+    // outside serde_json's exact i64/u64 representation. Falling through to
+    // f64 would accept a different value from the one the operator supplied.
+    if looks_like_yaml_integer(value) {
+        return Err(BoundedYamlError::Parse(
+            "YAML integer is outside the exact JSON numeric range".to_string(),
+        ));
+    }
     if !digits_but_not_number(value)
         && let Some(n) = parse_f64(value)
     {
@@ -845,6 +853,30 @@ fn parse_f64(scalar: &str) -> Option<f64> {
 fn digits_but_not_number(scalar: &str) -> bool {
     let scalar = scalar.strip_prefix(['-', '+']).unwrap_or(scalar);
     scalar.len() > 1 && scalar.starts_with('0') && scalar[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn looks_like_yaml_integer(scalar: &str) -> bool {
+    if digits_but_not_number(scalar) {
+        return false;
+    }
+    let unsigned = scalar.strip_prefix(['-', '+']).unwrap_or(scalar);
+    let (digits, radix) = if let Some(digits) = unsigned.strip_prefix("0x") {
+        (digits, 16)
+    } else if let Some(digits) = unsigned.strip_prefix("0o") {
+        (digits, 8)
+    } else if let Some(digits) = unsigned.strip_prefix("0b") {
+        (digits, 2)
+    } else {
+        (unsigned, 10)
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|byte| match radix {
+            2 => matches!(byte, b'0' | b'1'),
+            8 => matches!(byte, b'0'..=b'7'),
+            10 => byte.is_ascii_digit(),
+            16 => byte.is_ascii_hexdigit(),
+            _ => false,
+        })
 }
 
 // ---------------------------------------------------------------------------
