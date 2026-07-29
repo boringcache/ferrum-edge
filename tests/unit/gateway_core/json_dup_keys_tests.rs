@@ -654,7 +654,7 @@ fn memo_screens_small_bodies_directly() {
     assert!(memo.ambiguity_str(r#"{"a":1}"#).is_none());
 }
 
-/// Bodies above [`GOVERNED_JSON_LIMITS::max_bytes`] are refused as `TooLarge`
+/// Bodies above the governed JSON byte limit are refused as `TooLarge`
 /// before hashing or touching the memo, so hostile oversize payloads cannot
 /// force a full SHA-256 pass or retain a useless cache entry.
 #[test]
@@ -666,11 +666,7 @@ fn memo_refuses_oversized_bodies_without_hashing_or_caching() {
     let count_after_clean = ferrum_edge::_test_support::json_scan_memo_entry_count_for_test(&memo);
     assert_eq!(count_after_clean, 1);
 
-    let mut oversized = Vec::with_capacity(GOVERNED_JSON_LIMITS.max_bytes + 1);
-    // SAFETY: the memo path refuses on `len()` alone; these bytes are never read.
-    unsafe {
-        oversized.set_len(GOVERNED_JSON_LIMITS.max_bytes + 1);
-    }
+    let oversized = vec![0_u8; GOVERNED_JSON_LIMITS.max_bytes + 1];
     assert!(oversized.len() >= JsonScanMemo::MIN_MEMO_BYTES);
     assert!(oversized.len() > GOVERNED_JSON_LIMITS.max_bytes);
     assert_eq!(
