@@ -7401,14 +7401,10 @@ mod tests {
 
     #[test]
     fn telemetry_environment_custom_tag_does_not_resolve_controller_host_env() {
-        // SAFETY: this test is single-threaded — `mod tests` here doesn't
-        // touch `FERRUM_TEST_TELEMETRY_ENV_TAG` from any other thread, so
-        // the Rust 2024 unsafe contract on `set_var` is satisfied. We do not
-        // unset because the assertion is that the translation IGNORES it.
-        unsafe {
-            std::env::set_var("FERRUM_TEST_TELEMETRY_ENV_TAG", "live-env-value");
-        }
-
+        // Structural proof only: the translator carries `defaultValue` plus a
+        // typed `custom_env_tags` lookup and never reads process environment.
+        // Do not mutate the process environment — Rust 2024 forbids unsynchronized
+        // `set_var` under the parallel test harness, and host env is not the DP.
         let result = translate_k8s_objects(
             &[object(
                 "Telemetry",
@@ -7444,6 +7440,13 @@ mod tests {
         assert_eq!(
             tracing.custom_env_tags.get("env_tag").map(String::as_str),
             Some("FERRUM_TEST_TELEMETRY_ENV_TAG")
+        );
+        assert!(
+            tracing
+                .custom_tags
+                .values()
+                .all(|value| value != "live-env-value"),
+            "translated literals must stay at defaultValue, never a host env read"
         );
     }
 

@@ -5131,4 +5131,19 @@ pub mod _test_support {
     ) -> (std::net::SocketAddr, Arc<str>) {
         crate::http3::server::h3_client_identity(addr)
     }
+
+    /// Construct `workload_metrics` with an injected environment lookup so
+    /// external tests can exercise `custom_env_tags` present/missing/empty/
+    /// oversized/non-Unicode outcomes without mutating process environment.
+    pub fn workload_metrics_new_with_env_lookup_for_test<F>(
+        config: &serde_json::Value,
+        env_lookup: F,
+    ) -> Result<crate::plugins::mesh::workload_metrics::WorkloadMetrics, String>
+    where
+        F: FnMut(&str) -> Result<String, std::env::VarError>,
+    {
+        crate::plugins::mesh::workload_metrics::WorkloadMetrics::new_with_env_lookup_for_test(
+            config, env_lookup,
+        )
+    }
 }

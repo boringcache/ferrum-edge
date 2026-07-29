@@ -631,11 +631,6 @@ async fn k8s_telemetry_header_default_is_fallback_and_present_header_wins() {
 #[tokio::test]
 async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
     const ENV_VAR: &str = "FERRUM_TEST_TELEMETRY_DP_ENV_TAG";
-    // SAFETY: test-local env mutation; this integration file does not race
-    // other threads on ENV_VAR.
-    unsafe {
-        std::env::remove_var(ENV_VAR);
-    }
 
     let translation = translate_k8s_objects(
         &[telemetry(json!({
@@ -682,10 +677,15 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
         Some("FERRUM_TEST_TELEMETRY_DP_ENV_TAG_MISSING")
     );
 
-    let missing_plugin = WorkloadMetrics::new(&json!({
-        "custom_tags": tracing.custom_tags,
-        "custom_env_tags": tracing.custom_env_tags,
-    }))
+    // Translator must not resolve controller-host environment: only typed
+    // lookups + optional defaults are carried for DP construction/reload.
+    let missing_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": tracing.custom_tags,
+            "custom_env_tags": tracing.custom_env_tags,
+        }),
+        |_| Err(std::env::VarError::NotPresent),
+    )
     .expect("missing DP env keeps default / omits tag");
 
     let mut missing_ctx =
@@ -703,17 +703,23 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
     );
     assert!(!missing_ctx.metadata.contains_key("region"));
 
-    unsafe {
-        std::env::set_var(ENV_VAR, "live-cluster");
-    }
-    let present_plugin = WorkloadMetrics::new(&json!({
-        "custom_tags": {
-            "cluster": "fallback-cluster"
+    let present_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": {
+                "cluster": "fallback-cluster"
+            },
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok("live-cluster".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
         },
-        "custom_env_tags": {
-            "cluster": ENV_VAR
-        },
-    }))
+    )
     .expect("present DP env overrides default at construction/reload");
 
     let mut present_ctx =
@@ -729,17 +735,23 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
         Some("live-cluster")
     );
 
-    unsafe {
-        std::env::set_var(ENV_VAR, "");
-    }
-    let empty_plugin = WorkloadMetrics::new(&json!({
-        "custom_tags": {
-            "cluster": "fallback-cluster"
+    let empty_plugin = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_tags": {
+                "cluster": "fallback-cluster"
+            },
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok(String::new())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
         },
-        "custom_env_tags": {
-            "cluster": ENV_VAR
-        },
-    }))
+    )
     .expect("empty but present env value is a resolved value");
     let mut empty_ctx =
         RequestContext::new("10.0.0.2".to_string(), "GET".to_string(), "/".to_string());
@@ -754,14 +766,20 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
         Some("")
     );
 
-    unsafe {
-        std::env::set_var(ENV_VAR, "x".repeat(1025));
-    }
-    let oversized = WorkloadMetrics::new(&json!({
-        "custom_env_tags": {
-            "cluster": ENV_VAR
+    let oversized = ferrum_edge::_test_support::workload_metrics_new_with_env_lookup_for_test(
+        &json!({
+            "custom_env_tags": {
+                "cluster": ENV_VAR
+            },
+        }),
+        |name| {
+            if name == ENV_VAR {
+                Ok("x".repeat(1025))
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
         },
-    }));
+    );
     let oversized_err = oversized
         .err()
         .expect("oversized resolved env value fails closed");
@@ -771,10 +789,7 @@ async fn k8s_telemetry_environment_tag_resolves_on_data_plane_not_controller() {
     );
     // Do not assert the resolved secret/value appears in the error.
     assert!(!oversized_err.contains(&"x".repeat(32)));
-
-    unsafe {
-        std::env::remove_var(ENV_VAR);
-    }
+    assert!(!oversized_err.contains(ENV_VAR));
 }
 
 #[test]
