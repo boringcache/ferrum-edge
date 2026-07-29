@@ -579,6 +579,126 @@ async fn test_http2_pool_preserves_http1_downgrade_before_later_candidate_failur
 }
 
 #[tokio::test]
+async fn test_http2_pool_sni_override_skips_http1_candidate_for_later_h2() {
+    let (h2_listener, http1_listener, http1_ip, port) = bind_dual_loopback_listeners().await;
+    let http1_attempts = Arc::new(AtomicUsize::new(0));
+    let _http1_task = start_tls_backend_on_counted(
+        http1_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&http1_attempts)),
+    )
+    .await
+    .expect("start HTTP/1.1 TLS backend");
+    let _h2_task = start_tls_backend_on(
+        h2_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"h2".to_vec()],
+    )
+    .await
+    .expect("start H2 TLS backend");
+    let dns =
+        TestDnsServer::spawn(vec![IpAddr::V4(http1_ip), IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "multi-address-sni-h2.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+    let sender = pool.get_sender(&proxy).await;
+    assert!(
+        sender.is_ok(),
+        "SNI route should continue to the healthy H2 candidate: {:?}",
+        sender.err()
+    );
+    assert_eq!(
+        http1_attempts.load(Ordering::Relaxed),
+        1,
+        "the HTTP/1.1 candidate should be attempted before H2 failover"
+    );
+}
+
+/// The SNI candidate scan must stay fail-closed once every DNS answer proves
+/// HTTP/1.1: the loop now routes the downgrade through the *error* channel, so
+/// exhaustion has to keep propagating `BackendSelectedHttp1` verbatim rather
+/// than collapsing into a generic `BackendUnavailable`. The dispatcher branches
+/// on that exact variant to emit the SNI-requires-direct-H2 response and to
+/// downgrade the cached backend capability, so a change here would silently
+/// alter both.
+#[tokio::test]
+async fn test_http2_pool_sni_override_exhausts_all_http1_candidates() {
+    let (second_listener, first_listener, first_ip, port) = bind_dual_loopback_listeners().await;
+    let first_attempts = Arc::new(AtomicUsize::new(0));
+    let second_attempts = Arc::new(AtomicUsize::new(0));
+    let _first_task = start_tls_backend_on_counted(
+        first_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&first_attempts)),
+    )
+    .await
+    .expect("start first HTTP/1.1 TLS backend");
+    let _second_task = start_tls_backend_on_counted(
+        second_listener,
+        include_str!("../certs/server.crt"),
+        include_str!("../certs/server.key"),
+        vec![b"http/1.1".to_vec()],
+        Some(Arc::clone(&second_attempts)),
+    )
+    .await
+    .expect("start second HTTP/1.1 TLS backend");
+    let dns =
+        TestDnsServer::spawn(vec![IpAddr::V4(first_ip), IpAddr::V4(Ipv4Addr::LOCALHOST)]).await;
+    let pool = Http2ConnectionPool::new(
+        PoolConfig::default(),
+        ferrum_edge::config::EnvConfig::default(),
+        multi_address_dns_cache(dns.addr),
+        None,
+        Arc::new(Vec::new()),
+    );
+    let mut proxy = create_test_proxy();
+    proxy.backend_host = "all-http1-sni.test".to_string();
+    proxy.backend_port = port;
+    proxy.backend_connect_timeout_ms = 3_000;
+    proxy.backend_tls_verify_server_cert = false;
+    proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+
+    match pool.get_sender(&proxy).await {
+        Err(Http2PoolError::BackendSelectedHttp1 { pool_key }) => {
+            assert!(
+                pool_key.contains("all-http1-sni.test"),
+                "exhausted SNI downgrade must retain the direct-H2 pool key, got: {pool_key}"
+            );
+        }
+        Err(error) => panic!(
+            "exhausting every HTTP/1.1 candidate must still report the downgrade, got: {error}"
+        ),
+        Ok(_) => panic!("HTTP/1.1-only candidates must not produce a direct-H2 sender"),
+    }
+    assert_eq!(
+        first_attempts.load(Ordering::Relaxed),
+        1,
+        "the first HTTP/1.1 candidate must be attempted exactly once"
+    );
+    assert_eq!(
+        second_attempts.load(Ordering::Relaxed),
+        1,
+        "the SNI scan must continue past the first HTTP/1.1 candidate to the second"
+    );
+}
+
+#[tokio::test]
 async fn test_grpc_h2c_pool_fails_over_after_tcp_success_but_h2_failure() {
     let (healthy_listener, failing_listener, failing_ip, port) =
         bind_dual_loopback_listeners().await;

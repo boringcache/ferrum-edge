@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::types::OPENAPI_VALIDATOR_DEFAULT_CONTENT_TYPES;
+use crate::util::media_type::is_concrete_http_media_type;
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::utils::content_encoding::{DecodeLimits, decode_content_encoding};
@@ -82,25 +83,28 @@ const REQUEST_BODY_CONTENT_KEYS: &[&str] = &["content"];
 const MEDIA_TYPE_OBJECT_KEYS: &[&str] = &["schema", "encoding"];
 /// Fixed fields retained on a generated response object that carries `content`.
 const RESPONSE_OBJECT_KEYS: &[&str] = &["description", "content"];
-/// OpenAPI Header Object fields accepted inside request-body Encoding Objects.
-///
-/// A Header Object is distinguished from the supported bare-schema form by its
-/// `schema` or `content` field. Once that wrapper shape is selected, it is a
-/// fixed-field object: accepting a misspelled `required` would silently make a
-/// required multipart header optional.
-const ENCODING_HEADER_OBJECT_KEYS: &[&str] = &[
+/// Schema-form Header Object fields. `style`/`explode`/`example`/`examples`
+/// apply only when `schema` is selected. Common fields (`description`,
+/// `required`, `deprecated`) are included here and in the content-form set.
+const ENCODING_HEADER_OBJECT_SCHEMA_KEYS: &[&str] = &[
     "description",
     "required",
     "deprecated",
-    "allowEmptyValue",
     "style",
     "explode",
-    "allowReserved",
     "schema",
     "example",
     "examples",
-    "content",
 ];
+
+/// Content-form Header Object fields. Examples belong on the Media Type Object
+/// inside `content`, not on the Header Object itself.
+const ENCODING_HEADER_OBJECT_CONTENT_KEYS: &[&str] =
+    &["description", "required", "deprecated", "content"];
+
+/// Parameter-location fields that OpenAPI forbids on Header Objects
+/// (`allowEmptyValue` is query-only; `allowReserved` is query-only).
+const ENCODING_HEADER_OBJECT_INVALID_KEYS: &[&str] = &["allowEmptyValue", "allowReserved"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnforcementMode {
@@ -343,6 +347,11 @@ struct EncodingHeaderValidator {
     /// Precomputed at admission so header scalar conversion never re-walks.
     schema_types: SchemaTypeSet,
     validator: jsonschema::Validator,
+    /// When set, the header value is decoded as this single Media Type Object
+    /// media type before schema validation (OpenAPI Header Object `content`).
+    content_media_type: Option<String>,
+    /// Conversion plan for structured `content` decoding (JSON/XML/text/…).
+    conversion: ConversionPlan,
 }
 
 /// Hostile-input caps for multipart parsing (RFC 2046 / RFC 7578).
@@ -1929,84 +1938,135 @@ fn parse_property_encoding(
             let is_header_object = header_object.is_some_and(|object| {
                 object.contains_key("schema") || object.contains_key("content")
             });
-            if is_header_object && let Some(header_object) = header_object {
+            let (schema_value, content_media_type, required) = if is_header_object {
+                let header_object = header_object.ok_or_else(|| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] must be a Header Object"
+                    )
+                })?;
+                let header_path = format!("encoding['{property}'].headers['{header_name}']");
+                let has_schema = header_object.contains_key("schema");
+                let has_content = header_object.contains_key("content");
+                if has_schema && has_content {
+                    return Err(format!(
+                        "{header_path} must not declare both schema and content"
+                    ));
+                }
+                if !has_schema && !has_content {
+                    return Err(format!("{header_path} must contain schema or content"));
+                }
+                for key in ENCODING_HEADER_OBJECT_INVALID_KEYS {
+                    if header_object.contains_key(*key) {
+                        return Err(format!(
+                            "{header_path}.{key} is not valid for Header Objects"
+                        ));
+                    }
+                }
+                if has_content {
+                    for key in ["style", "explode", "example", "examples", "schema"] {
+                        if header_object.contains_key(key) {
+                            return Err(format!(
+                                "{header_path}.{key} is a schema-form Header Object field and is not valid with content"
+                            ));
+                        }
+                    }
+                }
+                // Keep spelling suggestions for near-miss keys on the selected form.
                 reject_unknown_keys(
                     header_object,
-                    &format!("encoding['{property}'].headers['{header_name}']"),
-                    ENCODING_HEADER_OBJECT_KEYS,
+                    &header_path,
+                    if has_content {
+                        ENCODING_HEADER_OBJECT_CONTENT_KEYS
+                    } else {
+                        ENCODING_HEADER_OBJECT_SCHEMA_KEYS
+                    },
                     ERROR_PREFIX,
                 )?;
                 if let Some(description) = header_object.get("description")
                     && !description.is_null()
                     && !description.is_string()
                 {
-                    return Err(format!(
-                        "encoding['{property}'].headers['{header_name}'].description must be a string"
-                    ));
+                    return Err(format!("{header_path}.description must be a string"));
                 }
-                for key in ["deprecated", "allowEmptyValue", "allowReserved"] {
-                    if let Some(value) = header_object.get(key)
-                        && !value.is_boolean()
-                    {
-                        return Err(format!(
-                            "encoding['{property}'].headers['{header_name}'].{key} must be a boolean"
-                        ));
-                    }
-                }
-                if let Some(examples) = header_object.get("examples")
-                    && !examples.is_object()
+                if let Some(deprecated) = header_object.get("deprecated")
+                    && !deprecated.is_boolean()
                 {
-                    return Err(format!(
-                        "encoding['{property}'].headers['{header_name}'].examples must be an object"
-                    ));
+                    return Err(format!("{header_path}.deprecated must be a boolean"));
                 }
-            }
-            let required = if is_header_object {
-                match header_object.and_then(|object| object.get("required")) {
+                let required = match header_object.get("required") {
                     None => false,
                     Some(Value::Bool(value)) => *value,
                     Some(_) => {
+                        return Err(format!("{header_path}.required must be a boolean"));
+                    }
+                };
+                if has_content {
+                    let content_object = header_object
+                        .get("content")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| format!("{header_path}.content must be an object"))?;
+                    if content_object.len() != 1 {
                         return Err(format!(
-                            "encoding['{property}'].headers['{header_name}'].required must be a boolean"
+                            "{header_path}.content must contain exactly one media type"
                         ));
                     }
+                    let (media_type, media_value) =
+                        content_object.iter().next().ok_or_else(|| {
+                            format!("{header_path}.content must contain exactly one media type")
+                        })?;
+                    let media_path = format!("{header_path}.content['{media_type}']");
+                    validate_concrete_media_type(media_type, &media_path)?;
+                    let media_base = normalize_media_type(media_type);
+                    if media_base == "multipart/form-data" {
+                        return Err(format!("{media_path} does not support multipart/form-data"));
+                    }
+                    let media_object = media_value
+                        .as_object()
+                        .ok_or_else(|| format!("{media_path} must be a Media Type Object"))?;
+                    reject_unknown_keys(
+                        media_object,
+                        &media_path,
+                        &["schema", "example", "examples"],
+                        ERROR_PREFIX,
+                    )?;
+                    if let Some(examples) = media_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(format!("{media_path}.examples must be an object"));
+                    }
+                    if media_object.contains_key("example") && media_object.contains_key("examples")
+                    {
+                        return Err(format!(
+                            "{media_path}.example and .examples are mutually exclusive"
+                        ));
+                    }
+                    let schema = media_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{media_path} must contain schema"))?;
+                    (schema, Some(media_base), required)
+                } else {
+                    if let Some(style) = header_object.get("style")
+                        && style.as_str() != Some("simple")
+                    {
+                        return Err(format!("{header_path}.style must be 'simple'"));
+                    }
+                    if let Some(explode) = header_object.get("explode")
+                        && !explode.is_boolean()
+                    {
+                        return Err(format!("{header_path}.explode must be a boolean"));
+                    }
+                    if let Some(examples) = header_object.get("examples")
+                        && !examples.is_object()
+                    {
+                        return Err(format!("{header_path}.examples must be an object"));
+                    }
+                    let schema = header_object
+                        .get("schema")
+                        .ok_or_else(|| format!("{header_path} must contain schema or content"))?;
+                    (schema, None, required)
                 }
             } else {
-                true
-            };
-            if is_header_object
-                && header_object.is_some_and(|object| object.contains_key("content"))
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].content is not supported; use a schema Header Object"
-                ));
-            }
-            if is_header_object
-                && let Some(style) = header_object.and_then(|object| object.get("style"))
-                && style.as_str() != Some("simple")
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].style must be 'simple'"
-                ));
-            }
-            if is_header_object
-                && let Some(explode) = header_object.and_then(|object| object.get("explode"))
-                && !explode.is_boolean()
-            {
-                return Err(format!(
-                    "encoding['{property}'].headers['{header_name}'].explode must be a boolean"
-                ));
-            }
-            let schema_value = if is_header_object {
-                header_object
-                    .and_then(|object| object.get("schema"))
-                    .ok_or_else(|| {
-                        format!(
-                            "encoding['{property}'].headers['{header_name}'] must contain schema"
-                        )
-                    })?
-            } else {
-                header_schema
+                (header_schema, None, true)
             };
             let validator = compile_schema(schema_value, schema_draft).map_err(|error| {
                 format!(
@@ -2014,6 +2074,12 @@ fn parse_property_encoding(
                 )
             })?;
             let schema_types = collect_schema_types(schema_value);
+            let conversion =
+                ConversionPlan::compile(schema_value, schema_draft).map_err(|error| {
+                    format!(
+                        "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
+                    )
+                })?;
             headers.insert(
                 name,
                 EncodingHeaderValidator {
@@ -2021,6 +2087,8 @@ fn parse_property_encoding(
                     schema: schema_value.clone(),
                     schema_types,
                     validator,
+                    content_media_type,
+                    conversion,
                 },
             );
         }
@@ -3573,6 +3641,39 @@ fn multipart_values_to_schema_value(
     multipart_part_to_schema_value(first, schema, encoding, conversion)
 }
 
+/// Decode an Encoding Object Header Object `content` value under the existing
+/// multipart header-size ceiling, then materialize a JSON Schema instance.
+fn header_content_to_schema_value(
+    value: &str,
+    media_type: &str,
+    schema: &Value,
+    conversion: &ConversionPlan,
+) -> Result<Value, String> {
+    if value.len() > MAX_MULTIPART_HEADER_BYTES {
+        return Err(format!(
+            "header content exceeds {MAX_MULTIPART_HEADER_BYTES} bytes"
+        ));
+    }
+    let media_type = media_type.to_ascii_lowercase();
+    if is_json_media_type(&media_type) {
+        return serde_json::from_str(value)
+            .map_err(|error| format!("Invalid JSON header content: {error}"));
+    }
+    if is_xml_media_type(&media_type) {
+        return xml_body_to_value(value, schema, conversion);
+    }
+    if media_type == "application/x-www-form-urlencoded" {
+        return form_urlencoded_to_value(value, schema, &AHashMap::new(), conversion);
+    }
+    if is_text_media_type(&media_type) {
+        return scalar_to_schema_value(value, schema, conversion);
+    }
+    match binary_body_to_schema_instance(value.as_bytes(), schema)? {
+        SchemaInstance::Value(instance) => Ok(instance),
+        SchemaInstance::BinaryLengthOnly => Ok(Value::String(value.to_string())),
+    }
+}
+
 fn multipart_part_to_schema_value(
     part: &MultipartPart,
     schema: &Value,
@@ -3604,12 +3705,34 @@ fn multipart_part_to_schema_value(
                 }
                 continue;
             };
-            let converted = scalar_to_schema_value_with_types(
-                header_value,
-                &header_validator.schema,
-                header_validator.schema_types,
-                schema_is_composed(&header_validator.schema).then_some(&header_validator.validator),
-            )?;
+            if header_value.len() > MAX_MULTIPART_HEADER_BYTES {
+                return Err(format!(
+                    "Multipart field '{}' header '{header_name}' exceeds {MAX_MULTIPART_HEADER_BYTES} bytes",
+                    part.name
+                ));
+            }
+            let converted = if let Some(media_type) = &header_validator.content_media_type {
+                header_content_to_schema_value(
+                    header_value,
+                    media_type,
+                    &header_validator.schema,
+                    &header_validator.conversion,
+                )
+                .map_err(|error| {
+                    format!(
+                        "Multipart field '{}' header '{header_name}' failed content decoding: {error}",
+                        part.name
+                    )
+                })?
+            } else {
+                scalar_to_schema_value_with_types(
+                    header_value,
+                    &header_validator.schema,
+                    header_validator.schema_types,
+                    schema_is_composed(&header_validator.schema)
+                        .then_some(&header_validator.validator),
+                )?
+            };
             header_validator
                 .validator
                 .validate(&converted)
@@ -4347,11 +4470,7 @@ fn validate_concrete_media_type(value: &str, path: &str) -> Result<(), String> {
             "{ERROR_PREFIX}'{path}' must be a valid HTTP header value"
         ));
     }
-    let base = value.split(';').next().unwrap_or("").trim();
-    let Some((type_, subtype)) = base.split_once('/') else {
-        return Err(format!("{ERROR_PREFIX}'{path}' must be a media type"));
-    };
-    if type_ == "*" || subtype == "*" || !is_mime_token(type_) || !is_mime_token(subtype) {
+    if !is_concrete_http_media_type(value) {
         return Err(format!(
             "{ERROR_PREFIX}'{path}' must be a concrete media type"
         ));
@@ -4806,6 +4925,8 @@ fn reject_filename_injection(filename: &str) -> Result<(), String> {
 }
 
 /// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.
+/// Retained for multipart Content-Type parameter names/values (including
+/// boundary) where the historical MIME token grammar still applies.
 fn is_mime_token(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(is_mime_token_char)
 }
