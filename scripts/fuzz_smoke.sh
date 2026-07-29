@@ -2,7 +2,7 @@
 # Deterministic smoke lane for hosted CI: property checks plus a short libFuzzer budget.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../fuzz" && pwd)"
 cd "$ROOT"
 
 export CARGO_TERM_COLOR=always

@@ -3529,7 +3529,6 @@ jobs:
           shared-key: fuzz-smoke
 
       - name: Run deterministic fuzz smoke lane
-        working-directory: fuzz
         run: bash scripts/fuzz_smoke.sh
 
   build-ebpf:
