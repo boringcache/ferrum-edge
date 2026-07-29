@@ -253,6 +253,7 @@ impl NamespaceConfigAdmissionGuard {
     /// Test-only: mark the lease invalid so [`Self::ensure_held`] and
     /// [`Self::run_to_completion_while_held`] observe loss without waiting for
     /// the production renewer / TTL.
+    #[allow(dead_code)]
     pub(crate) fn force_lose_for_test(&self) {
         self.valid.store(false, Ordering::Release);
         self.valid_until_millis.store(0, Ordering::Release);

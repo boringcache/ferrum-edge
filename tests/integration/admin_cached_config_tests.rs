@@ -3452,7 +3452,6 @@ async fn backup_api_specs_fails_closed_when_admission_lease_cannot_be_acquired()
 
 #[tokio::test]
 async fn backup_admission_lease_loss_is_observed_fail_closed() {
-    let tc = TestConfig::default();
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("backup_loss.db");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
