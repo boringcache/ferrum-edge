@@ -7994,6 +7994,12 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
     );
     assert_eq!(schema["properties"]["max_scan_bytes"]["minimum"], 1);
     assert_eq!(schema["properties"]["max_completion_length"]["minimum"], 0);
+    assert_eq!(
+        schema["properties"]["grpc"]["properties"]["methods"]["propertyNames"]["pattern"],
+        json!(
+            r"^\s*/?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*/[A-Za-z_][A-Za-z0-9_]*\s*$"
+        )
+    );
     for pointer in [
         "/properties/blocked_phrases/items/minLength",
         "/properties/required_fields/items/minLength",
@@ -8024,6 +8030,22 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         json!({"required_fields": ["x"]}),
         json!({"custom_pii_patterns": [{"name": "x", "regex": "x"}]}),
         json!({"blocked_patterns": [{"name": "x", "regex": "x"}]}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/etc/ferrum/d.bin",
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/etc/ferrum/d.bin",
+                "max_message_bytes": 1024,
+                "max_messages": 4,
+                "methods": {"/a.B/C": {"response_type": "a.R", "text_fields": ["x.y"]}}
+            }
+        }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &valid, true);
     }
@@ -8044,6 +8066,103 @@ fn ai_response_guard_schema_matches_strict_runtime_constraints() {
         }),
         json!({
             "blocked_patterns": [{"name": "x", "regex": "x", "enabled": true}]
+        }),
+        // gRPC block is closed and both of its required fields are load-bearing.
+        json!({"pii_patterns": ["email"], "grpc": {}}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"methods": {"/a.B/C": {"response_type": "a.R"}}}
+        }),
+        json!({"pii_patterns": ["email"], "grpc": {"descriptor_path": "/d.bin"}}),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {"descriptor_path": "/d.bin", "methods": {}}
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "method": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"response_type": "a.R", "fields": ["x"]}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"text_fields": ["x"]}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "max_messages": 0,
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a..B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/1Service/Method": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C?x=1": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"not-a-path": {"response_type": "a.R"}}
+            }
+        }),
+        // Runtime trims these three string surfaces and rejects an empty
+        // result. The published schema must not advertise whitespace-only
+        // values as admissible.
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": " \t ",
+                "methods": {"/a.B/C": {"response_type": "a.R"}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {"/a.B/C": {"response_type": "\n "}}
+            }
+        }),
+        json!({
+            "pii_patterns": ["email"],
+            "grpc": {
+                "descriptor_path": "/d.bin",
+                "methods": {
+                    "/a.B/C": {
+                        "response_type": "a.R",
+                        "text_fields": [" \r\n "]
+                    }
+                }
+            }
         }),
     ] {
         assert_component_validity(&spec, "AiResponseGuardConfig", &invalid, false);

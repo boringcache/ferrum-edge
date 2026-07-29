@@ -8445,7 +8445,12 @@ pub const REQUEST_BODY_BUFFERING_SCREEN_NO_CONSTRUCT: &[&str] = &[
 /// protobuf request/response *targets* come from the config shape, not from the
 /// descriptor file), so `Plugin::requires_request_body_buffering()` on the
 /// shape-only instance is the authoritative runtime answer.
-pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] = &["body_validator"];
+///
+/// `ai_response_guard` is here for the same reason: its runtime constructor
+/// reads the `grpc.descriptor_path` `FileDescriptorSet`, while its request-body
+/// answer is the trait default and never depends on that file.
+pub const REQUEST_BODY_BUFFERING_SCREEN_SHAPE_ONLY: &[&str] =
+    &["ai_response_guard", "body_validator"];
 
 /// Why the request-body-buffering screen could not evaluate a plugin config.
 ///
@@ -8584,6 +8589,8 @@ impl RequestBodyBufferingScreener {
     /// through its shape-only constructor.
     fn screen_shape_only(plugin_name: &str, config: &Value) -> RequestBodyBufferingScreen {
         let answer = match plugin_name {
+            "ai_response_guard" => ai_response_guard::AiResponseGuard::new_shape_only(config)
+                .map(|plugin| plugin.requires_request_body_buffering()),
             "body_validator" => body_validator::BodyValidator::new_shape_only(config)
                 .map(|plugin| plugin.requires_request_body_buffering()),
             // Unreachable today. A name added to the shape-only list without a
@@ -8646,6 +8653,12 @@ pub(crate) fn validate_plugin_config_with_http_client(
         // installed on data-plane nodes. Mode-aware dependency validation and
         // runtime construction handle the local FileDescriptorSet.
         return body_validator::BodyValidator::validate_config(config);
+    }
+    if name == "ai_response_guard" {
+        // Shape-only: CP/admin admission must not require gRPC descriptor
+        // files installed on data-plane nodes. Mode-aware dependency
+        // validation and runtime construction handle the FileDescriptorSet.
+        return ai_response_guard::AiResponseGuard::validate_config(config);
     }
     if name == "udp_logging" {
         // Shape-only: shared Admin / CP validation must not open node-local
