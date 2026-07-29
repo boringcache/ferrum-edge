@@ -347,8 +347,7 @@ fn validate_plugin_security_composition(plugins: &[Arc<dyn Plugin>]) -> Result<(
         }
 
         for response_cache in plugins.iter().filter(|plugin| {
-            plugin.supported_protocols().contains(&protocol)
-                && plugin.name() == "response_caching"
+            plugin.supported_protocols().contains(&protocol) && plugin.name() == "response_caching"
         }) {
             if let Some(transformer) = plugins.iter().find(|plugin| {
                 plugin.supported_protocols().contains(&protocol)

@@ -2963,9 +2963,7 @@ async fn handle_h3_request(
     // final pre-before_proxy representation empty.
     ctx.set_replay_request_body_empty_proven(
         before_proxy_body_requirements.required
-            && prebuffered_body_data
-                .as_ref()
-                .is_some_and(Vec::is_empty),
+            && prebuffered_body_data.as_ref().is_some_and(Vec::is_empty),
     );
 
     // before_proxy hooks — only clone headers if at least one plugin modifies them.
