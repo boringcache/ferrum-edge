@@ -2470,7 +2470,7 @@ mod virtual_service_cors {
         assert_eq!(
             config["allowed_origins"],
             serde_json::json!([
-                "https://a.example",
+                {"exact": "https://a.example"},
                 {"prefix": "https://app."},
                 {"regex": "https://.*"}
             ])
