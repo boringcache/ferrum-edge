@@ -1,0 +1,206 @@
+//! Bounded YAML anchor/alias expansion for API-spec ingestion (issue #3307).
+//!
+//! Specs may reuse shared response/schema fragments via YAML anchors and
+//! aliases. Expansion must stay deterministic under node, depth, alias-
+//! reference, expanded-byte, and work budgets, with cycle and undefined-alias
+//! detection, and must not admit an autodetection differential versus JSON.
+
+use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
+use serde_json::json;
+
+fn proxy_yaml(id: &str) -> String {
+    format!(
+        "x-ferrum-proxy:\n  id: {id}\n  backend_host: backend.internal\n  backend_port: 443\n"
+    )
+}
+
+#[test]
+fn shared_schema_anchor_expands_on_extract() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info:\n\
+           title: Alias Spec\n\
+           version: '1.0.0'\n\
+         components:\n\
+           schemas:\n\
+             ErrorBody: &ErrorBody\n\
+               type: object\n\
+               properties:\n\
+                 message:\n\
+                   type: string\n\
+         paths:\n\
+           /items:\n\
+             get:\n\
+               responses:\n\
+                 '500':\n\
+                   description: error\n\
+                   content:\n\
+                     application/json:\n\
+                       schema: *ErrorBody\n\
+         {}",
+        proxy_yaml("alias-proxy")
+    );
+    let (bundle, meta) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "alias-proxy");
+    assert_eq!(meta.title.as_deref(), Some("Alias Spec"));
+}
+
+#[test]
+fn alias_chain_expands_before_serde_conversion() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info:\n\
+           title: Chain\n\
+           version: '1.0.0'\n\
+         base: &base\n\
+           type: string\n\
+         mid: &mid\n\
+           allOf:\n\
+             - *base\n\
+         leaf: *mid\n\
+         {}",
+        proxy_yaml("chain-proxy")
+    );
+    let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "chain-proxy");
+}
+
+#[test]
+fn merge_key_expands_when_present() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info:\n\
+           title: Merge\n\
+           version: '1.0.0'\n\
+         defaults: &defaults\n\
+           backend_host: backend.internal\n\
+           backend_port: 443\n\
+         x-ferrum-proxy:\n\
+           <<: *defaults\n\
+           id: merge-proxy\n"
+    );
+    let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "merge-proxy");
+    assert_eq!(bundle.proxy.backend_host, "backend.internal");
+}
+
+#[test]
+fn undefined_alias_fails_closed() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info: *missing\n\
+         {}",
+        proxy_yaml("undef-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("undefined YAML alias")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn duplicate_anchor_fails_closed() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info:\n\
+           title: Dup\n\
+           version: '1.0.0'\n\
+         a: &same 1\n\
+         b: &same 2\n\
+         {}",
+        proxy_yaml("dup-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("duplicate YAML anchor")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn alias_cycle_fails_closed() {
+    let yaml = format!(
+        "openapi: '3.1.0'\n\
+         info:\n\
+           title: Cycle\n\
+           version: '1.0.0'\n\
+         loop: &loop\n\
+           next: *loop\n\
+         {}",
+        proxy_yaml("cycle-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("cycle")),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn alias_bomb_fails_closed_under_budgets() {
+    let yaml = format!(
+        "a: &a [1,2,3,4,5,6,7,8]\n\
+         b: &b [*a,*a,*a,*a,*a,*a,*a,*a]\n\
+         c: &c [*b,*b,*b,*b,*b,*b,*b,*b]\n\
+         d: &d [*c,*c,*c,*c,*c,*c,*c,*c]\n\
+         e: &e [*d,*d,*d,*d,*d,*d,*d,*d]\n\
+         f: &f [*e,*e,*e,*e,*e,*e,*e,*e]\n\
+         g: &g [*f,*f,*f,*f,*f,*f,*f,*f]\n\
+         openapi: '3.1.0'\n\
+         info: {{title: bomb, version: '1.0'}}\n\
+         {}",
+        proxy_yaml("bomb-proxy")
+    );
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            ExtractError::InvalidYaml(msg)
+                if msg.contains("limit") || msg.contains("exceeds")
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn json_and_yaml_literal_parity_without_aliases() {
+    let json = json!({
+        "openapi": "3.1.0",
+        "info": {"title": "Parity", "version": "1.0.0"},
+        "x-ferrum-proxy": {
+            "id": "parity-proxy",
+            "backend_host": "backend.internal",
+            "backend_port": 443
+        }
+    });
+    let yaml = "openapi: '3.1.0'\n\
+                info:\n\
+                  title: Parity\n\
+                  version: '1.0.0'\n\
+                x-ferrum-proxy:\n\
+                  id: parity-proxy\n\
+                  backend_host: backend.internal\n\
+                  backend_port: 443\n";
+    let (json_bundle, json_meta) = extract(
+        serde_json::to_vec(&json).unwrap().as_slice(),
+        Some(SpecFormat::Json),
+        "prod",
+    )
+    .unwrap();
+    let (yaml_bundle, yaml_meta) =
+        extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(json_bundle.proxy.id, yaml_bundle.proxy.id);
+    assert_eq!(json_meta.title, yaml_meta.title);
+    assert_eq!(json_meta.version, yaml_meta.version);
+}
+
+#[test]
+fn flow_style_autodetect_expands_aliases_under_same_budgets() {
+    let yaml = "{openapi: '3.1.0', info: &info {title: flow, version: '1.0'}, \
+                x-ferrum-proxy: {id: flow-proxy, backend_host: x.com, backend_port: 443}, \
+                reused: *info}";
+    let (bundle, meta) = extract(yaml.as_bytes(), None, "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "flow-proxy");
+    assert_eq!(meta.title.as_deref(), Some("flow"));
+}

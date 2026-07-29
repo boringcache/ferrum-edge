@@ -242,7 +242,7 @@ The following are rejected at parse time with a 400 error:
 
 **Body size limit**: controlled by `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25). Returns 413 when exceeded.
 
-**YAML alias expansion**: Ferrum rejects parsed YAML documents that exceed the expanded node budget, but `serde_yaml` performs alias expansion while parsing. Keep YAML submissions to trusted operator workflows; use JSON for very large generated specs or when you need the tightest memory bound.
+**YAML alias expansion**: YAML anchors and aliases are composed through a libyaml event graph and expanded deterministically under shared budgets (expanded nodes, nesting depth, alias references, expanded bytes, and expansion work) with cycle and undefined-alias detection. Expansion fails closed with field-specific diagnostics and never admits exponential alias bombs. JSON and YAML submissions share the same post-parse expanded-node cap so autodetection cannot weaken admission. Keep extremely large generated specs in JSON when you need the simplest wire form; modular YAML with finite alias reuse is supported.
 
 **MongoDB caveat**: the BSON document limit is 16 MiB. Since spec content is gzip-compressed before storage, a spec up to approximately 14–15 MiB compressed fits within the limit. Operators with larger specs should use a SQL backend (PostgreSQL, MySQL, or SQLite).
 

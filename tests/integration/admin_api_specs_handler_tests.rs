@@ -258,6 +258,21 @@ impl AdminClient {
         (status, val)
     }
 
+    async fn put_yaml(&self, path: &str, body: &str) -> (reqwest::StatusCode, Value) {
+        let resp = self
+            .client
+            .put(self.url(path))
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("content-type", "application/yaml")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let val: Value = resp.json().await.unwrap_or(json!(null));
+        (status, val)
+    }
+
     async fn put_json(&self, path: &str, body: &Value) -> (reqwest::StatusCode, Value) {
         let resp = self
             .client
@@ -6397,36 +6412,111 @@ async fn get_with_irrelevant_accept_returns_stored_format() {
     );
 }
 
-/// YAML with anchor/alias syntax must be rejected at parse time.
+/// YAML anchors/aliases expand under budgets on the live admin path, including
+/// PUT replacement and DELETE cascade (issue #3307).
 #[tokio::test]
-async fn post_yaml_with_anchor_alias_returns_400() {
+async fn yaml_anchor_alias_post_put_delete_roundtrip() {
     let dir = TempDir::new().unwrap();
     let store = make_store(&dir).await;
     let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
     let client = AdminClient::new(base);
 
-    let yaml_with_anchor = r#"openapi: "3.1.0"
+    let proxy_id = uid("proxy");
+    let yaml_with_anchor = format!(
+        r#"openapi: "3.1.0"
 info:
-  title: &title Bomb Test
+  title: &title Alias Live
   version: "1.0.0"
+components:
+  schemas:
+    SharedTitle:
+      type: string
+      default: *title
 x-ferrum-proxy:
-  id: anchor-test
+  id: {proxy_id}
   backend_host: backend.internal
   backend_port: 443
-  listen_path: /anchor-test
-alias_ref: *title
+  listen_path: /{proxy_id}
+"#
+    );
+
+    let (status, body) = client.post_yaml("/api-specs", &yaml_with_anchor).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "bounded YAML aliases must be accepted; body: {body}"
+    );
+    let spec_id = body["id"].as_str().expect("created spec id");
+    assert_eq!(body["title"].as_str(), Some("Alias Live"));
+
+    let updated = format!(
+        r#"openapi: "3.1.0"
+info:
+  title: &title Alias Updated
+  version: "1.1.0"
+x-ferrum-proxy:
+  id: {proxy_id}
+  backend_host: backend.internal
+  backend_port: 443
+  listen_path: /{proxy_id}
+copied: *title
+"#
+    );
+    let (put_status, put_body) = client
+        .put_yaml(&format!("/api-specs/{spec_id}"), &updated)
+        .await;
+    assert_eq!(
+        put_status,
+        reqwest::StatusCode::OK,
+        "PUT with aliases must succeed; body: {put_body}"
+    );
+    assert_eq!(put_body["title"].as_str(), Some("Alias Updated"));
+
+    let del_status = client.delete(&format!("/api-specs/{spec_id}")).await;
+    assert_eq!(del_status, reqwest::StatusCode::NO_CONTENT);
+
+    let (get_status, _, _) = client
+        .get_raw(&format!("/api-specs/{spec_id}"), None, None)
+        .await;
+    assert_eq!(get_status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Exponential YAML alias bombs must fail closed on the live admin path.
+#[tokio::test]
+async fn post_yaml_alias_bomb_returns_400() {
+    let dir = TempDir::new().unwrap();
+    let store = make_store(&dir).await;
+    let (base, _shutdown) = start_admin(make_admin_state(store, 25)).await;
+    let client = AdminClient::new(base);
+
+    let bomb = r#"a: &a [1,2,3,4,5,6,7,8]
+b: &b [*a,*a,*a,*a,*a,*a,*a,*a]
+c: &c [*b,*b,*b,*b,*b,*b,*b,*b]
+d: &d [*c,*c,*c,*c,*c,*c,*c,*c]
+e: &e [*d,*d,*d,*d,*d,*d,*d,*d]
+f: &f [*e,*e,*e,*e,*e,*e,*e,*e]
+g: &g [*f,*f,*f,*f,*f,*f,*f,*f]
+openapi: "3.1.0"
+info:
+  title: Bomb
+  version: "1.0.0"
+x-ferrum-proxy:
+  id: bomb-proxy
+  backend_host: backend.internal
+  backend_port: 443
+  listen_path: /bomb
 "#;
 
-    let (status, body) = client.post_yaml("/api-specs", yaml_with_anchor).await;
+    let (status, body) = client.post_yaml("/api-specs", bomb).await;
     assert_eq!(
         status,
         reqwest::StatusCode::BAD_REQUEST,
-        "YAML with anchor/alias must be rejected; body: {body}"
+        "alias bomb must be rejected; body: {body}"
     );
     let details = body["details"].as_str().unwrap_or("");
     assert!(
-        details.contains("anchor") || details.contains("alias"),
-        "error must mention anchor/alias; got: {details}"
+        details.contains("limit") || details.contains("exceeds"),
+        "error must mention a budget limit; got: {details}"
     );
 }
 

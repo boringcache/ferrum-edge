@@ -1,0 +1,945 @@
+//! Bounded YAML composition and alias expansion for API-spec ingestion.
+//!
+//! Parses YAML through libyaml events into an intermediate graph that preserves
+//! alias edges, then materializes a `serde_json::Value` under strict
+//! node / depth / alias-reference / expanded-byte / work budgets with cycle
+//! and undefined-alias detection. Expansion never shares JSON subtrees across
+//! alias sites, so exponential alias bombs fail closed before allocation grows
+//! unboundedly.
+
+use serde_json::{Map, Number, Value};
+use std::collections::{HashMap, HashSet};
+use std::mem::MaybeUninit;
+use std::ptr::{addr_of_mut, NonNull};
+use std::slice;
+use unsafe_libyaml as sys;
+
+/// Maximum nesting depth while composing and expanding YAML documents.
+pub(crate) const MAX_YAML_DEPTH: usize = 128;
+
+/// Maximum number of alias edges followed during expansion.
+pub(crate) const MAX_YAML_ALIAS_REFERENCES: usize = 500_000;
+
+/// Maximum approximate byte size of the expanded JSON tree.
+pub(crate) const MAX_YAML_EXPANDED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Maximum composition/expansion steps (event processing + node visits).
+pub(crate) const MAX_YAML_EXPANSION_WORK: usize = 2_000_000;
+
+/// Errors from bounded YAML parse/expand. Messages are field-oriented and must
+/// never echo secret scalar payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoundedYamlError {
+    Parse(String),
+    UndefinedAlias { name: String },
+    DuplicateAnchor { name: String },
+    Cycle { anchor: String },
+    DepthExceeded,
+    NodeLimitExceeded,
+    AliasReferenceLimitExceeded,
+    ExpandedByteLimitExceeded,
+    WorkLimitExceeded,
+    NonStringMappingKey,
+    UnsupportedTag { tag: String },
+    EmptyDocument,
+    NonFiniteNumber,
+}
+
+impl BoundedYamlError {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Parse(msg) => format!("YAML parse error: {msg}"),
+            Self::UndefinedAlias { name } => format!("undefined YAML alias '*{name}'"),
+            Self::DuplicateAnchor { name } => format!("duplicate YAML anchor '&{name}'"),
+            Self::Cycle { anchor } => {
+                format!("YAML alias cycle detected while expanding '&{anchor}'")
+            }
+            Self::DepthExceeded => "YAML document exceeds nesting depth limit".to_string(),
+            Self::NodeLimitExceeded => {
+                "YAML document exceeds expanded node limit; reduce nesting or alias reuse"
+                    .to_string()
+            }
+            Self::AliasReferenceLimitExceeded => {
+                "YAML document exceeds alias reference limit; reduce alias reuse".to_string()
+            }
+            Self::ExpandedByteLimitExceeded => {
+                "YAML document exceeds expanded byte limit; reduce alias reuse or document size"
+                    .to_string()
+            }
+            Self::WorkLimitExceeded => {
+                "YAML document exceeds expansion work limit; reduce alias reuse or nesting"
+                    .to_string()
+            }
+            Self::NonStringMappingKey => {
+                "YAML mapping keys must be strings for JSON conversion".to_string()
+            }
+            Self::UnsupportedTag { tag } => {
+                format!("unsupported YAML tag '{tag}' in API specs")
+            }
+            Self::EmptyDocument => "YAML document is empty".to_string(),
+            Self::NonFiniteNumber => {
+                "YAML non-finite numbers are not representable in JSON".to_string()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalarStyle {
+    Plain,
+    SingleQuoted,
+    DoubleQuoted,
+    Literal,
+    Folded,
+}
+
+#[derive(Debug)]
+enum NodeKind {
+    Scalar {
+        value: String,
+        style: ScalarStyle,
+        tag: Option<String>,
+    },
+    Sequence(Vec<usize>),
+    Mapping(Vec<(usize, usize)>),
+    /// Alias edge preserved until budgeted expansion.
+    Alias { target: usize, name: String },
+}
+
+struct Document {
+    nodes: Vec<NodeKind>,
+    /// Anchor name → node index (registered when the anchored node is allocated).
+    anchors: HashMap<String, usize>,
+    /// Node index → first anchor name that pointed at it (for cycle diagnostics).
+    anchor_names: HashMap<usize, String>,
+    root: Option<usize>,
+}
+
+struct Budgets {
+    max_nodes: usize,
+    nodes: usize,
+    depth: usize,
+    max_depth: usize,
+    alias_refs: usize,
+    max_alias_refs: usize,
+    bytes: usize,
+    max_bytes: usize,
+    work: usize,
+    max_work: usize,
+}
+
+impl Budgets {
+    fn charge_work(&mut self) -> Result<(), BoundedYamlError> {
+        self.work = self.work.saturating_add(1);
+        if self.work > self.max_work {
+            return Err(BoundedYamlError::WorkLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn enter_depth(&mut self) -> Result<(), BoundedYamlError> {
+        self.depth = self.depth.saturating_add(1);
+        if self.depth > self.max_depth {
+            return Err(BoundedYamlError::DepthExceeded);
+        }
+        Ok(())
+    }
+
+    fn leave_depth(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn charge_node(&mut self) -> Result<(), BoundedYamlError> {
+        self.nodes = self.nodes.saturating_add(1);
+        if self.nodes > self.max_nodes {
+            return Err(BoundedYamlError::NodeLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn charge_bytes(&mut self, n: usize) -> Result<(), BoundedYamlError> {
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > self.max_bytes {
+            return Err(BoundedYamlError::ExpandedByteLimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn charge_alias(&mut self) -> Result<(), BoundedYamlError> {
+        self.alias_refs = self.alias_refs.saturating_add(1);
+        if self.alias_refs > self.max_alias_refs {
+            return Err(BoundedYamlError::AliasReferenceLimitExceeded);
+        }
+        Ok(())
+    }
+}
+
+/// Parse `body` as a single YAML document and expand aliases into JSON under
+/// the given node budget (and the module's depth/alias/byte/work caps).
+pub(crate) fn parse_yaml_to_json(
+    body: &[u8],
+    max_nodes: usize,
+) -> Result<Value, BoundedYamlError> {
+    let document = compose_document(body, max_nodes)?;
+    let root = document.root.ok_or(BoundedYamlError::EmptyDocument)?;
+    let mut budgets = Budgets {
+        max_nodes,
+        nodes: 0,
+        depth: 0,
+        max_depth: MAX_YAML_DEPTH,
+        alias_refs: 0,
+        max_alias_refs: MAX_YAML_ALIAS_REFERENCES,
+        bytes: 0,
+        max_bytes: MAX_YAML_EXPANDED_BYTES,
+        work: 0,
+        max_work: MAX_YAML_EXPANSION_WORK,
+    };
+    let mut expanding = HashSet::new();
+    expand_node(&document, root, &mut budgets, &mut expanding)
+}
+
+// ---------------------------------------------------------------------------
+// Composition (event stream → alias-preserving graph)
+// ---------------------------------------------------------------------------
+
+enum Frame {
+    Sequence {
+        node: usize,
+    },
+    Mapping {
+        node: usize,
+        pending_key: Option<usize>,
+    },
+}
+
+fn compose_document(body: &[u8], max_nodes: usize) -> Result<Document, BoundedYamlError> {
+    let mut parser = Parser::new(body)?;
+    let mut document = Document {
+        nodes: Vec::new(),
+        anchors: HashMap::new(),
+        anchor_names: HashMap::new(),
+        root: None,
+    };
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut work = 0usize;
+    let mut seen_document = false;
+    let mut finished_document = false;
+
+    loop {
+        work = work.saturating_add(1);
+        if work > MAX_YAML_EXPANSION_WORK {
+            return Err(BoundedYamlError::WorkLimitExceeded);
+        }
+        if stack.len() > MAX_YAML_DEPTH {
+            return Err(BoundedYamlError::DepthExceeded);
+        }
+
+        let event = parser.next()?;
+        match event {
+            Event::StreamStart => {}
+            Event::DocumentStart => {
+                if seen_document {
+                    return Err(BoundedYamlError::Parse(
+                        "multi-document YAML streams are not supported in API specs".to_string(),
+                    ));
+                }
+                seen_document = true;
+            }
+            Event::StreamEnd => break,
+            Event::DocumentEnd => {
+                if !stack.is_empty() {
+                    return Err(BoundedYamlError::Parse(
+                        "unexpected document end inside collection".to_string(),
+                    ));
+                }
+                finished_document = true;
+            }
+            Event::Alias { name } => {
+                if finished_document {
+                    return Err(BoundedYamlError::Parse(
+                        "content after document end".to_string(),
+                    ));
+                }
+                let target = document
+                    .anchors
+                    .get(&name)
+                    .copied()
+                    .ok_or_else(|| BoundedYamlError::UndefinedAlias { name: name.clone() })?;
+                let id = alloc_node(
+                    &mut document,
+                    max_nodes,
+                    NodeKind::Alias {
+                        target,
+                        name: name.clone(),
+                    },
+                )?;
+                attach_child(&mut document, &mut stack, id)?;
+            }
+            Event::Scalar {
+                anchor,
+                tag,
+                value,
+                style,
+            } => {
+                if finished_document {
+                    return Err(BoundedYamlError::Parse(
+                        "content after document end".to_string(),
+                    ));
+                }
+                let id = alloc_node(
+                    &mut document,
+                    max_nodes,
+                    NodeKind::Scalar { value, style, tag },
+                )?;
+                register_anchor(&mut document, anchor, id)?;
+                attach_child(&mut document, &mut stack, id)?;
+            }
+            Event::SequenceStart { anchor } => {
+                if finished_document {
+                    return Err(BoundedYamlError::Parse(
+                        "content after document end".to_string(),
+                    ));
+                }
+                let id = alloc_node(&mut document, max_nodes, NodeKind::Sequence(Vec::new()))?;
+                // Register before children so self-referential aliases resolve.
+                register_anchor(&mut document, anchor, id)?;
+                attach_child(&mut document, &mut stack, id)?;
+                stack.push(Frame::Sequence { node: id });
+            }
+            Event::SequenceEnd => match stack.pop() {
+                Some(Frame::Sequence { .. }) => {}
+                _ => {
+                    return Err(BoundedYamlError::Parse(
+                        "unexpected sequence end".to_string(),
+                    ));
+                }
+            },
+            Event::MappingStart { anchor } => {
+                if finished_document {
+                    return Err(BoundedYamlError::Parse(
+                        "content after document end".to_string(),
+                    ));
+                }
+                let id = alloc_node(&mut document, max_nodes, NodeKind::Mapping(Vec::new()))?;
+                register_anchor(&mut document, anchor, id)?;
+                attach_child(&mut document, &mut stack, id)?;
+                stack.push(Frame::Mapping {
+                    node: id,
+                    pending_key: None,
+                });
+            }
+            Event::MappingEnd => match stack.pop() {
+                Some(Frame::Mapping {
+                    pending_key: None, ..
+                }) => {}
+                Some(Frame::Mapping {
+                    pending_key: Some(_),
+                    ..
+                }) => {
+                    return Err(BoundedYamlError::Parse(
+                        "mapping ended with unpaired key".to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(BoundedYamlError::Parse(
+                        "unexpected mapping end".to_string(),
+                    ));
+                }
+            },
+        }
+    }
+
+    if document.root.is_none() {
+        return Err(BoundedYamlError::EmptyDocument);
+    }
+    Ok(document)
+}
+
+fn alloc_node(
+    document: &mut Document,
+    max_nodes: usize,
+    kind: NodeKind,
+) -> Result<usize, BoundedYamlError> {
+    if document.nodes.len() >= max_nodes {
+        return Err(BoundedYamlError::NodeLimitExceeded);
+    }
+    let id = document.nodes.len();
+    document.nodes.push(kind);
+    Ok(id)
+}
+
+fn register_anchor(
+    document: &mut Document,
+    anchor: Option<String>,
+    id: usize,
+) -> Result<(), BoundedYamlError> {
+    let Some(name) = anchor else {
+        return Ok(());
+    };
+    if document.anchors.contains_key(&name) {
+        return Err(BoundedYamlError::DuplicateAnchor { name });
+    }
+    document.anchors.insert(name.clone(), id);
+    document.anchor_names.entry(id).or_insert(name);
+    Ok(())
+}
+
+fn attach_child(
+    document: &mut Document,
+    stack: &mut Vec<Frame>,
+    child: usize,
+) -> Result<(), BoundedYamlError> {
+    let Some(frame) = stack.last_mut() else {
+        if document.root.is_some() {
+            return Err(BoundedYamlError::Parse(
+                "multiple top-level YAML values are not supported".to_string(),
+            ));
+        }
+        document.root = Some(child);
+        return Ok(());
+    };
+    match frame {
+        Frame::Sequence { node } => {
+            let node = *node;
+            match document.nodes.get_mut(node) {
+                Some(NodeKind::Sequence(items)) => {
+                    items.push(child);
+                    Ok(())
+                }
+                _ => Err(BoundedYamlError::Parse(
+                    "internal sequence frame mismatch".to_string(),
+                )),
+            }
+        }
+        Frame::Mapping { node, pending_key } => {
+            if let Some(key) = *pending_key {
+                let node = *node;
+                match document.nodes.get_mut(node) {
+                    Some(NodeKind::Mapping(pairs)) => {
+                        pairs.push((key, child));
+                        *pending_key = None;
+                        Ok(())
+                    }
+                    _ => Err(BoundedYamlError::Parse(
+                        "internal mapping frame mismatch".to_string(),
+                    )),
+                }
+            } else {
+                *pending_key = Some(child);
+                Ok(())
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expansion (alias graph → JSON) with budgets + cycle detection
+// ---------------------------------------------------------------------------
+
+fn expand_node(
+    document: &Document,
+    id: usize,
+    budgets: &mut Budgets,
+    expanding: &mut HashSet<usize>,
+) -> Result<Value, BoundedYamlError> {
+    budgets.charge_work()?;
+    let kind = document
+        .nodes
+        .get(id)
+        .ok_or_else(|| BoundedYamlError::Parse("internal node index out of range".to_string()))?;
+
+    match kind {
+        NodeKind::Alias { target, name } => {
+            budgets.charge_alias()?;
+            if expanding.contains(target) {
+                let anchor = document
+                    .anchor_names
+                    .get(target)
+                    .cloned()
+                    .unwrap_or_else(|| name.clone());
+                return Err(BoundedYamlError::Cycle { anchor });
+            }
+            expand_node(document, *target, budgets, expanding)
+        }
+        NodeKind::Scalar { value, style, tag } => {
+            budgets.charge_node()?;
+            let json = scalar_to_json(value, *style, tag.as_deref())?;
+            charge_value_bytes(budgets, &json)?;
+            Ok(json)
+        }
+        NodeKind::Sequence(items) => {
+            if !expanding.insert(id) {
+                let anchor = document
+                    .anchor_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_string());
+                return Err(BoundedYamlError::Cycle { anchor });
+            }
+            budgets.enter_depth()?;
+            budgets.charge_node()?;
+            budgets.charge_bytes(2)?;
+            let mut out = Vec::with_capacity(items.len());
+            for child in items {
+                out.push(expand_node(document, *child, budgets, expanding)?);
+            }
+            budgets.leave_depth();
+            expanding.remove(&id);
+            Ok(Value::Array(out))
+        }
+        NodeKind::Mapping(pairs) => {
+            if !expanding.insert(id) {
+                let anchor = document
+                    .anchor_names
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| id.to_string());
+                return Err(BoundedYamlError::Cycle { anchor });
+            }
+            budgets.enter_depth()?;
+            budgets.charge_node()?;
+            budgets.charge_bytes(2)?;
+            let mut map = Map::new();
+            let mut merges: Vec<Value> = Vec::new();
+            for (key_id, value_id) in pairs {
+                let key_value = expand_node(document, *key_id, budgets, expanding)?;
+                let key = match key_value {
+                    Value::String(s) => s,
+                    _ => return Err(BoundedYamlError::NonStringMappingKey),
+                };
+                let value = expand_node(document, *value_id, budgets, expanding)?;
+                if key == "<<" {
+                    collect_merge_sources(value, &mut merges)?;
+                } else {
+                    budgets.charge_bytes(key.len())?;
+                    map.insert(key, value);
+                }
+            }
+            // YAML 1.1 merge keys: earlier merges lose to later merges and to
+            // explicit keys already present in `map`.
+            for merge in merges {
+                let Value::Object(merge_map) = merge else {
+                    return Err(BoundedYamlError::Parse(
+                        "YAML merge key '<<' must expand to a mapping or sequence of mappings"
+                            .to_string(),
+                    ));
+                };
+                for (k, v) in merge_map {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            budgets.leave_depth();
+            expanding.remove(&id);
+            Ok(Value::Object(map))
+        }
+    }
+}
+
+fn collect_merge_sources(value: Value, out: &mut Vec<Value>) -> Result<(), BoundedYamlError> {
+    match value {
+        Value::Object(_) => {
+            out.push(value);
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                match item {
+                    Value::Object(_) => out.push(item),
+                    _ => {
+                        return Err(BoundedYamlError::Parse(
+                            "YAML merge key '<<' sequence entries must be mappings".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Err(BoundedYamlError::Parse(
+            "YAML merge key '<<' must expand to a mapping or sequence of mappings".to_string(),
+        )),
+    }
+}
+
+fn charge_value_bytes(budgets: &mut Budgets, value: &Value) -> Result<(), BoundedYamlError> {
+    match value {
+        Value::Null => budgets.charge_bytes(4),
+        Value::Bool(_) => budgets.charge_bytes(5),
+        Value::Number(n) => budgets.charge_bytes(n.to_string().len()),
+        Value::String(s) => budgets.charge_bytes(s.len()),
+        Value::Array(_) | Value::Object(_) => Ok(()),
+    }
+}
+
+fn scalar_to_json(
+    value: &str,
+    style: ScalarStyle,
+    tag: Option<&str>,
+) -> Result<Value, BoundedYamlError> {
+    if let Some(tag) = tag {
+        if tag == "tag:yaml.org,2002:str" || tag == "!" {
+            return Ok(Value::String(value.to_owned()));
+        }
+        if tag == "tag:yaml.org,2002:null" {
+            return if parse_null(value.as_bytes()).is_some() {
+                Ok(Value::Null)
+            } else {
+                Err(BoundedYamlError::Parse(
+                    "invalid !!null scalar".to_string(),
+                ))
+            };
+        }
+        if tag == "tag:yaml.org,2002:bool" {
+            return parse_bool(value)
+                .map(Value::Bool)
+                .ok_or_else(|| BoundedYamlError::Parse("invalid !!bool scalar".to_string()));
+        }
+        if tag == "tag:yaml.org,2002:int" {
+            return int_to_json(value)
+                .ok_or_else(|| BoundedYamlError::Parse("invalid !!int scalar".to_string()));
+        }
+        if tag == "tag:yaml.org,2002:float" {
+            return float_to_json(value)?;
+        }
+        if tag.starts_with("tag:yaml.org,2002:") || tag.starts_with('!') {
+            // Non-core / local tags are not representable in OpenAPI JSON.
+            return Err(BoundedYamlError::UnsupportedTag {
+                tag: tag.to_owned(),
+            });
+        }
+        return Err(BoundedYamlError::UnsupportedTag {
+            tag: tag.to_owned(),
+        });
+    }
+
+    if style == ScalarStyle::Plain {
+        return untagged_plain_scalar(value);
+    }
+    Ok(Value::String(value.to_owned()))
+}
+
+fn untagged_plain_scalar(value: &str) -> Result<Value, BoundedYamlError> {
+    if value.is_empty() || parse_null(value.as_bytes()).is_some() {
+        return Ok(Value::Null);
+    }
+    if let Some(b) = parse_bool(value) {
+        return Ok(Value::Bool(b));
+    }
+    if let Some(n) = int_to_json(value) {
+        return Ok(n);
+    }
+    if !digits_but_not_number(value)
+        && let Some(n) = parse_f64(value)
+    {
+        return number_from_f64(n);
+    }
+    Ok(Value::String(value.to_owned()))
+}
+
+fn int_to_json(value: &str) -> Option<Value> {
+    if let Some(n) = parse_unsigned_int(value, u64::from_str_radix) {
+        return Some(Value::Number(Number::from(n)));
+    }
+    if let Some(n) = parse_negative_int(value, i64::from_str_radix) {
+        return Some(Value::Number(Number::from(n)));
+    }
+    None
+}
+
+fn float_to_json(value: &str) -> Result<Value, BoundedYamlError> {
+    let Some(n) = parse_f64(value) else {
+        return Err(BoundedYamlError::Parse(
+            "invalid !!float scalar".to_string(),
+        ));
+    };
+    number_from_f64(n)
+}
+
+fn number_from_f64(n: f64) -> Result<Value, BoundedYamlError> {
+    Number::from_f64(n)
+        .map(Value::Number)
+        .ok_or(BoundedYamlError::NonFiniteNumber)
+}
+
+fn parse_null(scalar: &[u8]) -> Option<()> {
+    match scalar {
+        b"null" | b"Null" | b"NULL" | b"~" => Some(()),
+        _ => None,
+    }
+}
+
+fn parse_bool(scalar: &str) -> Option<bool> {
+    match scalar {
+        "true" | "True" | "TRUE" => Some(true),
+        "false" | "False" | "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_unsigned_int<T>(
+    scalar: &str,
+    from_str_radix: fn(&str, radix: u32) -> Result<T, std::num::ParseIntError>,
+) -> Option<T> {
+    let unpositive = scalar.strip_prefix('+').unwrap_or(scalar);
+    if let Some(rest) = unpositive.strip_prefix("0x") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        return from_str_radix(rest, 16).ok();
+    }
+    if let Some(rest) = unpositive.strip_prefix("0o") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        return from_str_radix(rest, 8).ok();
+    }
+    if let Some(rest) = unpositive.strip_prefix("0b") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        return from_str_radix(rest, 2).ok();
+    }
+    if unpositive.starts_with(['+', '-']) {
+        return None;
+    }
+    if digits_but_not_number(scalar) {
+        return None;
+    }
+    from_str_radix(unpositive, 10).ok()
+}
+
+fn parse_negative_int<T>(
+    scalar: &str,
+    from_str_radix: fn(&str, radix: u32) -> Result<T, std::num::ParseIntError>,
+) -> Option<T> {
+    if let Some(rest) = scalar.strip_prefix("-0x") {
+        let negative = format!("-{rest}");
+        return from_str_radix(&negative, 16).ok();
+    }
+    if let Some(rest) = scalar.strip_prefix("-0o") {
+        let negative = format!("-{rest}");
+        return from_str_radix(&negative, 8).ok();
+    }
+    if let Some(rest) = scalar.strip_prefix("-0b") {
+        let negative = format!("-{rest}");
+        return from_str_radix(&negative, 2).ok();
+    }
+    if digits_but_not_number(scalar) {
+        return None;
+    }
+    if !scalar.starts_with('-') {
+        return None;
+    }
+    from_str_radix(scalar, 10).ok()
+}
+
+fn parse_f64(scalar: &str) -> Option<f64> {
+    let unpositive = if let Some(unpositive) = scalar.strip_prefix('+') {
+        if unpositive.starts_with(['+', '-']) {
+            return None;
+        }
+        unpositive
+    } else {
+        scalar
+    };
+    if matches!(unpositive, ".inf" | ".Inf" | ".INF") {
+        return Some(f64::INFINITY);
+    }
+    if matches!(scalar, "-.inf" | "-.Inf" | "-.INF") {
+        return Some(f64::NEG_INFINITY);
+    }
+    if matches!(scalar, ".nan" | ".NaN" | ".NAN") {
+        return Some(f64::NAN.copysign(1.0));
+    }
+    if let Ok(float) = unpositive.parse::<f64>()
+        && float.is_finite()
+    {
+        return Some(float);
+    }
+    None
+}
+
+fn digits_but_not_number(scalar: &str) -> bool {
+    let scalar = scalar.strip_prefix(['-', '+']).unwrap_or(scalar);
+    scalar.len() > 1 && scalar.starts_with('0') && scalar[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+// ---------------------------------------------------------------------------
+// libyaml event parser wrapper
+// ---------------------------------------------------------------------------
+
+enum Event {
+    StreamStart,
+    StreamEnd,
+    DocumentStart,
+    DocumentEnd,
+    Alias {
+        name: String,
+    },
+    Scalar {
+        anchor: Option<String>,
+        tag: Option<String>,
+        value: String,
+        style: ScalarStyle,
+    },
+    SequenceStart {
+        anchor: Option<String>,
+    },
+    SequenceEnd,
+    MappingStart {
+        anchor: Option<String>,
+    },
+    MappingEnd,
+}
+
+struct Parser {
+    sys: sys::yaml_parser_t,
+    /// Keep input alive for the parser's duration.
+    _input: Vec<u8>,
+}
+
+impl Parser {
+    fn new(input: &[u8]) -> Result<Self, BoundedYamlError> {
+        let mut owned = MaybeUninit::<sys::yaml_parser_t>::uninit();
+        let sys_ptr = owned.as_mut_ptr();
+        unsafe {
+            if sys::yaml_parser_initialize(sys_ptr).fail {
+                return Err(BoundedYamlError::Parse(
+                    "failed to initialize YAML parser".to_string(),
+                ));
+            }
+            let input = input.to_vec();
+            // Input pointer must remain valid for the parser lifetime.
+            let input_ptr = input.as_ptr();
+            let input_len = input.len() as u64;
+            // Leak prevention: store input in Self before setting; pointer stays
+            // valid because Vec is not moved after this once placed in Self.
+            let mut parser = Self {
+                sys: owned.assume_init(),
+                _input: input,
+            };
+            sys::yaml_parser_set_encoding(addr_of_mut!(parser.sys), sys::YAML_UTF8_ENCODING);
+            sys::yaml_parser_set_input_string(
+                addr_of_mut!(parser.sys),
+                parser._input.as_ptr(),
+                parser._input.len() as u64,
+            );
+            let _ = (input_ptr, input_len);
+            Ok(parser)
+        }
+    }
+
+    fn next(&mut self) -> Result<Event, BoundedYamlError> {
+        let mut event = MaybeUninit::<sys::yaml_event_t>::uninit();
+        unsafe {
+            let parser = addr_of_mut!(self.sys);
+            let event_ptr = event.as_mut_ptr();
+            // `yaml_parser_t` error detail fields are crate-private in
+            // unsafe-libyaml; fail closed with a non-secret generic diagnostic.
+            if sys::yaml_parser_parse(parser, event_ptr).fail {
+                return Err(BoundedYamlError::Parse(
+                    "malformed YAML document".to_string(),
+                ));
+            }
+            let converted = convert_event(&*event_ptr);
+            sys::yaml_event_delete(event_ptr);
+            converted
+        }
+    }
+}
+
+impl Drop for Parser {
+    fn drop(&mut self) {
+        unsafe {
+            sys::yaml_parser_delete(addr_of_mut!(self.sys));
+        }
+    }
+}
+
+unsafe fn convert_event(event: &sys::yaml_event_t) -> Result<Event, BoundedYamlError> {
+    match event.type_ {
+        sys::YAML_STREAM_START_EVENT => Ok(Event::StreamStart),
+        sys::YAML_STREAM_END_EVENT => Ok(Event::StreamEnd),
+        sys::YAML_DOCUMENT_START_EVENT => Ok(Event::DocumentStart),
+        sys::YAML_DOCUMENT_END_EVENT => Ok(Event::DocumentEnd),
+        sys::YAML_ALIAS_EVENT => {
+            let name = unsafe { optional_cstr(event.data.alias.anchor) }?.ok_or_else(|| {
+                BoundedYamlError::Parse("alias event missing name".to_string())
+            })?;
+            Ok(Event::Alias { name })
+        }
+        sys::YAML_SCALAR_EVENT => {
+            let anchor = unsafe { optional_cstr(event.data.scalar.anchor) }?;
+            let tag = unsafe { optional_cstr(event.data.scalar.tag) }?;
+            let value = unsafe {
+                let ptr = event.data.scalar.value;
+                let len = event.data.scalar.length as usize;
+                if ptr.is_null() {
+                    String::new()
+                } else {
+                    let bytes = slice::from_raw_parts(ptr, len);
+                    String::from_utf8(bytes.to_vec()).map_err(|_| {
+                        BoundedYamlError::Parse("YAML scalar is not valid UTF-8".to_string())
+                    })?
+                }
+            };
+            let style = match unsafe { event.data.scalar.style } {
+                sys::YAML_PLAIN_SCALAR_STYLE => ScalarStyle::Plain,
+                sys::YAML_SINGLE_QUOTED_SCALAR_STYLE => ScalarStyle::SingleQuoted,
+                sys::YAML_DOUBLE_QUOTED_SCALAR_STYLE => ScalarStyle::DoubleQuoted,
+                sys::YAML_LITERAL_SCALAR_STYLE => ScalarStyle::Literal,
+                sys::YAML_FOLDED_SCALAR_STYLE => ScalarStyle::Folded,
+                _ => ScalarStyle::Plain,
+            };
+            Ok(Event::Scalar {
+                anchor,
+                tag,
+                value,
+                style,
+            })
+        }
+        sys::YAML_SEQUENCE_START_EVENT => {
+            let anchor = unsafe { optional_cstr(event.data.sequence_start.anchor) }?;
+            Ok(Event::SequenceStart { anchor })
+        }
+        sys::YAML_SEQUENCE_END_EVENT => Ok(Event::SequenceEnd),
+        sys::YAML_MAPPING_START_EVENT => {
+            let anchor = unsafe { optional_cstr(event.data.mapping_start.anchor) }?;
+            Ok(Event::MappingStart { anchor })
+        }
+        sys::YAML_MAPPING_END_EVENT => Ok(Event::MappingEnd),
+        _ => Err(BoundedYamlError::Parse(
+            "unsupported YAML event type".to_string(),
+        )),
+    }
+}
+
+unsafe fn optional_cstr(ptr: *const sys::yaml_char_t) -> Result<Option<String>, BoundedYamlError> {
+    let Some(nn) = NonNull::new(ptr as *mut i8) else {
+        return Ok(None);
+    };
+    let s = unsafe { cstr_to_string(nn.as_ptr()) }.ok_or_else(|| {
+        BoundedYamlError::Parse("YAML identifier is not valid UTF-8".to_string())
+    })?;
+    if s.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(s))
+    }
+}
+
+unsafe fn cstr_to_string(ptr: *const i8) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len = len.saturating_add(1);
+            if len > 1_048_576 {
+                return None;
+            }
+        }
+        let bytes = slice::from_raw_parts(ptr as *const u8, len);
+        std::str::from_utf8(bytes).ok().map(str::to_owned)
+    }
+}

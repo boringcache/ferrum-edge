@@ -28,6 +28,19 @@ tool when:
 Vendoring without a retirement plan is not allowed. Prefer a dependency bump, a
 feature flag, or a gateway-side workaround first.
 
+## Direct pins of otherwise-transitive crates
+
+Some crates are already pulled in transitively but are also listed directly in
+`Cargo.toml` when Ferrum calls their API itself (not only through a parent
+crate). Keep the version aligned with the transitive copy already in
+`Cargo.lock` unless an intentional bump is part of the change.
+
+| Crate | Why pinned directly |
+|---|---|
+| `crossbeam-utils` | `CachePadded` on hot overload atomics |
+| `crossbeam-queue` | lock-free MPMC ring for router-cache eviction samples |
+| `unsafe-libyaml` | API-spec YAML event composition + bounded alias expansion (#3307); already transitive via `serde_yaml` |
+
 ## Vendored crate inventory
 
 Each row is the authoritative tracking record. Keep this table, the
