@@ -40,6 +40,7 @@ pub(crate) enum BoundedYamlError {
     ExpandedByteLimitExceeded,
     WorkLimitExceeded,
     NonStringMappingKey,
+    DuplicateMappingKey,
     UnsupportedTag { tag: String },
     EmptyDocument,
     NonFiniteNumber,
@@ -72,6 +73,9 @@ impl BoundedYamlError {
             }
             Self::NonStringMappingKey => {
                 "YAML mapping keys must be strings for JSON conversion".to_string()
+            }
+            Self::DuplicateMappingKey => {
+                "YAML mapping contains a duplicate key".to_string()
             }
             Self::UnsupportedTag { tag } => {
                 format!("unsupported YAML tag '{tag}' in API specs")
@@ -501,22 +505,30 @@ fn expand_node(
             budgets.charge_bytes(2)?;
             let mut map = Map::new();
             let mut merges: Vec<Value> = Vec::new();
+            let mut saw_merge_spelling = false;
             for (key_id, value_id) in pairs {
                 let key_value = expand_node(document, *key_id, budgets, expanding)?;
                 let key = match key_value {
                     Value::String(s) => s,
                     _ => return Err(BoundedYamlError::NonStringMappingKey),
                 };
+                if (key == "<<" && saw_merge_spelling)
+                    || (key != "<<" && map.contains_key(&key))
+                {
+                    return Err(BoundedYamlError::DuplicateMappingKey);
+                }
+                saw_merge_spelling |= key == "<<";
                 let value = expand_node(document, *value_id, budgets, expanding)?;
-                if key == "<<" {
+                if is_yaml_merge_key(document, *key_id) {
                     collect_merge_sources(value, &mut merges)?;
                 } else {
                     budgets.charge_bytes(key.len())?;
                     map.insert(key, value);
                 }
             }
-            // YAML 1.1 merge keys: earlier merges lose to later merges and to
-            // explicit keys already present in `map`.
+            // YAML 1.1 merge keys: earlier sequence entries take precedence
+            // over later ones, while explicit keys always take precedence over
+            // every merged value.
             for merge in merges {
                 let Value::Object(merge_map) = merge else {
                     return Err(BoundedYamlError::Parse(
@@ -533,6 +545,24 @@ fn expand_node(
             Ok(Value::Object(map))
         }
     }
+}
+
+fn is_yaml_merge_key(document: &Document, id: usize) -> bool {
+    matches!(
+        document.nodes.get(id),
+        Some(NodeKind::Scalar {
+            value,
+            style: ScalarStyle::Plain,
+            tag: None,
+        }) if value == "<<"
+    ) || matches!(
+        document.nodes.get(id),
+        Some(NodeKind::Scalar {
+            value,
+            tag: Some(tag),
+            ..
+        }) if value == "<<" && tag == "tag:yaml.org,2002:merge"
+    )
 }
 
 fn collect_merge_sources(value: Value, out: &mut Vec<Value>) -> Result<(), BoundedYamlError> {
@@ -576,7 +606,10 @@ fn scalar_to_json(
     tag: Option<&str>,
 ) -> Result<Value, BoundedYamlError> {
     if let Some(tag) = tag {
-        if tag == "tag:yaml.org,2002:str" || tag == "!" {
+        if tag == "tag:yaml.org,2002:str"
+            || tag == "!"
+            || (tag == "tag:yaml.org,2002:merge" && value == "<<")
+        {
             return Ok(Value::String(value.to_owned()));
         }
         if tag == "tag:yaml.org,2002:null" {

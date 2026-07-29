@@ -75,11 +75,58 @@ fn merge_key_expands_when_present() {
            backend_port: 443\n\
          x-ferrum-proxy:\n\
            <<: *defaults\n\
-           id: merge-proxy\n"
+           id: merge-proxy\n\
+           backend_port: 8443\n"
     );
     let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
     assert_eq!(bundle.proxy.id, "merge-proxy");
     assert_eq!(bundle.proxy.backend_host, "backend.internal");
+    assert_eq!(bundle.proxy.backend_port, 8443);
+}
+
+#[test]
+fn merge_sequence_uses_earlier_mapping_precedence() {
+    let yaml = "first: &first\n\
+                  backend_host: first.internal\n\
+                  backend_port: 443\n\
+                second: &second\n\
+                  backend_host: second.internal\n\
+                  backend_port: 9443\n\
+                x-ferrum-proxy:\n\
+                  <<: [*first, *second]\n\
+                  id: merge-order-proxy\n";
+    let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.backend_host, "first.internal");
+    assert_eq!(bundle.proxy.backend_port, 443);
+}
+
+#[test]
+fn quoted_merge_spelling_remains_an_ordinary_mapping_key() {
+    let yaml = format!(
+        "\"<<\": literal-value\n\
+         {}",
+        proxy_yaml("quoted-merge-proxy")
+    );
+    let (bundle, _) = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap();
+    assert_eq!(bundle.proxy.id, "quoted-merge-proxy");
+}
+
+#[test]
+fn duplicate_mapping_keys_fail_closed_without_echoing_the_key() {
+    let yaml = "x-ferrum-proxy:\n\
+                  id: first\n\
+                  id: must-not-escape\n\
+                  backend_host: backend.internal\n\
+                  backend_port: 443\n";
+    let err = extract(yaml.as_bytes(), Some(SpecFormat::Yaml), "prod").unwrap_err();
+    assert!(
+        matches!(&err, ExtractError::InvalidYaml(msg) if msg.contains("duplicate key")),
+        "got {err:?}"
+    );
+    assert!(
+        !format!("{err:?}").contains("must-not-escape"),
+        "duplicate-key diagnostics must not echo hostile key/value material"
+    );
 }
 
 #[test]
