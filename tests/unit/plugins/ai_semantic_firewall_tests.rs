@@ -5594,6 +5594,149 @@ async fn hold_timeout_publishes_fixed_cardinality_metadata() {
     assert_firewall_metadata_omits(&ctx, &server.uri());
 }
 
+/// Drive two active firewall instances so both expire on one response, then fold
+/// terminal metadata in `hook_order`. The fail-open instance must run first in
+/// the inspector chain so its released bytes reach the fail-closed sibling;
+/// hook order is independent of that chain order.
+async fn multi_instance_hold_timeout_metadata(
+    hook_order: [usize; 2],
+) -> (RequestContext, String) {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let server = stalled_embedding_server().await;
+    let endpoint = format!("{}/v1/embeddings", server.uri());
+    // Fail-open first so the chain can deliver bytes to the fail-closed sibling.
+    let forward: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    )));
+    let cut: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &endpoint,
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "cut"}),
+    )));
+    let instances = [forward, cut];
+    let plugins = vec![Arc::clone(&instances[0]), Arc::clone(&instances[1])];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("chained inspectors for both instances");
+
+    assert!(matches!(
+        inspector.on_chunk(CLEAN_SENTENCE_EVENT).await,
+        ResponseStreamAction::Terminate(_)
+    ));
+    drop(inspector);
+
+    for index in hook_order {
+        instances[index]
+            .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+            .await;
+    }
+    (ctx, server.uri())
+}
+
+#[tokio::test]
+async fn multi_instance_hold_timeouts_aggregate_counts_and_most_restrictive_action() {
+    for hook_order in [[0, 1], [1, 0]] {
+        let (ctx, server_uri) = multi_instance_hold_timeout_metadata(hook_order).await;
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.stream_hold_timeouts")
+                .map(String::as_str),
+            Some("2"),
+            "both instances' expiries must saturating-sum; hook order {hook_order:?}"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_semantic_firewall.stream_hold_timeout_action")
+                .map(String::as_str),
+            Some("cut"),
+            "cut outranks forward regardless of hook order {hook_order:?}"
+        );
+        assert_firewall_metadata_omits(&ctx, "sunny");
+        assert_firewall_metadata_omits(&ctx, &server_uri);
+        assert!(
+            !ctx.metadata.keys().any(|key| key.contains("rule")
+                || key.contains("endpoint")
+                || key.contains("window")),
+            "metadata keys must stay fixed-cardinality: {:?}",
+            ctx.metadata.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn zero_expiry_sibling_does_not_erase_hold_timeout_metadata() {
+    use ferrum_edge::plugins::create_response_stream_inspector;
+    use ferrum_edge::proxy::deferred_log::BodyOutcome;
+
+    let stalled = stalled_embedding_server().await;
+    let clean = nonmatching_embedding_server().await;
+    // Fail-open timeout first so bytes reach the long-hold sibling, which then
+    // receives a timely clean verdict and records zero expiries.
+    let timing_out: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", stalled.uri()),
+        "reject",
+        json!({"max_hold_ms": 120, "on_hold_timeout": "forward"}),
+    )));
+    let no_expiry: Arc<dyn Plugin> = Arc::new(plugin(&hold_config(
+        &format!("{}/v1/embeddings", clean.uri()),
+        "reject",
+        json!({"max_hold_ms": 30_000}),
+    )));
+    let plugins = vec![Arc::clone(&timing_out), Arc::clone(&no_expiry)];
+    let mut ctx = inspect_marked_ctx();
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("chained inspectors");
+
+    let ResponseStreamAction::Forward(released) = inspector.on_chunk(GOVERNED_CLEAN_EVENT).await
+    else {
+        panic!("fail-open timeout then clean sibling must forward, not cut");
+    };
+    assert_eq!(released.as_ref(), GOVERNED_CLEAN_EVENT);
+    let _ = inspector.on_end().await;
+    drop(inspector);
+
+    // Expiring instance writes first; zero-expiry sibling must not erase it.
+    timing_out
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeouts")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeout_action")
+            .map(String::as_str),
+        Some("forward")
+    );
+
+    no_expiry
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeouts")
+            .map(String::as_str),
+        Some("1"),
+        "zero-expiry sibling must not erase a sibling timeout count"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_semantic_firewall.stream_hold_timeout_action")
+            .map(String::as_str),
+        Some("forward"),
+        "zero-expiry sibling must not erase a sibling timeout action"
+    );
+}
+
 #[tokio::test]
 async fn no_hold_timeout_metadata_without_an_expiry() {
     use ferrum_edge::plugins::create_response_stream_inspector;

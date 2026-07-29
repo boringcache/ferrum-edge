@@ -2295,8 +2295,12 @@ impl Plugin for AiSemanticFirewall {
     ///
     /// Both keys are fixed and the action value comes from a closed vocabulary
     /// (`cut` / `forward` / `detect_abandoned`), so streamed traffic cannot
-    /// inflate log or metric cardinality. Nothing is written when no hold
-    /// expired. A `detect` evaluation that outlives terminal logging keeps its
+    /// inflate log or metric cardinality. Multiple active instances on one
+    /// response saturating-sum their timeout counts into the same key and merge
+    /// the action with client-visible precedence `cut` > `forward` >
+    /// `detect_abandoned`, so hook order cannot change the audit record. An
+    /// instance with zero expiries neither synthesizes nor erases those keys.
+    /// A `detect` evaluation that outlives terminal logging keeps its
     /// structured warning as the durable audit record, matching the plugin's
     /// existing detect contract.
     async fn on_response_stream_terminated(
@@ -2312,20 +2316,35 @@ impl Plugin for AiSemanticFirewall {
             return;
         };
         let timeouts = stats.timeouts.load(Ordering::Relaxed);
+        // Zero-expiry instances must leave any sibling-written keys intact.
         if timeouts == 0 {
             return;
         }
-        ctx.metadata.insert(
-            "ai_semantic_firewall.stream_hold_timeouts".to_string(),
-            timeouts.to_string(),
-        );
+        const TIMEOUTS_KEY: &str = "ai_semantic_firewall.stream_hold_timeouts";
+        const ACTION_KEY: &str = "ai_semantic_firewall.stream_hold_timeout_action";
+        let merged_timeouts = match ctx.metadata.get(TIMEOUTS_KEY) {
+            Some(existing) => existing
+                .parse::<u64>()
+                .unwrap_or(0)
+                .saturating_add(timeouts),
+            None => timeouts,
+        };
+        ctx.metadata
+            .insert(TIMEOUTS_KEY.to_string(), merged_timeouts.to_string());
         let last_action = stats.last_action.load(Ordering::Relaxed);
-        if let Some(action) = HoldTimeoutAction::from_code(last_action) {
-            ctx.metadata.insert(
-                "ai_semantic_firewall.stream_hold_timeout_action".to_string(),
-                action.as_str().to_string(),
-            );
-        }
+        let Some(action) = HoldTimeoutAction::from_code(last_action) else {
+            return;
+        };
+        let merged_action = match ctx
+            .metadata
+            .get(ACTION_KEY)
+            .and_then(|value| HoldTimeoutAction::parse(value))
+        {
+            Some(existing) => existing.most_restrictive(action),
+            None => action,
+        };
+        ctx.metadata
+            .insert(ACTION_KEY.to_string(), merged_action.as_str().to_string());
     }
 
     async fn on_response_body(
@@ -3263,20 +3282,52 @@ impl HoldTimeoutAction {
             _ => None,
         }
     }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "cut" => Some(Self::Cut),
+            "forward" => Some(Self::Forward),
+            "detect_abandoned" => Some(Self::DetectAbandoned),
+            _ => None,
+        }
+    }
+
+    /// Client-visible restrictiveness for multi-instance metadata merge.
+    ///
+    /// Higher wins so later terminal hooks cannot soften an earlier, more
+    /// restrictive sibling action: `cut` > `forward` > `detect_abandoned`.
+    fn restrictiveness(self) -> u8 {
+        match self {
+            Self::Cut => 3,
+            Self::Forward => 2,
+            Self::DetectAbandoned => 1,
+        }
+    }
+
+    fn most_restrictive(self, other: Self) -> Self {
+        if self.restrictiveness() >= other.restrictiveness() {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 /// Fixed-cardinality per-response hold-deadline counters.
 ///
 /// Published to the request-owned response-stream handoff by the inspector and
 /// drained into transaction metadata by
-/// [`Plugin::on_response_stream_terminated`]. Both fields are fixed keys with a
-/// fixed value vocabulary — no rule id, no window content, and no operator- or
-/// attacker-controlled label ever enters this surface.
+/// [`Plugin::on_response_stream_terminated`]. Both metadata keys stay fixed with
+/// a fixed value vocabulary — no rule id, no window content, and no operator-
+/// or attacker-controlled label ever enters this surface. Per-instance counters
+/// are saturating-summed across active instances; actions merge by
+/// [`HoldTimeoutAction::most_restrictive`].
 #[derive(Debug, Default)]
 struct StreamHoldStats {
-    /// Number of expired holds on this response.
+    /// Number of expired holds on this instance's inspector for this response.
     timeouts: AtomicU64,
-    /// [`HoldTimeoutAction::code`] of the most recent expiry, `0` when none.
+    /// [`HoldTimeoutAction::code`] of the most recent expiry on this instance,
+    /// `0` when none.
     last_action: AtomicU8,
 }
 
