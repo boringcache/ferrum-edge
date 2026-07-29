@@ -11260,7 +11260,7 @@ async fn send_h3_finalized_reject_response_with_recv_halt(
 async fn send_h3_pre_sanitized_reject_response_with_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
     status: StatusCode,
-    body: &[u8],
+    body: Bytes,
     headers: &HashMap<String, String>,
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
