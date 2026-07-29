@@ -3691,34 +3691,6 @@ async fn test_anthropic_legacy_function_history_rejects_malformed_and_mixed_shap
             vec![],
         ),
         (
-            "completed modern round then legacy round",
-            json!({
-                "model": "claude-3-5-sonnet",
-                "stream": true,
-                "messages": [
-                    {"role": "user", "content": "hi"},
-                    {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "alpha", "arguments": "{}"}
-                        }]
-                    },
-                    {"role": "tool", "tool_call_id": "call_1", "content": "A"},
-                    {
-                        "role": "assistant",
-                        "content": null,
-                        "function_call": {"name": "beta", "arguments": "{}"}
-                    },
-                    {"role": "function", "name": "beta", "content": "B"}
-                ]
-            }),
-            Some("mixes"),
-            vec![],
-        ),
-        (
             "oversized legacy arguments",
             json!({
                 "model": "claude-3-5-sonnet",
@@ -3825,6 +3797,88 @@ async fn test_anthropic_modern_tool_history_unchanged_alongside_legacy_support()
     let results = parsed["messages"][2]["content"].as_array().unwrap();
     assert_eq!(results[0]["tool_use_id"], json!("call_a"));
     assert_eq!(results[1]["tool_use_id"], json!("call_b"));
+}
+
+#[tokio::test]
+async fn test_anthropic_completed_modern_and_legacy_rounds_can_coexist() {
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_modern",
+                    "type": "function",
+                    "function": {"name": "alpha", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_modern", "content": "A"},
+            {
+                "role": "assistant",
+                "content": null,
+                "function_call": {"name": "beta", "arguments": "{\"x\":1}"}
+            },
+            {"role": "function", "name": "beta", "content": "B"}
+        ]
+    });
+
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("completed modern and legacy rounds are unambiguous");
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["id"],
+        json!("call_modern")
+    );
+    assert_eq!(
+        parsed["messages"][2]["content"][0]["tool_use_id"],
+        json!("call_modern")
+    );
+    assert_eq!(
+        parsed["messages"][3]["content"][0]["id"],
+        json!("call_legacy_3")
+    );
+    assert_eq!(
+        parsed["messages"][4]["content"][0]["tool_use_id"],
+        json!("call_legacy_3")
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_modern_tool_id_and_arguments_keep_existing_bounds() {
+    let long_id = format!("call_{}", "x".repeat(256));
+    let large_arguments =
+        serde_json::to_string(&json!({"payload": "x".repeat(256 * 1024)})).unwrap();
+    let body = json!({
+        "model": "claude-3-5-sonnet",
+        "stream": true,
+        "messages": [
+            {"role": "user", "content": "large modern call"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": long_id,
+                    "type": "function",
+                    "function": {"name": "alpha", "arguments": large_arguments}
+                }]
+            },
+            {"role": "tool", "tool_call_id": long_id, "content": "ok"}
+        ]
+    });
+
+    let parsed = translate_anthropic_body(&body)
+        .await
+        .expect("legacy support must not tighten the existing modern path");
+    assert_eq!(parsed["messages"][1]["content"][0]["id"], json!(long_id));
+    assert_eq!(
+        parsed["messages"][1]["content"][0]["input"]["payload"]
+            .as_str()
+            .map(str::len),
+        Some(256 * 1024)
+    );
 }
 
 #[tokio::test]

@@ -795,20 +795,8 @@ struct ParsedToolCall {
     arguments: Value,
 }
 
-/// Wire shape used by an OpenAI tool round when translating to Anthropic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolHistoryShape {
-    /// Modern `tool_calls` + `role: "tool"`.
-    Modern,
-    /// Legacy `function_call` + `role: "function"`.
-    Legacy,
-}
-
-/// Upper bound on a single tool/function `arguments` JSON string (bytes).
+/// Upper bound on a legacy function-call `arguments` JSON string (bytes).
 const MAX_TOOL_ARGUMENTS_BYTES: usize = 256 * 1024;
-
-/// Upper bound on an OpenAI / synthetic Anthropic tool-use identifier.
-const MAX_TOOL_CALL_ID_BYTES: usize = 128;
 
 fn valid_tool_name(name: &str) -> bool {
     !name.is_empty()
@@ -818,32 +806,11 @@ fn valid_tool_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-fn valid_tool_call_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= MAX_TOOL_CALL_ID_BYTES
-}
-
 fn legacy_tool_use_id(message_index: usize) -> String {
     format!("call_legacy_{message_index}")
 }
 
-fn note_tool_history_shape(
-    current: &mut Option<ToolHistoryShape>,
-    shape: ToolHistoryShape,
-    message_index: usize,
-) -> Result<(), String> {
-    match *current {
-        None => {
-            *current = Some(shape);
-            Ok(())
-        }
-        Some(existing) if existing == shape => Ok(()),
-        Some(_) => Err(format!(
-            "messages[{message_index}] mixes modern tool_calls and legacy function_call history"
-        )),
-    }
-}
-
-fn parse_tool_arguments_object(
+fn parse_legacy_tool_arguments_object(
     arguments: &str,
     field_path: &str,
 ) -> Result<Value, String> {
@@ -896,7 +863,7 @@ fn parse_openai_tool_calls(
         let id = call_object
             .get("id")
             .and_then(Value::as_str)
-            .filter(|value| valid_tool_call_id(value))
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| {
                 format!("messages[{message_index}].tool_calls[{tool_index}] missing id")
             })?;
@@ -923,8 +890,17 @@ fn parse_openai_tool_calls(
                     "messages[{message_index}].tool_calls[{tool_index}] arguments must be a JSON string"
                 )
             })?;
-        let field_path = format!("messages[{message_index}].tool_calls[{tool_index}]");
-        let arguments = parse_tool_arguments_object(arguments, &field_path)?;
+        let arguments: Value = serde_json::from_str(arguments).map_err(|_| {
+            // Field-specific only: never echo argument bytes (may hold credentials).
+            format!(
+                "messages[{message_index}].tool_calls[{tool_index}] arguments are not valid JSON"
+            )
+        })?;
+        if !arguments.is_object() {
+            return Err(format!(
+                "messages[{message_index}].tool_calls[{tool_index}] arguments must encode a JSON object"
+            ));
+        }
         parsed.push(ParsedToolCall {
             id: id.to_string(),
             name: name.to_string(),
@@ -967,13 +943,8 @@ fn parse_openai_function_call(
             )
         })?;
     let field_path = format!("messages[{message_index}].function_call");
-    let arguments = parse_tool_arguments_object(arguments, &field_path)?;
+    let arguments = parse_legacy_tool_arguments_object(arguments, &field_path)?;
     let id = legacy_tool_use_id(message_index);
-    if !valid_tool_call_id(&id) {
-        return Err(format!(
-            "messages[{message_index}].function_call could not be assigned a tool-use id"
-        ));
-    }
     Ok(Some(ParsedToolCall {
         id,
         name: name.to_string(),
@@ -1017,13 +988,12 @@ fn anthropic_text_content_blocks(text: &str) -> Vec<Value> {
 /// Fail closed on malformed tool calls/results rather than silently dropping them.
 ///
 /// Modern (`tool_calls` / `role: "tool"`) and legacy (`function_call` /
-/// `role: "function"`) shapes are each accepted when self-consistent, but mixing
-/// them in one request is rejected as ambiguous.
+/// `role: "function"`) rounds may coexist when each round is complete. Crossing
+/// the result shape while either round is pending is rejected as ambiguous.
 fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
     let mut tool_call_ids = HashSet::new();
     let mut pending_tool_results = HashSet::new();
     let mut pending_legacy: Option<(String, String)> = None;
-    let mut history_shape: Option<ToolHistoryShape> = None;
     for (index, message) in messages.iter().enumerate() {
         let message_object = message
             .as_object()
@@ -1107,7 +1077,6 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
                 ));
             }
             if !tool_calls.is_empty() {
-                note_tool_history_shape(&mut history_shape, ToolHistoryShape::Modern, index)?;
                 for call in tool_calls {
                     if !tool_call_ids.insert(call.id.clone()) {
                         return Err(format!("messages[{index}] repeats a tool-call id"));
@@ -1116,7 +1085,6 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
                 }
             }
             if let Some(call) = legacy_call {
-                note_tool_history_shape(&mut history_shape, ToolHistoryShape::Legacy, index)?;
                 if !tool_call_ids.insert(call.id.clone()) {
                     return Err(format!("messages[{index}] repeats a tool-call id"));
                 }
@@ -1125,11 +1093,10 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
         }
 
         if role == "tool" {
-            note_tool_history_shape(&mut history_shape, ToolHistoryShape::Modern, index)?;
             let tool_call_id = message_object
                 .get("tool_call_id")
                 .and_then(Value::as_str)
-                .filter(|value| valid_tool_call_id(value))
+                .filter(|value| !value.is_empty())
                 .ok_or_else(|| format!("messages[{index}] tool message missing tool_call_id"))?;
             if !pending_tool_results.remove(tool_call_id) {
                 return Err(format!(
@@ -1141,7 +1108,6 @@ fn validate_openai_tool_history(messages: &[Value]) -> Result<(), String> {
         }
 
         if role == "function" {
-            note_tool_history_shape(&mut history_shape, ToolHistoryShape::Legacy, index)?;
             let name = message_object
                 .get("name")
                 .and_then(Value::as_str)
