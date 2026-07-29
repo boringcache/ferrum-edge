@@ -460,6 +460,12 @@ pub fn carrier_resource_name_for_type_url(type_url: &str) -> Option<&'static str
         FERRUM_ECDS_NODE_WAYPOINT_ASSERTORS_TYPE_URL => {
             Some("ferrum-mesh-carrier/node-waypoint-assertors")
         }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_DESTINATIONS_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-destinations")
+        }
+        FERRUM_ECDS_NODE_WAYPOINT_CAPTURE_PEER_AUTH_TYPE_URL => {
+            Some("ferrum-mesh-carrier/node-waypoint-capture-peer-authentications")
+        }
         FERRUM_ECDS_LABELS_TYPE_URL => Some("ferrum-mesh-carrier/workload-labels"),
         FERRUM_ECDS_LABELS_AMBIGUOUS_TYPE_URL => {
             Some("ferrum-mesh-carrier/workload-labels-ambiguous")
