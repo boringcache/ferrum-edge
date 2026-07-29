@@ -9276,6 +9276,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            closes the WebSocket with a policy Close frame;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -9364,6 +9376,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            drops the datagram;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5
@@ -17674,6 +17698,18 @@ components:
         redis_password:
           type: string
           description: Redis password for authentication
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5
@@ -19820,6 +19856,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -19944,6 +19992,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1
@@ -21160,6 +21220,18 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_failure_policy:
+          type: string
+          enum: [fail_closed, local_fallback]
+          default: fail_closed
+          description: >-
+            Behavior when the centralized Redis store cannot be consulted: an
+            outage, an egress/DNS screen failure, or an endpoint rejected as an
+            unsupported topology (Redis Cluster is not supported). fail_closed
+            refuses the request with 503 and no rate-limit headers;
+            local_fallback explicitly opts into per-process budgets, which
+            enforce the configured limit once per gateway process. Only
+            meaningful with sync_mode=redis, but validated in either mode.
         redis_connect_timeout_seconds:
           type: integer
           default: 5
