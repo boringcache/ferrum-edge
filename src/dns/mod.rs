@@ -4007,12 +4007,8 @@ mod tests {
             "30s after publish, a 600s peer must still keep the shared row"
         );
         assert!(
-            no_global.shared_stale_deadline(
-                entry.resolved_at,
-                entry.native_ttl,
-                Some(5),
-                false,
-            ) < now,
+            no_global.shared_stale_deadline(entry.resolved_at, entry.native_ttl, Some(5), false,)
+                < now,
             "explicit-only 5s retention must already be past deadline; native 60s must not dominate"
         );
     }
@@ -4030,10 +4026,7 @@ mod tests {
         });
         let native = Duration::from_secs(60);
 
-        for note_order in [
-            vec![Some(5u64), Some(30u64)],
-            vec![Some(30u64), Some(5u64)],
-        ] {
+        for note_order in [vec![Some(5u64), Some(30u64)], vec![Some(30u64), Some(5u64)]] {
             let entry = success_entry(
                 Arc::from([IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 71))]),
                 Instant::now(),
