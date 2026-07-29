@@ -5271,11 +5271,27 @@ async fn partial_clean_release_does_not_refresh_older_held_bytes() {
     let calls_for_responder = Arc::clone(&calls);
     Mock::given(method("POST"))
         .and(path("/v1/embeddings"))
-        .respond_with(move |_request: &Request| {
-            let response = ResponseTemplate::new(200)
-                .set_body_json(json!({"data": [{"index": 0, "embedding": [0.0, 1.0]}]}));
-            if calls_for_responder.fetch_add(1, Ordering::Relaxed) == 0 {
-                response.set_delay(Duration::from_millis(250))
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("embedding request");
+            let inputs = body["input"].as_array().expect("embedding input array");
+            let data: Vec<Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    let text = input.as_str().unwrap_or("").to_ascii_lowercase();
+                    let embedding = if text.contains("harmless governed") {
+                        vec![0.0, 1.0]
+                    } else {
+                        vec![1.0, 0.0]
+                    };
+                    json!({"index": index, "embedding": embedding})
+                })
+                .collect();
+            let response = ResponseTemplate::new(200).set_body_json(json!({"data": data}));
+            if calls_for_responder.fetch_add(1, Ordering::Relaxed) < 2 {
+                // The rule-index and first-window embedding calls both finish
+                // cleanly, leaving ample room inside the original hold.
+                response.set_delay(Duration::from_millis(150))
             } else {
                 response.set_delay(Duration::from_secs(30))
             }
@@ -5286,15 +5302,15 @@ async fn partial_clean_release_does_not_refresh_older_held_bytes() {
     let config = hold_config(
         &format!("{}/v1/embeddings", server.uri()),
         "reject",
-        json!({"max_hold_ms": 400, "on_hold_timeout": "forward"}),
+        json!({"max_hold_ms": 800, "on_hold_timeout": "forward"}),
     );
     let firewall = plugin(&config);
     let ctx = inspect_marked_ctx();
     let mut inspector = firewall
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector for event stream");
-    let mut coalesced = CLEAN_SENTENCE_EVENT.to_vec();
-    coalesced.extend_from_slice(CLEAN_SENTENCE_EVENT);
+    let mut coalesced = GOVERNED_CLEAN_EVENT.to_vec();
+    coalesced.extend_from_slice(GOVERNED_CLEAN_EVENT);
 
     let started = std::time::Instant::now();
     let ResponseStreamAction::Forward(released) = inspector.on_chunk(&coalesced).await else {
@@ -5304,12 +5320,12 @@ async fn partial_clean_release_does_not_refresh_older_held_bytes() {
 
     assert_eq!(released.as_ref(), coalesced.as_slice());
     assert!(
-        calls.load(Ordering::Relaxed) >= 2,
+        calls.load(Ordering::Relaxed) >= 3,
         "the first window must complete cleanly before the second stalls"
     );
     assert!(
-        elapsed < Duration::from_millis(550),
-        "bytes already held behind a partial release must keep the original 400ms deadline, waited {elapsed:?}"
+        elapsed < Duration::from_millis(950),
+        "bytes from one coalesced chunk must keep the original 800ms deadline after a partial clean release, waited {elapsed:?}"
     );
 }
 

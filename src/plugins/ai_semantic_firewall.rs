@@ -3375,10 +3375,19 @@ impl HoldState {
     /// when nothing is held any more. Idempotent, allocation-free, and called
     /// after every ingest step.
     fn sync(&mut self, held_bytes: usize) {
+        self.sync_from(held_bytes, None);
+    }
+
+    /// As [`Self::sync`], but preserve the arrival time of the transport chunk
+    /// that supplied newly-held bytes. A coalesced chunk may contain several
+    /// ready SSE events which are inspected incrementally; releasing an earlier
+    /// event must not give a later event from that already-arrived chunk a fresh
+    /// hold budget.
+    fn sync_from(&mut self, held_bytes: usize, first_held_at: Option<std::time::Instant>) {
         if held_bytes == 0 {
             self.started = None;
         } else if self.started.is_none() {
-            self.started = Some(std::time::Instant::now());
+            self.started = Some(first_held_at.unwrap_or_else(std::time::Instant::now));
         }
     }
 
@@ -4184,6 +4193,12 @@ impl StreamInspector {
     /// Keep the hold clock in step with what is actually being held. Called
     /// after every ingest step and every release.
     fn sync_hold(&mut self) {
+        self.sync_hold_from(None);
+    }
+
+    /// As [`Self::sync_hold`], with an optional arrival-time anchor for bytes
+    /// taken from the current transport chunk.
+    fn sync_hold_from(&mut self, first_held_at: Option<std::time::Instant>) {
         // `detect` holds nothing: its bytes were forwarded in `on_chunk`, so the
         // deadline there bounds only the detached evaluation (and its admission
         // permit), never a client-visible hold.
@@ -4198,7 +4213,7 @@ impl StreamInspector {
         // Un-released wire bytes: complete held events plus the un-terminated
         // `carry`. Zero exactly when nothing is awaiting a verdict.
         let held = self.window.input_window_bytes();
-        hold.sync(held);
+        hold.sync_from(held, first_held_at);
     }
 
     /// Emit the one-time sanitized hold-timeout warning. Fixed fields only — no
@@ -4543,6 +4558,11 @@ impl ResponseStreamInspector for StreamInspector {
             // Hold: process a coalesced transport chunk incrementally, inspect
             // each bounded ready window, and aggregate only clean releases.
             StreamEnforcement::Block => {
+                // Every byte in this slice reached the gateway together. Later
+                // events are ingested only after earlier windows resolve, but
+                // that incremental bounded-memory processing must not turn one
+                // transport arrival into a series of fresh hold budgets.
+                let chunk_arrived_at = std::time::Instant::now();
                 let mut consumed = 0usize;
                 let mut released = Vec::new();
                 // Fail-open mid-event remainder: forward until the next SSE
@@ -4578,7 +4598,7 @@ impl ResponseStreamInspector for StreamInspector {
                 loop {
                     let step = self.window.ingest_step(&chunk[consumed..]);
                     consumed = consumed.saturating_add(step.consumed);
-                    self.sync_hold();
+                    self.sync_hold_from(Some(chunk_arrived_at));
                     if step.window_ready {
                         match self.act_on_window().await {
                             ResponseStreamAction::Forward(bytes) => {
