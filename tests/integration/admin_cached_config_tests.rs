@@ -4833,8 +4833,7 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
         upstream: None,
         plugins: vec![],
     };
-    let kept_raw =
-        br#"{"openapi":"3.1.0","info":{"title":"Kept","version":"1"},"paths":{}}"#;
+    let kept_raw = br#"{"openapi":"3.1.0","info":{"title":"Kept","version":"1"},"paths":{}}"#;
     let kept_spec = ferrum_edge::config::types::ApiSpec {
         id: "kept-spec".to_string(),
         namespace: "ferrum".to_string(),
@@ -4868,10 +4867,9 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
     let (base_url, _shutdown) = start_test_admin(state).await;
     let token = generate_test_token(&tc);
 
-    let hostile_raw =
-        br#"{"openapi":"3.1.0","info":{"title":"Hostile","version":"1"},"paths":{}}"#;
-    let compressed = ferrum_edge::admin::spec_codec::compress_gzip(hostile_raw)
-        .expect("compress hostile");
+    let hostile_raw = br#"{"openapi":"3.1.0","info":{"title":"Hostile","version":"1"},"paths":{}}"#;
+    let compressed =
+        ferrum_edge::admin::spec_codec::compress_gzip(hostile_raw).expect("compress hostile");
     let hostile_b64 = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.encode(&compressed)
@@ -4985,8 +4983,13 @@ async fn test_restore_rejects_hostile_api_spec_metadata_before_delete() {
             }]
         }
     });
-    let (status, body) =
-        admin_post(&base_url, "/restore?confirm=true", &token, &mismatch_payload).await;
+    let (status, body) = admin_post(
+        &base_url,
+        "/restore?confirm=true",
+        &token,
+        &mismatch_payload,
+    )
+    .await;
     assert_eq!(
         status, 400,
         "format-mismatch restore must be rejected: {:?}",

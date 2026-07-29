@@ -451,12 +451,10 @@ pub(crate) fn validate_restore_api_specs_section(
         // external refs — historical backups must remain restorable as-is.
         // Parse errors are mapped to generic messages so serde snippets that
         // may contain document fragments never enter operator responses/logs.
-        if let Err(parse_error) =
-            crate::admin::api_specs::extractor::parse_declared_spec_document(
-                &decompressed,
-                spec.spec_format,
-            )
-        {
+        if let Err(parse_error) = crate::admin::api_specs::extractor::parse_declared_spec_document(
+            &decompressed,
+            spec.spec_format,
+        ) {
             let reason = match parse_error {
                 crate::admin::api_specs::ExtractError::InvalidJson(_) => {
                     "document is not valid JSON for declared spec_format"
@@ -622,10 +620,9 @@ mod tests {
             parse_backup_resources(Some("resources=proxies")).expect("parse proxies");
         assert!(validate_backup_api_specs_resource_filter(Some(&proxies_only)).is_ok());
 
-        let without_specs = parse_backup_resources(Some(
-            "resources=proxies,consumers,plugin_configs,upstreams",
-        ))
-        .expect("parse without api_specs");
+        let without_specs =
+            parse_backup_resources(Some("resources=proxies,consumers,plugin_configs,upstreams"))
+                .expect("parse without api_specs");
         assert!(validate_backup_api_specs_resource_filter(Some(&without_specs)).is_ok());
     }
 
@@ -638,28 +635,24 @@ mod tests {
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
         );
 
-        let missing_plugins = parse_backup_resources(Some(
-            "resources=api_specs,proxies,upstreams",
-        ))
-        .expect("parse missing plugin_configs");
+        let missing_plugins = parse_backup_resources(Some("resources=api_specs,proxies,upstreams"))
+            .expect("parse missing plugin_configs");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_plugins)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
         );
 
-        let missing_upstreams = parse_backup_resources(Some(
-            "resources=api_specs,proxies,plugin_configs",
-        ))
-        .expect("parse missing upstreams");
+        let missing_upstreams =
+            parse_backup_resources(Some("resources=api_specs,proxies,plugin_configs"))
+                .expect("parse missing upstreams");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_upstreams)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
         );
 
-        let missing_proxies = parse_backup_resources(Some(
-            "resources=api_specs,upstreams,plugin_configs",
-        ))
-        .expect("parse missing proxies");
+        let missing_proxies =
+            parse_backup_resources(Some("resources=api_specs,upstreams,plugin_configs"))
+                .expect("parse missing proxies");
         assert_eq!(
             validate_backup_api_specs_resource_filter(Some(&missing_proxies)),
             Err(BACKUP_API_SPECS_FILTER_DEPENDENCY_ERROR)
@@ -1008,15 +1001,16 @@ mod tests {
         let err = validate_restore_api_specs_section(&section, &proxies, &[], &[], 25)
             .expect_err("format mismatch");
         assert!(
-            err.iter().any(|e| e.contains(
-                "document is not valid JSON for declared spec_format"
-            )),
+            err.iter()
+                .any(|e| e.contains("document is not valid JSON for declared spec_format")),
             "expected declared-format rejection, got {err:?}"
         );
 
         // Too many server URLs.
         let mut item = sample_spec_item("spec-1", "proxy-1", raw);
-        item.server_urls = (0..33).map(|i| format!("https://example.test/{i}")).collect();
+        item.server_urls = (0..33)
+            .map(|i| format!("https://example.test/{i}"))
+            .collect();
         let section = ApiSpecsBackupSection {
             section_version: API_SPECS_BACKUP_SECTION_VERSION.to_string(),
             items: vec![item],

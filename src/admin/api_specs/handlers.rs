@@ -2787,7 +2787,8 @@ fn parse_list_filter(uri: &hyper::Uri) -> Result<ApiSpecListFilter, ApiSpecError
                 //
                 // Apply the identical character whitelist used by
                 // `api_spec_tag_forbidden_char` / `ExtractError::InvalidTagName`.
-                if let Some(c) = crate::admin::api_specs::extractor::api_spec_tag_forbidden_char(&val)
+                if let Some(c) =
+                    crate::admin::api_specs::extractor::api_spec_tag_forbidden_char(&val)
                 {
                     return Err(ApiSpecError::BadRequest(format!(
                         "has_tag value contains forbidden character '{}'; tag names \
