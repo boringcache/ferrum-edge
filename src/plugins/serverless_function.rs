@@ -2400,8 +2400,7 @@ fn build_native_grpc_terminate_response(
                     format!("gRPC terminate trailer '{lower}' is not a valid gRPC ASCII value"),
                 ));
             }
-            if lower.ends_with("-bin")
-                && !crate::plugins::grpc_web::is_base64_metadata_value(value)
+            if lower.ends_with("-bin") && !crate::plugins::grpc_web::is_base64_metadata_value(value)
             {
                 return Err(InvocationFailure::new(
                     "invalid_grpc_terminate_response",
