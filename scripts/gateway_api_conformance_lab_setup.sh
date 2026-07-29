@@ -27,6 +27,10 @@ CP_NAMESPACE="${CP_NAMESPACE:-ferrum}"
 DP_SERVICE_NAME="${DP_SERVICE_NAME:-ferrum-gateway-data-plane}"
 DP_GATEWAY_NAMESPACE="${DP_GATEWAY_NAMESPACE:-gateway-conformance-infra}"
 BACKEND_NAMESPACE="${BACKEND_NAMESPACE:-gateway-conformance-web-backend}"
+# Upstream Gateway API conformance also provisions this fixed backend namespace
+# (see kubernetes-sigs/gateway-api conformance constants). Keep it on the K8s
+# watch list even though CP/DP auth stays single-namespace.
+APP_BACKEND_NAMESPACE="${APP_BACKEND_NAMESPACE:-gateway-conformance-app-backend}"
 JWT_SECRET="${JWT_SECRET:-ferrum-edge-gateway-api-conformance-grpc-secret}"
 ADMIN_SECRET="${ADMIN_SECRET:-ferrum-edge-gateway-api-conformance-admin-secret}"
 
@@ -107,6 +111,17 @@ create_frontend_tls_secret() {
 }
 
 deploy_control_plane() {
+  # Namespaced reflectors must complete their initial list before the
+  # reconciler publishes any status, including cluster-scoped GatewayClass
+  # status. Create every explicit watch namespace before the controller starts
+  # so a not-yet-created upstream backend namespace cannot hold readiness open.
+  local watched_namespace
+  for watched_namespace in \
+    "$DP_GATEWAY_NAMESPACE" \
+    "$BACKEND_NAMESPACE" \
+    "$APP_BACKEND_NAMESPACE"; do
+    kubectl create namespace "$watched_namespace" --dry-run=client -o yaml | kubectl apply -f -
+  done
   kubectl create namespace "$CP_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
   create_frontend_tls_secret
   helm upgrade --install ferrum "$ROOT_DIR/charts/ferrum-mesh" \
@@ -127,7 +142,8 @@ deploy_control_plane() {
     --set controlPlane.database.sqlite.mode=rwc \
     --set-string controlPlane.credentials.adminJwtSecret.value="$ADMIN_SECRET" \
     --set-string controlPlane.credentials.cpDpGrpcJwtSecret.value="$JWT_SECRET" \
-    --set-string 'controlPlane.env.FERRUM_CP_NAMESPACES=*' \
+    --set-string "controlPlane.env.FERRUM_NAMESPACE=$DP_GATEWAY_NAMESPACE" \
+    --set-string "controlPlane.env.FERRUM_K8S_WATCH_NAMESPACES=${DP_GATEWAY_NAMESPACE}\\,${BACKEND_NAMESPACE}\\,${APP_BACKEND_NAMESPACE}" \
     --set controlPlane.env.FERRUM_LOG_LEVEL=info \
     --set controlPlane.env.FERRUM_K8S_CONTROLLER_ENABLED=true \
     --set controlPlane.env.FERRUM_K8S_WATCH_GATEWAY_API_CRDS=true \
