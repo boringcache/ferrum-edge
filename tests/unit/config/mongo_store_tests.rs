@@ -176,6 +176,45 @@ fn mongo_backup_restore_api_specs_methods_exist() {
     );
 }
 
+/// `rollback_ids_for_unordered_insert_error` derives "documents this call
+/// created" as *every id minus the reported write-error indices*. That is only
+/// correct for an UNORDERED `insert_many`: an ordered insert stops at the first
+/// write error, so every id after it would be reported as created and then
+/// deleted by the compensating `delete_many({_id: {$in: ...}})`. Mongo `_id`s
+/// are bare resource ids with no namespace qualifier, so that delete reaches
+/// another namespace's documents. Every standalone batch insert paired with the
+/// helper must therefore stay `.ordered(false)`.
+#[test]
+fn standalone_insert_rollback_is_only_paired_with_unordered_inserts() {
+    const CALL: &str = "Self::rollback_ids_for_unordered_insert_error(";
+    let mut searched = 0usize;
+    let mut sites = 0usize;
+    while let Some(offset) = MONGO_STORE_SOURCE[searched..].find(CALL) {
+        let call = searched + offset;
+        searched = call + 1;
+        sites += 1;
+
+        let preceding = &MONGO_STORE_SOURCE[..call];
+        let insert = preceding
+            .rfind(".insert_many(")
+            .expect("the rollback helper must compensate a preceding insert_many");
+        let ordered_at = preceding[insert..]
+            .find(".ordered(")
+            .expect("an insert_many compensated by the rollback helper must set ordered()");
+        let ordered = &preceding[insert + ordered_at..];
+        assert!(
+            ordered.starts_with(".ordered(false)"),
+            "insert_many compensated by rollback_ids_for_unordered_insert_error must be \
+             unordered; found {}",
+            ordered.chars().take(20).collect::<String>()
+        );
+    }
+    assert!(
+        sites >= 5,
+        "expected every standalone batch insert rollback site to be scanned, found {sites}"
+    );
+}
+
 #[test]
 fn mongo_plugin_graph_validation_runs_under_the_durable_namespace_fence() {
     let validator = mongo_method("validate_mtls_dns_candidate_with_mode");

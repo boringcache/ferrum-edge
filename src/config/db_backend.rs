@@ -1623,10 +1623,13 @@ pub trait DatabaseBackend: NamespaceConfigAdmissionLeaseBackend + Send + Sync {
     /// unreachable.
     ///
     /// Reads MUST come from the authoritative primary — a rollback snapshot must
-    /// never be built from a possibly-stale read replica. `api_spec_id` ownership
-    /// tags are cleared (mirroring `load_full_config`): a rollback re-applies the
-    /// config resources as hand-managed, and the `api_specs` rows themselves are
-    /// captured separately by the caller.
+    /// never be built from a possibly-stale read replica. Unlike runtime/CP
+    /// `load_full_config` loads, this snapshot PRESERVES `api_spec_id` ownership
+    /// tags: the caller captures the `api_specs` documents separately (see
+    /// [`Self::list_api_specs_with_content`]) and a rollback recreates the
+    /// managed relationship rather than downgrading it to hand-managed. Do not
+    /// re-add a strip here — it would silently convert every spec-owned resource
+    /// to hand-managed on rollback.
     async fn load_namespace_snapshot(
         &self,
         namespace: &str,

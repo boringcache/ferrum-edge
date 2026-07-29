@@ -11546,7 +11546,17 @@ mod inner {
                         .context("batch_insert_api_specs transaction failed")?
                 } else {
                     let ids: Vec<&str> = specs.iter().map(|spec| spec.id.as_str()).collect();
-                    match self.api_specs().insert_many(docs).ordered(true).await {
+                    // MUST stay unordered, exactly like every sibling standalone
+                    // batch insert. `rollback_ids_for_unordered_insert_error`
+                    // derives "documents this call created" as *all ids minus
+                    // the reported write-error indices*, which is only true for
+                    // an unordered insert. An ordered insert stops at the first
+                    // write error, so every id after it would be reported as
+                    // created and then deleted by the compensating
+                    // `delete_many({_id: {$in: ...}})` — and `api_specs._id` is
+                    // the bare spec id with no namespace qualifier, so that
+                    // delete would destroy another namespace's spec documents.
+                    match self.api_specs().insert_many(docs).ordered(false).await {
                         Ok(result) => result.inserted_ids.len(),
                         Err(err) => {
                             let rollback_ids =
