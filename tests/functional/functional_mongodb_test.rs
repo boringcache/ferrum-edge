@@ -1757,7 +1757,26 @@ async fn test_mongodb_replica_set_restore_failure_rolls_back_api_specs() {
         200,
         "MongoDB API-spec backup must succeed: {backup:?}"
     );
-    assert_eq!(backup["counts"]["api_specs"], 1);
+    let backup_spec_ids: Vec<String> = backup["api_specs"]["items"]
+        .as_array()
+        .expect("backup API-spec section must contain an items array")
+        .iter()
+        .map(|item| {
+            item["id"]
+                .as_str()
+                .expect("backup API spec must carry an id")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        backup["counts"]["api_specs"].as_u64(),
+        u64::try_from(backup_spec_ids.len()).ok(),
+        "backup API-spec count must describe the authoritative section: {backup:?}"
+    );
+    assert!(
+        backup_spec_ids.iter().any(|id| id == &spec_id),
+        "backup must contain the API spec created by this test: {backup:?}"
+    );
 
     // The namespace clear completes before restore imports begin. Fail exactly
     // the first proxy insert, then let the one-shot failpoint disarm so the
@@ -1797,12 +1816,27 @@ async fn test_mongodb_replica_set_restore_failure_rolls_back_api_specs() {
         200,
         "API-spec list failed: {specs:?}"
     );
-    assert!(
-        specs["items"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item["id"] == spec_id)),
-        "MongoDB rollback must restore the API spec document: {specs:?}"
+    assert_eq!(
+        specs["total"].as_u64(),
+        u64::try_from(backup_spec_ids.len()).ok(),
+        "MongoDB rollback must restore exactly the authoritative API-spec count: {specs:?}"
     );
+    for backup_spec_id in &backup_spec_ids {
+        let restored_spec_response = client
+            .get(format!(
+                "{}/api-specs/{backup_spec_id}",
+                harness.admin_base_url
+            ))
+            .header("Authorization", &auth_header)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("read restored API spec {backup_spec_id}: {error}"));
+        assert_eq!(
+            restored_spec_response.status().as_u16(),
+            200,
+            "MongoDB rollback must restore API spec {backup_spec_id}"
+        );
+    }
 
     for (resource, id) in [
         ("proxies", fixture.proxy_id.as_str()),
