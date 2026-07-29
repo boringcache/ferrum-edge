@@ -1196,7 +1196,9 @@ fn backup_with_api_specs_holds_admission_across_config_and_document_reads() {
     assert!(helper_body.contains("FullConfigLoadPurpose::BackupExport"));
     assert!(helper_body.contains("list_api_specs_with_content(namespace)"));
     assert!(
-        helper_body.find("load_full_config_for_purpose").expect("config load")
+        helper_body
+            .find("load_full_config_for_purpose")
+            .expect("config load")
             < helper_body
                 .find("list_api_specs_with_content")
                 .expect("spec load")
@@ -1212,9 +1214,7 @@ fn backup_with_api_specs_holds_admission_across_config_and_document_reads() {
     assert!(backup.contains("backup_namespace_admission_before_export"));
     assert!(backup.contains("NamespaceConfigAdmissionCompletion::Lost"));
     assert!(
-        backup.contains(
-            "Filtered backups that explicitly omit `api_specs` skip this guard"
-        ),
+        backup.contains("Filtered backups that explicitly omit `api_specs` skip this guard"),
         "narrow skip for filtered omit must stay documented in code"
     );
     // Cached fallback stays available only after a held-lease config load

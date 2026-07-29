@@ -930,9 +930,7 @@ pub mod _test_support {
     }
 
     /// Opaque handle around the production admission guard for external tests.
-    pub struct TestNamespaceConfigAdmissionGuard(
-        crate::admin::crud::NamespaceConfigAdmissionGuard,
-    );
+    pub struct TestNamespaceConfigAdmissionGuard(crate::admin::crud::NamespaceConfigAdmissionGuard);
 
     impl TestNamespaceConfigAdmissionGuard {
         /// Force the lease into the lost state without waiting for TTL/renewal.

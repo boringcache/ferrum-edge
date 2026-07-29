@@ -6711,9 +6711,8 @@ fn serialize_backup_payload(
     // fallback whose runtime snapshot has already been stripped of ownership
     // tags. Strip the tags in both cases so the exported resources restore as
     // hand-managed instead of producing a file that only fails at restore time.
-    let export_carries_api_specs = include_api_specs
-        && source == "database"
-        && api_specs_owned.is_some();
+    let export_carries_api_specs =
+        include_api_specs && source == "database" && api_specs_owned.is_some();
     if !export_carries_api_specs {
         crate::config::db_loader::strip_api_spec_id_from_runtime_config(&mut config);
     }
@@ -6901,9 +6900,7 @@ async fn handle_backup(
     // Filtered backups that explicitly omit `api_specs` skip this guard: they
     // strip ownership tags and emit an intentional empty wipe section, so they
     // do not claim a consistent config↔document generation.
-    if include_api_specs
-        && let Some(ref db) = state.db
-    {
+    if include_api_specs && let Some(ref db) = state.db {
         let guard = match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(_error) => {
@@ -7021,8 +7018,14 @@ async fn handle_backup(
         warn!("Backup: cached fallback omits api_specs (ownership tags unavailable)");
     }
 
-    let (body_bytes, proxy_count, consumer_count, plugin_config_count, upstream_count, api_specs_count) =
-        serialize_backup_payload(config, source, resource_filter.as_ref(), None);
+    let (
+        body_bytes,
+        proxy_count,
+        consumer_count,
+        plugin_config_count,
+        upstream_count,
+        api_specs_count,
+    ) = serialize_backup_payload(config, source, resource_filter.as_ref(), None);
 
     info!(
         "Backup: {} proxies, {} consumers, {} plugin_configs, {} upstreams, {} api_specs ({} bytes)",
