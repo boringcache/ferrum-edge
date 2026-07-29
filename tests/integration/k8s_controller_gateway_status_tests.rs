@@ -627,7 +627,8 @@ fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted(
     ports.sort_unstable();
     assert_eq!(ports, vec![8080, 50051]);
 
-    let updates = plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    let updates =
+        plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
     for (kind, name) in [("HTTPRoute", "web"), ("GRPCRoute", "grpc")] {
         let update = updates
             .iter()
