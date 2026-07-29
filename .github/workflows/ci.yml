@@ -951,12 +951,14 @@ jobs:
               functional_router_cache_test
               functional_secrets_test
               functional_ai_plugins_test
+              functional_ai_response_guard_grpc_test
               functional_ai_stream_router_test
               functional_ai_semantic_firewall_streaming_test
               functional_body_validator_response_stream_test
               functional_json_duplicate_key_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
+              functional_grpcroute_pathless_dispatch_test
               functional_request_mirror_grpc_transport_test
               functional_logging_plugins_test
               functional_logging_test
@@ -972,6 +974,7 @@ jobs:
               functional_spec_expose_test
               functional_prometheus_test
               functional_serverless_mirror_test
+              functional_serverless_grpc_terminate_test
               functional_ws_plugins_test
               functional_circuit_breaker_retry_test
               functional_dns_cache_test
