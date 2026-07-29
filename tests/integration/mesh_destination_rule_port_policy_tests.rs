@@ -1360,7 +1360,7 @@ fn virtual_service_cors_policy_follows_updates_and_deletes_preserving_rule_order
     for path in &order {
         assert!(
             deleted_paths.contains(path),
-            "rule `{path}` must survive a CORS delete: {deleted_paths:?}"
+            "rule `{path:?}` must survive a CORS delete: {deleted_paths:?}"
         );
     }
 }
