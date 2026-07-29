@@ -238,7 +238,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         !oversize.contains("halt_cancelled_h3_upload("),
         "oversize terminal upload must rely on the writer's post-HEADERS halt"
     );
-    assert!(oversize.contains("&rejection.body"));
+    assert!(oversize.contains("rejection.body.clone()"));
     assert!(oversize.contains("&rejection.headers"));
 
     let disconnected = terminal_dispatch
@@ -280,7 +280,7 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
         .expect("timed-out terminal upload must use the recv-halt-aware sender");
     assert!(timed_out_finalize < timed_out_send);
-    assert!(timed_out.contains("&rejection.body"));
+    assert!(timed_out.contains("rejection.body.clone()"));
     assert!(timed_out.contains("&rejection.headers"));
     assert!(
         timed_out.contains("false,\n                    )\n                    .await?;"),
