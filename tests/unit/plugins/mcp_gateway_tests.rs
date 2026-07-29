@@ -7617,7 +7617,9 @@ async fn start_mcp_output_schema_tool_server(output_schema: Value) -> MockServer
         .await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .and(body_partial_json(json!({"method": "notifications/initialized"})))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
         .respond_with(ResponseTemplate::new(202))
         .mount(&server)
         .await;
@@ -7953,10 +7955,8 @@ async fn validate_tool_results_rejects_sse_tool_results() {
     .unwrap();
     let session_id = initialize(&plugin).await;
     let mut ctx = route_validated_tool_call(&plugin, &session_id, 170).await;
-    let mut headers = HashMap::from([(
-        "content-type".to_string(),
-        "text/event-stream".to_string(),
-    )]);
+    let mut headers =
+        HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]);
     let (status, body, _) = reject_json(plugin.after_proxy(&mut ctx, 200, &mut headers).await);
     assert_eq!(status, 200);
     assert_eq!(body["error"]["code"], -32012);
@@ -7987,9 +7987,12 @@ async fn validate_tool_results_reload_update_and_delete_change_enforcement() {
     let server = start_mcp_output_schema_tool_server(weather_output_schema()).await;
     let upstream = format!("{}/mcp", server.uri());
 
-    let enabled = create_plugin("mcp_gateway", &aggregate_output_validation_config(&upstream))
-        .unwrap()
-        .unwrap();
+    let enabled = create_plugin(
+        "mcp_gateway",
+        &aggregate_output_validation_config(&upstream),
+    )
+    .unwrap()
+    .unwrap();
     let session_id = initialize(&enabled).await;
     let mut ctx = route_validated_tool_call(&enabled, &session_id, 190).await;
     let invalid = serde_json::to_vec(&json!({
@@ -8009,7 +8012,9 @@ async fn validate_tool_results_reload_update_and_delete_change_enforcement() {
     // Reload/update: reconstruct without validation — same invalid body passes.
     let mut disabled_config = aggregate_output_validation_config(&upstream);
     disabled_config["validation"]["validate_tool_results"] = json!(false);
-    let disabled = create_plugin("mcp_gateway", &disabled_config).unwrap().unwrap();
+    let disabled = create_plugin("mcp_gateway", &disabled_config)
+        .unwrap()
+        .unwrap();
     let session_id = initialize(&disabled).await;
     let request_body = json!({
         "jsonrpc": "2.0",
@@ -8066,7 +8071,9 @@ async fn validate_tool_results_output_schema_change_hides_until_configured() {
         .await;
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .and(body_partial_json(json!({"method": "notifications/initialized"})))
+        .and(body_partial_json(
+            json!({"method": "notifications/initialized"}),
+        ))
         .respond_with(ResponseTemplate::new(202))
         .mount(&server)
         .await;

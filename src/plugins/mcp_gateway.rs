@@ -2959,8 +2959,8 @@ impl McpGateway {
             self.prepare_response_resource_bindings(ctx, downstream_session_id, &server.server_id)
                 .await;
         }
-        let validate_tool_results = self.validation.validate_tool_results
-            && entry.output_validator.is_some();
+        let validate_tool_results =
+            self.validation.validate_tool_results && entry.output_validator.is_some();
         ctx.mcp_validate_tool_result = validate_tool_results;
         let Some(catalog_lock) = self.catalog_for_session(downstream_session_id) else {
             return session_not_found_response();
@@ -4888,11 +4888,7 @@ impl Plugin for McpGateway {
         let value: Value = match serde_json::from_slice(body) {
             Ok(value) => value,
             Err(_) => {
-                return self.reject_invalid_tool_result(
-                    ctx,
-                    None,
-                    "tool result is not valid JSON",
-                );
+                return self.reject_invalid_tool_result(ctx, None, "tool result is not valid JSON");
             }
         };
         // Preserve upstream JSON-RPC protocol errors unchanged.
@@ -5633,9 +5629,7 @@ fn audit_output_schema_node(
         }
     }
     if map.contains_key("$vocabulary") {
-        return Err(
-            "outputSchema declares '$vocabulary', which is not supported".to_string(),
-        );
+        return Err("outputSchema declares '$vocabulary', which is not supported".to_string());
     }
     for (key, value) in map {
         match key.as_str() {
@@ -5697,7 +5691,9 @@ fn local_output_schema_pointer_target<'a>(
     }
     match document.pointer(pointer) {
         Some(target) => Ok(Some(target)),
-        None => Err(format!("outputSchema '{key}' target '{reference}' was not found")),
+        None => Err(format!(
+            "outputSchema '{key}' target '{reference}' was not found"
+        )),
     }
 }
 
