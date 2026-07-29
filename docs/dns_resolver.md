@@ -29,7 +29,7 @@ The DNS cache stores **one shared answer row per hostname** (addresses, native T
 
 **Shared-row age eviction:** the hostname row is retained until the longest effective TTL among **policies actually observed** for that hostname elapses, plus `FERRUM_DNS_STALE_TTL`, capped at one day. Explicit-only consumers retain for their longest override even when native TTL is longer; a default (`None`) consumer includes global/native effective policy in that maximum so a shorter explicit peer cannot age-evict data still fresh for the default consumer. Short global/native policies therefore remain reclaimable by `evict_expired` when they were actually observed, instead of pinning every success row to the one-day ceiling.
 
-If a caller past its own stale window attempts a synchronous refresh and DNS fails, Ferrum keeps the shared success row for peers whose longer TTL is still fresh. The expired caller observes a bounded cached refresh error before retrying DNS; the failure never replaces a still-usable hostname-wide answer with an error row.
+If a caller past its own stale window attempts a synchronous refresh and DNS fails, Ferrum keeps the shared success row for peers whose longer TTL is still fresh. The expired caller observes a bounded cached refresh error before retrying DNS; the failure never replaces a still-usable hostname-wide answer with an error row. That cooldown uses the same exponential backoff as error rows — `FERRUM_DNS_ERROR_TTL` doubling per consecutive refresh failure, capped at `FERRUM_DNS_STALE_TTL` (or 1 day when stale TTL is `0`) — so a hostname whose DNS is down cannot be re-queried at a fixed few-second cadence for the whole retention window of a long-TTL peer. A successful refresh resets the streak.
 
 ## Environment Variables
 

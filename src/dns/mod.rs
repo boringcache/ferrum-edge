@@ -233,7 +233,10 @@ struct DnsCacheEntry {
     /// still consider it fresh. Callers already past their own stale window
     /// observe the cached refresh error until this deadline instead of
     /// hammering DNS or replacing the shared success with a hostname-wide
-    /// error entry.
+    /// error entry. The cooldown uses the same exponential error backoff as
+    /// error rows (`consecutive_failures`), so a hostname whose DNS is down for
+    /// the whole retention window of a long-TTL peer is not re-queried at a
+    /// fixed `error_ttl` cadence for hours.
     refresh_error_deadline: Option<Instant>,
     /// Shortest observed explicit per-proxy `dns_cache_ttl_seconds` for this
     /// hostname. `NO_PER_PROXY_TTL` means no explicit override observed yet.
@@ -255,8 +258,10 @@ struct DnsCacheEntry {
     /// exists on the shared answer. Shared across success refresh, error
     /// transitions, clones, and generation guards via the same `Arc`.
     default_consumer_observed: Arc<AtomicBool>,
-    /// Consecutive failed resolutions while this hostname remains an error
-    /// entry. Used to compute exponential error-TTL backoff. Reset on success.
+    /// Consecutive failed resolutions for this hostname: error-entry failures,
+    /// and refresh failures against a preserved success row (see
+    /// `refresh_error_deadline`). Used to compute exponential error-TTL
+    /// backoff. Reset to zero on every successful publication.
     consecutive_failures: u32,
     /// When the current failure streak began. `None` for success entries.
     /// Error entries older than the failed-entry lifetime cap (`stale_ttl`,
@@ -292,9 +297,14 @@ impl DnsCacheEntry {
     fn note_per_proxy_ttl(&self, per_proxy_ttl: Option<u64>) {
         let Some(secs) = per_proxy_ttl else {
             // A real default consumer was observed: retention / refresh must
-            // include global/native effective policy for this hostname.
-            self.default_consumer_observed
-                .store(true, Ordering::Relaxed);
+            // include global/native effective policy for this hostname. Read
+            // before writing — the flag is monotonic and most proxies carry no
+            // `dns_cache_ttl_seconds`, so an unconditional store would dirty
+            // this shared cache line on every cache hit for no state change.
+            if !self.default_consumer_observed.load(Ordering::Relaxed) {
+                self.default_consumer_observed
+                    .store(true, Ordering::Relaxed);
+            }
             return;
         };
         let mut cur = self.shortest_per_proxy_ttl_secs.load(Ordering::Relaxed);
@@ -1248,14 +1258,35 @@ impl DnsCache {
                     // still owns a fresh view of this shared answer. Preserve
                     // the answer and cache only a bounded refresh-error
                     // cooldown for callers past their own stale window.
-                    let mut preserved = occupied.get().clone();
-                    let ttl = self.error_backoff_ttl(0);
-                    preserved.refresh_error_deadline = Some(now + ttl);
-                    occupied.insert(preserved);
-                    debug!(
-                        "DNS cached refresh error for {} without replacing shared success (ttl={:?})",
-                        hostname, ttl
-                    );
+                    if occupied.get().refresh_error_is_live(now) {
+                        // A concurrent expired caller already armed this round's
+                        // cooldown. Every racer passed the liveness gate before
+                        // the first failure landed, so advancing the backoff per
+                        // caller would slam a busy hostname straight to the cap
+                        // on its first failed round.
+                        debug!(
+                            "DNS refresh error for {} already covered by a live cooldown",
+                            hostname
+                        );
+                    } else {
+                        // Back off like an error row: the shared row survives
+                        // for the longest observed consumer, which can be far
+                        // longer than the expired caller's own window, so a
+                        // fixed `error_ttl` cooldown would re-query a dead
+                        // hostname at that cadence for the whole retention
+                        // period. `cache_success_entry` resets the streak on the
+                        // next successful publication.
+                        let mut preserved = occupied.get().clone();
+                        let ttl = self.error_backoff_ttl(preserved.consecutive_failures);
+                        let failures = preserved.consecutive_failures.saturating_add(1);
+                        preserved.consecutive_failures = failures;
+                        preserved.refresh_error_deadline = Some(now + ttl);
+                        occupied.insert(preserved);
+                        debug!(
+                            "DNS cached refresh error for {} without replacing shared success (ttl={:?}, consecutive_failures={})",
+                            hostname, ttl, failures
+                        );
+                    }
                 } else {
                     // A successful refresh won the race while this lookup was
                     // in flight. Never taint that newer generation with a stale
@@ -4273,6 +4304,111 @@ mod tests {
             entry.refresh_error_is_live(Instant::now()),
             "expired peer must receive a bounded cached refresh error"
         );
+    }
+
+    /// Repeated refresh rounds against a preserved shared answer must back off
+    /// exponentially. A shared row survives for its longest observed consumer,
+    /// so a fixed `error_ttl` cooldown would re-query a dead hostname every few
+    /// seconds for that entire window while the long-TTL peer keeps serving the
+    /// cached answer. Callers racing inside one live cooldown must not each
+    /// advance the streak.
+    #[test]
+    fn preserved_refresh_error_cooldown_backs_off_exponentially() {
+        let cache = DnsCache::new(DnsConfig {
+            min_ttl_seconds: 1,
+            stale_ttl_seconds: 3600,
+            error_ttl_seconds: 5,
+            ttl_override_seconds: None,
+            ..DnsConfig::default()
+        });
+        let address = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 47));
+        let now = Instant::now();
+        cache.cache.insert(
+            "shared.example".to_string(),
+            success_entry(
+                Arc::from([address]),
+                now - Duration::from_secs(10),
+                Duration::from_secs(600),
+                Some(5),
+                now + Duration::from_secs(86_400),
+            ),
+        );
+        // The 600s peer's row stays live across every failed 5s-peer refresh.
+        cache
+            .cache
+            .get("shared.example")
+            .expect("seeded row")
+            .note_per_proxy_ttl(Some(600));
+        let generation = cache
+            .cache
+            .get("shared.example")
+            .expect("success generation")
+            .next_start
+            .clone();
+
+        for (attempt, expected_secs) in [(1u32, 5u64), (2, 10), (3, 20)] {
+            let before = Instant::now();
+            cache.cache_error("shared.example", Some(5), Some(&generation));
+            let after = Instant::now();
+            let (is_error, deadline, failures) = {
+                let entry = cache
+                    .cache
+                    .get("shared.example")
+                    .expect("shared answer must survive every failed refresh");
+                (
+                    entry.is_error,
+                    entry.refresh_error_deadline.expect("cooldown armed"),
+                    entry.consecutive_failures,
+                )
+            };
+            let expected = Duration::from_secs(expected_secs);
+            assert!(!is_error, "attempt {attempt}: answer row must be preserved");
+            assert_eq!(
+                failures, attempt,
+                "attempt {attempt}: refresh failures must accumulate on the shared row"
+            );
+            assert!(
+                deadline >= before + expected && deadline <= after + expected,
+                "attempt {attempt}: cooldown must be {expected:?}, not a fixed error_ttl"
+            );
+
+            // A caller racing inside the live cooldown must not advance the
+            // streak — otherwise one failed round on a busy hostname jumps
+            // straight to the backoff cap.
+            cache.cache_error("shared.example", Some(5), Some(&generation));
+            {
+                let entry = cache.cache.get("shared.example").expect("still preserved");
+                assert_eq!(
+                    entry.consecutive_failures, attempt,
+                    "attempt {attempt}: a racing caller must not advance the backoff"
+                );
+                assert_eq!(
+                    entry.refresh_error_deadline,
+                    Some(deadline),
+                    "attempt {attempt}: a racing caller must not extend the cooldown"
+                );
+            }
+
+            // Let the cooldown lapse so the next iteration is a new round.
+            if let Some(mut entry) = cache.cache.get_mut("shared.example") {
+                entry.refresh_error_deadline = Some(before);
+            }
+        }
+
+        // A successful republication clears both the cooldown and the streak.
+        cache
+            .cache_success_entry(
+                "shared.example",
+                vec![address],
+                Some(CachedRecordType::A),
+                Duration::from_secs(600),
+                Some(5),
+                false,
+            )
+            .expect("republish");
+        let entry = cache.cache.get("shared.example").expect("republished row");
+        assert!(entry.refresh_error_deadline.is_none());
+        assert_eq!(entry.consecutive_failures, 0);
     }
 
     /// Success publication must preserve shared observation atomics under the
