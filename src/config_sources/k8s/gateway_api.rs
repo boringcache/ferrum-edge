@@ -911,8 +911,8 @@ pub(crate) fn route_conflicts(
             .creation_timestamp
             .as_deref()
             .and_then(parse_k8s_timestamp);
-        let keys = route_conflict_keys_for_acc(object, acc);
-        for key in &keys {
+        let key_set = route_conflict_key_set(object, acc);
+        for key in &key_set.keys {
             candidates_by_key.entry(key.clone()).or_default().push(
                 GatewayApiRouteConflictCandidate {
                     resource: resource.clone(),
@@ -925,7 +925,8 @@ pub(crate) fn route_conflicts(
                 resource,
                 creation_timestamp,
             },
-            keys,
+            keys: key_set.keys,
+            listeners: key_set.listeners,
         });
     }
 
@@ -956,10 +957,52 @@ pub(crate) fn route_conflict_keys(object: &K8sObject) -> Vec<GatewayApiRouteConf
 }
 
 /// One HTTPRoute / GRPCRoute participating in cross-kind conflict resolution,
-/// carrying the conflict keys it claims across every parent reference.
+/// carrying the conflict keys it claims across every parent reference plus the
+/// concrete Gateway listeners each `(parentRef, hostname)` claim resolved to.
 struct CrossKindRouteEntry {
     candidate: GatewayApiRouteConflictCandidate,
     keys: Vec<GatewayApiRouteConflictKey>,
+    /// parentRef key -> conflict hostname -> the accepted listeners behind it.
+    listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>>,
+}
+
+impl CrossKindRouteEntry {
+    /// The listeners this route attaches to for one `(parentRef, hostname)`
+    /// claim. When no Gateway listener policy resolved the reference — an
+    /// unknown Gateway, or a caller with no accumulator — the literal parentRef
+    /// remains the only available identity, which is the arbitration domain
+    /// that predates listener resolution.
+    fn listeners_for(&self, parent_ref: &str, hostname: &str) -> BTreeSet<CrossKindListener> {
+        match self
+            .listeners
+            .get(parent_ref)
+            .and_then(|by_hostname| by_hostname.get(hostname))
+        {
+            Some(listeners) if !listeners.is_empty() => listeners
+                .iter()
+                .cloned()
+                .map(CrossKindListener::Listener)
+                .collect(),
+            _ => BTreeSet::from([CrossKindListener::ParentRef(parent_ref.to_string())]),
+        }
+    }
+}
+
+/// The domain cross-kind arbitration runs in.
+///
+/// A route parentRef is a *selector*, not an identity: a wildcard reference
+/// (no `sectionName`, no `port`) and a reference pinning a section or port can
+/// name the very same listener, and two wildcard references on one Gateway can
+/// reach disjoint listeners once `allowedRoutes.kinds` filters them. Arbitrating
+/// on the literal selector string would therefore both miss real overlaps and
+/// invent conflicts between routes that never share a listener, so the domain
+/// is the resolved listener wherever one is known.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum CrossKindListener {
+    /// A concrete accepted Gateway listener the parentRef resolved to.
+    Listener(GatewayApiListenerKey),
+    /// No listener policy resolved the reference; fall back to its literal key.
+    ParentRef(String),
 }
 
 /// Resolve HTTPRoute vs GRPCRoute overlap on a shared listener.
@@ -984,27 +1027,46 @@ struct CrossKindRouteEntry {
 /// rejected only when it overlaps an already-accepted route of the other kind.
 /// A route that overlaps only a *rejected* opposite-kind route still wins,
 /// because that rejected route contributes no traffic state.
+///
+/// Arbitration runs per resolved `CrossKindListener`, never per parentRef
+/// selector string, so a wildcard reference and a `sectionName` / `port`
+/// reference that name one listener contend with each other, while wildcard
+/// references reaching disjoint `allowedRoutes.kinds`-filtered listeners do
+/// not. A route that loses on one listener but survives on another keeps its
+/// claim, because the shared conflict key cannot express a partial withdrawal.
 fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApiRouteConflict> {
-    // parent_ref -> the routes claiming it, with the hostnames they claim.
-    let mut by_parent: BTreeMap<&str, Vec<CrossKindParentClaim<'_>>> = BTreeMap::new();
-    for entry in entries {
-        let mut claims: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    // listener -> the routes attached to it, with the hostnames they claim
+    // there. Two different parentRef shapes selecting one listener land in the
+    // same bucket, and one wildcard parentRef spanning several listeners is
+    // arbitrated independently on each of them.
+    let mut by_listener: BTreeMap<CrossKindListener, Vec<CrossKindListenerClaim<'_>>> =
+        BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let mut claims: BTreeMap<CrossKindListener, BTreeSet<&str>> = BTreeMap::new();
         for key in &entry.keys {
-            claims
-                .entry(key.parent_ref.as_str())
-                .or_default()
-                .insert(key.hostname.as_str());
+            for listener in entry.listeners_for(&key.parent_ref, &key.hostname) {
+                claims
+                    .entry(listener)
+                    .or_default()
+                    .insert(key.hostname.as_str());
+            }
         }
-        for (parent_ref, hostnames) in claims {
-            by_parent
-                .entry(parent_ref)
+        for (listener, hostnames) in claims {
+            by_listener
+                .entry(listener)
                 .or_default()
-                .push(CrossKindParentClaim { entry, hostnames });
+                .push(CrossKindListenerClaim {
+                    index,
+                    entry,
+                    hostnames,
+                });
         }
     }
 
-    let mut conflicts = Vec::new();
-    for (parent_ref, mut claims) in by_parent {
+    // (route index, listener) -> the accepted opposite-kind Route that
+    // displaced it there.
+    let mut losses: HashMap<(usize, CrossKindListener), K8sResourceKey> = HashMap::new();
+    for (listener, mut claims) in by_listener {
         if claims.len() < 2 {
             continue;
         }
@@ -1028,7 +1090,7 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
             )
         });
 
-        let mut accepted: Vec<&CrossKindParentClaim<'_>> = Vec::new();
+        let mut accepted: Vec<&CrossKindListenerClaim<'_>> = Vec::new();
         for claim in &claims {
             let kind = &claim.entry.candidate.resource.kind;
             let winner = accepted
@@ -1042,16 +1104,58 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
                 accepted.push(claim);
                 continue;
             };
-            for key in claim
-                .entry
-                .keys
-                .iter()
-                .filter(|key| key.parent_ref == parent_ref)
-            {
+            losses.insert((claim.index, listener.clone()), winner);
+        }
+    }
+
+    // Project the per-listener losses back onto the route's own conflict keys.
+    // Those keys carry the *literal* originating parentRef — the identity route
+    // status, materialized-parent accounting, and losing-match suppression all
+    // key on — so the loss is expressed at the finest granularity a key can
+    // express: one `(parentRef, hostname)` claim.
+    let mut conflicts = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let mut keys_by_claim: BTreeMap<(&str, &str), Vec<&GatewayApiRouteConflictKey>> =
+            BTreeMap::new();
+        for key in &entry.keys {
+            keys_by_claim
+                .entry((key.parent_ref.as_str(), key.hostname.as_str()))
+                .or_default()
+                .push(key);
+        }
+        for ((parent_ref, hostname), keys) in keys_by_claim {
+            // One wildcard parentRef can reach several listeners while emitting
+            // a single shared conflict key, so rejecting the claim after losing
+            // on one listener would also withdraw the route from listeners it
+            // legitimately won. The claim is rejected only when it lost on every
+            // listener it reaches.
+            let listeners = entry.listeners_for(parent_ref, hostname);
+            let mut winner: Option<K8sResourceKey> = None;
+            let mut lost_on_every_listener = true;
+            for listener in &listeners {
+                match losses.get(&(index, listener.clone())) {
+                    Some(listener_winner) => {
+                        if winner.is_none() {
+                            winner = Some(listener_winner.clone());
+                        }
+                    }
+                    None => {
+                        lost_on_every_listener = false;
+                        break;
+                    }
+                }
+            }
+            if !lost_on_every_listener {
+                continue;
+            }
+            let Some(winner) = winner else {
+                continue;
+            };
+            for key in keys {
                 conflicts.push(GatewayApiRouteConflict {
                     key: key.clone(),
                     winner: winner.clone(),
-                    loser: claim.entry.candidate.resource.clone(),
+                    loser: entry.candidate.resource.clone(),
                 });
             }
         }
@@ -1059,7 +1163,10 @@ fn cross_kind_route_conflicts(entries: &[CrossKindRouteEntry]) -> Vec<GatewayApi
     conflicts
 }
 
-struct CrossKindParentClaim<'a> {
+struct CrossKindListenerClaim<'a> {
+    /// Index of the claiming route in the `entries` slice, used to key its
+    /// per-listener losses without re-deriving a resource identity.
+    index: usize,
     entry: &'a CrossKindRouteEntry,
     hostnames: BTreeSet<&'a str>,
 }
@@ -1080,6 +1187,24 @@ pub(crate) fn route_conflict_keys_for_acc(
     object: &K8sObject,
     acc: Option<&K8sAccumulator>,
 ) -> Vec<GatewayApiRouteConflictKey> {
+    route_conflict_key_set(object, acc).keys
+}
+
+/// A route's conflict keys plus the concrete listeners behind each
+/// `(parentRef, hostname)` claim.
+///
+/// The keys are the route's public identity — status conditions, materialized
+/// parents, and losing-match suppression all key on the literal parentRef they
+/// carry — while the listener resolution is only consumed by cross-kind
+/// arbitration, which must not mistake a selector shape for a listener.
+struct RouteConflictKeySet {
+    keys: Vec<GatewayApiRouteConflictKey>,
+    /// parentRef key -> conflict hostname -> the accepted listeners behind it.
+    /// A pair with no entry had no listener policy resolve it.
+    listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>>,
+}
+
+fn route_conflict_key_set(object: &K8sObject, acc: Option<&K8sAccumulator>) -> RouteConflictKeySet {
     let requested_hostnames = route_hostnames(object);
     let hostnames = acc
         .and_then(|acc| {
@@ -1089,8 +1214,46 @@ pub(crate) fn route_conflict_keys_for_acc(
         .unwrap_or_else(|| requested_hostnames.clone());
     let default_parent_refs = route_parent_ref_keys(object);
     let route_family = object.kind.to_ascii_lowercase();
-    let mut keys = Vec::new();
 
+    // Attachment depends on the hostname, not on the rule or match, so resolve
+    // each conflict hostname once instead of per rule x match.
+    let mut parent_refs_by_hostname: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut listeners: BTreeMap<String, BTreeMap<String, BTreeSet<GatewayApiListenerKey>>> =
+        BTreeMap::new();
+    for hostname in &hostnames {
+        let resolved = acc
+            .map(|acc| {
+                route_allowed_parent_listeners_for_hostname(
+                    object,
+                    acc,
+                    &requested_hostnames,
+                    None,
+                    hostname,
+                )
+            })
+            .filter(|resolved| !resolved.is_empty());
+        let parent_refs = match resolved {
+            Some(resolved) => {
+                let parent_refs: Vec<String> = resolved.keys().cloned().collect();
+                for (parent_ref, listener_keys) in resolved {
+                    if listener_keys.is_empty() {
+                        continue;
+                    }
+                    listeners
+                        .entry(parent_ref)
+                        .or_default()
+                        .entry(hostname.clone())
+                        .or_default()
+                        .extend(listener_keys);
+                }
+                parent_refs
+            }
+            None => default_parent_refs.clone(),
+        };
+        parent_refs_by_hostname.insert(hostname.as_str(), parent_refs);
+    }
+
+    let mut keys = Vec::new();
     for rule in object
         .spec
         .get("rules")
@@ -1100,19 +1263,10 @@ pub(crate) fn route_conflict_keys_for_acc(
     {
         for descriptor in route_match_descriptors(object, rule) {
             for hostname in &hostnames {
-                let parent_refs = acc
-                    .map(|acc| {
-                        route_allowed_parent_ref_keys_for_hostname(
-                            object,
-                            acc,
-                            &requested_hostnames,
-                            None,
-                            hostname,
-                        )
-                    })
-                    .filter(|refs| !refs.is_empty())
-                    .unwrap_or_else(|| default_parent_refs.clone());
-                for parent_ref in &parent_refs {
+                let Some(parent_refs) = parent_refs_by_hostname.get(hostname.as_str()) else {
+                    continue;
+                };
+                for parent_ref in parent_refs {
                     keys.push(GatewayApiRouteConflictKey {
                         route_family: route_family.clone(),
                         parent_ref: parent_ref.clone(),
@@ -1127,7 +1281,7 @@ pub(crate) fn route_conflict_keys_for_acc(
 
     keys.sort();
     keys.dedup();
-    keys
+    RouteConflictKeySet { keys, listeners }
 }
 
 fn route_conflict_match_signature(descriptor: &RouteMatchDescriptor) -> String {
@@ -1693,6 +1847,17 @@ const GRPC_CONTENT_TYPE_MUST_NARROW: &str = "matches[].headers[] 'content-type' 
      application/grpc-web-text are not native gRPC — configure the grpc_web plugin, which \
      rewrites a verified gRPC-Web request to application/grpc before backend dispatch";
 
+/// Diagnostic for an explicit `matches[].method: null`. An explicit null is a
+/// malformed predicate, not an omitted field: silently reading it as absent
+/// would widen the match to every gRPC call on the route's hostnames.
+const GRPC_EXPLICIT_NULL_METHOD: &str = "matches[].method must not be null; omit the field to match any gRPC call, or supply an \
+     Exact service / method predicate";
+
+/// Diagnostic for an explicit `matches[].headers: null`, which would otherwise
+/// widen the predicate to the headerless match.
+const GRPC_EXPLICIT_NULL_HEADERS: &str = "matches[].headers must not be null; omit the field to match without header predicates, or \
+     supply an array of Exact header matches";
+
 /// Upper bound on an `Exact` GRPCRoute `method.service` / `method.method`
 /// literal, matching the Gateway API v1.5.1 `GRPCMethodMatch` CRD, where both
 /// fields carry `MaxLength=1024`. Anything longer cannot have been admitted by
@@ -1751,7 +1916,14 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
         return Err("matches[] entry must be an object".to_string());
     }
 
-    let plan = match entry.get("method").filter(|method| !method.is_null()) {
+    // An *explicit* null is malformed operator input, not an omission: treating
+    // `method: null` as absent would widen the predicate to the any-gRPC-call
+    // match, exactly the fail-open this parser exists to prevent. Omission stays
+    // valid and keeps its documented meaning.
+    let plan = match entry.get("method") {
+        Some(method) if method.is_null() => {
+            return Err(GRPC_EXPLICIT_NULL_METHOD.to_string());
+        }
         Some(method) => grpc_route_method_plan(method)?,
         // `path` is not a GRPCRoute CRD field; it is retained as a Ferrum
         // extension for hand-authored specs that pin an HTTP listen path
@@ -1765,8 +1937,13 @@ fn grpc_route_match(entry: &Value) -> Result<GrpcRouteMatch, String> {
     };
 
     let mut headers: Vec<(String, String)> = Vec::new();
-    if let Some(headers_array) = entry.get("headers").filter(|value| !value.is_null()) {
-        let headers_array = headers_array
+    // Same fail-closed rule as `method`: an explicit `headers: null` must not
+    // silently become the headerless match.
+    if let Some(headers_value) = entry.get("headers") {
+        if headers_value.is_null() {
+            return Err(GRPC_EXPLICIT_NULL_HEADERS.to_string());
+        }
+        let headers_array = headers_value
             .as_array()
             .ok_or_else(|| "matches[].headers must be an array".to_string())?;
         for header in headers_array {
@@ -2123,15 +2300,51 @@ fn route_allowed_parent_ref_keys_for_hostname(
     namespace_filter: Option<&str>,
     conflict_hostname: &str,
 ) -> Vec<String> {
+    route_allowed_parent_listeners_for_hostname(
+        object,
+        acc,
+        requested_hostnames,
+        namespace_filter,
+        conflict_hostname,
+    )
+    .into_keys()
+    .collect()
+}
+
+/// The concrete Gateway listeners a route attaches to for one conflict
+/// hostname, grouped by the literal `parentRefs[]` entry that selected them.
+///
+/// A reference contributes only when it survives every attachment gate:
+/// `parent_ref_matches_listener_policy` (section / port selection), the
+/// listener's route-kind and namespace allowance plus its materializability
+/// (`route_listener_policy_materializes_route`), and an intersection of the
+/// route's hostnames with the listener hostname that lands exactly on
+/// `conflict_hostname`.
+///
+/// An empty listener set means the reference is known-good but no listener
+/// policy resolved it — an unknown Gateway — and callers fall back to the
+/// literal parentRef identity.
+fn route_allowed_parent_listeners_for_hostname(
+    object: &K8sObject,
+    acc: &K8sAccumulator,
+    requested_hostnames: &[String],
+    namespace_filter: Option<&str>,
+    conflict_hostname: &str,
+) -> BTreeMap<String, BTreeSet<GatewayApiListenerKey>> {
     let route_hostnames = hostnames_for_listener_intersection(requested_hostnames);
+    let unresolved = |keys: Vec<String>| -> BTreeMap<String, BTreeSet<GatewayApiListenerKey>> {
+        keys.into_iter()
+            .map(|key| (key, BTreeSet::new()))
+            .collect()
+    };
     let Some(parent_refs) = object.spec.get("parentRefs").and_then(Value::as_array) else {
-        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+        return unresolved(route_parent_ref_keys_for_namespace(object, namespace_filter));
     };
     if parent_refs.is_empty() {
-        return route_parent_ref_keys_for_namespace(object, namespace_filter);
+        return unresolved(route_parent_ref_keys_for_namespace(object, namespace_filter));
     }
 
-    let mut refs = Vec::new();
+    let mut refs: BTreeMap<String, BTreeSet<GatewayApiListenerKey>> = BTreeMap::new();
     for parent_ref in parent_refs {
         if !parent_ref_is_gateway(parent_ref) {
             continue;
@@ -2147,34 +2360,37 @@ fn route_allowed_parent_ref_keys_for_hostname(
             continue;
         }
 
-        let parent_ref_intersects_hostname =
-            acc.gateway_api_listener_policies
-                .iter()
-                .any(|(key, policy)| {
-                    key.namespace == gateway_namespace
-                        && key.gateway == gateway_name
-                        && parent_ref_matches_listener_policy(parent_ref, key, policy)
-                        && route_listener_policy_materializes_route(
-                            acc,
-                            object,
-                            gateway_namespace,
-                            policy,
+        let attached: BTreeSet<GatewayApiListenerKey> = acc
+            .gateway_api_listener_policies
+            .iter()
+            .filter_map(|(key, policy)| {
+                let attaches = key.namespace == gateway_namespace
+                    && key.gateway == gateway_name
+                    && parent_ref_matches_listener_policy(parent_ref, key, policy)
+                    && route_listener_policy_materializes_route(
+                        acc,
+                        object,
+                        gateway_namespace,
+                        policy,
+                    )
+                    && route_hostnames.iter().any(|route_hostname| {
+                        intersect_hostnames(
+                            route_hostname.as_str(),
+                            policy.hostname.as_deref().unwrap_or("*"),
                         )
-                        && route_hostnames.iter().any(|route_hostname| {
-                            intersect_hostnames(
-                                route_hostname.as_str(),
-                                policy.hostname.as_deref().unwrap_or("*"),
-                            )
-                            .as_deref()
-                                == Some(conflict_hostname)
-                        })
-                });
-        if parent_ref_intersects_hostname {
-            refs.push(route_parent_ref_key_for_parent(object, parent_ref));
+                        .as_deref()
+                            == Some(conflict_hostname)
+                    });
+                attaches.then(|| key.clone())
+            })
+            .collect();
+        if attached.is_empty() {
+            continue;
         }
+        refs.entry(route_parent_ref_key_for_parent(object, parent_ref))
+            .or_default()
+            .extend(attached);
     }
-    refs.sort();
-    refs.dedup();
     refs
 }
 
@@ -8645,6 +8861,365 @@ mod tests {
             "unexpected cross-kind conflict: {:?}",
             result.warnings
         );
+    }
+
+    /// A Gateway whose listeners are named, so cross-kind arbitration has
+    /// concrete listener identities to resolve parentRefs against.
+    fn cross_kind_gateway(listeners: Value) -> K8sObject {
+        let mut gateway = object(
+            "Gateway",
+            serde_json::json!({
+                "gatewayClassName": "ferrum",
+                "listeners": listeners
+            }),
+        );
+        gateway.metadata.name = "edge".to_string();
+        gateway
+    }
+
+    fn cross_kind_http_route(parent_ref: Value, matches: Option<Value>) -> K8sObject {
+        let rule = match matches {
+            Some(matches) => serde_json::json!({
+                "matches": matches,
+                "backendRefs": [{"name": "web", "port": 8080}]
+            }),
+            None => serde_json::json!({"backendRefs": [{"name": "web", "port": 8080}]}),
+        };
+        let mut route = object(
+            "HTTPRoute",
+            serde_json::json!({
+                "hostnames": ["edge.example.com"],
+                "parentRefs": [parent_ref],
+                "rules": [rule]
+            }),
+        );
+        route.metadata.name = "web".to_string();
+        route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+        route
+    }
+
+    fn cross_kind_grpc_route(parent_ref: Value, method_match: Value) -> K8sObject {
+        let mut route = object(
+            "GRPCRoute",
+            serde_json::json!({
+                "hostnames": ["edge.example.com"],
+                "parentRefs": [parent_ref],
+                "rules": [{
+                    "matches": [{"method": method_match}],
+                    "backendRefs": [{"name": "grpc-api", "port": 50051}]
+                }]
+            }),
+        );
+        route.metadata.name = "grpc".to_string();
+        route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+        route
+    }
+
+    /// A parentRef is a *selector*, not a listener identity. A wildcard
+    /// reference (no `sectionName`, no `port`) and a reference pinning that same
+    /// listener by `sectionName` or `port` attach to the very same listener, so
+    /// Gateway API v1.5.1's HTTPRoute/GRPCRoute merge prohibition applies and the
+    /// newer Route must be rejected whole — even though the two literal
+    /// parentRef keys differ.
+    #[test]
+    fn cross_kind_wildcard_and_pinned_parent_refs_contend_on_one_listener() {
+        for grpc_parent_ref in [
+            serde_json::json!({"name": "edge", "sectionName": "web"}),
+            serde_json::json!({"name": "edge", "port": 80}),
+        ] {
+            let gateway = cross_kind_gateway(serde_json::json!([{
+                "name": "web",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            }]));
+            let http_route = cross_kind_http_route(serde_json::json!({"name": "edge"}), None);
+            let grpc_route = cross_kind_grpc_route(
+                grpc_parent_ref.clone(),
+                serde_json::json!({"method": "SayHello"}),
+            );
+
+            for objects in [
+                vec![
+                    gateway.clone(),
+                    http_route.clone(),
+                    grpc_route.clone(),
+                ],
+                vec![
+                    grpc_route.clone(),
+                    http_route.clone(),
+                    gateway.clone(),
+                ],
+            ] {
+                let result =
+                    translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+                assert_eq!(
+                    result.config.proxies.len(),
+                    1,
+                    "the older HTTPRoute is the single accepted route for {grpc_parent_ref}"
+                );
+                assert_eq!(result.config.proxies[0].backend_port, 8080);
+                assert!(
+                    !result
+                        .config
+                        .plugin_configs
+                        .iter()
+                        .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                    "the rejected GRPCRoute must contribute no dispatch rules"
+                );
+                assert!(
+                    result.warnings.iter().any(|warning| {
+                        warning.contains("GRPCRoute default/grpc")
+                            && warning.contains("Gateway API forbids merging")
+                    }),
+                    "expected a whole-route rejection for {grpc_parent_ref}: {:?}",
+                    result.warnings
+                );
+                assert!(result.config.validate_unique_listen_paths().is_ok());
+            }
+        }
+    }
+
+    /// The mirror of the case above: two wildcard parentRefs share the literal
+    /// `*/*` key, but `allowedRoutes.kinds` sends each kind to a *different*
+    /// listener, so the two Routes never share one and neither may be rejected.
+    #[test]
+    fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_both_materialize() {
+        let gateway = cross_kind_gateway(serde_json::json!([
+            {
+                "name": "web",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}]
+                }
+            },
+            {
+                "name": "grpc",
+                "port": 8080,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "GRPCRoute"}]
+                }
+            }
+        ]));
+        // Distinct listen paths: Ferrum materializes Gateway API HTTP-family
+        // routes as port-agnostic `(hosts, listen_path)` proxies, so two Routes
+        // that survive on different listeners still have to occupy different
+        // route-table slots.
+        let http_route = cross_kind_http_route(
+            serde_json::json!({"name": "edge"}),
+            Some(serde_json::json!([{"path": {"type": "PathPrefix", "value": "/admin"}}])),
+        );
+        let grpc_route = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge"}),
+            serde_json::json!({"service": "pkg.Svc", "method": "SayHello"}),
+        );
+
+        for objects in [
+            vec![gateway.clone(), http_route.clone(), grpc_route.clone()],
+            vec![grpc_route.clone(), http_route.clone(), gateway.clone()],
+        ] {
+            let result = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+            let mut ports: Vec<u16> = result
+                .config
+                .proxies
+                .iter()
+                .map(|proxy| proxy.backend_port)
+                .collect();
+            ports.sort_unstable();
+            assert_eq!(
+                ports,
+                vec![8080, 50051],
+                "kind-disjoint listeners are not a shared listener"
+            );
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("Gateway API forbids merging")),
+                "unexpected cross-kind conflict: {:?}",
+                result.warnings
+            );
+            assert!(result.config.validate_unique_listen_paths().is_ok());
+        }
+    }
+
+    /// A wildcard parentRef can reach several listeners while emitting one
+    /// shared conflict key, so a loss on one listener must not withdraw the
+    /// route from a listener it still wins.
+    #[test]
+    fn a_wildcard_parent_ref_surviving_on_another_listener_is_not_withdrawn() {
+        let gateway = cross_kind_gateway(serde_json::json!([
+            {
+                "name": "shared",
+                "port": 80,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]
+                }
+            },
+            {
+                "name": "grpc-only",
+                "port": 8080,
+                "protocol": "HTTP",
+                "allowedRoutes": {
+                    "namespaces": {"from": "All"},
+                    "kinds": [{"kind": "GRPCRoute"}]
+                }
+            }
+        ]));
+        // The HTTPRoute pins the shared listener and is older, so it wins there.
+        // It takes a distinct listen path so the surviving GRPCRoute still has
+        // a route-table slot of its own.
+        let http_route = cross_kind_http_route(
+            serde_json::json!({"name": "edge", "sectionName": "shared"}),
+            Some(serde_json::json!([{"path": {"type": "PathPrefix", "value": "/admin"}}])),
+        );
+        let grpc_route = cross_kind_grpc_route(
+            serde_json::json!({"name": "edge"}),
+            serde_json::json!({"method": "SayHello"}),
+        );
+
+        let result = translate_k8s_objects(&[gateway, http_route, grpc_route], options())
+            .expect("translation succeeds");
+
+        let mut ports: Vec<u16> = result
+            .config
+            .proxies
+            .iter()
+            .map(|proxy| proxy.backend_port)
+            .collect();
+        ports.sort_unstable();
+        assert_eq!(
+            ports,
+            vec![8080, 50051],
+            "the GRPCRoute still owns the grpc-only listener its wildcard parentRef reaches"
+        );
+        assert!(result.config.validate_unique_listen_paths().is_ok());
+    }
+
+    /// An explicit `null` is malformed operator input, not an omitted field.
+    /// Reading it as absent would widen `method` into the any-gRPC-call match
+    /// and `headers` into the headerless match, so both fail closed with a
+    /// generic, field-specific diagnostic.
+    #[test]
+    fn grpc_route_explicit_null_predicates_fail_closed() {
+        for (entry, expected_fragment) in [
+            (
+                serde_json::json!({"method": null}),
+                "matches[].method must not be null",
+            ),
+            (
+                serde_json::json!({
+                    "method": null,
+                    "headers": [{"name": "x-tenant", "value": "a"}]
+                }),
+                "matches[].method must not be null",
+            ),
+            (
+                serde_json::json!({"method": null, "path": {"value": "/api"}}),
+                "matches[].method must not be null",
+            ),
+            (
+                serde_json::json!({"headers": null}),
+                "matches[].headers must not be null",
+            ),
+            (
+                serde_json::json!({
+                    "method": {"service": "pkg.Svc", "method": "SayHello"},
+                    "headers": null
+                }),
+                "matches[].headers must not be null",
+            ),
+        ] {
+            let reason = grpc_route_match(&entry)
+                .expect_err("an explicit null predicate must fail closed")
+                .to_string();
+            assert!(
+                reason.contains(expected_fragment),
+                "expected `{expected_fragment}` in `{reason}`"
+            );
+            assert!(
+                grpc_dispatch_match_criteria(&entry).is_none(),
+                "a refused predicate must not reach dispatch state: {entry}"
+            );
+
+            let result = translate_k8s_objects(
+                &[object(
+                    "GRPCRoute",
+                    serde_json::json!({
+                        "hostnames": ["grpc.example.com"],
+                        "rules": [{
+                            "matches": [entry],
+                            "backendRefs": [{"name": "grpc-api"}]
+                        }]
+                    }),
+                )],
+                options(),
+            )
+            .expect("translation succeeds");
+
+            assert!(
+                result.config.proxies.is_empty(),
+                "an explicit null predicate must not materialize a route: {reason}"
+            );
+            assert!(
+                !result
+                    .config
+                    .plugin_configs
+                    .iter()
+                    .any(|plugin| plugin.plugin_name == "mesh_route_dispatch"),
+                "an explicit null predicate must not emit dispatch rules: {reason}"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("dropped fail-closed")
+                        && warning.contains(expected_fragment)),
+                "expected a field-specific drop warning for `{expected_fragment}` in {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    /// The other half of the split above: an *omitted* `method` / `headers`
+    /// keeps its documented meaning and still materializes.
+    #[test]
+    fn grpc_route_omitted_predicates_remain_valid() {
+        let any_call = grpc_route_match(&serde_json::json!({}))
+            .expect("an empty match entry is the any-gRPC-call predicate");
+        assert_eq!(any_call, grpc_any_call_match());
+
+        let header_only = grpc_route_match(&serde_json::json!({
+            "headers": [{"name": "x-tenant", "value": "a"}]
+        }))
+        .expect("a header-only match omits `method`");
+        assert_eq!(
+            header_only.plan,
+            GrpcRouteMatchPlan::UriRegex {
+                pattern: grpc_any_call_pattern()
+            }
+        );
+        assert_eq!(
+            header_only.headers,
+            vec![("x-tenant".to_string(), "a".to_string())]
+        );
+
+        let method_only = grpc_route_match(&serde_json::json!({
+            "method": {"service": "pkg.Svc", "method": "SayHello"}
+        }))
+        .expect("a method-only match omits `headers`");
+        assert!(method_only.headers.is_empty());
     }
 
     #[test]

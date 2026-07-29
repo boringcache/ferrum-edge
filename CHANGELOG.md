@@ -189,14 +189,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two kinds may share a name and `creationTimestamp` has second granularity),
   independent of rule paths and of the order objects are observed in — and the losing Route materializes no proxy, upstream,
   plugin, or materialized-parent record and is reported `Accepted=False` with
-  `reason: Conflicted`. gRPC shapes Ferrum cannot represent exactly
+  `reason: Conflicted`. "The same listener" is the *resolved* Gateway listener,
+  not the literal `parentRefs[]` selector: a wildcard reference and a reference
+  pinning that listener by `sectionName` or `port` contend with each other,
+  while two wildcard references that `allowedRoutes.kinds` sends to different
+  listeners do not. A wildcard reference spanning several listeners emits one
+  shared conflict claim, so it is rejected only when it loses on every listener
+  that claim reaches, and route status always echoes the parentRef the operator
+  wrote. gRPC shapes Ferrum cannot represent exactly
   — `method.type: RegularExpression` (Ferrum cannot constrain a regex operand
   to a single gRPC path segment, so the predicate is refused rather than
   compiled into a matcher that could widen across service/method boundaries)
   or any other non-`Exact` `method.type`, a `method` block with neither
   `service` nor `method`, an `Exact` operand that is empty, over 1024
   characters, or outside the v1.5.1 CRD grammars, a non-native-gRPC
-  `content-type` predicate, or a non-`Exact` header match — are dropped fail
+  `content-type` predicate, a non-`Exact` header match, or an explicit
+  `method: null` / `headers: null` (an explicit null is malformed input, not an
+  omission, and must not widen into the any-gRPC-call or headerless match —
+  omitting either field keeps its documented meaning) — are dropped fail
   closed with a field-specific translator warning that never echoes the
   operand.
   See

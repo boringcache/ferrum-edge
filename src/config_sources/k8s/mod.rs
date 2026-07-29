@@ -380,7 +380,7 @@ impl K8sServiceKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct GatewayApiListenerKey {
     pub namespace: String,
     pub gateway: String,

@@ -175,9 +175,36 @@ materializes anything:
   **accepted** route of the other kind, so a second HTTPRoute is unaffected by a
   GRPCRoute that already lost.
 
+"The same listener" means the **resolved** listener, not the literal
+`parentRefs[]` entry. A parentRef is a selector, so the two are not
+interchangeable:
+
+- A wildcard reference (no `sectionName`, no `port`) and a reference pinning that
+  listener by `sectionName` or `port` attach to the same listener and therefore
+  contend, even though their selector shapes differ.
+- Two wildcard references on one Gateway that `allowedRoutes.kinds` sends to
+  *different* listeners never share one, so neither is rejected.
+- A wildcard reference that reaches several listeners is arbitrated on each of
+  them independently, but it emits one shared conflict claim, which cannot
+  express a partial withdrawal. Such a route is rejected only when it loses on
+  **every** listener that claim reaches; losing on one listener while surviving
+  on another leaves it accepted.
+
+Route status is still reported against the parentRef the operator wrote —
+listener resolution is an internal arbitration detail and never rewrites the
+`parentRef` echoed in `status.parents[]`.
+
 Same-kind behavior is unchanged: two HTTPRoutes (or two GRPCRoutes) sharing a
 `(hostname, listen path)` still collapse into one ordered dispatch-rule list,
 and only claim-for-claim collisions are resolved as conflicts.
+
+**Known limitation.** Ferrum materializes Gateway API HTTP-family routes as
+port-agnostic `(hosts, listen path)` proxies, so listeners of one Gateway are
+not distinguishable in the route table. Two routes that legitimately survive on
+different listeners but claim the same `(hostname, listen path)` therefore
+collide at config validation (`Overlapping host+listen_path`) rather than being
+served per listener port. Give such routes distinct listen paths, distinct
+hostnames, or distinct Gateways.
 
 ### Fail-closed match shapes
 
@@ -202,6 +229,12 @@ hand-authored one that it would have rejected never reaches routing state:
 - `headers[].type: RegularExpression`, or a header match missing `name` or
   `value` — only `Exact` header matches are translated, matching the HTTPRoute
   translator.
+- An **explicit** `method: null` or `headers: null`. An explicit null is
+  malformed input, not an omission: reading it as absent would widen `method`
+  into the any-gRPC-call predicate and `headers` into the headerless match.
+  *Omitting* either field keeps its documented meaning — an omitted `method`
+  matches any gRPC call on the route's hostnames, and omitted `headers` adds no
+  header predicate.
 
 Refusal warnings never echo the operator-supplied operand or header value back,
 since both are unbounded, attacker-influenceable input.

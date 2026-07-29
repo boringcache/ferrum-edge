@@ -421,3 +421,223 @@ fn cross_kind_listener_overlap_rejects_the_whole_losing_route_in_status() {
         }));
     }
 }
+
+fn gateway_class() -> K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "GatewayClass",
+        "ferrum",
+        "",
+        json!({"controllerName": FERRUM_GATEWAY_CONTROLLER_NAME}),
+    )
+}
+
+fn cross_kind_gateway(listeners: Value) -> K8sObject {
+    object(
+        "gateway.networking.k8s.io/v1",
+        "Gateway",
+        "edge",
+        "default",
+        json!({"gatewayClassName": "ferrum", "listeners": listeners}),
+    )
+}
+
+fn accepted_condition(update: &GatewayApiStatusUpdate) -> Value {
+    update.status["parents"][0]["conditions"]
+        .as_array()
+        .expect("route parent conditions")
+        .iter()
+        .find(|condition| condition["type"].as_str() == Some("Accepted"))
+        .expect("an Accepted condition")
+        .clone()
+}
+
+/// A parentRef selects listeners; it is not itself a listener identity. A
+/// wildcard reference and a `sectionName` reference naming the same listener
+/// attach to the same listener, so Gateway API v1.5.1's HTTPRoute/GRPCRoute
+/// merge prohibition applies and the newer Route is rejected whole — while the
+/// route status still reports the *original* parentRef shape the operator wrote.
+#[test]
+fn cross_kind_conflict_resolves_across_wildcard_and_section_name_parent_refs() {
+    let gateway = cross_kind_gateway(json!([{
+        "name": "web",
+        "port": 80,
+        "protocol": "HTTP",
+        "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}, {"kind": "GRPCRoute"}]}
+    }]));
+    let mut http_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "web",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{"backendRefs": [{"name": "web", "port": 8080}]}]
+        }),
+    );
+    http_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc_route = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "grpc",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge", "sectionName": "web"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"method": {"method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]
+        }),
+    );
+    grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    for objects in [
+        vec![
+            gateway_class(),
+            gateway.clone(),
+            http_route.clone(),
+            grpc_route.clone(),
+        ],
+        vec![
+            grpc_route.clone(),
+            http_route.clone(),
+            gateway.clone(),
+            gateway_class(),
+        ],
+    ] {
+        let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+        assert!(
+            !translation
+                .config
+                .proxies
+                .iter()
+                .any(|proxy| proxy.backend_port == 50051),
+            "the rejected GRPCRoute must not produce a proxy"
+        );
+        assert!(
+            !translation
+                .materialized_route_parents
+                .iter()
+                .any(|entry| entry.route.kind == "GRPCRoute"),
+            "the rejected GRPCRoute must not claim a materialized parent"
+        );
+
+        let updates =
+            plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+
+        let grpc_update = updates
+            .iter()
+            .find(|update| update.kind == "GRPCRoute" && update.name == "grpc")
+            .expect("the rejected GRPCRoute gets a status update");
+        assert_eq!(
+            grpc_update.status["parents"][0]["parentRef"]["sectionName"].as_str(),
+            Some("web"),
+            "route status must report the parentRef the operator wrote"
+        );
+        let accepted = accepted_condition(grpc_update);
+        assert_eq!(accepted["status"].as_str(), Some("False"));
+        assert_eq!(accepted["reason"].as_str(), Some("Conflicted"));
+
+        let http_update = updates
+            .iter()
+            .find(|update| update.kind == "HTTPRoute" && update.name == "web")
+            .expect("the accepted HTTPRoute gets a status update");
+        assert!(
+            http_update.status["parents"][0]["parentRef"]
+                .get("sectionName")
+                .is_none(),
+            "the wildcard parentRef must not gain a section name: {:?}",
+            http_update.status
+        );
+        let accepted = accepted_condition(http_update);
+        assert_eq!(accepted["status"].as_str(), Some("True"));
+    }
+}
+
+/// The mirror case: two wildcard parentRefs share the literal `*/*` selector,
+/// but `allowedRoutes.kinds` sends each kind to a different listener, so the
+/// Routes never share one and neither may be rejected.
+#[test]
+fn cross_kind_wildcard_parent_refs_on_kind_disjoint_listeners_are_both_accepted() {
+    let gateway = cross_kind_gateway(json!([
+        {
+            "name": "web",
+            "port": 80,
+            "protocol": "HTTP",
+            "allowedRoutes": {"kinds": [{"kind": "HTTPRoute"}]}
+        },
+        {
+            "name": "grpc",
+            "port": 8080,
+            "protocol": "HTTP",
+            "allowedRoutes": {"kinds": [{"kind": "GRPCRoute"}]}
+        }
+    ]));
+    // Distinct listen paths: Ferrum materializes Gateway API HTTP-family routes
+    // as port-agnostic `(hosts, listen_path)` proxies, so two Routes surviving
+    // on different listeners still occupy different route-table slots.
+    let mut http_route = object(
+        "gateway.networking.k8s.io/v1",
+        "HTTPRoute",
+        "web",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"path": {"type": "PathPrefix", "value": "/admin"}}],
+                "backendRefs": [{"name": "web", "port": 8080}]
+            }]
+        }),
+    );
+    http_route.metadata.creation_timestamp = Some("2026-01-01T00:00:00Z".to_string());
+    let mut grpc_route = object(
+        "gateway.networking.k8s.io/v1",
+        "GRPCRoute",
+        "grpc",
+        "default",
+        json!({
+            "parentRefs": [{"name": "edge"}],
+            "hostnames": ["edge.example.com"],
+            "rules": [{
+                "matches": [{"method": {"service": "pkg.Svc", "method": "SayHello"}}],
+                "backendRefs": [{"name": "grpc-api", "port": 50051}]
+            }]
+        }),
+    );
+    grpc_route.metadata.creation_timestamp = Some("2026-02-01T00:00:00Z".to_string());
+
+    let objects = vec![gateway_class(), gateway, http_route, grpc_route];
+    let translation = translate_k8s_objects(&objects, options()).expect("translation succeeds");
+
+    assert!(
+        translation.route_conflicts.is_empty(),
+        "kind-disjoint listeners are not a shared listener: {:?}",
+        translation.route_conflicts
+    );
+    let mut ports: Vec<u16> = translation
+        .config
+        .proxies
+        .iter()
+        .map(|proxy| proxy.backend_port)
+        .collect();
+    ports.sort_unstable();
+    assert_eq!(ports, vec![8080, 50051]);
+
+    let updates = plan_gateway_api_status_updates(&objects, options(), &translation.route_conflicts);
+    for (kind, name) in [("HTTPRoute", "web"), ("GRPCRoute", "grpc")] {
+        let update = updates
+            .iter()
+            .find(|update| update.kind == kind && update.name == name)
+            .unwrap_or_else(|| panic!("{kind} {name} gets a status update"));
+        let accepted = accepted_condition(update);
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("True"),
+            "{kind} {name} must stay accepted: {accepted:?}"
+        );
+    }
+}
