@@ -3248,7 +3248,7 @@ fn test_reject_body_disposition_is_method_and_status_derived() {
 #[test]
 fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
     use ferrum_edge::proxy::headers::{
-        sanitize_client_response_headers_for_wire, ClientResponseFraming,
+        ClientResponseFraming, sanitize_client_response_headers_for_wire,
     };
     use std::collections::HashMap;
 
@@ -3370,7 +3370,6 @@ fn test_sanitize_client_response_preserves_canonical_content_length_storage() {
         "duplicate Content-Length case variants must be stripped"
     );
 }
-
 
 /// An *empty* ordinary reject is the residual the emptiness heuristic missed:
 /// zero is an authoritative length, so a plugin-authored `Content-Length: 999`

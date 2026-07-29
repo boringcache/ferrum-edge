@@ -857,8 +857,9 @@ fn streaming_content_length_needs_repair(
     false
 }
 
-/// Preserve at most one valid streaming representation length and canonicalize
-/// its spelling. Multiple case variants are duplicate `Content-Length` fields
+/// Preserve already-safe `content-length` key/value storage — including
+/// parseable leading-zero values — and repair only invalid or ambiguous
+/// storage. Multiple case variants are duplicate `Content-Length` fields
 /// once converted to an HTTP HeaderMap, so fail closed by removing all of them.
 ///
 /// Already-safe common path: exactly one lowercase `content-length` whose value
