@@ -659,6 +659,7 @@ fn test_accepts_every_documented_root_key() {
             "redis_health_check_interval_seconds": 5,
             "redis_username": "user",
             "redis_password": "pass",
+            "redis_failure_policy": "local_fallback",
         }),
         PluginHttpClient::default(),
     )
@@ -1059,4 +1060,117 @@ async fn test_close_reason_truncates_on_utf8_boundary() {
         }
         other => panic!("Expected Close frame, got {:?}", other),
     }
+}
+
+// === Redis failure policy (GHSA-87rq-v4hx-8rcq) ===
+
+fn is_policy_close(result: &Option<Message>) -> bool {
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    matches!(result, Some(Message::Close(Some(cf))) if cf.code == CloseCode::Policy)
+}
+
+fn unavailable_redis_ws_config(extra: serde_json::Value) -> serde_json::Value {
+    let mut config = json!({
+        "frames_per_second": 1000,
+        "burst_size": 1000,
+        "sync_mode": "redis",
+        "redis_url": "redis://127.0.0.1:1",
+        "redis_health_check_interval_seconds": 3600
+    });
+    let (Some(object), Some(extra)) = (config.as_object_mut(), extra.as_object()) else {
+        return config;
+    };
+    for (key, value) in extra {
+        object.insert(key.clone(), value.clone());
+    }
+    config
+}
+
+/// Both frame-charging entry points must fail closed while the centralized
+/// store cannot be consulted.
+///
+/// `on_ws_reassembly_frames` charges the physical fragments of a reassembled
+/// message in one batched op (GHSA-qq94-2gv2-phh6) and shares `on_ws_frame`'s
+/// admission path, so a fragmented message must not slip past a budget this
+/// process cannot prove. The configured budget is far larger than anything
+/// charged here, so a Close can only come from the fail-closed policy.
+#[tokio::test]
+async fn fail_closed_policy_closes_both_frame_charging_paths_while_redis_is_unavailable() {
+    let plugin = WsRateLimiting::new(
+        &unavailable_redis_ws_config(json!({})),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let msg = Message::Text("hello".into());
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    let message = plugin.on_ws_frame("proxy", 1, direction, &msg).await;
+    let fragment = plugin
+        .on_ws_reassembly_frames("proxy", 2, direction, 3)
+        .await;
+
+    assert!(
+        is_policy_close(&message),
+        "a reassembled message must fail closed while centralized enforcement is \
+         unavailable, got {message:?}"
+    );
+    assert!(
+        is_policy_close(&fragment),
+        "a batched fragment charge must fail closed while centralized enforcement is \
+         unavailable, got {fragment:?}"
+    );
+}
+
+/// The availability escape hatch covers the batched fragment path too — but
+/// only when the operator asks for it.
+#[tokio::test]
+async fn local_fallback_policy_admits_both_frame_charging_paths_while_redis_is_unavailable() {
+    let plugin = WsRateLimiting::new(
+        &unavailable_redis_ws_config(json!({ "redis_failure_policy": "local_fallback" })),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let msg = Message::Text("hello".into());
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    let message = plugin.on_ws_frame("proxy", 1, direction, &msg).await;
+    let fragment = plugin
+        .on_ws_reassembly_frames("proxy", 2, direction, 3)
+        .await;
+
+    assert!(
+        message.is_none(),
+        "local_fallback must admit a reassembled message on per-process state"
+    );
+    assert!(
+        fragment.is_none(),
+        "local_fallback must admit a batched fragment charge on per-process state"
+    );
+}
+
+/// An empty fragment batch charges nothing, so there is nothing to refuse even
+/// under the fail-closed default. Zero fragments is not a free admission of
+/// work — there is no work.
+#[tokio::test]
+async fn empty_fragment_batch_is_not_charged_under_the_fail_closed_default() {
+    let plugin = WsRateLimiting::new(
+        &unavailable_redis_ws_config(json!({})),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let direction = WebSocketFrameDirection::ClientToBackend;
+
+    let result = plugin
+        .on_ws_reassembly_frames("proxy", 3, direction, 0)
+        .await;
+
+    assert!(
+        result.is_none(),
+        "a zero-fragment batch must not synthesize a policy Close"
+    );
+    assert_eq!(
+        plugin.tracked_keys_count(),
+        Some(0),
+        "a zero-fragment batch must not create local rate-limit state"
+    );
 }

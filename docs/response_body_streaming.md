@@ -316,7 +316,7 @@ buffering decision and may narrow that decision by request or response
 | `stdout_logging` | No | No |
 | `http_logging` | No | No |
 | `tcp_logging` | No | No |
-| `transaction_debugger` | No | No |
+| `transaction_debugger` | No | Only with `log_response_body: true`, the `transaction_debug` DEBUG target enabled, and only for an identity-encoded, capturable textual response whose `Content-Length` fits the configured cap. gRPC (typed flavor), WebSocket including H2/H3 Extended CONNECT (typed flavor), SSE, chunked/unknown-length, encoded, oversized, and non-textual responses are released to stream. |
 
 ## Interaction with Retry Logic
 
@@ -417,9 +417,20 @@ Use `response_body_mode: buffer` when:
 - A plugin needs to inspect or transform the **response body** (not just headers)
 - Your responses are small and the latency difference is negligible
 
-`transaction_debugger` does not capture payloads and does not require buffer
-mode. It reports final body completion, byte counts, disconnects, and typed
-streaming errors from the terminal transaction summary instead.
+`transaction_debugger` requires buffer mode only when `log_response_body` is
+enabled, the `transaction_debug` DEBUG target is actually enabled (otherwise no
+capture record could be emitted and the body is released to stream), *and* the
+concrete response passes its bounded-capture screen (identity encoding,
+capturable textual `Content-Type`, and a `Content-Length` within the configured
+cap). With capture disabled — the default — it requires no buffering
+at all and reports final body completion, byte counts, disconnects, and typed
+streaming errors from the terminal transaction summary instead. Its header-time
+refinement only ever downgrades buffer to stream, so no long-lived or
+unknown-length response is pinned onto the buffered path by enabling the
+debugger. On a retry-enabled proxy it applies the same screen through the
+after-headers retry opt-in, so a response it will not sample is released to
+stream there too; only the responses it actually captures stay buffered and
+mid-body retryable.
 
 Note: response body size limits are now enforced via `SizeLimitedStreamingResponse` even when Content-Length is absent — explicit buffer mode is no longer required for size enforcement.
 

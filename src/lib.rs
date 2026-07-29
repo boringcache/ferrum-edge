@@ -974,6 +974,12 @@ pub mod _test_support {
         plugin.max_retained_request_body_bytes_for_test()
     }
 
+    pub fn request_mirror_max_mirrored_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_mirrored_request_body_bytes_for_test()
+    }
+
     pub fn request_mirror_mirror_timeout_ms_for_test(
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> Option<u64> {
@@ -2744,6 +2750,13 @@ pub mod _test_support {
         )
     }
 
+    // ── util/json_dup_keys ───────────────────────────────────────────────────
+    pub fn json_scan_memo_entry_count_for_test(
+        memo: &crate::util::json_dup_keys::JsonScanMemo,
+    ) -> usize {
+        memo.entry_count_for_test()
+    }
+
     // ── plugins/ws_rate_limiting ─────────────────────────────────────────────
     /// Create a fresh `WsRateLimiting` instance and return its Redis scope key.
     /// Each call returns a key from a new instance (unique UUID prefix), so two
@@ -2796,6 +2809,56 @@ pub mod _test_support {
         }
     }
 
+    // ── Redis failure policy (GHSA-87rq-v4hx-8rcq) ───────────────────────────
+    /// Effective `redis_failure_policy` for one rate-limit plugin config.
+    ///
+    /// `None` for local-only configs. Proves the default is fail-closed and
+    /// that per-process fallback is only reached by explicit opt-in.
+    pub fn rate_limit_redis_failure_policy(
+        plugin_name: &str,
+        config: &serde_json::Value,
+    ) -> Result<Option<RedisFailurePolicy>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::ai_rate_limiter::AiRateLimiter;
+        use crate::plugins::graphql::GraphqlPlugin;
+        use crate::plugins::grpc_method_router::GrpcMethodRouter;
+        use crate::plugins::rate_limiting::RateLimiting;
+        use crate::plugins::udp_rate_limiting::UdpRateLimiting;
+        use crate::plugins::ws_rate_limiting::WsRateLimiting;
+
+        let http = PluginHttpClient::default();
+        match plugin_name {
+            "rate_limiting" => Ok(RateLimiting::new(config, http)?.redis_failure_policy_for_test()),
+            "graphql" => Ok(GraphqlPlugin::new(config, http)?.redis_failure_policy_for_test()),
+            "grpc_method_router" => {
+                Ok(GrpcMethodRouter::new(config, http)?.redis_failure_policy_for_test())
+            }
+            "udp_rate_limiting" => Ok(UdpRateLimiting::new_with_http_client(config, http)?
+                .redis_failure_policy_for_test()),
+            "ai_rate_limiter" => {
+                Ok(AiRateLimiter::new(config, http)?.redis_failure_policy_for_test())
+            }
+            "ws_rate_limiting" => {
+                Ok(WsRateLimiting::new(config, http)?.redis_failure_policy_for_test())
+            }
+            other => Err(format!("unsupported rate-limit plugin: {other}")),
+        }
+    }
+
+    /// Refusal a `rate_limiting` policy emits while the centralized store is
+    /// unavailable: `Some((status, body))`, or `None` when it degraded to
+    /// per-process admission instead of refusing.
+    pub async fn rate_limiting_refusal_under_redis_outage(
+        config: &serde_json::Value,
+        key: &str,
+    ) -> Result<Option<(u16, String)>, String> {
+        use crate::plugins::PluginHttpClient;
+        use crate::plugins::rate_limiting::RateLimiting;
+
+        let plugin = RateLimiting::new(config, PluginHttpClient::default())?;
+        Ok(plugin.refusal_under_redis_outage_for_test(key).await)
+    }
+
     /// Construct a rate-limit plugin through the production factory with an
     /// explicit plugin-config id, returning only the admission result.
     ///
@@ -2823,6 +2886,21 @@ pub mod _test_support {
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
+    pub use crate::plugins::utils::redis_rate_limiter::{
+        is_cluster_topology_code, is_cluster_topology_error, parse_cluster_enabled,
+    };
+
+    // ── plugins/utils/rate_limit (Redis failure policy) ──────────────────────
+    pub use crate::plugins::utils::rate_limit::{
+        ENFORCEMENT_UNAVAILABLE_BODY, ENFORCEMENT_UNAVAILABLE_MESSAGE,
+        ENFORCEMENT_UNAVAILABLE_STATUS, RATE_LIMIT_REDIS_CONFIG_KEYS, RedisFailurePolicy,
+        parse_redis_failure_policy,
+    };
+
+    /// Redis key a rate-limit window bucket would use, for hash-tag coverage.
+    pub fn redis_slot_key(config: RedisConfig, rate_key: &str, suffix: &[&str]) -> String {
+        RedisRateLimitClient::new(config, None, false, None).make_slot_key(rate_key, suffix)
+    }
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
         config.url_with_resolved_ip(ip)
@@ -5220,5 +5298,18 @@ pub mod _test_support {
         addr: std::net::SocketAddr,
     ) -> (std::net::SocketAddr, Arc<str>) {
         crate::http3::server::h3_client_identity(addr)
+    }
+
+    /// Build an email channel with deterministic `*_env` resolution for unit
+    /// tests. Production uses [`crate::notifications::channels::EmailChannel::new`]
+    /// and real `std::env::var`.
+    pub fn email_channel_new_with_env_for_test(
+        name: &str,
+        value: &serde_json::Value,
+        env: &HashMap<String, String>,
+    ) -> Result<crate::notifications::channels::EmailChannel, String> {
+        crate::notifications::channels::EmailChannel::new_with_env_lookup(name, value, &|var| {
+            env.get(var).cloned().ok_or(std::env::VarError::NotPresent)
+        })
     }
 }
