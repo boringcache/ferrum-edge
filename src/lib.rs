@@ -4252,6 +4252,10 @@ pub mod _test_support {
         }
     }
 
+    /// Owned `(grpc-status, optional grpc-message, additional terminal metadata)`
+    /// tuple returned by [`status_only_grpc_terminate_signal_for_test`].
+    pub type StatusOnlyGrpcTerminateSignal = (u32, Option<String>, Vec<(String, String)>);
+
     /// The shared emitter-facing terminate result for a trailers-only reply:
     /// `(grpc-status, optional grpc-message, remaining authored terminal
     /// metadata sorted by name)`, or `None` when this response is not an intact
@@ -4264,7 +4268,7 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
         status: StatusCode,
         body: &[u8],
-    ) -> Option<(u32, Option<String>, Vec<(String, String)>)> {
+    ) -> Option<StatusOnlyGrpcTerminateSignal> {
         let authored = crate::proxy::status_only_grpc_signal(
             crate::proxy::FramedGrpcUnaryProvenance::from_context(ctx),
             status,
