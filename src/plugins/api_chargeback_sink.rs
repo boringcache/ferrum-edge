@@ -756,11 +756,7 @@ fn compact_snapshot_lifecycle_measured(
         );
         // The staged overflow was taken out of the accumulator by preparation
         // and exists nowhere else; hand it back before dropping `events`.
-        lifecycle.restage_compaction_overflow(
-            events,
-            overflow_count,
-            overflow_retained_bytes,
-        );
+        lifecycle.restage_compaction_overflow(events, overflow_count, overflow_retained_bytes);
         return false;
     }
 
@@ -1898,11 +1894,7 @@ impl SnapshotLifecycle {
                 // overflow would clear accumulator totals that failed to
                 // serialize. Return the borrowed overflow to bounded staging so
                 // no pending billing delta is lost on this path.
-                self.restage_compaction_overflow(
-                    events,
-                    overflow_count,
-                    overflow_retained_bytes,
-                );
+                self.restage_compaction_overflow(events, overflow_count, overflow_retained_bytes);
                 None
             }
         }
@@ -10252,12 +10244,7 @@ fn emit_periodic_snapshot(
         runtime
             .metrics
             .record_failure(FailureReason::Serialize, error.clone());
-        restage_borrowed_overflow(
-            accumulator,
-            events,
-            overflow_count,
-            overflow_retained_bytes,
-        );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return Err(error);
     };
     // Bind the result first so the borrow of `events` ends before the failure
@@ -10278,12 +10265,7 @@ fn emit_periodic_snapshot(
             error = %error,
             "Chargeback sink could not durably spool its periodic snapshot; no baseline was advanced"
         );
-        restage_borrowed_overflow(
-            accumulator,
-            events,
-            overflow_count,
-            overflow_retained_bytes,
-        );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return Err(error);
     }
     // Snapshot mode requires the spool. It is the durable commit point before
@@ -10374,12 +10356,7 @@ fn emit_final_snapshot_to_spool(
             FailureReason::Serialize,
             "snapshot finalization requires an available spool",
         );
-        restage_borrowed_overflow(
-            accumulator,
-            events,
-            overflow_count,
-            overflow_retained_bytes,
-        );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return false;
     };
     // Bind the result first so the borrow of `events` ends before the failure
@@ -10400,12 +10377,7 @@ fn emit_final_snapshot_to_spool(
             error = %error,
             "Chargeback sink could not durably spool its final snapshot; generation state retained"
         );
-        restage_borrowed_overflow(
-            accumulator,
-            events,
-            overflow_count,
-            overflow_retained_bytes,
-        );
+        restage_borrowed_overflow(accumulator, events, overflow_count, overflow_retained_bytes);
         return false;
     }
     accumulator.commit_taken_overflow(overflow_retained_bytes);

@@ -7165,7 +7165,11 @@ fn borrowed_snapshot_overflow_keeps_its_process_reservation_until_commit() {
     );
 
     accumulator.clear_for_compaction_for_tests();
-    assert_eq!(ceiling.used(), 0, "the restored charge releases exactly once");
+    assert_eq!(
+        ceiling.used(),
+        0,
+        "the restored charge releases exactly once"
+    );
 }
 
 #[test]
