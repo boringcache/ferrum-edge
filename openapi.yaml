@@ -16409,7 +16409,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation, timestamp freshness, and nonce/assertion replay protection. Media types are parsed STRUCTURALLY (type/subtype plus parameters) and matched by exact essence, never substring-matched; content_type.mode defaults to 'strict', under which every request on the proxy is governed and a missing/unsupported/malformed representation is rejected (415/415/400) before backend dispatch, while 'mixed_route' is the explicit pass-through opt-out. Recognized representations are text/xml, application/soap+xml, application/xml, application/xop+xml, and MTOM/XOP multipart/related (root part validated, attachments never decoded). Buffers governed bodies as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. A configuration that establishes a principal (username_token, x509_signature, or saml) is an AUTH PLUGIN: it buffers the body before the authenticate phase, validates there, and publishes authenticated_identity plus a namespace-correct identified_consumer so access_control, consumer rate limiting, logging, retries, and chargeback all observe one SOAP identity. A timestamp-only configuration establishes no principal and keeps validating in before_proxy; the two phases never both run. Composition admission rejects an identity-establishing instance alongside another auth plugin under auth_mode=multi, and alongside compression decompress_request; on_final_request_body refuses to dispatch a message whose bytes changed after validation. At least one security feature must be enabled. Both signature paths settle TRUST FIRST: certificate fingerprint match and SignatureValue-over-SignedInfo verify before any attacker-selected Reference is resolved, canonicalized, or digested. Duplicate Reference URIs are rejected, the X.509 Reference ceiling is 8, one bounded id index is built per message, and every canonicalization is charged against an aggregate per-message byte budget. Structural selection is namespace-qualified and positional: one SOAP Envelope, at most one Header and exactly one Body as its direct children in the same envelope namespace, and one wsse:Security header targeting this receiver as a direct child of that Header; duplicates or misplaced elements fail closed. X.509 success additionally requires a Reference resolving uniquely to the backend-visible Body, and require_signed_timestamp rejects a missing Timestamp (pairing it with timestamp.require=false is refused at admission). SAML requires a mandatory bounded Conditions window, the configured service audience on every AudienceRestriction, a supported SubjectConfirmation naming the configured recipient with its own bounded NotOnOrAfter and no InResponseTo, and a single-use claim on the assertion id — so nonce.replay_scope is required when saml is enabled. Both signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported). Configuration admission is strict and fail-closed: the root object and every nested fixed-shape object reject unknown keys and wrong-typed values (including explicit JSON null — omit a field to use its default) before defaults apply, malformed credential / cert / issuer / algorithm entries are rejected rather than silently dropped, and every duration and cache control must fall inside its documented inclusive range. Invalid password_type and algorithm-enum diagnostics name only the field and accepted choices, never the rejected value. Fixed-shape properties are non-nullable in this schema. There is no nonce_replay_protection alias — nonce.* is the only canonical shape. Nonce replay entry/byte caps are exact under concurrent PasswordDigest claims. PasswordDigest additionally validates the UsernameToken's own wsu:Created against a bounded freshness window and binds it to the independently validated outer wsu:Timestamp, and requires an explicit nonce.replay_scope ('process' for a declared single-replica deployment, or 'shared' with sync_mode=redis for cross-replica atomic claims). A shared-backend outage fails closed."
       additionalProperties: false
       allOf:
         - if:
@@ -16432,6 +16432,48 @@ components:
               nonce:
                 type: object
                 required: [replay_scope]
+        - if:
+            properties:
+              saml:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+            required: [saml]
+          then:
+            required: [nonce, saml]
+            properties:
+              nonce:
+                type: object
+                required: [replay_scope]
+              saml:
+                type: object
+                required: [audience, recipient, trusted_issuers, trusted_signing_certs]
+        - if:
+            properties:
+              x509_signature:
+                allOf:
+                  - properties:
+                      enabled:
+                        const: true
+                    required: [enabled]
+                  - not:
+                      properties:
+                        require_signed_timestamp:
+                          const: false
+                      required: [require_signed_timestamp]
+            required: [x509_signature]
+          then:
+            not:
+              properties:
+                timestamp:
+                  type: object
+                  properties:
+                    require:
+                      const: false
+                  required: [require]
+              required: [timestamp]
         - if:
             properties:
               nonce:
@@ -16465,6 +16507,44 @@ components:
           type: boolean
           default: true
           description: Reject SOAP requests that lack a WS-Security header
+        content_type:
+          type: object
+          description: |
+            Which requests this proxy governs. Media types are parsed
+            structurally (type/subtype plus RFC 9110 parameters) and matched by
+            exact essence; they are never substring-matched, so a
+            `multipart/form-data; boundary=application/xml` request is not SOAP
+            and a SOAP envelope labelled `application/octet-stream` is not
+            exempt. Recognized representations: text/xml (SOAP 1.1),
+            application/soap+xml (SOAP 1.2), application/xml,
+            application/xop+xml, and MTOM/XOP multipart/related whose `type`
+            parameter names a SOAP/XOP root essence.
+          additionalProperties: false
+          properties:
+            mode:
+              type: string
+              enum: [strict, mixed_route]
+              default: strict
+              description: |
+                'strict' (default) governs every request on this proxy: a
+                missing Content-Type returns 415, an unsupported media type
+                returns 415, and a malformed one returns 400 — all before
+                backend dispatch. 'mixed_route' is the explicit opt-out that
+                passes non-SOAP media types through; a malformed media-type
+                label still fails closed in that mode because an unparsable
+                label cannot be proven non-SOAP.
+            allow_mtom:
+              type: boolean
+              default: true
+              description: |
+                Accept MTOM/XOP multipart/related packaging. The gateway locates
+                the root part (by the `start` parameter, else the first part),
+                validates that part's envelope, and never reads or decodes
+                attachment payloads. A root part that is mislabelled, that
+                declares a re-encoding Content-Transfer-Encoding (anything other
+                than 7bit/8bit/binary), or that cannot be located fails closed.
+                Set false to declare that this route does not accept MTOM at
+                all; a SOAP-bearing multipart then returns 415.
         sync_mode:
           type: string
           enum: [local, redis]
@@ -16639,7 +16719,11 @@ components:
             require_signed_timestamp:
               type: boolean
               default: true
-              description: Require the Timestamp to be included in the signature's references
+              description: |
+                Require a wsu:Timestamp to be PRESENT and covered by the
+                signature. A message with no Timestamp is rejected rather than
+                passing vacuously, and pairing this with timestamp.require=false
+                is refused at admission as a contradiction.'s references
         saml:
           type: object
           description: |
@@ -16650,24 +16734,38 @@ components:
                  More than one `<Assertion>` inside the WS-Security block is
                  rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-              3. Verify each `<Reference>` digest after the supported transform chain
-                 (XMLDSIG enveloped-signature followed by Exclusive XML Canonicalization
-                 `xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`).
-                 The digest algorithm must be in `allowed_digest_algorithms`. At
-                 least one Reference must target the enclosing Assertion ID.
-              4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
+              3. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
                  actual signing certificate(s) as published in IdP metadata).
-              5. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+              4. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
                  (`xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`) using the
                  matched cert's RSA public key.
-              6. Validate Issuer (must match `trusted_issuers`), NotBefore /
-                 NotOnOrAfter (with `clock_skew_seconds` tolerance), and Audience
-                 (if `audience` is configured).
-              7. Extract the Subject NameID into `ctx.metadata["soap_ws_saml_subject"]`
-                 for downstream plugins.
-            On any failure the request is rejected with HTTP 401. Unsupported
+              5. ONLY THEN verify the single `<Reference>` digest after the supported
+                 transform chain (XMLDSIG enveloped-signature followed by Exclusive XML
+                 Canonicalization `xml-exc-c14n#`, including `InclusiveNamespaces
+                 PrefixList`). The digest algorithm must be in
+                 `allowed_digest_algorithms` and the Reference must target the enclosing
+                 Assertion ID. Exactly one Reference is supported, so a duplicate cannot
+                 re-canonicalize the assertion.
+              6. Validate Issuer (must match `trusted_issuers`), the MANDATORY bounded
+                 Conditions window (both NotBefore and NotOnOrAfter required, span capped
+                 by `max_assertion_lifetime_seconds`, `clock_skew_seconds` tolerance), the
+                 service `audience` on every AudienceRestriction, and one supported
+                 SubjectConfirmation naming `recipient`.
+              7. Claim the assertion id for single use in the declared
+                 nonce.replay_scope, which is REQUIRED when SAML is enabled. Every
+                 accepted assertion is claimed exactly once, so OneTimeUse needs no
+                 special case; a replay-backend outage fails closed. Claims are retained
+                 for the fixed 93601s horizon, which dominates
+                 max_assertion_lifetime_seconds + 2 x clock_skew_seconds. 'process' scope
+                 is a single-replica declaration and makes NO cross-replica claim;
+                 multi-replica SAML deployments must use 'shared'.
+              8. Publish the Subject NameID as the request principal
+                 (authenticated_identity plus a namespace-correct identified_consumer) and
+                 mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
+            On any failure the request is rejected with HTTP 401. Rejections never echo
+            the issuer, audience, recipient, subject, or assertion id. Unsupported
             canonicalization or transform algorithms fail closed; inclusive c14n,
             comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
           additionalProperties: false
@@ -16725,12 +16823,45 @@ components:
               type: string
               minLength: 1
               description: |
-                Optional. When set, the assertion's
-                `Conditions/AudienceRestriction/Audience` must match this
-                string exactly. Use this to bind assertions to the specific
-                service this proxy fronts. Must be a non-empty string when
-                present — a wrong-typed value is rejected rather than silently
-                removing audience binding.
+                Required when `enabled` is true. Every
+                `Conditions/AudienceRestriction` in the assertion must name this
+                exact value (each restriction is a conjunct). Without it, an
+                assertion minted by the same trusted issuer for another relying
+                party is accepted here.
+            recipient:
+              type: string
+              minLength: 1
+              description: |
+                Required when `enabled` is true. Matched against
+                `Subject/SubjectConfirmation/SubjectConfirmationData/@Recipient`
+                so a captured assertion cannot be presented to a different
+                endpoint.
+            max_assertion_lifetime_seconds:
+              type: integer
+              format: uint64
+              default: 300
+              minimum: 1
+              maximum: 86400
+              description: |
+                Maximum permitted `Conditions/@NotOnOrAfter - @NotBefore` span.
+                Both instants are mandatory and the window must be non-empty,
+                so an assertion with absent or unbounded Conditions is refused
+                rather than becoming an indefinite bearer credential.
+            allowed_subject_confirmation_methods:
+              type: array
+              minItems: 1
+              items:
+                type: string
+              default: ["urn:oasis:names:tc:SAML:2.0:cm:bearer"]
+              description: |
+                Accepted SubjectConfirmation @Method URIs. Only
+                'urn:oasis:names:tc:SAML:2.0:cm:bearer' is implemented;
+                'urn:oasis:names:tc:SAML:2.0:cm:holder-of-key' is rejected at
+                admission because the confirmation key is not bound to the
+                message signature. Exactly one acceptable SubjectConfirmation
+                must be present, its SubjectConfirmationData must name
+                `recipient`, carry its own NotOnOrAfter, honour NotBefore when
+                present, and omit InResponseTo.
             clock_skew_seconds:
               type: integer
               format: uint64

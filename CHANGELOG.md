@@ -9,6 +9,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `soap_ws_security` no longer trusts client media-type selection
+  (GHSA-435h-f785-wmm4). Content types are parsed structurally (`type/subtype`
+  plus RFC 9110 parameters) and matched by exact essence instead of
+  case-insensitive substring search, and the new `content_type.mode` defaults to
+  `strict`: every request on a SOAP-protected proxy is governed, so a SOAP
+  envelope labelled `application/octet-stream`, `text/plain`, or with no
+  `Content-Type` at all is rejected (415) before backend dispatch rather than
+  streamed to a backend that routes by path or SOAPAction. `mixed_route` is the
+  explicit pass-through opt-out. SOAP 1.1/1.2, `application/xml`,
+  `application/xop+xml`, and MTOM/XOP `multipart/related` are supported;
+  MTOM validates the root part's envelope (selected by `start`, else the first
+  part) and refuses a root part that is mislabelled, re-encoded, or absent.
+  A `multipart/form-data; boundary=application/xml` request is no longer
+  raw-scanned as an envelope.
+- `soap_ws_security` now authenticates the signer before performing
+  attacker-selected XML work (GHSA-9g4v-h9hm-846r). Both the X.509 and SAML
+  paths settle certificate trust and `SignatureValue`-over-`SignedInfo`
+  verification *before* the first `<Reference>` is resolved, canonicalized, or
+  digested, so an untrusted or forged signature costs constant work. Duplicate
+  Reference URIs are rejected, the X.509 Reference ceiling drops from 64 to 8,
+  SAML accepts exactly one Reference, one bounded id index is built per message
+  in place of a full-envelope scan per Reference, the raw-attribute uniqueness
+  guard is a single pass for the whole `SignedInfo`, and every canonicalization
+  is charged against an aggregate per-message byte budget derived from the body
+  length. Previously 64 References to one large element could force well over a
+  gigabyte of scanning and canonicalization per unauthenticated request.
+- `soap_ws_security` now establishes SOAP identity before authorization
+  (GHSA-gfrx-43w6-jq3c). A configuration that establishes a principal
+  (`username_token`, `x509_signature`, or `saml`) is an authentication plugin:
+  it buffers the body before the authenticate phase, validates there, and
+  publishes `authenticated_identity` plus a namespace-correct
+  `identified_consumer`, so `access_control`, consumer-scoped `rate_limiting`,
+  logging, retries, and chargeback all observe one authoritative SOAP identity
+  instead of running before it exists. A timestamp-only policy establishes no
+  principal, stays out of the authentication chain, and keeps validating in
+  `before_proxy`; the two phases are mutually exclusive by configuration, so no
+  message is validated twice. **Breaking:** composing an identity-establishing
+  instance with another authentication plugin under `auth_mode: multi`, or with
+  `compression`'s `decompress_request`, is now rejected at config admission; an
+  `on_final_request_body` guard additionally refuses to dispatch a message whose
+  bytes changed after validation.
+- `soap_ws_security` X.509 signatures must now protect the backend-visible SOAP
+  Body (GHSA-3mwq-c8j6-9xhp). `Envelope`/`Header`/`Body`/`Security` selection is
+  namespace-qualified and positional rather than by local name, duplicate
+  namespace-correct envelope elements and misplaced `wsse:Security` headers are
+  rejected, and a successful X.509 verification now requires a Reference that
+  resolves uniquely to the actual Body. `require_signed_timestamp` rejects a
+  message with no Timestamp instead of passing vacuously, and pairing it with
+  `timestamp.require: false` is refused at admission. Previously a trusted
+  signature over only the Timestamp authorized an arbitrary rewritten operation,
+  and a signed lookalike `<Body>` under another namespace could be selected in
+  place of the real one.
+- `soap_ws_security` SAML assertions are now bound and single-use
+  (GHSA-f44p-hfqr-cvcc). **Breaking:** `saml.audience`, the new
+  `saml.recipient`, and `nonce.replay_scope` are required when SAML is enabled.
+  An accepted assertion must carry a mandatory `Conditions` window with both
+  `NotBefore` and `NotOnOrAfter` inside the new
+  `saml.max_assertion_lifetime_seconds` cap (default 300), must be admitted by
+  every `AudienceRestriction`, must carry one supported `SubjectConfirmation`
+  (bearer only; `holder-of-key` is refused at admission) whose
+  `SubjectConfirmationData` names `saml.recipient`, carries its own bounded
+  `NotOnOrAfter`, and omits `InResponseTo`, and its assertion id is claimed for
+  single use in the declared replay scope for the same fixed 93 601-second
+  horizon as PasswordDigest nonces. `OneTimeUse` needs no special case because
+  every accepted assertion is claimed exactly once. `process` scope is a
+  single-replica declaration and makes no cross-replica claim; multi-replica
+  SAML deployments must use `shared`. Previously a captured signed assertion
+  could be replayed indefinitely beside a freshly minted outer Timestamp, and in
+  the default configuration an assertion issued for another service by the same
+  trusted IdP was accepted.
+
 - Plugin egress no longer inherits ambient proxy configuration
   (GHSA-c4pj-vq6x-53rw). Backend dispatch `reqwest` clients (via
   `BackendTlsConfigBuilder::build_reqwest`), active health-check clients

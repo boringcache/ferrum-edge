@@ -2322,9 +2322,31 @@ Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP 
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
-The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact. Non-SOAP requests pass through untouched.
+The plugin buffers governed SOAP request bodies as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact.
 
-When a co-located `compression` plugin has `decompress_request: true`, configured gzip/Brotli request decoding runs in the shared pre-`before_proxy` body-normalization phase so this plugin validates the same size-bounded plaintext the backend receives. Malformed or over-limit compressed bodies are rejected before WS-Security runs; `Content-Encoding` / stale `Content-Length` are stripped only after successful decode.
+#### Which requests are governed
+
+Media types are parsed **structurally** — `type/subtype` plus RFC 9110 parameters — and matched by exact essence. They are never substring-matched: a `multipart/form-data; boundary=application/xml` request is not a SOAP request, and a SOAP envelope labelled `application/octet-stream` is not exempt from policy.
+
+| `content_type.mode` | Behaviour |
+|---|---|
+| `strict` *(default)* | Every request on this proxy is a governed SOAP request. A missing Content-Type returns `415`, an unsupported media type returns `415`, and a malformed one returns `400` — all before backend dispatch. |
+| `mixed_route` | Only requests whose media type is a recognized SOAP representation are governed; everything else passes through. This is the explicit opt-out for proxies that intentionally serve mixed traffic. A malformed media-type label still fails closed in this mode, because an unparsable label cannot be proven non-SOAP. |
+
+Recognized SOAP representations are `text/xml` (SOAP 1.1), `application/soap+xml` (SOAP 1.2), `application/xml`, `application/xop+xml`, and MTOM/XOP `multipart/related` whose `type` parameter names one of the XOP/SOAP root essences. For MTOM the gateway locates the root part (by `start`, else the first part), validates **that part's** envelope, and never reads, decodes, or validates attachment payloads. A root part that is mislabelled, that declares a re-encoding `Content-Transfer-Encoding` (anything other than `7bit`/`8bit`/`binary`), or that cannot be located fails closed. Set `content_type.allow_mtom: false` to declare that this route does not accept MTOM at all; a SOAP-bearing multipart then returns `415` instead of streaming past the policy.
+
+#### Phase, identity, and composition
+
+A configuration that establishes a principal — `username_token`, `x509_signature`, or `saml` — is an **authentication plugin**. It buffers the body before the authenticate phase, validates the message there, and publishes the SOAP principal as `RequestContext.authenticated_identity` together with a namespace-correct `identified_consumer` (a Consumer is matched by identity only when it belongs to the matched proxy's namespace). `access_control`, consumer-scoped `rate_limiting`, logging, retries, and chargeback therefore all observe one authoritative SOAP identity instead of running before it exists. The published principal is the UsernameToken username, the SAML Subject `NameID`, or — for an X.509-only policy — the stable string `x509:sha256:<lowercase-hex-fingerprint>` of the matched trusted certificate; register that string as a Consumer username/id to map it.
+
+A **timestamp-only** configuration proves freshness and nothing about the caller. It establishes no principal, is not an authentication plugin (so it never turns an ordinary request into "Authentication required"), and keeps validating in `before_proxy`. The two phases are selected by configuration and never both run, so a message is never validated twice.
+
+Because authentication now precedes the shared buffered-body normalization phase, two compositions are rejected at config admission (file-mode startup fails, Admin validation returns `400`, a DP/reload keeps the last known good generation):
+
+- An identity-establishing instance on a proxy whose `auth_mode` is `multi` alongside another authentication plugin. Multi-auth stops at the first mechanism that establishes an identity and lets a later success override an earlier rejection, so WS-Security message validation would be skipped or ignored. Use `auth_mode: single`, or disable the other mechanisms on that proxy.
+- An identity-establishing instance alongside `compression` with `decompress_request: true`. The gateway would validate the encoded bytes rather than the plaintext the backend parses. Decompress upstream, or disable `decompress_request` on that proxy.
+
+As a runtime backstop for every other transform (including custom plugins), the SHA-256 of the exact validated representation is recorded and re-checked in `on_final_request_body` before backend dispatch; a message whose bytes changed after validation is refused with `500` rather than forwarded.
 
 > **XMLDSIG canonicalization support.** Both the WS-Security X.509 and SAML signature paths apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to `<SignedInfo>` and referenced elements, including `InclusiveNamespaces PrefixList`. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n. Unsupported canonicalization or transform algorithms fail closed; inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
 
@@ -2333,6 +2355,8 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `reject_missing_security_header` | bool | `true` | Reject SOAP requests that lack a WS-Security header |
+| `content_type.mode` | String | `strict` | `strict` (every request on this proxy is governed) or `mixed_route` (only recognized SOAP media types are governed) |
+| `content_type.allow_mtom` | bool | `true` | Accept MTOM/XOP `multipart/related` packaging and validate its SOAP root part. `false` rejects SOAP-bearing multipart with `415` |
 | `timestamp.require` | bool | `true` | Require a `wsu:Timestamp` element in the Security header. Controls whether the element may be *absent*; a Timestamp that **is** present is always validated |
 | `timestamp.max_age_seconds` | u64 | `300` | Maximum age of the `Created` timestamp before rejection (`1`–`86400`) |
 | `timestamp.require_expires` | bool | `false` | Require an `Expires` element in the Timestamp |
@@ -2348,15 +2372,18 @@ When a co-located `compression` plugin has `decompress_request: true`, configure
 | `x509_signature.trusted_certs` | String[] | `[]` | PEM file paths of trusted signing certificates |
 | `x509_signature.allowed_algorithms` | String[] | `["rsa-sha256"]` | Allowed signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `x509_signature.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_algorithms` |
-| `x509_signature.require_signed_timestamp` | bool | `true` | Require the Timestamp to be included in the signature |
+| `x509_signature.require_signed_timestamp` | bool | `true` | Require a `wsu:Timestamp` to be present **and** covered by the signature. Requires `timestamp.require: true`; the contradictory pairing is rejected at admission |
 | `saml.enabled` | bool | `false` | Enable SAML 2.0 assertion validation (XMLDSIG signature-first) |
 | `saml.trusted_issuers` | String[] | `[]` | Trusted SAML Issuer URIs (required when enabled) |
 | `saml.trusted_signing_certs` | String[] | `[]` | PEM file paths of trusted IdP signing certs, matched by SHA-256 fingerprint (required when enabled) |
 | `saml.allowed_signature_algorithms` | String[] | `["rsa-sha256"]` | Allowed SAML signature algorithms (`rsa-sha256`, `rsa-sha1`) |
 | `saml.allowed_digest_algorithms` | String[] | `["sha256"]` | Allowed SAML Reference digest algorithms (`sha256`, `sha1`). Independent of `allowed_signature_algorithms` |
-| `saml.audience` | String | *(none)* | Optional SAML AudienceRestriction value (non-empty string when present) |
+| `saml.audience` | String | *(required when enabled)* | Service-specific `AudienceRestriction/Audience` value every accepted assertion must name |
+| `saml.recipient` | String | *(required when enabled)* | Service-specific `SubjectConfirmationData/@Recipient` value every accepted assertion must name |
+| `saml.max_assertion_lifetime_seconds` | u64 | `300` | Maximum permitted `Conditions/@NotOnOrAfter − @NotBefore` span (`1`–`86400`). Both instants are mandatory |
+| `saml.allowed_subject_confirmation_methods` | String[] | `["urn:oasis:names:tc:SAML:2.0:cm:bearer"]` | Accepted `SubjectConfirmation/@Method` URIs. Only `bearer` is implemented; `holder-of-key` is rejected at admission because the confirmation key is not bound to the message signature |
 | `saml.clock_skew_seconds` | u64 | `300` | Clock skew tolerance for SAML `NotBefore` / `NotOnOrAfter` (`0`–`3600`) |
-| `nonce.replay_scope` | String | *(required for PasswordDigest)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
+| `nonce.replay_scope` | String | *(required for PasswordDigest and for SAML)* | `process` or `shared`. No default — see [PasswordDigest replay scope](#passworddigest-replay-scope) |
 | `nonce.max_cache_size` | u64 | `100000` | Maximum retained nonce cache entries; a full cache of unexpired nonces rejects new claims rather than evicting them (`1`–`1000000`) |
 | `nonce.max_encoded_length` | u64 | `512` | Maximum encoded `wsse:Nonce` length, checked before Base64 decoding (`16`–`4096`) |
 | `nonce.max_total_cache_bytes` | u64 | `67108864` | Maximum total retained nonce-key UTF-8 payload bytes, counted once per shared immutable key allocation; must be ≥ `nonce.max_encoded_length` (`4096`–`1073741824`) |
@@ -2376,6 +2403,43 @@ The root object and every nested fixed-shape object (`timestamp`, `username_toke
 Because construction now returns an error for these inputs, the plugin's `FailClosed` registration takes effect: file-mode startup fails, Admin validation returns HTTP `400`, and a DP/reload keeps the last known good generation instead of quietly enforcing a weaker policy.
 
 UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
+
+#### Signature ordering and XML work bounds
+
+Both signature paths settle **trust before work**. The presented certificate's SHA-256 fingerprint must match configured trust material, and `SignatureValue` must verify over the canonicalized `SignedInfo`, before a single attacker-selected `<Reference>` is resolved, canonicalized, or digested. Trust is a fixed-size comparison and `SignedInfo` is a small bounded subtree, so an untrusted or forged signature is refused after constant work regardless of how the References are shaped.
+
+On top of that ordering:
+
+- Duplicate Reference URIs are rejected. The X.509 Reference ceiling is **8**; SAML accepts exactly one Reference, targeting the enclosing assertion's own id.
+- One bounded id index is built per message after the structure is settled, replacing a full-envelope scan per Reference. The independent raw start-tag scan is likewise a single pass covering every referenced id at once.
+- Every canonicalization is charged against an aggregate per-message byte budget of `2 × decoded body length` (floor 64 KiB), counting both the source subtree walked and the canonical bytes emitted. An over-budget message is refused before the work is done.
+
+#### X.509 must protect the backend-visible Body
+
+Structural selection is namespace-qualified and positional, not by local name:
+
+- Exactly one SOAP `Envelope` in a known envelope namespace (SOAP 1.1 or 1.2) as the document root, with at most one `Header` and exactly one `Body` as its direct children **in that same namespace** and in that order. No other element may be a direct child of `Envelope`.
+- Exactly one `wsse:Security` header targeting this receiver — no `actor`/`role`, or `next`/`ultimateReceiver` — as a direct child of that `Header`. Headers addressed to another intermediary are left alone; two targeting this receiver is an error.
+- A second namespace-correct `Envelope`/`Header`/`Body` anywhere in the document, or a `wsse:Security` anywhere outside the `Header`, is rejected. Those are the wrapping shapes that make the gateway and a tolerant backend resolve different elements.
+
+When `x509_signature.enabled` is true, a valid signature is **not sufficient**: a Reference must resolve uniquely to the namespace-correct `Body` the backend will consume. A trusted signature covering only the Timestamp no longer authorizes a rewritten operation. Referenced elements must also resolve inside the Security header or inside that Body, and a referenced id must be unique under both the entity-decoded DOM view and the raw start-tag scan, which covers `wsu:Id`, any prefixed `Id`, bare `Id`, `xml:id`, `ID`, and `id`.
+
+`x509_signature.require_signed_timestamp: true` (the default) now **rejects a message with no Timestamp** rather than passing vacuously, and pairing it with `timestamp.require: false` is refused at admission as a contradiction.
+
+#### SAML assertions are bearer values
+
+A signed assertion carries nothing that changes between presentations, and the outer WS-Security Timestamp it travels beside is not covered by its signature — so an attacker can remint that Timestamp and replay the assertion indefinitely. Accepting one therefore requires all of the following, in order, after signature verification and issuer trust:
+
+1. **Bounded validity.** `Conditions` is mandatory, and so are both `NotBefore` and `NotOnOrAfter`. The window must be non-empty and no wider than `saml.max_assertion_lifetime_seconds`, and the current instant must fall inside it (± `saml.clock_skew_seconds`).
+2. **Service audience.** At least one `AudienceRestriction` must be present, and **every** `AudienceRestriction` must name `saml.audience` — each one is a conjunct, so a second restriction naming only another relying party invalidates the assertion here.
+3. **Supported subject confirmation.** Exactly one `SubjectConfirmation` whose `Method` is in `saml.allowed_subject_confirmation_methods` must be acceptable. Its `SubjectConfirmationData` must name `saml.recipient` as `Recipient`, carry its own `NotOnOrAfter` (honoured with skew), honour `NotBefore` when present, and **omit** `InResponseTo` — there is no SAML request in a WS-Security bearer flow to correlate one against, and a value the gateway cannot check must not be silently ignored.
+4. **Single use.** The assertion id, bound to its issuer, is claimed atomically in the scope declared by `nonce.replay_scope`, which is therefore **required whenever `saml.enabled` is true**. `OneTimeUse` needs no special case because every accepted assertion is claimed exactly once; a replay backend outage fails closed like every other replay decision.
+
+Assertion claims are retained for the same fixed **93 601-second** horizon as PasswordDigest nonces, which provably dominates `max_assertion_lifetime_seconds` (86400) + 2 × `clock_skew_seconds` (3600) — the widest span any admissible SAML policy can accept one unchanged assertion over. No reload generation can therefore expire a claim while a later generation would still accept the assertion.
+
+**Cross-replica scope is exactly what you declare.** `process` is a single-replica assertion and makes **no** cross-replica claim: with more than one replica, one captured assertion can be spent once per replica. Multi-replica SAML deployments must use `replay_scope: shared` with `sync_mode: "redis"`. Shared claim keys are `SHA-256("…|issuer\0assertion-id")` in lowercase hex — never the issuer or the assertion id — so no credential-adjacent value reaches a Redis keyspace, `MONITOR`, `SLOWLOG`, or the Redis client's error logs.
+
+Rejections never echo the issuer, audience, recipient, subject, assertion id, or any part of the assertion; client bodies and logs carry fixed messages and the fixed failure class `saml`.
 
 #### UsernameToken — PasswordDigest
 
@@ -2427,7 +2491,7 @@ max created_max_age_seconds (86400) + 2 × max created_clock_skew_seconds (3600)
 
 #### PasswordDigest replay scope
 
-`nonce.replay_scope` is **required** whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, and it has no default. A gateway cannot observe how many replicas serve a proxy, so the deployment shape is an explicit operator declaration rather than a silent assumption:
+`nonce.replay_scope` is **required** whenever `username_token.enabled` is true and `password_type` is `PasswordDigest`, and whenever `saml.enabled` is true. It has no default. A gateway cannot observe how many replicas serve a proxy, so the deployment shape is an explicit operator declaration rather than a silent assumption:
 
 | Value | Guarantee | Requirements |
 |---|---|---|
@@ -2549,11 +2613,12 @@ The plugin cryptographically verifies the SAML assertion's `<Signature>` element
 
 1. Locate `<Signature>` inside the assertion (`401` if absent). The plugin also rejects requests carrying more than one `<Assertion>` inside the WS-Security block.
 2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-3. Verify each `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`. At least one Reference must target the enclosing Assertion ID.
-4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate` against `trusted_signing_certs` by SHA-256 fingerprint of the full DER. This is leaf-cert trust — operators supply the IdP's actual signing certificate(s) as published in IdP metadata, not a CA.
-5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched cert's RSA public key.
-6. Validate `Issuer` (must match one of `trusted_issuers`), `NotBefore` / `NotOnOrAfter` (with `clock_skew_seconds` tolerance), and `Audience` (when `audience` is configured).
-7. Extract the Subject `NameID` into `ctx.metadata["soap_ws_saml_subject"]` so downstream plugins (ACL, rate limiting, logging) can consume the SAML identity.
+3. Match the signing certificate from `KeyInfo/X509Data/X509Certificate` against `trusted_signing_certs` by SHA-256 fingerprint of the full DER. This is leaf-cert trust — operators supply the IdP's actual signing certificate(s) as published in IdP metadata, not a CA.
+4. Verify `<SignatureValue>` over the canonicalized `<SignedInfo>` bytes using the matched cert's RSA public key.
+5. **Only then** verify the single `<Reference>` digest against the assertion with its own `<Signature>` element removed (XMLDSIG enveloped-signature transform). The digest algorithm must be in `allowed_digest_algorithms`, and the Reference must target the enclosing Assertion ID.
+6. Validate `Issuer` (must match one of `trusted_issuers`), the mandatory bounded `Conditions` window, the service `Audience`, and the `SubjectConfirmation` / `Recipient` binding — see [SAML assertions are bearer values](#saml-assertions-are-bearer-values).
+7. Claim the assertion id for single use in the declared `nonce.replay_scope`.
+8. Publish the Subject `NameID` as the request principal (`authenticated_identity`, plus a namespace-correct `identified_consumer`) and mirror it into `ctx.metadata["soap_ws_saml_subject"]`.
 
 ```yaml
 plugin_name: soap_ws_security
@@ -2569,12 +2634,18 @@ config:
     allowed_digest_algorithms:
       - sha256
     audience: https://my-service.example.com
+    recipient: https://my-service.example.com/ws
+    max_assertion_lifetime_seconds: 300
     clock_skew_seconds: 300
+  nonce:
+    # Required for SAML: assertion ids are claimed for single use.
+    # Use `shared` (with sync_mode: redis) for more than one replica.
+    replay_scope: process
   timestamp:
     require: true
 ```
 
-Both `trusted_issuers` and `trusted_signing_certs` are required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
+`trusted_issuers`, `trusted_signing_certs`, `audience`, `recipient`, and `nonce.replay_scope` are all required when `saml.enabled: true`. A missing or unreadable signing cert is a fatal startup error. Rotating an IdP signing cert requires updating `trusted_signing_certs` and restarting the gateway (no live reload). `allowed_signature_algorithms` and `allowed_digest_algorithms` are independent — the defaults reject SHA-1 in either position; add `rsa-sha1` / `sha1` only to interoperate with legacy IdPs.
 
 #### Combined Configuration
 
@@ -2608,7 +2679,7 @@ config:
 
 **Metadata:** On successful UsernameToken authentication, the plugin sets `ctx.metadata["soap_ws_username"]` to the authenticated username. On successful SAML assertion validation, it sets `ctx.metadata["soap_ws_saml_subject"]` to the Subject `NameID`. Both are available to downstream plugins and logging.
 
-**Namespace prefix agnostic:** The plugin matches XML elements by local name, so it works regardless of namespace prefix conventions (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:`, etc.).
+**Namespace prefix agnostic, namespace URI strict:** Element *prefixes* are irrelevant (`wsse:`, `WSSE:`, `sec:`, `soap:`, `s:` all work), but element *namespace URIs* are enforced. `Envelope`/`Header`/`Body` must be in a SOAP envelope namespace, `Security`/`UsernameToken`/`Username`/`Password`/`Nonce`/`BinarySecurityToken` in the WS-Security secext namespace, `Timestamp`/`Created`/`Expires`/`wsu:Id` in the WS-Security utility namespace, `Signature`/`SignedInfo`/`Reference`/`Transforms`/`KeyInfo` in the XMLDSIG namespace, and `Assertion`/`Issuer`/`Conditions`/`Subject`/`SubjectConfirmation`/`NameID` in the SAML 2.0 assertion namespace. An element that merely shares a local name is not a candidate.
 
 ---
 
@@ -3739,7 +3810,7 @@ Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
 - Forces response body buffering on proxies where this plugin is enabled
-- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
+- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so `before_proxy` body consumers inspect validated plaintext (an identity-establishing `soap_ws_security` instance authenticates earlier still, in the `authenticate` phase, and composing the two on one proxy is rejected at admission); the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
 - `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
