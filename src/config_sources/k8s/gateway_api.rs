@@ -7767,7 +7767,6 @@ mod tests {
                 }],
                 "rules": [{
                     "matches": [{
-                        "path": {"type": "PathPrefix", "value": "/grpc"},
                         "method": {
                             "service": "ferrum.echo.v1.Echo",
                             "method": "Ping"
@@ -7782,6 +7781,10 @@ mod tests {
             .expect("HTTP listeners should allow GRPCRoute when requested");
 
         assert_eq!(result.config.proxies.len(), 1);
+        assert_eq!(
+            result.config.proxies[0].listen_path.as_deref(),
+            Some("=/ferrum.echo.v1.Echo/Ping")
+        );
     }
 
     #[test]
