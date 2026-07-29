@@ -4078,8 +4078,9 @@ fn reconcile_udp_capture_readiness_with_sync_state(
             // inbound capture. The flag is derived PER FAMILY so an IPv4-only
             // capture listener cannot get a true IPv6 flag reinstated here.
             let base = pod_map_info(config, false);
-            let info_v4 =
-                base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
+            let info_v4 = base
+                .clone()
+                .with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
             let info_v6 =
                 base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), true));
             let v4_ok = state
@@ -4161,8 +4162,9 @@ fn reconcile_udp_capture_readiness_with_sync_state(
         // Per-family flags: an IPv4-only capture listener never advertises an
         // IPv6 redirect, so this rewrite cannot resurrect one.
         let base = pod_map_info(config, ready);
-        let info_v4 =
-            base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
+        let info_v4 = base
+            .clone()
+            .with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), false));
         let info_v6 =
             base.with_inbound_redirect(pod_inbound_redirect_flag(config, state.value(), true));
         let v4_ok = state
@@ -5231,7 +5233,7 @@ fn reconcile_existing_pod_inbound_redirect(
     let base = pod_map_info(config, udp_ready_marker_exists(config, pod_uid));
     let mut failed = false;
     if let Some(ip) = state.pod_ip
-        && let Err(e) = apply_pod_inbound_redirect_v4(backend, base, ip, &desired)
+        && let Err(e) = apply_pod_inbound_redirect_v4(backend, base.clone(), ip, &desired)
     {
         warn!(
             pod_uid,
