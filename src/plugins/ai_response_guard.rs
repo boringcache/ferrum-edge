@@ -1790,12 +1790,48 @@ impl AiResponseGuard {
     }
 }
 
-/// True when a response `Content-Type` is native gRPC framing.
+/// True when a response `Content-Type` is native gRPC or gRPC-Web framing.
 ///
-/// Delegates to the canonical, delimiter-aware dispatch classifier so this
+/// Delegates to the shared classifier every sibling AI plugin uses, so this
 /// stays aligned with the H1/H2/H3 paths. Allocation-free.
-fn is_native_grpc_content_type(content_type: &str) -> bool {
-    crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+///
+/// Native gRPC alone is not enough here: a gRPC-Web response body is the same
+/// length-prefixed frame grammar (optionally base64-armored), and it is the
+/// representation an `ai_response_guard` on a mixed route actually meets —
+/// `grpc_web`'s `after_proxy` relabels every translated response to
+/// `application/grpc-web*` before `on_response_body` runs.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    crate::plugins::utils::body_transform::is_framed_grpc_content_type(content_type)
+}
+
+/// Whether these buffered response bytes are gRPC framing rather than the
+/// JSON/SSE/text document model this plugin's non-gRPC paths assume.
+///
+/// The live `content-type` cannot answer this alone. `grpc_web`'s `after_proxy`
+/// rewrites it, and an ordinary header rule may relabel or strip it outright, so
+/// the resolution mirrors
+/// [`crate::plugins::response_representation::effective_response_media_type`]:
+/// the live label, then the pristine backend label stamped before any response
+/// hook ran, then a total frame parse under the one grammar the client's
+/// representation admits. The parse is structural, never a sniff, so a genuine
+/// bare JSON document on a gRPC-Web request stays claimed and inspectable.
+fn response_is_grpc_framed(ctx: &RequestContext, content_type: Option<&str>, body: &[u8]) -> bool {
+    if content_type.is_some_and(is_framed_grpc_content_type) {
+        return true;
+    }
+    if ctx
+        .metadata
+        .get(crate::proxy::ORIGINAL_RESPONSE_CONTENT_TYPE_METADATA_KEY)
+        .map(String::as_str)
+        .is_some_and(is_framed_grpc_content_type)
+    {
+        return true;
+    }
+    let Some(representation) = crate::plugins::grpc_web::client_grpc_framing_representation(ctx)
+    else {
+        return false;
+    };
+    crate::plugins::grpc_web::bytes_are_complete_grpc_frames(body, representation)
 }
 
 /// Bounded walk accounting shared by every protobuf traversal.
@@ -2962,7 +2998,14 @@ impl Plugin for AiResponseGuard {
         // prefixed frames as a raw text document would let `scan_mode: all`
         // report a redaction the transform can never apply; fail closed for
         // enforcing actions instead, exactly as content mode already does.
-        if is_native_grpc_content_type(content_type) {
+        //
+        // gRPC-Web is the same grammar and the same hazard, and it is what a
+        // browser client on a mixed route actually sends: its request flavor is
+        // `Plain`, so it never reaches `inspect_grpc_response` above, and
+        // `grpc_web`'s `after_proxy` has already relabeled the response to
+        // `application/grpc-web*` — a native-gRPC media-type test alone would
+        // let those frames through to the text redactor.
+        if response_is_grpc_framed(ctx, Some(content_type), body) {
             return self.respond_to_uninspectable(
                 ctx,
                 "grpc_framed_response_requires_grpc_contract",
@@ -3218,19 +3261,22 @@ impl Plugin for AiResponseGuard {
         if self.grpc_transform_applies(ctx, content_type) {
             return self.redacted_grpc_body(ctx, response_headers, body);
         }
-        // A native-gRPC request's response body is length-prefixed protobuf
-        // framing — or the gRPC-Web re-framing of it — whatever the response
-        // `Content-Type` claims. The JSON/SSE/text rewriter below cannot
-        // address that representation, and its `scan_fields: all` branch would
-        // regex-rewrite raw frame bytes whenever they happen to be valid UTF-8,
-        // changing a payload's length without its 5-byte prefix and corrupting
-        // the wire. `application/grpc-web+proto` is not
-        // `is_native_grpc_content_type`, so the media-type guard inside
-        // `transform_response_body` does not cover the translated case. Only
-        // the descriptor contract above may rewrite these bytes; when it does
-        // not apply, `inspect_grpc_response` has already failed closed for
-        // anything it detected, so deliver them unchanged.
-        if ctx.is_native_grpc_request() {
+        // A gRPC or gRPC-Web response body is length-prefixed protobuf framing
+        // — or the base64 armoring of it — whatever the response `Content-Type`
+        // claims. The JSON/SSE/text rewriter below cannot address that
+        // representation, and its `scan_fields: all` branch would regex-rewrite
+        // raw frame bytes whenever they happen to be valid UTF-8, changing a
+        // payload's length without its 5-byte prefix and corrupting the wire.
+        //
+        // The request flavor alone cannot gate this: a gRPC-Web request is
+        // `HttpFlavor::Plain`, so keying on `is_native_grpc_request()` would
+        // leave every browser gRPC client — translated by `grpc_web` (which
+        // re-frames at priority 260, before this transform) or passed through
+        // to a gRPC-Web backend — exposed to the text redactor. Only the
+        // descriptor contract above may rewrite these bytes; when it does not
+        // apply, `on_response_body` has already failed closed under the same
+        // predicate for anything it detected, so deliver them unchanged.
+        if ctx.is_native_grpc_request() || response_is_grpc_framed(ctx, content_type, body) {
             return None;
         }
         self.transform_response_body(body, content_type, response_headers)
@@ -3247,9 +3293,9 @@ impl Plugin for AiResponseGuard {
             return None;
         }
 
-        // Native gRPC bodies are only ever rewritten through the
+        // Native gRPC and gRPC-Web bodies are only ever rewritten through the
         // context-carrying entry point above, which knows the method contract.
-        if content_type.is_some_and(is_native_grpc_content_type) {
+        if content_type.is_some_and(is_framed_grpc_content_type) {
             return None;
         }
 

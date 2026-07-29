@@ -4387,12 +4387,14 @@ async fn grpc_redact_transform_ignores_mislabeled_response_content_type() {
 async fn grpc_web_translated_response_is_never_rewritten_as_text() {
     // A gRPC-Web translated response is excluded from the protobuf rewrite
     // (`grpc_web` re-frames the body first), but its bytes are still gRPC
-    // framing — and `application/grpc-web+proto` is not
-    // `is_native_grpc_content_type`, so the media-type guard inside the plain
-    // `transform_response_body` does not cover it. With `scan_fields: all` the
-    // frame bytes of an ASCII payload are valid UTF-8, so a text redaction
-    // would rewrite them and change a payload's length without its 5-byte
-    // prefix, corrupting the wire while reporting success.
+    // framing, so the plain `transform_response_body` must decline them. With
+    // `scan_fields: all` the frame bytes of an ASCII payload are valid UTF-8,
+    // so a text redaction would rewrite them and change a payload's length
+    // without its 5-byte prefix, corrupting the wire while reporting success.
+    //
+    // This ctx is the native-flavor half of the hazard. The production
+    // gRPC-Web shape — `HttpFlavor::Plain` — is covered by
+    // `grpc_web_framed_response_fails_closed_instead_of_being_text_redacted`.
     let plugin = make_plugin(json!({
         "action": "redact",
         "scan_fields": "all",
@@ -4847,4 +4849,172 @@ async fn grpc_text_fields_ignore_out_of_scope_strings_and_map_keys() {
         ),
         "in-scope text_fields matches must still reject"
     );
+}
+
+/// A browser gRPC-Web request as the proxy actually classifies it.
+///
+/// `detect_http_flavor` calls gRPC-Web `HttpFlavor::Plain` — only the request
+/// protocol view is gRPC — so a framing guard keyed on
+/// `is_native_grpc_request()` never fires for real gRPC-Web traffic.
+fn grpc_web_ctx(path: &str, translated: bool) -> RequestContext {
+    let ip = "127.0.0.1".to_string();
+    let mut ctx = RequestContext::new(ip, "POST".to_string(), path.to_string());
+    if translated {
+        // `grpc_web` claimed the translation, so the backend answered in native
+        // framing and this plugin's transform runs after that re-framing.
+        let mode = "binary".to_string();
+        ctx.metadata.insert("grpc_web_mode".to_string(), mode);
+    }
+    // Retained on both the translated and pass-through deployments.
+    let ct = "application/grpc-web+proto".to_string();
+    ctx.metadata.insert("grpc_web_original_ct".to_string(), ct);
+    ctx
+}
+
+fn grpc_web_guard(with_grpc_block: bool) -> AiResponseGuard {
+    let mut config = json!({
+        "action": "redact",
+        "scan_fields": "all",
+        "pii_patterns": ["email"]
+    });
+    if with_grpc_block {
+        config["grpc"] = json!({
+            "descriptor_path": grpc_descriptor_path(),
+            "methods": {
+                "/test.Greeter/SayHello": {"response_type": "test.HelloResponse"}
+            }
+        });
+    }
+    make_plugin(config)
+}
+
+fn content_type_headers(value: Option<&str>) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    if let Some(ct) = value {
+        headers.insert("content-type".to_string(), ct.to_string());
+    }
+    headers
+}
+
+async fn guard_inspect(
+    plugin: &AiResponseGuard,
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+    body: &[u8],
+) -> PluginResult {
+    plugin.on_response_body(ctx, 200, headers, body).await
+}
+
+async fn guard_transform(
+    plugin: &AiResponseGuard,
+    ctx: &mut RequestContext,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let content_type = headers.get("content-type").map(String::as_str);
+    plugin
+        .transform_response_body_with_context(ctx, body, content_type, headers)
+        .await
+}
+
+fn rejected_reason(ctx: &RequestContext) -> Option<&str> {
+    ctx.metadata
+        .get("ai_response_guard_rejected")
+        .map(String::as_str)
+}
+
+fn assert_framing_reject(verdict: PluginResult, ctx: &RequestContext, label: &str) {
+    assert!(matches!(verdict, PluginResult::Reject { .. }), "{label}");
+    let expected = Some("grpc_framed_response_requires_grpc_contract");
+    assert_eq!(rejected_reason(ctx), expected, "{label}");
+    let redacted = ctx.metadata.contains_key("ai_response_guard_redacted");
+    assert!(!redacted, "a redaction that cannot reach the wire: {label}");
+}
+
+#[tokio::test]
+async fn grpc_web_framed_response_fails_closed_instead_of_being_text_redacted() {
+    // Regression: the framing guard must not key on the request's HTTP flavor
+    // or on `application/grpc` alone. A browser gRPC-Web request is
+    // `HttpFlavor::Plain`, so it never reaches the descriptor contract, and
+    // `grpc_web`'s `after_proxy` has already relabeled the response to
+    // `application/grpc-web*` by the time `on_response_body` runs. Under
+    // `scan_fields: all` those frame bytes are valid UTF-8, so the JSON/text
+    // model would detect the PII, report `redacted`, and then regex-rewrite the
+    // payload without its 5-byte length prefix — corrupting the delivered wire.
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+    assert!(
+        std::str::from_utf8(&body).is_ok(),
+        "the regression only bites when the framed body is valid UTF-8"
+    );
+
+    for with_grpc_block in [false, true] {
+        let plugin = grpc_web_guard(with_grpc_block);
+        for translated in [true, false] {
+            let label = format!("grpc_block={with_grpc_block} translated={translated}");
+            let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", translated);
+            let ct = Some("application/grpc-web+proto");
+            let mut headers = content_type_headers(ct);
+
+            let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+            assert_framing_reject(verdict, &ctx, &label);
+
+            let rewritten = guard_transform(&plugin, &mut ctx, &body, &headers).await;
+            assert!(
+                rewritten.is_none(),
+                "a gRPC-Web framed body must never be rewritten as text ({label})"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn grpc_web_framing_is_resolved_without_a_trustworthy_content_type() {
+    // A header rule can strip or relabel the response `Content-Type` after the
+    // backend answered, so the live label alone cannot decide framing. The
+    // pristine backend label stamped before any response hook ran, and failing
+    // that a total frame parse under the client's representation, must still
+    // recognize these bytes as gRPC-Web framing and fail closed.
+    let plugin = grpc_web_guard(true);
+    let body = grpc_frame(&hello_response_bytes("mail ops@example.com now"));
+
+    // (a) Live type relabeled to JSON; the pristine backend type proves framing.
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", true);
+    let key = "ferrum:original_response_content_type".to_string();
+    let pristine = "application/grpc+proto".to_string();
+    ctx.metadata.insert(key, pristine);
+    let mut headers = content_type_headers(Some("application/json"));
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+    assert_framing_reject(verdict, &ctx, "relabeled content-type");
+
+    // (b) No live type and no pristine type: the bytes themselves total-parse
+    // as complete frames under the retained gRPC-Web binary grammar.
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", false);
+    let mut headers = content_type_headers(None);
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, &body).await;
+    assert_framing_reject(verdict, &ctx, "stripped content-type");
+}
+
+#[tokio::test]
+async fn grpc_web_request_with_a_bare_json_document_is_still_inspected() {
+    // The framing resolution is one-directional: it must not turn every
+    // response on a gRPC-Web request into a 502. A genuine bare JSON document
+    // is not a frame sequence under any gRPC grammar (a frame's first octet is
+    // a flag byte, and `{` is not one), so it stays claimed and redactable.
+    let plugin = grpc_web_guard(true);
+    let body = br#"{"choices":[{"message":{"content":"mail ops@example.com"}}]}"#;
+
+    let mut ctx = grpc_web_ctx("/test.Greeter/SayHello", false);
+    let mut headers = content_type_headers(Some("application/json"));
+    let verdict = guard_inspect(&plugin, &mut ctx, &mut headers, body).await;
+    assert!(matches!(verdict, PluginResult::Continue));
+    assert!(
+        ctx.metadata.contains_key("ai_response_guard_redacted"),
+        "a bare JSON document on a gRPC-Web request must still be redacted"
+    );
+
+    let rewritten = guard_transform(&plugin, &mut ctx, body, &headers).await;
+    let rewritten = rewritten.expect("bare JSON is still rewritten");
+    let rewritten = String::from_utf8(rewritten).unwrap();
+    assert!(!rewritten.contains("ops@example.com"));
+    assert!(rewritten.contains("[REDACTED:pii:email]"));
 }
