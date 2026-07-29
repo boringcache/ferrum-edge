@@ -8560,14 +8560,8 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
         ("non-object schema", json!("not-a-schema")),
         ("null schema", Value::Null),
         ("array schema", json!([])),
-        (
-            "non-string $ref",
-            json!({ "$ref": ["#/$defs/x"] }),
-        ),
-        (
-            "non-string $dynamicRef",
-            json!({ "$dynamicRef": 12 }),
-        ),
+        ("non-string $ref", json!({ "$ref": ["#/$defs/x"] })),
+        ("non-string $dynamicRef", json!({ "$dynamicRef": 12 })),
         (
             "non-local $id",
             json!({
@@ -8575,10 +8569,7 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
                 "$id": "https://example.invalid/schemas/weather.json"
             }),
         ),
-        (
-            "non-string $id",
-            json!({ "type": "object", "$id": 7 }),
-        ),
+        ("non-string $id", json!({ "type": "object", "$id": 7 })),
         (
             "non-local id",
             json!({
@@ -8586,10 +8577,7 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
                 "id": "https://example.invalid/legacy-id"
             }),
         ),
-        (
-            "non-string id",
-            json!({ "type": "object", "id": false }),
-        ),
+        ("non-string id", json!({ "type": "object", "id": false })),
         (
             "$vocabulary refused",
             json!({
@@ -8597,10 +8585,7 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
                 "$vocabulary": { "https://json-schema.org/draft/2020-12/vocab/core": true }
             }),
         ),
-        (
-            "non-pointer local $ref",
-            json!({ "$ref": "#foo" }),
-        ),
+        ("non-pointer local $ref", json!({ "$ref": "#foo" })),
         (
             "missing local $ref target",
             json!({ "$ref": "#/$defs/missing" }),
@@ -8621,7 +8606,10 @@ async fn validate_tool_results_skips_tools_for_output_schema_security_boundaries
             }),
         ),
         ("schema deeper than budget", deeply_nested_output_schema(40)),
-        ("schema wider than node budget", node_budget_output_schema(10_100)),
+        (
+            "schema wider than node budget",
+            node_budget_output_schema(10_100),
+        ),
     ];
 
     for (offset, (case, schema)) in cases.into_iter().enumerate() {
@@ -8938,8 +8926,7 @@ async fn validate_tool_results_rejects_duplicate_json_keys() {
         assert_eq!(status, 200, "{case}");
         assert_eq!(response["error"]["code"], -32012, "{case}");
         assert_eq!(
-            response["error"]["message"],
-            "Invalid MCP tool result",
+            response["error"]["message"], "Invalid MCP tool result",
             "{case}"
         );
         assert_eq!(
@@ -9247,8 +9234,7 @@ async fn validate_tool_results_pinned_validator_survives_catalog_refresh_and_clo
     let mut ctx = route_validated_tool_call(&plugin, &session_id, 1041).await;
     assert!(ferrum_edge::_test_support::mcp_validate_tool_result_is_some_for_test(&ctx));
 
-    let clone =
-        ferrum_edge::_test_support::clone_for_final_request_body_hooks_for_test(&mut ctx);
+    let clone = ferrum_edge::_test_support::clone_for_final_request_body_hooks_for_test(&mut ctx);
     assert!(
         ferrum_edge::_test_support::mcp_validate_tool_result_ptr_eq_for_test(&ctx, &clone),
         "compatibility clone must carry the same pinned validator Arc"

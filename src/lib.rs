@@ -180,9 +180,7 @@ pub mod _test_support {
     }
 
     /// Whether a routed `tools/call` pinned a private outputSchema validator.
-    pub fn mcp_validate_tool_result_is_some_for_test(
-        ctx: &crate::plugins::RequestContext,
-    ) -> bool {
+    pub fn mcp_validate_tool_result_is_some_for_test(ctx: &crate::plugins::RequestContext) -> bool {
         ctx.mcp_validate_tool_result.is_some()
     }
 
