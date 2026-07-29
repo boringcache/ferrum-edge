@@ -6163,6 +6163,18 @@ async fn apply_buffered_grpc_plugin_reject(
         &headers,
     );
     apply_h3_grpc_reject_metadata(ctx, &normalized);
+    // A rejection here replaces the backend response wholesale, so the backend's
+    // trailers must not survive.
+    //
+    // This helper is the response-BODY reject path: it runs only after a backend
+    // response was received, whereas `serverless_function` terminate
+    // short-circuits in `before_proxy` before any backend dispatch. A framed
+    // unary terminate representation can therefore never arrive here, and
+    // `normalize_h3_grpc_reject` deliberately carries no framed provenance — so
+    // the normalized rejection is always trailers-only and the clear is
+    // unconditional. Every caller immediately follows with
+    // `select_buffered_grpc_terminal_response`, which clears again from the
+    // gateway-authored header view.
     *response_status = normalized.http_status.as_u16();
     *response_headers = normalized.headers;
     *response_body = normalized.body;
@@ -7018,6 +7030,9 @@ pub(crate) fn normalize_reject_for_client(
     Option<crate::plugins::grpc_web::GrpcWebErrorResponse>,
 ) {
     let grpc_web = crate::plugins::grpc_web::client_uses_grpc_web(ctx);
+    // Cross-protocol rejects run only after backend dispatch; `serverless_function`
+    // terminate short-circuits in `before_proxy`, so framed unary provenance
+    // never reaches this normalizer.
     let mut normalized =
         crate::proxy::normalize_reject_response(status, body, headers, native_grpc || grpc_web);
     // Single trusted chokepoint for the cross-protocol reject writers: derive
@@ -7577,32 +7592,31 @@ where
 {
     debug_assert!(
         reject.body.is_empty(),
-        "normalized gRPC rejects should be trailers-only"
+        "cross-protocol gRPC rejects must be trailers-only"
     );
     let mut headers = reject.headers.clone();
+    // Trailers-only framing: strips hop-by-hop / Connection-listed fields AND
+    // removes any `Content-Length` a plugin authored, so this cross-protocol
+    // writer stays on the same fail-closed boundary as the H1/H2 reject builder.
     sanitize_client_response_headers_for_wire(&mut headers, ClientResponseFraming::TrailersOnly);
-    let mut resp_builder = Response::builder().status(reject.http_status);
-    for (key, value) in &headers {
-        let sanitized_grpc_message;
-        let header_value = if key.eq_ignore_ascii_case("grpc-message") {
-            sanitized_grpc_message = sanitize_h3_grpc_message_for_header(value);
-            if sanitized_grpc_message.is_empty() {
-                continue;
-            }
-            sanitized_grpc_message.as_str()
+    if let Some(key) = headers
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case("grpc-message"))
+        .cloned()
+    {
+        let sanitized = sanitize_h3_grpc_message_for_header(&headers[&key]);
+        if sanitized.is_empty() {
+            headers.remove(&key);
         } else {
-            value.as_str()
-        };
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(key.as_bytes()),
-            HeaderValue::from_str(header_value),
-        ) {
-            resp_builder = resp_builder.header(name, val);
+            headers.insert(key, sanitized);
         }
     }
-    let resp = resp_builder
-        .body(())
-        .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
+    let resp = crate::proxy::headers::apply_response_headers(
+        Response::builder().status(reject.http_status),
+        &headers,
+    )
+    .body(())
+    .map_err(|e| anyhow::anyhow!("Failed to build H3 gRPC reject response: {}", e))?;
     stream.send_response(resp).await?;
     let _ = stream.finish().await;
     Ok(CrossProtocolOutcome {

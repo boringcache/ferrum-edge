@@ -16092,7 +16092,10 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// validator explicitly requires zero-byte inspection) and the same
 /// response-body-buffering capability gate the normal response path uses is
 /// satisfied. Specifically we skip when:
-/// - the request is gRPC (synthetic gRPC bodies are handled as trailers-only),
+/// - the request is gRPC AND this is not the authorized `serverless_function`
+///   native-gRPC terminate representation (every other synthetic gRPC body is
+///   handled as trailers-only, so there is nothing for a body validator to
+///   inspect; see [`authorized_serverless_grpc_terminate_representation`]),
 /// - the status is neither 2xx nor a marked final serverless response,
 /// - the status is 204, 205, or 304 (a body-emitting transform there is
 ///   protocol-incorrect),
@@ -16117,7 +16120,7 @@ pub(crate) async fn apply_plugin_rejection_response(
 /// this body-hook gate.
 ///
 /// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
-fn should_apply_synthetic_response_body_hooks(
+pub(crate) fn should_apply_synthetic_response_body_hooks(
     status_code: u16,
     is_grpc_request: bool,
     response_body: &[u8],
@@ -16126,7 +16129,9 @@ fn should_apply_synthetic_response_body_hooks(
 ) -> bool {
     let governed_synthetic_status = (200..300).contains(&status_code)
         || (ctx.serverless_terminate_response && (200..=599).contains(&status_code));
-    if is_grpc_request
+    let governed_grpc_representation = !is_grpc_request
+        || authorized_serverless_grpc_terminate_representation(status_code, response_body, ctx);
+    if !governed_grpc_representation
         || !governed_synthetic_status
         || crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
     {
@@ -16142,6 +16147,44 @@ fn should_apply_synthetic_response_body_hooks(
         return false;
     }
     response_body_plugins_process_body(plugins, ctx)
+}
+
+/// Whether this synthetic response IS the validated `serverless_function`
+/// native-gRPC terminate representation for this request.
+///
+/// This is the sole gRPC short-circuit that puts a real body on the wire, so it
+/// is the sole gRPC short-circuit the shared response-body policy lifecycle can
+/// meaningfully govern. The predicate is deliberately the same request-scoped
+/// provenance the reject writers use, never body shape or reject headers:
+/// - the request must be the native-gRPC flavor the frontend stamped at intake,
+/// - the plugin must have marked a terminate response,
+/// - the status must be the one the contract authored, and
+/// - the bytes must still be the authored frame — which for the status-only
+///   contract shape is the empty frame it authored, so an empty body matches and
+///   a body that the contract never authored does not (that case still has to
+///   clear the explicit zero-byte inspection gate in
+///   [`should_apply_synthetic_response_body_hooks`]).
+///
+/// A body hook that rewrites or replaces these bytes invalidates the
+/// authorization, and the rejection then fails closed in
+/// [`normalize_reject_response_with_provenance`] rather than reaching the wire.
+fn authorized_serverless_grpc_terminate_representation(
+    status_code: u16,
+    response_body: &[u8],
+    ctx: &RequestContext,
+) -> bool {
+    if !ctx.serverless_terminate_response || !ctx.is_native_grpc_request() {
+        return false;
+    }
+    match ctx.serverless_grpc_terminate_frame.as_deref() {
+        Some(authored) => {
+            authored.http_status == status_code && authored.frame.as_ref() == response_body
+        }
+        // Every native-gRPC terminate contract — framed and status-only alike —
+        // stamps the authored representation. No provenance therefore means this
+        // is not the terminate representation at all, and the gate stays closed.
+        None => false,
+    }
 }
 
 /// Whether a response-body-capable plugin phase actually processes THIS
@@ -16529,8 +16572,17 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
             .any(|plugin| plugin.requires_response_committed_hook())
     {
         let status_code = StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let normalized =
-            normalize_reject_response(status_code, body.clone(), headers, is_grpc_request);
+        // Committed observers must see the response that is actually emitted,
+        // including a serverless terminate framed unary body — otherwise the
+        // hook view and the wire diverge on exactly this path. The `Bytes` clone
+        // is a refcount bump, not a body copy.
+        let normalized = normalize_reject_response_with_provenance(
+            status_code,
+            body.clone(),
+            headers,
+            is_grpc_request,
+            FramedGrpcUnaryProvenance::from_context(ctx),
+        );
         for (index, plugin) in plugins.iter().enumerate() {
             if !plugin.requires_response_committed_hook() {
                 continue;
@@ -16759,6 +16811,11 @@ pub(crate) struct NormalizedRejectResponse {
     /// authoritative, so an ordinary empty reject publishes `Content-Length: 0`
     /// instead of preserving a plugin-authored length.
     pub(crate) body_disposition: headers_mod::RejectBodyDisposition,
+    /// When non-empty together with a non-empty `body`, these are emitted as
+    /// HTTP trailers after the unary DATA frame (serverless native-gRPC
+    /// terminate). Ordinary trailers-only rejects leave this empty and keep
+    /// terminal metadata in `headers`.
+    pub(crate) grpc_trailers: HashMap<String, String>,
 }
 
 /// Apply route policy to a gateway-generated plain HTTP response and then
@@ -16881,11 +16938,297 @@ pub(crate) fn map_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     grpc_proxy::http_reject_status_to_grpc_status(status)
 }
 
+/// Provenance authorizing a native-gRPC rejection to keep a framed unary DATA
+/// body instead of collapsing to the trailers-only error contract.
+///
+/// The only holder of this authorization is a `serverless_function` terminate
+/// invocation whose function output already passed the plugin's fail-closed
+/// contract validation. Body shape and reject headers are deliberately NOT
+/// provenance: they are reachable by any plugin (including custom plugins) and
+/// partly derived from function/backend input, so trusting them would let an
+/// ordinary rejection reflect an untrusted body onto a native gRPC stream.
+///
+/// Authorization is byte-exact against the frame the plugin authored — and
+/// against the HTTP status it authored alongside it — so a replaceable
+/// `after_proxy` decorator that rewrites the reject body, a response-body
+/// transform that rewrites the frame, and any later unrelated rejection on the
+/// same request all fall back to trailers-only.
+///
+/// Falling back is not by itself safe: the authored reject headers still carry
+/// the contract's `grpc-status`, which is `0` on a successful unary response, so
+/// a plain fallback would emit an empty Trailers-Only *success*. Invalidated
+/// authorization therefore fails closed — see
+/// [`invalidated_grpc_terminate_fail_closed_signal`].
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FramedGrpcUnaryProvenance<'a> {
+    authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+}
+
+impl<'a> FramedGrpcUnaryProvenance<'a> {
+    /// No authorization: framed unary DATA is never preserved.
+    pub(crate) const NONE: Self = Self { authored: None };
+
+    /// Read the request-scoped authorization stamped by `serverless_function`.
+    pub(crate) fn from_context(ctx: &'a RequestContext) -> Self {
+        Self::from_authored_frame(ctx.serverless_grpc_terminate_frame.as_deref())
+    }
+
+    /// Same authorization from a snapshot of the stamped frame, for call sites
+    /// that must release their `ctx` borrow before the write.
+    pub(crate) fn from_authored_frame(
+        authored: Option<&'a crate::plugins::ServerlessGrpcTerminateFrame>,
+    ) -> Self {
+        Self { authored }
+    }
+
+    /// Whether this request holds a terminate authorization at all — framed or
+    /// status-only.
+    ///
+    /// `true` + "the authorized representation was not emitted" is exactly the
+    /// invalidated case that must fail closed rather than fall back to the
+    /// authored (possibly successful) `grpc-status`. The one representation for
+    /// which trailers-only is *not* an invalidation is the unchanged status-only
+    /// contract; see [`Self::intact_status_only_signal`].
+    pub(crate) fn is_authorizing(&self) -> bool {
+        self.authored.is_some()
+    }
+
+    /// The terminal metadata this rejection may emit as trailers, or `None`
+    /// when this rejection is not the authored representation and must stay
+    /// trailers-only.
+    ///
+    /// Both the authored HTTP status and the authored frame bytes must match.
+    /// Requiring the status too is what keeps a *later* rejection from
+    /// inheriting the original successful trailers on a byte coincidence: a
+    /// replacement rejection selects its own status, and the authored status
+    /// (200) is the one the terminate contract itself produced.
+    fn authorized_trailers(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<&'a HashMap<String, String>> {
+        let authored = self.authored?;
+        if authored.frame.is_empty() || authored.trailers.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        (authored.frame.as_ref() == body).then_some(&authored.trailers)
+    }
+
+    /// The COMPLETE authorized terminal metadata for the *status-only*
+    /// terminate contract — the shape that authored no frame and whose correct
+    /// client representation therefore IS trailers-only.
+    ///
+    /// `Some` only while the response is still exactly what the contract
+    /// authored: the authored HTTP status and a still-empty body. Every field
+    /// comes from the authored provenance rather than the reject header map,
+    /// which has been through `after_proxy` decorators, initial-header policy,
+    /// and — since the framed representation now runs it — the shared
+    /// response-body lifecycle. That covers `grpc-status`, an optional
+    /// `grpc-message`, `grpc-status-details-bin`, and the validated custom
+    /// trailers, so restoring this result is what makes the reply immune to
+    /// decorator mutation.
+    ///
+    /// `None` for a framed authorization (it authored DATA, so trailers-only is
+    /// not its representation), for a changed status or a body the contract
+    /// never authored, and for a status-only record whose own `grpc-status` no
+    /// longer parses. Each of those is an invalidation and falls through to
+    /// [`invalidated_grpc_terminate_fail_closed_signal`].
+    fn intact_status_only_signal(
+        &self,
+        status: StatusCode,
+        body: &[u8],
+    ) -> Option<StatusOnlyTerminalMetadata<'a>> {
+        let authored = self.authored?;
+        if !authored.frame.is_empty() || !body.is_empty() {
+            return None;
+        }
+        if authored.http_status != status.as_u16() {
+            return None;
+        }
+        let grpc_status = authored.trailers.get("grpc-status")?.parse::<u32>().ok()?;
+        // `grpc_message` is OPTIONAL in the contract, and omission is carried
+        // through as omission. Substituting a canonical reason here would invent
+        // "Gateway rejected request" for a status-only SUCCESS, and would
+        // override a nonzero contract's deliberate silence just as wrongly.
+        let grpc_message = authored
+            .trailers
+            .get("grpc-message")
+            .map(|message| sanitize_grpc_message(message))
+            .filter(|message| !message.is_empty());
+        // Everything else the contract authored — `grpc-status-details-bin` and
+        // the validated custom trailers — is restored alongside the status.
+        // Sorted so the emitted header block is deterministic regardless of map
+        // iteration order.
+        let mut additional: Vec<(&'a str, &'a str)> = authored
+            .trailers
+            .iter()
+            .filter(|(name, _)| !is_status_or_message_trailer(name.as_str()))
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        additional.sort_unstable();
+        Some(StatusOnlyTerminalMetadata {
+            grpc_status,
+            grpc_message,
+            additional,
+        })
+    }
+
+    /// Whether a trailers-only emitter must evict `name` from the mutable
+    /// reject header map because this request holds terminate authorization.
+    ///
+    /// Covers two things: every name the contract itself authored, and the
+    /// reserved gRPC terminal-metadata namespace whether the contract authored
+    /// it or not. So a decorator can neither replace what the contract
+    /// terminated with, nor inject a `grpc-status-details-bin` the contract
+    /// never authored onto the contract's own status.
+    ///
+    /// On the intact status-only path the authoritative copies are restored
+    /// from [`Self::intact_status_only_signal`] immediately afterwards. On any
+    /// invalidated path nothing is restored: pairing a replacement nonzero
+    /// `grpc-status` with the original contract's `grpc-status-details-bin` (or
+    /// its custom trailers) would describe the successful response the client
+    /// is not receiving.
+    ///
+    /// `grpc-status` and `grpc-message` are already dropped unconditionally by
+    /// every emitter; they are named here so the rule reads complete rather
+    /// than depending on that.
+    ///
+    /// Costs nothing when nothing is authorizing, which is every ordinary gRPC
+    /// rejection.
+    pub(crate) fn evicts_terminal_metadata(&self, name: &str) -> bool {
+        let Some(authored) = self.authored else {
+            return false;
+        };
+        if is_reserved_grpc_terminal_name(name) {
+            return true;
+        }
+        let mut authored_names = authored.trailers.keys();
+        authored_names.any(|authored_name| authored_name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Terminal names a [`StatusOnlyTerminalMetadata`] carries in its own
+/// `grpc_status` / `grpc_message` fields rather than in `additional`.
+fn is_status_or_message_trailer(name: &str) -> bool {
+    name.eq_ignore_ascii_case("grpc-status") || name.eq_ignore_ascii_case("grpc-message")
+}
+
+/// The reserved gRPC terminal-metadata namespace, matched case-insensitively
+/// because reject header maps are not normalized to lowercase.
+fn is_reserved_grpc_terminal_name(name: &str) -> bool {
+    is_status_or_message_trailer(name) || name.eq_ignore_ascii_case("grpc-status-details-bin")
+}
+
+/// The complete terminal metadata an UNCHANGED status-only
+/// `serverless_function` terminate contract must emit, taken from the validated
+/// authored provenance rather than the mutable reject header map.
+///
+/// This is the one representation shared by the H1/H2 normalizer and the
+/// direct-H3 writer, so a non-terminal response decorator can add initial
+/// response headers but can never alter, drop, or inject contract terminal
+/// metadata on either path.
+pub(crate) struct StatusOnlyTerminalMetadata<'a> {
+    pub(crate) grpc_status: u32,
+    /// `None` when the contract omitted `grpc_message`. Omission is emitted as
+    /// omission — never as an empty field and never as a synthesized reason.
+    pub(crate) grpc_message: Option<String>,
+    /// Authored terminal metadata other than `grpc-status`/`grpc-message`:
+    /// `grpc-status-details-bin` and the validated custom trailers, sorted by
+    /// name. Names are already lowercase.
+    pub(crate) additional: Vec<(&'a str, &'a str)>,
+}
+
+/// The authorized trailers-only signal for an unchanged status-only
+/// `serverless_function` terminate contract, shared by the H1/H2 normalizer and
+/// the direct-H3 writer (which derives its own signal and would otherwise read
+/// the mutable reject header map instead).
+///
+/// Every emitter must consult this BEFORE
+/// [`invalidated_grpc_terminate_fail_closed_signal`]: `Some` is the one case in
+/// which a terminate authorization legitimately produces no DATA, and `None`
+/// means the fail-closed correction applies. Ordering it this way keeps the
+/// carve-out at the call site, so an emitter that forgets it fails closed rather
+/// than silently emitting the contract's `grpc-status`.
+pub(crate) fn status_only_grpc_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+) -> Option<StatusOnlyTerminalMetadata<'a>> {
+    framed_unary_provenance.intact_status_only_signal(status, body)
+}
+
+/// The `grpc-message` emitted when a framed serverless-terminate authorization
+/// was invalidated and the gateway had to fail closed.
+pub(crate) const INVALIDATED_GRPC_TERMINATE_MESSAGE: &str =
+    "gateway: authorized gRPC terminate response was invalidated";
+
+/// Fail-closed correction for a native-gRPC rejection that HELD framed
+/// serverless-terminate authorization but is not emitting the authorized
+/// representation (the frame was rewritten, the status changed, or the
+/// representation was replaced by a body-policy rejection).
+///
+/// The authored reject headers carry the contract's own `grpc-status`, which is
+/// `0` for a successful unary response. Falling back to the ordinary
+/// trailers-only derivation would therefore turn a rewritten/replaced success
+/// into an empty Trailers-Only **success** — the client would see
+/// `grpc-status: 0` with no message at all. A rejection that selected its own
+/// status keeps it (`derived_grpc_status` is already nonzero, or the HTTP status
+/// maps to a nonzero code); only a residual OK is replaced.
+///
+/// `http_status_fallback` is the caller's own HTTP→gRPC mapping so the H1/H2 and
+/// H3 emitters stay on their respective tables.
+///
+/// This deliberately knows nothing about the one authorization for which
+/// emitting no DATA is *correct* — the unchanged status-only contract. Callers
+/// resolve that first through [`status_only_grpc_signal`] and only reach
+/// here when it declined, so an emitter that forgets the carve-out fails closed
+/// instead of falling through to the contract's possibly-successful status.
+///
+/// Returns the replacement `(grpc-status, grpc-message)`, or `None` when no
+/// correction is required.
+pub(crate) fn invalidated_grpc_terminate_fail_closed_signal(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
+    derived_grpc_status: u32,
+    http_status_fallback: u32,
+) -> Option<(u32, &'static str)> {
+    if !framed_unary_provenance.is_authorizing() {
+        return None;
+    }
+    if derived_grpc_status != grpc_proxy::grpc_status::OK {
+        return None;
+    }
+    let replacement = if http_status_fallback == grpc_proxy::grpc_status::OK {
+        grpc_proxy::grpc_status::INTERNAL
+    } else {
+        http_status_fallback
+    };
+    Some((replacement, INVALIDATED_GRPC_TERMINATE_MESSAGE))
+}
+
 pub(crate) fn normalize_reject_response(
     status: StatusCode,
     body: Bytes,
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
+) -> NormalizedRejectResponse {
+    normalize_reject_response_with_provenance(
+        status,
+        body,
+        headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::NONE,
+    )
+}
+
+pub(crate) fn normalize_reject_response_with_provenance(
+    status: StatusCode,
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    is_grpc_request: bool,
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'_>,
 ) -> NormalizedRejectResponse {
     let grpc_web_accept_rejected =
         crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
@@ -16906,34 +17249,103 @@ pub(crate) fn normalize_reject_response(
             grpc_message: None,
             failed_websocket_handshake: false,
             body_disposition: headers_mod::RejectBodyDisposition::default(),
+            grpc_trailers: HashMap::new(),
         };
     }
 
-    let grpc_status = headers
-        .get("grpc-status")
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| map_http_reject_status_to_grpc_status(status));
-    let grpc_message = headers
-        .get("grpc-message")
-        .cloned()
-        .or_else(|| extract_grpc_reject_message(body.as_ref()))
-        .unwrap_or_else(|| grpc_status_reason(grpc_status).to_string());
-    let grpc_message = sanitize_grpc_message(&grpc_message);
+    // Preserve uncompressed unary DATA + terminal metadata ONLY for the
+    // explicitly authorized `serverless_function` terminate result. Every other
+    // rejection — including one whose body happens to look like a gRPC frame and
+    // whose headers claim `application/grpc` + `grpc-status` — falls through to
+    // trailers-only, so an untrusted body is never reflected onto the wire.
+    // `body` is handed over as owned shared `Bytes`, so the authorized frame
+    // reaches the wire without a copy; the trailers-only fall-through below
+    // borrows it and then drops it. The predicates that decide intactness are
+    // shared with H3 reject logging via [`intact_framed_unary_terminate_signal`].
+    if let Some((grpc_status, grpc_message, trailers)) =
+        intact_framed_unary_terminate_signal(framed_unary_provenance, status, &body, headers)
+    {
+        return build_framed_grpc_unary_reject(body, headers, trailers, grpc_status, grpc_message);
+    }
 
+    // Past this point no DATA is emitted. That is correct for exactly one
+    // authorization — the status-only terminate contract, which authored no
+    // frame — and only while that reply is unchanged. For every other holder of
+    // terminate authorization, reaching here means the authored representation
+    // was invalidated (rewritten body, changed status, a body the status-only
+    // contract never authored, or a replacement rejection), and the contract's
+    // `grpc-status: 0` must not survive as an empty Trailers-Only success.
+    let mapped_status = map_http_reject_status_to_grpc_status(status);
+    let status_only = status_only_grpc_signal(framed_unary_provenance, status, &body);
+    let (grpc_status, grpc_message) = match status_only {
+        // The status-only terminate contract authored no frame, so trailers-only
+        // IS its authorized representation, and its own terminal metadata — not
+        // the decorated reject header map — is what the client must see. An
+        // omitted `grpc_message` stays omitted.
+        Some(ref authored) => (authored.grpc_status, authored.grpc_message.clone()),
+        None => {
+            let derived_grpc_status = headers
+                .get("grpc-status")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(mapped_status);
+            let fail_closed = invalidated_grpc_terminate_fail_closed_signal(
+                framed_unary_provenance,
+                derived_grpc_status,
+                mapped_status,
+            );
+            match fail_closed {
+                Some((status_code, message)) => (status_code, Some(message.to_string())),
+                None => {
+                    let message = headers
+                        .get("grpc-message")
+                        .cloned()
+                        .or_else(|| extract_grpc_reject_message(&body))
+                        .unwrap_or_else(|| grpc_status_reason(derived_grpc_status).to_string());
+                    (derived_grpc_status, Some(message))
+                }
+            }
+        }
+    };
+    let grpc_message = grpc_message
+        .map(|message| sanitize_grpc_message(&message))
+        .filter(|message| !message.is_empty());
+
+    // `content-length` is dropped with the terminal metadata: this branch emits
+    // an empty body, so any inbound value describes bytes that are not being
+    // sent. The framed terminate representation now runs the shared
+    // response-body lifecycle, whose transforms set `content-length` on the
+    // reject header map, so a stale value can reach here on the invalidated
+    // path.
     let mut normalized_headers = HashMap::with_capacity(headers.len() + 3);
     for (key, value) in headers {
         if key.eq_ignore_ascii_case("content-type")
             || key.eq_ignore_ascii_case("grpc-status")
             || key.eq_ignore_ascii_case("grpc-message")
+            || key.eq_ignore_ascii_case("content-length")
         {
+            continue;
+        }
+        // No terminal metadata is carried out of the reject header map while a
+        // terminate contract is authorizing — neither the keys it authored nor
+        // a `grpc-status-details-bin` a decorator injected. Intact status-only
+        // restores the authoritative copies from provenance just below; every
+        // invalidated path must emit none of them, so a replacement nonzero
+        // `grpc-status` can never ship beside the original contract's
+        // `grpc-status-details-bin` or its custom trailers.
+        if framed_unary_provenance.evicts_terminal_metadata(key) {
             continue;
         }
         normalized_headers.insert(key.clone(), value.clone());
     }
+    if let Some(ref authored) = status_only {
+        for (name, value) in &authored.additional {
+            normalized_headers.insert((*name).to_string(), (*value).to_string());
+        }
+    }
     normalized_headers.insert("content-type".to_string(), "application/grpc".to_string());
     normalized_headers.insert("grpc-status".to_string(), grpc_status.to_string());
-    if !grpc_message.is_empty() {
-        normalized_headers.insert("grpc-message".to_string(), grpc_message.clone());
+    if let Some(ref message) = grpc_message {
+        normalized_headers.insert("grpc-message".to_string(), message.clone());
     }
 
     NormalizedRejectResponse {
@@ -16941,12 +17353,161 @@ pub(crate) fn normalize_reject_response(
         headers: normalized_headers,
         body: Bytes::new(),
         grpc_status: Some(grpc_status),
-        grpc_message: Some(grpc_message),
+        grpc_message,
         failed_websocket_handshake: false,
         // Trailers-only gRPC keeps streaming/trailer semantics through
         // `grpc_status`; the disposition is unused on that branch.
         body_disposition: headers_mod::RejectBodyDisposition::default(),
+        grpc_trailers: HashMap::new(),
     }
+}
+
+/// Build the client representation for a rejection that already carries the
+/// authorized `serverless_function` terminate frame: HTTP 200 +
+/// `application/grpc` HEADERS, one uncompressed unary DATA frame, and the
+/// plugin-authored terminal trailers.
+///
+/// `authored_trailers` is the ONLY source of client-visible trailers. Terminal
+/// metadata is deliberately not promoted out of `headers`: that map has been
+/// through `after_proxy` decorators and initial-response-header policy, so it
+/// can hold CORS fields, gateway-managed values, and internal bridge fields
+/// that belong in the HEADERS block (or nowhere) rather than in trailers. Those
+/// headers are preserved in the initial block minus terminal/hop-by-hop names.
+///
+/// Callers must have already obtained `(grpc_status, grpc_message, trailers)`
+/// from [`intact_framed_unary_terminate_signal`] so the owned normalizer and
+/// the borrowed H3 logging path cannot drift on the shared predicates.
+fn build_framed_grpc_unary_reject(
+    body: Bytes,
+    headers: &HashMap<String, String>,
+    authored_trailers: &HashMap<String, String>,
+    grpc_status: u32,
+    grpc_message: Option<String>,
+) -> NormalizedRejectResponse {
+    let mut initial_headers = HashMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let lower = key.to_ascii_lowercase();
+        // Terminal metadata belongs in the trailers block only; emitting it in
+        // HEADERS too would make the response look Trailers-Only to a client.
+        if lower == "content-type" || authored_trailers.contains_key(&lower) {
+            continue;
+        }
+        // The reserved gRPC terminal-metadata namespace is contract-owned even
+        // for names the contract did not author, so a decorator cannot inject
+        // `grpc-status-details-bin` alongside the contract's own trailers.
+        if grpc_proxy::is_reserved_grpc_terminal_metadata(&lower) {
+            continue;
+        }
+        // Ferrum-owned gRPC-Web bridge fields must never reach a client.
+        if crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(&lower) {
+            continue;
+        }
+        if lower == "connection"
+            || lower == "keep-alive"
+            || lower == "proxy-connection"
+            || lower == "transfer-encoding"
+            || lower == "te"
+            || lower == "trailer"
+            || lower == "upgrade"
+            || lower == "content-length"
+        {
+            continue;
+        }
+        initial_headers.insert(lower, value.clone());
+    }
+    initial_headers.insert("content-type".to_string(), "application/grpc".to_string());
+
+    // Emit the same `grpc-message` shape every other gRPC error path emits, so
+    // the terminate contract cannot be the one place an unsanitized status
+    // message reaches the wire.
+    let mut trailers = authored_trailers.clone();
+    match grpc_message {
+        Some(ref message) => {
+            trailers.insert("grpc-message".to_string(), message.clone());
+        }
+        None => {
+            trailers.remove("grpc-message");
+        }
+    }
+
+    NormalizedRejectResponse {
+        http_status: StatusCode::OK,
+        headers: initial_headers,
+        // The authorized frame keeps the caller's allocation identity: the DATA
+        // frame every emitter writes is this same shared buffer, never a copy.
+        body,
+        grpc_status: Some(grpc_status),
+        grpc_message,
+        // A native gRPC framed-unary terminate is never a WebSocket handshake,
+        // and its DATA frame is written under trailers-only gRPC framing, so no
+        // `Content-Length` is derived from the disposition here.
+        failed_websocket_handshake: false,
+        body_disposition: headers_mod::RejectBodyDisposition::default(),
+        grpc_trailers: trailers,
+    }
+}
+
+/// Borrowed inspection of whether an authorizing terminate rejection is still
+/// the intact framed unary representation.
+///
+/// Shared by the owned normalizer and H3 reject logging so both agree on
+/// authored HTTP status, byte-exact frame equality, native `content-type`, a
+/// single uncompressed unary frame, terminal status parsing, and message
+/// sanitization — without requiring a full-body copy on the logging path.
+pub(crate) fn intact_framed_unary_terminate_signal<'a>(
+    framed_unary_provenance: FramedGrpcUnaryProvenance<'a>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+) -> Option<(u32, Option<String>, &'a HashMap<String, String>)> {
+    let authored_trailers = framed_unary_provenance.authorized_trailers(status, body)?;
+    if body.is_empty() {
+        return None;
+    }
+    let content_type = headers.get("content-type")?;
+    if !backend_dispatch::is_native_grpc_content_type(content_type.as_bytes()) {
+        return None;
+    }
+    if !bytes_are_single_uncompressed_unary_grpc_frame(body) {
+        return None;
+    }
+    let grpc_status = authored_trailers.get("grpc-status")?.parse::<u32>().ok()?;
+    let grpc_message = authored_trailers
+        .get("grpc-message")
+        .map(|message| sanitize_grpc_message(message))
+        .filter(|message| !message.is_empty());
+    Some((grpc_status, grpc_message, authored_trailers))
+}
+
+/// Shared predicate for "this normalized rejection is a framed unary gRPC
+/// response rather than a trailers-only error", plus the terminal trailers that
+/// MUST accompany the DATA frame.
+///
+/// Every emitter (the H1/H2 body builder, the direct-H3 writer, and both H3
+/// cross-protocol writers) reads this one helper so no protocol path can emit
+/// DATA while dropping the mandatory terminal metadata.
+/// The `Bytes` handle is returned (rather than a slice) so an emitter clones the
+/// shared buffer instead of copying the frame out of it.
+pub(crate) fn framed_unary_reject_parts(
+    reject: &NormalizedRejectResponse,
+) -> Option<(&Bytes, &HashMap<String, String>)> {
+    (!reject.body.is_empty() && !reject.grpc_trailers.is_empty())
+        .then_some((&reject.body, &reject.grpc_trailers))
+}
+
+pub(crate) fn bytes_are_single_uncompressed_unary_grpc_frame(body: &[u8]) -> bool {
+    if body.len() < 5 {
+        return false;
+    }
+    // Compression is unsupported on the serverless terminate contract; only
+    // flag byte 0 (uncompressed DATA) is accepted.
+    if body[0] != 0 {
+        return false;
+    }
+    let msg_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    // `5 + msg_len` would overflow `usize` on a 32-bit target for a declared
+    // length near `u32::MAX`; a wrapped sum could then match a short body.
+    msg_len.checked_add(5) == Some(body.len())
 }
 
 fn normalized_grpc_deadline_exceeded() -> NormalizedRejectResponse {
@@ -17051,7 +17612,10 @@ pub(crate) fn build_response_from_normalized_reject(
     let reject_builder = Response::builder().status(reject.http_status);
     let builder = headers_mod::apply_response_headers(reject_builder, &headers);
 
-    let body = if reject.body.is_empty() {
+    let body = if framed_unary_reject_parts(&reject).is_some() {
+        let trailers = grpc_proxy::buffered_grpc_trailers_to_header_map(&reject.grpc_trailers);
+        ProxyBody::buffered_grpc_with_trailers(reject.body, trailers)
+    } else if reject.body.is_empty() {
         // Status-aware empty body: 205 must not advertise Content-Length on H1
         // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
         // empty Full bodies; 204/304 are already special-cased upstream).
@@ -18186,8 +18750,17 @@ async fn finalize_reject_response_with_after_proxy_hooks_and_commit_policy(
     let status = StatusCode::from_u16(response_status).unwrap_or(status);
     // `response_body` is moved (not copied) into the normalizer: the reject
     // payload keeps the shared allocation the synthetic-body hooks produced.
-    let mut normalized =
-        normalize_reject_response(status, response_body, &headers, is_grpc_request);
+    // The framed-unary provenance is read from the request context so an
+    // authorized `serverless_function` native-gRPC terminate keeps its DATA
+    // frame and terminal trailers, and every unauthorized body still falls
+    // through to trailers-only.
+    let mut normalized = normalize_reject_response_with_provenance(
+        status,
+        response_body,
+        &headers,
+        is_grpc_request,
+        FramedGrpcUnaryProvenance::from_context(ctx),
+    );
     // Carry the request-context WebSocket boundary into the normalized reject
     // so the response builder can strip transport-managed fields after
     // ExactBody length repair. Do not infer this from response header names.
