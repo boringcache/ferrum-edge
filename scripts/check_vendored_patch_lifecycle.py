@@ -147,17 +147,6 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
         if not find_readme(docs_path):
             errors.append(f"{pid}: missing README under {docs_path}")
 
-        group = patch["retirement"].get("co_retirement_group")
-        if group is not None:
-            group_ids = {
-                group_entry["id"]: group_entry["patch_ids"]
-                for group_entry in data.get("co_retirement_groups", [])
-            }
-            if group not in group_ids:
-                errors.append(f"{pid}: unknown co_retirement_group {group!r}")
-            elif pid not in group_ids[group]:
-                errors.append(f"{pid}: not listed in co_retirement_group {group!r}")
-
         reaffirmation = patch.get("reaffirmation")
         readme = find_readme(docs_path)
         if readme is not None:
@@ -179,12 +168,62 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
 
     declared_groups = data.get("co_retirement_groups", [])
     known_ids = set(patch_ids)
+    patch_declared_group = {
+        patch["id"]: patch["retirement"].get("co_retirement_group") for patch in patches
+    }
+    group_members: dict[str, list[str]] = {}
+    seen_group_ids: set[str] = set()
+    patch_group_membership: dict[str, str] = {}
+
     for group in declared_groups:
-        for member in group.get("patch_ids", []):
+        gid = group.get("id")
+        if not isinstance(gid, str) or not gid.strip():
+            errors.append("co_retirement_groups entry missing id")
+            continue
+        if gid in seen_group_ids:
+            errors.append(f"duplicate co_retirement_group id {gid!r}")
+        seen_group_ids.add(gid)
+
+        members = group.get("patch_ids")
+        if not isinstance(members, list) or not members:
+            errors.append(
+                f"co_retirement_groups.{gid}: patch_ids must be a non-empty list"
+            )
+            continue
+        if len(members) != len(set(members)):
+            errors.append(
+                f"co_retirement_groups.{gid}: duplicate patch id in patch_ids"
+            )
+
+        group_members[gid] = members
+        for member in members:
             if member not in known_ids:
                 errors.append(
-                    f"co_retirement_groups.{group['id']}: unknown patch id {member!r}"
+                    f"co_retirement_groups.{gid}: unknown patch id {member!r}"
                 )
+                continue
+            prior = patch_group_membership.get(member)
+            if prior is not None and prior != gid:
+                errors.append(
+                    f"{member}: listed in multiple co_retirement_groups "
+                    f"({prior!r} and {gid!r})"
+                )
+            else:
+                patch_group_membership[member] = gid
+            if patch_declared_group.get(member) != gid:
+                errors.append(
+                    f"co_retirement_groups.{gid}: member {member!r} "
+                    f"declares co_retirement_group {patch_declared_group.get(member)!r}"
+                )
+
+    for patch in patches:
+        pid = patch["id"]
+        group = patch_declared_group[pid]
+        if group is not None:
+            if group not in group_members:
+                errors.append(f"{pid}: unknown co_retirement_group {group!r}")
+            elif pid not in group_members.get(group, []):
+                errors.append(f"{pid}: not listed in co_retirement_group {group!r}")
 
     lifecycle_vendor_paths = {patch["vendor_path"] for patch in patches}
     on_disk_vendor_paths = vendor_patch_dirs()
@@ -212,6 +251,11 @@ def parity_errors(data: dict[str, Any]) -> list[str]:
 
     if MESH_PERF_CARGO.is_file():
         mesh_patches = parse_patch_crates_io(MESH_PERF_CARGO)
+        if set(mesh_patches) != set(root_patches):
+            errors.append(
+                "tests/performance/mesh/Cargo.toml [patch.crates-io] crates "
+                f"{sorted(mesh_patches)} != root crates {sorted(root_patches)}"
+            )
         for crate, path in root_patches.items():
             mesh_path = mesh_patches.get(crate)
             if mesh_path is None:
