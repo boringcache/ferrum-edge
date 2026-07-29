@@ -1315,16 +1315,7 @@ pub mod _test_support {
         buffer_max_bytes: usize,
         max_entry_bytes: usize,
         hold_bytes: Option<usize>,
-    ) -> (
-        bool,
-        bool,
-        bool,
-        Option<usize>,
-        usize,
-        usize,
-        usize,
-        usize,
-    ) {
+    ) -> (bool, bool, bool, Option<usize>, usize, usize, usize, usize) {
         let probe = crate::plugins::loki_logging::probe_loki_provisional_admission_for_test(
             ceiling,
             buffer_max_bytes,

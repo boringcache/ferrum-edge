@@ -1554,7 +1554,10 @@ fn test_loki_provisional_reservation_shrinks_to_exact_and_releases_on_drop() {
         None,
     );
 
-    assert!(admitted, "small probe entry must admit under a fresh budget");
+    assert!(
+        admitted,
+        "small probe entry must admit under a fresh budget"
+    );
     assert!(serialize_called, "successful admit must serialize");
     assert!(labels_called, "successful admit must build labels");
     let charged = charged_after_admit.expect("admitted lease must report a charge");

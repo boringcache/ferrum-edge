@@ -722,7 +722,8 @@ fn compact_snapshot_lifecycle_measured(
         );
         return false;
     }
-    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events(&emission_guard) else {
+    let Some((events, overflow_count)) = lifecycle.prepare_compaction_events(&emission_guard)
+    else {
         // Serialize failure: keep the Full generation intact and retry later.
         // `prepare_compaction_events` already restaged its borrowed overflow.
         return false;
