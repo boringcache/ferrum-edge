@@ -13698,7 +13698,7 @@ components:
           minimum: 100
           maximum: 60000
           default: 5000
-          description: Bounds DNS resolution, TCP connect, and the TLS handshake.
+          description: Applied independently to DNS resolution, TCP connect, and the TLS handshake, so a stalled connect can take up to three times this value before it fails.
         command_timeout_ms:
           type: integer
           minimum: 100

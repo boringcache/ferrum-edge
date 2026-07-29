@@ -122,12 +122,12 @@ Bounds (all enforced, all fail closed or truncate visibly):
 | `${fields}` block | 8 KiB hard ceiling (names, values, separators, truncation marker); 512 B per value |
 | SMTP reply | 1 KiB per line, 64 lines, 16 KiB total |
 | Concurrent SMTP sessions per channel | 4 (further dispatches fail immediately rather than queue) |
-| Timeouts | `connect_timeout_ms` covers DNS + TCP + TLS handshake; `command_timeout_ms` covers each command/reply exchange including `DATA` |
+| Timeouts | `connect_timeout_ms` applies independently to DNS resolution, TCP connect, and the TLS handshake (so a stalled connect can take up to 3× the configured value before it fails); `command_timeout_ms` bounds each command/reply exchange including `DATA` |
 
 Security notes:
 
 - Credentials resolve through the same inline / `*_env` convention as the other channels, so the gateway secret resolver (`_FILE`, `_VAULT`, `_AWS`, `_AZURE`, `_GCP`) materializes them. They are never logged, never `Debug`-printed (the channel has a hand-written `Debug` impl), and never appear in an error.
-- Delivery errors are structured and carry only a phase plus the numeric SMTP reply code — server reply text is always withheld because it is untrusted and can be attacker-influenced. A reply that echoes configured credential material aborts the session with a dedicated error.
+- Delivery errors are structured and carry only a phase plus the numeric SMTP reply code — server reply text is always withheld because it is untrusted and can be attacker-influenced. A reply that echoes the configured password, or either credential in its on-the-wire base64 form, aborts the session with a dedicated error. The plaintext AUTH username is deliberately not watched: it is usually the mailbox address and relays legitimately echo addresses in `MAIL FROM` / `RCPT TO` replies.
 - Multiline replies are parsed strictly: every line must repeat the same 3-digit code with a `-`/space separator, and a malformed, oversized, or truncated reply fails the send.
 - Every templated value that reaches a header has its control characters folded to spaces, and the body is base64-encoded, so neither header injection nor premature `DATA` termination is reachable from template variables.
 - The resolved SMTP address is screened against `FERRUM_BACKEND_ALLOW_IPS` / `FERRUM_BACKEND_DENY_CIDRS` before connecting, so a hostname that resolves into a denied range is refused.

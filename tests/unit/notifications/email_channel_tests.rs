@@ -1653,6 +1653,33 @@ async fn a_reply_that_echoes_credential_material_aborts_the_session() {
 }
 
 #[tokio::test]
+async fn a_reply_that_echoes_the_auth_username_is_not_a_credential_leak() {
+    let mut script = SmtpScript::starttls_default();
+    // SMTP AUTH usernames are normally the mailbox address, and relays routinely
+    // echo addresses back (sendmail's classic `250 2.1.0 <sender>... Sender ok`,
+    // and the `550 ... <rcpt>` shape used elsewhere in this file). That must not
+    // be mistaken for the relay reflecting credential material, or every send
+    // from a `username == from` configuration would abort at MAIL FROM.
+    script.mail_from = vec![format!("250 2.1.0 <{SMTP_USERNAME}>... Sender ok")];
+    let fixture = spawn_smtp_fixture(script, false, "localhost").await;
+
+    let channel = parse_email(fixture.channel_def(json!({
+        "username": SMTP_USERNAME,
+        "password": SMTP_PASSWORD
+    })));
+    channel
+        .dispatch(
+            &notification(EventAction::Trigger),
+            &client_with_ca(fixture.ca_path()),
+        )
+        .await
+        .expect("an echoed address is not a credential reflection");
+
+    assert!(fixture.saw("DATA"), "delivery must reach the DATA phase");
+    fixture.handle.abort();
+}
+
+#[tokio::test]
 async fn command_timeout_bounds_a_silent_relay() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

@@ -940,6 +940,15 @@ impl fmt::Display for SmtpFailure {
 /// Substrings that must never appear in a server reply. Guards against a relay
 /// (or a MITM that somehow got a valid certificate) echoing credentials back in
 /// a banner that a future change might surface in diagnostics.
+///
+/// Only *secret* material is watched in its plaintext form. The AUTH username
+/// deliberately is not: it is normally the mailbox address, and relays routinely
+/// echo addresses back (`250 2.1.0 <sender>... Sender ok`,
+/// `550 5.1.1 no such user <rcpt>`), so treating it as a leak would abort
+/// ordinary deliveries whenever the username matches the envelope sender or
+/// happens to appear in the relay's own banner. Its base64 form stays a needle,
+/// because that is the shape it takes on the wire during `AUTH LOGIN` and
+/// nothing legitimate ever echoes it.
 #[derive(Clone, Default)]
 struct CredentialGuard {
     needles: Arc<Vec<String>>,
@@ -949,10 +958,13 @@ impl CredentialGuard {
     fn new(credentials: Option<&SmtpCredentials>) -> Self {
         let mut needles = Vec::new();
         if let Some(credentials) = credentials {
+            // Very short values would false-positive on ordinary banner text.
+            let password = credentials.password.as_ref();
+            if password.len() >= 4 {
+                needles.push(password.to_string());
+            }
             for raw in [credentials.username.as_ref(), credentials.password.as_ref()] {
-                // Very short values would false-positive on ordinary banner text.
                 if raw.len() >= 4 {
-                    needles.push(raw.to_string());
                     needles.push(base64::engine::general_purpose::STANDARD.encode(raw));
                 }
             }

@@ -220,7 +220,7 @@ Counts stream disconnects whose `disconnect_cause` matches one of `causes`. Stre
 
 ### Webhook template variables
 
-In addition to the [generic notification template variables](notifications.md#template-variables-provided-by-the-notifications-layer), the proxy_alerts plugin exposes these to the webhook channel `body_template`:
+In addition to the [generic notification template variables](notifications.md#template-variables-provided-by-the-notifications-layer), the proxy_alerts plugin exposes these to the operator-templated channels — the `webhook` channel's `body_template` and the `email` channel's `subject_template` / `body_template`:
 
 | Variable | Value |
 |----------|-------|
