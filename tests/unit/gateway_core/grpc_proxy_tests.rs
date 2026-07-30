@@ -478,6 +478,20 @@ fn h2c_settings_observer_preserves_vectored_writes() {
             && implementation.contains("self.inner.is_write_vectored()"),
         "the h2c wrapper must advertise the inner transport capability"
     );
+
+    assert!(
+        source.contains("fn initial_settings_header_is_well_formed(&self)")
+            && source.contains("self.first_frame_header[4] & 0x1 == 0")
+            && source.contains("stream_id == 0")
+            && source.contains("payload_len <= DEFAULT_MAX_FRAME_SIZE")
+            && source.contains("payload_len % 6 == 0"),
+        "raw readiness must reject an ACK, nonzero stream, oversized frame, or malformed SETTINGS payload"
+    );
+    assert!(
+        source.contains("let post_observation = std::future::poll_fn(|cx|")
+            && source.contains("Pin::new(&mut *conn).poll(cx)"),
+        "Hyper must receive one post-observation poll so a protocol error wins the readiness race"
+    );
 }
 
 #[test]
