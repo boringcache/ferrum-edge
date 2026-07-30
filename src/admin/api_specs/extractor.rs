@@ -4308,7 +4308,11 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    s[..s.floor_char_boundary(max_bytes)].to_string()
+    let mut boundary = max_bytes.min(s.len());
+    while !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    s[..boundary].to_string()
 }
 
 /// Extract Tier 1 metadata from the parsed spec root value.

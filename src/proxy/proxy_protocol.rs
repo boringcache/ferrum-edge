@@ -46,8 +46,14 @@ pub enum ProxyProtocolResult {
 
 /// Maximum in-memory PROXY header size accepted by [`parse_proxy_protocol_header_bytes`].
 #[cfg(feature = "fuzzing")]
-pub(crate) const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize =
-    V1_MAX_LEN.max(V2_SIG.len() + 4 + V2_MAX_ADDR_LEN as usize);
+pub(crate) const PROXY_PROTOCOL_MAX_HEADER_BYTES: usize = {
+    const V2_MAX_LEN: usize = V2_SIG.len() + 4 + V2_MAX_ADDR_LEN as usize;
+    if V1_MAX_LEN > V2_MAX_LEN {
+        V1_MAX_LEN
+    } else {
+        V2_MAX_LEN
+    }
+};
 
 /// Error variants for PROXY protocol parsing.
 #[derive(Debug, thiserror::Error)]

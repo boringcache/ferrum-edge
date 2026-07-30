@@ -794,7 +794,9 @@ pub fn decode_and_validate_config_document(
         .validate_stream_proxies(ValidationAction::FatalCount(
             "Configuration validation failed: {} stream proxy error(s) found",
         ))
-        .run()
+        .run()?;
+
+    Ok(config)
 }
 
 /// Load and validate an owned file-mode candidate without blocking an async
