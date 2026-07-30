@@ -2,9 +2,12 @@
 //! LeastLatency warm-up / locality-distribute selection counters are sharded
 //! and cache-line padded (reusing the WRR shard mechanism).
 //!
-//! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` (2-target
-//! RR at 1 vs 8 threads) with `.github/scripts/verify_rr_selection_benchmark.py`
-//! for the contention floor. These unit tests guard layout and selection parity.
+//! Hosted CI runs `tests/performance/mesh/benches/rr_selection.rs` with
+//! `.github/scripts/verify_rr_selection_benchmark.py`: a same-run 4-thread
+//! shared-`AtomicU64` control versus production sharded RoundRobin on the
+//! 2-target fixture (absolute 1-thread/N-thread speedup is diagnostic-only).
+//! These unit tests guard layout, selection parity, and the hosted gate's
+//! measurement contract.
 
 use chrono::Utc;
 use crossbeam_utils::CachePadded;
@@ -83,6 +86,51 @@ fn upstream_with_locality_lb(
         created_at: now,
         updated_at: now,
     }
+}
+
+#[test]
+fn rr_contention_bench_uses_same_run_shared_atomic_control() {
+    // The hosted gate must compare production sharded RR against a deliberately
+    // contended bare AtomicU64 under the same worker pool — not absolute
+    // 1-thread vs N-thread speedup on a variable runner (observed 1.50x→0.44x).
+    let bench = std::fs::read_to_string("tests/performance/mesh/benches/rr_selection.rs")
+        .expect("rr_selection bench must be readable from crate root");
+    let verifier =
+        std::fs::read_to_string(".github/scripts/verify_rr_selection_benchmark.py")
+            .expect("RR verifier must be readable from crate root");
+
+    assert!(
+        bench.contains("run_shared_selections")
+            && bench.contains("AtomicU64")
+            && bench.contains("sharded")
+            && bench.contains("shared"),
+        "RR bench must measure a same-run shared AtomicU64 control beside sharded select"
+    );
+    assert!(
+        bench.contains("PARALLEL_THREADS: usize = 4")
+            || bench.contains("const PARALLEL_THREADS: usize = 4"),
+        "RR contended comparison must use 4 threads (hosted vCPU calibration)"
+    );
+    assert!(
+        !bench.contains("THREAD_COUNTS: [usize; 2] = [1, 8]"),
+        "RR gate must not depend on the flaky 1-vs-8 absolute speedup thread matrix"
+    );
+    assert!(
+        verifier.contains("contended_advantage")
+            && verifier.contains("shared_wall_ns / sharded_wall_ns")
+            && verifier.contains("diagnostic-only")
+            && verifier.contains("--min-contended-advantage"),
+        "RR verifier must gate shared/sharded advantage and keep absolute speedup diagnostic"
+    );
+    assert!(
+        verifier.contains("PARALLEL_THREADS = 4")
+            && verifier.contains("HOSTED_CONTENTION_FLOOR = 1.10"),
+        "RR verifier thread count and floor must stay aligned with the bench"
+    );
+    assert!(
+        !verifier.contains("speedup = (PARALLEL_THREADS * serial_ns) / parallel_ns"),
+        "RR verifier must not document the old absolute parallel/serial throughput gate"
+    );
 }
 
 #[test]

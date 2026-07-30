@@ -4072,7 +4072,7 @@ jobs:
           python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_rr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
-            --min-parallel-speedup 1.10
+            --min-contended-advantage 1.10
 
       - name: Run AI semantic-cache cleanup p99 microbenchmark
         if: steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
@@ -4197,7 +4197,7 @@ jobs:
           fi
           if [ "${RUN_RR}" = "true" ]; then
             {
-              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture."
+              echo "RoundRobin selection contention guard executed: same-run shared AtomicU64 control vs sharded RR at 4 threads (shared_wall/sharded_wall >= 1.10x) for the 2-target fixture; absolute 1-thread/N-thread speedup is diagnostic-only."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
